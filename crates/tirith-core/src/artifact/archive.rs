@@ -910,7 +910,13 @@ fn parse_dist_info_dir(root: &str) -> Option<(String, String)> {
 
 /// PEP 503 name normalization: lowercase and collapse any run of `-`, `_`, or `.`
 /// into a single `-`. So `Foo.Bar_baz` and `foo-bar-baz` compare equal.
-fn normalize_project_name(name: &str) -> String {
+///
+/// `pub(crate)` so the D5 post-install RECORD check
+/// ([`crate::artifact::install::verify_post_install_record`]) scopes its
+/// verification to exactly the just-installed distributions using the SAME
+/// normalizer the resolver's `name @ file://...` line uses, so a `.dist-info`
+/// directory name and an approved distribution name cannot drift apart.
+pub(crate) fn normalize_project_name(name: &str) -> String {
     let lowered = name.to_ascii_lowercase();
     let mut out = String::with_capacity(lowered.len());
     let mut prev_sep = false;

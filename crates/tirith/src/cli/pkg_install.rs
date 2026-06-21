@@ -37,7 +37,10 @@
 
 use std::path::{Path, PathBuf};
 
-use tirith_core::artifact::install::{DigestInstallPlan, InstallCommand};
+use tirith_core::artifact::install::{
+    verify_post_install_record, DigestInstallPlan, InstallCommand, PostInstallIntegrity,
+};
+use tirith_core::policy::Policy;
 
 use crate::cli::capsule::{self, CapsuleRefused, DegradedPolicy};
 
@@ -63,6 +66,13 @@ pub struct ContainedInstallOutcome {
     /// The absolute path of the `approved.txt` the install read (inside the
     /// transaction directory).
     pub approved_requirements_path: PathBuf,
+    /// D5: the post-install RECORD verification over the just-installed
+    /// distributions, run ONLY when the contained install exited cleanly
+    /// (`exit_code == 0`). `None` when the install failed, since there is nothing
+    /// trustworthy to verify. Its [`PostInstallIntegrity::verdict`] is folded into
+    /// the install's overall result and recorded (with its coverage counters) in the
+    /// D6 receipt; a strict integrity policy can make that verdict block.
+    pub post_install: Option<PostInstallIntegrity>,
 }
 
 /// Why a contained install-from-digest could not run. Distinct from
@@ -106,7 +116,8 @@ impl From<CapsuleRefused> for ContainedInstallError {
     }
 }
 
-/// Run a re-bound [`DigestInstallPlan`] as a contained `pip install`.
+/// Run a re-bound [`DigestInstallPlan`] as a contained `pip install`, then (on
+/// success) verify the installed RECORD of the just-installed distributions.
 ///
 /// `plan` is the verified plan from
 /// [`tirith_core::artifact::install::rebind_for_install`] (the re-bind already
@@ -114,7 +125,12 @@ impl From<CapsuleRefused> for ContainedInstallError {
 /// the plan's `file://` wheels and the `approved.txt` live in (the plan's spec
 /// already grants it read). `interpreter` is the resolved Python interpreter to run
 /// `python -m pip` with; resolve it by executable provenance (as the D2 resolver
-/// does), never a bare `pip` on `PATH`.
+/// does), never a bare `pip` on `PATH`. `target_environment` is the environment pip
+/// installed into (the plan's spec write root) and `installed_names` are the PEP
+/// 503-normalised distribution names the plan landed (build them with
+/// [`tirith_core::artifact::install::installed_distribution_names`] over the resolved
+/// set); both scope the D5 post-install verification. `policy` finalises that
+/// post-install verdict (so a strict integrity policy can make it block).
 ///
 /// This:
 /// 1. Writes `plan.approved_requirements` to `transaction_dir/approved.txt`
@@ -123,6 +139,11 @@ impl From<CapsuleRefused> for ContainedInstallError {
 /// 3. Runs `interpreter <argv>` through the capsule under
 ///    [`DegradedPolicy::FailClosed`]: a degraded/NoOp backend refuses BEFORE
 ///    spawning (fail-closed), so the install never runs uncontained.
+/// 4. **D5:** if pip exited cleanly (`exit_code == 0`), runs
+///    [`verify_post_install_record`] over `installed_names` in `target_environment`
+///    and carries the resulting [`PostInstallIntegrity`] (verdict + coverage
+///    counters) in the outcome. On a non-zero exit there is nothing trustworthy to
+///    verify, so the post-install field stays `None`.
 ///
 /// It NEVER calls [`crate::cli::install::ProcessInstallRunner`]; the only spawn is
 /// the capsule seam.
@@ -130,6 +151,9 @@ pub fn run_contained_install(
     plan: &DigestInstallPlan,
     transaction_dir: &Path,
     interpreter: &Path,
+    target_environment: &Path,
+    installed_names: &[String],
+    policy: &Policy,
 ) -> Result<ContainedInstallOutcome, ContainedInstallError> {
     // 1. Write approved.txt into the transaction directory (atomic, 0600). The
     //    write helper writes a temp INSIDE the dir and renames, so a reader sees the
@@ -161,12 +185,27 @@ pub fn run_contained_install(
         DegradedPolicy::FailClosed,
     )?;
 
+    // 4. D5 post-install RECORD verification, ONLY on a clean install. A failed pip
+    //    run may have extracted nothing (or a partial tree), so there is nothing
+    //    trustworthy to verify; the post-install field stays `None` and the caller
+    //    reports the install failure on its own.
+    let post_install = if outcome.exit_code == 0 {
+        Some(verify_post_install_record(
+            target_environment,
+            installed_names,
+            policy,
+        ))
+    } else {
+        None
+    };
+
     Ok(ContainedInstallOutcome {
         exit_code: outcome.exit_code,
         backend_id: outcome.backend_id,
         coverage_summary: outcome.coverage_summary(),
         bound_db_sequence: plan.bound_db_sequence,
         approved_requirements_path: approved_path,
+        post_install,
     })
 }
 
@@ -263,9 +302,18 @@ mod tests {
         // genuinely lacks a backend the error is the fail-closed refusal.
         let (dir, plan) = planned();
         let fake_python = dir.path().join("no-such-python");
-        let res = run_contained_install(&plan, dir.path(), &fake_python);
+        let env = dir.path().join("env");
+        let res = run_contained_install(
+            &plan,
+            dir.path(),
+            &fake_python,
+            &env,
+            &["demo".to_string()],
+            &Policy::default(),
+        );
         // It must be an error (never a clean success against a missing interpreter /
-        // absent backend).
+        // absent backend). The fail-closed refusal (or the spawn error) happens BEFORE
+        // the post-install verification, so the post-install field is never reached.
         assert!(res.is_err(), "a missing backend/interpreter must error");
     }
 
