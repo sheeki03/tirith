@@ -9,6 +9,7 @@ pub mod audit_upload;
 pub mod baseline;
 pub mod blast_radius;
 pub mod canary;
+pub mod capsule;
 pub mod checkpoint;
 pub mod clipboard;
 pub mod command_card;
