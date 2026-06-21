@@ -315,11 +315,23 @@ pub fn finalize_static_verdict(
     // 3. Per-rule action overrides operate on the full finding set, before any
     // paranoia filter removes the causal finding.
     let mut override_forced_block = false;
+    let mut causal_findings: Vec<Finding> = Vec::new();
     if !policy.action_overrides.is_empty() {
         let (new_action, caused_by) =
             apply_action_overrides(verdict.action, &verdict.findings, &policy.action_overrides);
         if !caused_by.is_empty() && action_rank(new_action) > action_rank(verdict.action) {
             override_forced_block = true;
+            // Snapshot the findings that forced the override BEFORE paranoia can drop
+            // them, so a restored Block still carries its explanation (mirrors
+            // `post_process_verdict`).
+            let causal: std::collections::HashSet<&str> =
+                caused_by.iter().map(String::as_str).collect();
+            causal_findings = verdict
+                .findings
+                .iter()
+                .filter(|f| causal.contains(f.rule_id.to_string().as_str()))
+                .cloned()
+                .collect();
         }
         verdict.action = new_action;
     }
@@ -329,6 +341,20 @@ pub fn finalize_static_verdict(
     crate::engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
     if override_forced_block && action_rank(pre_paranoia_action) > action_rank(verdict.action) {
         verdict.action = pre_paranoia_action;
+        // Re-add any causal finding paranoia removed, so the restored Block is not left
+        // without an explaining finding (a static caller would otherwise see a blocking
+        // verdict with no cause).
+        for cf in &causal_findings {
+            let already_present = verdict.findings.iter().any(|ef| {
+                ef.rule_id == cf.rule_id
+                    && ef.severity == cf.severity
+                    && ef.title == cf.title
+                    && ef.description == cf.description
+            });
+            if !already_present {
+                verdict.findings.push(cf.clone());
+            }
+        }
     }
 
     verdict
@@ -1802,6 +1828,31 @@ mod tests {
             .insert("threat_malicious_package".to_string(), Severity::Info);
         let verdict = finalize_static_verdict(findings, &policy, 3, Timings::default());
         assert_eq!(verdict.action, Action::Allow);
+    }
+
+    #[test]
+    fn finalize_static_verdict_reexposes_override_causal_finding_after_paranoia() {
+        // An Info finding (default paranoia removes Info) carrying a `block` override
+        // must still Block AND keep its causal finding, so the restored Block is not
+        // left without an explanation.
+        let findings = vec![make_finding(
+            RuleId::ThreatUnresolvedMaliciousPackage,
+            Severity::Info,
+        )];
+        let mut policy = crate::policy::Policy::default();
+        policy.action_overrides.insert(
+            "threat_unresolved_malicious_package".to_string(),
+            "block".to_string(),
+        );
+        let verdict = finalize_static_verdict(findings, &policy, 3, Timings::default());
+        assert_eq!(verdict.action, Action::Block, "override must force Block");
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ThreatUnresolvedMaliciousPackage),
+            "the override-causal finding must be re-exposed after paranoia filtering"
+        );
     }
 
     fn empty_session() -> SessionWarnings {
