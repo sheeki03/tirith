@@ -514,7 +514,12 @@ fn python_requirement_spec(line: &str) -> String {
             _ => {}
         }
     }
-    match buf.find(['=', '<', '>', '!', '~']) {
+    // Search for a version operator ONLY in the part before the `;` marker, so a
+    // comparator INSIDE the marker (`python_version < "3.9"`) is not mistaken for the
+    // dependency's version. When a real operator IS found before the marker, keep the
+    // whole tail (marker included) so `from_pep440_specifier` still rejects the marker.
+    let before_marker = buf.split(';').next().unwrap_or(buf.as_str());
+    match before_marker.find(['=', '<', '>', '!', '~']) {
         Some(i) => buf[i..].trim().to_string(),
         None => String::new(),
     }
@@ -2724,6 +2729,16 @@ git+https://github.com/x/y.git
         assert!(names.contains(&"requests"));
         assert!(names.contains(&"flask"), "extras must be stripped");
         assert!(names.contains(&"django"), "env markers must be stripped");
+        // The `<` inside the marker must NOT be read as django's version spec.
+        let django = deps
+            .iter()
+            .find(|d| d.name == "django")
+            .expect("django dep");
+        assert_eq!(
+            django.version,
+            crate::version_intent::VersionIntent::Unspecified,
+            "a marker comparator must not be read as a version constraint"
+        );
         assert!(names.contains(&"numpy"), "inline comment must be stripped");
         // pip directives and VCS installs must NOT yield a name.
         assert!(!names.iter().any(|n| n.contains("other-requirements")));
