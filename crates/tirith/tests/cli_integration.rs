@@ -15640,6 +15640,15 @@ fn scan_operator_policy_ignore_oversized_passes() {
         }),
         "an ignored oversized gap must emit no analysis_incomplete finding; got: {json}"
     );
+    // ...but the gap itself is STILL recorded in the envelope (transparency), so an
+    // ignore can never silently drop the gap from the output.
+    let gaps = json["coverage_gaps"]
+        .as_array()
+        .expect("coverage_gaps must be an array");
+    assert!(
+        gaps.iter().any(|g| g.to_string().contains("CLAUDE.md")),
+        "the ignored oversized gap must still be recorded in coverage_gaps; got: {json}"
+    );
 }
 
 /// A2 — a REPO-scoped `oversized_file_action: ignore` is CLAMPED up to Warn (a
@@ -15678,5 +15687,17 @@ fn scan_repo_policy_ignore_oversized_is_clamped_to_warn() {
     assert_eq!(
         json["analysis_incomplete"], true,
         "the clamped repo policy still surfaces the oversized gap; got: {json}"
+    );
+    // Assert the exact cause so this cannot regress to incompleteness for some other
+    // reason: an `oversized` gap for CLAUDE.md must be present.
+    let gaps = json["coverage_gaps"]
+        .as_array()
+        .expect("coverage_gaps must be an array");
+    assert!(
+        gaps.iter().any(|g| {
+            let s = g.to_string();
+            s.contains("CLAUDE.md") && s.contains("oversized")
+        }),
+        "the clamped policy must surface an oversized CLAUDE.md gap; got: {json}"
     );
 }
