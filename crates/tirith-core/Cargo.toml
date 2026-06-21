@@ -24,6 +24,16 @@ categories = ["development-tools"]
 # today; it just never fires until the DB methods exist.
 default = []
 artifact-hash-lookup = []
+# native-yara (yara-x): DEFERRED by the PR-0 dependency spike, NOT wired here.
+# The plan pencilled in `native-yara = ["dep:yara-x"]` with yara-x 0.14, but on the
+# current registry yara-x 0.14 requires `intaglio >= 1.10`, and intaglio 1.10 (its
+# lowest available release) bumped its MSRV to Rust 1.85. yara-x 0.14 also pulls
+# `ar_archive_writer` (Rust 1.88) and a newer `time` (1.88) transitively. There is
+# no version of the yara-x 0.14 closure that builds on our MSRV 1.83, so the
+# feature and the `yara-x` dependency are intentionally omitted. The engine already
+# treats an absent native-yara feature as `native_yara_rules: unavailable` (not
+# "incomplete"), so this is a clean no-op. Revisit when the workspace MSRV rises to
+# >= 1.85 or a yara-x line with a 1.83-compatible closure ships.
 
 [dependencies]
 url = { workspace = true }
@@ -73,9 +83,37 @@ arboard = { workspace = true }
 # OS RNG for the per-install anomaly-baseline salt (M10 ch5). Tiny, OS-only
 # entropy source; already present transitively. Used by `baseline::load_or_create_salt`.
 getrandom = "0.3"
+# MCP message typing (Stack C). A serde-only schema crate for the Model Context
+# Protocol — NO async runtime, NO tokio (rmcp was rejected for core precisely
+# because it pulls tokio + Apache-only). `default-features = false` plus the single
+# protocol-revision feature keeps the surface to serde structs we map known
+# content onto, while unknown blocks are preserved losslessly by our own
+# `PreservedContent::Unknown(serde_json::Value)` wrapper. Proven on MSRV 1.83 in
+# the PR-0 dependency spike (crate MSRV 1.80). License MIT.
+rust-mcp-schema = { version = "0.10", default-features = false, features = ["2025_11_25"] }
+# JSON Schema validation for MCP inputSchema -> args and outputSchema ->
+# result.structuredContent (Stack C). `default-features = false` is mandatory:
+# the default feature set pulls `resolve-http` + `resolve-file` (HTTP and
+# filesystem `$ref` resolution) and a TLS stack, none of which we want — schema
+# refs must never trigger network or disk I/O. With defaults off the crate uses
+# the `fancy-regex` engine for the `pattern` keyword. Crate MSRV is exactly 1.83
+# (verified in the PR-0 spike); the consuming code (C2) bounds size/depth/branch/
+# $ref/regex/cache/error. License MIT.
+jsonschema = { version = "0.46", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+# Linux runtime-containment capsule backend (Stack E2). Landlock = unprivileged
+# filesystem (and, on ABI v4 / Linux 6.7, port-level network) access control;
+# extrasafe = an ergonomic seccomp-BPF policy builder (wraps seccompiler). Both
+# are applied by the internal `tirith __capsule-child` launcher, NOT inside
+# `pre_exec`. `cfg(target_os = "linux")`-gated so macOS / Windows targets compile
+# without them. Proven to resolve + build on MSRV 1.83 across the linux-gnu target
+# in the PR-0 spike. Licenses: landlock MIT/Apache-2.0, extrasafe MIT.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+extrasafe = "0.5"
 
 [build-dependencies]
 toml = "0.8"
