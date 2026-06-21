@@ -4644,6 +4644,29 @@ version = "1.0.61"
     }
 
     #[test]
+    fn integrity_non_utf8_installer_is_not_externally_managed() {
+        // A non-UTF-8 INSTALLER must NOT count as "externally managed" (which would skip
+        // the integrity check): an attacker could otherwise write one junk byte to
+        // INSTALLER to bypass RECORD verification. With a divergent (tampered) RECORD, the
+        // violation must still fire.
+        let dir = tempfile::tempdir().unwrap();
+        plant_installed_dist(
+            dir.path(),
+            "sneaky",
+            "1.0",
+            &[("sneaky/__init__.py", b"# real\n")],
+            false, // RECORD hashes diverge (tamper)
+            &[("INSTALLER", b"\xff\xfe not utf8")],
+        );
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "a non-UTF-8 INSTALLER must not bypass integrity via a false externally-managed"
+        );
+    }
+
+    #[test]
     fn integrity_absent_in_manifests_mode() {
         // The integrity report is only computed in `--installed` mode, so a
         // manifest-mode scan must leave it None (byte-identical JSON invariant).
