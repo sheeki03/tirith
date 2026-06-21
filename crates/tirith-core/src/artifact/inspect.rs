@@ -305,8 +305,21 @@ fn inspect_wheel<R: std::io::Read + std::io::Seek>(
                 fold_startup_member(&mut inspection, captured);
             }
             ArtifactFileKind::DistInfoMetadata => {
-                // The RECORD member (the only DistInfoMetadata member captured).
-                record_entries_bytes = Some(captured.bytes.clone());
+                // ONLY the exact RECORD member, not its detached signatures
+                // (`RECORD.jws` / `RECORD.p7s`), which `is_text_member_of_interest` also
+                // captures as DistInfoMetadata. A signature appearing AFTER RECORD in the
+                // central directory would otherwise overwrite the real RECORD bytes, fail
+                // CSV parsing (`record` becomes None), and fire a false RecordMissingFile
+                // on a legitimately signed wheel.
+                let is_record = captured
+                    .location
+                    .member_path
+                    .as_deref()
+                    .map(|m| m.rsplit('/').next().unwrap_or(m) == "RECORD")
+                    .unwrap_or(false);
+                if is_record {
+                    record_entries_bytes = Some(captured.bytes.clone());
+                }
             }
             _ => {}
         }
