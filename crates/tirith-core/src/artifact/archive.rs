@@ -474,24 +474,18 @@ pub fn read_wheel<R: Read + Seek>(
         // `NativeTruncated` gap noting the deep parse was truncated. The streaming
         // view is bounded by `remaining_total`, and the bytes it reads are debited,
         // so an oversized native member cannot bypass the total budget either.
-        if meta.declared_size > limits.max_member_uncompressed {
-            let file_kind = classify_member(&member_label);
-            if file_kind == ArtifactFileKind::NativeModule {
-                let (handoff, consumed) =
-                    stream_native_view(&mut archive, meta.index, location.clone(), remaining_total);
-                total_uncompressed = total_uncompressed.saturating_add(consumed);
-                if total_uncompressed >= limits.max_total_uncompressed {
-                    total_budget_hit = true;
-                }
-                if let Some(handoff) = handoff {
-                    visitor.on_native_member(handoff);
-                }
-                inspection.coverage.gaps.push(CoverageGap {
-                    location: location.clone(),
-                    kind: CoverageGapKind::NativeTruncated,
-                    sha256: None,
-                });
-            }
+        // A NON-native member whose DECLARED size exceeds the per-member cap needs no
+        // deep parse, so skip decompression and record the gap. A NATIVE member is
+        // deliberately NOT routed on the attacker-controlled `declared_size` (the field
+        // doc warns it is "attacker-controlled, NOT trusted"): an inflated declared size
+        // would otherwise downgrade a SMALL module to the shallow streaming view and evade
+        // B7's deep parser. Native members fall through to `stream_member`, which routes on
+        // the REAL streamed bytes - it Buffers a module that actually fits and streams
+        // (with a NativeTruncated gap, in stream_member's too-large arm) only one whose
+        // real bytes exceed the cap.
+        if meta.declared_size > limits.max_member_uncompressed
+            && classify_member(&member_label) != ArtifactFileKind::NativeModule
+        {
             inspection.coverage.gaps.push(CoverageGap {
                 location,
                 kind: CoverageGapKind::MemberTooLarge,
@@ -2222,16 +2216,17 @@ mod tests {
 
     #[test]
     fn archive_total_budget_debits_aborted_and_native_members() {
-        // REGRESSION (T1.1): the shared total-uncompressed budget must be debited
-        // for EVERY member, including the over-declared-cap native branch (which
-        // historically called `stream_native_view` with the FULL total budget per
-        // member, so N oversized native members could each read the whole budget).
+        // REGRESSION (T1.1 + B7 routing): native routing must use the REAL streamed
+        // size, NOT the attacker-controlled DECLARED size, and the shared
+        // total-uncompressed budget must still bound the work.
         //
         // Build 5 highly-compressible `.so` members, each REAL size 100 KiB but
-        // DECLARING 150 KiB (a lie patched into the central directory) so each
-        // enters the over-cap native branch. With the per-member cap at 100 KiB and
-        // the TOTAL budget at 200 KiB, only the first ~2 members fit the total; the
-        // rest must read NOTHING once the budget is exhausted.
+        // DECLARING 150 KiB (a lie patched into the central directory). With the
+        // per-member cap at 128 KiB (ABOVE the real size), the inflated declared size no
+        // longer downgrades these small modules to a streaming view - their real bytes
+        // FIT, so they are BUFFERED for B7's deep parse. The TOTAL budget (200 KiB) still
+        // caps the work: only the first ~2 members buffer; the rest read NOTHING once the
+        // budget is exhausted (TotalBytesCapped).
         const MEMBER_REAL: usize = 100 * 1024;
         const N: usize = 5;
         let body = vec![0u8; MEMBER_REAL]; // zeros: deflate to almost nothing
@@ -2247,9 +2242,9 @@ mod tests {
         let sha = sha256_hex(&bytes);
 
         let limits = ArchiveLimits {
-            max_member_uncompressed: MEMBER_REAL as u64, // 100 KiB: each member is "oversized" only by its lie
-            max_total_uncompressed: (2 * MEMBER_REAL) as u64, // 200 KiB: ~2 members fit
-            max_compression_ratio: 1_000_000_000,        // never let the ratio be the trigger
+            max_member_uncompressed: (MEMBER_REAL + 28 * 1024) as u64, // 128 KiB: real bytes (100 KiB) FIT; only the declared 150 KiB "lies" oversized
+            max_total_uncompressed: (2 * MEMBER_REAL) as u64,          // 200 KiB: ~2 members fit
+            max_compression_ratio: 1_000_000_000, // never let the ratio be the trigger
             ..ArchiveLimits::default()
         };
 
@@ -2278,25 +2273,22 @@ mod tests {
             N,
             (N * MEMBER_REAL) as u64,
         );
-        // Concretely: only the first two members fit the 200 KiB budget; the rest
-        // read nothing, so exactly two streaming views were produced (NOT five).
+        // The inflated DECLARED size (150 KiB) no longer routes these members: their REAL
+        // bytes (100 KiB) fit the 128 KiB cap, so they are BUFFERED for B7's deep parse,
+        // NOT downgraded to a streaming view. No member streams.
         assert_eq!(
-            visitor.streaming_count, 2,
-            "only the members that fit the total budget should stream a view"
+            visitor.streaming_count, 0,
+            "an inflated declared size must NOT downgrade a small native member to streaming"
         );
-        // Every oversized member is still a MemberTooLarge coverage gap (the
-        // structural bookkeeping is unchanged; only the budget accounting is fixed).
+        // No member's REAL bytes exceed the per-member cap, so there is no MemberTooLarge
+        // gap and no truncated deep parse.
         let member_too_large = inspection
             .coverage
             .gaps
             .iter()
             .filter(|g| g.kind == CoverageGapKind::MemberTooLarge)
             .count();
-        assert_eq!(
-            member_too_large, N,
-            "each oversized native member is a MemberTooLarge gap"
-        );
-        // And the deep parse was marked truncated for each native member.
+        assert_eq!(member_too_large, 0, "no member's REAL bytes exceed the cap");
         let native_truncated = inspection
             .coverage
             .gaps
@@ -2304,8 +2296,21 @@ mod tests {
             .filter(|g| g.kind == CoverageGapKind::NativeTruncated)
             .count();
         assert_eq!(
-            native_truncated, N,
-            "each oversized native member records a NativeTruncated gap"
+            native_truncated, 0,
+            "fitting native members are not truncated"
+        );
+        // The TOTAL budget (200 KiB) still bounds the work: only the first two members
+        // buffer; the rest are TotalBytesCapped once the budget is exhausted.
+        let total_capped = inspection
+            .coverage
+            .gaps
+            .iter()
+            .filter(|g| g.kind == CoverageGapKind::TotalBytesCapped)
+            .count();
+        assert_eq!(
+            total_capped,
+            N - 2,
+            "members past the total budget are TotalBytesCapped"
         );
     }
 
