@@ -5254,7 +5254,9 @@ field-tested.")]
         /// (deny-network, scrubbed env, resource limits, no inherited handles).
         /// Enforcing: if this host's backend cannot enforce the containment, the
         /// gateway refuses to launch the upstream rather than running it
-        /// uncontained. Default is the current uncontained spawn.
+        /// uncontained. Default is the current uncontained spawn. The `secure`
+        /// gateway profile (policy `gateway_profile: secure`) requires this
+        /// containment even without the flag.
         #[arg(long)]
         capsule: bool,
     },

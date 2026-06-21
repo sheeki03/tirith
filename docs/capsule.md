@@ -15,7 +15,7 @@ tirith itself launches, never to arbitrary shell commands.
 | --- | --- | --- | --- |
 | `tirith run` | `--capsule` | deny-all | fail closed |
 | `tirith temp-run` | `--capsule` | deny-all | best-effort (runs uncontained if no backend, and says so) |
-| `tirith gateway run` | `--capsule` | deny-all | fail closed |
+| `tirith gateway run` | `--capsule` (or the `secure` gateway profile) | deny-all | fail closed |
 | `tirith pkg install` | (always, a later milestone) | deny-all | fail closed |
 
 "Fail closed" means: if this host's backend cannot enforce the containment the
@@ -23,6 +23,16 @@ surface requires, the command refuses to run rather than running the child
 uncontained. The `temp-run` surface is the only best-effort one, because it is
 explicitly a filesystem-impact preview rather than a security boundary; with
 `--capsule` it hardens the run where it can and reports honestly when it cannot.
+
+For the gateway, containment is part of the hardened posture: when the discovered
+core policy sets `gateway_profile: secure` (the `ai-agent-heavy` posture), the
+gateway requires a contained upstream even if the operator did not pass
+`--capsule`, so a secure deployment never silently fronts an uncontained MCP
+server. The upstream is launched deny-network, with the system readable but the
+credential subtrees (`~/.aws`, `~/.ssh`, ...) still denied, and the environment
+scrubbed down to a minimal allow-list (the `TIRITH_GATEWAY_DEPTH` recursion guard
+is preserved). The flag still works on its own, so containment does not depend on
+adopting the profile.
 
 ## Backends
 

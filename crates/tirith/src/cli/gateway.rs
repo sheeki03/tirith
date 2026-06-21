@@ -25,7 +25,14 @@ use tirith_core::verdict::{Action, Finding};
 /// through [`tirith_core::mcp::output_filter::filter_tool_result`]. E5:
 /// `capsule` (opt-in, default `false`) spawns the upstream MCP server inside the
 /// OS containment capsule (deny-network), failing closed if the host backend
-/// cannot enforce it. (C5b builds out the fuller contained-launch policy.)
+/// cannot enforce it.
+///
+/// C5b — the contained-launch policy itself: the explicit
+/// [`mcp_server_capsule_spec`] (deny-network, read-the-system-but-not-the-secret
+/// -subtrees, scrub the env) and the rule that the C5a `secure` gateway profile
+/// **requires** the upstream be contained (containment is part of the hardened
+/// posture, so a secure operator who forgets `--capsule` still gets a contained
+/// upstream, or a fail-closed refusal — never a silent uncontained spawn).
 #[derive(Debug, Clone, Default)]
 pub struct GatewayOptions {
     pub filter_output: bool,
@@ -667,18 +674,33 @@ pub fn validate_config(config_path: &str) -> i32 {
     0
 }
 
-/// E5 — spawn the upstream MCP server inside the OS containment capsule with piped
-/// stdio (the gateway must read/write the child's stdio to proxy the protocol).
-/// Deny-network is the right default for an MCP server the gateway fronts; the spec
-/// scrubs the env (keeping `TIRITH_GATEWAY_DEPTH` for recursion detection), caps
-/// resources, and closes inherited handles. Enforcing surface: under degraded
-/// coverage [`crate::cli::capsule::spawn_piped`] returns `Err` and we never run the
-/// upstream uncontained. Returns the live [`Child`] for the existing bridge threads.
-fn spawn_upstream_capsuled(
-    upstream_bin: &str,
-    upstream_args: &[String],
-    depth_env: &str,
-) -> Result<Child, String> {
+/// C5b — the contained-launch POLICY for the local (upstream) MCP server.
+///
+/// E5 wired the seam (a `--capsule` flag that hands a spec to
+/// [`crate::cli::capsule::spawn_piped`] and fails closed on degraded coverage);
+/// this is the spec it hands over, lifted out of the spawn site so the policy is
+/// explicit, documented, and testable.
+///
+/// The posture for a server the gateway fronts:
+/// - **Network `DenyAll`.** The gateway is the only thing the upstream needs to
+///   talk to, and it does so over the piped stdio, not a socket. An MCP server
+///   that reaches the network on its own is exactly what containment exists to
+///   stop, so there is no allow-list here.
+/// - **Read the system, not the secrets.** Start from
+///   [`tirith_core::capsule::CapsuleSpec::locked_down`] (which seeds
+///   [`tirith_core::capsule::deny_default_paths`] into `deny_roots`) and grant
+///   read of the common runtime roots an interpreter / `node_modules` launch
+///   needs, plus the cwd. Because the deny-default credential subtrees
+///   (`~/.aws`, `~/.ssh`, ...) stay in `deny_roots`, a broad read grant never
+///   re-exposes them.
+/// - **Scrub the environment** down to a minimal allow-list, but keep
+///   `TIRITH_GATEWAY_DEPTH` so the upstream's own recursion guard still fires.
+///   The sensitive-variable strip in
+///   [`tirith_core::capsule::EnvironmentPolicy`] drops tokens even if a future
+///   allow entry named one.
+///
+/// Resource limits and handle closure come from `locked_down` unchanged.
+fn mcp_server_capsule_spec() -> tirith_core::capsule::CapsuleSpec {
     use tirith_core::capsule::CapsuleSpec;
 
     let mut spec = CapsuleSpec::locked_down();
@@ -709,6 +731,21 @@ fn spawn_upstream_capsuled(
         "TERM".to_string(),
         "TIRITH_GATEWAY_DEPTH".to_string(),
     ];
+    spec
+}
+
+/// E5 + C5b — spawn the upstream MCP server inside the OS containment capsule with
+/// piped stdio (the gateway must read/write the child's stdio to proxy the
+/// protocol), using the [`mcp_server_capsule_spec`] contained-launch policy.
+/// Enforcing surface: under degraded coverage [`crate::cli::capsule::spawn_piped`]
+/// returns `Err` and we never run the upstream uncontained. Returns the live
+/// [`Child`] for the existing bridge threads.
+fn spawn_upstream_capsuled(
+    upstream_bin: &str,
+    upstream_args: &[String],
+    depth_env: &str,
+) -> Result<Child, String> {
+    let spec = mcp_server_capsule_spec();
 
     let extra_env = vec![("TIRITH_GATEWAY_DEPTH".to_string(), depth_env.to_string())];
     match crate::cli::capsule::spawn_piped(
@@ -727,6 +764,22 @@ fn spawn_upstream_capsuled(
         }
         Err(refused) => Err(refused.reason),
     }
+}
+
+/// C5b — whether the upstream MCP server must be launched contained for this run.
+///
+/// Containment is required when the operator passes `--capsule` (E5's explicit
+/// opt-in) OR when the C5a `secure` gateway profile is active. The secure profile
+/// is the home of the hardened posture (aligned with `ai-agent-heavy`), and a
+/// gateway that *promises* a hardened posture must not silently front an
+/// uncontained MCP server: an `ai-agent-heavy` operator who runs `gateway run`
+/// but forgets `--capsule` still gets a contained upstream (or a fail-closed
+/// refusal if the host backend cannot contain it), never a quiet uncontained
+/// spawn. This mirrors cross-cutting invariant 2 (a surface that promises
+/// containment fails closed under degraded coverage). The flag still works
+/// standalone, so containment does not depend on adopting the profile.
+fn upstream_must_be_contained(capsule_flag: bool, profile: Option<GatewayProfile>) -> bool {
+    capsule_flag || matches!(profile, Some(GatewayProfile::Secure))
 }
 
 pub fn run_gateway_with_options(
@@ -788,11 +841,22 @@ pub fn run_gateway_with_options(
     eprintln!("tirith gateway: batch JSON-RPC requests are denied until batch interception is implemented");
 
     let depth_env = (depth + 1).to_string();
-    let mut child = if options.capsule {
-        // E5 — contain the upstream MCP server: deny-network, scrubbed env,
-        // resource limits, no inherited handles. Enforcing surface, so fail closed
-        // if the host backend cannot deliver the required coverage (C5b expands the
-        // policy around this; E5 wires the seam + the fail-closed gate).
+    // C5b — decide containment from the flag AND the secure profile. The flag is
+    // the explicit opt-in (E5); the secure profile (C5a) makes containment part of
+    // the hardened posture, so a secure operator who omits `--capsule` still gets a
+    // contained upstream rather than a silent uncontained spawn.
+    let contain_upstream = upstream_must_be_contained(options.capsule, gateway_profile);
+    if contain_upstream && !options.capsule {
+        eprintln!(
+            "tirith gateway: secure profile requires a contained upstream; \
+             launching the MCP server in the OS capsule (deny-network)"
+        );
+    }
+    let mut child = if contain_upstream {
+        // E5 + C5b — contain the upstream MCP server: deny-network, scrubbed env,
+        // resource limits, no inherited handles, per the contained-launch policy in
+        // `mcp_server_capsule_spec`. Enforcing surface, so fail closed if the host
+        // backend cannot deliver the required coverage.
         match spawn_upstream_capsuled(upstream_bin, upstream_args, &depth_env) {
             Ok(c) => c,
             Err(reason) => {
@@ -2795,6 +2859,143 @@ policy:
             CompiledConfig::from_config_with_profile(config, Some(GatewayProfile::Secure)).unwrap();
         assert_eq!(compiled.policy.fail_mode, "closed");
         assert_eq!(compiled.policy.warn_action, "deny");
+    }
+
+    // ---------------------------------------------------------------------
+    // C5b — contained-launch policy for the local (upstream) MCP server.
+    // ---------------------------------------------------------------------
+
+    // C5b — the contained-launch spec is deny-network. An MCP server the gateway
+    // fronts talks to the gateway over piped stdio, never a socket; a server that
+    // reaches the network on its own is exactly what containment stops.
+    #[test]
+    fn mcp_capsule_spec_denies_network() {
+        let spec = mcp_server_capsule_spec();
+        assert!(
+            spec.network.is_deny_all(),
+            "the contained MCP upstream must have no network capability"
+        );
+        // Deny-all means an enforcing surface requires raw sockets blocked and does
+        // NOT require an egress proxy (there is no allow-list to proxy).
+        let req = spec.required_coverage();
+        assert!(
+            req.network_raw_denied,
+            "raw outbound must be required-denied"
+        );
+        assert!(!req.domain_proxy_enforced, "deny-all needs no egress proxy");
+    }
+
+    // C5b — a broad read grant for the upstream must never re-expose the
+    // deny-default credential subtrees (`~/.aws`, `~/.ssh`, ...): the builder
+    // carries the deny set `CapsuleSpec::locked_down` seeds (which overrides any
+    // covering read root) and never lists a denied subtree as a read root.
+    //
+    // HOME is pinned to a known temp dir under the crate-wide `ENV_LOCK` for the
+    // whole test, so the builder's internal `deny_default_paths` (which reads
+    // HOME) is deterministic and this cannot flake on the process-wide HOME
+    // env-race that parallel tests in this workspace trip.
+    #[test]
+    fn mcp_capsule_spec_keeps_credential_subtrees_denied() {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join("tirith-c5b-home");
+        let _h = EnvGuard::set("HOME", &home);
+        // On Windows `home_dir()` reads USERPROFILE; pin it too so the test is
+        // deterministic regardless of platform.
+        let _u = EnvGuard::set("USERPROFILE", &home);
+
+        let spec = mcp_server_capsule_spec();
+
+        // The deny set is populated and matches `deny_default_paths` under the same
+        // pinned HOME (both reads happen while we hold ENV_LOCK).
+        let expected = tirith_core::capsule::deny_default_paths();
+        assert!(
+            !expected.is_empty(),
+            "with HOME pinned, the credential deny set must be populated"
+        );
+        assert_eq!(
+            spec.filesystem.deny_roots, expected,
+            "the contained MCP upstream must keep every deny-default credential subtree denied"
+        );
+        // The well-known credential stores are denied, and none is a read root.
+        for suffix in [".aws", ".ssh", ".gnupg", ".npmrc", ".pypirc"] {
+            assert!(
+                spec.filesystem
+                    .deny_roots
+                    .iter()
+                    .any(|d| d.ends_with(suffix)),
+                "credential store '{suffix}' must remain denied for the contained upstream"
+            );
+        }
+        for d in &spec.filesystem.deny_roots {
+            assert!(
+                !spec.filesystem.read_roots.contains(d),
+                "credential subtree {d:?} must not be a read root"
+            );
+        }
+    }
+
+    // C5b — the env scrub keeps only a minimal allow-list and, crucially, the
+    // recursion-detection var so the upstream's own depth guard still fires; it
+    // does not inherit the parent environment and strips sensitive variables.
+    #[test]
+    fn mcp_capsule_spec_scrubs_env_but_keeps_recursion_var() {
+        let spec = mcp_server_capsule_spec();
+        assert!(!spec.environment.inherit, "must not inherit parent env");
+        assert!(
+            spec.environment.deny_sensitive,
+            "must strip sensitive variables"
+        );
+        assert!(
+            spec.environment
+                .allow
+                .contains(&"TIRITH_GATEWAY_DEPTH".to_string()),
+            "the recursion-detection var must survive the scrub"
+        );
+        // The surviving set, computed against a parent that carries a credential,
+        // drops the credential and keeps the recursion var.
+        let surviving = spec
+            .environment
+            .surviving_vars(["TIRITH_GATEWAY_DEPTH", "AWS_SECRET_ACCESS_KEY", "PATH"].into_iter());
+        assert!(surviving.contains("TIRITH_GATEWAY_DEPTH"));
+        assert!(
+            !surviving.contains("AWS_SECRET_ACCESS_KEY"),
+            "a credential must not survive into the contained upstream"
+        );
+    }
+
+    // C5b — the `--capsule` flag forces containment regardless of profile (E5's
+    // explicit opt-in still works standalone).
+    #[test]
+    fn capsule_flag_forces_containment() {
+        assert!(upstream_must_be_contained(true, None));
+        assert!(upstream_must_be_contained(
+            true,
+            Some(GatewayProfile::Secure)
+        ));
+    }
+
+    // C5b — the secure profile REQUIRES containment even without the flag: an
+    // `ai-agent-heavy` operator who forgets `--capsule` still gets a contained
+    // upstream (or a fail-closed refusal), never a silent uncontained spawn.
+    #[test]
+    fn secure_profile_forces_containment_without_flag() {
+        assert!(
+            upstream_must_be_contained(false, Some(GatewayProfile::Secure)),
+            "secure profile must require a contained upstream even without --capsule"
+        );
+    }
+
+    // C5b — the unnamed default (no profile, no flag) does NOT force containment,
+    // preserving the historical uncontained spawn for operators who have not
+    // opted in. Containment is strictly opt-in (flag) or hardened-posture (secure).
+    #[test]
+    fn default_does_not_force_containment() {
+        assert!(
+            !upstream_must_be_contained(false, None),
+            "without the flag or the secure profile, the upstream is not forced contained"
+        );
     }
 
     // C5a — the presence-aware raw config is strict: a typo'd knob is rejected
