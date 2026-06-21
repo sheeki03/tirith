@@ -5240,8 +5240,9 @@ fn mcp_lock_writes_lockfile_for_planted_config() {
     // The lockfile records both servers, deterministically sorted by name.
     let contents = fs::read_to_string(&lock_path).unwrap();
     let lock: serde_json::Value = serde_json::from_str(&contents).expect("lockfile must be JSON");
-    // format_version 5 — folds `tools_declared` into the per-server content_hash.
-    assert_eq!(lock["format_version"], 5);
+    // format_version 6 — adds the live `tools/list` descriptor lock (captured at
+    // runtime; empty for a config-only `mcp lock`) atop v5's `tools_declared` hash.
+    assert_eq!(lock["format_version"], 6);
     let servers = lock["servers"].as_array().expect("servers array");
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0]["name"], "filesystem");
@@ -5398,10 +5399,10 @@ fn mcp_lock_does_not_leak_url_userinfo_into_committed_file() {
         !lock_text.contains("@mcp.example.com"),
         "the userinfo `@` boundary leaked into the committed mcp.lock:\n{lock_text}"
     );
-    // The schema bumped to format_version 5 (which folds `tools_declared` into the per-server
-    // content_hash); v4's URL userinfo redaction is preserved through the bump.
+    // The schema is at format_version 6 (which adds the live `tools/list` descriptor lock);
+    // v4's URL userinfo redaction is preserved through the bumps.
     let lock: serde_json::Value = serde_json::from_str(lock_text).expect("lockfile must be JSON");
-    assert_eq!(lock["format_version"], 5);
+    assert_eq!(lock["format_version"], 6);
 
     // The URL transport stores the redacted URL and carries the `userinfo_hash` field; it does
     // NOT carry a plaintext userinfo / credential / token field.
@@ -5630,7 +5631,7 @@ fn mcp_verify_json_emits_envelope() {
     assert_eq!(v["in_sync"], true);
     assert_eq!(v["drift_count"], 0);
     assert_eq!(v["command"], "tirith mcp verify");
-    assert_eq!(v["lockfile_format_version"], 5);
+    assert_eq!(v["lockfile_format_version"], 6);
 }
 
 #[test]
