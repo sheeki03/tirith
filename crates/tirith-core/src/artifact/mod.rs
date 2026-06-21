@@ -467,7 +467,11 @@ fn deserialize_ecosystem<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Ecosy
 /// The default schema version for serde, so a value written before
 /// `schema_version` existed (or one that omits it) deserializes as v1.
 fn default_schema_version() -> u32 {
-    ARTIFACT_SCHEMA_VERSION
+    // Hardcoded to 1 (the version when `schema_version` was introduced), NOT
+    // `ARTIFACT_SCHEMA_VERSION`: additive versioning means a JSON value that OMITS the
+    // field is legacy v1 data and must default to 1 even after the constant is bumped.
+    // Returning the live constant would silently relabel old data as the new version.
+    1
 }
 
 #[cfg(test)]
@@ -631,7 +635,9 @@ mod tests {
         // and `schema_version` is omitted entirely so the serde default fills it.
         let json = r#"{"subject":{"kind":"generic_archive","identity":{"filename":"x.zip","sha256":"00"}}}"#;
         let back: ArtifactInspection = serde_json::from_str(json).unwrap();
-        assert_eq!(back.schema_version, ARTIFACT_SCHEMA_VERSION);
+        // Must be the hardcoded baseline 1, NOT ARTIFACT_SCHEMA_VERSION: this locks the
+        // default so a future schema bump cannot silently relabel legacy JSON as new.
+        assert_eq!(back.schema_version, 1);
     }
 
     /// A schema_version newer than this build understands is rejected by
