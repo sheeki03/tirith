@@ -11,11 +11,14 @@
 //! The constraint evaluator here is a deliberately small, conservative subset
 //! of PEP 440: numeric release segments and the comparison operators `==`,
 //! `!=`, `<`, `<=`, `>`, `>=`. Anything outside that subset (an environment
-//! marker, an epoch, a local version, a pre/post/dev release, a wildcard, the
-//! compatible-release `~=`, or arbitrary equality `===`) deliberately fails to
-//! parse so the caller falls back to UNRESOLVED instead of guessing. A full
-//! PEP 440 solver is intentionally out of scope; the contract is "prove
-//! exclusion only when every part is understood, otherwise stay unresolved".
+//! marker, an epoch, a pre/post/dev release, a wildcard, the compatible-release
+//! `~=`, or arbitrary equality `===`) deliberately fails to parse so the caller
+//! falls back to UNRESOLVED instead of guessing. A PEP 440 LOCAL version
+//! (`1.0+ubuntu1`) is the exception: an EXACT local pin is kept as `Exact` and
+//! matched against the threat DB literally and by its base release (a local build
+//! carries the base's code); only a local inside a RANGE stays unresolved. A full
+//! PEP 440 solver is intentionally out of scope; the contract is "prove exclusion
+//! only when every part is understood, otherwise stay unresolved".
 
 /// How a package's version was expressed at the point of reference.
 ///
