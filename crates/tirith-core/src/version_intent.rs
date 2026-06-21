@@ -98,13 +98,13 @@ impl VersionIntent {
             let ver = rest.trim();
             // Only a clean exact-looking version is an Exact pin. `looks_like_plain_version`
             // rejects environment markers (`;`), arbitrary equality (`===`, which leaves a
-            // leading `=`), epochs (`!`), wildcards (`*`), and whitespace, so those fall
-            // through to a Constraint (and thus UNRESOLVED) instead of becoming a bogus
-            // Exact string that silently fails to match the DB. Prereleases (`1.0.0rc1`)
-            // are still accepted, matching the threat-DB literal/numeric compare. A PEP 440
-            // LOCAL version (`+local`) is outside the comparable subset (it can never match
-            // a base record like `1.0`), so it stays UNRESOLVED rather than a false Exact.
-            if looks_like_plain_version(ver) && !ver.contains('+') {
+            // leading `=`), epochs (`!`), wildcards (`*`), empty segments, and whitespace,
+            // so those fall through to a Constraint (and thus UNRESOLVED) instead of a bogus
+            // Exact. Prereleases (`1.0.0rc1`) AND PEP 440 local versions (`1.0+ubuntu1`) are
+            // kept Exact: `assess_package_self` matches an exact-local DB record literally
+            // and a malicious base record via its base, and `ReleaseVersion::parse` rejects
+            // locals so the numeric fallback never produces a false base match.
+            if looks_like_plain_version(ver) {
                 return VersionIntent::Exact(ver.to_string());
             }
         }
@@ -407,9 +407,9 @@ mod tests {
             VersionIntent::from_pep440_specifier("==1.0.0;python_version<\"3.9\""),
             VersionIntent::Constraint { parsed: None, .. }
         ));
-        // A PEP 440 local version, and malformed/dynamic versions with an empty
-        // segment, must NOT be Exact either (they cannot match a base DB record).
-        for spec in ["==1.0+ubuntu1", "==1.", "==1..2", "==1.+"] {
+        // Malformed/dynamic versions with an empty segment are NOT Exact (they cannot
+        // be a real pin). A `+` local version is handled separately below.
+        for spec in ["==1.", "==1..2", "==1.+"] {
             assert!(
                 matches!(
                     VersionIntent::from_pep440_specifier(spec),
@@ -418,6 +418,13 @@ mod tests {
                 "{spec} must be an unresolved Constraint, not Exact"
             );
         }
+        // A PEP 440 local version IS Exact: `assess_package_self` matches it against an
+        // exact-local DB record literally and a malicious base record via its base, so
+        // it must not be downgraded to an unresolved Constraint.
+        assert_eq!(
+            VersionIntent::from_pep440_specifier("==1.0+ubuntu1"),
+            VersionIntent::Exact("1.0+ubuntu1".to_string())
+        );
         // A clean exact pin and a prerelease pin are still Exact.
         assert_eq!(
             VersionIntent::from_pep440_specifier("==1.2.3"),
