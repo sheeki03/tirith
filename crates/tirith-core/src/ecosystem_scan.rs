@@ -2839,8 +2839,10 @@ fn scan_native_modules(
                 break;
             }
             // `symlink_metadata` does not follow the link, so a symlinked directory
-            // is seen as a symlink (we skip descending it) and a symlinked file is
-            // still read no-follow below (the opener rejects it).
+            // is seen as a symlink (is_dir() is false, so we do not descend it) and a
+            // symlinked file is seen as a symlink (is_file() is false), so it is not
+            // enqueued below and is intentionally never triaged (this avoids following
+            // a link out of the tree).
             let Ok(meta) = std::fs::symlink_metadata(&entry) else {
                 continue;
             };
