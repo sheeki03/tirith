@@ -6460,6 +6460,19 @@ Examples:
 /// main-thread stack overflows it once the CLI grows. A generous stack keeps
 /// startup safe on every platform regardless of how the command set expands.
 fn main() {
+    // Internal capsule launcher (`tirith __capsule-child ...`, Stack E unit E2)
+    // must run while the process is single-threaded: seccomp filters only the
+    // calling thread and Landlock is incompatible with thread-sync, so containment
+    // has to be applied before any worker thread exists. Intercept it HERE, before
+    // the `tirith-main` worker spawn below, and handle it on the genuinely
+    // single-threaded main thread. `run_on_main_thread` never returns on success
+    // (it `execve`s the contained target) and exits non-zero on failure; it never
+    // falls through to running the target uncontained.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if cli::capsule_child::is_invocation(&raw_args) {
+        cli::capsule_child::run_on_main_thread(&raw_args);
+    }
+
     let handle = std::thread::Builder::new()
         .name("tirith-main".to_string())
         .stack_size(16 * 1024 * 1024)

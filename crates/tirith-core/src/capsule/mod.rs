@@ -37,6 +37,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Linux runtime-containment backend (Stack E, unit E2): the
+/// `LandlockSeccompCapsule` and the internal-launcher containment primitive that
+/// applies rlimits -> `PR_SET_NO_NEW_PRIVS` -> Landlock -> seccomp -> env cleanup
+/// in a freshly-`exec`'d single-threaded child, NOT inside `pre_exec`. Gated to
+/// Linux so macOS / Windows targets compile without `landlock` / `extrasafe`.
+#[cfg(target_os = "linux")]
+pub mod linux;
+
 /// Sensitive environment variables stripped from a contained child whenever
 /// [`EnvironmentPolicy::deny_sensitive`] is set (the default).
 ///
@@ -483,6 +491,42 @@ impl CapsuleSpec {
             handles_isolated: true,
         }
     }
+
+    /// The containment level a spec asks a backend to deliver, derived purely from
+    /// its [`NetworkPolicy`]. This is the host-independent classifier the OS
+    /// backends branch on (so the decision is unit-testable on any platform, not
+    /// just where the backend compiles).
+    pub fn capability_level(&self) -> CapabilityLevel {
+        if self.network.is_deny_all() {
+            CapabilityLevel::DenyAll
+        } else {
+            CapabilityLevel::AllowListedDomains
+        }
+    }
+}
+
+/// The two containment levels an OS backend distinguishes (cross-cutting the E2-E4
+/// units). Kept platform-independent so callers and tests can reason about the
+/// level a [`CapsuleSpec`] requires without a working backend.
+///
+/// - [`DenyAll`](Self::DenyAll): no network capability at all. A Linux backend can
+///   satisfy this *natively* with Landlock filesystem confinement + a seccomp
+///   policy that grants no socket-creation syscalls, the target for
+///   `tirith pkg install` (installs never need outbound traffic).
+/// - [`AllowListedDomains`](Self::AllowListedDomains): outbound traffic only to
+///   policy domains, only through the loopback broker. Claiming this is *enforced*
+///   requires a backend that blocks every raw outbound socket except the broker
+///   (cross-cutting invariant 3). E2's Linux backend has no such verified
+///   raw-socket-blocking path yet (a complete netns+veth/slirp broker or a proven
+///   `srt`/bubblewrap launcher), so it reports this level as **degraded** and an
+///   enforcing command fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityLevel {
+    /// No network capability; satisfiable natively by an OS sandbox backend.
+    DenyAll,
+    /// Egress restricted to allow-listed domains via the broker; only honestly
+    /// enforceable behind a verified raw-socket-blocking backend.
+    AllowListedDomains,
 }
 
 /// The containment backend interface. Implemented by the OS backends (E2-E4) and
@@ -665,6 +709,25 @@ mod tests {
         let req = allow.required_coverage();
         assert!(req.domain_proxy_enforced);
         assert!(req.network_raw_denied);
+    }
+
+    #[test]
+    fn capability_level_follows_network_policy() {
+        // Deny-all network -> DenyAll level (natively satisfiable).
+        assert_eq!(
+            CapsuleSpec::locked_down().capability_level(),
+            CapabilityLevel::DenyAll
+        );
+        // An allow-list -> AllowListedDomains level (broker-only egress).
+        let mut allow = CapsuleSpec::locked_down();
+        allow.network = NetworkPolicy::AllowListedDomains {
+            domains: ["pypi.org".to_string()].into_iter().collect(),
+            ports: [443u16].into_iter().collect(),
+        };
+        assert_eq!(
+            allow.capability_level(),
+            CapabilityLevel::AllowListedDomains
+        );
     }
 
     #[test]

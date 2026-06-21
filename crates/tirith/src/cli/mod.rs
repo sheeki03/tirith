@@ -397,6 +397,7 @@ pub mod bash_capability;
 pub mod browser;
 pub mod browser_host;
 pub mod canary;
+pub mod capsule_child;
 pub mod capsule_proxy;
 pub mod check;
 pub mod checkpoint;
