@@ -419,12 +419,22 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
                 // hash a different inode. The prior read left the cursor at EOF, so
                 // rewind to the start before streaming the hash.
                 use std::io::Seek as _;
-                let sha256 = match (&file).seek(std::io::SeekFrom::Start(0)) {
+                // If the grown file is too big to even hash within budget, keep the
+                // STRONGER `HashBudgetExceeded` kind (always security-relevant) rather
+                // than collapsing it to `Oversized` with no digest. The read was capped
+                // at `MAX_FILE_SIZE + 1`, so the true size is unknown here; the hash
+                // outcome (not a size compare) is what tells us the budget was blown.
+                let (sha256, kind) = match (&file).seek(std::io::SeekFrom::Start(0)) {
                     Ok(_) => match crate::util::sha256_from_handle(file, MAX_COVERAGE_HASH_BYTES) {
-                        Ok(crate::util::HashOutcome::Digest(hex)) => Some(hex),
-                        Ok(crate::util::HashOutcome::BudgetExceeded) | Err(_) => None,
+                        Ok(crate::util::HashOutcome::Digest(hex)) => {
+                            (Some(hex), CoverageGapKind::Oversized)
+                        }
+                        Ok(crate::util::HashOutcome::BudgetExceeded) => {
+                            (None, CoverageGapKind::HashBudgetExceeded)
+                        }
+                        Err(_) => (None, CoverageGapKind::Oversized),
                     },
-                    Err(_) => None,
+                    Err(_) => (None, CoverageGapKind::Oversized),
                 };
                 eprintln!(
                     "tirith: scan: skipping {} (grew past {}B analysis limit during read)",
@@ -433,7 +443,7 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
                 );
                 return ScanFileOutcome::Skipped(CoverageGap {
                     location,
-                    kind: CoverageGapKind::Oversized,
+                    kind,
                     sha256,
                 });
             }
