@@ -92,6 +92,12 @@ pub mod correlate;
 /// cross-distribution loader/payload splits across multiple wheels.
 pub mod inspect;
 
+/// Content-addressed quarantine store for the package firewall (PR D1): land
+/// resolver downloads as immutable verified blobs and materialise per-install
+/// transaction copies, with atomic publishes, path containment, file leases, and
+/// GC. The store the D3 inspection and D4 install-from-digest stand on.
+pub mod quarantine;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.
