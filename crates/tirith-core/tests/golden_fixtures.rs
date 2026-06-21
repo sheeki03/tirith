@@ -778,6 +778,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "native_import_execution_chain",
     // B8 + DB-D artifact/member known-malicious hash match (feature-gated)
     "artifact_known_malicious",
+    // D3 package-firewall download-vs-expected hash mismatch (externally triggered)
+    "artifact_download_integrity_mismatch",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1048,6 +1050,12 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // and has no PATTERN_TABLE entry and no fixture. Covered by the feature-gated
     // `hash_lookup` tests in `artifact/correlate.rs`.
     "artifact_known_malicious",
+    // D3: `artifact_download_integrity_mismatch` is produced by the package
+    // firewall (`crate::artifact::firewall`) when a content-addressed quarantine
+    // blob no longer hashes to the resolver-pinned digest at firewall time, never
+    // from a command/paste fixture, so it has no PATTERN_TABLE entry. Covered by
+    // unit tests in `artifact/firewall.rs`.
+    "artifact_download_integrity_mismatch",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1323,6 +1331,8 @@ rule_id_variant_registry! {
     NativeImportExecutionChain,
     // Artifact/member known-malicious hash match (B8 + DB-D, feature-gated)
     ArtifactKnownMalicious,
+    // Package-firewall download-vs-expected hash mismatch (D3, externally triggered)
+    ArtifactDownloadIntegrityMismatch,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is

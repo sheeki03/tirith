@@ -491,7 +491,10 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::NativeImportExecutionChain
         // B8 + DB-D artifact/member known-malicious hash match: a structural
         // artifact finding (feature-gated), never an injection seed.
-        | RuleId::ArtifactKnownMalicious => false,
+        | RuleId::ArtifactKnownMalicious
+        // D3 package-firewall download-vs-expected hash mismatch: a structural
+        // integrity finding, never an injection seed.
+        | RuleId::ArtifactDownloadIntegrityMismatch => false,
     }
 }
 

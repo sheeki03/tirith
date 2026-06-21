@@ -343,7 +343,11 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::NativeImportExecutionChain
         // B8 + DB-D: artifact/member known-malicious hash match — a structural
         // artifact verdict (feature-gated), not a reputation/threat-intel score.
-        | RuleId::ArtifactKnownMalicious => false,
+        | RuleId::ArtifactKnownMalicious
+        // D3: package-firewall download-vs-expected hash mismatch — a structural
+        // integrity verdict (the bytes are not the approved bytes), not a
+        // reputation/threat-intel score.
+        | RuleId::ArtifactDownloadIntegrityMismatch => false,
     }
 }
 

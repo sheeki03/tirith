@@ -2794,3 +2794,15 @@ examples_good = ["a wheel whose hash and member hashes match no known-malicious 
 false_positive_guidance = "A known-malicious hash match is exact, so a false positive means the database itself is wrong; report a mistaken record to the feed maintainer rather than suppressing the rule."
 remediation = "Do not install or run the artifact. Remove it from caches and mirrors, identify how it entered the supply chain, and rotate any credentials that may have been exposed to it. Pull the dependency only from a trusted source after confirming a clean hash."
 mitre_id = "T1195"
+
+[[rule]]
+id = "artifact_download_integrity_mismatch"
+title = "A quarantined artifact no longer hashes to its approved digest"
+category = "ecosystem"
+severity_rationale = "Critical, mapping to block: the package firewall is about to inspect or install bytes that do not match the SHA-256 the resolver pinned and the quarantine recorded. The approved content is gone, so proceeding would run unapproved bytes. This is an integrity failure that fails the enforcing surface closed; it is not a heuristic and not a known-malicious reputation hit."
+description = "Produced by the package firewall, not by a pattern rule, so it has no tier-1 PATTERN_TABLE entry and is in EXTERNALLY_TRIGGERED_RULES. The firewall operates only on content-addressed quarantine blobs and re-hashes each one from a single no-follow handle immediately before evaluation (the TOCTOU re-bind required by the firewall invariant). If a blob is absent, unreadable, or hashes to anything other than the digest the resolver locked, this finding fires for that artifact and the verdict blocks. It is deliberately distinct from a known-malicious hash match: a match means the bytes are a confirmed bad artifact, while this means the bytes are not the bytes that were approved, regardless of whether the substituted content is itself flagged."
+examples_bad = ["a quarantine blob whose bytes were swapped between download and install so its re-hash differs from the resolver-pinned digest", "an approved wheel digest whose backing blob is missing or truncated at firewall time"]
+examples_good = ["a quarantined wheel whose re-hash at firewall time equals the digest the resolver pinned", "an artifact set where every blob still matches its approved hash"]
+false_positive_guidance = "A re-hash equals the approved digest unless the bytes actually changed or went missing, so a genuine match never fires this. If it fires, treat the quarantine as compromised rather than suppressing the rule: re-resolve the requirement from a trusted index to repopulate a verified blob."
+remediation = "Do not install the artifact. Discard the quarantine transaction and re-resolve the requirement so the firewall lands a freshly verified blob, then re-run the install. Investigate why the quarantined bytes changed, since a content swap inside the quarantine points at local tampering or a storage fault."
+mitre_id = "T1565"

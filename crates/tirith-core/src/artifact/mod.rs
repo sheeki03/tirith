@@ -107,6 +107,15 @@ pub mod quarantine;
 /// controlled-network step D3 inspection and D4 install-from-digest stand on.
 pub mod resolver;
 
+/// The package firewall's inspect-and-verdict layer (PR D3): re-hash each
+/// content-addressed quarantine blob (the TOCTOU re-bind), run the wheel-set
+/// inspection over the verified bytes, fold the signal/native/cross findings plus
+/// the threat-DB hash lookup through `finalize_static_verdict`, and surface a
+/// download-vs-expected hash mismatch as the Critical
+/// [`crate::verdict::RuleId::ArtifactDownloadIntegrityMismatch`]. The verdict D4
+/// install-from-digest gates on.
+pub mod firewall;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.

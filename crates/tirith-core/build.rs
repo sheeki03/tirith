@@ -1276,6 +1276,12 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     // B8 + DB-D artifact/member known-malicious hash match (feature-gated,
     // externally triggered; unreachable until the hash-lookup feature + DB land).
     ("artifact_known_malicious", "ArtifactKnownMalicious"),
+    // D3 package-firewall download-vs-expected hash mismatch (externally
+    // triggered by `artifact::firewall` re-hashing a quarantine blob; no fixture).
+    (
+        "artifact_download_integrity_mismatch",
+        "ArtifactDownloadIntegrityMismatch",
+    ),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[

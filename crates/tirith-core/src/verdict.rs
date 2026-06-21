@@ -811,6 +811,21 @@ pub enum RuleId {
     /// NO fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`. Critical severity
     /// (whence the action is Block).
     ArtifactKnownMalicious,
+    /// D3: the bytes the package firewall is about to inspect/install do NOT hash
+    /// to the digest the resolver pinned and the quarantine recorded (MITRE T1565
+    /// data manipulation). The firewall operates only on content-addressed
+    /// quarantine blobs and RE-HASHES each one immediately before evaluation
+    /// (cross-cutting invariant 4, the TOCTOU re-bind); if the on-disk blob is
+    /// absent, unreadable, or hashes to anything other than the approved digest,
+    /// the approved bytes are gone and installing would run unapproved content, so
+    /// this fires and the enforcing surface fails closed. DISTINCT from
+    /// [`Self::ArtifactKnownMalicious`], which is a POSITIVE threat-DB match on a
+    /// known-malicious hash: this is an integrity failure (the bytes are not the
+    /// approved bytes), not a reputation hit. Produced by
+    /// `crate::artifact::firewall`, not from a command/paste fixture, so it has no
+    /// PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`. Critical
+    /// severity (whence the action is Block).
+    ArtifactDownloadIntegrityMismatch,
 }
 
 impl fmt::Display for RuleId {
