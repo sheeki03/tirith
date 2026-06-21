@@ -78,8 +78,15 @@ To roll back, FIRST disable v2 publishing, then remove the published artifacts:
    queued) before step 1 still completes with `PUBLISH_V2=true` and would
    re-publish v2, silently undoing steps 3 and 4. List and cancel them first:
    `gh run list --workflow threatdb.yml --json databaseId,status --jq '.[] | select(.status=="in_progress" or .status=="queued") | .databaseId'`, then `gh run cancel <id>` for each.
-3. Delete the rolling-release v2 asset:
-   `gh release delete-asset threatdb-latest tirith-threatdb-v2-*.dat --repo <owner>/<repo>`.
+3. Delete the rolling-release v2 asset(s). The shell does NOT expand `*.dat` against a
+   remote release (no local file matches the glob), and `gh release delete-asset` takes
+   an EXACT asset name, so resolve the names first, then delete each:
+
+   ```sh
+   gh release view threatdb-latest --repo <owner>/<repo> \
+     --json assets --jq '.assets[].name | select(startswith("tirith-threatdb-v2-"))' \
+   | xargs -r -I{} gh release delete-asset threatdb-latest {} --repo <owner>/<repo> --yes
+   ```
 4. Revert `threatdb-index-v2.json` on main.
 
 New clients then fail to fetch or verify the v2 index and fall back to the legacy
