@@ -40,7 +40,7 @@ use crate::artifact::archive::{
 };
 use crate::artifact::native::triage_native;
 use crate::artifact::pth::{self, StartupHookKind};
-use crate::artifact::record::{verify_wheel_record, NormalizedInstalledPath, OwnershipIndex};
+use crate::artifact::record::verify_wheel_record;
 use crate::artifact::wheel::parse_record;
 use crate::artifact::{
     ArtifactFileKind, ArtifactInspection, ArtifactSignalKind, DistributionIdentity, EdgeConfidence,
@@ -480,25 +480,12 @@ pub fn inspect_artifact_set(paths: &[PathBuf]) -> ArtifactSetInspection {
         }
     }
 
-    // ---- Pass 2: virtual ownership map across all artifacts ------------------
-    // Each wheel's members become "installed" paths owned by that wheel's
-    // distribution identity, so a loader in wheel A that references a path owned by
-    // wheel B resolves across the set. The ownership KEY is the member path inside
-    // the wheel (the same forward-slash module path a `.pth`/import would name).
-    let mut index = OwnershipIndex::new();
-    for m in &members {
-        let Some(dist) = member_distribution_identity(m) else {
-            continue;
-        };
-        for file in &m.inspected.inspection.files {
-            if let Some(member) = &file.location.member_path {
-                index.insert(NormalizedInstalledPath::new(member), dist.clone());
-            }
-        }
-    }
-
-    // ---- Pass 3/4: resolve cross-artifact references and correlate -----------
-    let cross_findings = correlate_cross_distribution(&members, &index);
+    // ---- Resolve cross-artifact references and correlate ---------------------
+    // The cross-distribution correlation walks the members directly (every
+    // payload-shaped member of another distribution is treated as reachable when a
+    // loader searches sys.path); it does not consult an ownership map, so none is
+    // built here.
+    let cross_findings = correlate_cross_distribution(&members);
 
     ArtifactSetInspection {
         members,
@@ -534,10 +521,7 @@ fn member_distribution_identity(member: &ArtifactSetMember) -> Option<Distributi
 /// PAYLOAD owned by a DIFFERENT artifact. The finding is attached to the loader and
 /// NAMES the payload, reusing the existing startup/native RuleIds (cross-cutting
 /// invariant 1: no new RuleId for the cross-artifact context).
-fn correlate_cross_distribution(
-    members: &[ArtifactSetMember],
-    index: &OwnershipIndex,
-) -> Vec<Finding> {
+fn correlate_cross_distribution(members: &[ArtifactSetMember]) -> Vec<Finding> {
     use crate::verdict::{Evidence, RuleId, Severity};
     let mut findings: Vec<Finding> = Vec::new();
 
@@ -570,7 +554,7 @@ fn correlate_cross_distribution(
         // cross-distribution payload. To stay generic (a rename must not evade), we
         // also treat ANY payload-shaped member (a script / native / wasm) owned by
         // another distribution as reachable when the loader searches sys.path.
-        let payload_refs = resolve_cross_payloads(loader, &loader_dist, index, members);
+        let payload_refs = resolve_cross_payloads(loader, &loader_dist, members);
         if payload_refs.is_empty() {
             continue;
         }
@@ -672,7 +656,6 @@ struct CrossPayloadRef {
 fn resolve_cross_payloads(
     loader: &ArtifactSetMember,
     loader_dist: &DistributionIdentity,
-    _index: &OwnershipIndex,
     members: &[ArtifactSetMember],
 ) -> Vec<CrossPayloadRef> {
     let mut refs: Vec<CrossPayloadRef> = Vec::new();
