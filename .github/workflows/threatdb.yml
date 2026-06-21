@@ -358,6 +358,13 @@ jobs:
       # so a combined sort would misorder v2. The v1 regex excludes the v2 names
       # by requiring digits immediately after the prefix.
       - name: Prune old threatdb assets
+        # `always()`: cleanup must run even when an upstream step failed (most
+        # concretely a v2-side failure such as the version-tag preflight). Without
+        # this, a repeating v2 failure would skip every prune and let v1+v2 assets
+        # accumulate past GitHub's 2 GB/release limit, eventually blocking uploads.
+        # Pruning keeps the newest KEEP assets, so running it on a failed build is
+        # safe (nothing new to over-delete).
+        if: ${{ always() }}
         env:
           GH_TOKEN: ${{ github.token }}
           KEEP: "3"
