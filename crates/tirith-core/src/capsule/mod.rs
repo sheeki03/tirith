@@ -11,6 +11,15 @@
 //! (`tirith::cli::capsule_proxy`) because it needs `tokio`/`hyper`, and
 //! `tirith-core` stays async-free.
 //!
+//! The Windows backend (E4) is split: the portable, host-testable planning layer
+//! (the `AppContainerCapsule`, coverage derivation, the AppContainer profile /
+//! SID-name derivation, Job Object limits, ACL grants, and the assembled launch
+//! plan) lives here in [`windows`]; the `windows`-crate Win32 calls that *apply* it
+//! (`CreateAppContainerProfile`, `SetEntriesInAclW`, `STARTUPINFOEXW` +
+//! `CreateProcessW`, Job Objects) live in the CLI crate
+//! (`tirith::cli::capsule_windows`), because the `windows` crate is a CLI-crate
+//! dependency and `tirith-core` stays free of OS-API bindings.
+//!
 //! ## Containment honesty + fail-closed (cross-cutting invariant 2)
 //!
 //! A backend NEVER reports a capability it did not actually enforce.
@@ -55,6 +64,21 @@ pub mod linux;
 /// targets compile without it.
 #[cfg(target_os = "macos")]
 pub mod macos;
+
+/// Windows runtime-containment backend (Stack E, unit E4): the
+/// [`windows::AppContainerCapsule`] plus the **pure, host-testable** planning layer
+/// it hands the CLI executor — the AppContainer profile / package-SID-name
+/// derivation, the Job Object resource ceilings, the ACL grant list, and the
+/// assembled launch plan (program + `CreateProcessW` command line, `bInheritHandles
+/// = FALSE`). The `windows`-crate Win32 calls that apply the plan live in the CLI
+/// crate (`tirith::cli::capsule_windows`), so this module needs no `windows`
+/// dependency and compiles + tests on every target (the dev host as well as the
+/// Windows runner). `available_coverage` reports honest [`CapsuleCoverage`] (no
+/// AppContainer support -> degraded, never a silent NoOp success), and an
+/// allow-listed-domains spec is degraded on `domain_proxy_enforced` until E5 wires
+/// the broker. Declared unconditionally (it pulls in no OS-specific crate); the
+/// runtime probe reports support only on the `windows` target.
+pub mod windows;
 
 /// Sensitive environment variables stripped from a contained child whenever
 /// [`EnvironmentPolicy::deny_sensitive`] is set (the default).

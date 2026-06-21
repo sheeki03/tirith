@@ -399,6 +399,13 @@ pub mod browser_host;
 pub mod canary;
 pub mod capsule_child;
 pub mod capsule_proxy;
+/// Windows capsule executor (Stack E, unit E4): the `windows`-crate Win32 half that
+/// applies a `tirith_core::capsule::windows::WindowsLaunchPlan` (AppContainer +
+/// ACLs + Job Object + suspended `CreateProcessW`). `cfg(windows)`-gated so the
+/// `windows` crate is only required on the Windows target; the portable planning +
+/// honesty logic it consumes lives in `tirith-core` and is tested on every platform.
+#[cfg(windows)]
+pub mod capsule_windows;
 pub mod check;
 pub mod checkpoint;
 pub mod clipboard;
