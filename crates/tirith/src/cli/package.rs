@@ -285,8 +285,12 @@ fn print_inspect_json(
         schema_version: u32,
         action: String,
         artifacts: Vec<JsonArtifact<'a>>,
-        cross_distribution_findings: &'a [tirith_core::verdict::Finding],
         coverage_gaps: Vec<JsonGap>,
+        // The single authoritative finding list (post `action_overrides` escalation), via
+        // `set.all_findings` which already appends the cross-distribution findings. A
+        // separate raw `cross_distribution_findings` field was removed: it duplicated each
+        // cross finding here with its PRE-escalation severity, so a consumer saw the same
+        // finding twice with conflicting severities and no authoritative one.
         findings: &'a [tirith_core::verdict::Finding],
     }
     #[derive(serde::Serialize)]
@@ -318,7 +322,6 @@ fn print_inspect_json(
         schema_version: 1,
         action: format!("{:?}", verdict.action).to_lowercase(),
         artifacts,
-        cross_distribution_findings: &set.cross_findings,
         coverage_gaps: set
             .gaps
             .iter()

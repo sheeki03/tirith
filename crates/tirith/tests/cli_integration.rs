@@ -15964,23 +15964,22 @@ fn package_inspect_cross_distribution_attaches_to_loader_names_payload() {
     );
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("inspect set --format json must be valid JSON");
-    let cross = json["cross_distribution_findings"]
-        .as_array()
-        .expect("cross_distribution_findings array");
+    // The cross-distribution finding now lives in the single authoritative `findings`
+    // list (no separate, pre-escalation `cross_distribution_findings` array). Exactly one
+    // finding names BOTH the loader and the payload artifact.
+    let findings = json["findings"].as_array().expect("findings array");
+    let cross: Vec<&serde_json::Value> = findings
+        .iter()
+        .filter(|f| {
+            let s = f.to_string();
+            s.contains("loaderpkg-1.0-py3-none-any.whl")
+                && s.contains("payloadpkg-2.0-py3-none-any.whl")
+        })
+        .collect();
     assert_eq!(
         cross.len(),
         1,
-        "exactly one cross-distribution finding expected; got: {json}"
-    );
-    // The finding names BOTH the loader and the payload artifact.
-    let cross_text = cross[0].to_string();
-    assert!(
-        cross_text.contains("loaderpkg-1.0-py3-none-any.whl"),
-        "the cross finding must name the loader artifact: {cross_text}"
-    );
-    assert!(
-        cross_text.contains("payloadpkg-2.0-py3-none-any.whl"),
-        "the cross finding must name the payload artifact: {cross_text}"
+        "exactly one cross-distribution finding (naming both artifacts) expected in findings; got: {json}"
     );
 }
 
