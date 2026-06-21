@@ -137,6 +137,24 @@ jobs:
           {"version":${RUN_ID},"sha256":"$SHA","size":$SIZE,"url":"$URL","signature":"$SIG"}
           EEOF
 
+      # The v1 asset + legacy manifest publish UNCONDITIONALLY and BEFORE the v2
+      # index is generated, so a v2-side failure (the version-tag preflight, a
+      # jq/signature error) can never skip the v1 publish that old clients depend
+      # on. The v2 asset + index publish in a SEPARATE gated step further below.
+      - name: Publish release (v1 + legacy manifest)
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: threatdb-latest
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          name: "Threat DB (rolling)"
+          body: "Auto-updated threat-intelligence database (prerelease channel). Not a versioned download; tirith resolves it via the signed manifest. See #140."
+          files: |
+            tirith-threatdb-${{ github.run_id }}-${{ github.run_attempt }}.dat
+            threatdb-manifest.json
+
       # Generate + sign the multi-asset v2 index for v2-capable client discovery.
       # ADDITIVE: the legacy manifest above is untouched and keeps pointing at v1;
       # old clients only ever read it. New clients read this index, verify its
@@ -270,23 +288,6 @@ jobs:
       # the manifest is overwritten in place. The tag stays pinned where it was
       # first created (we deliberately do NOT set target_commitish).
       #
-      # The v1 asset + legacy manifest publish UNCONDITIONALLY (old clients depend
-      # on them); the v2 asset + v2 index publish in a SEPARATE gated step so the
-      # PUBLISH_V2 rollback switch can stop re-publishing v2 without affecting v1.
-      - name: Publish release (v1 + legacy manifest)
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          tag_name: threatdb-latest
-          prerelease: true
-          make_latest: false
-          overwrite_files: true
-          fail_on_unmatched_files: true
-          name: "Threat DB (rolling)"
-          body: "Auto-updated threat-intelligence database (prerelease channel). Not a versioned download; tirith resolves it via the signed manifest. See #140."
-          files: |
-            tirith-threatdb-${{ github.run_id }}-${{ github.run_attempt }}.dat
-            threatdb-manifest.json
-
       - name: Publish release (v2 asset + v2 index)
         # Gated by the PUBLISH_V2 rollback switch (DB-C runbook). When false, the
         # v2 asset and index are not uploaded; the v1 step above still ran, so old
