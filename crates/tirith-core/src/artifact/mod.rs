@@ -116,6 +116,16 @@ pub mod resolver;
 /// install-from-digest gates on.
 pub mod firewall;
 
+/// Install-from-digest planning for the package firewall (PR D4): re-bind the
+/// approval against the live threat DB immediately before launch (re-hash every
+/// quarantine blob via the firewall, reject a stale DB sequence), generate the
+/// `approved.txt` direct-reference requirements (`name @ file://... --hash=...`),
+/// the pinned `python -m pip install --isolated --no-index --no-deps
+/// --require-hashes --no-cache-dir --force-reinstall` argv, and the locked-down
+/// deny-all capsule spec. The pure planning half; the CLI crate runs the plan
+/// through the fail-closed capsule launcher (never the uncontained install runner).
+pub mod install;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.

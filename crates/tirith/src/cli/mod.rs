@@ -455,6 +455,11 @@ pub mod paste;
 pub mod path;
 pub mod pending;
 pub mod persistence;
+/// Contained install-from-digest for the package firewall (PR D4, CLI half): write
+/// the re-bound plan's `approved.txt`, build the pinned `python -m pip install`
+/// argv, and run it through the fail-closed capsule launcher (never the uncontained
+/// `ProcessInstallRunner`).
+pub mod pkg_install;
 pub mod policy;
 pub mod preview;
 pub mod prompt_status;

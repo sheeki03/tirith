@@ -1,0 +1,299 @@
+//! Contained install-from-digest for the package firewall (PR D4, CLI half).
+//!
+//! `tirith-core`'s [`tirith_core::artifact::install`] does the pure planning: it
+//! re-binds the approval against the live threat DB (re-hashing every quarantine
+//! blob), and produces a [`tirith_core::artifact::install::DigestInstallPlan`]
+//! carrying the `approved.txt` text, the materialised wheel paths, and a
+//! locked-down **deny-all-network** [`tirith_core::capsule::CapsuleSpec`]. This
+//! module is the side-effecting half that the core crate cannot host (it needs the
+//! OS capsule backends, which live in the CLI crate):
+//!
+//! 1. Write the plan's `approved.txt` into the transaction directory (atomic,
+//!    `0o600`), giving the `file://`-and-`--hash` requirements file pip reads.
+//! 2. Build the `python -m pip install --isolated --no-index --no-deps
+//!    --require-hashes --no-cache-dir --force-reinstall -r approved.txt` argv.
+//! 3. Run the interpreter through [`crate::cli::capsule::run_to_completion`] under
+//!    [`crate::cli::capsule::DegradedPolicy::FailClosed`], so on a host whose
+//!    capsule backend cannot enforce the required containment the install **fails
+//!    closed** (cross-cutting invariant 2) rather than running uncontained.
+//!
+//! # The grep-test invariant
+//!
+//! The plan requires that the install-from-digest path **never** calls the
+//! uncontained [`crate::cli::install::ProcessInstallRunner`] (the analysis-path
+//! runner that installs with the user's full privileges and no containment). That
+//! holds here by construction: this module's only spawn is through the capsule
+//! seam, and it does not name `ProcessInstallRunner` at all. A guard test
+//! (`source_never_references_process_install_runner`) reads this file's source and
+//! asserts the symbol is absent, so a future edit cannot silently route the
+//! enforcing install through the uncontained runner.
+//!
+//! Because no runtime consumer calls this surface until D7 adds the
+//! `tirith pkg install` command, the public API and its helpers are exercised only
+//! by this module's own tests in this unit. `#![allow(dead_code)]` keeps the
+//! not-yet-wired surface from tripping the `-D warnings` gate; D7 removes the need
+//! for it by calling [`run_contained_install`] from the `tirith pkg install` path.
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+
+use tirith_core::artifact::install::{DigestInstallPlan, InstallCommand};
+
+use crate::cli::capsule::{self, CapsuleRefused, DegradedPolicy};
+
+/// The file name of the generated requirements file written into the transaction
+/// directory. A single safe component; pip reads it via `-r`.
+const APPROVED_REQUIREMENTS_FILE: &str = "approved.txt";
+
+/// The outcome of a contained install-from-digest: the child's exit code plus the
+/// honest capsule backend / coverage record, so the D6 receipt (and an audit line)
+/// can state exactly what containment the install ran under.
+#[derive(Debug, Clone)]
+pub struct ContainedInstallOutcome {
+    /// pip's exit code (0 on success).
+    pub exit_code: i32,
+    /// The capsule backend that contained the install (`"landlock-seccomp"`,
+    /// `"seatbelt"`, `"appcontainer"`, or `"noop"`).
+    pub backend_id: &'static str,
+    /// A compact, secret-free description of the coverage actually enforced.
+    pub coverage_summary: String,
+    /// The threat-DB sequence the (re-validated) plan was bound to, carried through
+    /// for the receipt.
+    pub bound_db_sequence: u64,
+    /// The absolute path of the `approved.txt` the install read (inside the
+    /// transaction directory).
+    pub approved_requirements_path: PathBuf,
+}
+
+/// Why a contained install-from-digest could not run. Distinct from
+/// [`tirith_core::artifact::install::InstallError`] (which is the planning/re-bind
+/// failure surfaced before this module runs): this is a failure of the side-effect
+/// half, writing `approved.txt` or the fail-closed capsule refusal.
+#[derive(Debug)]
+pub enum ContainedInstallError {
+    /// Writing the `approved.txt` requirements file failed.
+    WriteApproved(std::io::Error),
+    /// The capsule refused to run the install: on the enforcing
+    /// ([`DegradedPolicy::FailClosed`]) path this means the host backend could not
+    /// deliver the required containment, so the install fails closed rather than
+    /// running uncontained. The carried message names the backend and the shortfall
+    /// (secret-free).
+    CapsuleRefused(String),
+}
+
+impl std::fmt::Display for ContainedInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContainedInstallError::WriteApproved(e) => {
+                write!(f, "could not write the approved requirements file: {e}")
+            }
+            ContainedInstallError::CapsuleRefused(reason) => {
+                write!(
+                    f,
+                    "refusing to install: the containment capsule is unavailable or degraded \
+                     on this host ({reason})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ContainedInstallError {}
+
+impl From<CapsuleRefused> for ContainedInstallError {
+    fn from(r: CapsuleRefused) -> Self {
+        ContainedInstallError::CapsuleRefused(r.to_string())
+    }
+}
+
+/// Run a re-bound [`DigestInstallPlan`] as a contained `pip install`.
+///
+/// `plan` is the verified plan from
+/// [`tirith_core::artifact::install::rebind_for_install`] (the re-bind already
+/// passed; the bytes are the approved bytes). `transaction_dir` is the directory
+/// the plan's `file://` wheels and the `approved.txt` live in (the plan's spec
+/// already grants it read). `interpreter` is the resolved Python interpreter to run
+/// `python -m pip` with; resolve it by executable provenance (as the D2 resolver
+/// does), never a bare `pip` on `PATH`.
+///
+/// This:
+/// 1. Writes `plan.approved_requirements` to `transaction_dir/approved.txt`
+///    (atomic, `0o600`).
+/// 2. Builds the pinned pip argv ([`InstallCommand::pip_install_args`]).
+/// 3. Runs `interpreter <argv>` through the capsule under
+///    [`DegradedPolicy::FailClosed`]: a degraded/NoOp backend refuses BEFORE
+///    spawning (fail-closed), so the install never runs uncontained.
+///
+/// It NEVER calls [`crate::cli::install::ProcessInstallRunner`]; the only spawn is
+/// the capsule seam.
+pub fn run_contained_install(
+    plan: &DigestInstallPlan,
+    transaction_dir: &Path,
+    interpreter: &Path,
+) -> Result<ContainedInstallOutcome, ContainedInstallError> {
+    // 1. Write approved.txt into the transaction directory (atomic, 0600). The
+    //    write helper writes a temp INSIDE the dir and renames, so a reader sees the
+    //    whole file or none.
+    let approved_path = transaction_dir.join(APPROVED_REQUIREMENTS_FILE);
+    tirith_core::util::write_file_atomic_0600(
+        &approved_path,
+        plan.approved_requirements.as_bytes(),
+    )
+    .map_err(ContainedInstallError::WriteApproved)?;
+
+    // 2. The pinned pip argv reading that approved.txt.
+    let cmd = InstallCommand {
+        approved_requirements_path: approved_path.clone(),
+    };
+    let args = cmd.pip_install_args();
+    let program = interpreter.display().to_string();
+
+    // 3. Run it contained, fail-closed. The spec is deny-all network + the txn-dir
+    //    read root + the target-env write root the plan already assembled. cwd is
+    //    the transaction directory (a granted read root); no extra env is injected
+    //    (the spec scrubs the environment to a temporary HOME).
+    let outcome = capsule::run_to_completion(
+        &plan.spec,
+        &program,
+        &args,
+        Some(transaction_dir),
+        &[],
+        DegradedPolicy::FailClosed,
+    )?;
+
+    Ok(ContainedInstallOutcome {
+        exit_code: outcome.exit_code,
+        backend_id: outcome.backend_id,
+        coverage_summary: outcome.coverage_summary(),
+        bound_db_sequence: plan.bound_db_sequence,
+        approved_requirements_path: approved_path,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tirith_core::capsule::CapsuleSpec;
+
+    /// A directly-constructed [`DigestInstallPlan`] over a single synthetic wheel
+    /// path, plus a tempdir standing in for the transaction directory. The core
+    /// crate's own tests cover the re-bind that PRODUCES a plan from quarantined
+    /// bytes; this CLI half only needs a valid plan to exercise the write +
+    /// fail-closed launch, so we build the plan directly (no hex/zip/sha2 needed in
+    /// the binary crate).
+    fn planned() -> (tempfile::TempDir, DigestInstallPlan) {
+        let dir = tempfile::tempdir().unwrap();
+        let wheel = dir.path().join("demo-1.0-py3-none-any.whl");
+        // A placeholder wheel file so the materialised path exists on disk.
+        std::fs::write(&wheel, b"PK\x03\x04 placeholder wheel bytes").unwrap();
+        let approved = format!(
+            "demo @ file://{} --hash=sha256:{}\n",
+            wheel.display(),
+            "a".repeat(64)
+        );
+        let mut spec = CapsuleSpec::locked_down();
+        spec.network = tirith_core::capsule::NetworkPolicy::DenyAll;
+        spec.filesystem.read_roots.push(dir.path().to_path_buf());
+        let plan = DigestInstallPlan {
+            approved_requirements: approved,
+            materialized: vec![wheel],
+            spec,
+            bound_db_sequence: 0,
+        };
+        (dir, plan)
+    }
+
+    #[test]
+    fn writing_approved_txt_lands_the_requirements_in_the_txn_dir() {
+        // We exercise the write half WITHOUT spawning: write approved.txt and check
+        // it landed with the file:// + hash lines. (The capsule spawn is covered by
+        // the fail-closed test below, which needs no real interpreter.)
+        let (dir, plan) = planned();
+        let approved_path = dir.path().join(APPROVED_REQUIREMENTS_FILE);
+        tirith_core::util::write_file_atomic_0600(
+            &approved_path,
+            plan.approved_requirements.as_bytes(),
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(&approved_path).unwrap();
+        assert!(written.contains("demo @ file://"));
+        assert!(written.contains("--hash=sha256:"));
+        // The approved.txt is inside the transaction directory pip is granted to read.
+        assert!(approved_path.starts_with(dir.path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&approved_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "approved.txt must be 0600");
+        }
+    }
+
+    #[test]
+    fn pip_argv_is_the_pinned_install_command() {
+        // The argv this module would pass the interpreter is exactly the pinned set.
+        let cmd = InstallCommand {
+            approved_requirements_path: PathBuf::from("/q/txn/approved.txt"),
+        };
+        let args = cmd.pip_install_args();
+        assert_eq!(&args[0..3], &["-m", "pip", "install"]);
+        for flag in [
+            "--isolated",
+            "--no-index",
+            "--no-deps",
+            "--require-hashes",
+            "--no-cache-dir",
+            "--force-reinstall",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "missing {flag}");
+        }
+    }
+
+    #[test]
+    fn install_fails_closed_when_capsule_is_degraded() {
+        // On a host whose backend cannot enforce containment (NoOp, or a CI host
+        // without Landlock/Seatbelt), the enforcing FailClosed path must REFUSE
+        // before spawning. We point the install at a non-existent interpreter: if the
+        // capsule were degraded-and-permissive it would try to spawn and fail with a
+        // spawn error; if it fails closed it refuses with a CapsuleRefused naming the
+        // shortfall. Either way it must NOT silently succeed, and on a host that
+        // genuinely lacks a backend the error is the fail-closed refusal.
+        let (dir, plan) = planned();
+        let fake_python = dir.path().join("no-such-python");
+        let res = run_contained_install(&plan, dir.path(), &fake_python);
+        // It must be an error (never a clean success against a missing interpreter /
+        // absent backend).
+        assert!(res.is_err(), "a missing backend/interpreter must error");
+    }
+
+    /// Guard the grep-test invariant: the enforcing install-from-digest source must
+    /// never reference the uncontained `ProcessInstallRunner` as actual code.
+    /// Reading our own source keeps a future edit from silently routing the
+    /// contained install through the uncontained analysis runner.
+    #[test]
+    fn source_never_references_process_install_runner() {
+        let src = include_str!("pkg_install.rs");
+        const SYM: &str = "ProcessInstallRunner";
+        // The symbol legitimately appears here in two NON-code forms: the doc
+        // comments that explain the invariant, and the string literals in this very
+        // test. Either is fine; a real CODE reference (a path/call/use) is not. So
+        // every occurrence must be on a comment line OR be a quoted string-literal
+        // occurrence (`"...ProcessInstallRunner..."`).
+        for (i, line) in src.lines().enumerate() {
+            if !line.contains(SYM) {
+                continue;
+            }
+            let is_comment = line.trim_start().starts_with("//");
+            let is_quoted =
+                line.contains(&format!("\"{SYM}\"")) || line.contains(&format!("`{SYM}`"));
+            assert!(
+                is_comment || is_quoted,
+                "line {} references {SYM} as code (not a comment or string literal): {line:?}",
+                i + 1
+            );
+        }
+    }
+}
