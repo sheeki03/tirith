@@ -140,6 +140,16 @@ pub enum RuleId {
     ThreatMaliciousIp,
     ThreatPackageTyposquat,
     ThreatPackageSimilarName,
+    /// A1 — the package name is in the malicious-package DB but the requested
+    /// version could not be resolved to a definite hit: an unpinned install
+    /// (`pip install foo`) of a version-specific malicious record, or a version
+    /// constraint that provably overlaps the affected versions. Distinct from
+    /// `ThreatMaliciousPackage` (a confirmed exact/all-versions hit, which still
+    /// fires and may short-circuit weaker signals); this one is Medium/Warn
+    /// because the resolver MIGHT pick an affected version. A constraint that
+    /// provably excludes every affected version does NOT fire this. Emitted by
+    /// `rules::threatintel` (command path) and `ecosystem_scan` (manifest path).
+    ThreatUnresolvedMaliciousPackage,
     // Supplemental-feed rules are defined now so RuleId stays stable.
     ThreatMaliciousUrl,
     ThreatPhishingUrl,
@@ -729,6 +739,78 @@ pub enum RuleId {
     /// recursive wipe). Build-artifact paths are excluded via
     /// `crate::util_build_dirs::is_build_artifact_path`.
     MassFileDeletion,
+    /// A2 — the scan could not fully cover a relevant file (an oversized
+    /// priority/text file, an unreadable file, an unsupported native/packaging
+    /// artifact like a `.so`/`.whl`, a file too large to even hash, or a
+    /// rule panic), so the result is NOT "complete and clean". Assembled by the
+    /// scan driver from the recorded `CoverageGap`s, NOT a fixture-driven rule,
+    /// so it lives in `EXTERNALLY_TRIGGERED_RULES`. Medium by default; High when
+    /// the gap's effective policy action is Fail (whence the action is Block).
+    AnalysisIncomplete,
+    /// B5: an installed Python distribution's integrity does not hold: a RECORD
+    /// hash mismatch, a RECORD-listed file missing, an installed file owned by no
+    /// distribution, a single path owned by two distributions, or an unowned
+    /// `sitecustomize.py`/`usercustomize.py` startup hook. Correlated from the
+    /// granular `crate::artifact::ArtifactSignalKind`s by the installed-tree scan,
+    /// NOT a command/paste fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`
+    /// with no PATTERN_TABLE entry. Medium by default (installed-environment drift
+    /// is common: conda, distro packaging, instrumentation, editable installs);
+    /// High/Critical/Block only with corroboration (a known malicious hash, an
+    /// unowned startup hook, startup execution plus an integrity mismatch, an
+    /// unowned native executable, or cross-distribution execution). A strict
+    /// integrity policy upgrades the action to Block via `action_overrides`.
+    PythonInstalledIntegrityViolation,
+    /// B6: a Python startup hook (`.pth` `import` line, Python 3.15 `.start`
+    /// entry-point file, or `sitecustomize.py`/`usercustomize.py`) executes
+    /// suspicious code at interpreter start. Correlated from the granular
+    /// `crate::artifact::ArtifactSignalKind`s by the installed-tree scan when an
+    /// executing, non-template line is paired with a danger capability (a network
+    /// download, a subprocess spawn, a `sys.path` search, obfuscated content, or an
+    /// untrusted path addition). Canonical editable-install and namespace-package
+    /// bootstraps are exempt because their COMPLETE line matches a known template.
+    /// Fires over the filesystem from `ecosystem scan --installed`, never from a
+    /// command/paste fixture, so it has no PATTERN_TABLE entry and lives in
+    /// `EXTERNALLY_TRIGGERED_RULES`. High severity (whence the action is Block).
+    PythonStartupHookSuspicious,
+    /// B6: a Python startup hook launches a DIFFERENT language runtime
+    /// (Bun/Node/Deno) at interpreter start, the cross-distribution loader/payload
+    /// split the live campaign uses to hand execution from a Python `.pth` to a
+    /// bundled JavaScript payload. The rule keys on the launched RUNTIME name, not
+    /// the payload filename, so renaming the script does not evade. Correlated from
+    /// the artifact signals by the installed-tree scan; no PATTERN_TABLE entry
+    /// (`EXTERNALLY_TRIGGERED_RULES`). Critical severity (whence the action is
+    /// Block).
+    PythonStartupHookCrossRuntime,
+    /// B7: a bundled native module (`.so`/`.dylib`/`.pyd`/`.node`) exposes a direct
+    /// EXECUTION ENTRY (a `PyInit_*` export, an ELF constructor, a Mach-O
+    /// `__mod_init_func`, or a PE TLS callback / `DllMain`) AND a DANGER CAPABILITY
+    /// (a process spawn, an external-runtime loader, a downloader/network call, or
+    /// dynamic code loading) AND CORROBORATION (an external runtime name, a sibling
+    /// script/payload reference, a sensitive credential path, or a known-malicious
+    /// indicator). The native-import trigger the live supply-chain campaign uses to
+    /// hand execution from a compiled extension to a bundled payload at import time.
+    /// The rule keys on GENERIC relationships (any sibling script, any unrelated
+    /// runtime), so renaming the payload does not evade. Correlated from the
+    /// granular `crate::artifact::ArtifactSignalKind`s by native triage over an
+    /// archive member or an installed `.so`/`.pyd`/`.dylib`, never from a
+    /// command/paste fixture, so it has no PATTERN_TABLE entry and lives in
+    /// `EXTERNALLY_TRIGGERED_RULES`. Critical severity (whence the action is Block).
+    /// Mere native-module presence yields at most an informational signal, never
+    /// this finding.
+    NativeImportExecutionChain,
+    /// B8 + DB-D: an inspected artifact (a wheel/sdist) or one of its members has a
+    /// SHA-256 that matches a KNOWN-MALICIOUS hash in the threat DB (MITRE T1195
+    /// supply-chain compromise). Emitted by `crate::artifact::evaluate_artifact`
+    /// only when the `artifact-hash-lookup` cargo feature is enabled AND the DB-B
+    /// hash-lookup methods (`ThreatDb::check_artifact_sha256` /
+    /// `check_file_sha256`) resolve a match. Those methods are the DB-B deliverable
+    /// and DO NOT EXIST YET, so this milestone ships the feature OFF by default and
+    /// the emission behind a reserved seam (see `crate::artifact::correlate`); the
+    /// RuleId is therefore UNREACHABLE until the feature + DB land. Registered now
+    /// (the registry tests must see every variant), with NO PATTERN_TABLE entry and
+    /// NO fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`. Critical severity
+    /// (whence the action is Block).
+    ArtifactKnownMalicious,
 }
 
 impl fmt::Display for RuleId {

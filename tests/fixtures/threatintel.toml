@@ -69,6 +69,40 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 
+# A1 — an unpinned install of a version-specific malicious record cannot be
+# resolved, so it warns (not blocks) and must NOT claim a confirmed exact match.
+[[fixture]]
+name = "npm_install_unpinned_malicious_warns_unresolved"
+min_milestone = 1
+input = "npm install evil-package"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["threat_unresolved_malicious_package"]
+forbidden_rules = ["threat_malicious_package"]
+
+# A1 — an npm range constraint is not in the parsed subset, so it stays
+# unresolved (warn), never a false exact match.
+[[fixture]]
+name = "npm_install_range_malicious_warns_unresolved"
+min_milestone = 1
+input = "npm install evil-package@^1.0"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["threat_unresolved_malicious_package"]
+forbidden_rules = ["threat_malicious_package"]
+
+# A1 — the unresolved warning does NOT short-circuit other signals: a co-present
+# typosquat (reacct -> react) still fires. The typosquat is High, so the verdict
+# blocks, but both rules must be present and there must be no false exact match.
+[[fixture]]
+name = "npm_install_unresolved_plus_typosquat_both_fire"
+min_milestone = 1
+input = "npm install evil-package reacct"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_unresolved_malicious_package", "threat_package_typosquat"]
+forbidden_rules = ["threat_malicious_package"]
+
 [[fixture]]
 name = "pip_install_all_versions_malicious"
 min_milestone = 1

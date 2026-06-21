@@ -55,8 +55,8 @@ pub fn enrich_command(
     let urls = extract::extract_urls(input, shell);
 
     for package in packages {
-        let effective_version = if let Some(version) = package.version.clone() {
-            Some(version)
+        let effective_version = if let Some(version) = package.version.as_version_str() {
+            Some(version.to_string())
         } else if config.deps_dev_enabled {
             resolve_default_version(package.ecosystem, &package.name, deadline)
         } else {

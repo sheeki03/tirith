@@ -421,9 +421,11 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
     let policy = crate::policy::Policy::discover(None);
 
     // Guarded: a long-lived MCP server must not crash if a rule panics on a
-    // crafted file — degrade to a tool error instead of unwinding.
+    // crafted file — degrade to a tool error instead of unwinding. A skip carries
+    // a typed coverage gap so "not scanned" is reported as a gap, never as clean.
+    use scan::{CoverageGapKind, GuardedScanOutcome, ScanFileOutcome};
     match scan::scan_single_file_guarded(&path) {
-        Ok(Some(mut result)) => {
+        GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(mut result)) => {
             crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
             let structured = json!({
                 "path": result.path.display().to_string(),
@@ -441,10 +443,16 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
                 structured_content: Some(structured),
             }
         }
-        Ok(None) => tool_error(&format!("Could not read file: {path_str}")),
-        Err(scan::RulePanic) => tool_error(&format!(
-            "Internal error scanning {path_str}: a rule panicked; file not scanned"
+        GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => tool_error(&format!(
+            "Could not analyze {path_str}: coverage gap ({})",
+            gap.kind.as_str()
         )),
+        GuardedScanOutcome::RulePanic(gap) => {
+            debug_assert_eq!(gap.kind, CoverageGapKind::Panicked);
+            tool_error(&format!(
+                "Internal error scanning {path_str}: a rule panicked; file not scanned"
+            ))
+        }
     }
 }
 
@@ -532,8 +540,9 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
 
     // scan_single_file routes through FileScan, which runs configfile rules.
     // Guarded so a crafted config can't crash the long-lived MCP server.
+    use scan::{GuardedScanOutcome, ScanFileOutcome};
     match scan::scan_single_file_guarded(&path) {
-        Ok(Some(mut result)) => {
+        GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(mut result)) => {
             crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
             let mcp_findings: Vec<_> = result
                 .findings
@@ -578,8 +587,11 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
                 structured_content: Some(structured),
             }
         }
-        Ok(None) => tool_error(&format!("Could not read file: {path_str}")),
-        Err(scan::RulePanic) => tool_error(&format!(
+        GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => tool_error(&format!(
+            "Could not analyze {path_str}: coverage gap ({})",
+            gap.kind.as_str()
+        )),
+        GuardedScanOutcome::RulePanic(_) => tool_error(&format!(
             "Internal error scanning {path_str}: a rule panicked; file not scanned"
         )),
     }

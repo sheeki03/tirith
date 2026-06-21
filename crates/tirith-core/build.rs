@@ -970,6 +970,10 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("threat_malicious_ip", "ThreatMaliciousIp"),
     ("threat_package_typosquat", "ThreatPackageTyposquat"),
     ("threat_package_similar_name", "ThreatPackageSimilarName"),
+    (
+        "threat_unresolved_malicious_package",
+        "ThreatUnresolvedMaliciousPackage",
+    ),
     // Threat intelligence — supplemental feeds
     ("threat_malicious_url", "ThreatMaliciousUrl"),
     ("threat_phishing_url", "ThreatPhishingUrl"),
@@ -1247,6 +1251,31 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ),
     ("delete_then_force_push", "DeleteThenForcePush"),
     ("mass_file_deletion", "MassFileDeletion"),
+    // A2 — scan coverage incompleteness (assembled by the scan driver).
+    ("analysis_incomplete", "AnalysisIncomplete"),
+    // B5 installed-distribution integrity (correlated by the installed-tree scan).
+    (
+        "python_installed_integrity_violation",
+        "PythonInstalledIntegrityViolation",
+    ),
+    // B6 Python startup-hook execution (correlated by the installed-tree scan).
+    (
+        "python_startup_hook_suspicious",
+        "PythonStartupHookSuspicious",
+    ),
+    (
+        "python_startup_hook_cross_runtime",
+        "PythonStartupHookCrossRuntime",
+    ),
+    // B7 native import-execution chain (correlated by native triage over an
+    // archive member or installed native module).
+    (
+        "native_import_execution_chain",
+        "NativeImportExecutionChain",
+    ),
+    // B8 + DB-D artifact/member known-malicious hash match (feature-gated,
+    // externally triggered; unreachable until the hash-lookup feature + DB land).
+    ("artifact_known_malicious", "ArtifactKnownMalicious"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -1286,6 +1315,8 @@ const VALID_CATEGORIES: &[&str] = &[
     "aifile",
     // W7: cross-event correlation rules, emitted by `correlate_session`.
     "correlation",
+    // A2: scan-coverage rules, assembled by the scan driver from coverage gaps.
+    "scan",
 ];
 
 #[derive(Deserialize)]

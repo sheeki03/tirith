@@ -80,6 +80,7 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::ThreatMaliciousIp
         | RuleId::ThreatPackageTyposquat
         | RuleId::ThreatPackageSimilarName
+        | RuleId::ThreatUnresolvedMaliciousPackage
         | RuleId::ThreatMaliciousUrl
         | RuleId::ThreatPhishingUrl
         | RuleId::ThreatTorExitNode
@@ -327,7 +328,22 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::SecretWriteThenNetwork
         | RuleId::DependencyChangeThenNetwork
         | RuleId::DeleteThenForcePush
-        | RuleId::MassFileDeletion => false,
+        | RuleId::MassFileDeletion
+        // A2: scan-coverage incompleteness, not a threat-DB indicator.
+        | RuleId::AnalysisIncomplete
+        // B5: installed-distribution integrity, correlated from artifact signals,
+        // not a threat-DB indicator.
+        | RuleId::PythonInstalledIntegrityViolation
+        // B6: Python startup-hook execution, correlated from artifact signals
+        // (structural body analysis), not a threat-DB indicator.
+        | RuleId::PythonStartupHookSuspicious
+        | RuleId::PythonStartupHookCrossRuntime
+        // B7: native import-execution chain, correlated from native-triage signals
+        // (structural object-format analysis), not a threat-DB indicator.
+        | RuleId::NativeImportExecutionChain
+        // B8 + DB-D: artifact/member known-malicious hash match — a structural
+        // artifact verdict (feature-gated), not a reputation/threat-intel score.
+        | RuleId::ArtifactKnownMalicious => false,
     }
 }
 

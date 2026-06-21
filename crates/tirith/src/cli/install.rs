@@ -674,7 +674,7 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
         .map(|p| PackageOut {
             ecosystem: p.reference.ecosystem.to_string(),
             name: &p.reference.name,
-            version: p.reference.version.as_deref(),
+            version: p.reference.version.as_version_str(),
             risk_score: p.risk.score,
             risk_level: p.risk.risk_level,
         })

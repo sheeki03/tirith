@@ -602,6 +602,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "threat_malicious_ip",
     "threat_package_typosquat",
     "threat_package_similar_name",
+    "threat_unresolved_malicious_package",
     // Threat intelligence — supplemental feeds
     "threat_malicious_url",
     "threat_phishing_url",
@@ -766,6 +767,17 @@ const ALL_RULE_IDS: &[&str] = &[
     "dependency_change_then_network",
     "delete_then_force_push",
     "mass_file_deletion",
+    // A2 — scan-coverage incompleteness (assembled by the scan driver)
+    "analysis_incomplete",
+    // B5 installed-distribution integrity (correlated by the installed-tree scan)
+    "python_installed_integrity_violation",
+    // B6 Python startup-hook execution (correlated by the installed-tree scan)
+    "python_startup_hook_suspicious",
+    "python_startup_hook_cross_runtime",
+    // B7 native import-execution chain (correlated by native triage)
+    "native_import_execution_chain",
+    // B8 + DB-D artifact/member known-malicious hash match (feature-gated)
+    "artifact_known_malicious",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -996,6 +1008,45 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "dependency_change_then_network",
     "delete_then_force_push",
     "mass_file_deletion",
+    // A2 — `analysis_incomplete` is assembled by the scan driver from recorded
+    // coverage gaps (an oversized/unreadable/unsupported/hash-budget file or a
+    // rule panic), never from a fixture input, so it has no PATTERN_TABLE entry
+    // and gets no `tests/fixtures` entry. Covered by unit tests in `scan.rs` +
+    // the `scan --ci` / `policy` CLI integration tests.
+    "analysis_incomplete",
+    // B5: `python_installed_integrity_violation` is correlated by the
+    // installed-tree scan from `crate::artifact::ArtifactSignalKind`s recorded
+    // while walking a `site-packages` tree on the filesystem (a RECORD mismatch,
+    // a missing/unlisted/duplicate-owned file, an unowned sitecustomize), never
+    // from a command/paste fixture, so it has no PATTERN_TABLE entry. Covered by
+    // unit tests in `artifact/record.rs` + `ecosystem_scan` installed-tree tests.
+    "python_installed_integrity_violation",
+    // B6: `python_startup_hook_suspicious` / `python_startup_hook_cross_runtime`
+    // are correlated by the installed-tree scan from
+    // `crate::artifact::ArtifactSignalKind`s recorded while READING a startup-hook
+    // body (`.pth`/`.start`/`sitecustomize.py`/`usercustomize.py`) on the
+    // filesystem, never from a command/paste fixture, so they have no PATTERN_TABLE
+    // entry. Covered by unit tests in `artifact/pth.rs` + the `ecosystem_scan`
+    // installed-tree startup-execution tests.
+    "python_startup_hook_suspicious",
+    "python_startup_hook_cross_runtime",
+    // B7: `native_import_execution_chain` is correlated by native triage from
+    // `crate::artifact::ArtifactSignalKind`s extracted from a native member's
+    // object-format structure (an archive member via the A4 handoff, or an
+    // installed `.so`/`.pyd`/`.dylib` walked by the installed-tree scan), never
+    // from a command/paste fixture, so it has no PATTERN_TABLE entry. Covered by
+    // unit tests in `artifact/native.rs` (the correlation matrix, a NumPy-shaped
+    // control, the malformed/streaming paths) + the `ecosystem_scan` installed
+    // native-triage test.
+    "native_import_execution_chain",
+    // B8 + DB-D: `artifact_known_malicious` is emitted by
+    // `crate::artifact::evaluate_artifact` ONLY under the `artifact-hash-lookup`
+    // cargo feature (OFF by default) once the DB-B hash-lookup methods land. The
+    // RuleId is registered now so the registry tests see every variant, but it is
+    // UNREACHABLE in the default build (no feature, no DB method), so it has no
+    // PATTERN_TABLE entry and no fixture. Covered by the feature-gated emission
+    // seam in `artifact/correlate.rs` once DB-B ships.
+    "artifact_known_malicious",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1182,6 +1233,7 @@ rule_id_variant_registry! {
     SvgExternalReference,
     // Threat intelligence — local DB
     ThreatMaliciousPackage, ThreatMaliciousIp, ThreatPackageTyposquat, ThreatPackageSimilarName,
+    ThreatUnresolvedMaliciousPackage,
     // Threat intelligence — supplemental feeds
     ThreatMaliciousUrl, ThreatPhishingUrl, ThreatTorExitNode, ThreatThreatFoxIoc,
     // Threat intelligence — real-time lookups
@@ -1260,6 +1312,16 @@ rule_id_variant_registry! {
     AiConfigHiddenInstructionAdded, AiConfigToolUseEscalation,
     // Cross-event correlation rules (W7)
     SecretWriteThenNetwork, DependencyChangeThenNetwork, DeleteThenForcePush, MassFileDeletion,
+    // Scan-coverage incompleteness (A2)
+    AnalysisIncomplete,
+    // Installed-distribution integrity (B5)
+    PythonInstalledIntegrityViolation,
+    // Python startup-hook execution (B6)
+    PythonStartupHookSuspicious, PythonStartupHookCrossRuntime,
+    // Native import-execution chain (B7)
+    NativeImportExecutionChain,
+    // Artifact/member known-malicious hash match (B8 + DB-D, feature-gated)
+    ArtifactKnownMalicious,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is
@@ -1340,6 +1402,8 @@ fn test_no_url_rules_have_no_url_fixtures() {
         // M8 ch5 — container-runtime rules fire without a URL in the input.
         "docker_run_privileged",           // docker run --privileged alpine
         "docker_run_sensitive_bind_mount", // docker run -v /var/run/docker.sock:...
+        // A1 — unpinned/constrained malicious package: npm install evil-package
+        "threat_unresolved_malicious_package",
     ]
     .into_iter()
     .collect();

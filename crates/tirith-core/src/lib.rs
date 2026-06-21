@@ -1,6 +1,7 @@
 pub mod agent_origin;
 pub mod aliases;
 pub mod approval;
+pub mod artifact;
 pub mod audit;
 pub mod audit_aggregator;
 pub mod audit_tune;
@@ -35,6 +36,7 @@ pub mod install_script_analysis;
 pub mod install_txn;
 pub mod intent;
 pub mod license;
+pub mod location;
 pub mod lsp_profiles;
 pub mod mcp;
 pub mod mcp_lock;
@@ -82,6 +84,7 @@ pub mod url_validate;
 pub mod util;
 pub mod util_build_dirs;
 pub mod verdict;
+pub mod version_intent;
 pub mod webhook;
 
 #[cfg(unix)]

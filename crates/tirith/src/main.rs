@@ -5785,6 +5785,44 @@ is assumed.")]
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Inspect exact package artifacts (wheels) or an installed environment for
+    /// startup hooks, native import chains, RECORD tampering, and
+    /// cross-distribution loader/payload splits
+    #[command(after_help = "\
+Examples:
+  tirith package inspect --artifact dist/foo-1.0-py3-none-any.whl
+  tirith package inspect --artifact a.whl --artifact b.whl
+  tirith package inspect --artifact-set ./downloaded-wheels/
+  tirith package inspect --installed ./.venv
+  tirith package inspect --format json --artifact dist/foo.whl
+
+Verdict-oriented (unlike `package risk`, which is an advisory scorer): exits
+0 when clean, 1 on a block-grade finding, 2 on an advisory (warn) finding.
+Pass two or more --artifact files (or --artifact-set <dir>) to detect a
+cross-distribution split where one wheel's startup hook executes a payload
+bundled in another. Member-qualified locations (foo.whl!/pkg/file) appear in
+--format json output. tirith never downloads an artifact; it inspects the
+bytes you point it at.")]
+    Inspect {
+        /// A wheel (.whl) artifact to inspect. Repeatable: pass two or more to
+        /// detect a cross-distribution loader/payload split across them.
+        #[arg(long, value_name = "FILE")]
+        artifact: Vec<PathBuf>,
+        /// A directory of wheels to inspect as a SET (cross-distribution
+        /// correlation across every .whl found, non-recursively).
+        #[arg(long, value_name = "DIR", conflicts_with = "installed")]
+        artifact_set: Option<PathBuf>,
+        /// An installed environment (a venv or site-packages root) to inspect for
+        /// RECORD integrity, startup hooks, and native import chains.
+        #[arg(long, value_name = "DIR", conflicts_with = "artifact_set")]
+        installed: Option<PathBuf>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7155,6 +7193,21 @@ fn run() {
                     offline,
                     max_installed_entries,
                     non_interactive,
+                    json,
+                )
+            }
+            PackageAction::Inspect {
+                artifact,
+                artifact_set,
+                installed,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::package::inspect(
+                    &artifact,
+                    artifact_set.as_deref(),
+                    installed.as_deref(),
                     json,
                 )
             }

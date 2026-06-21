@@ -820,7 +820,14 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "ignore_patterns",
         "fail_on",
         "profiles",
+        // A2 coverage keys.
+        "require_complete",
+        "oversized_file_action",
+        "unreadable_file_action",
+        "unsupported_artifact_action",
     ];
+    // A2 — valid `GapAction` string values for the `scan.*_action` keys.
+    let known_gap_actions = ["ignore", "warn", "fail"];
     let known_checkpoint_fields = ["max_count", "max_age_hours", "max_storage_bytes"];
     // PR #121 fix-list item 10 — the `allow`/`deny` children were never
     // validated, so `agent_rules: { denyy: [...] }` passed silently and the
@@ -886,6 +893,54 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
                                             }
                                         }
                                     }
+                                }
+
+                                // A2 — validate the coverage gap-action VALUES so a
+                                // typo (`oversized_file_action: warnn`) is caught
+                                // instead of silently parsing to the serde default.
+                                if matches!(
+                                    sk.as_str(),
+                                    "oversized_file_action"
+                                        | "unreadable_file_action"
+                                        | "unsupported_artifact_action"
+                                ) {
+                                    if let serde_yaml::Value::String(av) = sub_val {
+                                        // Exact-match the lowercase wire contract: the
+                                        // serde layer is `rename_all = "lowercase"`, so
+                                        // `Warn`/`FAIL` would be REJECTED at load. Do not
+                                        // `to_lowercase()` here, or the validator would
+                                        // green-light a value that deserialization refuses.
+                                        if !known_gap_actions.contains(&av.as_str()) {
+                                            issues.push(PolicyIssue {
+                                                level: IssueLevel::Error,
+                                                message: format!(
+                                                    "scan.{sk}: invalid action '{av}' (valid: ignore, warn, fail)"
+                                                ),
+                                                field: Some(format!("scan.{sk}")),
+                                            });
+                                        }
+                                    } else {
+                                        issues.push(PolicyIssue {
+                                            level: IssueLevel::Error,
+                                            message: format!(
+                                                "scan.{sk}: must be a string (ignore, warn, fail)"
+                                            ),
+                                            field: Some(format!("scan.{sk}")),
+                                        });
+                                    }
+                                }
+
+                                // A2 — `require_complete` must be a boolean.
+                                if sk == "require_complete"
+                                    && !matches!(sub_val, serde_yaml::Value::Bool(_))
+                                {
+                                    issues.push(PolicyIssue {
+                                        level: IssueLevel::Error,
+                                        message:
+                                            "scan.require_complete: must be a boolean (true/false)"
+                                                .to_string(),
+                                        field: Some("scan.require_complete".into()),
+                                    });
                                 }
                             }
                         }
@@ -1023,6 +1078,74 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].level, IssueLevel::Error);
         assert!(issues[0].message.contains("YAML parse error"));
+    }
+
+    /// T2.10: the gap-action validator matches the LOWERCASE serde wire contract
+    /// exactly (`#[serde(rename_all = "lowercase")]`), so a mixed-case `Warn` /
+    /// `FAIL` is rejected. End-to-end through `validate()` the strict typed parse
+    /// rejects it first; the text field-walker (`validate_unknown_fields`) is the
+    /// belt-and-suspenders that MUST agree, so it is exercised directly here to
+    /// prove the exact-match (no `to_lowercase()`) fix.
+    #[test]
+    fn gap_action_rejects_mixed_case_in_policy_validate() {
+        for v in ["Warn", "FAIL"] {
+            let yaml = format!("scan:\n  oversized_file_action: {v}\n");
+
+            // End-to-end: a mixed-case action is an Error (the wire contract
+            // refuses it, here at the strict typed parse).
+            let issues = validate(&yaml);
+            assert!(
+                issues.iter().any(|i| i.level == IssueLevel::Error),
+                "mixed-case action '{v}' must be rejected by validate(): {issues:?}"
+            );
+
+            // The text field-walker, exercised on its own, must ALSO flag the
+            // mixed-case value with the invalid-action error (it no longer
+            // lowercases the value, so it cannot green-light what serde refuses).
+            let mut walker_issues = Vec::new();
+            validate_unknown_fields(&yaml, &mut walker_issues);
+            assert!(
+                walker_issues.iter().any(|i| i.level == IssueLevel::Error
+                    && i.message.contains("invalid action")
+                    && i.message.contains(v)),
+                "the field-walker must flag mixed-case '{v}' as an invalid action: {walker_issues:?}"
+            );
+        }
+    }
+
+    /// T2.10: a lowercase `warn` / `fail` is accepted by the validator (no error
+    /// from `validate()` and no invalid-action error from the field-walker) AND
+    /// round-trips through serde, matching the wire contract.
+    #[test]
+    fn gap_action_lowercase_validates_and_round_trips() {
+        for v in ["warn", "fail", "ignore"] {
+            let yaml = format!("scan:\n  oversized_file_action: {v}\n");
+
+            // No validation error at all for a valid lowercase action.
+            let issues = validate(&yaml);
+            assert!(
+                issues.iter().all(|i| i.level != IssueLevel::Error),
+                "lowercase action '{v}' must validate cleanly: {issues:?}"
+            );
+
+            // The field-walker raises no invalid-action error for the valid value.
+            let mut walker_issues = Vec::new();
+            validate_unknown_fields(&yaml, &mut walker_issues);
+            assert!(
+                !walker_issues
+                    .iter()
+                    .any(|i| i.message.contains("invalid action")),
+                "the field-walker must accept lowercase '{v}': {walker_issues:?}"
+            );
+
+            // And it round-trips through the strict typed parse (the wire layer).
+            let parsed: Result<crate::policy::Policy, _> = serde_yaml::from_str(&yaml);
+            assert!(
+                parsed.is_ok(),
+                "lowercase action '{v}' must deserialize: {:?}",
+                parsed.err()
+            );
+        }
     }
 
     #[test]

