@@ -233,13 +233,19 @@ pub fn run(
     let coverage_findings =
         scan::build_analysis_incomplete_findings_located(&result.coverage_gaps, &policy);
     for (location, finding) in coverage_findings {
-        // The gap's most relevant on-disk path (outer container, else installed),
-        // mirroring `CoverageGap::primary_path`; the scan root when neither exists.
-        let path = location
-            .outer_path
-            .clone()
-            .or_else(|| location.installed_path.clone())
-            .unwrap_or_else(|| config.path.clone());
+        // Preserve the gap's member-qualified location (`outer.whl!/member`) so the
+        // synthetic finding attributes to the exact member, not just the outer
+        // container; the rendered form matches the coverage gap's own location. A
+        // non-member gap keeps its real on-disk path (outer, else installed, else root).
+        let path = if location.member_path.is_some() {
+            PathBuf::from(location.to_string())
+        } else {
+            location
+                .outer_path
+                .clone()
+                .or_else(|| location.installed_path.clone())
+                .unwrap_or_else(|| config.path.clone())
+        };
         result.file_results.push(scan::FileScanResult {
             path,
             findings: vec![finding],
@@ -377,27 +383,30 @@ fn run_single_file(
         .map(|p| p.display().to_string());
     let policy = Policy::discover(cwd.as_deref());
 
-    let (mut result, coverage_gaps): (FileScanResult, Vec<CoverageGap>) =
-        match scan::scan_single_file_guarded(&path) {
-            GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(r)) => (r, Vec::new()),
-            GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap))
-            | GuardedScanOutcome::RulePanic(gap) => {
-                // No analyzed content: synthesize a result carrying only the
-                // driver-assembled `AnalysisIncomplete` findings (if the gap is
-                // security-relevant and not policy-ignored) so the gap surfaces in
-                // every output and the exit code.
-                let findings =
-                    scan::build_analysis_incomplete_findings(std::slice::from_ref(&gap), &policy);
-                (
-                    FileScanResult {
-                        path: path.clone(),
-                        findings,
-                        is_config_file: false,
-                    },
-                    vec![gap],
-                )
-            }
-        };
+    let outcome = scan::scan_single_file_guarded(&path);
+    // A RulePanic must fail `--ci` UNCONDITIONALLY (matching the directory path), so
+    // capture it before the outcome is consumed by the match below.
+    let was_panic = matches!(outcome, GuardedScanOutcome::RulePanic(_));
+    let (mut result, coverage_gaps): (FileScanResult, Vec<CoverageGap>) = match outcome {
+        GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(r)) => (r, Vec::new()),
+        GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap))
+        | GuardedScanOutcome::RulePanic(gap) => {
+            // No analyzed content: synthesize a result carrying only the
+            // driver-assembled `AnalysisIncomplete` findings (if the gap is
+            // security-relevant and not policy-ignored) so the gap surfaces in
+            // every output and the exit code.
+            let findings =
+                scan::build_analysis_incomplete_findings(std::slice::from_ref(&gap), &policy);
+            (
+                FileScanResult {
+                    path: path.clone(),
+                    findings,
+                    is_config_file: false,
+                },
+                vec![gap],
+            )
+        }
+    };
     if !rule_overlay.is_empty() {
         result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
     }
@@ -419,7 +428,7 @@ fn run_single_file(
 
     // CI fail-closed on incompleteness: a security-relevant gap under
     // `require_complete`, or any gap whose effective action is Fail.
-    let ci_coverage_fail = ci && coverage_requires_failure(&coverage_gaps, &policy);
+    let ci_coverage_fail = ci && (was_panic || coverage_requires_failure(&coverage_gaps, &policy));
 
     if result.findings.iter().any(|f| f.severity >= fail_on) || ci_coverage_fail {
         1
