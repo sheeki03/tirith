@@ -96,7 +96,13 @@ impl VersionIntent {
         // which already returns Exact for prerelease tails.
         if let Some(rest) = trimmed.strip_prefix("==") {
             let ver = rest.trim();
-            if !ver.is_empty() && !ver.contains(',') && !ver.contains('*') {
+            // Only a clean exact-looking version is an Exact pin. `looks_like_plain_version`
+            // rejects environment markers (`;`), arbitrary equality (`===`, which leaves a
+            // leading `=`), epochs (`!`), wildcards (`*`), and whitespace, so those fall
+            // through to a Constraint (and thus UNRESOLVED) instead of becoming a bogus
+            // Exact string that silently fails to match the DB. Prereleases (`1.0.0rc1`)
+            // are still accepted, matching the threat-DB literal/numeric compare.
+            if looks_like_plain_version(ver) {
                 return VersionIntent::Exact(ver.to_string());
             }
         }
@@ -380,6 +386,30 @@ mod tests {
             }
             other => panic!("expected unresolved Constraint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pep440_arbitrary_equality_and_markers_are_not_exact() {
+        // `===1.0` (arbitrary equality, leaves a leading `=`) and a marker-qualified
+        // pin must NOT become a bogus Exact; they fall through to an unresolved
+        // Constraint per the conservative subset.
+        assert!(matches!(
+            VersionIntent::from_pep440_specifier("===1.0"),
+            VersionIntent::Constraint { parsed: None, .. }
+        ));
+        assert!(matches!(
+            VersionIntent::from_pep440_specifier("==1.0.0;python_version<\"3.9\""),
+            VersionIntent::Constraint { parsed: None, .. }
+        ));
+        // A clean exact pin and a prerelease pin are still Exact.
+        assert_eq!(
+            VersionIntent::from_pep440_specifier("==1.2.3"),
+            VersionIntent::Exact("1.2.3".to_string())
+        );
+        assert_eq!(
+            VersionIntent::from_pep440_specifier("==1.0.0rc1"),
+            VersionIntent::Exact("1.0.0rc1".to_string())
+        );
     }
 
     #[test]
