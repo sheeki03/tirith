@@ -603,17 +603,17 @@ pub fn read_wheel<R: Read + Seek>(
                     total_uncompressed = total_uncompressed.saturating_add(view_consumed);
                     if let Some(h) = handoff {
                         visitor.on_native_member(h);
-                        // Mirror the declared-oversized path: a Streaming handoff means
-                        // this native member was analyzed via a bounded VIEW, not buffered.
-                        // Record NativeTruncated so a downstream consumer (B8) can tell
-                        // which native members got streaming analysis, regardless of which
-                        // arm produced the handoff.
-                        inspection.coverage.gaps.push(CoverageGap {
-                            location: location.clone(),
-                            kind: CoverageGapKind::NativeTruncated,
-                            sha256: None,
-                        });
                     }
+                    // NativeTruncated UNCONDITIONALLY, matching the declared-oversized
+                    // path: a native member reaching this arm was truncated whether or not
+                    // a streaming handoff was produced (handoff is None when the total
+                    // budget is already exhausted). A B8 consumer enumerating
+                    // NativeTruncated gaps must see EVERY under-analyzed native module.
+                    inspection.coverage.gaps.push(CoverageGap {
+                        location: location.clone(),
+                        kind: CoverageGapKind::NativeTruncated,
+                        sha256: None,
+                    });
                 }
                 if total_uncompressed >= limits.max_total_uncompressed {
                     total_budget_hit = true;
