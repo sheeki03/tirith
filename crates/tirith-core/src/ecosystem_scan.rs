@@ -2755,6 +2755,17 @@ fn collect_installed_integrity(root: &Path) -> InstalledIntegrityReport {
         for (dist_info, identity) in &dist_infos {
             let result = verify_installed_record(dist_info, &layout, identity, false);
             report.distributions_checked += 1;
+            // An externally-managed distribution (conda / distro-packaged) legitimately
+            // diverges from its RECORD (post-install patching), and its integrity is owned
+            // by that package manager, not pip's RECORD. Per `externally_managed`'s
+            // documented purpose ("avoid over-flagging"), it does NOT feed the integrity
+            // violation - otherwise a clean conda env would fire
+            // PythonInstalledIntegrityViolation (and Block under a strict action policy).
+            // The strong corroborator (an UNOWNED startup hook) is collected separately,
+            // so a genuinely-tampered managed package is still caught by that High signal.
+            if result.externally_managed {
+                continue;
+            }
             if result.record_missing {
                 report.records_missing += 1;
             }
@@ -5409,6 +5420,30 @@ version = "1.0.61"
         );
         let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
         assert!(!rules.contains(&RuleId::PythonInstalledIntegrityViolation));
+    }
+
+    #[test]
+    fn integrity_externally_managed_mismatch_does_not_violate() {
+        // A conda/distro package whose installed bytes DIVERGE from its RECORD (the real
+        // post-install-patching case, not just empty/unverifiable hashes) must NOT fire
+        // the integrity violation: its integrity is owned by that package manager, per
+        // the `externally_managed` flag.
+        let dir = tempfile::tempdir().unwrap();
+        plant_installed_dist(
+            dir.path(),
+            "patchedpkg",
+            "2.0",
+            &[("patchedpkg/__init__.py", b"# patched\n")],
+            false, // RECORD hashes DIVERGE from the installed bytes
+            &[("INSTALLER", b"conda\n")],
+        );
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "an externally-managed package's RECORD divergence must not fire a violation"
+        );
+        assert_ne!(report.verdict.action, Action::Block);
     }
 
     #[test]
