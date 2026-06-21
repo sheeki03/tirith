@@ -447,6 +447,22 @@ fn normalize_for_template(line: &str) -> String {
     out
 }
 
+/// `true` if the body carries a dynamic CODE-EXECUTION capability OTHER than a bare
+/// `__import__`. The canonical distutils and namespace bootstraps legitimately use
+/// `__import__(...)` (for `_distutils_hack` / importlib), so it is NOT disqualifying;
+/// but an injected `exec(`/`eval(`/`compile(`/deserializer sandwiched between a
+/// template's required prefix and suffix is a trojaned payload, not a benign template.
+/// Computed over the deobfuscated haystacks, like `scan_capabilities`.
+fn has_injected_code_exec(line: &str) -> bool {
+    let haystacks = capability_haystacks(line);
+    let tokens: Vec<&str> = DYNAMIC_EXEC_TOKENS
+        .iter()
+        .copied()
+        .filter(|t| *t != "__import__")
+        .collect();
+    any_contains(&haystacks, &tokens)
+}
+
 /// `true` if the COMPLETE normalized line matches a canonical benign bootstrap.
 ///
 /// These are real setuptools / editable-install / namespace-package one-liners
@@ -475,7 +491,8 @@ fn is_benign_template(line: &str) -> bool {
         // alone is bypassable, e.g. `import os; os.system('curl|sh'); __import__(
         // '_distutils_hack').add_shim()`, so a payload capability disqualifies it.
         let caps = scan_capabilities(line);
-        if !caps.subprocess && !caps.network && !caps.cross_runtime {
+        if !caps.subprocess && !caps.network && !caps.cross_runtime && !has_injected_code_exec(line)
+        {
             return true;
         }
     }
@@ -496,7 +513,11 @@ fn is_benign_template(line: &str) -> bool {
                 // Defense in depth (mirrors the namespace template): a payload
                 // capability disqualifies the line even when the shape matches.
                 let caps = scan_capabilities(line);
-                if !caps.subprocess && !caps.network && !caps.cross_runtime {
+                if !caps.subprocess
+                    && !caps.network
+                    && !caps.cross_runtime
+                    && !has_injected_code_exec(line)
+                {
                     return true;
                 }
             }
@@ -520,7 +541,8 @@ fn is_benign_template(line: &str) -> bool {
         // cross-runtime launch means the template was trojaned, so fall through and
         // analyze it on its merits.
         let caps = scan_capabilities(line);
-        if !caps.subprocess && !caps.network && !caps.cross_runtime {
+        if !caps.subprocess && !caps.network && !caps.cross_runtime && !has_injected_code_exec(line)
+        {
             return true;
         }
     }
@@ -971,6 +993,28 @@ mod tests {
         // The canonical (payload-free) shim is still recognized as benign.
         let canonical = "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim()";
         assert!(is_benign_template(canonical));
+    }
+
+    #[test]
+    fn injected_dynamic_exec_breaks_benign_template() {
+        // `exec(`/`eval(`/`compile(` sandwiched between a template's prefix and suffix
+        // is a trojaned payload. The `__import__` the templates legitimately use must
+        // NOT be what gates them, or the hook is fully evasible (Greptile).
+        let distutils_exec =
+            "import os; exec(open('/tmp/stage2').read()); __import__('_distutils_hack').add_shim()";
+        assert!(
+            !is_benign_template(distutils_exec),
+            "a distutils shim carrying exec() must not be benign"
+        );
+        let namespace_eval = "import sys, types, os; eval(compile('x','<s>','exec')); has_mfs = sys.version_info > (3, 5); importlib = has_mfs and __import__('importlib.util'); m = has_mfs and sys.modules.setdefault('ns', types.ModuleType('ns'))";
+        assert!(
+            !is_benign_template(namespace_eval),
+            "a namespace bootstrap carrying eval()/compile() must not be benign"
+        );
+        // The canonical distutils + namespace templates legitimately use `__import__`
+        // and must stay benign (no regression from the dynamic-exec guard).
+        let canonical_distutils = "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim()";
+        assert!(is_benign_template(canonical_distutils));
     }
 
     #[test]
