@@ -28,7 +28,7 @@ the clients that cannot still have v1.
 
 These are implemented in DB-B and are what make the staged rollout safe:
 
-- **Range-accepting reader.** `from_bytes` accepts `MIN_SUPPORTED_FORMAT_VERSION (1)` through `FORMAT_VERSION (2)`. A v1 file loads with every v2 lookup returning `None` (behaves exactly like today); a v2 file loads on the new binary; an old (v1-only) binary rejects a v2 file and fails closed for that file.
+- **Range-accepting reader.** `from_bytes` accepts `MIN_SUPPORTED_FORMAT_VERSION (1)` through `FORMAT_VERSION (2)`. A v1 file loads with every v2 lookup returning `None` (behaves exactly like today); a v2 file loads on the new binary; an old (v1-only) binary rejects a v2 file with `InvalidVersion`. The per-format cache filenames (next point) mean an old binary never loads a v2 file in the first place, and the staged publish order keeps v2 off the wire until v2-capable clients are widely deployed. If an old binary ever did read a v2 file, that rejection is fail-OPEN for that file's detections (per the fail-open note in the intro), not fail-safe, which is exactly why the per-format split below exists.
 - **Per-format local cache filenames.** v1 keeps the canonical `tirith-threatdb.dat`; the new updater writes v2 to a distinct `tirith-threatdb-v2.dat` and never clobbers the v1 path. The loader prefers `tirith-threatdb-v2.dat` when present, parseable, and signature-valid (the primary resolver requires a valid signature, see the unsigned-v2 point below), else falls back to `tirith-threatdb.dat`. So a co-located old binary still reads its own v1 file and is never fail-opened by a shared cache. The same split applies to the supplemental DB.
 - **Dual manifests.** Old clients keep verifying the legacy single-asset `threatdb-manifest.json` (`{sha256,size,url,version}` + detached signature), which keeps pointing at v1. New clients read a separate signed multi-asset `threatdb-index-v2.json` and select the highest `format <= MAX_FORMAT_VERSION` whose `min_tirith_version` is satisfied and whose asset hash verifies, falling back to the legacy manifest on any failure. So an old client only ever sees v1.
 - **Signature and rollback preserved.** All v2 bytes (sections + descriptor trailer + the fixed EOF footer) live after `HEADER_SIZE`, so the existing Ed25519 signature and the rollback `build_sequence` cover them with no change to the signed range. A malformed v2 footer or trailer is rejected (`InvalidTrailer`), fail-closed for v2 data.
@@ -48,6 +48,14 @@ non-telemetry signals only:
 There is no fixed adoption percentage baked into code; the cutover is a human
 decision made against the signals above.
 
+Before publishing, the release operator confirms the v2 floor matches a real
+release: the `min_tirith_version` set on the v2 index (the workflow's
+`V2_MIN_VERSION`) must equal the tag of the release that first carried the v1+v2
+reader, so the index never gates v2 behind a version no client can satisfy. DB-D
+enforces this in the workflow with a preflight check
+(`git tag -l "v${V2_MIN_VERSION}" | grep -q .`); the operator confirms that tag
+exists before flipping the publish gate.
+
 ## Phase 4 publish and rollback
 
 When the gate is met, DB-D adds the v2 publish step to the release workflow: it
@@ -65,15 +73,24 @@ To roll back, FIRST disable v2 publishing, then remove the published artifacts:
 1. Set the repository variable `PUBLISH_V2` to `false` (Settings, then Secrets and
    variables, then Actions, then Variables). DB-D gates the v2 generate, publish,
    and commit steps on this variable, so the next cron run stops re-publishing.
-2. Delete the rolling-release v2 asset:
+2. Cancel any in-progress or queued release/cron runs. GitHub Actions reads
+   repository variables at job-dispatch time, so a run already dispatched (or
+   queued) before step 1 still completes with `PUBLISH_V2=true` and would
+   re-publish v2, silently undoing steps 3 and 4. List and cancel them first:
+   `gh run list --workflow threatdb.yml --json databaseId,status --jq '.[] | select(.status=="in_progress" or .status=="queued") | .databaseId'`, then `gh run cancel <id>` for each.
+3. Delete the rolling-release v2 asset:
    `gh release delete-asset threatdb-latest tirith-threatdb-v2-*.dat --repo <owner>/<repo>`.
-3. Revert `threatdb-index-v2.json` on main.
+4. Revert `threatdb-index-v2.json` on main.
 
 New clients then fail to fetch or verify the v2 index and fall back to the legacy
 manifest and v1. The v1 asset and the legacy manifest are kept through the entire
 migration window, so v1 is always available. Until step 1, the next scheduled cron
 re-publishes v2, so the `PUBLISH_V2` gate (not the revert) is what actually holds
-the rollback.
+the rollback. Clients that already cached `tirith-threatdb-v2.dat` keep reading it
+from disk (the loader prefers the local v2 file, independent of the manifest) until
+their next successful update overwrites it from the rolled-back feed. Because v1 and
+the legacy manifest stay published throughout, that next update cycle rewrites the
+cached v2 file from v1-only inputs, so there is no separate client-side purge step.
 
 ## After both stacks merge: activate exact-hash blocking
 
