@@ -221,10 +221,11 @@ pub fn run(
     // gap path) so it flows through the existing JSON/SARIF/human emitters and is
     // counted by `total_findings` / `has_findings_at_or_above`. Done BEFORE the
     // exit decision so a Fail-action gap can drive a non-zero code.
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
-    let policy = Policy::discover(cwd.as_deref());
+    // Discover policy from the SCAN TARGET (not the caller's cwd) so scanning another
+    // tree applies THAT tree's repo policy to the AnalysisIncomplete synthesis and CI
+    // coverage decision, consistent with the engine's own discovery.
+    let scan_root = config.path.display().to_string();
+    let policy = Policy::discover(Some(&scan_root));
     // Each finding is paired with the EXACT `SubjectLocation` of its gap, so the
     // file entry resolves to that gap's own path by exact equality. Matching back
     // by a substring of the finding's description is WRONG: one gap's location can
@@ -378,10 +379,13 @@ fn run_single_file(
     // unsupported artifact / hash-budget) or a rule panic carries a reason into
     // the JSON/SARIF/exit path instead of being read as "clean".
     use scan::{CoverageGap, FileScanResult, GuardedScanOutcome, ScanFileOutcome};
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
-    let policy = Policy::discover(cwd.as_deref());
+    // Discover policy from the scanned FILE's directory (not the caller's cwd) so a
+    // single-file scan applies that file's repo policy, consistent with a directory scan.
+    let file_dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.display().to_string(),
+        _ => ".".to_string(),
+    };
+    let policy = Policy::discover(Some(&file_dir));
 
     let outcome = scan::scan_single_file_guarded(&path);
     // A RulePanic must fail `--ci` UNCONDITIONALLY (matching the directory path), so
