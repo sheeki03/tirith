@@ -384,21 +384,17 @@ fn ossf_confidence(id: &str, entry_type: Option<&str>) -> Confidence {
         Some("MALWARE") => Confidence::Confirmed,
         Some("POTENTIALLY_UNWANTED") => Confidence::Medium,
         Some(other) => {
-            // An OpenSSF type we do not recognize: surface it (the feed may have
-            // grown a new value worth handling) rather than silently swallowing it.
-            // A MAL-* id is still a confirmed-malicious record regardless of an
-            // unknown type, so it stays Confirmed; an unknown type on a non-MAL id
-            // is the borderline default.
-            let is_mal = id.starts_with("MAL-");
+            // An OpenSSF type we do not recognize: surface it (the feed may have grown a
+            // new value worth handling) rather than silently swallowing it. The type is
+            // PRESENT, so the `MAL-` id promotion does NOT apply here - that is reserved
+            // for TYPELESS records (the `None` arm below). Promoting a MAL- id with an
+            // explicit-but-unrecognized type would break precedence and could turn a
+            // future explicit LOWER-confidence type into Confirmed. An unrecognized
+            // explicit type is the borderline default.
             eprintln!(
-                "  warning: unrecognized OpenSSF database_specific type {other:?} for {id}, defaulting to {}",
-                if is_mal { "Confirmed (MAL- id)" } else { "Medium" }
+                "  warning: unrecognized OpenSSF database_specific type {other:?} for {id}, defaulting to Medium"
             );
-            if is_mal {
-                Confidence::Confirmed
-            } else {
-                Confidence::Medium
-            }
+            Confidence::Medium
         }
         None if id.starts_with("MAL-") => Confidence::Confirmed,
         None => Confidence::Medium, // No type and not a MAL- id: borderline default.
