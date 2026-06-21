@@ -206,13 +206,12 @@ fn normalize_name(eco: Ecosystem, name: &str) -> String {
 /// OSV records are extensible, so every struct here uses `#[serde(default)]`
 /// and tolerates unknown fields. The shapes below were derived from real
 /// `MAL-*` records fetched from the OSV API (see the vendored fixtures in
-/// `tests/fixtures` exercised by `test_parse_real_ossf_record_indicators`):
+/// `src/bin/fixtures` exercised by `test_parse_real_ossf_record_indicators`):
 /// indicators live in the entry-level `database_specific.iocs` and
 /// `database_specific.malicious-packages-origins`, NOT under
 /// `affected[].database_specific`. The affected-level `database_specific`
 /// carries provenance (`source` URL) and `cwes`.
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)] // id used for diagnostics in future
 struct OsvEntry {
     #[serde(default)]
     id: String,
@@ -351,8 +350,10 @@ impl OssfIndicators {
         };
         for origin in &ds.malicious_packages_origins {
             if let Some(sha) = &origin.sha256 {
-                if !sha.is_empty() {
-                    out.artifact_sha256.push(sha.clone());
+                // Only accept a real 64-char hex SHA-256: a malformed value would
+                // poison the artifact-hash index DB-B builds from these indicators.
+                if sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    out.artifact_sha256.push(sha.to_ascii_lowercase());
                 }
             }
         }
@@ -413,16 +414,24 @@ fn ossf_confidence(id: &str, entry_type: Option<&str>) -> Confidence {
     match entry_type {
         Some("MALWARE") => Confidence::Confirmed,
         Some("POTENTIALLY_UNWANTED") => Confidence::Medium,
-        _ if id.starts_with("MAL-") => Confidence::Confirmed,
         Some(other) => {
             // An OpenSSF type we do not recognize: surface it (the feed may have
-            // grown a new value worth handling) and fall back to the borderline
-            // default rather than silently swallowing it.
+            // grown a new value worth handling) rather than silently swallowing it.
+            // A MAL-* id is still a confirmed-malicious record regardless of an
+            // unknown type, so it stays Confirmed; an unknown type on a non-MAL id
+            // is the borderline default.
+            let is_mal = id.starts_with("MAL-");
             eprintln!(
-                "  warning: unrecognized OpenSSF database_specific type {other:?} for {id}, defaulting to Medium"
+                "  warning: unrecognized OpenSSF database_specific type {other:?} for {id}, defaulting to {}",
+                if is_mal { "Confirmed (MAL- id)" } else { "Medium" }
             );
-            Confidence::Medium
+            if is_mal {
+                Confidence::Confirmed
+            } else {
+                Confidence::Medium
+            }
         }
+        None if id.starts_with("MAL-") => Confidence::Confirmed,
         None => Confidence::Medium, // No type and not a MAL- id: borderline default.
     }
 }
@@ -1823,7 +1832,7 @@ mod tests {
                 "future_key": true,
                 "iocs": {"domains": ["evil.example"], "future_ioc": ["x"]},
                 "malicious-packages-origins": [
-                    {"source": "ossf-package-analysis", "sha256": "abc", "extra": 1}
+                    {"source": "ossf-package-analysis", "sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "extra": 1}
                 ]
             },
             "affected": [{
@@ -1835,8 +1844,35 @@ mod tests {
         let osv: OsvEntry = serde_json::from_str(json).expect("unknown fields must be tolerated");
         let ind = OssfIndicators::from_database_specific(osv.database_specific.as_ref());
         assert_eq!(ind.domains, vec!["evil.example".to_string()]);
-        assert_eq!(ind.artifact_sha256, vec!["abc".to_string()]);
+        assert_eq!(
+            ind.artifact_sha256,
+            vec!["deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()]
+        );
         assert!(ind.urls.is_empty());
+    }
+
+    /// A malformed (non-64-hex) `sha256` indicator is rejected, not pushed: it would
+    /// otherwise poison the artifact-hash index DB-B builds, and a mixed-case hex is
+    /// normalized to lowercase.
+    #[test]
+    fn ossf_indicators_rejects_non_hex_sha() {
+        let json = r#"{
+            "id": "MAL-2099-0002",
+            "database_specific": {
+                "malicious-packages-origins": [
+                    {"sha256": "not-hex"},
+                    {"sha256": "abc"},
+                    {"sha256": "DEADBEEFdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}
+                ]
+            }
+        }"#;
+        let osv: OsvEntry = serde_json::from_str(json).unwrap();
+        let ind = OssfIndicators::from_database_specific(osv.database_specific.as_ref());
+        // The two malformed values are dropped; the valid hex survives, lowercased.
+        assert_eq!(
+            ind.artifact_sha256,
+            vec!["deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()]
+        );
     }
 
     #[test]
