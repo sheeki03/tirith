@@ -3377,6 +3377,7 @@ dependencies = [
  "extrasafe",
  "fs2",
  "getrandom 0.3.4",
+ "hex",
  "home",
  "is-terminal",
  "jsonschema",

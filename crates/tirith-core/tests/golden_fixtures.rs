@@ -1041,11 +1041,12 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "native_import_execution_chain",
     // B8 + DB-D: `artifact_known_malicious` is emitted by
     // `crate::artifact::evaluate_artifact` ONLY under the `artifact-hash-lookup`
-    // cargo feature (OFF by default) once the DB-B hash-lookup methods land. The
-    // RuleId is registered now so the registry tests see every variant, but it is
-    // UNREACHABLE in the default build (no feature, no DB method), so it has no
-    // PATTERN_TABLE entry and no fixture. Covered by the feature-gated emission
-    // seam in `artifact/correlate.rs` once DB-B ships.
+    // cargo feature (OFF by default). DB-D shipped the v2 hash indices and their
+    // `check_artifact_sha256` / `check_file_sha256` readers, and PR-I activated the
+    // lookup behind the feature, so the RuleId is now reachable WITH the feature on.
+    // In the default build the lookup is compiled out, so the RuleId is unreachable
+    // and has no PATTERN_TABLE entry and no fixture. Covered by the feature-gated
+    // `hash_lookup` tests in `artifact/correlate.rs`.
     "artifact_known_malicious",
 ];
 

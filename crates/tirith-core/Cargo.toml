@@ -14,14 +14,15 @@ categories = ["development-tools"]
 [features]
 # Off-by-default seam for artifact / member SHA-256 known-malicious lookups
 # against the threat DB. The DB methods it calls (`check_artifact_sha256` /
-# `check_file_sha256`) are the DB-B deliverable and DO NOT EXIST YET, so this
-# milestone keeps the feature OFF and the emission behind a reserved seam that
-# computes its indicator from a stub returning `false` (see
-# `artifact::correlate::artifact_hash_indicator`). When DB-B lands, the stub body
-# is replaced with the real lookup; the `ArtifactKnownMalicious` RuleId is already
-# registered (so the registry tests see it) and the CLI flips this feature on.
-# Building with `--features artifact-hash-lookup` compiles and tests cleanly
-# today; it just never fires until the DB methods exist.
+# `check_file_sha256`) shipped with DB-D, so this seam is now ACTIVE under the
+# feature: it decodes the inspected artifact's whole-file SHA-256 and each
+# member's SHA-256 and queries the v2 hash indices, emitting the Critical
+# `ArtifactKnownMalicious` RuleId on a positive match (see
+# `artifact::correlate::artifact_hash_indicator`). The feature stays OFF in the
+# default library build (the lookup is compiled out and the RuleId is
+# unreachable); the firewall / package-install surfaces flip it on. Building with
+# `--features artifact-hash-lookup` compiles and tests cleanly; with an empty or
+# v1 DB the lookup returns no match, so there is no false positive.
 default = []
 artifact-hash-lookup = []
 # native-yara (yara-x): DEFERRED by the PR-0 dependency spike, NOT wired here.
@@ -48,6 +49,12 @@ etcetera = { workspace = true }
 home = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
+# Lowercase-hex decode for the artifact / file SHA-256 known-malicious lookup
+# (the `[u8; 32]` keys the v2 threat-DB hash indices take). Tiny, permissive
+# (MIT OR Apache-2.0), already in the dependency closure. Used only by
+# `artifact::correlate::artifact_hash_indicator` to turn an inspection's
+# lowercase-hex sha256 strings into the fixed digest the DB lookups expect.
+hex = "0.4"
 fs2 = { workspace = true }
 unicode-normalization = { workspace = true }
 unicode-script = { workspace = true }
