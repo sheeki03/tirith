@@ -155,6 +155,25 @@ jobs:
             tirith-threatdb-${{ github.run_id }}-${{ github.run_attempt }}.dat
             threatdb-manifest.json
 
+      # Commit the legacy manifest's raw `main` copy UNCONDITIONALLY and BEFORE the v2
+      # index is generated: this raw file is the v1 client's PRIMARY discovery URL, so a
+      # later v2-side failure must never skip it (which would strand v1 clients on a
+      # stale manifest pointing at a since-pruned asset).
+      - name: Commit v1 manifest to main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add threatdb-manifest.json
+          if git diff --cached --quiet; then
+            echo "Manifest unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore: update threatdb manifest to v${RUN_ID}"
+          # Absorb any commits that landed on main during the build, then push.
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main
+
       # Generate + sign the multi-asset v2 index for v2-capable client discovery.
       # ADDITIVE: the legacy manifest above is untouched and keeps pointing at v1;
       # old clients only ever read it. New clients read this index, verify its
@@ -305,36 +324,27 @@ jobs:
             tirith-threatdb-v2-${{ github.run_id }}-${{ github.run_attempt }}.dat
             threatdb-index-v2.json
 
-      # Push manifest + v2 index update directly to main. Branch is unprotected
-      # and the bot has contents:write; the PR + auto-merge ceremony was
-      # unreliable (--auto silently no-ops when there are no required checks to
-      # gate on) and produced an unmerged backlog. Both files are committed
-      # because each client's PRIMARY discovery URL is the raw main copy (the
-      # release asset is only the fallback): the legacy manifest at
-      # raw.githubusercontent.com/.../threatdb-manifest.json and the v2 index at
-      # raw.githubusercontent.com/.../threatdb-index-v2.json.
-      - name: Update manifest
+      # Push the v2 index update directly to main. Branch is unprotected and the bot
+      # has contents:write; the PR + auto-merge ceremony was unreliable (--auto silently
+      # no-ops when there are no required checks to gate on) and produced an unmerged
+      # backlog. The v2 index's PRIMARY discovery URL is its raw main copy at
+      # raw.githubusercontent.com/.../threatdb-index-v2.json (the release asset is only
+      # the fallback). The legacy manifest was already committed unconditionally above
+      # (before v2 generation), so a v2-side failure here cannot strand v1 clients.
+      # Committed ONLY when PUBLISH_V2 is on: under the rollback switch the next cron run
+      # must stop re-committing the v2 index so a manual revert of it sticks.
+      - name: Commit v2 index to main
+        if: ${{ env.PUBLISH_V2 == 'true' }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # The legacy manifest is committed UNCONDITIONALLY (its raw main copy is
-          # the v1 client's primary discovery URL). The v2 index is committed ONLY
-          # when PUBLISH_V2 is on: under the rollback switch the next cron run must
-          # stop re-committing the v2 index so a manual revert of it sticks.
-          git add threatdb-manifest.json
-          if [ "${PUBLISH_V2}" = "true" ]; then
-            git add threatdb-index-v2.json
-            COMMIT_MSG="chore: update threatdb manifest and v2 index to v${RUN_ID}"
-          else
-            echo "PUBLISH_V2 is not 'true'; committing the legacy manifest only (v2 index left as-is)."
-            COMMIT_MSG="chore: update threatdb manifest to v${RUN_ID}"
-          fi
+          git add threatdb-index-v2.json
           if git diff --cached --quiet; then
-            echo "Nothing to commit."
+            echo "v2 index unchanged; nothing to commit."
             exit 0
           fi
-          git commit -m "${COMMIT_MSG}"
+          git commit -m "chore: update threatdb v2 index to v${RUN_ID}"
           # Absorb any commits that landed on main during the build, then push.
           git pull --rebase --autostash origin main
           git push origin HEAD:main
