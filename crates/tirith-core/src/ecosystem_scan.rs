@@ -495,15 +495,18 @@ fn python_requirement_name(line: &str) -> Option<String> {
 }
 
 /// Extract the version specifier from a PEP 508 requirement line: the part after
-/// the name and optional `[extras]`, before any `;` environment marker. Returns an
-/// empty string for a bare name (which `from_pep440_specifier` maps to Unspecified).
+/// the name and optional `[extras]`. Returns an empty string for a bare name (which
+/// `from_pep440_specifier` maps to Unspecified). A `;` environment marker is KEPT in
+/// the specifier so a marker-qualified requirement degrades to an unresolved
+/// Constraint rather than a false exact pin.
 fn python_requirement_spec(line: &str) -> String {
-    // Drop the environment marker, then any `[extras]` so neither is mistaken for a
-    // specifier; the specifier starts at the first comparison operator.
-    let before_marker = line.split(';').next().unwrap_or(line);
-    let mut buf = String::with_capacity(before_marker.len());
+    // Drop any `[extras]` so its contents are not mistaken for a specifier. The
+    // environment marker is KEPT: a marker-qualified requirement only applies under an
+    // unsupported condition, so keeping the `;` makes `from_pep440_specifier` reject it
+    // (its `looks_like_plain_version` rejects `;`) and degrade to unresolved.
+    let mut buf = String::with_capacity(line.len());
     let mut depth = 0u32;
-    for c in before_marker.chars() {
+    for c in line.chars() {
         match c {
             '[' => depth += 1,
             ']' => depth = depth.saturating_sub(1),
@@ -2746,9 +2749,18 @@ git+https://github.com/x/y.git
 
     #[test]
     fn requirements_txt_pinned_dep_carries_version_intent() {
-        let deps = parse_requirements_txt("requests==2.28.1\nflask>=2.0,<3.0\nbare-pkg\n");
+        let deps = parse_requirements_txt(
+            "requests==2.28.1\nflask>=2.0,<3.0\nbare-pkg\nevil==1.0; python_version<\"3.9\"\n",
+        );
         let requests = deps.iter().find(|d| d.name == "requests").unwrap();
         assert_eq!(requests.version, VersionIntent::Exact("2.28.1".to_string()));
+        // A marker-qualified pin only applies conditionally -> unresolved, not Exact.
+        let evil = deps.iter().find(|d| d.name == "evil").unwrap();
+        assert!(
+            matches!(evil.version, VersionIntent::Constraint { parsed: None, .. }),
+            "marker-qualified pin must be an unresolved Constraint: {:?}",
+            evil.version
+        );
         let flask = deps.iter().find(|d| d.name == "flask").unwrap();
         assert!(matches!(
             flask.version,

@@ -101,8 +101,10 @@ impl VersionIntent {
             // leading `=`), epochs (`!`), wildcards (`*`), and whitespace, so those fall
             // through to a Constraint (and thus UNRESOLVED) instead of becoming a bogus
             // Exact string that silently fails to match the DB. Prereleases (`1.0.0rc1`)
-            // are still accepted, matching the threat-DB literal/numeric compare.
-            if looks_like_plain_version(ver) {
+            // are still accepted, matching the threat-DB literal/numeric compare. A PEP 440
+            // LOCAL version (`+local`) is outside the comparable subset (it can never match
+            // a base record like `1.0`), so it stays UNRESOLVED rather than a false Exact.
+            if looks_like_plain_version(ver) && !ver.contains('+') {
                 return VersionIntent::Exact(ver.to_string());
             }
         }
@@ -157,8 +159,12 @@ fn looks_like_plain_version(t: &str) -> bool {
     }
     body.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
-        // A bare `x`/`X` wildcard segment (`1.x`) is a range, not an exact pin.
-        && !body.split(['.', '-', '+']).any(|seg| seg == "x" || seg == "X")
+        // Every segment must be non-empty and not a wildcard: this rejects an empty
+        // segment (`1.`, `1..2`, `1.+`, a malformed or Gradle-style dynamic selector)
+        // and a `x`/`X` wildcard (`1.x`), which are ranges, not exact pins.
+        && body
+            .split(['.', '-', '+'])
+            .all(|seg| !seg.is_empty() && seg != "x" && seg != "X")
 }
 
 /// A parsed PEP 440 version constraint: a conjunction (AND) of comparison
@@ -401,6 +407,17 @@ mod tests {
             VersionIntent::from_pep440_specifier("==1.0.0;python_version<\"3.9\""),
             VersionIntent::Constraint { parsed: None, .. }
         ));
+        // A PEP 440 local version, and malformed/dynamic versions with an empty
+        // segment, must NOT be Exact either (they cannot match a base DB record).
+        for spec in ["==1.0+ubuntu1", "==1.", "==1..2", "==1.+"] {
+            assert!(
+                matches!(
+                    VersionIntent::from_pep440_specifier(spec),
+                    VersionIntent::Constraint { .. }
+                ),
+                "{spec} must be an unresolved Constraint, not Exact"
+            );
+        }
         // A clean exact pin and a prerelease pin are still Exact.
         assert_eq!(
             VersionIntent::from_pep440_specifier("==1.2.3"),
