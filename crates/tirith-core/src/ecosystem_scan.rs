@@ -2348,7 +2348,10 @@ fn walk_site_packages(
 /// scan (it filters a junk `Name:` out of the dependency list); a name that fails
 /// it is dropped here, yielding `None`.
 fn read_dist_info_metadata(path: &Path) -> Option<(String, Option<String>)> {
-    let text = std::fs::read_to_string(path).ok()?;
+    // No-follow, like every other `.dist-info` read: a planted METADATA symlink must
+    // not be followed out of the environment (std::fs::read_to_string follows links).
+    let bytes = crate::util::read_text_no_follow_capped(path, 4 * 1024 * 1024).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
     let (name, version) = crate::artifact::wheel::parse_metadata_headers(&text)?;
     if !is_plausible_package_name(&name) {
         return None;
@@ -2673,10 +2676,14 @@ fn scan_site_root_startup(
     for (name, path) in names {
         let lower = name.to_ascii_lowercase();
         if lower == "sitecustomize.py" || lower == "usercustomize.py" {
-            // Owned by a distribution? The ownership key is the file's path
-            // relative to site-packages (just its name at the root).
+            // Owned by a distribution? Probe ownership under BOTH the site-relative
+            // filename and the file's absolute path: a conda/system RECORD may list
+            // sitecustomize.py with an absolute path, so a bare-filename probe alone
+            // would miss it and raise a false SitecustomizeUnowned (Block) on a hook
+            // that is legitimately owned.
             let key = NormalizedInstalledPath::new(&name);
-            if !index.is_owned(&key) {
+            let abs_key = NormalizedInstalledPath::new(&path.to_string_lossy());
+            if !index.is_owned(&key) && !index.is_owned(&abs_key) {
                 report
                     .unowned_startup_hooks
                     .push(path.display().to_string());
@@ -4384,6 +4391,53 @@ version = "1.0.61"
         // An unowned startup hook is the High corroborator -> Block.
         assert_eq!(finding.severity, Severity::High);
         assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    /// A sitecustomize.py whose owning distribution lists it in RECORD by ABSOLUTE
+    /// path (as conda/system installs do) is OWNED, so it must NOT raise a false
+    /// SitecustomizeUnowned (which would Block a clean environment).
+    #[test]
+    fn sitecustomize_owned_via_absolute_record_path_is_not_unowned() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        let hook = site.join("sitecustomize.py");
+        std::fs::write(&hook, b"import sys\n").unwrap();
+        // A distribution that owns sitecustomize.py, listing it by ABSOLUTE path.
+        let dist_info = site.join("owner-1.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: owner\nVersion: 1.0\n",
+        )
+        .unwrap();
+        std::fs::write(dist_info.join("RECORD"), format!("{},,\n", hook.display())).unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.unowned_startup_hooks.is_empty(),
+            "sitecustomize owned via an absolute RECORD path must not be flagged unowned"
+        );
+    }
+
+    /// `read_dist_info_metadata` must not follow a symlinked METADATA out of the
+    /// environment (it reads no-follow like every other `.dist-info` read).
+    #[test]
+    #[cfg(unix)]
+    fn dist_info_metadata_symlink_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let dist_info = dir.path().join("pkg-1.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        let outside = dir.path().join("outside-metadata");
+        std::fs::write(
+            &outside,
+            "Metadata-Version: 2.1\nName: sneaky\nVersion: 9.9\n",
+        )
+        .unwrap();
+        symlink(&outside, dist_info.join("METADATA")).unwrap();
+        assert!(read_dist_info_metadata(&dist_info.join("METADATA")).is_none());
     }
 
     #[test]
