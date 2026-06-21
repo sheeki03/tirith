@@ -627,6 +627,20 @@ pub fn verify_installed_record(
     let entries = match parse_record(&text) {
         Ok(e) => e,
         Err(e) => {
+            // A RECORD that fails to PARSE (corrupt CSV) must surface a SIGNAL, not just a
+            // swallowed `parse_error` that `collect_installed_integrity` ignores:
+            // post-install tampering can corrupt RECORD into an unparseable form to bypass
+            // the whole integrity check, which is exactly the case this verifier exists to
+            // catch.
+            result.signals.push(signal(
+                ArtifactSignalKind::RecordHashMismatch,
+                SubjectLocation::installed(record_path.clone()),
+                format!(
+                    "{} RECORD could not be parsed ({e}); installed-file integrity is unverifiable",
+                    dist.name
+                ),
+                EdgeConfidence::High,
+            ));
             result.parse_error = Some(e.to_string());
             return result;
         }
@@ -780,7 +794,15 @@ enum RecordRead {
 fn read_record_text(path: &Path) -> RecordRead {
     const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
     match crate::util::read_text_no_follow_capped(path, MAX_RECORD_BYTES) {
-        Ok(bytes) => RecordRead::Text(String::from_utf8_lossy(&bytes).into_owned()),
+        // STRICT from_utf8 (not lossy): a RECORD with non-UTF-8 bytes is damaged or
+        // tampered, and lossy substitution would silently turn injected bytes into a
+        // `U+FFFD` that then fails hash parsing - masking the damage as a swallowed parse
+        // error. Treat it as Unreadable so it surfaces as a coverage gap, matching the
+        // strict `read_dist_info_metadata`.
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => RecordRead::Text(text),
+            Err(_) => RecordRead::Unreadable,
+        },
         Err(crate::util::OpenRegularError::NotFound) => RecordRead::Missing,
         Err(_) => RecordRead::Unreadable,
     }
@@ -1443,6 +1465,39 @@ mod tests {
         assert_eq!(
             result.entries[0].verification,
             FileVerification::OutOfEnvironment
+        );
+    }
+
+    #[test]
+    fn unparseable_record_emits_a_signal_not_silent_bypass() {
+        // Post-install tampering can corrupt RECORD into unparseable CSV to bypass the
+        // integrity check. That must NOT be silently counted as "checked" with zero
+        // signals: parse failure has to surface a signal for correlation.
+        let tmp = tempdir().unwrap();
+        let site = tmp.path();
+        let dist_info = make_installed_dist(
+            site,
+            "demo",
+            "1.0",
+            &[("demo/mod.py", b"x")],
+            &[("demo/mod.py", Some(sha256_bytes(b"x")), Some(1))],
+            &[],
+        );
+        // Overwrite RECORD with an unparseable single-column row (wrong column count).
+        std::fs::write(dist_info.join("RECORD"), "tampered-row-no-commas\n").unwrap();
+        let layout = EnvironmentLayout::for_site_packages(site);
+        let d = dist("demo", &dist_info);
+        let result = verify_installed_record(&dist_info, &layout, &d, false);
+        assert!(
+            result.parse_error.is_some(),
+            "a corrupt RECORD sets parse_error"
+        );
+        assert!(
+            result
+                .signals
+                .iter()
+                .any(|s| s.kind == ArtifactSignalKind::RecordHashMismatch),
+            "a corrupt RECORD must emit a signal, not silently bypass integrity"
         );
     }
 
