@@ -528,6 +528,11 @@ pub enum UnverifiableReason {
     /// The file could not be opened/hashed (a permission error), so no comparison
     /// was possible. Distinct from `Missing` (which is absence).
     Unreadable,
+    /// The recorded hash is malformed: a `sha256` label with a digest that is not
+    /// 32 bytes (e.g. a truncated `sha256=AAAA`). It can never equal a real digest,
+    /// so comparing it would mislabel a structurally-broken row as a tampering
+    /// Mismatch; report it as unverifiable (mirrors `RecordHash::is_strong`).
+    MalformedHash,
 }
 
 /// One verified RECORD entry: the recorded path, its resolved on-disk path (when
@@ -863,6 +868,14 @@ fn verify_one_file(path: &Path, entry: &RecordEntry) -> FileVerification {
         // be checked here, so it is unverifiable, not a mismatch.
         return FileVerification::Unverifiable {
             reason: UnverifiableReason::UnsupportedAlgorithm,
+        };
+    }
+    if hash.digest.len() != 32 {
+        // A `sha256` digest MUST decode to 32 bytes. A malformed/truncated one can
+        // never equal a real SHA-256, so a direct comparison would mislabel it as a
+        // tampering Mismatch; treat it as unverifiable (matches wheel `is_strong`).
+        return FileVerification::Unverifiable {
+            reason: UnverifiableReason::MalformedHash,
         };
     }
 
@@ -1411,6 +1424,43 @@ mod tests {
         assert_eq!(
             result.entries[0].verification,
             FileVerification::OutOfEnvironment
+        );
+    }
+
+    #[test]
+    fn malformed_sha256_digest_is_unverifiable_not_mismatch() {
+        // A RECORD row labeled `sha256` but with a digest that is not 32 bytes (a
+        // truncated `sha256=AAAA`) can never equal a real digest. It must be
+        // Unverifiable (malformed), NOT a tampering Mismatch.
+        let tmp = tempdir().unwrap();
+        let site = tmp.path();
+        let body = b"some real bytes\n";
+        let dist_info = make_installed_dist(
+            site,
+            "demo",
+            "1.0",
+            &[("demo/mod.py", body)],
+            &[(
+                "demo/mod.py",
+                Some(vec![0xAA, 0xAA, 0xAA]),
+                Some(body.len() as u64),
+            )],
+            &[],
+        );
+        let layout = EnvironmentLayout::for_site_packages(site);
+        let d = dist("demo", &dist_info);
+        let result = verify_installed_record(&dist_info, &layout, &d, false);
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.recorded_path == "demo/mod.py")
+            .unwrap();
+        assert_eq!(
+            entry.verification,
+            FileVerification::Unverifiable {
+                reason: UnverifiableReason::MalformedHash
+            },
+            "a malformed (non-32-byte) sha256 digest must be unverifiable, not a mismatch"
         );
     }
 
