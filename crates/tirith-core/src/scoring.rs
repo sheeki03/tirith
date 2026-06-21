@@ -857,6 +857,9 @@ mod tests {
     #[test]
     fn is_threat_intel_rule_classifies_threat_family() {
         assert!(is_threat_intel_rule(RuleId::ThreatMaliciousPackage));
+        assert!(is_threat_intel_rule(
+            RuleId::ThreatUnresolvedMaliciousPackage
+        ));
         assert!(is_threat_intel_rule(RuleId::ThreatCisaKev));
         assert!(is_threat_intel_rule(RuleId::ThreatSafeBrowsing));
         assert!(!is_threat_intel_rule(RuleId::CurlPipeShell));
