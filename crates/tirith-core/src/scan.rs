@@ -338,19 +338,12 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
     let location = SubjectLocation::from_path(file_path.to_path_buf());
 
     // An artifact candidate (`.so`/`.whl`/...) has no analyzer yet, so it is an
-    // `Unsupported` coverage gap even on the DIRECT `scan --file`/single-file
-    // path (the directory walk filters these out before getting here, so this is
-    // for a directly-named artifact). It must never be read as text. Best-effort
-    // hash within the budget for a later content-addressed lookup.
-    if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
-        if classify_collected_file(name) == CollectedFileKind::ArtifactCandidate {
-            return ScanFileOutcome::Skipped(CoverageGap {
-                location,
-                kind: CoverageGapKind::Unsupported,
-                sha256: hash_path_within_budget(file_path),
-            });
-        }
-    }
+    // `Unsupported` coverage gap even on the DIRECT `scan --file`/single-file path.
+    // It must never be read as text. Classified by extension up front (robust to a
+    // non-UTF-8 filename) and hashed from the SAME open handle below, never a path
+    // reopen, so the recorded digest is exactly the inode we opened.
+    let is_artifact_candidate =
+        classify_collected_path(file_path) == CollectedFileKind::ArtifactCandidate;
 
     // Open no-follow with NO byte cap so we get the handle even for an oversized
     // file (we want to classify + hash it, not reject it outright). `open` reads
@@ -391,6 +384,20 @@ pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
             });
         }
     };
+
+    // Artifact candidate: an `Unsupported` coverage gap, hashed from THIS handle
+    // (never a path reopen) so the recorded digest is exactly the inode we opened.
+    if is_artifact_candidate {
+        let sha256 = match crate::util::sha256_from_handle(file, MAX_COVERAGE_HASH_BYTES) {
+            Ok(crate::util::HashOutcome::Digest(hex)) => Some(hex),
+            Ok(crate::util::HashOutcome::BudgetExceeded) | Err(_) => None,
+        };
+        return ScanFileOutcome::Skipped(CoverageGap {
+            location,
+            kind: CoverageGapKind::Unsupported,
+            sha256,
+        });
+    }
 
     // Size from the OPEN fd (the inode we will read), not a fresh path stat.
     let size = match file.metadata() {
@@ -652,8 +659,7 @@ fn collect_files(
         // a `.so` surfaces it as an artifact candidate rather than scanning it as
         // text. (The `scan --file` / `scan <file>` CLI paths handle a directly
         // named file separately; this branch is the directory-collection helper.)
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        return match classify_collected_file(name) {
+        return match classify_collected_path(path) {
             CollectedFileKind::TextCandidate => CollectedFiles {
                 text_candidates: vec![path.to_path_buf()],
                 artifact_candidates: Vec::new(),
@@ -783,7 +789,7 @@ fn collect_files_recursive(
         // include/exclude. A `TextCandidate` or `ArtifactCandidate` falls through
         // the pattern filters; only one that PASSES every filter is collected (an
         // ignore/exclude/include miss is an INTENTIONAL exclusion, not a gap).
-        let kind = classify_collected_file(name);
+        let kind = classify_collected_path(&path);
         if kind == CollectedFileKind::BinaryIgnored {
             continue;
         }
@@ -928,6 +934,27 @@ fn classify_collected_file(name: &str) -> CollectedFileKind {
     CollectedFileKind::TextCandidate
 }
 
+/// Classify a path, robust to a non-UTF-8 filename. `classify_collected_file`
+/// needs a `&str`, so a `to_str().unwrap_or("")` on a non-UTF-8 name would drop it
+/// to `TextCandidate` and let a `.so`/`.whl` be read as text. Here a non-UTF-8 name
+/// falls back to an extension-only check (the extension is almost always ASCII), so
+/// an artifact is still surfaced as a coverage gap instead of silently scanned.
+fn classify_collected_path(path: &Path) -> CollectedFileKind {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        return classify_collected_file(name);
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let dotted = format!(".{}", ext.to_lowercase());
+        if ARTIFACT_EXTENSIONS.iter().any(|e| *e == dotted) {
+            return CollectedFileKind::ArtifactCandidate;
+        }
+        if IGNORED_BINARY_EXTENSIONS.iter().any(|e| *e == dotted) {
+            return CollectedFileKind::BinaryIgnored;
+        }
+    }
+    CollectedFileKind::TextCandidate
+}
+
 /// Match a filename against a simple glob: `*.ext`, `prefix*`, `pre*suf`,
 /// `*middle*`, or exact. Patterns without `*` fall back to substring match.
 pub fn matches_ignore_pattern(name: &str, pattern: &str) -> bool {
@@ -987,13 +1014,14 @@ impl ScanResult {
 /// one of these is treated as a SECURITY-relevant gap (it could carry executable
 /// or supply-chain content), so `require_complete` / a Fail action must surface
 /// it. Lockfiles and workflow YAML are matched by basename/path separately.
-/// `.dll`/`.exe`/`.jar`/`.class` are here for the same reason as `.so`: each is
-/// loadable code with no analyzer yet, so an unanalyzed one must not read as clean
-/// (they are also `ARTIFACT_EXTENSIONS`, so the scan records them as `Unsupported`
-/// gaps in the first place).
+/// `.dll`/`.exe`/`.jar`/`.class`/`.whl` are here for the same reason as `.so`: each
+/// is loadable code or a packaging artifact with no analyzer yet (a `.whl` the wheel
+/// reader cannot inspect is an `Unsupported` gap), so an unanalyzed one must not read
+/// as clean (they are also `ARTIFACT_EXTENSIONS`, so the scan records them as
+/// `Unsupported` gaps in the first place).
 const SECURITY_RELEVANT_EXTENSIONS: &[&str] = &[
-    ".so", ".pth", ".start", ".dylib", ".node", ".wasm", ".sh", ".ps1", ".dll", ".exe", ".jar",
-    ".class",
+    ".so", ".pth", ".start", ".dylib", ".node", ".wasm", ".whl", ".sh", ".ps1", ".dll", ".exe",
+    ".jar", ".class",
 ];
 
 /// Lockfile / workflow basenames or path fragments that make a gap security
@@ -1775,6 +1803,38 @@ mod tests {
             collected.artifact_candidates,
             vec![so],
             "a directly named .so is an artifact candidate"
+        );
+    }
+
+    /// A `.whl` is an `Unsupported` artifact gap AND security-relevant, so an
+    /// unanalyzable wheel can't read as clean (CodeRabbit #152: `.whl` was missing
+    /// from `SECURITY_RELEVANT_EXTENSIONS`).
+    #[test]
+    fn whl_unsupported_gap_is_security_relevant() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let whl = tmp.path().join("pkg-1.0-py3-none-any.whl");
+        std::fs::write(&whl, b"PK\x03\x04 not a real wheel").unwrap();
+        let gap = match scan_single_file(&whl) {
+            ScanFileOutcome::Skipped(gap) => gap,
+            ScanFileOutcome::Scanned(_) => panic!("a .whl must not be scanned as text"),
+        };
+        assert_eq!(gap.kind, CoverageGapKind::Unsupported);
+        assert!(
+            gap_is_security_relevant(&gap),
+            "a .whl gap must be security-relevant"
+        );
+    }
+
+    /// A non-UTF-8 filename with an artifact extension is still an `ArtifactCandidate`
+    /// (CodeRabbit #152: a `to_str().unwrap_or("")` previously dropped it to text).
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_artifact_name_is_classified_as_artifact() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9.so"); // invalid UTF-8 + .so
+        assert_eq!(
+            classify_collected_path(std::path::Path::new(name)),
+            CollectedFileKind::ArtifactCandidate
         );
     }
 
