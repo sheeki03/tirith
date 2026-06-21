@@ -22,10 +22,14 @@ use tirith_core::verdict::{Action, Finding};
 
 /// Per-run gateway options (CLI surface). M7 ch4: `filter_output` (opt-in,
 /// default `false`) routes every guarded-tool response's `result.content`
-/// through [`tirith_core::mcp::output_filter::filter_tool_result`].
+/// through [`tirith_core::mcp::output_filter::filter_tool_result`]. E5:
+/// `capsule` (opt-in, default `false`) spawns the upstream MCP server inside the
+/// OS containment capsule (deny-network), failing closed if the host backend
+/// cannot enforce it. (C5b builds out the fuller contained-launch policy.)
 #[derive(Debug, Clone, Default)]
 pub struct GatewayOptions {
     pub filter_output: bool,
+    pub capsule: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -663,6 +667,68 @@ pub fn validate_config(config_path: &str) -> i32 {
     0
 }
 
+/// E5 — spawn the upstream MCP server inside the OS containment capsule with piped
+/// stdio (the gateway must read/write the child's stdio to proxy the protocol).
+/// Deny-network is the right default for an MCP server the gateway fronts; the spec
+/// scrubs the env (keeping `TIRITH_GATEWAY_DEPTH` for recursion detection), caps
+/// resources, and closes inherited handles. Enforcing surface: under degraded
+/// coverage [`crate::cli::capsule::spawn_piped`] returns `Err` and we never run the
+/// upstream uncontained. Returns the live [`Child`] for the existing bridge threads.
+fn spawn_upstream_capsuled(
+    upstream_bin: &str,
+    upstream_args: &[String],
+    depth_env: &str,
+) -> Result<Child, String> {
+    use tirith_core::capsule::CapsuleSpec;
+
+    let mut spec = CapsuleSpec::locked_down();
+    // An MCP server typically needs to read its own files and the broader system to
+    // start (interpreters, node_modules, etc.). Grant read of the common roots; this
+    // keeps the deny-default credential subtrees denied. Network stays DenyAll.
+    for root in [
+        "/bin",
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/etc",
+        "/System",
+        "/private/var/select",
+    ] {
+        let p = std::path::PathBuf::from(root);
+        if p.exists() {
+            spec.filesystem.read_roots.push(p);
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        spec.filesystem.read_roots.push(cwd);
+    }
+    // The recursion-detection env var must survive the scrub.
+    spec.environment.allow = vec![
+        "PATH".to_string(),
+        "LANG".to_string(),
+        "TERM".to_string(),
+        "TIRITH_GATEWAY_DEPTH".to_string(),
+    ];
+
+    let extra_env = vec![("TIRITH_GATEWAY_DEPTH".to_string(), depth_env.to_string())];
+    match crate::cli::capsule::spawn_piped(
+        &spec,
+        upstream_bin,
+        upstream_args,
+        &extra_env,
+        crate::cli::capsule::DegradedPolicy::FailClosed,
+    ) {
+        Ok((child, sel, _degraded)) => {
+            eprintln!(
+                "tirith gateway: upstream contained via '{}' (deny-network)",
+                sel.backend_id
+            );
+            Ok(child)
+        }
+        Err(refused) => Err(refused.reason),
+    }
+}
+
 pub fn run_gateway_with_options(
     upstream_bin: &str,
     upstream_args: &[String],
@@ -721,18 +787,33 @@ pub fn run_gateway_with_options(
 
     eprintln!("tirith gateway: batch JSON-RPC requests are denied until batch interception is implemented");
 
-    let mut child = match Command::new(upstream_bin)
-        .args(upstream_args)
-        .env("TIRITH_GATEWAY_DEPTH", (depth + 1).to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("tirith gateway: failed to spawn upstream '{upstream_bin}': {e}");
-            return 1;
+    let depth_env = (depth + 1).to_string();
+    let mut child = if options.capsule {
+        // E5 — contain the upstream MCP server: deny-network, scrubbed env,
+        // resource limits, no inherited handles. Enforcing surface, so fail closed
+        // if the host backend cannot deliver the required coverage (C5b expands the
+        // policy around this; E5 wires the seam + the fail-closed gate).
+        match spawn_upstream_capsuled(upstream_bin, upstream_args, &depth_env) {
+            Ok(c) => c,
+            Err(reason) => {
+                eprintln!("tirith gateway: refusing to launch upstream uncontained: {reason}");
+                return 1;
+            }
+        }
+    } else {
+        match Command::new(upstream_bin)
+            .args(upstream_args)
+            .env("TIRITH_GATEWAY_DEPTH", &depth_env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("tirith gateway: failed to spawn upstream '{upstream_bin}': {e}");
+                return 1;
+            }
         }
     };
 

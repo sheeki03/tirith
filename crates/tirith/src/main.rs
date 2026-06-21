@@ -104,13 +104,17 @@ Exit code:
   reported but never overrides the child's exit code.
 
 JSON:
-  Every --json envelope carries `\"isolation_kind\": \"file_only_not_a_sandbox\"`
-  so a downstream consumer can never mistake this for a security boundary.
+  Every --json envelope carries `\"isolation_kind\"`. Without `--capsule` it is
+  `\"file_only_not_a_sandbox\"`, so a downstream consumer can never mistake plain
+  temp-run for a security boundary. With `--capsule`, when an OS backend actually
+  contains the run, it is `\"capsule_contained\"`; a degraded `--capsule` run that
+  fell back to uncontained keeps the not-a-sandbox marker.
 
 Examples:
   tirith temp-run -- ./script.sh
   tirith temp-run --copy-repo -- make build
   tirith temp-run --strip-env -- ./untrusted-installer.sh
+  tirith temp-run --capsule -- ./untrusted-installer.sh
   tirith temp-run --json -- npm install left-pad";
 
 #[derive(Subcommand)]
@@ -263,6 +267,13 @@ Examples:
         /// Download and analyze only, don't execute
         #[arg(long)]
         no_exec: bool,
+
+        /// Execute the downloaded script inside the OS containment capsule
+        /// (deny-network, scrubbed env, resource limits, FS confined to the
+        /// script's cache dir). Enforcing: a host whose backend cannot enforce
+        /// the containment refuses to run rather than running uncontained.
+        #[arg(long)]
+        capsule: bool,
 
         /// Output format (default: human)
         #[arg(long, value_enum)]
@@ -2225,8 +2236,17 @@ Examples:
         #[arg(long)]
         strip_env: bool,
 
-        /// Output the run + file diff as JSON. The envelope always carries
-        /// `"isolation_kind": "file_only_not_a_sandbox"`.
+        /// Additionally run the command through the OS containment capsule
+        /// (Landlock/seccomp, Seatbelt, or AppContainer), confined to the temp
+        /// dir with no network. Best-effort hardening: a host without a working
+        /// backend runs the command UNCONTAINED and says so. The JSON envelope
+        /// reports the real backend and whether containment was achieved.
+        #[arg(long)]
+        capsule: bool,
+
+        /// Output the run + file diff as JSON. The envelope carries
+        /// `"isolation_kind"` (`file_only_not_a_sandbox`, or `capsule_contained`
+        /// when `--capsule` actually contained the run).
         #[arg(long)]
         json: bool,
 
@@ -2248,7 +2268,13 @@ Examples:
         #[arg(long)]
         strip_env: bool,
 
-        /// Output JSON (carries `"isolation_kind": "file_only_not_a_sandbox"`).
+        /// Additionally run the command through the OS containment capsule,
+        /// confined to the temp dir with no network (best-effort; runs
+        /// uncontained on a host with no working backend and says so).
+        #[arg(long)]
+        capsule: bool,
+
+        /// Output JSON (carries `"isolation_kind"`).
         #[arg(long)]
         json: bool,
 
@@ -5223,6 +5249,14 @@ field-tested.")]
         /// pass-through (current behavior).
         #[arg(long)]
         filter_output: bool,
+
+        /// Spawn the upstream MCP server inside the OS containment capsule
+        /// (deny-network, scrubbed env, resource limits, no inherited handles).
+        /// Enforcing: if this host's backend cannot enforce the containment, the
+        /// gateway refuses to launch the upstream rather than running it
+        /// uncontained. Default is the current uncontained spawn.
+        #[arg(long)]
+        capsule: bool,
     },
     /// Validate gateway config file
     #[command(after_help = "\
@@ -6561,12 +6595,13 @@ fn run() {
         Commands::Run {
             url,
             no_exec,
+            capsule,
             format,
             json,
             sha256,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::run::run(&url, no_exec, json, sha256)
+            cli::run::run(&url, no_exec, json, capsule, sha256)
         }
 
         Commands::Install {
@@ -6790,11 +6825,15 @@ fn run() {
                 upstream_arg,
                 config,
                 filter_output,
+                capsule,
             } => cli::gateway::run_gateway_with_options(
                 &upstream_bin,
                 &upstream_arg,
                 &config,
-                cli::gateway::GatewayOptions { filter_output },
+                cli::gateway::GatewayOptions {
+                    filter_output,
+                    capsule,
+                },
             ),
             GatewayAction::ValidateConfig { config } => cli::gateway::validate_config(&config),
         },
@@ -8058,15 +8097,17 @@ fn run() {
         Commands::TempRun {
             copy_repo,
             strip_env,
+            capsule,
             json,
             command,
         }
         | Commands::SandboxDir {
             copy_repo,
             strip_env,
+            capsule,
             json,
             command,
-        } => cli::temp_run::run(&command, copy_repo, strip_env, json),
+        } => cli::temp_run::run(&command, copy_repo, strip_env, capsule, json),
     };
 
     std::process::exit(exit_code);

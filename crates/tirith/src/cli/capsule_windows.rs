@@ -85,9 +85,10 @@ use windows::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, ResumeThread,
-    TerminateProcess, UpdateProcThreadAttribute, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
@@ -190,6 +191,24 @@ pub fn launch_contained(
     let plan = tirith_core::capsule::windows::windows_launch_plan(spec, program, args)
         .map_err(|e| WindowsLaunchError::Encoding(e.to_string()))?;
     apply_plan(&plan, &spec.environment)
+}
+
+/// Wait for a contained child to exit and return its process exit code (E5
+/// run-to-completion). Blocks on the process handle, then reads the exit code via
+/// `GetExitCodeProcess`. A code that does not fit `i32` is clamped (a child that
+/// exits with a huge unsigned code is reported as the low 31 bits, non-negative);
+/// callers only use this for the consumer "child's code, else non-zero" convention.
+pub fn wait_for(child: &ContainedChild) -> Result<i32, WindowsLaunchError> {
+    let handle = child.process_handle();
+    // SAFETY: `handle` is the valid child process handle owned by `child` for the
+    // duration of the call; WaitForSingleObject does not consume it.
+    let _ = unsafe { WaitForSingleObject(handle, INFINITE) };
+    let mut code: u32 = 0;
+    // SAFETY: `handle` is valid; `&mut code` is a valid u32 out-param.
+    unsafe { GetExitCodeProcess(handle, &mut code) }.map_err(|e| {
+        WindowsLaunchError::CreateProcess("GetExitCodeProcess failed".to_string(), e)
+    })?;
+    Ok((code & 0x7fff_ffff) as i32)
 }
 
 /// Apply an already-built [`WindowsLaunchPlan`]. Split out from

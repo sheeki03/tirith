@@ -397,6 +397,13 @@ pub mod bash_capability;
 pub mod browser;
 pub mod browser_host;
 pub mod canary;
+/// Consumer-facing capsule launch surface (Stack E, unit E5): the single seam
+/// `runner.rs`, `temp_run.rs`, the package-firewall install, and the gateway
+/// upstream spawn route through. Selects the host backend (Landlock/seccomp,
+/// Seatbelt, AppContainer, or NoOp), probes deliverable coverage, fails closed for
+/// enforcing surfaces under degraded coverage, and offers both a run-to-completion
+/// and a piped-stdio launch on top of one fail-closed gate.
+pub mod capsule;
 pub mod capsule_child;
 pub mod capsule_proxy;
 /// Windows capsule executor (Stack E, unit E4): the `windows`-crate Win32 half that
