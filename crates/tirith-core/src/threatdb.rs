@@ -1124,6 +1124,16 @@ impl ThreatDb {
                         }
                     }
                 }
+                // A version-specific malicious record with NO affected versions gives
+                // us nothing to test the constraint against, so we cannot claim the
+                // constraint excludes it; stay unresolved rather than silently clean.
+                if parsed_affected.is_empty() {
+                    return PackageThreatAssessment::Unresolved {
+                        summary,
+                        reason: UnresolvedReason::AffectedVersionUnparsed,
+                        affected_versions: affected,
+                    };
+                }
                 let intersecting: Vec<String> = parsed_affected
                     .iter()
                     .filter(|(_, rv)| constraint.matches(rv))
@@ -3322,6 +3332,30 @@ mod tests {
         };
         assert!(matches!(
             db.assess_package(Ecosystem::Npm, "tagged-evil", &miss),
+            PackageThreatAssessment::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn constraint_against_empty_affected_versions_is_unresolved_not_excluded() {
+        // A version-specific malicious record with NO affected versions (and not
+        // all-versions-malicious) gives nothing to test a constraint against, so it
+        // must stay Unresolved, not be silently treated as a proven exclusion.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            "no-versions-evil",
+            &[],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false, // NOT all-versions-malicious
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let constraint = crate::version_intent::VersionIntent::from_pep440_specifier(">=1.0,<2.0");
+        assert!(matches!(
+            db.assess_package(Ecosystem::Npm, "no-versions-evil", &constraint),
             PackageThreatAssessment::Unresolved { .. }
         ));
     }
