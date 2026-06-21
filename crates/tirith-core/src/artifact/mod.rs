@@ -675,8 +675,11 @@ mod tests {
     }
 
     /// An inspection claiming more inspected members than exist is internally
-    /// inconsistent; is_complete debug-asserts that invariant.
+    /// inconsistent; is_complete debug-asserts that invariant. Gated to debug builds:
+    /// `debug_assert!` is a no-op under `--release`, so without this the
+    /// `#[should_panic]` test would fail (no panic) in a release test run.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "inconsistent")]
     fn inspection_coverage_rejects_inconsistent_counters() {
         let cov = InspectionCoverage {
