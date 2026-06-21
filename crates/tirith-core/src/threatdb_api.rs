@@ -55,7 +55,11 @@ pub fn enrich_command(
     let urls = extract::extract_urls(input, shell);
 
     for package in packages {
-        let effective_version = if let Some(version) = package.version.as_version_str() {
+        // Only a CONCRETE version (Exact/Resolved) is a valid OSV `version`; a range
+        // or constraint must NOT be sent as one (OSV would treat the range text as a
+        // literal version, degrading matching and skipping deps.dev fallback). A
+        // non-concrete intent falls through to resolution instead.
+        let effective_version = if let Some(version) = package.version.exact_version() {
             Some(version.to_string())
         } else if config.deps_dev_enabled {
             resolve_default_version(package.ecosystem, &package.name, deadline)
