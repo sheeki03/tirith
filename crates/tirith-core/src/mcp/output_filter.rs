@@ -224,6 +224,30 @@ pub fn filter_tool_result(
     outcome
 }
 
+/// C4 — scan every string leaf (object keys AND values) of an arbitrary JSON
+/// value through the SAME streaming engine output analyzer
+/// [`filter_tool_result`] uses, seeded with the operator's compiled custom
+/// injection seeds, and return the resulting [`crate::verdict::Verdict`].
+///
+/// This is the read-only counterpart of [`filter_tool_result`] for the
+/// listing/reading MCP responses ([`crate::mcp::response_inspect`]) whose shapes
+/// are NOT a `tools/call` result (`tools[]`, `resources[]`, `prompts[]`,
+/// `messages[]`, `contents[]`): it produces the injection / exfil / OSC verdict
+/// without rewriting anything (the gateway, not this scan, applies the Block /
+/// Warn rewrite, exactly as it does on the `tools/call` path). Like
+/// `filter_tool_result`, there is no per-call byte cap — the gateway's
+/// `max_message_bytes` transport cap bounds the whole response upstream, so every
+/// reachable leaf is scanned in full and a payload split across leaves still
+/// fires via the analyzer's cross-chunk join.
+pub fn scan_value_leaves(
+    value: &serde_json::Value,
+    ctx: &OutputFilterContext,
+) -> crate::verdict::Verdict {
+    let mut state = OutputAnalyzerState::with_custom_seeds(ctx.custom_seeds.clone());
+    stream_json_string_leaves(value, &mut state);
+    analyze_output_finalize_mut(&mut state)
+}
+
 /// `true` if `rule_id` is one of the three injection-SEED rules eligible for the
 /// opt-in redact downgrade. Any OTHER blocking rule (exfil, OSC52, …) keeps the
 /// whole-message Block. Exhaustive (no `_` arm) so a future injection RuleId is a
