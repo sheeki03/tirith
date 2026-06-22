@@ -1558,7 +1558,11 @@ mod tests {
             &[],
         );
         // Overwrite RECORD with a non-UTF-8 byte sequence.
-        std::fs::write(dist_info.join("RECORD"), b"demo/mod.py,sha256=x,1\n\xff\xfe\n").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            b"demo/mod.py,sha256=x,1\n\xff\xfe\n",
+        )
+        .unwrap();
         let layout = EnvironmentLayout::for_site_packages(site);
         let d = dist("demo", &dist_info);
         let result = verify_installed_record(&dist_info, &layout, &d, false);
