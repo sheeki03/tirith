@@ -405,9 +405,11 @@ impl ArtifactScanReceipt {
     /// signed.
     ///
     /// Order: the file is saved first, then the chain anchor is appended. If the
-    /// anchor append fails, the saved file is reported via
-    /// [`ReceiptError::AnchorFailed`] (the file exists but is unanchored) so the
-    /// caller can surface the gap rather than believing the receipt is anchored.
+    /// anchor append fails when a signature is mandatory, it is reported via
+    /// [`ReceiptError::AnchorFailed`] (the file exists but is unanchored). For the
+    /// unsigned case a failed anchor degrades to a saved-but-unanchored receipt
+    /// (`signed: false`), like a disabled chain, so a platform that cannot take the
+    /// audit-log lock (Windows) still produces a receipt rather than blocking install.
     pub fn record(&self, require_signature: bool) -> Result<RecordedReceipt, ReceiptError> {
         // Fail closed BEFORE writing anything if a signature is mandatory but
         // unavailable: a `pkg install` that asked for a signed receipt must not get
@@ -441,7 +443,23 @@ impl ArtifactScanReceipt {
                 path,
                 signed: false,
             }),
-            crate::audit::ReceiptAnchor::Failed(reason) => Err(ReceiptError::AnchorFailed(reason)),
+            // The receipt file is saved but the chain anchor could not be appended.
+            // When a signature is mandatory this is fatal. Otherwise (unsigned /
+            // tamper-evident acceptable) it degrades like `Skipped`: report the
+            // saved-but-unanchored receipt rather than failing the whole install. This
+            // is the path a platform that cannot take the audit-log lock (Windows
+            // `fs2` denies locking an append handle) takes, so `tirith pkg install`
+            // still produces a receipt there instead of hard-failing.
+            crate::audit::ReceiptAnchor::Failed(reason) => {
+                if require_signature {
+                    Err(ReceiptError::AnchorFailed(reason))
+                } else {
+                    Ok(RecordedReceipt {
+                        path,
+                        signed: false,
+                    })
+                }
+            }
         }
     }
 
