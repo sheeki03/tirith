@@ -69,14 +69,15 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_W,
+    GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    FreeSid, ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, NO_MULTIPLE_TRUSTEE, PSECURITY_DESCRIPTOR,
-    PSID, SECURITY_CAPABILITIES, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    FreeSid, ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_CAPABILITIES,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -279,7 +280,7 @@ fn apply_plan(
     // CreateProcessW; ResumeThread takes ownership of nothing.
     let resume_rc = unsafe { ResumeThread(launched.thread.0) };
     if resume_rc == u32::MAX {
-        let err = WinError::from_win32();
+        let err = WinError::from_thread();
         terminate_quietly(launched.process.0);
         // Dropping `job` closes the Job and (kill-on-close) the process too.
         drop(job);
@@ -348,13 +349,12 @@ fn create_or_open_appcontainer(plan: &WindowsLaunchPlan) -> Result<OwnedSid, Win
         Err(_) => {
             // Most likely ERROR_ALREADY_EXISTS: derive the SID from the existing
             // profile. (Any other error surfaces here too, with a derive failure.)
-            let mut psid = PSID(std::ptr::null_mut());
-            // SAFETY: `name` is NUL-terminated; `psid` is a valid out-pointer.
-            let derived = unsafe {
-                DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr()), &mut psid)
-            };
+            // SAFETY: `name` is NUL-terminated. The windows-crate binding returns the
+            // derived PSID directly (no out-param).
+            let derived =
+                unsafe { DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr())) };
             match derived {
-                Ok(()) => Ok(OwnedSid(psid)),
+                Ok(psid) => Ok(OwnedSid(psid)),
                 Err(e) => Err(WindowsLaunchError::AppContainer(
                     "create and derive both failed".to_string(),
                     e,
@@ -426,7 +426,7 @@ impl Drop for AclGuard {
             // SAFETY: `security_descriptor` was allocated by GetNamedSecurityInfoW and
             // is freed exactly once here; `original_dacl` is not used after this.
             unsafe {
-                let _ = LocalFree(HLOCAL(self.security_descriptor.0));
+                let _ = LocalFree(Some(HLOCAL(self.security_descriptor.0)));
             }
             self.security_descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
         }
@@ -522,7 +522,7 @@ fn apply_acl_grant(grant: &AclGrant, container_sid: PSID) -> Result<AclGuard, Wi
         // Free the descriptor we read (existing_dacl points into it) before bailing.
         // SAFETY: `sd` was allocated by GetNamedSecurityInfoW; freed once here.
         unsafe {
-            let _ = LocalFree(HLOCAL(sd.0));
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
         }
         return Err(WindowsLaunchError::Acl("merge ACE".to_string(), set_rc));
     }
@@ -545,13 +545,13 @@ fn apply_acl_grant(grant: &AclGrant, container_sid: PSID) -> Result<AclGuard, Wi
     // regardless of success.
     // SAFETY: `new_dacl` was allocated by SetEntriesInAclW; freed exactly once.
     unsafe {
-        let _ = LocalFree(HLOCAL(new_dacl as *mut core::ffi::c_void));
+        let _ = LocalFree(Some(HLOCAL(new_dacl as *mut core::ffi::c_void)));
     }
     if apply_rc.is_err() {
         // Free the read descriptor; we never built a guard.
         // SAFETY: `sd` was allocated by GetNamedSecurityInfoW; freed once here.
         unsafe {
-            let _ = LocalFree(HLOCAL(sd.0));
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
         }
         return Err(WindowsLaunchError::Acl(
             "install DACL".to_string(),
