@@ -54,6 +54,8 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
@@ -308,8 +310,6 @@ struct MemberMeta {
     /// size, used only as a hint for native-member buffering decisions before we
     /// know the real streamed size.
     declared_size: u64,
-    /// The declared compressed size, for the compression-ratio guard's denominator.
-    compressed_size: u64,
 }
 
 /// Inspect a wheel (or generic zip) from a `Read + Seek` handle, streaming each
@@ -321,6 +321,31 @@ struct MemberMeta {
 ///
 /// Returns [`ArchiveOutcome::Rejected`] if ANY structural violation is found
 /// (with a best-effort partial inspection), else [`ArchiveOutcome::Accepted`].
+/// Wraps the archive's reader to count the COMPRESSED bytes actually consumed. The
+/// compression-ratio guard divides decompressed output by this real count instead of the
+/// central-directory `compressed_size`, which is attacker-controlled metadata: inflating
+/// it to a huge value would otherwise push the ratio threshold to `u64::MAX` and disable
+/// the guard, while the decompressor (bounded by the local header / deflate end-of-stream,
+/// not the central directory) still expands a bomb up to the per-member byte cap.
+struct CountingReader<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for CountingReader<R> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
 pub fn read_wheel<R: Read + Seek>(
     reader: R,
     outer_name: &str,
@@ -328,7 +353,11 @@ pub fn read_wheel<R: Read + Seek>(
     limits: &ArchiveLimits,
     visitor: &mut dyn MemberVisitor,
 ) -> ArchiveOutcome {
-    let mut archive = match zip::ZipArchive::new(reader) {
+    let read_counter = Arc::new(AtomicU64::new(0));
+    let mut archive = match zip::ZipArchive::new(CountingReader {
+        inner: reader,
+        count: Arc::clone(&read_counter),
+    }) {
         Ok(a) => a,
         Err(e) => {
             // A non-archive (or truncated/corrupt) input is a structural fault: it
@@ -383,7 +412,6 @@ pub fn read_wheel<R: Read + Seek>(
             encrypted: file.encrypted(),
             compression: file.compression(),
             declared_size: file.size(),
-            compressed_size: file.compressed_size(),
         });
     }
 
@@ -514,7 +542,7 @@ pub fn read_wheel<R: Read + Seek>(
             meta.index,
             limits.max_member_uncompressed,
             remaining_total,
-            meta.compressed_size,
+            &read_counter,
             limits.max_compression_ratio,
         );
 
@@ -1027,7 +1055,7 @@ fn stream_member<R: Read + Seek>(
     index: usize,
     member_cap: u64,
     remaining_total: u64,
-    compressed_size: u64,
+    read_counter: &AtomicU64,
     max_ratio: u64,
 ) -> MemberStream {
     let mut file = match archive.by_index(index) {
@@ -1044,10 +1072,12 @@ fn stream_member<R: Read + Seek>(
     let mut bytes: Vec<u8> = Vec::new();
     let mut buf = [0u8; 64 * 1024];
     let mut total: u64 = 0;
-    // The ratio guard's threshold: real bytes may not exceed compressed * ratio.
-    // A stored (uncompressed) member has compressed == uncompressed, so guard with
-    // at least 1 to avoid a zero threshold on an empty member.
-    let ratio_limit = compressed_size.max(1).saturating_mul(max_ratio.max(1));
+    // Snapshot the underlying-reader byte counter now that the member is open, so the delta
+    // measures the COMPRESSED bytes this member actually consumes. The central-directory
+    // `compressed_size` is attacker-controlled (inflating it would push the threshold to
+    // u64::MAX and disable the guard), so the ratio is computed against this real consumed
+    // count, incrementally, in the loop below.
+    let compressed_before = read_counter.load(Ordering::Relaxed);
     // The binding byte bound and the gap kind that names it.
     let (byte_bound, bound_kind) = if member_cap <= remaining_total {
         (member_cap, CoverageGapKind::MemberTooLarge)
@@ -1071,8 +1101,15 @@ fn stream_member<R: Read + Seek>(
             }
         };
         total = total.saturating_add(n as u64);
-        // Compression-ratio guard on REAL bytes (the declared size is not trusted).
-        if total > ratio_limit {
+        // Compression-ratio guard against the REAL consumed compressed bytes: once any
+        // compressed bytes have been read, abort the moment decompressed output exceeds
+        // consumed * max_ratio. This catches a bomb after a bounded prefix instead of
+        // decompressing it all the way to the per-member byte cap, and classifies it as
+        // CompressionRatioExceeded rather than MemberTooLarge.
+        let compressed_so_far = read_counter
+            .load(Ordering::Relaxed)
+            .saturating_sub(compressed_before);
+        if compressed_so_far > 0 && total > compressed_so_far.saturating_mul(max_ratio.max(1)) {
             return MemberStream::RatioExceeded { consumed: total };
         }
         if total > byte_bound {
@@ -1592,7 +1629,6 @@ mod tests {
             encrypted: false,
             compression: CompressionMethod::Deflated,
             declared_size: 0,
-            compressed_size: 0,
         }
     }
 
@@ -1910,6 +1946,69 @@ mod tests {
             .gaps
             .iter()
             .any(|g| g.kind == CoverageGapKind::CompressionRatioExceeded));
+    }
+
+    /// Patch every central-directory header's COMPRESSED-size field (offset +20..+24)
+    /// to `size`. The companion of `set_central_dir_uncompressed_size` (which patches
+    /// +24..+28), used to forge the attacker-controlled denominator.
+    fn set_central_dir_compressed_size(bytes: &mut [u8], size: u32) {
+        const CDH_SIG: [u8; 4] = [b'P', b'K', 0x01, 0x02];
+        let mut i = 0;
+        let mut patched = false;
+        while i + 24 <= bytes.len() {
+            if bytes[i..i + 4] == CDH_SIG {
+                bytes[i + 20..i + 24].copy_from_slice(&size.to_le_bytes());
+                patched = true;
+            }
+            i += 1;
+        }
+        assert!(
+            patched,
+            "test setup: no central directory header found to patch"
+        );
+    }
+
+    #[test]
+    fn inflated_central_dir_compressed_size_cannot_disable_ratio_guard() {
+        // The finding's attack: an adversary patches ONLY the central-directory
+        // compressed_size to a huge value. If the ratio guard used THAT as its denominator
+        // it would compute ratio_limit ~= u64::MAX and never fire, so a bomb would slip
+        // through (decompressed under the per-member cap, no gap) instead of being flagged.
+        // The guard now divides by the REAL consumed compressed bytes (a wrapping byte
+        // counter), so the central-directory lie has no effect.
+        let bomb = vec![0u8; 1024 * 1024]; // 1 MiB of zeros, deflates to ~1 KiB
+        let mut bytes = ZipBuilder::new().file("demo/bomb.bin", &bomb).build();
+        set_central_dir_compressed_size(&mut bytes, 100 * 1024 * 1024); // the lie: declare 100 MiB
+        let sha = sha256_hex(&bytes);
+        let limits = ArchiveLimits {
+            max_compression_ratio: 2, // 1 MiB from ~1 KiB real deflate blows past 2x
+            max_member_uncompressed: 64 * 1024 * 1024,
+            max_total_uncompressed: 512 * 1024 * 1024,
+            ..ArchiveLimits::default()
+        };
+        struct NoopVisitor;
+        impl MemberVisitor for NoopVisitor {}
+        let outcome = read_wheel(
+            Cursor::new(bytes),
+            "demo-1.0-py3-none-any.whl",
+            &sha,
+            &limits,
+            &mut NoopVisitor,
+        );
+        let inspection = match &outcome {
+            ArchiveOutcome::Accepted(i) => i,
+            other => panic!("a ratio bomb must Accept (coverage limit), got {other:?}"),
+        };
+        // Caught as a ratio bomb DESPITE the inflated declared compressed_size.
+        assert!(
+            inspection
+                .coverage
+                .gaps
+                .iter()
+                .any(|g| g.kind == CoverageGapKind::CompressionRatioExceeded),
+            "an inflated central-dir compressed_size must not disable the ratio guard; gaps: {:?}",
+            inspection.coverage.gaps
+        );
     }
 
     #[test]
