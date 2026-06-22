@@ -221,6 +221,13 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     // unsupported/unreadable candidate (an sdist, a bare `.so` with no archive
     // wrapper, an oversize file) still records a coverage gap so it is never
     // silently dropped.
+    //
+    // `max_files` bounds this work too (A2 re-review): artifact INSPECTION (open + archive
+    // walk + B5/B6/B7) is even more expensive than the old hash, so an artifact-heavy tree
+    // must not force unbounded inspection before the text-file cap below. Cap the candidates
+    // inspected; any beyond the cap are folded into the skip accounting below, not dropped
+    // silently.
+    let artifact_total = collected.artifact_candidates.len();
     let mut coverage_gaps: Vec<CoverageGap> = Vec::new();
     let mut artifact_results: Vec<FileScanResult> = Vec::new();
     // Distinct artifacts that were actually inspected (NOT the per-finding result
@@ -232,7 +239,11 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     // hash-lookup seam returns None until the DB-B methods land), but this is the
     // correct wiring so the artifact path consults the same DB the engine does.
     let artifact_threat_db = crate::threatdb::ThreatDb::cached();
-    for p in &collected.artifact_candidates {
+    for p in collected
+        .artifact_candidates
+        .iter()
+        .take(config.max_files.unwrap_or(usize::MAX))
+    {
         let (mut results, gap) = inspect_artifact_candidate(p, artifact_threat_db.as_deref());
         if gap.is_none() {
             artifacts_inspected += 1;
@@ -242,6 +253,8 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
             coverage_gaps.push(gap);
         }
     }
+    // Candidates beyond the cap were neither inspected nor gapped; count them as skipped.
+    let artifact_skipped = artifact_total.saturating_sub(config.max_files.unwrap_or(usize::MAX));
 
     files.sort_by(|a, b| {
         let a_priority = is_priority_file(a);
@@ -253,17 +266,19 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         }
     });
 
-    let mut truncated = false;
+    let mut truncated = artifact_skipped > 0;
     let mut truncation_reason = None;
-    let mut skipped_count = 0;
+    let mut skipped_count = artifact_skipped;
 
     if let Some(max) = config.max_files {
         if files.len() > max {
-            skipped_count = files.len() - max;
+            skipped_count += files.len() - max;
             files.truncate(max);
             truncated = true;
+        }
+        if skipped_count > 0 {
             truncation_reason = Some(format!(
-                "Scan capped at {max} files ({skipped_count} skipped)."
+                "Scan capped at {max} files/artifacts ({skipped_count} skipped)."
             ));
         }
     }
