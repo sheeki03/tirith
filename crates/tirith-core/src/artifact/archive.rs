@@ -1147,7 +1147,7 @@ fn stream_member<R: Read + Seek>(
     }
 
     let digest = hasher.finalize();
-    let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let sha256: String = hex::encode(digest);
     MemberStream::Complete {
         bytes,
         sha256,
@@ -1217,7 +1217,7 @@ fn stream_native_view<R: Read + Seek>(
         printable.feed(&buf[..n]);
     }
     let digest = hasher.finalize();
-    let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let sha256: String = hex::encode(digest);
     (
         Some(NativeMemberHandoff::Streaming {
             location,
@@ -1398,7 +1398,7 @@ mod tests {
     /// `outer_sha256`). Tests compute it independently of the reader.
     fn sha256_hex(bytes: &[u8]) -> String {
         let digest = Sha256::digest(bytes);
-        digest.iter().map(|b| format!("{b:02x}")).collect()
+        hex::encode(digest)
     }
 
     /// A builder over an in-memory zip, so each test reads like the hostile shape

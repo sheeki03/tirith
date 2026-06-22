@@ -409,10 +409,7 @@ mod tests {
         assert_eq!(bind_subject_digest("abc", A), SubjectBinding::Malformed);
         // A `sha256:` prefix is not a bare hex digest.
         let prefixed = format!("sha256:{}", &A[7..]);
-        assert_eq!(
-            bind_subject_digest(&prefixed, A),
-            SubjectBinding::Malformed
-        );
+        assert_eq!(bind_subject_digest(&prefixed, A), SubjectBinding::Malformed);
         // Non-hex character in an otherwise 64-char string.
         let nonhex = "z".repeat(64);
         assert_eq!(bind_subject_digest(&nonhex, A), SubjectBinding::Malformed);
@@ -465,13 +462,19 @@ mod tests {
     fn constrained_policy_checks_workflow_and_signer() {
         let policy = PublisherPolicy {
             allowed_workflows: vec!["release.yml".into()],
-            allowed_signer_identities: vec!["https://github.com/pypa/sampleproject/.github/workflows/release.yml@refs/tags/v1".into()],
+            allowed_signer_identities: vec![
+                "https://github.com/pypa/sampleproject/.github/workflows/release.yml@refs/tags/v1"
+                    .into(),
+            ],
             ..Default::default()
         };
         let id = PublisherIdentity {
             repository: Some("pypa/sampleproject".into()),
             workflow: Some("release.yml".into()),
-            signer_identity: Some("https://github.com/pypa/sampleproject/.github/workflows/release.yml@refs/tags/v1".into()),
+            signer_identity: Some(
+                "https://github.com/pypa/sampleproject/.github/workflows/release.yml@refs/tags/v1"
+                    .into(),
+            ),
         };
         assert!(policy.check(&id).is_ok());
         // A bad workflow fails even with a good signer.

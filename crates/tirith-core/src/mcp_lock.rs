@@ -454,7 +454,10 @@ impl ToolDescriptor {
         // sorts the keys, so the literal insertion order here does not matter.
         let mut captured = serde_json::Map::new();
         for field in DESCRIPTOR_HASHED_FIELDS {
-            let v = entry.get(*field).cloned().unwrap_or(serde_json::Value::Null);
+            let v = entry
+                .get(*field)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             captured.insert((*field).to_string(), v);
         }
         let canonical = canonical_json(&serde_json::Value::Object(captured));
@@ -705,9 +708,8 @@ pub fn descriptor_drift_finding(
 
     let summary =
         format!("{added} added, {removed} removed, {changed} changed since the descriptor lock");
-    let mut detail = format!(
-        "MCP live tool-descriptor drift for server {server_name:?}: {summary}."
-    );
+    let mut detail =
+        format!("MCP live tool-descriptor drift for server {server_name:?}: {summary}.");
     if !names.is_empty() {
         let suffix = if changes.len() > names.len() {
             format!(" first tools: {} …", names.join(", "))
@@ -5792,14 +5794,10 @@ mod tests {
         // Two objects that differ ONLY in key order (at the top level and in a
         // nested object) must canonicalize to the SAME string — the load-bearing
         // property behind descriptor hashing.
-        let a: serde_json::Value = serde_json::from_str(
-            r#"{"b":1,"a":2,"nested":{"y":1,"x":2}}"#,
-        )
-        .unwrap();
-        let b: serde_json::Value = serde_json::from_str(
-            r#"{"nested":{"x":2,"y":1},"a":2,"b":1}"#,
-        )
-        .unwrap();
+        let a: serde_json::Value =
+            serde_json::from_str(r#"{"b":1,"a":2,"nested":{"y":1,"x":2}}"#).unwrap();
+        let b: serde_json::Value =
+            serde_json::from_str(r#"{"nested":{"x":2,"y":1},"a":2,"b":1}"#).unwrap();
         assert_eq!(canonical_json(&a), canonical_json(&b));
         // And the canonical form is the sorted-key, no-whitespace encoding.
         assert_eq!(
@@ -5812,12 +5810,9 @@ mod tests {
     fn canonical_json_ignores_insignificant_whitespace() {
         // The same document with and without pretty-printing whitespace
         // canonicalizes identically.
-        let compact: serde_json::Value =
-            serde_json::from_str(r#"{"a":[1,2,3],"b":"x"}"#).unwrap();
-        let spaced: serde_json::Value = serde_json::from_str(
-            "{\n  \"a\" : [ 1, 2, 3 ],\n  \"b\" : \"x\"\n}",
-        )
-        .unwrap();
+        let compact: serde_json::Value = serde_json::from_str(r#"{"a":[1,2,3],"b":"x"}"#).unwrap();
+        let spaced: serde_json::Value =
+            serde_json::from_str("{\n  \"a\" : [ 1, 2, 3 ],\n  \"b\" : \"x\"\n}").unwrap();
         assert_eq!(canonical_json(&compact), canonical_json(&spaced));
     }
 
@@ -5879,25 +5874,37 @@ mod tests {
             r#"{"name":"run","description":"EVIL","inputSchema":{"type":"object"}}"#,
         )
         .unwrap();
-        assert_ne!(base_hash, ToolDescriptor::from_tool_entry(&desc_swap).descriptor_hash);
+        assert_ne!(
+            base_hash,
+            ToolDescriptor::from_tool_entry(&desc_swap).descriptor_hash
+        );
 
         let schema_widen: serde_json::Value = serde_json::from_str(
             r#"{"name":"run","description":"safe","inputSchema":{"type":"object","additionalProperties":true}}"#,
         )
         .unwrap();
-        assert_ne!(base_hash, ToolDescriptor::from_tool_entry(&schema_widen).descriptor_hash);
+        assert_ne!(
+            base_hash,
+            ToolDescriptor::from_tool_entry(&schema_widen).descriptor_hash
+        );
 
         let annotated: serde_json::Value = serde_json::from_str(
             r#"{"name":"run","description":"safe","inputSchema":{"type":"object"},"annotations":{"destructiveHint":true}}"#,
         )
         .unwrap();
-        assert_ne!(base_hash, ToolDescriptor::from_tool_entry(&annotated).descriptor_hash);
+        assert_ne!(
+            base_hash,
+            ToolDescriptor::from_tool_entry(&annotated).descriptor_hash
+        );
 
         let icon: serde_json::Value = serde_json::from_str(
             r#"{"name":"run","description":"safe","inputSchema":{"type":"object"},"icons":[{"src":"https://evil.example/x.png"}]}"#,
         )
         .unwrap();
-        assert_ne!(base_hash, ToolDescriptor::from_tool_entry(&icon).descriptor_hash);
+        assert_ne!(
+            base_hash,
+            ToolDescriptor::from_tool_entry(&icon).descriptor_hash
+        );
     }
 
     #[test]
@@ -5908,8 +5915,7 @@ mod tests {
         let a: serde_json::Value =
             serde_json::from_str(r#"{"name":"run","description":"d"}"#).unwrap();
         let b: serde_json::Value =
-            serde_json::from_str(r#"{"name":"run","description":"d","_unrelated":42}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"name":"run","description":"d","_unrelated":42}"#).unwrap();
         assert_eq!(
             ToolDescriptor::from_tool_entry(&a).descriptor_hash,
             ToolDescriptor::from_tool_entry(&b).descriptor_hash,
@@ -6029,9 +6035,7 @@ mod tests {
 
     #[test]
     fn descriptor_drift_finding_is_high_mcp_server_drift() {
-        let changes = vec![McpDescriptorChange::ToolChanged {
-            name: "run".into(),
-        }];
+        let changes = vec![McpDescriptorChange::ToolChanged { name: "run".into() }];
         let finding =
             descriptor_drift_finding("github", &changes).expect("non-empty drift → finding");
         assert_eq!(finding.rule_id, crate::verdict::RuleId::McpServerDrift);
@@ -6120,8 +6124,7 @@ mod tests {
         let (seeds, bad) =
             crate::rules::prompt_injection::compile_seeds(&["super-secret-trigger".to_string()]);
         assert!(bad.is_empty());
-        let findings =
-            scan_descriptor_text("benign text with super-secret-trigger inside", &seeds);
+        let findings = scan_descriptor_text("benign text with super-secret-trigger inside", &seeds);
         assert!(
             !findings.is_empty(),
             "a custom seed must fire on a tool description",

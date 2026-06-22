@@ -17,8 +17,6 @@
 //! (init-safe) and selects enter only when proven; absent/stale/`broken` falls
 //! back to preexec — the fail-closed safety floor.
 
-#![cfg(unix)]
-
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};

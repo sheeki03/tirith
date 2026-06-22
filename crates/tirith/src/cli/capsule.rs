@@ -150,6 +150,11 @@ impl std::fmt::Display for CapsuleRefused {
 /// always-degraded [`NoOpCapsule`] on any other target. A backend that probes its
 /// OS mechanism and finds it absent reports degraded coverage here, so the caller
 /// can fail closed before any side effect.
+// Each target arm `return`s its backend; only the catch-all fallback is a tail
+// expression. On any single platform clippy sees that platform's arm as the
+// effective tail and flags `needless_return`, but the keyword is required for the
+// other (cfg'd-out) arms, so keep the shape uniform rather than diverge per OS.
+#[allow(clippy::needless_return)]
 pub fn select_backend(spec: &CapsuleSpec) -> SelectedBackend {
     let required = spec.required_coverage();
 
@@ -488,7 +493,7 @@ fn linux_contained_command(
 /// macOS: wrap in `sandbox-exec -p <profile> -- <program> <args>` (built by the E3
 /// backend) and, in a `pre_exec` hook, apply the environment scrub + handle-closure
 /// + rlimits that the SBPL profile alone does not — closing the env/resource/handle
-/// coverage the E5 probe only claims because this wrapper applies them.
+///   coverage the E5 probe only claims because this wrapper applies them.
 #[cfg(target_os = "macos")]
 fn macos_contained_command(
     spec: &CapsuleSpec,

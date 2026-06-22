@@ -784,7 +784,7 @@ mod tests {
         assert!(plan
             .acl_grants
             .iter()
-            .any(|g| g.access == AclAccess::Modify && g.path == PathBuf::from("C:/work")));
+            .any(|g| g.access == AclAccess::Modify && g.path == Path::new("C:/work")));
         // Job kills on close.
         assert!(plan.job_limits.kill_on_close);
     }

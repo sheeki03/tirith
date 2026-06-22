@@ -41,8 +41,8 @@
 use std::path::{Path, PathBuf};
 
 use tirith_core::artifact::install::{
-    installed_distribution_names, rebind_for_install, verify_post_install_record, DigestInstallPlan,
-    InstallCommand, InstallError, InstallPlanDigest, InstallPlanInputs,
+    installed_distribution_names, rebind_for_install, verify_post_install_record,
+    DigestInstallPlan, InstallCommand, InstallError, InstallPlanDigest, InstallPlanInputs,
 };
 use tirith_core::artifact::quarantine::{QuarantineError, QuarantineStore, QuarantineTransaction};
 use tirith_core::artifact::resolver::{
@@ -96,10 +96,7 @@ pub enum PkgAction {
         json: bool,
     },
     /// List / show the D6 tamper-evident receipts.
-    Receipt {
-        which: ReceiptQuery,
-        json: bool,
-    },
+    Receipt { which: ReceiptQuery, json: bool },
 }
 
 /// Which receipt(s) `pkg receipt` reports.
@@ -321,7 +318,14 @@ fn prepare_plan(
     // the digest binds the backend + the required coverage the spec demands.
     let backend = capsule::select_backend(&plan.spec);
 
-    let digest = build_plan_digest(&plan, &resolved, &target, policy, backend.backend_id, expiry);
+    let digest = build_plan_digest(
+        &plan,
+        &resolved,
+        &target,
+        policy,
+        backend.backend_id,
+        expiry,
+    );
 
     Ok(PreparedPlan {
         plan,
@@ -401,7 +405,12 @@ fn platform_tag_of(filename: &str) -> Option<String> {
         return None;
     }
     let n = parts.len();
-    Some(format!("{}-{}-{}", parts[n - 3], parts[n - 2], parts[n - 1]))
+    Some(format!(
+        "{}-{}-{}",
+        parts[n - 3],
+        parts[n - 2],
+        parts[n - 1]
+    ))
 }
 
 /// A fresh, path-safe transaction id derived from the current time + a random
@@ -456,13 +465,15 @@ fn run_approve(
     if let Some(code) = precheck(ecosystem, requirements) {
         return code;
     }
-    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     // Operator policy only (offline / local-only), so a repo-scoped policy cannot
     // weaken the approval; the resolver never reads repo-local pip/uv config.
     let policy = Policy::discover_local_only(cwd.as_deref());
 
-    let expiry = (chrono::Utc::now() + chrono::Duration::seconds(DEFAULT_APPROVAL_TTL_SECS))
-        .to_rfc3339();
+    let expiry =
+        (chrono::Utc::now() + chrono::Duration::seconds(DEFAULT_APPROVAL_TTL_SECS)).to_rfc3339();
     let prepared = match prepare_plan(requirements, target, index_url, &policy, expiry) {
         Ok(p) => p,
         Err(e) => {
@@ -500,10 +511,7 @@ fn run_approve(
                 );
                 eprintln!("  interpreter:  {}", prepared.digest.interpreter);
                 eprintln!("  target env:   {}", prepared.digest.target_environment);
-                eprintln!(
-                    "  DB sequence:  {}",
-                    prepared.digest.threat_db_sequence
-                );
+                eprintln!("  DB sequence:  {}", prepared.digest.threat_db_sequence);
                 eprintln!("  capsule:      {}", prepared.digest.capsule_backend);
                 eprintln!("  expires:      {}", prepared.digest.expiry);
                 eprintln!(
@@ -538,7 +546,9 @@ fn run_install(
     if let Some(code) = precheck(ecosystem, requirements) {
         return code;
     }
-    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let policy = Policy::discover_local_only(cwd.as_deref());
 
     // An install's digest is NOT time-boxed by itself (the install happens now); the
@@ -643,12 +653,7 @@ fn run_install(
         true,
     );
 
-    report_install_outcome(
-        &prepared.digest,
-        &outcome,
-        recorded,
-        json,
-    )
+    report_install_outcome(&prepared.digest, &outcome, recorded, json)
 }
 
 /// Run the contained install honoring the chosen degraded policy. A thin wrapper so
@@ -813,7 +818,9 @@ fn run_verify_env(target: &Path, packages: &[String], json: bool) -> i32 {
         );
         return 2;
     }
-    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let policy = Policy::discover_local_only(cwd.as_deref());
 
     // Normalise the given names with the SAME PEP 503 normaliser the install scope
@@ -1149,7 +1156,10 @@ mod tests {
 
     #[test]
     fn precheck_allows_a_clean_pip_requirement() {
-        assert_eq!(precheck(Ecosystem::Pip, &["requests==2.31.0".to_string()]), None);
+        assert_eq!(
+            precheck(Ecosystem::Pip, &["requests==2.31.0".to_string()]),
+            None
+        );
     }
 
     // ── platform tag extraction ─────────────────────────────────────────────

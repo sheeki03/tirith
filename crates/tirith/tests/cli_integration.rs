@@ -14557,7 +14557,7 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
     }
 
     // Predicate: a `textDocument/publishDiagnostics` notification for `uri`.
-    fn is_publish_for<'a>(uri: &'a str) -> impl Fn(&serde_json::Value) -> bool + 'a {
+    fn is_publish_for(uri: &str) -> impl Fn(&serde_json::Value) -> bool + '_ {
         move |v: &serde_json::Value| {
             v.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
                 && v["params"]["uri"].as_str() == Some(uri)
@@ -14571,6 +14571,10 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
     let empty_bin = home.path().join("empty-bin");
     let _ = fs::create_dir_all(&empty_bin);
 
+    // The child is moved into `child_arc` below and reaped by the watchdog thread
+    // (`try_wait` then `kill`/`wait`); clippy can't see the process through the
+    // `Arc<Mutex<Child>>`, so it false-positives on `zombie_processes`.
+    #[allow(clippy::zombie_processes)]
     let mut child = tirith()
         .arg("lsp")
         // Hermetic env: isolate HOME/XDG/APPDATA and clear every TIRITH_* seam so policy /

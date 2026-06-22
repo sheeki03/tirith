@@ -53,10 +53,10 @@ use std::time::Duration;
 use tirith_core::artifact::inspect::inspect_artifact_file;
 use tirith_core::artifact::InspectionSubject;
 use tirith_core::policy::Policy;
-use tirith_core::threatdb::Ecosystem;
 use tirith_core::provenance::pypi_integrity::{
     AttestationOutcome, PublisherIdentity, PublisherPolicy, SubjectBinding,
 };
+use tirith_core::threatdb::Ecosystem;
 
 /// The PyPI Integrity API base. The provenance for a file lives at
 /// `<base>/<project>/<version>/<filename>/provenance`. A fixed, public HTTPS host;
@@ -86,10 +86,7 @@ pub fn run(wheel: &Path, json: bool) -> i32 {
     let inspected = match inspect_artifact_file(wheel) {
         Ok(i) => i,
         Err(e) => {
-            report_input_error(
-                &format!("the wheel could not be inspected: {e:?}"),
-                json,
-            );
+            report_input_error(&format!("the wheel could not be inspected: {e:?}"), json);
             return 2;
         }
     };
@@ -132,7 +129,9 @@ pub fn run(wheel: &Path, json: bool) -> i32 {
     //    discovery the firewall uses). Today this is the unconstrained default
     //    (there is no operator attestation-policy field yet); it can only TIGHTEN,
     //    so a repo-scoped policy can never relax it.
-    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     let policy = Policy::discover_local_only(cwd.as_deref());
     let publisher_policy = publisher_policy_from(&policy);
 
@@ -448,7 +447,11 @@ fn verify_and_finalize(
     // publisher identity (`claim.identity`) is the value that path checks against
     // `publisher_policy`, so it is referenced here to keep the wiring explicit.
     let _claimed_identity = &claim.identity;
-    let _ = (claim.subject_sha256.as_ref(), artifact_sha256, publisher_policy);
+    let _ = (
+        claim.subject_sha256.as_ref(),
+        artifact_sha256,
+        publisher_policy,
+    );
     AttestationOutcome::Invalid {
         reason: "sigstore verification backend is enabled but the verify call is not yet wired \
                  (F3 spike); refusing to report an unverified bundle as trusted"
@@ -458,7 +461,13 @@ fn verify_and_finalize(
 
 /// Render the attestation outcome for a file in the requested format. Human form to
 /// stderr (a short evidence summary); JSON form to stdout (the machine surface).
-fn render(project: &str, version: &str, artifact_sha256: &str, outcome: &AttestationOutcome, json: bool) {
+fn render(
+    project: &str,
+    version: &str,
+    artifact_sha256: &str,
+    outcome: &AttestationOutcome,
+    json: bool,
+) {
     if json {
         let out = serde_json::json!({
             "project": project,
@@ -489,7 +498,9 @@ fn render(project: &str, version: &str, artifact_sha256: &str, outcome: &Attesta
                 attested_sha256,
                 artifact_sha256,
             } => {
-                eprintln!("  SUBJECT MISMATCH: the attestation covers different bytes than this artifact");
+                eprintln!(
+                    "  SUBJECT MISMATCH: the attestation covers different bytes than this artifact"
+                );
                 eprintln!("    attested: {attested_sha256}");
                 eprintln!("    artifact: {artifact_sha256}");
             }
@@ -598,13 +609,11 @@ mod tests {
     fn url_segment_encoding_contains_no_path_breakout() {
         // A component containing a slash must be percent-encoded into its segment,
         // not expand the path. `url::Url`'s path_segments_mut guarantees this.
-        let url = integrity_provenance_url(
-            "https://pypi.org/integrity",
-            "demo",
-            "1.0",
-            "a/b.whl",
+        let url = integrity_provenance_url("https://pypi.org/integrity", "demo", "1.0", "a/b.whl");
+        assert!(
+            url.contains("a%2Fb.whl"),
+            "slash must be encoded, got {url}"
         );
-        assert!(url.contains("a%2Fb.whl"), "slash must be encoded, got {url}");
         assert!(url.ends_with("/provenance"), "got {url}");
     }
 
@@ -683,7 +692,10 @@ mod tests {
         let body = provenance_json(SHA_A);
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         let claim = extract_attestation_claim(&value).expect("a claim");
-        assert_eq!(claim.identity.repository.as_deref(), Some("pypa/sampleproject"));
+        assert_eq!(
+            claim.identity.repository.as_deref(),
+            Some("pypa/sampleproject")
+        );
         assert_eq!(claim.identity.workflow.as_deref(), Some("release.yml"));
     }
 

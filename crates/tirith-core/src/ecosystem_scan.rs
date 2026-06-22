@@ -2822,11 +2822,7 @@ fn scan_native_modules(
         };
         let sha256 = {
             use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(&bytes);
-            digest
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
+            hex::encode(Sha256::digest(&bytes))
         };
         let location = SubjectLocation::installed(path.clone());
         let handoff = NativeMemberHandoff::Buffered {
@@ -4692,7 +4688,7 @@ version = "1.0.61"
         site
     }
 
-    fn installed_request<'a>(root: &'a Path) -> ScanRequest<'a> {
+    fn installed_request(root: &Path) -> ScanRequest<'_> {
         ScanRequest {
             root,
             db: None,

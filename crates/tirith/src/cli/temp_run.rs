@@ -430,10 +430,7 @@ fn run_in_dir_capsuled(
         )),
         Err(refused) => {
             // AllowDegraded never fails closed, so this is a real spawn error.
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                refused.reason,
-            ))
+            Err(std::io::Error::other(refused.reason))
         }
     }
 }

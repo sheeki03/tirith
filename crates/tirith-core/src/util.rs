@@ -103,15 +103,12 @@ pub fn open_write_no_follow(path: &Path, truncate: bool) -> std::io::Result<File
     }
     #[cfg(not(unix))]
     {
-        use std::io::{Error, ErrorKind};
+        use std::io::Error;
         if std::fs::symlink_metadata(path)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
         {
-            return Err(Error::new(
-                ErrorKind::Other,
-                "refusing to open symlink for write",
-            ));
+            return Err(Error::other("refusing to open symlink for write"));
         }
         std::fs::OpenOptions::new()
             .write(true)
@@ -238,7 +235,7 @@ pub fn sha256_from_handle(mut file: File, budget: u64) -> std::io::Result<HashOu
         hasher.update(&buf[..n]);
     }
     let digest = hasher.finalize();
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = hex::encode(digest);
     Ok(HashOutcome::Digest(hex))
 }
 
@@ -995,10 +992,7 @@ mod no_follow_tests {
         std::fs::write(&p, bytes).unwrap();
 
         // Independent reference digest (NEVER shelling out to sha256sum).
-        let expected: String = Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let expected: String = hex::encode(Sha256::digest(bytes));
 
         // Within budget: the streamed digest matches the reference exactly.
         let f = open_read_no_follow_capped(&p, u64::MAX).unwrap();

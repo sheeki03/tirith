@@ -1287,10 +1287,7 @@ mod tests {
         let path = write_temp(&dir, "demo-1.0-py3-none-any.whl", &bytes);
 
         // Independent reference digest of the exact file bytes (NEVER shelling out).
-        let expected: String = Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let expected: String = hex::encode(Sha256::digest(&bytes));
 
         let inspected = inspect_artifact_file(&path).expect("inspect");
         let recorded = match &inspected.inspection.subject {

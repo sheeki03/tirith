@@ -39,6 +39,13 @@ use serde_json::Value;
 
 /// One element of a `tools/call` result's `content` array: either a known,
 /// typed MCP content block, or an unknown block kept verbatim.
+///
+/// The `Known` variant wraps the rich `rust-mcp-schema` `ContentBlock` (~280B);
+/// `Unknown` holds a small JSON `Value`. The size gap is inherent to the domain,
+/// and this enum is constructed/matched on the content-forwarding path where the
+/// block is re-serialized anyway, so boxing every block to satisfy the heuristic
+/// would add a heap allocation per content element for no real benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum PreservedContent {
     /// A block this build models (text / image / audio / resource-link /

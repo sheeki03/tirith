@@ -19,34 +19,32 @@ pub fn list_checkpoints(json: bool) -> i32 {
                         "{}".to_string()
                     })
                 );
+            } else if entries.is_empty() {
+                println!("No checkpoints found.");
             } else {
-                if entries.is_empty() {
-                    println!("No checkpoints found.");
-                } else {
+                println!(
+                    "{id:<38} {created:<26} {files:<8} {size:<12} Trigger",
+                    id = "ID",
+                    created = "Created",
+                    files = "Files",
+                    size = "Size"
+                );
+                println!("{}", "-".repeat(100));
+                for e in &entries {
+                    let size = format_bytes(e.total_bytes);
+                    let trigger = e
+                        .trigger_command
+                        .as_deref()
+                        .unwrap_or("-")
+                        .chars()
+                        .take(30)
+                        .collect::<String>();
                     println!(
-                        "{id:<38} {created:<26} {files:<8} {size:<12} Trigger",
-                        id = "ID",
-                        created = "Created",
-                        files = "Files",
-                        size = "Size"
+                        "{:<38} {:<26} {:<8} {:<12} {}",
+                        e.id, e.created_at, e.file_count, size, trigger
                     );
-                    println!("{}", "-".repeat(100));
-                    for e in &entries {
-                        let size = format_bytes(e.total_bytes);
-                        let trigger = e
-                            .trigger_command
-                            .as_deref()
-                            .unwrap_or("-")
-                            .chars()
-                            .take(30)
-                            .collect::<String>();
-                        println!(
-                            "{:<38} {:<26} {:<8} {:<12} {}",
-                            e.id, e.created_at, e.file_count, size, trigger
-                        );
-                    }
-                    println!("\n{} checkpoint(s)", entries.len());
                 }
+                println!("\n{} checkpoint(s)", entries.len());
             }
             0
         }

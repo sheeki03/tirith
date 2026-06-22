@@ -166,7 +166,7 @@ struct CacheEnvelope<T> {
 fn cache_path(kind: &str, key: &str) -> Option<PathBuf> {
     let state = policy::state_dir()?;
     let digest = sha2::Sha256::digest(format!("{kind}:{key}").as_bytes());
-    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    let hex: String = hex::encode(&digest[..16]);
     Some(
         state
             .join("threatdb-api-cache")

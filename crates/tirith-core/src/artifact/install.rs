@@ -1402,7 +1402,7 @@ mod tests {
         let txn_dir = PathBuf::from("/q/transactions/txn-1");
         let env = PathBuf::from("/venv");
         let prefix = PathBuf::from("/usr");
-        let spec = build_install_spec(&txn_dir, &env, &[prefix.clone()]);
+        let spec = build_install_spec(&txn_dir, &env, std::slice::from_ref(&prefix));
         // Deny-all network: an install needs no egress.
         assert!(matches!(spec.network, NetworkPolicy::DenyAll));
         // The target environment is writable; the txn dir + interpreter prefix are

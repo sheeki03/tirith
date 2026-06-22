@@ -1321,7 +1321,7 @@ fn resolve_with_parser(
     None
 }
 
-fn resolve_step_generic<'a>(args: &'a [String], shell: ShellType) -> ResolveStep<'a> {
+fn resolve_step_generic(args: &[String], shell: ShellType) -> ResolveStep<'_> {
     let mut idx = 0;
     let mut seen_dashdash = false;
     while idx < args.len() {
@@ -1378,7 +1378,7 @@ fn resolve_step_generic<'a>(args: &'a [String], shell: ShellType) -> ResolveStep
     ResolveStep::Stop
 }
 
-fn resolve_step_sudo<'a>(args: &'a [String], shell: ShellType) -> ResolveStep<'a> {
+fn resolve_step_sudo(args: &[String], shell: ShellType) -> ResolveStep<'_> {
     let value_short_flags = ["-u", "-g", "-C", "-D", "-R", "-T"];
     let value_long_flags = [
         "--user",

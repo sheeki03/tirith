@@ -75,6 +75,10 @@ const KEYRING: &[KeyEntry] = &[
     },
 ];
 
+// A build-time guard: the compiled keyring must never be empty. Clippy sees the
+// current literal is non-empty (`const_is_empty`), but the assert exists to fail
+// the build if someone later edits KEYRING down to nothing.
+#[allow(clippy::const_is_empty)]
 const _: () = assert!(!KEYRING.is_empty());
 
 /// Maximum token length accepted before any parsing — DoS guard.

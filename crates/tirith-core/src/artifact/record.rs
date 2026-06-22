@@ -401,7 +401,7 @@ fn member_location(outer: Option<&str>, member: &str) -> SubjectLocation {
 
 /// Lowercase-hex of a digest byte slice (to compare with A4's hex hashes).
 fn hex_of(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    hex::encode(bytes)
 }
 
 /// Build an [`ArtifactSignal`].
@@ -913,10 +913,7 @@ mod tests {
 
     fn sha256_hex(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
-        Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        hex::encode(Sha256::digest(bytes))
     }
 
     /// SHA-256 digest bytes of a slice (for a RECORD hash).

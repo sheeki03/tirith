@@ -2955,9 +2955,11 @@ policy:
         );
         // The surviving set, computed against a parent that carries a credential,
         // drops the credential and keeps the recursion var.
-        let surviving = spec
-            .environment
-            .surviving_vars(["TIRITH_GATEWAY_DEPTH", "AWS_SECRET_ACCESS_KEY", "PATH"].into_iter());
+        let surviving = spec.environment.surviving_vars([
+            "TIRITH_GATEWAY_DEPTH",
+            "AWS_SECRET_ACCESS_KEY",
+            "PATH",
+        ]);
         assert!(surviving.contains("TIRITH_GATEWAY_DEPTH"));
         assert!(
             !surviving.contains("AWS_SECRET_ACCESS_KEY"),
