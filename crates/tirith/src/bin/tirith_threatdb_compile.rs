@@ -1617,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ossv_confidence_mapping() {
+    fn test_ossf_confidence_mapping() {
         // Legacy `database_specific.type` still wins when present, regardless of id.
         assert_eq!(
             ossf_confidence("MAL-2025-6812", Some("MALWARE")),
