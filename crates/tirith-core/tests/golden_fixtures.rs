@@ -1724,6 +1724,23 @@ struct LabScenario {
     tags: Vec<String>,
     #[serde(default)]
     raw_bytes: Vec<u8>,
+    /// G2 artifact-fixture scenarios. When either is set the scenario is driven by
+    /// the artifact pipeline (built in the `tirith` CLI crate, where the wheel
+    /// builder lives), NOT `engine::analyze`, so this engine-side safeguard skips
+    /// it. Coverage for those scenarios lives in the `tirith` crate's
+    /// `lab_artifact_scenarios` integration test.
+    #[serde(default)]
+    artifact_path: Option<String>,
+    #[serde(default)]
+    binary_fixture: Option<String>,
+}
+
+impl LabScenario {
+    /// Whether this scenario is an artifact-fixture scenario (G2). These bypass the
+    /// engine and so are excluded from `test_lab_corpus_reaches_tier3`.
+    fn is_artifact_fixture(&self) -> bool {
+        self.artifact_path.is_some() || self.binary_fixture.is_some()
+    }
 }
 
 fn default_lab_shell() -> String {
@@ -1750,6 +1767,13 @@ fn test_lab_corpus_reaches_tier3() {
     );
 
     for scenario in &file.scenarios {
+        // G2 artifact-fixture scenarios run through the artifact pipeline (built in
+        // the `tirith` crate), not the engine, so this engine-side safeguard cannot
+        // evaluate them; the `tirith` crate's `lab_artifact_scenarios` test does.
+        if scenario.is_artifact_fixture() {
+            continue;
+        }
+
         // Shared `FromStr` impls (one parse table with `cli/lab.rs`); panic-on-unknown.
         let shell: ShellType = scenario.shell.parse().unwrap_or_else(|_| {
             panic!(

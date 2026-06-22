@@ -441,6 +441,7 @@ pub mod init;
 pub mod install;
 pub mod intent;
 pub mod lab;
+pub mod lab_artifacts;
 pub mod last_trigger;
 pub mod license_cmd;
 pub mod logs;

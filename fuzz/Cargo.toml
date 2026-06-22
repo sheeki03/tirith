@@ -48,3 +48,8 @@ doc = false
 name = "byte_scanner"
 path = "fuzz_targets/byte_scanner.rs"
 doc = false
+
+[[bin]]
+name = "artifact_wheel"
+path = "fuzz_targets/artifact_wheel.rs"
+doc = false

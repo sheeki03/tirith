@@ -43,6 +43,18 @@ struct LabScenario {
     tags: Vec<String>,
     #[serde(default)]
     raw_bytes: Vec<u8>,
+    /// Optional on-disk artifact path (relative to `assets/lab_artifacts/`) to
+    /// inspect through the artifact pipeline instead of running `input` through
+    /// `engine::analyze`. Reserved for prebuilt members; the current corpus drives
+    /// the synthetic wheels via `binary_fixture` (G2).
+    #[serde(default)]
+    artifact_path: Option<String>,
+    /// Optional named synthetic artifact fixture (a [`super::lab_artifacts`]
+    /// token). When set, the scenario materializes inert wheel bytes and runs them
+    /// through `inspect_artifact_set` + `all_findings` + `finalize_static_verdict`,
+    /// comparing the resulting action to `expected_action` (G2).
+    #[serde(default)]
+    binary_fixture: Option<String>,
 }
 
 fn default_posix() -> String {
@@ -244,7 +256,20 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
             }
         }
 
-        let verdict = engine::analyze(&ctx);
+        // An artifact-fixture scenario (`binary_fixture`/`artifact_path`) runs the
+        // synthetic wheel bytes through the artifact pipeline; everything else runs
+        // `input` through the engine. A fixture that cannot be resolved/materialized
+        // is a hard corpus/IO error (return 1), like the parse errors above.
+        let verdict = match evaluate_scenario(scenario, &ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "tirith lab: scenario '{}' artifact fixture failed: {e}",
+                    scenario.name
+                );
+                return 1;
+            }
+        };
         let actual = action_to_str(verdict.action);
         let expected = scenario.expected_action.as_str();
         let pass = actual == expected;
@@ -299,6 +324,94 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
     }
 
     i32::from(failed > 0)
+}
+
+/// Produce the verdict for one scenario. An artifact-fixture scenario
+/// (`binary_fixture` or `artifact_path`) materializes inert wheel bytes and runs
+/// them through the artifact pipeline; every other scenario runs `input` through
+/// `engine::analyze`. Returns the on-disk/materialization error string on failure
+/// so the caller can fail the corpus rather than silently pass.
+fn evaluate_scenario(
+    scenario: &LabScenario,
+    ctx: &AnalysisContext,
+) -> Result<tirith_core::verdict::Verdict, String> {
+    match (&scenario.binary_fixture, &scenario.artifact_path) {
+        (Some(_), Some(_)) => {
+            Err("scenario sets both binary_fixture and artifact_path; use exactly one".to_string())
+        }
+        (Some(token), None) => {
+            let fixture =
+                super::lab_artifacts::ArtifactFixture::from_token(token).ok_or_else(|| {
+                    let known: Vec<&str> = super::lab_artifacts::ArtifactFixture::all()
+                        .iter()
+                        .map(|f| f.as_str())
+                        .collect();
+                    format!(
+                        "unknown binary_fixture '{token}' (known: {})",
+                        known.join(", ")
+                    )
+                })?;
+            // Materialize into a per-scenario temp dir, kept alive for the whole
+            // inspection. Inspection re-reads the files from disk, so the guard must
+            // outlive `inspect_artifact_paths`.
+            let dir = tempfile::tempdir()
+                .map_err(|e| format!("could not create temp dir for fixture: {e}"))?;
+            let paths = fixture
+                .materialize(dir.path())
+                .map_err(|e| format!("could not materialize fixture '{token}': {e}"))?;
+            Ok(inspect_artifact_paths(&paths))
+        }
+        (None, Some(rel)) => {
+            // A prebuilt member under assets/lab_artifacts/, located relative to this
+            // crate's manifest dir. Reject path escapes so a corpus typo cannot read
+            // outside the fixtures tree.
+            let path = resolve_artifact_asset(rel)?;
+            Ok(inspect_artifact_paths(&[path]))
+        }
+        (None, None) => Ok(engine::analyze(ctx)),
+    }
+}
+
+/// Inspect a set of on-disk artifact paths through the SAME seam the package
+/// firewall uses (`inspect_artifact_set` -> `all_findings` -> the policy-aware
+/// `finalize_static_verdict`), yielding one verdict. The lab is deterministic and
+/// repo-independent, so it finalizes against a default policy and never reaches the
+/// threat DB (`None`) — the synthetic fixtures must fire on their structural shape
+/// alone, not on any local DB or override.
+fn inspect_artifact_paths(paths: &[std::path::PathBuf]) -> tirith_core::verdict::Verdict {
+    use tirith_core::artifact::inspect::inspect_artifact_set;
+    use tirith_core::escalation::finalize_static_verdict;
+    use tirith_core::policy::Policy;
+    use tirith_core::verdict::Timings;
+
+    let set = inspect_artifact_set(paths);
+    let findings = set.all_findings(None);
+    // Tier 3 by construction (no tier-1 command gate on this seam), mirroring
+    // `crate::artifact::firewall::firewall_resolved_set`.
+    finalize_static_verdict(findings, &Policy::default(), 3, Timings::default())
+}
+
+/// Resolve a corpus `artifact_path` (relative) into an absolute path under
+/// `assets/lab_artifacts/`, rejecting any component that would escape the fixtures
+/// directory (no `..`, no absolute path). A missing file is reported by the
+/// inspection as a coverage gap, so we only guard traversal here.
+fn resolve_artifact_asset(rel: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, Path, PathBuf};
+    let rel_path = Path::new(rel);
+    for comp in rel_path.components() {
+        match comp {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "artifact_path '{rel}' must be a relative path inside assets/lab_artifacts/ (no '..' or absolute components)"
+                ))
+            }
+        }
+    }
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("lab_artifacts");
+    Ok(base.join(rel_path))
 }
 
 fn action_to_str(action: Action) -> &'static str {
@@ -450,5 +563,130 @@ mod tests {
         // warn_ack collapses to "warn" in action_to_str, so accepting it would
         // silently always-FAIL (Greptile P1, M5 wave-end review).
         assert!(parse_expected_action("warn_ack").is_err());
+    }
+
+    // ---- G2 artifact-fixture scenarios ----------------------------------------
+    // These run the synthetic wheels through the artifact pipeline; the engine-side
+    // golden_fixtures safeguard skips them, so the equivalent coverage lives here
+    // (this crate owns both the wheel builder and the artifact runner).
+
+    use super::super::lab_artifacts::ArtifactFixture;
+
+    /// Resolve `expected_action` to the same bucket the runner compares against
+    /// (Warn/WarnAck collapse to "warn").
+    fn corpus() -> LabCorpus {
+        toml::from_str(LAB_CORPUS).expect("embedded lab corpus parses")
+    }
+
+    #[test]
+    fn artifact_scenarios_reference_known_fixtures() {
+        // Every binary_fixture token in the corpus must resolve to a real fixture,
+        // and an artifact scenario must not also set artifact_path.
+        let mut artifact_count = 0usize;
+        for s in &corpus().scenarios {
+            if let Some(tok) = &s.binary_fixture {
+                artifact_count += 1;
+                assert!(
+                    ArtifactFixture::from_token(tok).is_some(),
+                    "scenario '{}' references unknown binary_fixture '{}'",
+                    s.name,
+                    tok
+                );
+                assert!(
+                    s.artifact_path.is_none(),
+                    "scenario '{}' sets both binary_fixture and artifact_path",
+                    s.name
+                );
+            }
+        }
+        assert!(
+            artifact_count >= 6,
+            "expected the G2 artifact scenarios in the corpus, found {artifact_count}"
+        );
+    }
+
+    #[test]
+    fn artifact_scenarios_produce_expected_action() {
+        // Drive each artifact scenario through the real pipeline (materialize ->
+        // inspect_artifact_set -> finalize_static_verdict) and assert the action
+        // matches expected_action, bucketing Warn/WarnAck like the runner.
+        let bucket = |a: Action| match a {
+            Action::Warn | Action::WarnAck => "warn",
+            Action::Allow => "allow",
+            Action::Block => "block",
+        };
+        for s in &corpus().scenarios {
+            let Some(tok) = &s.binary_fixture else {
+                continue;
+            };
+            let fixture = ArtifactFixture::from_token(tok).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let paths = fixture.materialize(dir.path()).unwrap();
+            let verdict = inspect_artifact_paths(&paths);
+            assert_eq!(
+                bucket(verdict.action),
+                s.expected_action.as_str(),
+                "scenario '{}' ({}): expected {} but pipeline returned {:?} ({} findings: {:?})",
+                s.name,
+                tok,
+                s.expected_action,
+                verdict.action,
+                verdict.findings.len(),
+                verdict
+                    .findings
+                    .iter()
+                    .map(|f| f.rule_id)
+                    .collect::<Vec<_>>(),
+            );
+            // A non-allow artifact scenario must reach tier-3 with a finding, the
+            // same coverage invariant the engine-side safeguard enforces.
+            if s.expected_action != "allow" {
+                assert!(
+                    verdict.tier_reached >= 3,
+                    "scenario '{}': artifact verdict must be tier-3",
+                    s.name
+                );
+                assert!(
+                    !verdict.findings.is_empty(),
+                    "scenario '{}': a blocking artifact scenario must carry a finding",
+                    s.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_path_rejects_traversal() {
+        // A corpus artifact_path must stay inside assets/lab_artifacts/.
+        assert!(resolve_artifact_asset("../../etc/passwd").is_err());
+        assert!(resolve_artifact_asset("/etc/passwd").is_err());
+        // A plain relative member resolves under the fixtures dir.
+        let p = resolve_artifact_asset("pth_cross_runtime.pth").unwrap();
+        assert!(p.ends_with("assets/lab_artifacts/pth_cross_runtime.pth"));
+    }
+
+    #[test]
+    fn evaluate_scenario_rejects_both_fixture_fields() {
+        let mut s = corpus()
+            .scenarios
+            .into_iter()
+            .find(|s| s.binary_fixture.is_some())
+            .expect("an artifact scenario exists");
+        s.artifact_path = Some("pth_cross_runtime.pth".to_string());
+        let ctx = AnalysisContext {
+            input: s.input.clone(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: false,
+            cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        };
+        assert!(evaluate_scenario(&s, &ctx).is_err());
     }
 }

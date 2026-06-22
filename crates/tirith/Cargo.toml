@@ -86,6 +86,11 @@ fs2 = { workspace = true }
 portable-pty = "0.9"
 # Parses the embedded `tirith lab` corpus (assets/lab_corpus.toml).
 toml = "0.8"
+# Builds the synthetic, inert `tirith lab` artifact fixtures (wheels) at lab time
+# (`cli::lab_artifacts`, plan unit G2). Same line tirith-core already depends on
+# (2.x, deflate only); already in the lockfile, no new transitive resolution.
+# License: MIT.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # Synchronous loopback HTTP server for `tirith dashboard serve` (M13 ch3).
 # Bound to 127.0.0.1 ONLY; never exposed off-host.
 tiny_http = { workspace = true }
