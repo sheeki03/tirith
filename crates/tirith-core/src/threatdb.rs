@@ -404,6 +404,11 @@ pub enum UnresolvedReason {
     /// The constraint parsed, but at least one affected version in the record
     /// is not a plain release version we can compare against.
     AffectedVersionUnparsed,
+    /// The record is version-specific (not all-versions-malicious) but enumerates
+    /// NO affected versions, so there is nothing to match or exclude against. Distinct
+    /// from `AffectedVersionUnparsed` (versions present but uncomparable) so a JSON
+    /// consumer can tell MISSING version metadata from a malformed version.
+    AffectedVersionsMissing,
 }
 
 /// Outcome of a constraint-aware package threat assessment.
@@ -1069,7 +1074,7 @@ impl ThreatDb {
         if rec.versions.is_empty() {
             return PackageThreatAssessment::Unresolved {
                 summary,
-                reason: UnresolvedReason::AffectedVersionUnparsed,
+                reason: UnresolvedReason::AffectedVersionsMissing,
                 affected_versions: affected,
             };
         }
@@ -1580,49 +1585,51 @@ fn merge_assessments(
             _ => None,
         }
     };
-    let merge_affected = || {
-        let mut v = affected_from(&primary);
-        v.extend(affected_from(&overlay));
-        v.sort();
-        v.dedup();
-        v
-    };
-
     // 2. Any unresolved layer makes the result unresolved (primary's reason and
-    // summary preferred), carrying the union of affected versions.
+    // summary preferred). The affected versions come from the SAME layer whose summary
+    // is returned, NOT a union of both: the merged finding phrases the list as flagged by
+    // that one summary's `source_label`, so unioning would misattribute an overlay-only
+    // version to the primary's source. (The package is still flagged regardless; only the
+    // affected-version list is scoped to the reported source.)
     let primary_unresolved = matches!(primary, P::Unresolved { .. });
     let overlay_unresolved = matches!(overlay, P::Unresolved { .. });
     if primary_unresolved || overlay_unresolved {
-        let (reason, summary) = if let P::Unresolved {
+        let (reason, summary, affected_versions) = if let P::Unresolved {
             reason, summary, ..
         } = &primary
         {
-            (*reason, summary.clone())
+            (*reason, summary.clone(), affected_from(&primary))
         } else if let P::Unresolved {
             reason, summary, ..
         } = &overlay
         {
-            (*reason, summary.clone())
+            (*reason, summary.clone(), affected_from(&overlay))
         } else {
             unreachable!("one layer is Unresolved")
         };
         return P::Unresolved {
             summary,
             reason,
-            affected_versions: merge_affected(),
+            affected_versions,
         };
     }
 
-    // 3. A concrete intersection in either layer (primary summary preferred).
+    // 3. A concrete intersection in either layer (primary summary preferred). Same
+    // provenance rule: the affected versions come from the layer whose summary is returned.
     let primary_intersects = matches!(primary, P::ConstraintIntersectsAffected { .. });
     let overlay_intersects = matches!(overlay, P::ConstraintIntersectsAffected { .. });
     if primary_intersects || overlay_intersects {
-        let summary = summary_from(&primary)
-            .or_else(|| summary_from(&overlay))
-            .expect("an intersecting layer carries a summary");
+        let (summary, affected_versions) = if let Some(s) = summary_from(&primary) {
+            (s, affected_from(&primary))
+        } else {
+            (
+                summary_from(&overlay).expect("an intersecting layer carries a summary"),
+                affected_from(&overlay),
+            )
+        };
         return P::ConstraintIntersectsAffected {
             summary,
-            affected_versions: merge_affected(),
+            affected_versions,
         };
     }
 
@@ -3546,10 +3553,38 @@ mod tests {
     }
 
     #[test]
-    fn assess_supplemental_unresolved_dedups_affected() {
+    fn assess_record_with_no_versions_is_missing_not_unparsed() {
+        // A version-specific record (not all-versions-malicious) that enumerates NO affected
+        // versions is AffectedVersionsMissing - distinct from AffectedVersionUnparsed (a
+        // present-but-uncomparable version) - so a JSON consumer can tell the two apart.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 9);
+        writer.add_package(
+            Ecosystem::PyPI,
+            "no-vers",
+            &[],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build failed");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
+        let a = db.assess_package(Ecosystem::PyPI, "no-vers", &constraint_intent(">=1.0.0"));
+        match a {
+            PackageThreatAssessment::Unresolved { reason, .. } => {
+                assert_eq!(reason, UnresolvedReason::AffectedVersionsMissing);
+            }
+            other => panic!("expected Unresolved (AffectedVersionsMissing), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_supplemental_merge_keeps_per_layer_affected() {
         // Primary excludes (>=1.4.4 over 1.4.2/1.4.3) but a supplemental overlay
-        // is unresolved for the same name; the merge must surface Unresolved
-        // (never the primary's exclusion) with deduplicated affected versions.
+        // is unresolved for the same name; the merge must surface Unresolved (never the
+        // primary's exclusion). Affected versions come from the SAME layer whose summary is
+        // returned - NOT a union - so a version is never misattributed to another source.
         let key = SigningKey::generate(&mut OsRng);
         let primary_bytes = {
             let mut w = ThreatDbWriter::new(1700000000, 11);
@@ -3594,16 +3629,17 @@ mod tests {
             other => panic!("expected ConstraintIntersectsAffected from overlay, got {other:?}"),
         }
 
-        // An Unspecified request is unresolved in both layers; affected versions
-        // are the deduplicated union across both.
+        // An Unspecified request is unresolved in both layers; the merged result keeps the
+        // PRIMARY layer's summary AND the primary's affected versions (NOT a union), so the
+        // overlay-only version (1.4.9) is not misattributed to the primary's source_label.
         let a2 = db.assess_package(Ecosystem::PyPI, "split-pkg", &VersionIntent::Unspecified);
         match a2 {
             PackageThreatAssessment::Unresolved {
                 affected_versions, ..
             } => {
-                assert_eq!(affected_versions, vec!["1.4.2", "1.4.3", "1.4.9"]);
+                assert_eq!(affected_versions, vec!["1.4.2", "1.4.3"]);
             }
-            other => panic!("expected Unresolved with merged affected, got {other:?}"),
+            other => panic!("expected Unresolved with the primary layer's affected, got {other:?}"),
         }
     }
 
