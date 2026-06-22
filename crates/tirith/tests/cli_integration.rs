@@ -1254,7 +1254,11 @@ fn capability_matrix_is_in_sync() {
     }
 
     let committed = fs::read_to_string(&matrix_path)
-        .unwrap_or_else(|e| panic!("failed reading capability-matrix.md: {e}"));
+        .unwrap_or_else(|e| panic!("failed reading capability-matrix.md: {e}"))
+        // Normalize CRLF -> LF: on Windows, git may check the committed file out with
+        // CRLF (autocrlf), while `rendered` always uses LF. Compare canonically so the
+        // sync check is about content, not the checkout's line-ending policy.
+        .replace("\r\n", "\n");
     assert_eq!(
         committed, rendered,
         "docs/capability-matrix.md is out of sync with docs/capability-manifest.toml. \

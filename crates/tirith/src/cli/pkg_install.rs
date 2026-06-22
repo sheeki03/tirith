@@ -96,6 +96,11 @@ pub enum ContainedInstallError {
     /// running uncontained. The carried message names the backend and the shortfall
     /// (secret-free).
     CapsuleRefused(String),
+    /// The target interpreter does not exist on disk. Caught BEFORE the capsule spawn
+    /// so a missing interpreter fails fast and never re-execs the launcher (the Linux
+    /// backend re-execs the current executable as the capsule child) just to `execve`
+    /// a path that is not there.
+    InterpreterNotFound(PathBuf),
 }
 
 impl std::fmt::Display for ContainedInstallError {
@@ -109,6 +114,13 @@ impl std::fmt::Display for ContainedInstallError {
                     f,
                     "refusing to install: the containment capsule is unavailable or degraded \
                      on this host ({reason})"
+                )
+            }
+            ContainedInstallError::InterpreterNotFound(p) => {
+                write!(
+                    f,
+                    "refusing to install: the target interpreter does not exist: {}",
+                    p.display()
                 )
             }
         }
@@ -162,6 +174,16 @@ pub fn run_contained_install(
     installed_names: &[String],
     policy: &Policy,
 ) -> Result<ContainedInstallOutcome, ContainedInstallError> {
+    // 0. The interpreter must exist before we touch the capsule. A missing
+    //    interpreter is a caller error; catching it here fails fast and, on the Linux
+    //    backend (which re-execs the current executable as the capsule child), avoids
+    //    ever spawning a contained child just to `execve` a path that is not there.
+    if !interpreter.exists() {
+        return Err(ContainedInstallError::InterpreterNotFound(
+            interpreter.to_path_buf(),
+        ));
+    }
+
     // 1. Write approved.txt into the transaction directory (atomic, 0600). The
     //    write helper writes a temp INSIDE the dir and renames, so a reader sees the
     //    whole file or none.
