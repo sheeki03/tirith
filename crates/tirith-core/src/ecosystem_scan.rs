@@ -663,10 +663,13 @@ fn parse_cargo_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
                     out.push(DeclaredDependency {
                         name: real_name.to_string(),
                         ecosystem: Ecosystem::Crates,
-                        // Cargo semver requirement: not parsed; plain is exact,
-                        // a range stays unresolved.
+                        // A Cargo.toml requirement is a SemVer range: a plain `1.0.193` is
+                        // a caret requirement (^1.0.193); only `=1.0.193` is an exact pin.
+                        // Use from_cargo_version so the manifest scanner resolves the real
+                        // installed version (deps.dev), matching the CLI cargo path, rather
+                        // than pinning the literal token as Exact.
                         version: version
-                            .map(|v| VersionIntent::from_explicit_version(&v))
+                            .map(|v| VersionIntent::from_cargo_version(&v))
                             .unwrap_or(VersionIntent::Unspecified),
                         dev,
                     });
@@ -3537,6 +3540,31 @@ cc = "1.0"
         assert!(names.contains(&"cc"));
         let criterion = deps.iter().find(|d| d.name == "criterion").unwrap();
         assert!(criterion.dev);
+    }
+
+    #[test]
+    fn parse_cargo_toml_version_is_a_caret_constraint_not_exact() {
+        // A Cargo.toml requirement is a SemVer range: a plain `serde = "1.0.193"` is a
+        // caret requirement (^1.0.193), NOT an exact pin (only `=1.0.193` is). The manifest
+        // scanner must use from_cargo_version like the CLI cargo path, or it silently
+        // misses a threat whose resolved version differs from the literal token.
+        let text = r#"
+[package]
+name = "app"
+
+[dependencies]
+serde = "1.0.193"
+pinned = "=2.3.4"
+"#;
+        let deps = parse_cargo_toml(text).expect("valid TOML parses");
+        let serde = deps.iter().find(|d| d.name == "serde").unwrap();
+        assert!(
+            matches!(&serde.version, VersionIntent::Constraint { raw, .. } if raw == "1.0.193"),
+            "a plain Cargo.toml version is a caret constraint, got {:?}",
+            serde.version
+        );
+        let pinned = deps.iter().find(|d| d.name == "pinned").unwrap();
+        assert_eq!(pinned.version, VersionIntent::Exact("2.3.4".to_string()));
     }
 
     #[test]
