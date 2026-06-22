@@ -1189,11 +1189,14 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
         // Abort the whole update rather than record a half-validated set. Any
         // coverage gap (oversized / unreadable / unsupported / hash-budget) is
         // treated the same way the old `None` skip was.
-        let result = match tirith_core::scan::scan_single_file(f) {
-            tirith_core::scan::ScanFileOutcome::Scanned(r) => r,
-            tirith_core::scan::ScanFileOutcome::Skipped(_) => {
-                return snapshot_scan_failed_code(json, f)
-            }
+        let result = match tirith_core::scan::scan_single_file_guarded(f) {
+            tirith_core::scan::GuardedScanOutcome::Completed(
+                tirith_core::scan::ScanFileOutcome::Scanned(r),
+            ) => r,
+            // A skip OR a rule panic is a HARD failure: an un-scanned file must not be
+            // recorded as validated, and a rule panic must surface a CONTROLLED failure
+            // code rather than unwinding and aborting the whole `ai snapshot --update`.
+            _ => return snapshot_scan_failed_code(json, f),
         };
         for finding in &result.findings {
             if finding.severity >= Severity::High {
