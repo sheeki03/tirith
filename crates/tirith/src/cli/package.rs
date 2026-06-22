@@ -191,7 +191,12 @@ fn collect_set_wheels(dir: &Path) -> Result<Vec<PathBuf>, i32> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| {
+            // `is_file()` FOLLOWS symlinks: a symlinked `.whl` would pass here, then the
+            // no-follow reader rejects it downstream into `gaps`, leaving `members` empty and
+            // the command exiting 0 (Allow). Require a REAL regular file so an all-symlink set
+            // directory correctly exits 2 ("no .whl files found").
             p.is_file()
+                && !p.is_symlink()
                 && p.extension()
                     .and_then(|e| e.to_str())
                     .is_some_and(|e| e.eq_ignore_ascii_case("whl"))
@@ -221,6 +226,16 @@ fn inspect_artifacts(paths: &[PathBuf], json: bool) -> i32 {
         if !p.exists() {
             eprintln!(
                 "tirith package inspect: artifact not found: {}",
+                p.display()
+            );
+            return 2;
+        }
+        // A path that EXISTS but is not a REGULAR file (a symlink, directory, fifo, ...) would
+        // be rejected by the no-follow reader downstream into `gaps`, leaving `members` empty
+        // and the command exiting 0 (Allow) as if clean. Treat it as a usage error (exit 2).
+        if !p.is_file() || p.is_symlink() {
+            eprintln!(
+                "tirith package inspect: artifact is not a regular file: {}",
                 p.display()
             );
             return 2;
@@ -1017,6 +1032,29 @@ mod tests {
             risk("not-a-real-ecosystem", "react", None, false, false, false),
             2
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_set_wheels_excludes_symlinks() {
+        // A symlinked `.whl` must NOT count as a set member: is_file() follows the link, but the
+        // no-follow reader rejects it downstream into a gap, leaving members empty and the
+        // command exiting 0 (Allow). An all-symlink set directory must exit 2, and a symlink
+        // must not be mistaken for a member when a real wheel is also present.
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real-1.0-py3-none-any.whl");
+        fs::write(&target, b"PK\x03\x04").unwrap();
+        let set_dir = dir.path().join("set");
+        fs::create_dir(&set_dir).unwrap();
+        symlink(&target, set_dir.join("linked-1.0-py3-none-any.whl")).unwrap();
+        // Only a symlinked .whl -> no real members -> Err(2).
+        assert_eq!(collect_set_wheels(&set_dir), Err(2));
+        // A REAL .whl alongside the symlink is collected; the symlink is excluded, not the dir.
+        fs::write(set_dir.join("real2-1.0-py3-none-any.whl"), b"PK\x03\x04").unwrap();
+        let got = collect_set_wheels(&set_dir).expect("a real wheel is present");
+        assert_eq!(got.len(), 1, "symlink excluded, real wheel kept: {got:?}");
+        assert!(got[0].ends_with("real2-1.0-py3-none-any.whl"));
     }
 
     #[test]
