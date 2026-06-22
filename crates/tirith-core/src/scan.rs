@@ -381,6 +381,24 @@ fn inspect_artifact_candidate(
         });
     }
 
+    // A structurally REJECTED wheel (path traversal, encrypted member, CRC failure,
+    // duplicate paths) must NEVER read as clean on the scan path: surface a coverage gap so
+    // `tirith scan` does not exit 0 and report it clean. This mirrors pre-B8 (every wheel
+    // was an Unsupported gap) and the package-inspect path, which forces Block on the same
+    // condition. Any signal findings that DID fire from the partial inspection are returned
+    // alongside the gap. `Unsupported` on a `.whl` is security-relevant, so the gap is not
+    // silently benign.
+    if inspected.rejected {
+        return (
+            results,
+            Some(CoverageGap {
+                location: SubjectLocation::from_path(path.to_path_buf()),
+                kind: CoverageGapKind::Unsupported,
+                sha256: hash_path_within_budget(path),
+            }),
+        );
+    }
+
     // A clean wheel (no findings) still counts as scanned: emit one empty result at
     // the outer wheel path.
     if results.is_empty() {
@@ -1651,6 +1669,56 @@ mod tests {
                 .iter()
                 .any(|r| { !r.findings.is_empty() && r.path.display().to_string().contains("!/") }),
             "an artifact finding must carry a member-qualified `foo.whl!/member` path"
+        );
+    }
+
+    /// B8 re-review: a structurally REJECTED wheel (path traversal) with NO B5/B6/B7 signal
+    /// must NOT scan as clean - it surfaces a coverage gap (mirroring the package-inspect
+    /// Block on the same condition), not a silent pass / exit 0.
+    #[test]
+    fn test_directory_scan_rejected_wheel_is_not_clean() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path();
+        // A wheel whose only payload is a path-traversal entry (not a `.pth`/`.so`/RECORD,
+        // so it fires NO startup/native/integrity signal) plus valid minimal dist-info.
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in [
+            ("../../../etc/cron.d/evil", b"* * * * * root sh\n".as_slice()),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n".as_slice(),
+            ),
+        ] {
+            zw.start_file(name, SimpleFileOptions::default()).unwrap();
+            zw.write_all(body).unwrap();
+        }
+        let wheel_bytes = zw.finish().unwrap().into_inner();
+        std::fs::write(root.join("demo-1.0-py3-none-any.whl"), &wheel_bytes).unwrap();
+
+        let config = ScanConfig {
+            path: root.to_path_buf(),
+            recursive: true,
+            fail_on: Severity::High,
+            ignore_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            max_files: None,
+        };
+        let result = scan(&config);
+
+        // The rejected wheel is surfaced as a coverage gap, NOT a clean inspected result.
+        assert!(
+            result.coverage_gaps.iter().any(|g| g.kind
+                == CoverageGapKind::Unsupported
+                && g.location
+                    .to_string()
+                    .contains("demo-1.0-py3-none-any.whl")),
+            "a structurally rejected wheel must produce a coverage gap, not pass clean: {:?}",
+            result.coverage_gaps
         );
     }
 
