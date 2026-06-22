@@ -454,7 +454,17 @@ fn run_single_file(
 /// and single-file paths so both fail closed identically.
 fn coverage_requires_failure(gaps: &[scan::CoverageGap], policy: &Policy) -> bool {
     use tirith_core::policy::GapAction;
-    if policy.scan.require_complete && gaps.iter().any(scan::gap_is_security_relevant) {
+    // `require_complete` fails on a security-relevant gap, BUT a per-kind `Ignore` action is
+    // an explicit operator override for that kind: an Ignore'd gap produces no
+    // AnalysisIncomplete finding, so it must not fail the run either (else exit 1 pairs with
+    // zero findings). Both this gate and the Fail-action one below exclude Ignore'd gaps, so
+    // the exit decision always matches the findings list.
+    if policy.scan.require_complete
+        && gaps.iter().any(|g| {
+            scan::gap_is_security_relevant(g)
+                && policy.scan.action_for_gap_kind(g.kind) != GapAction::Ignore
+        })
+    {
         return true;
     }
     // A Fail-action gap fails the run ONLY when it is security-relevant. Without this gate,
