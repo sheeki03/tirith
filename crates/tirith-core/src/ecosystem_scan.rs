@@ -514,6 +514,14 @@ fn python_requirement_spec(line: &str) -> String {
             _ => {}
         }
     }
+    // Drop an inline `#` comment (pip treats ` #` / `\t#` as a comment start): without this,
+    // `malware==1.0.0 # pinned` carries the comment into the version token, so an EXACT pin
+    // degrades to a Constraint/Unresolved - a confirmed Critical hit silently downgraded to
+    // a Warn, and a safe pin (`malware==99.9.9 # not the bad one`) gets a spurious warn.
+    let buf = match buf.split_once(" #").or_else(|| buf.split_once("\t#")) {
+        Some((before, _)) => before.trim_end().to_string(),
+        None => buf,
+    };
     // Search for a version operator ONLY in the part before the `;` marker, so a
     // comparator INSIDE the marker (`python_version < "3.9"`) is not mistaken for the
     // dependency's version. When a real operator IS found before the marker, keep the
@@ -2772,6 +2780,23 @@ git+https://github.com/x/y.git
             Some("pkg")
         );
         assert_eq!(python_requirement_name(""), None);
+    }
+
+    #[test]
+    fn python_requirement_spec_strips_inline_comment() {
+        // An inline `#` comment must not leak into the version token: otherwise an EXACT pin
+        // (`malware==1.0.0 # note`) degrades to a Constraint/Unresolved and a confirmed
+        // Critical hit is silently downgraded to a Warn.
+        assert_eq!(
+            python_requirement_spec("malware==1.0.0 # pinned safe version"),
+            "==1.0.0"
+        );
+        assert_eq!(
+            python_requirement_spec("pkg==2.3.4\t# tab comment"),
+            "==2.3.4"
+        );
+        // No inline comment: unchanged (a `#` without leading whitespace is not a comment).
+        assert_eq!(python_requirement_spec("pkg>=1.0,<2.0"), ">=1.0,<2.0");
     }
 
     #[test]
