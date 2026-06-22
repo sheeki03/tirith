@@ -1123,8 +1123,14 @@ impl ThreatDb {
                     // digest, a dist-tag like `latest`, a non-semver selector) still names a
                     // concrete identity. If it LITERALLY equals an affected version that is a
                     // definite malicious hit, not an unresolved guess, so return ExactMatch
-                    // rather than downgrading a known-bad pin to a Medium warning.
-                    if rec.versions.iter().any(|rv| rv == raw) {
+                    // rather than downgrading a known-bad pin to a Medium warning. A raw that
+                    // LOOKS LIKE A PLAIN VERSION is NOT such a token, though: it is a range
+                    // requirement we did not parse (e.g. Cargo's caret default, where
+                    // `1.0.0` means `^1.0.0`), so exact-matching it would wrongly upgrade a
+                    // range request to a confirmed hit. Those stay Unresolved (a warning).
+                    if !crate::version_intent::looks_like_plain_version(raw)
+                        && rec.versions.iter().any(|rv| rv == raw)
+                    {
                         return PackageThreatAssessment::ExactMatch(summary);
                     }
                     return PackageThreatAssessment::Unresolved {
@@ -3577,6 +3583,34 @@ mod tests {
             }
             other => panic!("expected Unresolved (AffectedVersionsMissing), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cargo_caret_constraint_does_not_become_exact_malicious_hit() {
+        // A Cargo plain version is a caret requirement: from_cargo_version("1.0.0") ->
+        // Constraint{parsed:None, raw:"1.0.0"}. Even though raw LITERALLY equals an affected
+        // version in the DB, it must NOT upgrade to a confirmed ExactMatch - it is a RANGE
+        // request, so it stays Unresolved (an overlap warning). The raw-token exact fallback
+        // is only for opaque concrete tokens (digests/dist-tags), not plain versions.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 9);
+        writer.add_package(
+            Ecosystem::Crates,
+            "evil-crate",
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build(&key).expect("build failed");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
+        let caret = VersionIntent::from_cargo_version("1.0.0");
+        let a = db.assess_package(Ecosystem::Crates, "evil-crate", &caret);
+        assert!(
+            matches!(a, PackageThreatAssessment::Unresolved { .. }),
+            "a cargo caret requirement must stay Unresolved, not become an ExactMatch; got {a:?}"
+        );
     }
 
     #[test]
