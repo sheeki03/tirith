@@ -1012,36 +1012,49 @@ fn is_suspicious_url(url: &str) -> bool {
 /// (the basename portion). `lower` is `s` lowercased (for the case-insensitive
 /// extension match). GENERIC: any filename with the extension, not a known name.
 fn sibling_reference(s: &str, lower: &str, ext: &str) -> Option<String> {
-    let pos = lower.find(ext)?;
-    let end = pos + ext.len();
-    // The character after the extension must be a path/word boundary (not another
-    // identifier char), so `.js` does not fire inside `.jsonp`.
-    let after_ok = end >= s.len()
-        || !s
-            .as_bytes()
-            .get(end)
-            .map(|b| b.is_ascii_alphanumeric())
-            .unwrap_or(false);
-    if !after_ok {
-        return None;
-    }
-    // Walk backwards from `pos` to the start of the basename (a separator or quote).
-    let bytes = s.as_bytes();
-    let mut start = pos;
-    while start > 0 {
-        let b = bytes[start - 1];
-        if b == b'/' || b == b'\\' || b == b'"' || b == b'\'' || b == b'`' || b == b' ' || b == b'='
-        {
-            break;
+    // `.js` is a PREFIX of `.json` (likewise `.py`/`.pyc`, `.sh`/`.sha256`,
+    // `.bash`/`.bashrc`), so the FIRST occurrence of `ext` may sit inside a longer
+    // extension whose boundary check fails - yet a LATER occurrence can be a real sibling.
+    // Iterate EVERY occurrence and return the first that passes the boundary and stem
+    // checks; `find` would stop at the first and silently drop the rest.
+    for (pos, _) in lower.match_indices(ext) {
+        let end = pos + ext.len();
+        // The character after the extension must be a path/word boundary (not another
+        // identifier char), so `.js` does not fire inside `.jsonp`.
+        let after_ok = end >= s.len()
+            || !s
+                .as_bytes()
+                .get(end)
+                .map(|b| b.is_ascii_alphanumeric())
+                .unwrap_or(false);
+        if !after_ok {
+            continue;
         }
-        start -= 1;
+        // Walk backwards from `pos` to the start of the basename (a separator or quote).
+        let bytes = s.as_bytes();
+        let mut start = pos;
+        while start > 0 {
+            let b = bytes[start - 1];
+            if b == b'/'
+                || b == b'\\'
+                || b == b'"'
+                || b == b'\''
+                || b == b'`'
+                || b == b' '
+                || b == b'='
+            {
+                break;
+            }
+            start -= 1;
+        }
+        let candidate = &s[start..end];
+        // A bare extension with no stem (`.js`) is not a sibling reference.
+        if candidate.len() <= ext.len() {
+            continue;
+        }
+        return Some(candidate.to_string());
     }
-    let candidate = &s[start..end];
-    // A bare extension with no stem (`.js`) is not a sibling reference.
-    if candidate.len() <= ext.len() {
-        return None;
-    }
-    Some(candidate.to_string())
+    None
 }
 
 /// `true` if `haystack` contains `word` bounded on both sides by a non-identifier
@@ -2260,6 +2273,21 @@ mod tests {
         let mut facts2 = NativeFacts::default();
         scan_one_string("./a/run.js", &mut facts2);
         assert!(facts2.sibling_refs.iter().any(|r| r.ends_with("run.js")));
+    }
+
+    #[test]
+    fn sibling_reference_skips_prefix_extension_to_later_match() {
+        // `.js` is a PREFIX of `.json`: a string with `.json` BEFORE a real `.js` must still
+        // detect the later `.js` sibling. The old `find` stopped at the `.json` occurrence
+        // (its boundary check failed) and silently dropped the real reference, leaving the
+        // spawn+sibling chain undetected.
+        let mut facts = NativeFacts::default();
+        scan_one_string("system(\"./config.json ./payload.js\")", &mut facts);
+        assert!(
+            facts.sibling_refs.iter().any(|r| r.ends_with("payload.js")),
+            "the real ./payload.js sibling must be found past the .json occurrence; got {:?}",
+            facts.sibling_refs
+        );
     }
 
     // ------------------------------------------------------------------
