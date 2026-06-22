@@ -2944,7 +2944,9 @@ fn scan_native_modules(
             .map(|rel| !index.is_owned(&NormalizedInstalledPath::new(rel)))
             .unwrap_or(false);
 
-        let triage = triage_native(&handoff, unowned);
+        // `unowned` (module path in NO RECORD) is a distinct corroborator, NOT a hash
+        // match, so it is passed as the dedicated `unowned` arg (known_malicious = false).
+        let triage = triage_native(&handoff, false, unowned);
         report.native_signals.extend(triage.signals);
         report.native_execution_edges.extend(triage.edges);
         if let Some(finding) = triage.finding {
@@ -5282,6 +5284,23 @@ version = "1.0.61"
         assert!(
             rules.contains(&RuleId::NativeImportExecutionChain),
             "an unowned native module with entry+danger must fire (unowned corroborates); got {rules:?}"
+        );
+        // The corroboration evidence must name the REAL reason (unowned), not a fictitious
+        // "hash match": no SHA-256 threat-DB lookup happened here (Greptile).
+        let chain = report
+            .verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::NativeImportExecutionChain)
+            .expect("chain finding present");
+        let ev = format!("{:?}", chain.evidence);
+        assert!(
+            ev.contains("not listed in any installed RECORD"),
+            "the unowned corroborator must name the real reason; got {ev}"
+        );
+        assert!(
+            !ev.contains("hash match"),
+            "an unowned module must NOT claim a hash match it never performed; got {ev}"
         );
     }
 
