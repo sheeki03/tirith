@@ -170,6 +170,16 @@ impl VersionIntent {
             raw: t.to_string(),
         }
     }
+
+    /// Build an intent from a Ruby Gemfile version requirement (`gem "x", "= 1.0"`,
+    /// `gem "x", "~> 1.0"`). Unlike Cargo, a bare `1.0` and an explicit `= 1.0` are BOTH
+    /// exact pins; `~>`, `>=`, `<`, etc. are ranges. Strip a single leading `=` operator,
+    /// then reuse the plain-or-constraint logic (plain -> Exact, sigil -> Constraint).
+    pub fn from_gem_version(token: &str) -> VersionIntent {
+        let t = token.trim();
+        let stripped = t.strip_prefix('=').map(str::trim).unwrap_or(t);
+        Self::from_explicit_version(stripped)
+    }
 }
 
 /// Whether a token looks like a plain, fully-specified version (an exact pin)
