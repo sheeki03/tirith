@@ -1687,7 +1687,10 @@ mod tests {
         // so it fires NO startup/native/integrity signal) plus valid minimal dist-info.
         let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         for (name, body) in [
-            ("../../../etc/cron.d/evil", b"* * * * * root sh\n".as_slice()),
+            (
+                "../../../etc/cron.d/evil",
+                b"* * * * * root sh\n".as_slice(),
+            ),
             (
                 "demo-1.0.dist-info/METADATA",
                 b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n".as_slice(),
@@ -1712,11 +1715,11 @@ mod tests {
 
         // The rejected wheel is surfaced as a coverage gap, NOT a clean inspected result.
         assert!(
-            result.coverage_gaps.iter().any(|g| g.kind
-                == CoverageGapKind::Unsupported
-                && g.location
-                    .to_string()
-                    .contains("demo-1.0-py3-none-any.whl")),
+            result
+                .coverage_gaps
+                .iter()
+                .any(|g| g.kind == CoverageGapKind::Unsupported
+                    && g.location.to_string().contains("demo-1.0-py3-none-any.whl")),
             "a structurally rejected wheel must produce a coverage gap, not pass clean: {:?}",
             result.coverage_gaps
         );
