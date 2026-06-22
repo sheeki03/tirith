@@ -41,6 +41,10 @@ use tirith_core::artifact::install::{
     verify_post_install_record, DigestInstallPlan, InstallCommand, PostInstallIntegrity,
 };
 use tirith_core::policy::Policy;
+use tirith_core::receipt::{
+    ArtifactScanReceipt, CapsuleReceipt, PostInstallRecordSummary, ReceiptError, RecordedReceipt,
+    VerdictSummary,
+};
 
 use crate::cli::capsule::{self, CapsuleRefused, DegradedPolicy};
 
@@ -60,6 +64,9 @@ pub struct ContainedInstallOutcome {
     pub backend_id: &'static str,
     /// A compact, secret-free description of the coverage actually enforced.
     pub coverage_summary: String,
+    /// The honest per-capability coverage ledger the backend reported, carried
+    /// structured (not just summarised) so the D6 receipt records the real flags.
+    pub coverage: tirith_core::capsule::CapsuleCoverage,
     /// The threat-DB sequence the (re-validated) plan was bound to, carried through
     /// for the receipt.
     pub bound_db_sequence: u64,
@@ -203,10 +210,89 @@ pub fn run_contained_install(
         exit_code: outcome.exit_code,
         backend_id: outcome.backend_id,
         coverage_summary: outcome.coverage_summary(),
+        coverage: outcome.coverage,
         bound_db_sequence: plan.bound_db_sequence,
         approved_requirements_path: approved_path,
         post_install,
     })
+}
+
+/// The already-redacted resolver / package-manager provenance the D6 receipt
+/// records. The caller (D7's `tirith pkg install`) fills these from the D2 resolver
+/// run, having stripped any index credential from the command strings; the receipt
+/// stores them verbatim and NEVER re-derives them from the environment, so a
+/// credential can never leak in through this seam.
+#[derive(Debug, Clone, Default)]
+pub struct ResolverProvenance {
+    /// The resolver command line, redacted (e.g. `"uv pip compile --generate-hashes
+    /// --no-build"`). No index URL with embedded credentials.
+    pub resolver_command: String,
+    /// The resolver tool version (e.g. `uv`'s `--version` output), redacted.
+    pub resolver_version: String,
+    /// The package-manager (pip) version, redacted.
+    pub package_manager_version: String,
+}
+
+/// Build and record the D6 [`ArtifactScanReceipt`] for a completed contained
+/// install, returning the saved path + whether the chain anchor was ed25519-signed.
+///
+/// This is the D6 seam D7 calls after [`run_contained_install`]: it composes the
+/// receipt from
+///
+/// * the redacted policy posture hash ([`Policy::security_projection_hash`]),
+/// * the threat-DB sequence the install bound to (`outcome.bound_db_sequence`),
+/// * the redacted resolver / package-manager provenance (`provenance`),
+/// * the capsule backend + honest coverage (`outcome.backend_id` /
+///   `outcome.coverage`),
+/// * every installed artifact sha256 (`artifact_sha256`),
+/// * the post-install RECORD summary (`outcome.post_install`), and
+/// * the finalised install `verdict` summary,
+///
+/// then calls [`ArtifactScanReceipt::record`]. `require_signature` enforces the
+/// "Ed25519 mandatory for `pkg install`" rule: pass `true` from the enforcing
+/// `pkg install` path so an unsigned audit log fails closed
+/// ([`ReceiptError::SignatureRequiredButUnavailable`]) rather than silently
+/// recording a merely-tamper-evident receipt.
+///
+/// No secret or machine path is recorded: the artifacts are hashes only, the policy
+/// is a redacted hash, the provenance strings are pre-redacted by the caller, and
+/// the verdict is summarised without evidence text.
+pub fn record_install_receipt(
+    outcome: &ContainedInstallOutcome,
+    policy: &Policy,
+    provenance: &ResolverProvenance,
+    artifact_sha256: Vec<String>,
+    verdict: &tirith_core::verdict::Verdict,
+    require_signature: bool,
+) -> Result<RecordedReceipt, ReceiptError> {
+    let post_install_record = outcome
+        .post_install
+        .as_ref()
+        .map(|p| PostInstallRecordSummary {
+            blocked: p.is_block(),
+            distributions_verified: p.distributions_verified,
+            distributions_not_found: p.distributions_not_found,
+            records_missing: p.records_missing,
+            hash_mismatches: p.hash_mismatches,
+        });
+
+    let receipt = ArtifactScanReceipt::new(
+        env!("CARGO_PKG_VERSION").to_string(),
+        policy.security_projection_hash(),
+        outcome.bound_db_sequence,
+        provenance.resolver_command.clone(),
+        provenance.resolver_version.clone(),
+        provenance.package_manager_version.clone(),
+        CapsuleReceipt {
+            backend_id: outcome.backend_id.to_string(),
+            coverage: outcome.coverage,
+        },
+        artifact_sha256,
+        post_install_record,
+        VerdictSummary::from_verdict(verdict),
+    );
+
+    receipt.record(require_signature)
 }
 
 #[cfg(test)]
@@ -343,5 +429,160 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    // ── D6: record_install_receipt ──────────────────────────────────────────
+
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+    use tirith_core::capsule::CapsuleCoverage;
+    use tirith_core::verdict::{Action, Timings, Verdict};
+
+    /// A clean Allow verdict for receipt tests.
+    fn allow_verdict() -> Verdict {
+        Verdict {
+            action: Action::Allow,
+            findings: vec![],
+            tier_reached: 3,
+            timings_ms: Timings::default(),
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
+        }
+    }
+
+    /// A successful contained-install outcome with full coverage + a clean
+    /// post-install record.
+    fn ok_outcome() -> ContainedInstallOutcome {
+        ContainedInstallOutcome {
+            exit_code: 0,
+            backend_id: "landlock-seccomp",
+            coverage_summary: "fs+net+exec".to_string(),
+            coverage: CapsuleCoverage {
+                fs_read_enforced: true,
+                fs_write_enforced: true,
+                exec_limited: true,
+                network_raw_denied: true,
+                domain_proxy_enforced: false,
+                resource_limits_enforced: true,
+                env_isolated: true,
+                handles_isolated: true,
+            },
+            bound_db_sequence: 7,
+            approved_requirements_path: PathBuf::from("/q/txn/approved.txt"),
+            post_install: Some(PostInstallIntegrity {
+                verdict: allow_verdict(),
+                distributions_verified: 2,
+                distributions_not_found: 0,
+                records_missing: 0,
+                hash_mismatches: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn record_install_receipt_writes_redacted_receipt_with_coverage() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        // Isolate every dir env var data_dir()/config_dir() consults.
+        let _g = [
+            EnvGuard::set("XDG_DATA_HOME", root.path()),
+            EnvGuard::set("XDG_CONFIG_HOME", root.path()),
+            EnvGuard::set("XDG_STATE_HOME", root.path()),
+            EnvGuard::set("APPDATA", root.path()),
+            EnvGuard::set("LOCALAPPDATA", root.path()),
+            EnvGuard::set("HOME", root.path()),
+            EnvGuard::set("USERPROFILE", root.path()),
+        ];
+        std::env::set_var("TIRITH_LOG", "1");
+
+        // A policy carrying a secret that must NOT reach the receipt's policy hash.
+        let policy = Policy {
+            policy_server_api_key: Some("ghp_SECRET_TOKEN_42".to_string()),
+            ..Default::default()
+        };
+
+        let provenance = ResolverProvenance {
+            resolver_command: "uv pip compile --generate-hashes --no-build".to_string(),
+            resolver_version: "uv 0.4.0".to_string(),
+            package_manager_version: "pip 24.0".to_string(),
+        };
+        let outcome = ok_outcome();
+        let verdict = allow_verdict();
+
+        // require_signature=false: unsigned (tamper-evident) anchor is acceptable.
+        let recorded = record_install_receipt(
+            &outcome,
+            &policy,
+            &provenance,
+            vec!["a".repeat(64)],
+            &verdict,
+            false,
+        )
+        .expect("record_install_receipt should save + anchor");
+
+        assert!(recorded.path.exists());
+        let json = std::fs::read_to_string(&recorded.path).unwrap();
+        // The receipt carries the redaction-safe fields...
+        assert!(json.contains("\"engine_build_sha\""));
+        assert!(json.contains("landlock-seccomp"));
+        assert!(json.contains("\"threat_db_sequence\": 7"));
+        assert!(json.contains("\"distributions_verified\": 2"));
+        assert!(json.contains("\"network_raw_denied\": true"));
+        assert!(json.contains("uv pip compile")); // pre-redacted provenance command
+                                                  // ...and never the secret token (it is reduced to a policy HASH only).
+        assert!(
+            !json.contains("ghp_SECRET_TOKEN_42"),
+            "the receipt must never serialize the policy server API key: {json}"
+        );
+
+        std::env::remove_var("TIRITH_LOG");
+    }
+
+    #[test]
+    fn record_install_receipt_omits_post_install_on_failed_install() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _g = [
+            EnvGuard::set("XDG_DATA_HOME", root.path()),
+            EnvGuard::set("XDG_CONFIG_HOME", root.path()),
+            EnvGuard::set("APPDATA", root.path()),
+            EnvGuard::set("LOCALAPPDATA", root.path()),
+            EnvGuard::set("HOME", root.path()),
+            EnvGuard::set("USERPROFILE", root.path()),
+        ];
+        std::env::set_var("TIRITH_LOG", "1");
+
+        let mut outcome = ok_outcome();
+        outcome.exit_code = 1;
+        outcome.post_install = None; // a failed install has nothing to verify
+
+        let recorded = record_install_receipt(
+            &outcome,
+            &Policy::default(),
+            &ResolverProvenance::default(),
+            vec!["a".repeat(64)],
+            &allow_verdict(),
+            false,
+        )
+        .expect("record");
+        let json = std::fs::read_to_string(&recorded.path).unwrap();
+        // The post-install field is null when the install failed.
+        assert!(
+            json.contains("\"post_install_record\": null"),
+            "a failed install records no post-install RECORD summary: {json}"
+        );
+
+        std::env::remove_var("TIRITH_LOG");
     }
 }
