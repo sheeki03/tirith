@@ -178,7 +178,7 @@ impl VersionIntent {
 /// prerelease/build tail (`1.2.3`, `1.2.3-beta.1`, `1.2.3+build.5`). Rejects
 /// range sigils (`^ ~ > < = | *`), wildcards (`1.x`), whitespace, and dist-tags
 /// (`latest`).
-fn looks_like_plain_version(t: &str) -> bool {
+pub(crate) fn looks_like_plain_version(t: &str) -> bool {
     // Allow a single leading `v`/`V` so Go's `v1.9.1` stays an exact pin.
     let body = t.strip_prefix(['v', 'V']).unwrap_or(t);
     match body.chars().next() {
