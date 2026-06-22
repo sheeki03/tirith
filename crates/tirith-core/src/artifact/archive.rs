@@ -262,12 +262,27 @@ impl NativeMemberHandoff {
     }
 }
 
-/// A sink the reader calls as it streams members, so a caller (B7) can consume
-/// native handoffs without the reader knowing how the bytes are parsed. The
-/// default no-op impl lets A4's own tests and a metadata-only caller ignore them.
+/// A sink the reader calls as it streams members, so a caller (B7/B8) can consume
+/// member bytes without the reader knowing how they are parsed. Both methods
+/// default to a no-op so A4's own tests and a metadata-only caller ignore them.
 pub trait MemberVisitor {
     /// Called once per native member with its handoff (buffered or streaming).
     fn on_native_member(&mut self, _handoff: NativeMemberHandoff) {}
+
+    /// Called once per SMALL TEXT member that streamed `Complete` within budget and
+    /// is one of the kinds B5/B6 analyze (a `.pth`/`.start` startup file, a
+    /// `sitecustomize.py`/`usercustomize.py`, or a `.dist-info/RECORD`). The reader
+    /// already enforced every budget before this fires, so the bytes are bounded.
+    /// B8's inspection populator uses this to run the startup-hook body analysis and
+    /// the wheel-RECORD verification WITHOUT re-opening the archive. `kind` is the
+    /// member's [`ArtifactFileKind`] so the consumer can dispatch without re-sniffing.
+    fn on_text_member(
+        &mut self,
+        _location: &SubjectLocation,
+        _kind: ArtifactFileKind,
+        _bytes: &[u8],
+    ) {
+    }
 }
 
 /// A visitor that records every native handoff, for tests and for a caller that
@@ -560,6 +575,15 @@ pub fn read_wheel<R: Read + Seek>(
                     if let Some(id) = parse_metadata_identity(&member_label, &bytes) {
                         metadata_identity = Some(id);
                     }
+                }
+
+                // B8: hand small, security-relevant TEXT members (a startup hook or
+                // the dist-info RECORD) to the visitor's text sink for B5/B6 body
+                // analysis, before any move of `bytes`. Native members go to the
+                // native sink instead. Everything else is already accounted for in
+                // `inspection.files`.
+                if is_text_member_of_interest(kind, &member_label) {
+                    visitor.on_text_member(&location, kind, &bytes);
                 }
 
                 // Native member: hand the buffered bytes to B7.
@@ -1014,6 +1038,25 @@ fn classify_member(member: &str) -> ArtifactFileKind {
         return ArtifactFileKind::Script;
     }
     ArtifactFileKind::Other
+}
+
+/// Whether a member is a small TEXT member B5/B6 want the bytes of: a startup hook
+/// (`.pth`/`.start`/`sitecustomize.py`/`usercustomize.py`) for B6 body analysis, or
+/// the `.dist-info/RECORD` for B5 wheel-RECORD verification. A `DistInfoMetadata`
+/// member is handed over ONLY when it is the RECORD file (not every metadata file),
+/// so the visitor is not flooded with METADATA/WHEEL/entry_points bytes it does not
+/// need.
+fn is_text_member_of_interest(kind: ArtifactFileKind, member: &str) -> bool {
+    match kind {
+        ArtifactFileKind::PthFile
+        | ArtifactFileKind::StartFile
+        | ArtifactFileKind::SiteCustomize => true,
+        ArtifactFileKind::DistInfoMetadata => {
+            let base = member.rsplit('/').next().unwrap_or(member);
+            matches!(base, "RECORD" | "RECORD.jws" | "RECORD.p7s")
+        }
+        _ => false,
+    }
 }
 
 /// The result of streaming one member's bytes under the budgets. EVERY variant

@@ -82,6 +82,16 @@ pub mod pth;
 /// [`crate::verdict::RuleId::NativeImportExecutionChain`].
 pub mod native;
 
+/// Correlate an artifact inspection's signals/edges into user-facing findings (PR
+/// B8): the wheel/sdist counterpart of the installed-tree correlation, reusing the
+/// same RuleIds. Holds the DB-gated, feature-gated `ArtifactKnownMalicious` seam.
+pub mod correlate;
+
+/// Artifact I/O entry points (PR B8): inspect a wheel/sdist file (magic sniff ->
+/// A4 reader -> B5/B6/B7 analyzers) and inspect an artifact SET for
+/// cross-distribution loader/payload splits across multiple wheels.
+pub mod inspect;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.
@@ -460,12 +470,13 @@ impl InspectionCoverage {
 /// severity overrides and `action_overrides` are honored at this verdict site,
 /// exactly like `ecosystem_scan` (cross-cutting invariant 5).
 ///
-/// In A3 there are no analyzers and no artifact-specific
-/// [`crate::verdict::RuleId`]s yet, so the signal-to-finding correlation is a
-/// skeleton: it produces no findings. The real correlation (and the
-/// artifact RuleIds it emits) lands with the analyzers in B5 to B8. The
-/// `threat_db` is threaded now so later PRs can resolve hashes/names without a
-/// signature change.
+/// The signal-to-finding correlation is delegated to
+/// [`crate::artifact::correlate::correlate_inspection_findings`] (wired in B8),
+/// which maps the B5/B6 signal sets to their artifact RuleIds and applies the
+/// DB-gated `ArtifactKnownMalicious` hash check; a clean inspection yields no
+/// findings. The `threat_db` is threaded so the hash lookups resolve without a
+/// signature change. The per-member native chains (B7) are folded in by
+/// [`evaluate_inspected_artifact`], not by this bare-inspection entry point.
 pub fn evaluate_artifact(
     inspection: &ArtifactInspection,
     policy: &Policy,
@@ -477,17 +488,42 @@ pub fn evaluate_artifact(
     crate::escalation::finalize_static_verdict(findings, policy, 3, Timings::default())
 }
 
+/// Evaluate an inspection that also carries the per-member native-chain findings
+/// (B7) the byte inspection produced. Identical to [`evaluate_artifact`] except it
+/// folds `native_findings` in alongside the signal-correlated findings, so a wheel
+/// whose `.so` formed a [`crate::verdict::RuleId::NativeImportExecutionChain`]
+/// blocks. The [`crate::artifact::inspect`] path uses this; a caller with only an
+/// inspection (and no native findings) uses [`evaluate_artifact`].
+pub fn evaluate_inspected_artifact(
+    inspection: &ArtifactInspection,
+    native_findings: &[Finding],
+    policy: &Policy,
+    threat_db: Option<&ThreatDb>,
+) -> Verdict {
+    let findings = crate::artifact::correlate::correlate_inspection_findings(
+        inspection,
+        native_findings,
+        threat_db,
+    );
+    crate::escalation::finalize_static_verdict(findings, policy, 3, Timings::default())
+}
+
 /// Correlate the inspection's signals/edges into user-facing findings.
 ///
-/// A3 skeleton: returns no findings. B5 to B8 replace this with the real
-/// correlation that maps signal sets to the artifact RuleIds. Kept as a named
-/// seam (rather than inlined into [`evaluate_artifact`]) so the analyzers extend
-/// one place and `evaluate_artifact` stays the stable policy boundary.
+/// B8 fills the A3 seam: it delegates to
+/// [`crate::artifact::correlate::correlate_inspection_findings`], which maps the
+/// startup-hook (B6) and RECORD/ownership (B5) signal sets to their RuleIds and
+/// applies the DB-gated `ArtifactKnownMalicious` hash check. The per-member native
+/// chains (B7) are decided during byte inspection, not from the merged signal set,
+/// so a caller that has them (the [`crate::artifact::inspect`] path) folds them in
+/// via [`evaluate_inspected_artifact`]; this seam passes an empty native slice
+/// (so [`evaluate_artifact`] on a bare inspection still yields the non-native
+/// findings). A clean inspection has no signals and yields no findings.
 fn correlate_findings(
-    _inspection: &ArtifactInspection,
-    _threat_db: Option<&ThreatDb>,
+    inspection: &ArtifactInspection,
+    threat_db: Option<&ThreatDb>,
 ) -> Vec<Finding> {
-    Vec::new()
+    crate::artifact::correlate::correlate_inspection_findings(inspection, &[], threat_db)
 }
 
 /// Serialize an [`Ecosystem`] as its lowercase name, mirroring

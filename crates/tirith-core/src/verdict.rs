@@ -798,6 +798,28 @@ pub enum RuleId {
     /// Mere native-module presence yields at most an informational signal, never
     /// this finding.
     NativeImportExecutionChain,
+    /// B8 + DB-D: an inspected artifact (a wheel/sdist) or one of its members has a
+    /// SHA-256 that matches a KNOWN-MALICIOUS hash in the threat DB (MITRE T1195
+    /// supply-chain compromise). Emitted by `crate::artifact::evaluate_artifact`
+    /// only when the `artifact-hash-lookup` cargo feature is enabled AND the DB-B
+    /// hash-lookup methods (`ThreatDb::check_artifact_sha256` /
+    /// `check_file_sha256`) resolve a match. Those methods are the DB-B deliverable
+    /// and DO NOT EXIST YET, so this milestone ships the feature OFF by default and
+    /// the emission behind a reserved seam (see `crate::artifact::correlate`); the
+    /// RuleId is therefore UNREACHABLE until the feature + DB land. Registered now
+    /// (the registry tests must see every variant), with NO PATTERN_TABLE entry and
+    /// NO fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`. Critical severity
+    /// (whence the action is Block).
+    ArtifactKnownMalicious,
+    /// A wheel/archive STRUCTURALLY REJECTED by the hardened reader (a path-traversal
+    /// entry, an encrypted member, a CRC mismatch, or a duplicate-path collision) - a hard
+    /// fault the B5/B6/B7 signal correlation does not surface as a finding. `package
+    /// inspect` synthesizes this finding (carrying the violation detail strings) for a
+    /// rejected artifact so the `findings` array is non-empty whenever the action is Block
+    /// due to a rejection (a CI consumer gating on `findings.length` must not pass a
+    /// path-traversal wheel). Triggered by artifact inspection, not a PATTERN_TABLE string,
+    /// so it lives in `EXTERNALLY_TRIGGERED_RULES` with no fixture. High severity.
+    WheelStructurallyRejected,
 }
 
 impl fmt::Display for RuleId {

@@ -90,6 +90,344 @@ pub fn scan(
     )
 }
 
+/// Run `tirith package inspect` — the VERDICT-oriented artifact / installed
+/// inspector (B8b). Unlike `risk`/`explain` (advisory scorers that always exit 0),
+/// this exits scan-style: 0 clean, 1 a block-grade finding, 2 an advisory (warn)
+/// finding, 2 on a usage error.
+///
+/// Modes (mutually exclusive at the CLI):
+/// * one or more `--artifact <file>` — inspect each wheel; with two or more, also
+///   correlate a cross-distribution loader/payload split across them (B8c);
+/// * `--artifact-set <dir>` — inspect every `.whl` in a directory as a set;
+/// * `--installed <dir>` — inspect an installed environment (routes through the
+///   `ecosystem scan --installed` engine, which already runs B5/B6/B7 and the
+///   multi-wheel cross-distribution correlation, B8e).
+pub fn inspect(
+    artifacts: &[PathBuf],
+    artifact_set: Option<&Path>,
+    installed: Option<&Path>,
+    json: bool,
+) -> i32 {
+    // Exactly one mode must be selected. clap marks `--artifact-set`/`--installed`
+    // mutually exclusive; guard the combinations clap cannot express.
+    let mode_count =
+        (!artifacts.is_empty()) as u8 + artifact_set.is_some() as u8 + installed.is_some() as u8;
+    if mode_count == 0 {
+        eprintln!(
+            "tirith package inspect: nothing to inspect. Pass --artifact <file> \
+             (repeatable), --artifact-set <dir>, or --installed <dir>."
+        );
+        return 2;
+    }
+    if mode_count > 1 {
+        eprintln!(
+            "tirith package inspect: choose ONE of --artifact, --artifact-set, or --installed."
+        );
+        return 2;
+    }
+
+    if let Some(venv) = installed {
+        return inspect_installed(venv, json);
+    }
+
+    // Resolve the artifact paths to inspect (explicit list, or every `.whl` in the
+    // set directory).
+    let paths: Vec<PathBuf> = if let Some(dir) = artifact_set {
+        match collect_set_wheels(dir) {
+            Ok(p) => p,
+            Err(code) => return code,
+        }
+    } else {
+        artifacts.to_vec()
+    };
+
+    inspect_artifacts(&paths, json)
+}
+
+/// Inspect an installed environment by routing through the `ecosystem scan
+/// --installed` engine (B8e: it already runs B5/B6/B7 and the cross-distribution
+/// ownership correlation, surfaces the `InstalledIntegrityReport`, and folds the
+/// findings into the verdict / exit code).
+fn inspect_installed(venv: &Path, json: bool) -> i32 {
+    let Some(path_str) = venv.to_str() else {
+        eprintln!(
+            "tirith package inspect: path {:?} is not valid UTF-8; tirith inspects UTF-8 paths only.",
+            venv.display()
+        );
+        return 2;
+    };
+    super::ecosystem::scan(
+        Some(path_str),
+        /* online = */ false,
+        /* offline = */ true,
+        /* installed = */ true,
+        /* max_installed_entries = */ 5000,
+        /* non_interactive = */ true,
+        json,
+    )
+}
+
+/// Collect every `.whl` in `dir` (non-recursive) for `--artifact-set`. Returns an
+/// exit code on a usage error (a missing/unreadable directory, or no wheels).
+fn collect_set_wheels(dir: &Path) -> Result<Vec<PathBuf>, i32> {
+    if !dir.is_dir() {
+        eprintln!(
+            "tirith package inspect: --artifact-set path is not a directory: {}",
+            dir.display()
+        );
+        return Err(2);
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            eprintln!(
+                "tirith package inspect: cannot read --artifact-set directory {}: {e}",
+                dir.display()
+            );
+            return Err(2);
+        }
+    };
+    let mut wheels: Vec<PathBuf> = rd
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            // `is_file()` FOLLOWS symlinks: a symlinked `.whl` would pass here, then the
+            // no-follow reader rejects it downstream into `gaps`, leaving `members` empty and
+            // the command exiting 0 (Allow). Require a REAL regular file so an all-symlink set
+            // directory correctly exits 2 ("no .whl files found").
+            p.is_file()
+                && !p.is_symlink()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("whl"))
+        })
+        .collect();
+    wheels.sort();
+    if wheels.is_empty() {
+        eprintln!(
+            "tirith package inspect: no .whl files found in --artifact-set directory {}",
+            dir.display()
+        );
+        return Err(2);
+    }
+    Ok(wheels)
+}
+
+/// Inspect a list of artifact paths (a single wheel, or a set for
+/// cross-distribution correlation), print the verdict, and return a scan-style
+/// exit code.
+fn inspect_artifacts(paths: &[PathBuf], json: bool) -> i32 {
+    use tirith_core::artifact::inspect::inspect_artifact_set;
+    use tirith_core::verdict::Action;
+
+    // Validate each path exists up front so a typo is a usage error (exit 2), not a
+    // silent coverage gap.
+    for p in paths {
+        if !p.exists() {
+            eprintln!(
+                "tirith package inspect: artifact not found: {}",
+                p.display()
+            );
+            return 2;
+        }
+        // A path that EXISTS but is not a REGULAR file (a symlink, directory, fifo, ...) would
+        // be rejected by the no-follow reader downstream into `gaps`, leaving `members` empty
+        // and the command exiting 0 (Allow) as if clean. Treat it as a usage error (exit 2).
+        if !p.is_file() || p.is_symlink() {
+            eprintln!(
+                "tirith package inspect: artifact is not a regular file: {}",
+                p.display()
+            );
+            return 2;
+        }
+    }
+
+    // The set inspector handles BOTH a single artifact and a set: pass 1 inspects
+    // each independently, pass 2 correlates cross-distribution splits (a no-op for a
+    // single artifact). The threat DB is threaded for the (feature-gated)
+    // known-malicious hash check.
+    let db = ThreatDb::cached();
+    let set = inspect_artifact_set(paths);
+
+    // Discover the operator policy from the first artifact's directory so a strict
+    // integrity policy's overrides are honored on this verdict site too.
+    let policy_root = paths
+        .first()
+        .and_then(|p| p.parent())
+        .map(|p| p.display().to_string());
+    let policy = tirith_core::policy::Policy::discover(policy_root.as_deref());
+
+    let findings = set.all_findings(db.as_deref());
+    let mut verdict = tirith_core::escalation::finalize_static_verdict(
+        findings,
+        &policy,
+        3,
+        tirith_core::verdict::Timings::default(),
+    );
+
+    // A structurally REJECTED artifact (path traversal, duplicate-path collision, an
+    // encrypted member, a CRC mismatch) is a hard archive violation that `all_findings`
+    // (B5/B6/B7 signal correlation) does NOT see. Force Block AND synthesize a
+    // WheelStructurallyRejected finding (carrying the violation details) for each rejected
+    // member, so `findings` is non-empty whenever the action is Block due to a rejection:
+    // a CI consumer gating on `findings.length` (not only the action, exit code, or the
+    // nested `rejected`/`violations` fields) must not pass a path-traversal wheel.
+    for m in set.members.iter().filter(|m| m.inspected.rejected) {
+        verdict.action = Action::Block;
+        let detail = if m.inspected.violation_details.is_empty() {
+            "structural archive violation".to_string()
+        } else {
+            m.inspected.violation_details.join("; ")
+        };
+        verdict.findings.push(tirith_core::verdict::Finding {
+            rule_id: tirith_core::verdict::RuleId::WheelStructurallyRejected,
+            severity: tirith_core::verdict::Severity::High,
+            title: "Wheel structurally rejected".to_string(),
+            description: format!("{}: {}", m.path.display(), detail),
+            evidence: Vec::new(),
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
+    // The verdict's own exit code, computed up front so a write failure can preserve it.
+    let code = match verdict.action {
+        Action::Block => 1,
+        Action::Warn | Action::WarnAck => 2,
+        Action::Allow => 0,
+    };
+
+    let output_ok = if json {
+        print_inspect_json(&set, &verdict)
+    } else {
+        print_inspect_human(&set, &verdict);
+        true
+    };
+
+    // A write failure must not DOWNGRADE a Warn (2) into a block-grade 1, nor pass a
+    // clean scan off as success: surface the verdict's own non-zero code, or 1 when the
+    // scan was clean (mirrors the ecosystem.rs write-failure path).
+    if !output_ok {
+        return if code == 0 { 1 } else { code };
+    }
+    code
+}
+
+/// JSON output for `package inspect`: the verdict (with member-qualified finding
+/// locations carried in evidence) plus per-artifact coverage and the
+/// cross-distribution findings. Returns `false` on a write failure.
+fn print_inspect_json(
+    set: &tirith_core::artifact::inspect::ArtifactSetInspection,
+    verdict: &tirith_core::verdict::Verdict,
+) -> bool {
+    #[derive(serde::Serialize)]
+    struct JsonOut<'a> {
+        schema_version: u32,
+        action: String,
+        artifacts: Vec<JsonArtifact<'a>>,
+        coverage_gaps: Vec<JsonGap>,
+        // The single authoritative finding list (post `action_overrides` escalation), via
+        // `set.all_findings` which already appends the cross-distribution findings. A
+        // separate raw `cross_distribution_findings` field was removed: it duplicated each
+        // cross finding here with its PRE-escalation severity, so a consumer saw the same
+        // finding twice with conflicting severities and no authoritative one.
+        findings: &'a [tirith_core::verdict::Finding],
+    }
+    #[derive(serde::Serialize)]
+    struct JsonArtifact<'a> {
+        path: String,
+        rejected: bool,
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        violations: &'a [String],
+        inspection: &'a tirith_core::artifact::ArtifactInspection,
+    }
+    #[derive(serde::Serialize)]
+    struct JsonGap {
+        location: String,
+        kind: &'static str,
+    }
+
+    let artifacts: Vec<JsonArtifact> = set
+        .members
+        .iter()
+        .map(|m| JsonArtifact {
+            path: m.path.display().to_string(),
+            rejected: m.inspected.rejected,
+            violations: &m.inspected.violation_details,
+            inspection: &m.inspected.inspection,
+        })
+        .collect();
+
+    let out = JsonOut {
+        schema_version: 1,
+        action: format!("{:?}", verdict.action).to_lowercase(),
+        artifacts,
+        coverage_gaps: set
+            .gaps
+            .iter()
+            .map(|g| JsonGap {
+                location: g.location.to_string(),
+                kind: g.kind.as_str(),
+            })
+            .collect(),
+        findings: &verdict.findings,
+    };
+    super::write_json_stdout(&out, "tirith package inspect: failed to write JSON output")
+}
+
+/// Human output for `package inspect`: a per-artifact summary to stderr and the
+/// findings (member-qualified) to stdout, mirroring the `tirith scan` convention.
+fn print_inspect_human(
+    set: &tirith_core::artifact::inspect::ArtifactSetInspection,
+    verdict: &tirith_core::verdict::Verdict,
+) {
+    eprintln!(
+        "tirith package inspect: {} artifact(s) inspected",
+        set.members.len()
+    );
+    for m in &set.members {
+        let status = if m.inspected.rejected {
+            " [REJECTED: structural violation]"
+        } else {
+            ""
+        };
+        eprintln!("  {}{status}", m.path.display());
+        for v in &m.inspected.violation_details {
+            eprintln!("    - {v}");
+        }
+    }
+    for gap in &set.gaps {
+        eprintln!("  not inspected: {} ({})", gap.location, gap.kind.as_str());
+    }
+
+    if verdict.findings.is_empty() {
+        eprintln!();
+        eprintln!("  no artifact risks found.");
+        return;
+    }
+
+    println!();
+    println!("Artifact findings:");
+    for finding in &verdict.findings {
+        let sev = tirith_core::style::severity_label(
+            &finding.severity,
+            tirith_core::style::Stream::Stdout,
+        );
+        println!("  {} {} — {}", sev, finding.rule_id, finding.title);
+        // Surface the member-qualified location lines from the evidence so a
+        // reviewer sees `foo.whl!/member`, not just the outer wheel.
+        for ev in &finding.evidence {
+            if let tirith_core::verdict::Evidence::Text { detail } = ev {
+                if detail.starts_with("location:") || detail.contains("!/") {
+                    println!("    {detail}");
+                }
+            }
+        }
+    }
+}
+
 /// Run `tirith package risk <ecosystem> <name>`. Prints the deterministic risk
 /// score; `path` optionally points at local package content to inspect (else
 /// auto-discovered under `node_modules`/`site-packages`). `online` opts into
@@ -694,6 +1032,29 @@ mod tests {
             risk("not-a-real-ecosystem", "react", None, false, false, false),
             2
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_set_wheels_excludes_symlinks() {
+        // A symlinked `.whl` must NOT count as a set member: is_file() follows the link, but the
+        // no-follow reader rejects it downstream into a gap, leaving members empty and the
+        // command exiting 0 (Allow). An all-symlink set directory must exit 2, and a symlink
+        // must not be mistaken for a member when a real wheel is also present.
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real-1.0-py3-none-any.whl");
+        fs::write(&target, b"PK\x03\x04").unwrap();
+        let set_dir = dir.path().join("set");
+        fs::create_dir(&set_dir).unwrap();
+        symlink(&target, set_dir.join("linked-1.0-py3-none-any.whl")).unwrap();
+        // Only a symlinked .whl -> no real members -> Err(2).
+        assert_eq!(collect_set_wheels(&set_dir), Err(2));
+        // A REAL .whl alongside the symlink is collected; the symlink is excluded, not the dir.
+        fs::write(set_dir.join("real2-1.0-py3-none-any.whl"), b"PK\x03\x04").unwrap();
+        let got = collect_set_wheels(&set_dir).expect("a real wheel is present");
+        assert_eq!(got.len(), 1, "symlink excluded, real wheel kept: {got:?}");
+        assert!(got[0].ends_with("real2-1.0-py3-none-any.whl"));
     }
 
     #[test]

