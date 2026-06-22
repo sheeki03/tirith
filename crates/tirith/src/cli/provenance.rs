@@ -1,10 +1,19 @@
-//! `tirith pkg graph` / `tirith env graph`, the provenance-graph CLI surface
-//! (PR F1).
+//! `tirith pkg graph` / `tirith env graph` (PR F1) and `tirith pkg diff` (PR F2),
+//! the provenance / release-differential CLI surface over package artifacts.
 //!
-//! Both commands COMPOSE already-computed signals into one
+//! The graph commands COMPOSE already-computed signals into one
 //! [`tirith_core::provenance::graph::ProvenanceGraph`] and render it as JSON or
 //! Graphviz DOT. They introduce no new detection and never block: the graph is a
 //! read model that answers ownership / execution / payload questions.
+//!
+//! `pkg diff <old.whl> <new.whl>` (F2) is the one verdict-bearing surface here: it
+//! differences two versions of the same distribution via
+//! [`tirith_core::artifact::release_diff::diff_artifact_files`] (which reuses the
+//! same hardened wheel inspection the graph does) and reports the structural deltas
+//! that mark a benign release turning malicious. Unlike the graph, it routes the
+//! result through the offline operator policy and exits with the verdict's code
+//! (Allow `0`, Warn `2`, Block `1`), so a release anomaly is surfaced and a strict
+//! policy can escalate it.
 //!
 //! * **`pkg graph <wheels...>`** inspects a set of wheel artifacts (reusing the B8
 //!   [`tirith_core::artifact::inspect::inspect_artifact_set`]) and graphs each
@@ -35,9 +44,10 @@ use std::path::{Path, PathBuf};
 use tirith_core::artifact::inspect::inspect_artifact_set;
 use tirith_core::artifact::install::discover_installed_distributions;
 use tirith_core::artifact::record::{index_distribution_ownership, OwnershipIndex};
+use tirith_core::artifact::release_diff::{diff_artifact_files, ReleaseDiff, ReleaseDiffError};
 use tirith_core::artifact::{ArtifactInspection, DistributionIdentity, InspectionSubject};
 use tirith_core::mcp_lock::{build_inventory, McpInventory};
-use tirith_core::policy;
+use tirith_core::policy::{self, Policy};
 use tirith_core::provenance::graph::{ProvenanceGraph, ProvenanceGraphBuilder};
 
 /// How the graph should be rendered.
@@ -94,6 +104,95 @@ pub fn run(target: GraphTarget, format: GraphFormat) -> i32 {
 
     render(&graph, format);
     0
+}
+
+// ---------------------------------------------------------------------------
+// pkg diff (release differential, F2)
+// ---------------------------------------------------------------------------
+
+/// Entry point for `tirith pkg diff <old.whl> <new.whl>`. Inspects both wheels
+/// (reusing the hardened wheel reader), runs the release differential, evaluates
+/// the result under the offline operator policy, and reports the anomalies.
+///
+/// Returns a process exit code: the verdict's exit code (Allow `0`, Warn `2`,
+/// Block `1`) when both wheels inspected, or `2` on a usage / input error (a wheel
+/// that could not be inspected). A clean diff (no anomaly) is an Allow, exit `0`.
+pub fn run_diff(old: &Path, new: &Path, json: bool) -> i32 {
+    let diff = match diff_artifact_files(old, new) {
+        Ok(d) => d,
+        Err(e) => {
+            report_diff_error(&e, json);
+            return 2;
+        }
+    };
+
+    // Evaluate under the offline operator policy (the same discovery the firewall
+    // and verify-env use), so a per-rule severity / action override is honored and
+    // a repo-scoped policy cannot weaken it.
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let policy = Policy::discover_local_only(cwd.as_deref());
+    let verdict = diff.evaluate(&policy);
+    let exit = verdict.action.exit_code();
+
+    if json {
+        let out = serde_json::json!({
+            "old": old.display().to_string(),
+            "new": new.display().to_string(),
+            "action": format!("{:?}", verdict.action),
+            "anomaly_count": diff.anomalies.len(),
+            "anomalies": diff.anomalies,
+            "rule_ids": verdict
+                .findings
+                .iter()
+                .map(|f| f.rule_id.to_string())
+                .collect::<Vec<_>>(),
+        });
+        let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
+        println!();
+    } else {
+        render_diff_human(old, new, &diff, &verdict);
+    }
+
+    exit
+}
+
+/// Report a release-diff input error (a wheel that could not be inspected) in the
+/// requested format.
+fn report_diff_error(err: &ReleaseDiffError, json: bool) {
+    if json {
+        let out = serde_json::json!({
+            "error": err.to_string(),
+        });
+        let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
+        println!();
+    } else {
+        eprintln!("tirith pkg diff: {err}");
+        eprintln!(
+            "  both artifacts must be inspectable wheels; try: tirith pkg diff old.whl new.whl"
+        );
+    }
+}
+
+/// Render the release diff as a short human summary to stderr: the verdict, the
+/// anomaly count, and each anomaly's kind + detail.
+fn render_diff_human(
+    old: &Path,
+    new: &Path,
+    diff: &ReleaseDiff,
+    verdict: &tirith_core::verdict::Verdict,
+) {
+    eprintln!("tirith pkg diff: {} -> {}", old.display(), new.display());
+    eprintln!("  verdict:  {:?}", verdict.action);
+    if diff.anomalies.is_empty() {
+        eprintln!("  no release anomaly: the two releases have the same execution shape");
+        return;
+    }
+    eprintln!("  {} release anomaly(ies):", diff.anomalies.len());
+    for anomaly in &diff.anomalies {
+        eprintln!("    [{}] {}", anomaly.kind.label(), anomaly.detail);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -320,5 +419,105 @@ mod tests {
             "an empty env contributes no distribution nodes"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // pkg diff (F2)
+    // -----------------------------------------------------------------------
+
+    use std::io::Write as _;
+
+    /// Write a minimal `demo` wheel (version `ver`) carrying the EXTRA members
+    /// beyond dist-info, with a correct RECORD, to `<dir>/<filename>`, and return
+    /// the path. Mirrors the core release_diff I/O test helper.
+    fn write_demo_wheel(dir: &Path, ver: &str, extra: &[(&str, &[u8])]) -> PathBuf {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let cell = |body: &[u8]| {
+            let mut h = Sha256::new();
+            h.update(body);
+            format!(
+                "sha256={}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
+            )
+        };
+
+        let metadata =
+            format!("Metadata-Version: 2.1\nName: demo\nVersion: {ver}\n\n").into_bytes();
+        let wheel =
+            b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+                .to_vec();
+        let mut record = format!(
+            "demo-{ver}.dist-info/METADATA,{},{}\ndemo-{ver}.dist-info/WHEEL,{},{}\n",
+            cell(&metadata),
+            metadata.len(),
+            cell(&wheel),
+            wheel.len(),
+        );
+        for (name, body) in extra {
+            record.push_str(&format!("{},{},{}\n", name, cell(body), body.len()));
+        }
+        record.push_str(&format!("demo-{ver}.dist-info/RECORD,,\n"));
+
+        let mut members: Vec<(String, Vec<u8>)> = vec![
+            (format!("demo-{ver}.dist-info/METADATA"), metadata),
+            (format!("demo-{ver}.dist-info/WHEEL"), wheel),
+        ];
+        for (name, body) in extra {
+            members.push((name.to_string(), body.to_vec()));
+        }
+        members.push((format!("demo-{ver}.dist-info/RECORD"), record.into_bytes()));
+
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in &members {
+            zw.start_file(name.as_str(), SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(body).unwrap();
+        }
+        let bytes = zw.finish().unwrap().into_inner();
+        let path = dir.join(format!("demo-{ver}-py3-none-any.whl"));
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    /// `pkg diff` over a pure->native release returns the warn exit code (2): the
+    /// release anomaly is surfaced, not blocked, under the default operator policy.
+    #[test]
+    fn run_diff_pure_to_native_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
+        let so: &[u8] = b"\x7fELF\x02\x01\x01\x00 tiny native body";
+        let new = write_demo_wheel(
+            dir.path(),
+            "1.1",
+            &[("demo/__init__.py", b"x = 1\n"), ("demo/_speed.so", so)],
+        );
+        // JSON form so nothing is written to stderr in the test output.
+        let code = run_diff(&old, &new, true);
+        assert_eq!(code, 2, "a release anomaly warns (exit 2)");
+    }
+
+    /// `pkg diff` over an honest point release (same shape) returns 0.
+    #[test]
+    fn run_diff_clean_release_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
+        let new = write_demo_wheel(dir.path(), "1.1", &[("demo/__init__.py", b"x = 2\n")]);
+        let code = run_diff(&old, &new, true);
+        assert_eq!(code, 0, "a clean diff is an Allow (exit 0)");
+    }
+
+    /// `pkg diff` with an uninspectable input is a usage error (exit 2), not a
+    /// panic.
+    #[test]
+    fn run_diff_bad_input_is_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = write_demo_wheel(dir.path(), "1.1", &[("demo/__init__.py", b"x = 1\n")]);
+        let missing = dir.path().join("nope.whl");
+        let code = run_diff(&missing, &new, true);
+        assert_eq!(code, 2);
     }
 }

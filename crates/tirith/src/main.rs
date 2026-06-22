@@ -5259,6 +5259,37 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Release differential: compare an OLD wheel against a NEW wheel of the same
+    /// distribution and flag the execution-shape changes that mark a benign release
+    /// turning malicious. Local-artifact-only; warns (never auto-blocks) on an
+    /// anomaly, so a strict policy can escalate it.
+    #[command(after_help = "\
+What it flags:
+  A pure-Python release that now ships a compiled extension, a release that newly
+  carries an interpreter-startup hook, a release that now bundles a multi-megabyte
+  JavaScript payload, a changed distribution identity, or a newly-gained execution
+  capability (a startup or native subprocess spawn, a network or runtime download,
+  a native execution entry) the prior release did not have. Each is a heuristic
+  delta, so it warns; the conclusive cases are caught at block strength by
+  inspecting the new wheel directly. No registry or network access.
+
+Examples:
+  tirith pkg diff requests-2.31.0-py3-none-any.whl requests-2.32.0-py3-none-any.whl
+  tirith pkg diff old.whl new.whl --json")]
+    Diff {
+        /// The OLD (prior) wheel artifact.
+        #[arg(value_name = "OLD_WHEEL")]
+        old: std::path::PathBuf,
+        /// The NEW (candidate) wheel artifact.
+        #[arg(value_name = "NEW_WHEEL")]
+        new: std::path::PathBuf,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
     /// List or show the package-firewall tamper-evident receipts.
     #[command(after_help = "\
 Examples:
@@ -6867,6 +6898,18 @@ fn run() {
             };
             cli::provenance::run(target, graph_format)
         }
+        Commands::Pkg {
+            action:
+                PkgAction::Diff {
+                    old,
+                    new,
+                    format,
+                    json,
+                },
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::provenance::run_diff(&old, &new, json)
+        }
         Commands::Pkg { action } => {
             let pkg_action = match action {
                 PkgAction::Approve {
@@ -6946,6 +6989,10 @@ fn run() {
                 // through `cli::provenance::run`), so it can never reach this inner
                 // match.
                 PkgAction::Graph { .. } => unreachable!("pkg graph handled above"),
+                // `Diff` is likewise handled by its own earlier arm (it returns the
+                // release-differential verdict's exit code through
+                // `cli::provenance::run_diff`), so it never reaches here.
+                PkgAction::Diff { .. } => unreachable!("pkg diff handled above"),
             };
             cli::pkg::run(pkg_action)
         }

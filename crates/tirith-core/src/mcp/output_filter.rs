@@ -494,7 +494,10 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::ArtifactKnownMalicious
         // D3 package-firewall download-vs-expected hash mismatch: a structural
         // integrity finding, never an injection seed.
-        | RuleId::ArtifactDownloadIntegrityMismatch => false,
+        | RuleId::ArtifactDownloadIntegrityMismatch
+        // F2 package-firewall release differential anomaly: a structural
+        // execution-shape-change finding, never an injection seed.
+        | RuleId::ArtifactReleaseAnomaly => false,
     }
 }
 

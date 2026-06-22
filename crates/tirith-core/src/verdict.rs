@@ -826,6 +826,24 @@ pub enum RuleId {
     /// PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`. Critical
     /// severity (whence the action is Block).
     ArtifactDownloadIntegrityMismatch,
+    /// F2: a local release differential between two versions of the SAME
+    /// distribution found that the NEW wheel changed its EXECUTION SHAPE versus the
+    /// OLD wheel in a way that, in the live supply-chain campaign, marks a benign
+    /// release turning malicious (MITRE T1195): a pure-Python release that now
+    /// ships a compiled extension, a release that newly carries an
+    /// interpreter-startup hook, a release that now bundles a multi-megabyte
+    /// JavaScript payload, a changed distribution identity, or a newly-gained
+    /// execution capability (a `.pth`/native subprocess spawn, a network/runtime
+    /// download, a native execution entry) the prior release lacked. Each is a
+    /// HEURISTIC delta a legitimate release can sometimes have, so this is MEDIUM
+    /// severity (it WARNS, never auto-blocks; a strict policy can upgrade it via
+    /// `action_overrides`); the conclusive conjunctions are caught at Block strength
+    /// by `python_startup_hook_*` / `native_import_execution_chain` when the new
+    /// wheel is inspected directly. Produced by `crate::artifact::release_diff`
+    /// comparing two on-disk wheels (local-artifact-only), never from a
+    /// command/paste fixture, so it has no PATTERN_TABLE entry and lives in
+    /// `EXTERNALLY_TRIGGERED_RULES`.
+    ArtifactReleaseAnomaly,
 }
 
 impl fmt::Display for RuleId {

@@ -126,6 +126,16 @@ pub mod firewall;
 /// through the fail-closed capsule launcher (never the uncontained install runner).
 pub mod install;
 
+/// Local release differential between two versions of the same distribution (PR
+/// F2): compose the two wheels' already-computed inspections (reusing the A4
+/// [`archive::read_wheel`] via [`inspect::inspect_artifact_file`] and the B5/B6/B7
+/// native/startup signals) and flag the structural deltas that mark a benign
+/// release turning malicious (pure -> native, no-hook -> startup hook, a multi-MB
+/// JavaScript payload, an identity change, a newly-gained execution capability),
+/// correlating them into the single Medium
+/// [`crate::verdict::RuleId::ArtifactReleaseAnomaly`]. Local-artifact-only.
+pub mod release_diff;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.

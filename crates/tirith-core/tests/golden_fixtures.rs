@@ -780,6 +780,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "artifact_known_malicious",
     // D3 package-firewall download-vs-expected hash mismatch (externally triggered)
     "artifact_download_integrity_mismatch",
+    // F2 package-firewall release differential anomaly (externally triggered)
+    "artifact_release_anomaly",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1056,6 +1058,11 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // from a command/paste fixture, so it has no PATTERN_TABLE entry. Covered by
     // unit tests in `artifact/firewall.rs`.
     "artifact_download_integrity_mismatch",
+    // F2: `artifact_release_anomaly` is produced by the package-firewall release
+    // differential (`crate::artifact::release_diff`) comparing two on-disk wheels
+    // of the same distribution, never from a command/paste fixture, so it has no
+    // PATTERN_TABLE entry. Covered by unit tests in `artifact/release_diff.rs`.
+    "artifact_release_anomaly",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1333,6 +1340,8 @@ rule_id_variant_registry! {
     ArtifactKnownMalicious,
     // Package-firewall download-vs-expected hash mismatch (D3, externally triggered)
     ArtifactDownloadIntegrityMismatch,
+    // Package-firewall release differential anomaly (F2, externally triggered)
+    ArtifactReleaseAnomaly,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is

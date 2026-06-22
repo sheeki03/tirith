@@ -1282,6 +1282,9 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "artifact_download_integrity_mismatch",
         "ArtifactDownloadIntegrityMismatch",
     ),
+    // F2 package-firewall release differential anomaly (externally triggered by
+    // `artifact::release_diff` comparing two on-disk wheels; no fixture).
+    ("artifact_release_anomaly", "ArtifactReleaseAnomaly"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
