@@ -1580,49 +1580,51 @@ fn merge_assessments(
             _ => None,
         }
     };
-    let merge_affected = || {
-        let mut v = affected_from(&primary);
-        v.extend(affected_from(&overlay));
-        v.sort();
-        v.dedup();
-        v
-    };
-
     // 2. Any unresolved layer makes the result unresolved (primary's reason and
-    // summary preferred), carrying the union of affected versions.
+    // summary preferred). The affected versions come from the SAME layer whose summary
+    // is returned, NOT a union of both: the merged finding phrases the list as flagged by
+    // that one summary's `source_label`, so unioning would misattribute an overlay-only
+    // version to the primary's source. (The package is still flagged regardless; only the
+    // affected-version list is scoped to the reported source.)
     let primary_unresolved = matches!(primary, P::Unresolved { .. });
     let overlay_unresolved = matches!(overlay, P::Unresolved { .. });
     if primary_unresolved || overlay_unresolved {
-        let (reason, summary) = if let P::Unresolved {
+        let (reason, summary, affected_versions) = if let P::Unresolved {
             reason, summary, ..
         } = &primary
         {
-            (*reason, summary.clone())
+            (*reason, summary.clone(), affected_from(&primary))
         } else if let P::Unresolved {
             reason, summary, ..
         } = &overlay
         {
-            (*reason, summary.clone())
+            (*reason, summary.clone(), affected_from(&overlay))
         } else {
             unreachable!("one layer is Unresolved")
         };
         return P::Unresolved {
             summary,
             reason,
-            affected_versions: merge_affected(),
+            affected_versions,
         };
     }
 
-    // 3. A concrete intersection in either layer (primary summary preferred).
+    // 3. A concrete intersection in either layer (primary summary preferred). Same
+    // provenance rule: the affected versions come from the layer whose summary is returned.
     let primary_intersects = matches!(primary, P::ConstraintIntersectsAffected { .. });
     let overlay_intersects = matches!(overlay, P::ConstraintIntersectsAffected { .. });
     if primary_intersects || overlay_intersects {
-        let summary = summary_from(&primary)
-            .or_else(|| summary_from(&overlay))
-            .expect("an intersecting layer carries a summary");
+        let (summary, affected_versions) = if let Some(s) = summary_from(&primary) {
+            (s, affected_from(&primary))
+        } else {
+            (
+                summary_from(&overlay).expect("an intersecting layer carries a summary"),
+                affected_from(&overlay),
+            )
+        };
         return P::ConstraintIntersectsAffected {
             summary,
-            affected_versions: merge_affected(),
+            affected_versions,
         };
     }
 
