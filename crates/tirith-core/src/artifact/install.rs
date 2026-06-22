@@ -719,6 +719,57 @@ pub fn installed_distribution_names(resolved: &ResolvedSet) -> Vec<String> {
     names
 }
 
+/// Discover EVERY installed distribution under a target environment, returning each
+/// one's `(dist_info_dir, identity)`. Reuses the SAME [`post_install_site_packages`]
+/// venv-layout enumeration the post-install check uses (so the provenance graph and
+/// the integrity check see the same site roots), then lists every `<name>-<version>
+/// .dist-info` in each. Unlike [`locate_installed_dist_info`], this is name-agnostic:
+/// it enumerates the whole environment, for `tirith env graph` (PR F1). A malformed
+/// `.dist-info` directory name is skipped; an unreadable site root contributes
+/// nothing (best-effort, never panics). Results are sorted by `.dist-info` path for
+/// determinism, and de-duplicated so the same distribution dir is not returned twice
+/// when two enumerated site roots happen to overlap.
+pub fn discover_installed_distributions(
+    target_environment: &Path,
+) -> Vec<(PathBuf, DistributionIdentity)> {
+    let mut found: Vec<(PathBuf, DistributionIdentity)> = Vec::new();
+    let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for site in post_install_site_packages(target_environment) {
+        let Ok(rd) = std::fs::read_dir(&site) else {
+            continue;
+        };
+        let mut dist_infos: Vec<PathBuf> = rd
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(".dist-info"))
+            })
+            .collect();
+        dist_infos.sort();
+        for dist_info in dist_infos {
+            if !seen.insert(dist_info.clone()) {
+                continue;
+            }
+            if let Some((proj, version)) = dist_info_name_version(&dist_info) {
+                found.push((
+                    dist_info.clone(),
+                    DistributionIdentity {
+                        ecosystem: Ecosystem::PyPI,
+                        name: proj,
+                        version: Some(version),
+                        dist_info_path: SubjectLocation::installed(dist_info),
+                    },
+                ));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
 /// The `site-packages` roots under a target environment the post-install check
 /// scans, mirroring the venv layouts pip installs into: `<env>/site-packages`,
 /// `<env>/Lib/site-packages` (Windows venv), and `<env>/lib/python*/site-packages`
@@ -1967,7 +2018,9 @@ mod tests {
             ),
             (
                 "different package set",
-                Box::new(|i: &mut InstallPlanInputs| i.normalized_packages = vec!["evil".to_string()]),
+                Box::new(|i: &mut InstallPlanInputs| {
+                    i.normalized_packages = vec!["evil".to_string()]
+                }),
             ),
             (
                 "different interpreter",
@@ -1977,7 +2030,9 @@ mod tests {
             ),
             (
                 "different target env",
-                Box::new(|i: &mut InstallPlanInputs| i.target_environment = PathBuf::from("/other")),
+                Box::new(|i: &mut InstallPlanInputs| {
+                    i.target_environment = PathBuf::from("/other")
+                }),
             ),
             (
                 "different platform tags",
@@ -2078,7 +2133,7 @@ mod tests {
     #[test]
     fn plan_digest_expiry_is_fail_closed() {
         let mut d = InstallPlanDigest::new(plan_inputs()); // expiry 2026-06-22T12:00
-        // Before expiry: live.
+                                                           // Before expiry: live.
         assert!(!d.is_expired_at("2026-06-22T11:59:59+00:00"));
         // At/after expiry: expired.
         assert!(d.is_expired_at("2026-06-22T12:00:00+00:00"));

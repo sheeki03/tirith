@@ -468,6 +468,7 @@ pub mod pkg_install;
 pub mod policy;
 pub mod preview;
 pub mod prompt_status;
+pub mod provenance;
 pub mod receipt;
 pub mod rule;
 pub mod scan;

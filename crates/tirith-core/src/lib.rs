@@ -54,6 +54,7 @@ pub mod policy;
 pub mod policy_client;
 pub mod policy_migrations;
 pub mod policy_validate;
+pub mod provenance;
 pub mod receipt;
 pub mod redact;
 pub mod registry_api;

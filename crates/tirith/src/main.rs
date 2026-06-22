@@ -4418,6 +4418,33 @@ Examples:
         json: bool,
     },
 
+    /// Compose a provenance graph over an installed environment (ownership /
+    /// execution / payload), plus this repo's MCP surface. Read model only.
+    #[command(after_help = "\
+What it shows:
+  The same provenance read model as `tirith pkg graph --installed`: every
+  installed distribution in the environment, the paths each owns, any path two
+  distributions both claim, and this repo's declared MCP servers/tools. It
+  introduces no new detection and never blocks.
+
+Examples:
+  tirith env graph --installed .venv
+  tirith env graph --installed .venv --json
+  tirith env graph --installed .venv --dot")]
+    Graph {
+        /// The installed environment tree to graph (a venv root or `--target` dir).
+        #[arg(long = "installed", value_name = "ENV")]
+        installed: std::path::PathBuf,
+        /// Render as Graphviz DOT.
+        #[arg(long, conflicts_with = "json")]
+        dot: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
     /// Internal: write the shell-start env snapshot (used by the shell hook)
     #[command(hide = true)]
     Snapshot,
@@ -5192,6 +5219,39 @@ Examples:
         /// The distribution names to verify (PEP 503 normalized internally).
         #[arg(trailing_var_arg = true)]
         packages: Vec<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Compose a provenance graph (ownership / execution / payload) over a wheel
+    /// set or an installed environment, plus this repo's MCP surface. Read model
+    /// only: no detection, never blocks.
+    #[command(after_help = "\
+What it shows:
+  A directed graph that answers ownership / execution / payload questions by
+  COMPOSING already-computed signals: each artifact/distribution, the files it
+  carries, the loader -> payload execution edges (a .pth import, a native init, a
+  cross-runtime launch), the duplicate-aware ownership across distributions, and
+  this repo's declared MCP servers/tools. It introduces no new detection.
+
+Examples:
+  tirith pkg graph requests-2.31.0-py3-none-any.whl
+  tirith pkg graph a.whl b.whl --dot
+  tirith pkg graph --installed .venv --json")]
+    Graph {
+        /// Wheel artifact paths to graph (omit when using --installed).
+        #[arg(value_name = "WHEEL")]
+        wheels: Vec<std::path::PathBuf>,
+        /// Graph an installed environment tree (a venv root or `--target` dir)
+        /// instead of wheel files.
+        #[arg(long = "installed", value_name = "ENV")]
+        installed: Option<std::path::PathBuf>,
+        /// Render as Graphviz DOT.
+        #[arg(long, conflicts_with = "json")]
+        dot: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -6789,6 +6849,24 @@ fn run() {
             cli::install::run(source, &args, online, offline, json, yes, no_exec, sha256)
         }
 
+        Commands::Pkg {
+            action:
+                PkgAction::Graph {
+                    wheels,
+                    installed,
+                    dot,
+                    format,
+                    json,
+                },
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            let graph_format = cli::provenance::GraphFormat::resolve(json, dot);
+            let target = match installed {
+                Some(env) => cli::provenance::GraphTarget::InstalledEnv(env),
+                None => cli::provenance::GraphTarget::Wheels(wheels),
+            };
+            cli::provenance::run(target, graph_format)
+        }
         Commands::Pkg { action } => {
             let pkg_action = match action {
                 PkgAction::Approve {
@@ -6863,6 +6941,11 @@ fn run() {
                     };
                     cli::pkg::PkgAction::Receipt { which, json }
                 }
+                // `Graph` is handled by the earlier `Commands::Pkg { action:
+                // PkgAction::Graph { .. } }` arm (it returns its own exit code
+                // through `cli::provenance::run`), so it can never reach this inner
+                // match.
+                PkgAction::Graph { .. } => unreachable!("pkg graph handled above"),
             };
             cli::pkg::run(pkg_action)
         }
@@ -8001,6 +8084,19 @@ fn run() {
             EnvAction::Explain { var, format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::env_guard::explain(&var, json)
+            }
+            EnvAction::Graph {
+                installed,
+                dot,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                let graph_format = cli::provenance::GraphFormat::resolve(json, dot);
+                cli::provenance::run(
+                    cli::provenance::GraphTarget::InstalledEnv(installed),
+                    graph_format,
+                )
             }
             EnvAction::Snapshot => cli::env_guard::snapshot_write(),
         },
