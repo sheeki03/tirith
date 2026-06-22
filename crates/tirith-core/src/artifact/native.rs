@@ -1020,12 +1020,13 @@ fn sibling_reference(s: &str, lower: &str, ext: &str) -> Option<String> {
     for (pos, _) in lower.match_indices(ext) {
         let end = pos + ext.len();
         // The character after the extension must be a path/word boundary (not another
-        // identifier char), so `.js` does not fire inside `.jsonp`.
+        // identifier char), so `.js` does not fire inside `.jsonp`. `_` counts as a
+        // continuation too: `addon.node_v8` is a `.node_v8` token, NOT a `.node` reference.
         let after_ok = end >= s.len()
             || !s
                 .as_bytes()
                 .get(end)
-                .map(|b| b.is_ascii_alphanumeric())
+                .map(|b| b.is_ascii_alphanumeric() || *b == b'_')
                 .unwrap_or(false);
         if !after_ok {
             continue;
@@ -2273,6 +2274,15 @@ mod tests {
         let mut facts2 = NativeFacts::default();
         scan_one_string("./a/run.js", &mut facts2);
         assert!(facts2.sibling_refs.iter().any(|r| r.ends_with("run.js")));
+        // `_` is a token continuation: `addon.node_v8` is a `.node_v8` name, NOT a `.node`
+        // sibling reference, so it must not fire.
+        let mut facts3 = NativeFacts::default();
+        scan_one_string("dlopen(\"addon.node_v8\")", &mut facts3);
+        assert!(
+            facts3.sibling_refs.is_empty(),
+            "'.node' must not match in '.node_v8': {:?}",
+            facts3.sibling_refs
+        );
     }
 
     #[test]
