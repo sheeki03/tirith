@@ -1267,6 +1267,12 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "python_startup_hook_cross_runtime",
         "PythonStartupHookCrossRuntime",
     ),
+    // B7 native import-execution chain (correlated by native triage over an
+    // archive member or installed native module).
+    (
+        "native_import_execution_chain",
+        "NativeImportExecutionChain",
+    ),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[

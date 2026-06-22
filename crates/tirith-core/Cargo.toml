@@ -38,6 +38,23 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 csv = { workspace = true }
 owo-colors = { workspace = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# B7 native binary triage. A vetted, pure-Rust, READ-ONLY object-format parser
+# (gimli-rs/object), used to read ELF / fat (universal) Mach-O / PE+TLS section,
+# symbol, import and init tables from a bounded in-memory buffer. Features are
+# minimized to exactly the formats we triage: no `write`/`build` (we never emit
+# objects), no `compression`/`archive`/`wasm`/`xcoff`. `pe` pulls `coff`. We
+# enable `std` for the borrowed-data `read` API and `std::io::Error`. MSRV: the
+# crate declares rust-version 1.65, under our workspace MSRV 1.83. Reviewed under
+# the repo `cargo deny` gate (Apache-2.0 OR MIT, both allowlisted). This replaces
+# hand-rolling ELF + fat Mach-O + PE/TLS parsing, which is a far larger
+# malformed-input attack surface; `object` is widely fuzzed and read-only.
+object = { version = "0.39", default-features = false, features = [
+    "read_core",
+    "elf",
+    "macho",
+    "pe",
+    "std",
+] }
 arboard = { workspace = true }
 # OS RNG for the per-install anomaly-baseline salt (M10 ch5). Tiny, OS-only
 # entropy source; already present transitively. Used by `baseline::load_or_create_salt`.

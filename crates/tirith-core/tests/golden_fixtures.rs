@@ -774,6 +774,8 @@ const ALL_RULE_IDS: &[&str] = &[
     // B6 Python startup-hook execution (correlated by the installed-tree scan)
     "python_startup_hook_suspicious",
     "python_startup_hook_cross_runtime",
+    // B7 native import-execution chain (correlated by native triage)
+    "native_import_execution_chain",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1026,6 +1028,15 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // installed-tree startup-execution tests.
     "python_startup_hook_suspicious",
     "python_startup_hook_cross_runtime",
+    // B7: `native_import_execution_chain` is correlated by native triage from
+    // `crate::artifact::ArtifactSignalKind`s extracted from a native member's
+    // object-format structure (an archive member via the A4 handoff, or an
+    // installed `.so`/`.pyd`/`.dylib` walked by the installed-tree scan), never
+    // from a command/paste fixture, so it has no PATTERN_TABLE entry. Covered by
+    // unit tests in `artifact/native.rs` (the correlation matrix, a NumPy-shaped
+    // control, the malformed/streaming paths) + the `ecosystem_scan` installed
+    // native-triage test.
+    "native_import_execution_chain",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1297,6 +1308,8 @@ rule_id_variant_registry! {
     PythonInstalledIntegrityViolation,
     // Python startup-hook execution (B6)
     PythonStartupHookSuspicious, PythonStartupHookCrossRuntime,
+    // Native import-execution chain (B7)
+    NativeImportExecutionChain,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is

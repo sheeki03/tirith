@@ -464,7 +464,10 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::AnalysisIncomplete
         | RuleId::PythonInstalledIntegrityViolation
         | RuleId::PythonStartupHookSuspicious
-        | RuleId::PythonStartupHookCrossRuntime => false,
+        | RuleId::PythonStartupHookCrossRuntime
+        // B7 native import-execution chain: a structural artifact finding, not an
+        // injection seed, so it is never downgraded to a redacted Warn.
+        | RuleId::NativeImportExecutionChain => false,
     }
 }
 

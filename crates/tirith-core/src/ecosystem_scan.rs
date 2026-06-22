@@ -1931,6 +1931,10 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
         // runs over the same report's startup signals, folded into the same
         // verdict so policy overrides apply uniformly.
         findings.extend(report.startup_correlated_findings());
+        // B7: the native import-execution-chain findings (built per native module
+        // during the walk) fold into the same verdict, so their Critical action and
+        // any policy overrides apply uniformly with the B5/B6 findings.
+        findings.extend(report.native_correlated_findings());
         Some(report)
     } else {
         None
@@ -2463,6 +2467,23 @@ pub struct InstalledIntegrityReport {
     /// language runtime (Bun/Node/Deno) at interpreter start, the Critical
     /// cross-runtime case.
     pub startup_cross_runtime: bool,
+    /// B7: how many native modules (`.so`/`.pyd`/`.dylib`/`.node`) under the
+    /// site-packages roots were triaged.
+    pub native_modules_triaged: usize,
+    /// B7: the granular native-triage signals collected (native-module presence, a
+    /// native execution entry, a danger capability, corroboration). Correlated into
+    /// the `NativeImportExecutionChain` findings, kept separate from the B5/B6
+    /// signal sets so the three correlations do not interfere.
+    pub native_signals: Vec<crate::artifact::ArtifactSignal>,
+    /// B7: the execution edges discovered from native modules (a module's init
+    /// triggers a sibling payload / launches a runtime). Carried for the JSON report.
+    pub native_execution_edges: Vec<crate::artifact::ExecutionEdge>,
+    /// B7: the correlated native findings (each a Critical
+    /// `NativeImportExecutionChain`). Built during the native walk because the
+    /// per-module conjunction is decided per member; folded into the verdict by
+    /// [`InstalledIntegrityReport::native_correlated_findings`].
+    #[serde(skip)]
+    pub native_findings: Vec<Finding>,
 }
 
 impl InstalledIntegrityReport {
@@ -2701,6 +2722,15 @@ impl InstalledIntegrityReport {
 
         findings
     }
+
+    /// B7: the correlated native findings (each a Critical
+    /// `RuleId::NativeImportExecutionChain`). Built during the native walk because
+    /// the per-module conjunction (execution entry AND danger capability AND
+    /// corroboration) is decided per member; this returns them to fold into the
+    /// verdict. Returns a clone so the report keeps its own copy for the JSON view.
+    fn native_correlated_findings(&self) -> Vec<Finding> {
+        self.native_findings.clone()
+    }
 }
 
 /// The distinct startup-signal-kind wire strings present, sorted, for evidence.
@@ -2804,9 +2834,210 @@ fn collect_installed_integrity(root: &Path, max_entries: usize) -> InstalledInte
         //    signal; `.pth`/`.start`/`.egg-link` are INVENTORY (for B6), not a
         //    finding here.
         scan_site_root_startup(&site, &index, &mut report);
+
+        // 5. B7: walk the site root (bounded) for native modules and triage each.
+        //    The per-member conjunction (execution entry AND danger capability AND
+        //    corroboration) decides whether a Critical NativeImportExecutionChain
+        //    finding is produced; an UNOWNED native module strengthens it.
+        scan_native_modules(&site, &index, &mut report);
     }
 
     report
+}
+
+/// Maximum native-module body size triaged. A member at or under this is read
+/// whole (no-follow) and parsed in full by B7; a larger one is skipped here (the
+/// installed walk does not stream above-cap members — that streaming path is
+/// exercised through the archive reader's handoff). 64 MiB matches the archive
+/// reader's native-parse cap so the two paths agree.
+const MAX_NATIVE_MODULE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum native modules triaged per site-packages root, so a pathological tree
+/// with thousands of `.so` files cannot dominate the scan.
+const MAX_NATIVE_MODULES_PER_SITE: usize = 4096;
+
+/// Maximum directory depth descended under a site-packages root when collecting
+/// native modules (package -> subpackage nesting is shallow in practice).
+const MAX_NATIVE_WALK_DEPTH: usize = 12;
+
+/// Maximum TOTAL filesystem entries visited during the native-module walk (across all
+/// directories), so a tree padded with non-native files cannot force unbounded
+/// read_dir/sort/symlink_metadata work. Far above any real site-packages.
+const MAX_NATIVE_WALK_ENTRIES: usize = 100_000;
+
+/// Walk a `site-packages` root for native modules (`.so`/`.dylib`/`.pyd`/`.node`),
+/// read each whole (no-follow, capped), build an A4-style buffered handoff, and run
+/// B7 triage. Folds the granular native signals, execution edges, and any correlated
+/// `NativeImportExecutionChain` finding into `report`. An UNOWNED native module
+/// (owned by no distribution's RECORD) is a known-malicious-grade corroborator, so
+/// it forces the corroboration leg even without a runtime/sibling/path string.
+fn scan_native_modules(
+    site: &Path,
+    index: &crate::artifact::record::OwnershipIndex,
+    report: &mut InstalledIntegrityReport,
+) {
+    use crate::artifact::archive::NativeMemberHandoff;
+    use crate::artifact::native::triage_native;
+    use crate::artifact::record::NormalizedInstalledPath;
+    use crate::artifact::{ArtifactSignal, ArtifactSignalKind, EdgeConfidence};
+    use crate::location::SubjectLocation;
+    use crate::util::OpenRegularError;
+
+    // Collect native-module paths via a bounded, iterative (non-recursive) walk so
+    // depth and entry count are explicitly capped. We never follow symlinked
+    // directories (we only descend real dirs reported by `read_dir`, and the file
+    // read is no-follow).
+    let mut native_paths: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(site.to_path_buf(), 0)];
+    // Bound the walk by TOTAL filesystem entries visited, not only native hits: an attacker
+    // can plant many NON-native files/dirs between hits, so the native-hit cap alone leaves
+    // read_dir / sort / symlink_metadata work unbounded. `take(remaining)` also caps the
+    // per-directory materialization so one giant directory cannot be fully read into memory.
+    let mut entries_visited = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if native_paths.len() >= MAX_NATIVE_MODULES_PER_SITE
+            || entries_visited >= MAX_NATIVE_WALK_ENTRIES
+        {
+            break;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let remaining = MAX_NATIVE_WALK_ENTRIES.saturating_sub(entries_visited);
+        let mut entries: Vec<PathBuf> = rd
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .take(remaining)
+            .collect();
+        entries.sort();
+        for entry in entries {
+            if native_paths.len() >= MAX_NATIVE_MODULES_PER_SITE
+                || entries_visited >= MAX_NATIVE_WALK_ENTRIES
+            {
+                break;
+            }
+            entries_visited += 1;
+            // `symlink_metadata` does not follow the link, so a symlinked directory is seen as
+            // a symlink (is_dir() is false, so we never descend it - no following out of the
+            // tree). A native-LOOKING non-directory (regular file OR symlink) IS enqueued: a
+            // symlinked `.so`/`.pyd`/`.node` must not be silently skipped. The no-follow capped
+            // read below returns NotRegularFile for the symlink and records a
+            // NativeUninspectable coverage signal, so it is surfaced rather than ignored.
+            let Ok(meta) = std::fs::symlink_metadata(&entry) else {
+                continue;
+            };
+            if meta.file_type().is_dir() && depth < MAX_NATIVE_WALK_DEPTH {
+                stack.push((entry, depth + 1));
+            } else if !meta.file_type().is_dir() && is_native_module_path(&entry) {
+                native_paths.push(entry);
+            }
+        }
+    }
+    native_paths.sort();
+
+    for path in native_paths {
+        // Read the whole module (no-follow, capped). A module OVER the native-parse
+        // cap, a symlinked/non-regular final component, or an I/O error leaves the
+        // module UNINSPECTED. Do not skip silently and do not fabricate an execution
+        // entry: record an HONEST Low-confidence "uninspectable native module" signal
+        // (a partial-coverage marker, not a danger leg) so the gap is visible. The
+        // installed walk does not stream above-cap members (the archive reader owns
+        // that path), so the size-cap case is a real coverage gap here. A vanished
+        // file (a race with the walk) is a benign gap and stays silent. This signal
+        // path does NOT increment `native_modules_triaged`: the module was not
+        // triaged, and counting it would overstate coverage.
+        let bytes = match crate::util::read_text_no_follow_capped(&path, MAX_NATIVE_MODULE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(OpenRegularError::NotFound) => continue,
+            Err(err) => {
+                let reason = match err {
+                    OpenRegularError::TooLarge => "the module exceeds the native-parse size cap",
+                    OpenRegularError::NotRegularFile => {
+                        "a symlinked or non-regular final component (read refused, not followed)"
+                    }
+                    OpenRegularError::Io(_) => "a permission or I/O error",
+                    OpenRegularError::NotFound => unreachable!("NotFound handled above"),
+                };
+                report.native_signals.push(ArtifactSignal {
+                    kind: ArtifactSignalKind::NativeUninspectable,
+                    location: SubjectLocation::installed(path.clone()),
+                    evidence: format!(
+                        "native module could not be triaged ({reason}); its content is unknown, \
+                         not known-clean"
+                    ),
+                    confidence: EdgeConfidence::Low,
+                });
+                continue;
+            }
+        };
+        let sha256 = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(&bytes);
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let location = SubjectLocation::installed(path.clone());
+        let handoff = NativeMemberHandoff::Buffered {
+            location: location.clone(),
+            bytes,
+            sha256,
+        };
+
+        report.native_modules_triaged += 1;
+
+        // An unowned native module (owned by no distribution's RECORD) is a strong
+        // corroborator on its own (the plan lists an unowned native executable as a
+        // High/Critical corroborator). Resolve ownership by the module's path
+        // relative to site-packages.
+        let unowned = path
+            .strip_prefix(site)
+            .ok()
+            .and_then(|rel| rel.to_str())
+            .map(|rel| !index.is_owned(&NormalizedInstalledPath::new(rel)))
+            .unwrap_or(false);
+
+        // `unowned` (module path in NO RECORD) is a distinct corroborator, NOT a hash
+        // match, so it is passed as the dedicated `unowned` arg (known_malicious = false).
+        let triage = triage_native(&handoff, false, unowned);
+        report.native_signals.extend(triage.signals);
+        report.native_execution_edges.extend(triage.edges);
+        if let Some(finding) = triage.finding {
+            report.native_findings.push(finding);
+        }
+    }
+}
+
+/// Whether a path names a native module by extension (`.so`/`.dylib`/`.pyd`/
+/// `.node`), including a versioned ELF shared object (`libfoo.so.3`,
+/// `libbar.so.1.2.3`). Mirrors the archive reader's `NativeModule` classification.
+fn is_native_module_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".dylib")
+        || lower.ends_with(".pyd")
+        || lower.ends_with(".node")
+        || is_versioned_so(&lower)
+}
+
+/// Whether `name` (already lowercased) matches `*.so` with an optional trailing
+/// numeric version chain, i.e. `\.so(\.\d+)*$`: `foo.so`, `libcrypto.so.3`,
+/// `libfoo.so.1.2.3`. Anchored at the END: trailing `.<digits>` segments are
+/// stripped first, then the remainder must end in `.so`, so `foo.sober` and a
+/// non-numeric suffix like `foo.so.dev` do not match.
+fn is_versioned_so(name: &str) -> bool {
+    // Strip trailing `.<digits>` version segments (`.3`, `.1.2.3`).
+    let mut base = name;
+    while let Some((head, last)) = base.rsplit_once('.') {
+        if last.is_empty() || !last.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        base = head;
+    }
+    base.ends_with(".so")
 }
 
 /// Discover every `<name>-<version>.dist-info` directory in a `site-packages`
@@ -4955,6 +5186,342 @@ version = "1.0.61"
         );
     }
 
+    /// Build a minimal real ELF64 shared object exporting `PyInit_<sym>` with a
+    /// non-empty `.init_array` constructor and a `.rodata` carrying `rodata`
+    /// verbatim. Section-header driven so `object`'s reader accepts it; used by the
+    /// B7 live-path installed-scan tests. (A fuller builder with the full layout
+    /// math lives in `artifact::native`'s unit tests; this is the compact variant
+    /// the installed-tree test needs.)
+    fn build_min_elf_so(sym: &str, rodata: &[u8]) -> Vec<u8> {
+        // .dynstr
+        let mut dynstr: Vec<u8> = vec![0];
+        let sym_off = dynstr.len() as u32;
+        dynstr.extend_from_slice(sym.as_bytes());
+        dynstr.push(0);
+        // .dynsym: null + one GLOBAL FUNC.
+        let mut dynsym: Vec<u8> = vec![0u8; 24];
+        dynsym.extend_from_slice(&sym_off.to_le_bytes());
+        dynsym.push(0x12); // STB_GLOBAL|STT_FUNC
+        dynsym.push(0);
+        dynsym.extend_from_slice(&1u16.to_le_bytes());
+        dynsym.extend_from_slice(&0x1000u64.to_le_bytes());
+        dynsym.extend_from_slice(&0u64.to_le_bytes());
+        // .init_array: one non-zero slot (a real constructor).
+        let init_array = 0x1234u64.to_le_bytes().to_vec();
+        // .shstrtab
+        let mut shstrtab: Vec<u8> = vec![0];
+        let name_off = |s: &str, t: &mut Vec<u8>| {
+            let o = t.len() as u32;
+            t.extend_from_slice(s.as_bytes());
+            t.push(0);
+            o
+        };
+        let n_dynsym = name_off(".dynsym", &mut shstrtab);
+        let n_dynstr = name_off(".dynstr", &mut shstrtab);
+        let n_init = name_off(".init_array", &mut shstrtab);
+        let n_rodata = name_off(".rodata", &mut shstrtab);
+        let n_shstr = name_off(".shstrtab", &mut shstrtab);
+        // Layout after 64-byte header.
+        let eh = 64u64;
+        let off_dynsym = eh;
+        let off_dynstr = off_dynsym + dynsym.len() as u64;
+        let off_init = off_dynstr + dynstr.len() as u64;
+        let off_rodata = off_init + init_array.len() as u64;
+        let off_shstr = off_rodata + rodata.len() as u64;
+        let after = off_shstr + shstrtab.len() as u64;
+        let shoff = (after + 7) & !7;
+        // Section headers: NULL, .dynsym(11, link=2, info=1, ent=24), .dynstr(3),
+        // .init_array(14, ent=8), .rodata(1), .shstrtab(3).
+        let secs: [[u64; 8]; 6] = [
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [
+                n_dynsym as u64,
+                11,
+                off_dynsym,
+                dynsym.len() as u64,
+                2,
+                1,
+                24,
+                0,
+            ],
+            [
+                n_dynstr as u64,
+                3,
+                off_dynstr,
+                dynstr.len() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            [
+                n_init as u64,
+                14,
+                off_init,
+                init_array.len() as u64,
+                0,
+                0,
+                8,
+                0,
+            ],
+            [
+                n_rodata as u64,
+                1,
+                off_rodata,
+                rodata.len() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            [
+                n_shstr as u64,
+                3,
+                off_shstr,
+                shstrtab.len() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"\x7fELF");
+        buf.push(2);
+        buf.push(1);
+        buf.push(1);
+        buf.push(0);
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        buf.extend_from_slice(&0x3eu16.to_le_bytes()); // x86-64
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // entry
+        buf.extend_from_slice(&0u64.to_le_bytes()); // phoff
+        buf.extend_from_slice(&shoff.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // flags
+        buf.extend_from_slice(&(eh as u16).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&64u16.to_le_bytes()); // shentsize
+        buf.extend_from_slice(&6u16.to_le_bytes()); // shnum
+        buf.extend_from_slice(&5u16.to_le_bytes()); // shstrndx
+        buf.extend_from_slice(&dynsym);
+        buf.extend_from_slice(&dynstr);
+        buf.extend_from_slice(&init_array);
+        buf.extend_from_slice(rodata);
+        buf.extend_from_slice(&shstrtab);
+        while (buf.len() as u64) < shoff {
+            buf.push(0);
+        }
+        for s in &secs {
+            buf.extend_from_slice(&(s[0] as u32).to_le_bytes()); // name
+            buf.extend_from_slice(&(s[1] as u32).to_le_bytes()); // type
+            buf.extend_from_slice(&0u64.to_le_bytes()); // flags
+            buf.extend_from_slice(&0u64.to_le_bytes()); // addr
+            buf.extend_from_slice(&s[2].to_le_bytes()); // offset
+            buf.extend_from_slice(&s[3].to_le_bytes()); // size
+            buf.extend_from_slice(&(s[4] as u32).to_le_bytes()); // link
+            buf.extend_from_slice(&(s[5] as u32).to_le_bytes()); // info
+            buf.extend_from_slice(&8u64.to_le_bytes()); // addralign
+            buf.extend_from_slice(&s[6].to_le_bytes()); // entsize
+        }
+        buf
+    }
+
+    #[test]
+    fn native_import_execution_chain_fires_on_installed_so() {
+        // B7 LIVE PATH: `ecosystem scan --installed` over a site-packages tree
+        // containing a malicious native module produces NativeImportExecutionChain.
+        let dir = tempfile::tempdir().unwrap();
+        // A malicious .so: PyInit export (execution entry) + .init_array
+        // constructor, and a single co-located command string that LAUNCHES a
+        // runtime against a sibling payload (the danger + corroboration legs, the
+        // campaign's actual pattern).
+        let so = build_min_elf_so("PyInit_evil", b"system(\"node ./loader/_bootstrap.js\")\0");
+        plant_installed_dist(
+            dir.path(),
+            "evilpkg",
+            "1.0.0",
+            &[
+                ("evilpkg/__init__.py", b"from . import _ext\n"),
+                ("evilpkg/_ext.cpython-311-x86_64-linux-gnu.so", &so),
+            ],
+            true,
+            &[],
+        );
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.native_modules_triaged >= 1,
+            "the installed .so must be triaged"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::NativeImportExecutionChain),
+            "a malicious native module must fire NativeImportExecutionChain; got {rules:?}"
+        );
+        // Critical -> Block.
+        let finding = report
+            .verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::NativeImportExecutionChain)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Critical);
+        assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn native_benign_so_no_chain_on_installed() {
+        // A NumPy-shaped .so (PyInit + constructor, only numerical strings) LISTED
+        // in RECORD must NOT fire the chain on the live installed path.
+        let dir = tempfile::tempdir().unwrap();
+        let so = build_min_elf_so(
+            "PyInit__multiarray",
+            b"cblas_dgemm\0numpy.linalg\0_ARRAY_API\0",
+        );
+        plant_installed_dist(
+            dir.path(),
+            "numpyish",
+            "1.26.0",
+            &[
+                ("numpyish/__init__.py", b"from . import _core\n"),
+                ("numpyish/_core.cpython-311-x86_64-linux-gnu.so", &so),
+            ],
+            true,
+            &[],
+        );
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::NativeImportExecutionChain),
+            "a benign numerical .so must produce no native chain; got {rules:?}"
+        );
+        assert_ne!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn native_unowned_so_corroborates_chain_on_installed() {
+        // An UNOWNED native module (not listed in any RECORD) with an execution
+        // entry + a danger capability fires the chain even WITHOUT a runtime/sibling
+        // string, because being unowned is itself the corroborator.
+        let dir = tempfile::tempdir().unwrap();
+        // Plant a benign dist first (so a site-packages exists with an ownership
+        // index), then drop an unowned .so beside it.
+        let site = plant_installed_dist(
+            dir.path(),
+            "host",
+            "1.0",
+            &[("host/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        // The unowned .so: PyInit + constructor + a SUSPICIOUS URL (the danger leg),
+        // but NO co-located runtime launch and NO sensitive path (so string
+        // corroboration is absent). The chain fires only because being UNOWNED is
+        // itself the corroborator.
+        let so = build_min_elf_so("PyInit_orphan", b"https://198.51.100.7:4444/stage2\0");
+        let orphan_dir = site.join("orphan");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("_payload.so"), &so).unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::NativeImportExecutionChain),
+            "an unowned native module with entry+danger must fire (unowned corroborates); got {rules:?}"
+        );
+        // The corroboration evidence must name the REAL reason (unowned), not a fictitious
+        // "hash match": no SHA-256 threat-DB lookup happened here (Greptile).
+        let chain = report
+            .verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::NativeImportExecutionChain)
+            .expect("chain finding present");
+        let ev = format!("{:?}", chain.evidence);
+        assert!(
+            ev.contains("not listed in any installed RECORD"),
+            "the unowned corroborator must name the real reason; got {ev}"
+        );
+        assert!(
+            !ev.contains("hash match"),
+            "an unowned module must NOT claim a hash match it never performed; got {ev}"
+        );
+    }
+
+    #[test]
+    fn oversized_native_module_emits_partial_coverage_signal() {
+        // A native module larger than the native-parse cap (64 MiB) cannot be
+        // triaged on the installed walk (which does not stream above-cap members).
+        // Before the fix it was skipped silently with no gap/signal. It must now
+        // emit an HONEST Low-confidence `NativeUninspectable` partial-coverage
+        // signal (NOT a NativeExecutionEntry, which would claim execution we never
+        // observed), and it must NOT be counted as triaged.
+        let dir = tempfile::tempdir().unwrap();
+        let site = plant_installed_dist(
+            dir.path(),
+            "host",
+            "1.0",
+            &[("host/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        // One synthetic .so strictly over the cap (ELF magic so it is plausibly a
+        // module, though it is never parsed because the read is refused for size).
+        let oversized = (MAX_NATIVE_MODULE_BYTES + 1) as usize;
+        let mut body = vec![0u8; oversized];
+        body[..4].copy_from_slice(b"\x7fELF");
+        std::fs::write(site.join("host").join("_big.so"), &body).unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.native_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::NativeUninspectable
+            )),
+            "an oversized native module must emit the uninspectable partial-coverage signal; got {:?}",
+            integrity
+                .native_signals
+                .iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>()
+        );
+        // The oversized module must NOT count as triaged (it was not).
+        assert_eq!(
+            integrity.native_modules_triaged, 0,
+            "an uninspected oversized module must not be counted as triaged"
+        );
+        // And it must NOT fabricate an execution entry (the dishonest representation
+        // the finding warns against).
+        assert!(
+            !integrity.native_signals.iter().any(|s| matches!(
+                s.kind,
+                crate::artifact::ArtifactSignalKind::NativeExecutionEntry
+            )),
+            "an uninspected module must not claim a native execution entry"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // `N` reads as the version-component placeholder
+    fn versioned_so_N_is_native_module() {
+        // T3.22: a versioned ELF shared object (`libcrypto.so.3`, `libfoo.so.1.2.3`)
+        // is a native module, not just the bare `.so`/`.dylib`/`.pyd`/`.node`.
+        assert!(is_native_module_path(Path::new("/x/libcrypto.so.3")));
+        assert!(is_native_module_path(Path::new("/x/libfoo.so.1.2.3")));
+        assert!(is_native_module_path(Path::new("/x/_core.so")));
+        assert!(is_native_module_path(Path::new("/x/_core.dylib")));
+        assert!(is_native_module_path(Path::new("/x/_core.pyd")));
+        assert!(is_native_module_path(Path::new("/x/addon.node")));
+        // Negatives: a non-numeric suffix or an unrelated extension is not a module.
+        assert!(!is_native_module_path(Path::new("/x/notes.sober")));
+        assert!(!is_native_module_path(Path::new("/x/lib.so.dev")));
+        assert!(!is_native_module_path(Path::new("/x/readme.txt")));
+    }
+
     #[test]
     fn integrity_benign_editable_install_no_block() {
         // An editable install: a sparse RECORD (listing only the dist-info and a
@@ -5396,6 +5963,43 @@ version = "1.0.61"
             "an executing line + subprocess capability must still fire suspicious; got {:?}",
             findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
         );
+    }
+
+    /// native_findings is #[serde(skip)] (folded into the verdict via
+    /// native_correlated_findings, not the JSON report), so it must not appear in the
+    /// serialized report yet must still be returned for the verdict.
+    #[test]
+    fn native_findings_skipped_in_json_but_folded_into_verdict() {
+        use crate::verdict::{Evidence, Finding, Severity};
+        let finding = Finding {
+            rule_id: RuleId::NativeImportExecutionChain,
+            severity: Severity::Critical,
+            title: "native import-execution chain".to_string(),
+            description: "test".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: "test".to_string(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let report = InstalledIntegrityReport {
+            native_findings: vec![finding],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("native_findings"),
+            "native_findings is #[serde(skip)] and must not appear in the JSON report: {json}"
+        );
+        let folded = report.native_correlated_findings();
+        assert_eq!(
+            folded.len(),
+            1,
+            "native_findings must still be folded into the verdict"
+        );
+        assert_eq!(folded[0].rule_id, RuleId::NativeImportExecutionChain);
     }
 
     #[cfg(unix)]

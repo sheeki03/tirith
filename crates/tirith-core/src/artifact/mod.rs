@@ -75,6 +75,13 @@ pub mod record;
 /// signals, and correlates them into the two startup-hook findings.
 pub mod pth;
 
+/// Native binary triage (PR B7): parses the bounded buffer A4 hands off (ELF /
+/// fat Mach-O / PE) with a vetted read-only object library, extracts execution
+/// entries / danger capabilities / corroboration under strict caps without ever
+/// panicking, and correlates the full conjunction into the Critical
+/// [`crate::verdict::RuleId::NativeImportExecutionChain`].
+pub mod native;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.
@@ -347,6 +354,14 @@ pub enum ArtifactSignalKind {
     SitecustomizeUnowned,
     /// An editable install could not be verified against its target.
     EditableInstallUnverified,
+    /// A native module could not be triaged (read refused: a body over the
+    /// native-parse size cap, a symlinked or non-regular final component, or an I/O
+    /// error), so its content is unknown rather than known-clean. Low confidence:
+    /// like [`Self::StartupHookUninspectable`] this is an HONEST partial-coverage
+    /// marker, not a danger leg, and does not on its own promote to a Block. It is
+    /// deliberately NOT a `NativeExecutionEntry`, which would falsely claim an
+    /// execution we never observed.
+    NativeUninspectable,
     /// A native module exposes a direct execution entry (`PyInit_*`, a
     /// constructor, TLS/DllMain).
     NativeExecutionEntry,

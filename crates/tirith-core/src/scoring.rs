@@ -337,7 +337,10 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         // B6: Python startup-hook execution, correlated from artifact signals
         // (structural body analysis), not a threat-DB indicator.
         | RuleId::PythonStartupHookSuspicious
-        | RuleId::PythonStartupHookCrossRuntime => false,
+        | RuleId::PythonStartupHookCrossRuntime
+        // B7: native import-execution chain, correlated from native-triage signals
+        // (structural object-format analysis), not a threat-DB indicator.
+        | RuleId::NativeImportExecutionChain => false,
     }
 }
 
