@@ -40,9 +40,6 @@ const MAX_DB_SIZE: u64 = 256 * 1024 * 1024;
 /// Sanity cap on a v2 index asset's declared `size`, mirroring [`MAX_DB_SIZE`].
 /// An asset claiming more than this is rejected before any download.
 const MAX_INDEX_ASSET_SIZE: u64 = MAX_DB_SIZE;
-/// The highest v2-index manifest_version this build understands; a newer one is
-/// rejected (fail-closed) so an old client falls back to v1 rather than misread it.
-const MAX_MANIFEST_VERSION: u64 = 1;
 const MANIFEST_TIMEOUT_SECS: u64 = 15;
 const DB_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 const SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
@@ -137,13 +134,30 @@ struct IndexAsset {
 /// and discipline apply. Old clients never fetch this and only ever see v1.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct IndexV2 {
-    /// The index schema version. verify_signature rejects a value newer than
-    /// MAX_MANIFEST_VERSION (fail-closed); excluded from the signed canonical_payload.
-    #[serde(default)]
+    // Read in `verify_signature` to fail-closed on a schema we don't understand:
+    // a future `manifest_version` (e.g. 3) is rejected so an old client never
+    // silently accepts an index shape it cannot reason about, and falls back to
+    // v1 instead. Excluded from `canonical_payload`, so it is NOT covered by the
+    // signature; rejecting it here is a parse/shape gate, not an authenticity one.
+    #[serde(default = "default_manifest_version")]
     manifest_version: u64,
     sequence: u64,
     assets: Vec<IndexAsset>,
     signature: String,
+}
+
+/// Highest `manifest_version` of the v2 index this build understands. A higher
+/// value means the publisher moved to a schema this client predates; the client
+/// rejects it and falls back to the legacy v1 manifest. Bump this in lockstep
+/// with any change to the published index shape.
+const MAX_MANIFEST_VERSION: u64 = 1;
+
+/// Default `manifest_version` when the field is absent. The first published v2
+/// indexes always carry `manifest_version: 1`, but an absent field is treated as
+/// 1 (the original schema) rather than 0 so a hand-rolled or legacy index without
+/// the key is still accepted.
+fn default_manifest_version() -> u64 {
+    1
 }
 
 impl IndexV2 {
@@ -177,12 +191,12 @@ impl IndexV2 {
         serde_json::Value::Object(top).to_string()
     }
 
-    /// Verify the index's top-level Ed25519 signature against the pinned key, and
-    /// reject a manifest_version newer than this build understands. The
-    /// manifest_version is NOT covered by the signature (it is excluded from
-    /// `canonical_payload`), so an attacker cannot use it to bypass verification,
-    /// but a legitimately newer publisher schema must make an old client fall back
-    /// to v1 rather than misread the index.
+    /// Verify the index's top-level Ed25519 signature against the pinned key,
+    /// after rejecting any `manifest_version` newer than this build understands.
+    /// The version check is fail-closed and runs FIRST: it is not covered by the
+    /// signature (it is excluded from `canonical_payload`), so an attacker cannot
+    /// use it to bypass verification, but a legitimately newer publisher schema
+    /// must make an old client fall back to v1 rather than misread the index.
     fn verify_signature(&self) -> Result<(), String> {
         if self.manifest_version > MAX_MANIFEST_VERSION {
             return Err(format!(
@@ -3026,6 +3040,162 @@ mod tests {
             .unwrap();
         assert_eq!(u32::from_le_bytes(v1[8..12].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(v2[8..12].try_into().unwrap()), 2);
+    }
+
+    // ---- v2 index publish contract (DB-D) --------------------------------
+    //
+    // These pin the byte-for-byte agreement between the canonical payload the
+    // release workflow signs (.github/workflows/threatdb.yml, "Generate signed
+    // v2 index") and the payload this client reconstructs in
+    // `IndexV2::canonical_payload()`. The two constants below are the LITERAL
+    // `jq -cS` output of that workflow step (captured by running its exact jq
+    // filter). If `canonical_payload()` ever diverges from this shape, the
+    // workflow's signature would no longer verify on the client and v2 would
+    // silently never take effect (clients fall back to v1); these tests turn
+    // that into a local failure. The PRESENT/ABSENT pair proves the canonical
+    // form is stable whether the optional `min_tirith_version` is emitted or
+    // not, matching how the workflow's jq omits an absent key and how
+    // `canonical_payload()` skips an absent `Option`.
+
+    /// Exact workflow `jq -cS` canonical payload for a two-asset index whose v2
+    /// asset carries `min_tirith_version` and whose v1 asset omits it.
+    const WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN: &str = concat!(
+        "{\"assets\":[",
+        "{\"filename\":\"tirith-threatdb-7-1.dat\",\"format\":1,",
+        "\"sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+        "\"size\":4096,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-7-1.dat\"},",
+        "{\"filename\":\"tirith-threatdb-v2-7-1.dat\",\"format\":2,",
+        "\"min_tirith_version\":\"0.3.4\",",
+        "\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
+        "\"size\":8192,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-v2-7-1.dat\"}",
+        "],\"sequence\":7}"
+    );
+
+    /// Exact workflow `jq -cS` canonical payload for a single-asset index with
+    /// NO `min_tirith_version` (the absent-Option case).
+    const WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN: &str = concat!(
+        "{\"assets\":[",
+        "{\"filename\":\"tirith-threatdb-7-1.dat\",\"format\":1,",
+        "\"sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+        "\"size\":4096,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-7-1.dat\"}",
+        "],\"sequence\":7}"
+    );
+
+    /// The published `threatdb-index-v2.json` is exactly the signed canonical
+    /// payload with a top-level `manifest_version` and `signature` injected (the
+    /// workflow derives it via `. + {manifest_version, signature}`). This mirrors
+    /// that derivation so a parsed-then-reconstructed payload can be checked.
+    fn published_index_json(canonical_payload: &str, signature: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(canonical_payload).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert("manifest_version".to_string(), serde_json::json!(1));
+        obj.insert(
+            "signature".to_string(),
+            serde_json::Value::String(signature.to_string()),
+        );
+        value.to_string()
+    }
+
+    #[test]
+    fn workflow_v2_index_payload_matches_client_canonical_with_min() {
+        // Parse the PUBLISHED index (workflow payload + injected manifest_version
+        // + signature), exactly as the client receives it over the wire.
+        let published = published_index_json(WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN, "AA==");
+        let index: IndexV2 = serde_json::from_str(&published).unwrap();
+
+        // The client's reconstruction MUST equal the bytes the workflow signed.
+        assert_eq!(
+            index.canonical_payload(),
+            WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN,
+            "client canonical_payload() must be byte-identical to the workflow's jq -cS output"
+        );
+
+        // And a signature made over canonical_payload() verifies. The pinned
+        // production key can't be self-signed in a test, so sign + verify against
+        // a test key directly (same pattern as the DB-B index_v2 sig roundtrip),
+        // which exercises the same bytes verify_signature() would.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        use ed25519_dalek::{Signer, Verifier};
+        let sig = key.sign(index.canonical_payload().as_bytes());
+        assert!(key
+            .verifying_key()
+            .verify(index.canonical_payload().as_bytes(), &sig)
+            .is_ok());
+
+        // Tamper-negative: the same signature must NOT verify over a one-byte-
+        // mutated payload, proving the byte-equality above is load-bearing for
+        // authenticity and not just an incidental string match.
+        let mut tampered = WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN.as_bytes().to_vec();
+        tampered[0] ^= 0x01;
+        assert!(
+            key.verifying_key().verify(&tampered, &sig).is_err(),
+            "signature must not verify over a mutated payload"
+        );
+    }
+
+    #[test]
+    fn workflow_v2_index_payload_matches_client_canonical_no_min() {
+        // Same proof for the absent-`min_tirith_version` case: the canonical form
+        // is stable, and the workflow omitting the key matches `canonical_payload()`
+        // skipping the absent Option.
+        let published = published_index_json(WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN, "AA==");
+        let index: IndexV2 = serde_json::from_str(&published).unwrap();
+
+        // The single asset must have NO min floor after parsing.
+        assert!(index.assets[0].min_tirith_version.is_none());
+        assert_eq!(
+            index.canonical_payload(),
+            WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN,
+            "absent min_tirith_version must yield the same byte shape on both sides"
+        );
+
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        use ed25519_dalek::{Signer, Verifier};
+        let sig = key.sign(index.canonical_payload().as_bytes());
+        assert!(key
+            .verifying_key()
+            .verify(index.canonical_payload().as_bytes(), &sig)
+            .is_ok());
+    }
+
+    #[test]
+    fn canonical_payload_large_sequence_round_trips_losslessly() {
+        // The workflow signs `--argjson sequence ${RUN_ID}` and the client field
+        // is u64, but jq numbers are IEEE-754 f64, so a RUN_ID > 2^53 would lose
+        // precision on the SIGNING side (jq), even though the client side here is
+        // exact. This documents the u64 client boundary: a sequence above 2^53
+        // must round-trip losslessly through canonical_payload() and a re-parse.
+        // GitHub run IDs are nowhere near 2^53 today, so this is a guard against a
+        // future ID-space change, not a live bug; if jq's f64 ever feeds such a
+        // value the signed bytes (not this client) would be wrong, and the v2
+        // index would simply fail to verify and fall back to v1.
+        let big: u64 = 9_007_199_254_740_993; // 2^53 + 1, not representable in f64
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        let idx = signed_index_v2(big, vec![asset(2, None)], &key);
+
+        // The canonical payload carries the exact integer literal (no f64 rounding,
+        // no scientific notation): serde_json emits u64 as an exact integer.
+        let payload = idx.canonical_payload();
+        assert!(
+            payload.contains(&format!("\"sequence\":{big}")),
+            "sequence must serialize as the exact u64 literal, got: {payload}"
+        );
+
+        // Re-parsing the canonical payload yields the same u64 with no loss.
+        let reparsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            reparsed["sequence"].as_u64(),
+            Some(big),
+            "sequence must round-trip losslessly as u64"
+        );
+
+        // And parsing a full IndexV2 (the wire path) preserves it too.
+        let published = published_index_json(&payload, &idx.signature);
+        let parsed: IndexV2 = serde_json::from_str(&published).unwrap();
+        assert_eq!(parsed.sequence, big, "wire round-trip must preserve u64");
     }
 
     /// Check whether the next-check-at file indicates the update is not yet due.
