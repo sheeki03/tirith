@@ -616,9 +616,26 @@ pub fn verify_installed_record(
             return result;
         }
         RecordRead::Unreadable => {
-            // Treat an unreadable RECORD like a missing one (a coverage gap); we
-            // cannot verify what we cannot read.
+            // Treat an unreadable RECORD (a permission/IO error) like a missing one (a
+            // coverage gap); we cannot verify what we cannot read.
             result.record_missing = true;
+            return result;
+        }
+        RecordRead::Corrupt => {
+            // A RECORD that read but is not valid UTF-8 is damaged/tampered: surface a
+            // SIGNAL (not a swallowed coverage gap), exactly like the corrupt-CSV parse
+            // error below. One injected non-UTF-8 byte must not suppress integrity
+            // correlation by masquerading as a "missing" RECORD.
+            result.signals.push(signal(
+                ArtifactSignalKind::RecordHashMismatch,
+                SubjectLocation::installed(record_path.clone()),
+                format!(
+                    "{} RECORD is not valid UTF-8 (damaged or tampered); installed-file integrity is unverifiable",
+                    dist.name
+                ),
+                EdgeConfidence::High,
+            ));
+            result.parse_error = Some("RECORD is not valid UTF-8".to_string());
             return result;
         }
         RecordRead::Text(t) => t,
@@ -782,8 +799,12 @@ pub fn index_distribution_ownership(
 enum RecordRead {
     /// The file does not exist.
     Missing,
-    /// The file exists but could not be read.
+    /// The file exists but could not be read (a permission/IO error).
     Unreadable,
+    /// The file was read but is not valid UTF-8 - damaged or tampered. Distinct from
+    /// `Unreadable`: it must surface a tampering SIGNAL, not a silent coverage gap, or one
+    /// injected non-UTF-8 byte would suppress all integrity correlation.
+    Corrupt,
     /// The file's text.
     Text(String),
 }
@@ -796,12 +817,12 @@ fn read_record_text(path: &Path) -> RecordRead {
     match crate::util::read_text_no_follow_capped(path, MAX_RECORD_BYTES) {
         // STRICT from_utf8 (not lossy): a RECORD with non-UTF-8 bytes is damaged or
         // tampered, and lossy substitution would silently turn injected bytes into a
-        // `U+FFFD` that then fails hash parsing - masking the damage as a swallowed parse
-        // error. Treat it as Unreadable so it surfaces as a coverage gap, matching the
-        // strict `read_dist_info_metadata`.
+        // `U+FFFD` that then fails hash parsing - masking the damage. Treat non-UTF-8 as
+        // `Corrupt` so it surfaces a tampering SIGNAL (an injected byte must not suppress
+        // integrity correlation); only a real IO/permission error is `Unreadable`.
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => RecordRead::Text(text),
-            Err(_) => RecordRead::Unreadable,
+            Err(_) => RecordRead::Corrupt,
         },
         Err(crate::util::OpenRegularError::NotFound) => RecordRead::Missing,
         Err(_) => RecordRead::Unreadable,
@@ -960,7 +981,13 @@ fn detect_externally_managed(dist_info_dir: &Path, layout: &EnvironmentLayout) -
     // A PEP 668 `EXTERNALLY-MANAGED` marker at the environment prefix (one level
     // up from site-packages, best-effort) means a distro/system manager owns it.
     if let Some(prefix) = layout.site_packages.parent() {
-        if prefix.join("EXTERNALLY-MANAGED").exists() {
+        // The sentinel must be a REAL regular file, checked WITHOUT following symlinks: an
+        // attacker who can write site-packages (the tamper prerequisite) also owns its
+        // parent prefix, so `exists()` (which resolves a symlink) would let them
+        // `ln -s /etc/hosts prefix/EXTERNALLY-MANAGED` to force externally-managed and skip
+        // the entire RECORD integrity check. symlink_metadata + is_file closes that channel.
+        let marker = prefix.join("EXTERNALLY-MANAGED");
+        if std::fs::symlink_metadata(&marker).is_ok_and(|m| m.file_type().is_file()) {
             return true;
         }
     }
@@ -974,7 +1001,13 @@ fn detect_editable(dist_info_dir: &Path) -> bool {
     let Ok(bytes) = crate::util::read_text_no_follow_capped(&direct_url, 1024 * 1024) else {
         return false;
     };
-    let text = String::from_utf8_lossy(&bytes);
+    // STRICT from_utf8 (not lossy), matching INSTALLER / RECORD / METADATA: a non-UTF-8
+    // direct_url.json is damaged or tampered, and lossy substitution could leave it
+    // parseable as `editable: true`, suppressing RecordMissingFile signals for a
+    // non-editable distribution. A non-UTF-8 file is treated as NOT editable.
+    let Ok(text) = String::from_utf8(bytes) else {
+        return false;
+    };
     crate::artifact::wheel::parse_direct_url(&text)
         .map(|du| du.editable)
         .unwrap_or(false)
@@ -1505,6 +1538,40 @@ mod tests {
                 .iter()
                 .any(|s| s.kind == ArtifactSignalKind::RecordHashMismatch),
             "a corrupt RECORD must emit a signal, not silently bypass integrity"
+        );
+    }
+
+    #[test]
+    fn non_utf8_record_emits_a_signal_not_silent_missing() {
+        // A tampered RECORD can add ONE invalid byte to become non-UTF-8. Strict from_utf8
+        // maps that to `Corrupt`, which must surface a RecordHashMismatch SIGNAL (not be
+        // swallowed as a silent `record_missing` coverage gap, which would suppress all
+        // integrity correlation).
+        let tmp = tempdir().unwrap();
+        let site = tmp.path();
+        let dist_info = make_installed_dist(
+            site,
+            "demo",
+            "1.0",
+            &[("demo/mod.py", b"x")],
+            &[("demo/mod.py", Some(sha256_bytes(b"x")), Some(1))],
+            &[],
+        );
+        // Overwrite RECORD with a non-UTF-8 byte sequence.
+        std::fs::write(dist_info.join("RECORD"), b"demo/mod.py,sha256=x,1\n\xff\xfe\n").unwrap();
+        let layout = EnvironmentLayout::for_site_packages(site);
+        let d = dist("demo", &dist_info);
+        let result = verify_installed_record(&dist_info, &layout, &d, false);
+        assert!(
+            !result.record_missing,
+            "a non-UTF-8 RECORD is corrupt, not missing"
+        );
+        assert!(
+            result
+                .signals
+                .iter()
+                .any(|s| s.kind == ArtifactSignalKind::RecordHashMismatch),
+            "a non-UTF-8 (corrupt) RECORD must emit a signal, not silently bypass integrity"
         );
     }
 

