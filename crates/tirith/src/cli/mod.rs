@@ -455,6 +455,11 @@ pub mod paste;
 pub mod path;
 pub mod pending;
 pub mod persistence;
+/// The package-firewall CLI surface (PR D7): `tirith pkg install | verify-env |
+/// approve | receipt`. Drives the D1-D6 resolve -> firewall -> re-bind -> contained
+/// install -> receipt pipeline, binding an operator approval to an
+/// `InstallPlanDigest`. Distinct from `tirith install` (analysis-only).
+pub mod pkg;
 /// Contained install-from-digest for the package firewall (PR D4, CLI half): write
 /// the re-bound plan's `approved.txt`, build the pinned `python -m pip install`
 /// argv, and run it through the fail-closed capsule launcher (never the uncontained

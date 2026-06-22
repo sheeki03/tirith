@@ -102,6 +102,7 @@
 use std::path::{Path, PathBuf};
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use serde::{Deserialize, Serialize};
 
 use crate::artifact::firewall::firewall_resolved_set;
 use crate::artifact::quarantine::QuarantineTransaction;
@@ -253,6 +254,19 @@ impl InstallCommand {
     /// same hardening the D2 resolver uses; the caller supplies the resolved
     /// interpreter path as the program and these as its args.
     pub fn pip_install_args(&self) -> Vec<String> {
+        let mut args = self.pip_install_args_without_requirements_path();
+        args.push("-r".to_string());
+        args.push(self.approved_requirements_path.display().to_string());
+        args
+    }
+
+    /// The pinned install flags WITHOUT the trailing `-r <approved.txt>` (the
+    /// security-relevant *semantics* of the command, with the per-run requirements
+    /// path omitted). D7's [`InstallPlanDigest`] binds these so a change to the
+    /// install flags re-binds the approval, while a per-run temp approved.txt path
+    /// (which differs every invocation) does not perturb the digest. The full argv
+    /// ([`Self::pip_install_args`]) is this plus `-r <path>`.
+    pub fn pip_install_args_without_requirements_path(&self) -> Vec<String> {
         vec![
             "-m".to_string(),
             "pip".to_string(),
@@ -265,8 +279,6 @@ impl InstallCommand {
             "--no-input".to_string(),
             "--disable-pip-version-check".to_string(),
             "--force-reinstall".to_string(),
-            "-r".to_string(),
-            self.approved_requirements_path.display().to_string(),
         ]
     }
 }
@@ -896,6 +908,228 @@ fn post_install_integrity_findings(signals: &[ArtifactSignal]) -> Vec<Finding> {
         mitre_id: None,
         custom_rule_id: None,
     }]
+}
+
+// ---------------------------------------------------------------------------
+// D7: the install-plan digest the operator approval binds to
+// ---------------------------------------------------------------------------
+
+/// The complete, hashable description of an install-from-digest plan that a
+/// `tirith pkg approve` decision binds to (PR D7).
+///
+/// # Why an approval binds to a digest, not a SHA-set
+///
+/// An operator who approves an install is approving a WHOLE SITUATION, not just a
+/// bag of artifact hashes. The same wheels installed into a different interpreter,
+/// for a different platform, under a weaker policy, against an older threat-DB
+/// sequence, or with a different install command is a DIFFERENT and possibly
+/// dangerous operation. Binding the approval to the sorted SHA-set alone would let
+/// any of those swap silently after approval. So the approval id is the content
+/// hash of every binding input below (`plan_digest`), and the sorted SHA-set
+/// ([`Self::artifact_set_label`]) is a human-readable DISPLAY LABEL only, never the
+/// binding identity.
+///
+/// # The binding inputs (the plan's list)
+///
+/// The digest is `H(artifact hashes, normalized packages, target interpreter/env,
+/// platform tags, install-command semantics, redacted policy-projection hash, DB
+/// sequence, capsule backend, required coverage, expiry)`. Each is a field here; the
+/// digest is the sha256 of the canonical JSON of all of them (with `plan_digest`
+/// itself blanked, exactly as [`crate::receipt::ArtifactScanReceipt`] content-
+/// addresses itself), through the SAME [`crate::audit::canonical_json_for_hash`] the
+/// audit chain uses, so the digest is stable, order-independent over the sets it
+/// sorts, and reproducible.
+///
+/// # Redaction
+///
+/// `policy_projection_hash` is [`crate::policy::Policy::security_projection_hash`]
+/// (never the raw policy); `target_environment` and `interpreter` are recorded as
+/// their plain paths because the digest is an operator-local binding token, not a
+/// shared receipt (the receipt, [`crate::receipt::ArtifactScanReceipt`], stores no
+/// paths). The digest is not persisted to a shared store by core; the CLI decides
+/// where (if anywhere) to keep an approval record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallPlanDigest {
+    /// The content-addressed binding id: the lowercase-hex sha256 of this struct's
+    /// canonical JSON with `plan_digest` blanked. The value `tirith pkg approve`
+    /// records and `tirith pkg install` re-derives and compares.
+    pub plan_digest: String,
+    /// Every approved artifact's sha256 (lowercase hex), sorted + de-duplicated.
+    /// The bytes the install will extract.
+    pub artifact_sha256: Vec<String>,
+    /// The PEP 503-normalised distribution names the plan installs, sorted. Bound
+    /// so a re-resolve to a different package set invalidates the approval even if a
+    /// hash happens to collide in the label.
+    pub normalized_packages: Vec<String>,
+    /// The resolved target interpreter the install runs `python -m pip` with (its
+    /// path). A different interpreter is a different operation.
+    pub interpreter: String,
+    /// The environment tree pip installs into (its path).
+    pub target_environment: String,
+    /// The platform tags the resolve targeted (e.g. the wheel ABI / platform tags),
+    /// sorted. Empty when the resolve did not constrain them. Bound so an approval
+    /// for one platform's wheels does not authorise another's.
+    pub platform_tags: Vec<String>,
+    /// The install-command semantics: the exact pinned pip argv
+    /// ([`InstallCommand::pip_install_args`]) WITHOUT the trailing approved.txt path
+    /// (which is install-run-specific), so the security-relevant flags are bound but
+    /// a per-run temp path is not. A change to the install flags re-binds.
+    pub install_command_semantics: Vec<String>,
+    /// The redacted security-projection hash of the effective policy
+    /// ([`crate::policy::Policy::security_projection_hash`]). A weaker policy after
+    /// approval invalidates it.
+    pub policy_projection_hash: String,
+    /// The threat-DB build sequence the approval is bound to. The live DB advancing
+    /// past this invalidates the approval (cross-cutting invariant 4), exactly as
+    /// [`rebind_for_install`] enforces at launch.
+    pub threat_db_sequence: u64,
+    /// The capsule backend id the install must run under (`"landlock-seccomp"` /
+    /// `"seatbelt"` / `"appcontainer"` / `"noop"`). An approval issued for a
+    /// containing backend does not authorise a run on a NoOp host.
+    pub capsule_backend: String,
+    /// The per-capability coverage the install REQUIRES (the spec's
+    /// [`crate::capsule::CapsuleSpec::required_coverage`]). Bound so an approval that
+    /// demanded raw-network-deny cannot be redeemed against a spec that does not.
+    pub required_coverage: crate::capsule::CapsuleCoverage,
+    /// RFC 3339 UTC expiry. After this instant the approval is stale and
+    /// [`Self::is_expired_at`] refuses it. An empty string means "no expiry"
+    /// (the caller chose not to time-box it).
+    pub expiry: String,
+}
+
+/// The binding inputs for an [`InstallPlanDigest`], everything except the derived
+/// `plan_digest` itself. [`InstallPlanDigest::new`] takes this and stamps the hash,
+/// keeping the long argument list to one named value.
+#[derive(Debug, Clone)]
+pub struct InstallPlanInputs {
+    /// Every approved artifact's sha256 (any case / order; normalised by `new`).
+    pub artifact_sha256: Vec<String>,
+    /// The PEP 503-normalised distribution names (sorted by `new`).
+    pub normalized_packages: Vec<String>,
+    /// The resolved target interpreter path.
+    pub interpreter: PathBuf,
+    /// The environment tree pip installs into.
+    pub target_environment: PathBuf,
+    /// The platform tags the resolve targeted (sorted by `new`).
+    pub platform_tags: Vec<String>,
+    /// The pinned pip argv WITHOUT the trailing approved.txt path.
+    pub install_command_semantics: Vec<String>,
+    /// The redacted policy-projection hash.
+    pub policy_projection_hash: String,
+    /// The threat-DB sequence the approval binds to.
+    pub threat_db_sequence: u64,
+    /// The capsule backend id the install must run under.
+    pub capsule_backend: String,
+    /// The required per-capability coverage.
+    pub required_coverage: crate::capsule::CapsuleCoverage,
+    /// RFC 3339 UTC expiry, or empty for none.
+    pub expiry: String,
+}
+
+impl InstallPlanDigest {
+    /// Build a digest from its binding inputs and stamp the content-addressed
+    /// `plan_digest`. The lists that have no meaningful order (artifact hashes,
+    /// normalised package names, platform tags) are sorted + de-duplicated so two
+    /// plans that differ only in input ordering bind to the SAME digest; the install
+    /// argv is bound verbatim (its order is meaningful).
+    pub fn new(inputs: InstallPlanInputs) -> Self {
+        let mut artifact_sha256: Vec<String> = inputs
+            .artifact_sha256
+            .into_iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+        artifact_sha256.sort();
+        artifact_sha256.dedup();
+        let mut normalized_packages = inputs.normalized_packages;
+        normalized_packages.sort();
+        normalized_packages.dedup();
+        let mut platform_tags = inputs.platform_tags;
+        platform_tags.sort();
+        platform_tags.dedup();
+
+        let mut digest = InstallPlanDigest {
+            plan_digest: String::new(),
+            artifact_sha256,
+            normalized_packages,
+            interpreter: inputs.interpreter.display().to_string(),
+            target_environment: inputs.target_environment.display().to_string(),
+            platform_tags,
+            install_command_semantics: inputs.install_command_semantics,
+            policy_projection_hash: inputs.policy_projection_hash,
+            threat_db_sequence: inputs.threat_db_sequence,
+            capsule_backend: inputs.capsule_backend,
+            required_coverage: inputs.required_coverage,
+            expiry: inputs.expiry,
+        };
+        digest.plan_digest = digest.compute_plan_digest();
+        digest
+    }
+
+    /// The lowercase-hex sha256 of this plan's canonical JSON with `plan_digest`
+    /// blanked, so the id is a stable function of the binding inputs and never of
+    /// itself. Computed through [`crate::audit::canonical_json_for_hash`], the same
+    /// canonicaliser the receipt + audit chain use.
+    pub fn compute_plan_digest(&self) -> String {
+        let mut value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "plan_digest".to_string(),
+                serde_json::Value::String(String::new()),
+            );
+        }
+        let canon = crate::audit::canonical_json_for_hash(&value);
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(canon.as_bytes());
+        let out = h.finalize();
+        let mut s = String::with_capacity(64);
+        for b in out {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// Whether the stored `plan_digest` matches a recomputation over the binding
+    /// inputs. `tirith pkg install` compares the operator-approved digest against
+    /// the digest of the plan it is ABOUT to run; a mismatch means the situation
+    /// changed (different interpreter, policy, DB sequence, ...) and the install is
+    /// refused. Two digests are equivalent iff their `plan_digest` strings match
+    /// (the hash binds every field), so callers compare ids.
+    pub fn digest_matches(&self) -> bool {
+        self.plan_digest == self.compute_plan_digest()
+    }
+
+    /// A human-readable DISPLAY LABEL for the artifact set: the sorted sha256s
+    /// joined, truncated for readability. NEVER the binding identity (that is
+    /// `plan_digest`); shown in the approve/install UX so an operator recognises the
+    /// set without reading the full hash list.
+    pub fn artifact_set_label(&self) -> String {
+        if self.artifact_sha256.is_empty() {
+            return "<no artifacts>".to_string();
+        }
+        self.artifact_sha256
+            .iter()
+            .map(|h| crate::util::truncate_bytes(h, 12))
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+
+    /// Whether this approval has expired at `now_rfc3339` (an RFC 3339 timestamp).
+    /// An empty `expiry` means "no expiry" and never expires. A malformed `expiry`
+    /// is treated as ALREADY EXPIRED (fail closed: an approval whose expiry cannot
+    /// be parsed is not trusted). A malformed `now` is also fail-closed.
+    pub fn is_expired_at(&self, now_rfc3339: &str) -> bool {
+        if self.expiry.is_empty() {
+            return false;
+        }
+        let (Ok(expiry), Ok(now)) = (
+            chrono::DateTime::parse_from_rfc3339(&self.expiry),
+            chrono::DateTime::parse_from_rfc3339(now_rfc3339),
+        ) else {
+            return true;
+        };
+        now >= expiry
+    }
 }
 
 #[cfg(test)]
@@ -1671,5 +1905,189 @@ mod tests {
             "the normalised name must match the on-disk dist-info spelling"
         );
         assert_eq!(res.distributions_not_found, 0);
+    }
+
+    // ── D7: InstallPlanDigest ────────────────────────────────────────────────
+
+    /// A full set of binding inputs for a digest, every field populated so a test
+    /// can mutate exactly one and observe the digest change.
+    fn plan_inputs() -> InstallPlanInputs {
+        InstallPlanInputs {
+            artifact_sha256: vec!["b".repeat(64), "a".repeat(64)], // out of order
+            normalized_packages: vec!["flask".to_string(), "click".to_string()],
+            interpreter: PathBuf::from("/venv/bin/python"),
+            target_environment: PathBuf::from("/venv"),
+            platform_tags: vec!["py3-none-any".to_string()],
+            install_command_semantics: InstallCommand {
+                approved_requirements_path: PathBuf::from("/q/txn/approved.txt"),
+            }
+            .pip_install_args_without_requirements_path(),
+            policy_projection_hash: "deadbeef".repeat(8),
+            threat_db_sequence: 7,
+            capsule_backend: "landlock-seccomp".to_string(),
+            required_coverage: crate::capsule::CapsuleSpec::locked_down().required_coverage(),
+            expiry: "2026-06-22T12:00:00+00:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn plan_digest_is_content_addressed_and_stable() {
+        let d = InstallPlanDigest::new(plan_inputs());
+        // The id is the content hash with id blanked: reproducible and self-consistent.
+        assert_eq!(d.plan_digest.len(), 64);
+        assert!(d.digest_matches());
+        assert_eq!(d.compute_plan_digest(), d.plan_digest);
+        // The unordered lists were sorted + de-duplicated by `new`.
+        assert_eq!(d.artifact_sha256, vec!["a".repeat(64), "b".repeat(64)]);
+        assert_eq!(d.normalized_packages, vec!["click", "flask"]);
+    }
+
+    #[test]
+    fn plan_digest_is_order_independent_over_the_sorted_sets() {
+        // Two plans differing ONLY in the order they list artifacts / packages bind
+        // to the SAME digest (the sets are sorted before hashing).
+        let a = InstallPlanDigest::new(plan_inputs());
+        let mut other = plan_inputs();
+        other.artifact_sha256 = vec!["a".repeat(64), "b".repeat(64)]; // already sorted
+        other.normalized_packages = vec!["flask".to_string(), "click".to_string()];
+        let b = InstallPlanDigest::new(other);
+        assert_eq!(a.plan_digest, b.plan_digest);
+    }
+
+    #[test]
+    fn plan_digest_changes_when_any_bound_input_changes() {
+        let base = InstallPlanDigest::new(plan_inputs());
+
+        // Each of these is a DIFFERENT install situation and MUST re-bind the digest.
+        type Mutator = Box<dyn Fn(&mut InstallPlanInputs)>;
+        let mutate: Vec<(&str, Mutator)> = vec![
+            (
+                "different artifact hash",
+                Box::new(|i: &mut InstallPlanInputs| i.artifact_sha256 = vec!["c".repeat(64)]),
+            ),
+            (
+                "different package set",
+                Box::new(|i: &mut InstallPlanInputs| i.normalized_packages = vec!["evil".to_string()]),
+            ),
+            (
+                "different interpreter",
+                Box::new(|i: &mut InstallPlanInputs| {
+                    i.interpreter = PathBuf::from("/other/python")
+                }),
+            ),
+            (
+                "different target env",
+                Box::new(|i: &mut InstallPlanInputs| i.target_environment = PathBuf::from("/other")),
+            ),
+            (
+                "different platform tags",
+                Box::new(|i: &mut InstallPlanInputs| {
+                    i.platform_tags = vec!["cp311-cp311-manylinux".to_string()]
+                }),
+            ),
+            (
+                "different install command",
+                Box::new(|i: &mut InstallPlanInputs| {
+                    i.install_command_semantics = vec!["-m".to_string(), "pip".to_string()]
+                }),
+            ),
+            (
+                "weaker policy",
+                Box::new(|i: &mut InstallPlanInputs| i.policy_projection_hash = "0".repeat(64)),
+            ),
+            (
+                "advanced DB sequence",
+                Box::new(|i: &mut InstallPlanInputs| i.threat_db_sequence = 8),
+            ),
+            (
+                "different capsule backend",
+                Box::new(|i: &mut InstallPlanInputs| i.capsule_backend = "noop".to_string()),
+            ),
+            (
+                "weaker required coverage",
+                Box::new(|i: &mut InstallPlanInputs| {
+                    i.required_coverage = crate::capsule::CapsuleCoverage::NONE
+                }),
+            ),
+            (
+                "different expiry",
+                Box::new(|i: &mut InstallPlanInputs| {
+                    i.expiry = "2027-01-01T00:00:00+00:00".to_string()
+                }),
+            ),
+        ];
+
+        for (label, f) in mutate {
+            let mut inputs = plan_inputs();
+            f(&mut inputs);
+            let changed = InstallPlanDigest::new(inputs);
+            assert_ne!(
+                changed.plan_digest, base.plan_digest,
+                "changing the {label} must re-bind the plan digest"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_digest_install_semantics_omit_the_per_run_approved_txt_path() {
+        // The bound install argv carries the security-relevant flags but NOT the
+        // per-run approved.txt path, so two runs writing approved.txt to different
+        // temp dirs still bind to the same digest.
+        let semantics = InstallCommand {
+            approved_requirements_path: PathBuf::from("/q/txn-A/approved.txt"),
+        }
+        .pip_install_args_without_requirements_path();
+        // The flags are present; no concrete approved.txt path is.
+        assert!(semantics.iter().any(|a| a == "--require-hashes"));
+        assert!(semantics.iter().any(|a| a == "--no-index"));
+        assert!(!semantics.iter().any(|a| a.contains("approved.txt")));
+        assert!(!semantics.iter().any(|a| a == "-r"));
+    }
+
+    #[test]
+    fn artifact_set_label_is_a_display_label_not_the_binding() {
+        let d = InstallPlanDigest::new(plan_inputs());
+        let label = d.artifact_set_label();
+        // The label is the truncated sorted hashes joined; it is NOT the binding id.
+        assert!(label.contains(&"a".repeat(12)));
+        assert!(label.contains(&"b".repeat(12)));
+        assert_ne!(label, d.plan_digest, "the label must not be the digest");
+    }
+
+    #[test]
+    fn plan_digest_roundtrips_through_json() {
+        let d = InstallPlanDigest::new(plan_inputs());
+        let json = serde_json::to_string(&d).unwrap();
+        let back: InstallPlanDigest = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
+        assert!(back.digest_matches());
+    }
+
+    #[test]
+    fn plan_digest_detects_an_edited_record() {
+        // An attacker who edits a saved approval (e.g. swaps the interpreter) but
+        // leaves the stored digest stale is caught: digest_matches() recomputes.
+        let mut d = InstallPlanDigest::new(plan_inputs());
+        d.interpreter = "/attacker/python".to_string();
+        assert!(
+            !d.digest_matches(),
+            "an edited binding field with a stale digest must not validate"
+        );
+    }
+
+    #[test]
+    fn plan_digest_expiry_is_fail_closed() {
+        let mut d = InstallPlanDigest::new(plan_inputs()); // expiry 2026-06-22T12:00
+        // Before expiry: live.
+        assert!(!d.is_expired_at("2026-06-22T11:59:59+00:00"));
+        // At/after expiry: expired.
+        assert!(d.is_expired_at("2026-06-22T12:00:00+00:00"));
+        assert!(d.is_expired_at("2026-06-23T00:00:00+00:00"));
+        // A malformed expiry is treated as already expired (fail closed).
+        d.expiry = "not-a-timestamp".to_string();
+        assert!(d.is_expired_at("2026-06-22T11:00:00+00:00"));
+        // An empty expiry never expires.
+        d.expiry = String::new();
+        assert!(!d.is_expired_at("2030-01-01T00:00:00+00:00"));
     }
 }

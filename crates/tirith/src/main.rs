@@ -16,7 +16,7 @@ COMMANDS BY CATEGORY:
   Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
   Policy & Trust:   policy trust rule output
   Shell & System:   daemon hooks exec env path sudo ssh context persistence hygiene aliases
-  Supply-chain:     package ecosystem threat-db iac canary secret command-card commands
+  Supply-chain:     package pkg ecosystem threat-db iac canary secret command-card commands
   Integrations:     mcp mcp-server gateway agent ai lsp license
   Forensics:        audit incident checkpoint pending share redact clipboard
 
@@ -378,6 +378,23 @@ Examples:
         /// Expected SHA-256 of the downloaded script (url form only)
         #[arg(long)]
         sha256: Option<String>,
+    },
+
+    /// Package firewall: resolve, inspect, and install ONLY the verified bytes,
+    /// inside a containment capsule, with a tamper-evident receipt (Python only).
+    #[command(after_help = "\
+Examples:
+  tirith pkg approve pip requests==2.31.0       # resolve+inspect, print the plan digest
+  tirith pkg install pip requests==2.31.0       # install only the approved, inspected bytes
+  tirith pkg install pip flask --target .venv --yes
+  tirith pkg verify-env --target .venv requests flask
+  tirith pkg receipt list
+
+`tirith pkg install` is the ENFORCING path (contained, hash-pinned, fails closed
+on degraded coverage); `tirith install` is the analysis path. They are distinct.")]
+    Pkg {
+        #[command(subcommand)]
+        action: PkgAction,
     },
 
     /// Run adversarial training scenarios (experimental)
@@ -5076,6 +5093,157 @@ enum PendingAction {
     },
 }
 
+/// The ecosystem `tirith pkg` enforces for. Only `pip` installs; `npm`/`cargo`
+/// resolve-and-inspect lives behind hidden experimental flags and cannot install.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PkgEcosystem {
+    /// Python wheels (the only enforced ecosystem).
+    Pip,
+    /// npm, not enforced in this version.
+    Npm,
+    /// cargo, not enforced in this version.
+    Cargo,
+}
+
+impl PkgEcosystem {
+    fn into_core(self) -> cli::pkg::Ecosystem {
+        match self {
+            PkgEcosystem::Pip => cli::pkg::Ecosystem::Pip,
+            PkgEcosystem::Npm => cli::pkg::Ecosystem::Npm,
+            PkgEcosystem::Cargo => cli::pkg::Ecosystem::Cargo,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum PkgAction {
+    /// Resolve + inspect a requirement set and approve its install plan, printing
+    /// the plan digest the approval binds to. Does NOT install.
+    #[command(after_help = "\
+Examples:
+  tirith pkg approve pip requests==2.31.0
+  tirith pkg approve pip flask --target .venv")]
+    Approve {
+        /// The ecosystem (only `pip` is enforced).
+        #[arg(value_enum)]
+        ecosystem: PkgEcosystem,
+        /// Requirement specs (e.g. `requests==2.31.0`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        requirements: Vec<String>,
+        /// Install target directory (pip `--target`); defaults to the interpreter
+        /// prefix.
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
+        /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
+        #[arg(long = "index-url")]
+        index_url: Vec<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Resolve + inspect + install ONLY the verified, hash-pinned bytes, inside the
+    /// containment capsule, recording a tamper-evident receipt. Fails closed on
+    /// degraded containment.
+    #[command(after_help = "\
+Examples:
+  tirith pkg install pip requests==2.31.0
+  tirith pkg install pip flask --target .venv --yes")]
+    Install {
+        /// The ecosystem (only `pip` is enforced).
+        #[arg(value_enum)]
+        ecosystem: PkgEcosystem,
+        /// Requirement specs (e.g. `requests==2.31.0`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        requirements: Vec<String>,
+        /// Install target directory (pip `--target`); defaults to the interpreter
+        /// prefix.
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
+        /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
+        #[arg(long = "index-url")]
+        index_url: Vec<String>,
+        /// Install without a prior `tirith pkg approve` (unattended). The receipt
+        /// still attests the install honestly.
+        #[arg(long)]
+        yes: bool,
+        /// Acknowledge degraded containment (still routes through the fail-closed
+        /// installer; does not weaken the requirement).
+        #[arg(long = "allow-degraded")]
+        allow_degraded: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Verify an already-installed environment's RECORD integrity (D5), without
+    /// installing anything.
+    #[command(after_help = "\
+Examples:
+  tirith pkg verify-env --target .venv requests flask")]
+    VerifyEnv {
+        /// The environment tree to verify (a venv root or `--target` dir).
+        #[arg(long)]
+        target: std::path::PathBuf,
+        /// The distribution names to verify (PEP 503 normalized internally).
+        #[arg(trailing_var_arg = true)]
+        packages: Vec<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// List or show the package-firewall tamper-evident receipts.
+    #[command(after_help = "\
+Examples:
+  tirith pkg receipt list
+  tirith pkg receipt last
+  tirith pkg receipt show <receipt-id>")]
+    Receipt {
+        #[command(subcommand)]
+        query: PkgReceiptQuery,
+    },
+}
+
+#[derive(Subcommand)]
+enum PkgReceiptQuery {
+    /// List all artifact-scan receipts (newest first).
+    List {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Show the newest artifact-scan receipt.
+    Last {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Show one receipt by its id (content hash).
+    Show {
+        /// The receipt id (64-char content hash).
+        receipt_id: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum ReceiptAction {
     /// Show the last receipt
@@ -6619,6 +6787,84 @@ fn run() {
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::install::run(source, &args, online, offline, json, yes, no_exec, sha256)
+        }
+
+        Commands::Pkg { action } => {
+            let pkg_action = match action {
+                PkgAction::Approve {
+                    ecosystem,
+                    requirements,
+                    target,
+                    index_url,
+                    format,
+                    json,
+                } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::pkg::PkgAction::Approve {
+                        ecosystem: ecosystem.into_core(),
+                        requirements,
+                        target,
+                        index_url,
+                        json,
+                    }
+                }
+                PkgAction::Install {
+                    ecosystem,
+                    requirements,
+                    target,
+                    index_url,
+                    yes,
+                    allow_degraded,
+                    format,
+                    json,
+                } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::pkg::PkgAction::Install {
+                        ecosystem: ecosystem.into_core(),
+                        requirements,
+                        target,
+                        index_url,
+                        yes,
+                        allow_degraded,
+                        json,
+                    }
+                }
+                PkgAction::VerifyEnv {
+                    target,
+                    packages,
+                    format,
+                    json,
+                } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::pkg::PkgAction::VerifyEnv {
+                        target,
+                        packages,
+                        json,
+                    }
+                }
+                PkgAction::Receipt { query } => {
+                    let (which, json) = match query {
+                        PkgReceiptQuery::List { format, json } => {
+                            let (_, json) = HumanJsonFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::List, json)
+                        }
+                        PkgReceiptQuery::Last { format, json } => {
+                            let (_, json) = HumanJsonFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::Last, json)
+                        }
+                        PkgReceiptQuery::Show {
+                            receipt_id,
+                            format,
+                            json,
+                        } => {
+                            let (_, json) = HumanJsonFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::Show(receipt_id), json)
+                        }
+                    };
+                    cli::pkg::PkgAction::Receipt { which, json }
+                }
+            };
+            cli::pkg::run(pkg_action)
         }
 
         Commands::Lab {

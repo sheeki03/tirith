@@ -533,6 +533,19 @@ pub fn evaluate_inspected_artifact(
     crate::escalation::finalize_static_verdict(findings, policy, 3, Timings::default())
 }
 
+/// PEP 503 distribution-name normalization (lowercase; collapse any run of
+/// `-`/`_`/`.` to a single `-`), the public entry point for callers outside the
+/// crate. The D7 `tirith pkg verify-env` command normalizes the operator-supplied
+/// package names with this BEFORE handing them to
+/// [`crate::artifact::install::verify_post_install_record`], whose `.dist-info`
+/// lookup compares against the SAME normalizer; so a name spelled `Flask` /
+/// `typing_extensions` still matches the on-disk `flask-*.dist-info` /
+/// `typing_extensions-*.dist-info`. Thin wrapper over the internal
+/// [`archive::normalize_project_name`] so the normalization stays single-sourced.
+pub fn normalize_project_name_public(name: &str) -> String {
+    archive::normalize_project_name(name)
+}
+
 /// Correlate the inspection's signals/edges into user-facing findings.
 ///
 /// B8 fills the A3 seam: it delegates to
