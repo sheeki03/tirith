@@ -42,7 +42,19 @@ use crate::policy;
 use crate::util::levenshtein;
 
 const MAGIC: &[u8; 8] = b"TIRITHDB";
-const FORMAT_VERSION: u32 = 1;
+/// Highest on-disk format this binary can WRITE and is the newest it can READ.
+const FORMAT_VERSION: u32 = 2;
+/// Public view of the highest on-disk format this build understands. The
+/// updater uses it to select the highest `format <= MAX_FORMAT_VERSION` asset
+/// from the v2 index, so a future binary that bumps `FORMAT_VERSION` starts
+/// preferring the newer asset with no manifest-schema change.
+pub const MAX_FORMAT_VERSION: u32 = FORMAT_VERSION;
+/// Oldest on-disk format this binary still accepts on read. A v1 file loads with
+/// every v2 section absent (every v2 lookup returns None), so it behaves exactly
+/// like a pre-v2 binary did. An OLD binary (whose `FORMAT_VERSION` is 1) reading
+/// a v2 file rejects it via the `version != 1` check it shipped with and fails
+/// closed; the dual-cache-filename split below keeps it from ever seeing one.
+const MIN_SUPPORTED_FORMAT_VERSION: u32 = 1;
 /// Total header size in bytes.
 const HEADER_SIZE: usize = 172;
 /// Offset of the Ed25519 signature within the header.
@@ -50,10 +62,95 @@ const SIG_OFFSET: usize = 108;
 /// Offset of the signer fingerprint within the header.
 const FINGERPRINT_OFFSET: usize = 76;
 const FINGERPRINT_LEN: usize = 32;
+/// Canonical v1 cache filename. An OLD binary only ever knows this name, so the
+/// v2 updater must never clobber it (see [`DB_FILENAME_V2`]).
 const DB_FILENAME: &str = "tirith-threatdb.dat";
+/// Distinct v2 cache filename. A v2-capable client writes the v2 DB here and the
+/// loader prefers it when present and parseable, falling back to [`DB_FILENAME`].
+/// A co-located old binary never reads this file, so it is never fail-opened.
+const DB_FILENAME_V2: &str = "tirith-threatdb-v2.dat";
 const SUPPLEMENTAL_DB_FILENAME: &str = "tirith-threatdb-supplemental.dat";
+/// Distinct v2 supplemental filename (same split rationale as [`DB_FILENAME_V2`]).
+const SUPPLEMENTAL_DB_FILENAME_V2: &str = "tirith-threatdb-supplemental-v2.dat";
 /// Re-check file mtime at most every 60 seconds.
 const MTIME_CHECK_INTERVAL_SECS: u64 = 60;
+
+// ---------------------------------------------------------------------------
+// v2 binary format: a fixed EOF footer anchoring a variable, checked descriptor
+// trailer, with all new sections living AFTER `HEADER_SIZE` so the existing
+// Ed25519 signature (over `data[0..SIG_OFFSET]` ++ `data[HEADER_SIZE..]`) covers
+// them with NO change to `SIG_OFFSET` or the signed range.
+// ---------------------------------------------------------------------------
+
+/// Magic at the very end of a v2 file, anchoring the descriptor trailer.
+const FOOTER_MAGIC: &[u8; 8] = b"TRTHDBV2";
+/// Fixed EOF footer size: magic[8] + trailer_offset u64 + trailer_length u64 +
+/// trailer_version u16 + flags u16.
+const FOOTER_SIZE: usize = 8 + 8 + 8 + 2 + 2;
+/// Trailer format version carried in the footer (independent of the section
+/// `record_version`s). Bumped only on a trailer-layout change.
+const TRAILER_VERSION: u16 = 1;
+/// Per-descriptor size in the trailer: section_type u16 + record_version u16 +
+/// offset u64 + length u64 + count u64.
+const DESCRIPTOR_SIZE: usize = 2 + 2 + 8 + 8 + 8;
+/// Upper bound on the descriptor count, so a corrupt trailer_length cannot make
+/// the reader attempt an absurd allocation. Far above the handful of section
+/// types we define.
+const MAX_DESCRIPTORS: u64 = 1024;
+/// Defensive ceiling on any single section's record count. Each v2 record is at
+/// least 32 bytes (a SHA-256), so a file large enough to hold this many is well
+/// past any real DB; the real bound is the file-length check, this only stops a
+/// `count * record_size` multiply from being attempted on a wild value.
+const MAX_SECTION_RECORDS: u64 = 1 << 40;
+
+/// Fixed record size of the artifact-SHA index: full 32-byte SHA-256 +
+/// confidence(u8) + source(u8) + flags(u8) + reserved(u8) + campaign_offset(u32
+/// into the v2 campaign string table; 0xFFFF_FFFF = none).
+const ARTIFACT_SHA_RECORD_SIZE: usize = 32 + 1 + 1 + 1 + 1 + 4;
+/// Fixed record size of the file-hash index: full 32-byte SHA-256 +
+/// confidence(u8) + source(u8) + behavior_tags(u16) + campaign_offset(u32).
+const FILE_HASH_RECORD_SIZE: usize = 32 + 1 + 1 + 2 + 4;
+/// Fixed-size head of a malicious-URL index entry: full 32-byte SHA-256 of the
+/// normalized URL + url_offset(u32 into the v2 campaign string table) +
+/// source(u8) + reserved(u8). The URL string itself lives in the string table,
+/// so the index is fixed-size and binary-searchable on the hash.
+const URL_INDEX_RECORD_SIZE: usize = 32 + 4 + 1 + 1;
+
+/// v2 section type tags (stored in each descriptor's `section_type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u16)]
+enum SectionType {
+    ArtifactSha = 1,
+    FileHash = 2,
+    MaliciousUrl = 3,
+    CampaignStrings = 4,
+    BehaviorTags = 5,
+}
+
+impl SectionType {
+    fn from_u16(v: u16) -> Option<Self> {
+        match v {
+            1 => Some(Self::ArtifactSha),
+            2 => Some(Self::FileHash),
+            3 => Some(Self::MaliciousUrl),
+            4 => Some(Self::CampaignStrings),
+            5 => Some(Self::BehaviorTags),
+            _ => None,
+        }
+    }
+
+    /// Fixed record size for the index sections; `None` for the byte-blob
+    /// sections (campaign string table, behavior-tag bitset) whose `length` is
+    /// authoritative and whose `count` is informational.
+    fn record_size(self) -> Option<usize> {
+        match self {
+            Self::ArtifactSha => Some(ARTIFACT_SHA_RECORD_SIZE),
+            Self::FileHash => Some(FILE_HASH_RECORD_SIZE),
+            Self::MaliciousUrl => Some(URL_INDEX_RECORD_SIZE),
+            Self::CampaignStrings | Self::BehaviorTags => None,
+        }
+    }
+}
 
 /// Ed25519 verification key for threat DB signatures, compiled into the binary.
 /// The corresponding private key is stored as a GitHub Actions secret (THREATDB_SIGNING_KEY).
@@ -404,11 +501,6 @@ pub enum UnresolvedReason {
     /// The constraint parsed, but at least one affected version in the record
     /// is not a plain release version we can compare against.
     AffectedVersionUnparsed,
-    /// The record is version-specific (not all-versions-malicious) but enumerates
-    /// NO affected versions, so there is nothing to match or exclude against. Distinct
-    /// from `AffectedVersionUnparsed` (versions present but uncomparable) so a JSON
-    /// consumer can tell MISSING version metadata from a malformed version.
-    AffectedVersionsMissing,
 }
 
 /// Outcome of a constraint-aware package threat assessment.
@@ -449,6 +541,82 @@ pub struct TyposquatMatch {
     pub ecosystem: Ecosystem,
     pub malicious_name: String,
     pub target_name: String,
+}
+
+/// Which on-disk format a [`ThreatDbWriter`] should emit. v2 carries the same v1
+/// sections PLUS the artifact/file-hash/URL/campaign/behavior sections behind a
+/// fixed EOF footer; v1 is byte-for-byte the legacy layout (no footer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreatDbFormat {
+    V1,
+    V2,
+}
+
+/// Behavioral capability tags carried as a bitset on a v2 file-hash record.
+/// Discriminants are the bit positions and are part of the on-disk format, so
+/// they must stay stable; new tags append at higher bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum BehaviorTag {
+    ProcessSpawn = 0,
+    NetworkExfil = 1,
+    RuntimeLoader = 2,
+    DynamicCodeLoad = 3,
+    StartupHook = 4,
+    NativeInit = 5,
+    CrossRuntime = 6,
+    CredentialAccess = 7,
+}
+
+impl BehaviorTag {
+    /// The single-bit mask for this tag within a `u16` bitset.
+    pub fn mask(self) -> u16 {
+        1u16 << (self as u16)
+    }
+
+    /// Every tag, in stable bit order.
+    pub const ALL: [BehaviorTag; 8] = [
+        Self::ProcessSpawn,
+        Self::NetworkExfil,
+        Self::RuntimeLoader,
+        Self::DynamicCodeLoad,
+        Self::StartupHook,
+        Self::NativeInit,
+        Self::CrossRuntime,
+        Self::CredentialAccess,
+    ];
+
+    /// Decode a bitset into the set of tags it carries (stable bit order).
+    pub fn from_bits(bits: u16) -> Vec<BehaviorTag> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|t| bits & t.mask() != 0)
+            .collect()
+    }
+}
+
+/// Result of an artifact-SHA-256 lookup against the v2 artifact index. Returned
+/// only by a v2 DB; v1 (and the artifact index being absent) yields `None`.
+#[derive(Debug, Clone)]
+pub struct ArtifactMatch {
+    pub source: ThreatSource,
+    pub confidence: Confidence,
+    /// True when the record marks the whole artifact malicious (vs. a specific
+    /// version attestation); mirrors the package `all_versions_malicious` flag.
+    pub all_versions_malicious: bool,
+    /// Optional campaign label resolved from the v2 campaign string table.
+    pub campaign: Option<String>,
+}
+
+/// Result of a file-content SHA-256 lookup against the v2 file-hash index.
+#[derive(Debug, Clone)]
+pub struct FileIndicatorMatch {
+    pub source: ThreatSource,
+    pub confidence: Confidence,
+    /// Decoded behavioral capability tags carried by the record.
+    pub behavior_tags: Vec<BehaviorTag>,
+    pub campaign: Option<String>,
 }
 
 /// Aggregate statistics about a loaded DB.
@@ -527,6 +695,12 @@ pub enum ThreatDbError {
     InvalidRecord(usize),
     #[error("string table offset out of bounds: {0}")]
     StringOutOfBounds(u32),
+    /// The fixed EOF footer was present but structurally invalid (bad magic,
+    /// unsupported trailer version, or trailer bounds that do not fit the file
+    /// or escape the signed region). A v2 file that fails this is rejected, so
+    /// the DB never loads from a corrupt v2 trailer (fail closed for v2 data).
+    #[error("invalid v2 trailer: {0}")]
+    InvalidTrailer(&'static str),
 }
 
 /// Package index entry (8 bytes): offset_into_data(u32 LE) + key_hash(u32 LE,
@@ -580,6 +754,183 @@ fn read_u64_le(buf: &[u8], off: usize) -> Option<u64> {
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
+/// One parsed, structurally-validated v2 trailer descriptor.
+struct Descriptor {
+    section_type: SectionType,
+    #[allow(dead_code)] // record_version retained for forward-compat dispatch
+    record_version: u16,
+    offset: u64,
+    length: u64,
+    count: u64,
+}
+
+/// Locate and fully validate the v2 footer + descriptor trailer, returning the
+/// section extents the reader will index into. Every arithmetic step is checked
+/// and every offset is bounds- and signed-region-validated, so a hostile file
+/// can only ever be REJECTED, never made to read out of bounds.
+///
+/// Validations (any failure rejects the whole file):
+/// - fixed EOF footer present, magic matches, `trailer_version` supported;
+/// - the trailer region `[trailer_offset, trailer_offset+trailer_length)` lies
+///   inside the file, after `HEADER_SIZE` (never inside the signature header),
+///   and entirely before the fixed footer;
+/// - `trailer_length` is an exact multiple of [`DESCRIPTOR_SIZE`] and the
+///   descriptor count is `<= MAX_DESCRIPTORS`;
+/// - every descriptor's `section_type` is known (unknown mandatory type rejects;
+///   we treat all defined types as mandatory in v1 of the trailer);
+/// - no duplicate `section_type`;
+/// - each section `[offset, offset+length)` fits the file, starts after
+///   `HEADER_SIZE`, and ends at or before `trailer_offset` (so no section runs
+///   into the trailer or footer);
+/// - for fixed-record sections, `count * record_size == length` with the
+///   multiply done checked (`count <= MAX_SECTION_RECORDS` first);
+/// - no two sections overlap.
+fn parse_v2_footer(data: &[u8]) -> Result<V2Sections, ThreatDbError> {
+    use ThreatDbError::InvalidTrailer;
+
+    let file_len = data.len() as u64;
+    // The header and the footer must both fit, and they must not overlap.
+    let footer_start = file_len
+        .checked_sub(FOOTER_SIZE as u64)
+        .ok_or(InvalidTrailer("file shorter than footer"))?;
+    if footer_start < HEADER_SIZE as u64 {
+        return Err(InvalidTrailer("footer overlaps header"));
+    }
+    let footer = &data[footer_start as usize..];
+
+    if &footer[0..8] != FOOTER_MAGIC {
+        return Err(InvalidTrailer("bad footer magic"));
+    }
+    let trailer_offset =
+        read_u64_le(footer, 8).ok_or(InvalidTrailer("truncated trailer_offset"))?;
+    let trailer_length =
+        read_u64_le(footer, 16).ok_or(InvalidTrailer("truncated trailer_length"))?;
+    let trailer_version =
+        read_u16_le(footer, 24).ok_or(InvalidTrailer("truncated trailer_version"))?;
+    // flags at footer[26..28] reserved for future use; bit usage is validated
+    // per-descriptor, not here.
+    if trailer_version != TRAILER_VERSION {
+        return Err(InvalidTrailer("unsupported trailer version"));
+    }
+
+    // Trailer region must sit after the header, before the footer, in bounds.
+    let trailer_end = trailer_offset
+        .checked_add(trailer_length)
+        .ok_or(InvalidTrailer("trailer extent overflow"))?;
+    if trailer_offset < HEADER_SIZE as u64 {
+        return Err(InvalidTrailer("trailer offset inside header"));
+    }
+    if trailer_end > footer_start {
+        return Err(InvalidTrailer("trailer runs into footer"));
+    }
+
+    if trailer_length % DESCRIPTOR_SIZE as u64 != 0 {
+        return Err(InvalidTrailer("trailer length not a descriptor multiple"));
+    }
+    let descriptor_count = trailer_length / DESCRIPTOR_SIZE as u64;
+    if descriptor_count > MAX_DESCRIPTORS {
+        return Err(InvalidTrailer("too many descriptors"));
+    }
+
+    // Parse each descriptor with full bounds + arithmetic checks.
+    let mut descriptors: Vec<Descriptor> = Vec::with_capacity(descriptor_count as usize);
+    let mut seen_types: Vec<u16> = Vec::new();
+    for i in 0..descriptor_count {
+        let base = (trailer_offset + i * DESCRIPTOR_SIZE as u64) as usize;
+        let raw_type = read_u16_le(data, base).ok_or(InvalidTrailer("truncated descriptor"))?;
+        let record_version =
+            read_u16_le(data, base + 2).ok_or(InvalidTrailer("truncated descriptor"))?;
+        let offset = read_u64_le(data, base + 4).ok_or(InvalidTrailer("truncated descriptor"))?;
+        let length = read_u64_le(data, base + 12).ok_or(InvalidTrailer("truncated descriptor"))?;
+        let count = read_u64_le(data, base + 20).ok_or(InvalidTrailer("truncated descriptor"))?;
+
+        // Unknown mandatory section type rejects (the trailer carries only
+        // sections this version understands).
+        let section_type =
+            SectionType::from_u16(raw_type).ok_or(InvalidTrailer("unknown section type"))?;
+        if seen_types.contains(&raw_type) {
+            return Err(InvalidTrailer("duplicate section type"));
+        }
+        seen_types.push(raw_type);
+
+        // Section extent must fit the file, sit after the header, and end at or
+        // before the trailer (so it cannot run into the trailer or footer).
+        let section_end = offset
+            .checked_add(length)
+            .ok_or(InvalidTrailer("section extent overflow"))?;
+        if offset < HEADER_SIZE as u64 {
+            return Err(InvalidTrailer("section offset inside header"));
+        }
+        if section_end > trailer_offset {
+            return Err(InvalidTrailer("section runs into trailer"));
+        }
+
+        // Fixed-record sections: count * record_size must equal length exactly,
+        // with the multiply checked.
+        if let Some(rec_size) = section_type.record_size() {
+            if count > MAX_SECTION_RECORDS {
+                return Err(InvalidTrailer("absurd section count"));
+            }
+            let expected = count
+                .checked_mul(rec_size as u64)
+                .ok_or(InvalidTrailer("count * record_size overflow"))?;
+            if expected != length {
+                return Err(InvalidTrailer("section length != count * record_size"));
+            }
+        }
+
+        descriptors.push(Descriptor {
+            section_type,
+            record_version,
+            offset,
+            length,
+            count,
+        });
+    }
+
+    // Reject any pairwise overlap among the sections (the trailer/footer/header
+    // are already excluded by the per-descriptor checks above).
+    for a in 0..descriptors.len() {
+        for b in (a + 1)..descriptors.len() {
+            let da = &descriptors[a];
+            let db = &descriptors[b];
+            let a_end = da.offset + da.length; // checked above
+            let b_end = db.offset + db.length;
+            if da.offset < b_end && db.offset < a_end {
+                return Err(InvalidTrailer("overlapping sections"));
+            }
+        }
+    }
+
+    // Assemble the located extents. Absent optional sections stay zero/empty.
+    let mut out = V2Sections::default();
+    for d in &descriptors {
+        match d.section_type {
+            SectionType::ArtifactSha => {
+                out.artifact_sha_offset = d.offset;
+                out.artifact_sha_count = d.count;
+            }
+            SectionType::FileHash => {
+                out.file_hash_offset = d.offset;
+                out.file_hash_count = d.count;
+            }
+            SectionType::MaliciousUrl => {
+                out.url_offset = d.offset;
+                out.url_count = d.count;
+            }
+            SectionType::CampaignStrings => {
+                out.campaign_offset = d.offset;
+                out.campaign_length = d.length;
+            }
+            SectionType::BehaviorTags => {
+                // Validated structurally above; tags ride inline on file-hash
+                // records, so nothing more to retain for lookup.
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// In-memory threat intelligence database loaded from the signed binary file.
 #[derive(Debug)]
 pub struct ThreatDb {
@@ -601,6 +952,31 @@ pub struct ThreatDb {
     popular_index_count: u32,
     string_table_offset: u32,
     string_table_size: u32,
+    /// Parsed v2 sections, or `None` for a v1 file (every v2 lookup then
+    /// returns None and defers to the supplemental overlay, behaving exactly
+    /// like a pre-v2 binary).
+    v2: Option<V2Sections>,
+}
+
+/// Located, validated v2 section extents (absolute byte offsets into `data`).
+/// Present only when [`ThreatDb::from_bytes`] parsed a valid v2 footer + trailer.
+#[derive(Debug, Clone, Default)]
+struct V2Sections {
+    /// Artifact-SHA index: sorted by the full 32-byte hash.
+    artifact_sha_offset: u64,
+    artifact_sha_count: u64,
+    /// File-content-hash index: sorted by the full 32-byte hash.
+    file_hash_offset: u64,
+    file_hash_count: u64,
+    /// Malicious-URL index: sorted by the full 32-byte hash of the normalized URL.
+    url_offset: u64,
+    url_count: u64,
+    /// v2 campaign / URL string table (length-prefixed entries, like the v1 one).
+    campaign_offset: u64,
+    campaign_length: u64,
+    // The behavior-tag bitset rides inline on each file-hash record, so no
+    // separate section needs to be retained for lookup; the descriptor is still
+    // validated structurally on load.
 }
 
 impl ThreatDb {
@@ -619,7 +995,11 @@ impl ThreatDb {
 
         let err = || ThreatDbError::InvalidRecord(0);
         let version = read_u32_le(&data, 8).ok_or_else(err)?;
-        if version != FORMAT_VERSION {
+        // Range-accepting: any format in [MIN..=FORMAT_VERSION] loads. A v1 file
+        // loads with v2 sections absent; a v2 file loads its v2 sections. An OLD
+        // binary (FORMAT_VERSION == 1) keeps its `version != 1` reject and fails
+        // closed on a v2 file.
+        if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(ThreatDbError::UnsupportedVersion(version));
         }
 
@@ -690,6 +1070,15 @@ impl ThreatDb {
             return Err(ThreatDbError::SectionOutOfBounds);
         }
 
+        // v2 footer/trailer. Only parsed for a v2 file; a v1 file has no footer
+        // and `v2` stays None. A v2 file with a malformed footer/trailer is
+        // REJECTED (fail closed for v2 data) rather than silently degraded.
+        let v2 = if version >= 2 {
+            Some(parse_v2_footer(&data)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             data,
             supplemental: None,
@@ -708,6 +1097,7 @@ impl ThreatDb {
             popular_index_count,
             string_table_offset,
             string_table_size,
+            v2,
         })
     }
 
@@ -728,8 +1118,13 @@ impl ThreatDb {
         Self::from_bytes(data, min_sequence)
     }
 
-    /// Default filesystem path for the threat DB file. Checks
+    /// Canonical v1 filesystem path for the primary threat DB. Checks
     /// `TIRITH_THREATDB_PATH` first, then `~/.local/share/tirith/...`.
+    ///
+    /// This is the path an OLD (v1-only) binary reads, and the only one the v2
+    /// updater must never clobber. The loader resolves the *effective* path via
+    /// [`resolve_primary_path`], which prefers the v2 file when present and
+    /// parseable.
     pub fn default_path() -> Option<PathBuf> {
         if let Ok(p) = std::env::var("TIRITH_THREATDB_PATH") {
             if !p.is_empty() {
@@ -739,8 +1134,40 @@ impl ThreatDb {
         policy::data_dir().map(|d| d.join(DB_FILENAME))
     }
 
-    /// Optional supplemental DB path for user-local keyed feeds compiled on the
-    /// user's machine during `tirith threat-db update`.
+    /// Distinct v2 primary DB path. A v2-capable client writes the v2 DB here so
+    /// a co-located old binary, which only knows [`default_path`], never reads a
+    /// v2 file it cannot parse (and is therefore never fail-opened).
+    ///
+    /// Honors the same `TIRITH_THREATDB_PATH` override as [`default_path`] by
+    /// deriving a sibling `*-v2.dat` name next to the overridden path, so tests
+    /// and operators that redirect the primary path also redirect its v2 sibling.
+    ///
+    /// [`default_path`]: Self::default_path
+    pub fn default_path_v2() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("TIRITH_THREATDB_PATH") {
+            if !p.is_empty() {
+                return Some(v2_sibling(&PathBuf::from(p)));
+            }
+        }
+        policy::data_dir().map(|d| d.join(DB_FILENAME_V2))
+    }
+
+    /// Effective primary DB path the loader should read: the v2 file when it is
+    /// present, structurally loadable, AND signature-valid, else the v1 file. An
+    /// old binary never calls this and only ever reads [`default_path`].
+    ///
+    /// Requiring a valid signature here (not merely "parseable") closes a
+    /// fail-open: a structurally-valid but unsigned/wrong-key v2 planted beside a
+    /// good v1 must NOT shadow it, since the cache loads exactly the resolved
+    /// primary and would otherwise reject the bad v2 without falling back.
+    ///
+    /// [`default_path`]: Self::default_path
+    pub fn resolve_primary_path() -> Option<PathBuf> {
+        resolve_preferring_v2(Self::default_path_v2(), Self::default_path(), true)
+    }
+
+    /// Canonical v1 supplemental DB path for user-local keyed feeds compiled on
+    /// the user's machine during `tirith threat-db update`.
     pub fn supplemental_path() -> Option<PathBuf> {
         if let Ok(p) = std::env::var("TIRITH_THREATDB_SUPPLEMENTAL_PATH") {
             if !p.is_empty() {
@@ -748,6 +1175,32 @@ impl ThreatDb {
             }
         }
         policy::data_dir().map(|d| d.join(SUPPLEMENTAL_DB_FILENAME))
+    }
+
+    /// Distinct v2 supplemental DB path (same split rationale as
+    /// [`default_path_v2`]).
+    ///
+    /// [`default_path_v2`]: Self::default_path_v2
+    pub fn supplemental_path_v2() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("TIRITH_THREATDB_SUPPLEMENTAL_PATH") {
+            if !p.is_empty() {
+                return Some(v2_sibling(&PathBuf::from(p)));
+            }
+        }
+        policy::data_dir().map(|d| d.join(SUPPLEMENTAL_DB_FILENAME_V2))
+    }
+
+    /// Effective supplemental DB path: the v2 file when present and structurally
+    /// loadable, else the v1 file, else `None` when neither exists. The
+    /// supplemental overlay is intentionally UNSIGNED (its authenticity is
+    /// anchored to local machine policy, not CI), so the resolver requires only
+    /// "parseable" here, never a signature.
+    pub fn resolve_supplemental_path() -> Option<PathBuf> {
+        resolve_preferring_v2(
+            Self::supplemental_path_v2(),
+            Self::supplemental_path(),
+            false,
+        )
     }
 
     fn with_supplemental(mut self, supplemental: Option<ThreatDb>) -> Self {
@@ -1068,41 +1521,21 @@ impl ThreatDb {
             return PackageThreatAssessment::ExactMatch(summary);
         }
 
-        // A malicious record with NO affected versions (and not all-versions-malicious)
-        // gives nothing to match against or exclude, so NO intent can be proven a hit
-        // or an exclusion: it is Unresolved, never a silent NoRecord/clean.
-        if rec.versions.is_empty() {
-            return PackageThreatAssessment::Unresolved {
-                summary,
-                reason: UnresolvedReason::AffectedVersionsMissing,
-                affected_versions: affected,
-            };
-        }
-
         match intent {
             VersionIntent::Exact(v) | VersionIntent::Resolved(v) => {
-                // Match on a literal string equal OR a numeric release equal, so a pin
-                // like `==1.4` still hits a record listing `1.4.0`. A PEP 440 LOCAL
-                // version (`1.0+ubuntu1`) ALSO matches a record for its base (`1.0`): a
-                // local build is a rebuild of the base release, so a malicious upstream
-                // is not missed, while an exact local record (`1.0+ubuntu1`) still
-                // matches via the literal compare. Compare via `cmp` (not `==`): only
-                // `Ord` treats trailing-zero segments as equal, so `1.4` == `1.4.0`.
-                let v_s: &str = v;
-                let base: &str = v_s.split('+').next().unwrap_or(v_s);
+                // Match on a literal string equal OR a numeric release equal, so
+                // a pin like `==1.4` still hits a record listing `1.4.0`. The
+                // numeric arm only fires when both sides parse as plain release
+                // versions; anything else (prereleases, locals) relies on the
+                // literal compare and falls through to NoRecord when it differs.
+                // Compare via `cmp` (not `==`): only `Ord` treats trailing-zero
+                // segments as equal, so `1.4` and `1.4.0` match here.
                 let matched = rec.versions.iter().any(|rv| {
-                    let rv: &str = rv;
-                    rv == v_s
+                    rv == v
                         || matches!(
-                            (ReleaseVersion::parse(rv), ReleaseVersion::parse(v_s)),
+                            (ReleaseVersion::parse(rv), ReleaseVersion::parse(v)),
                             (Some(a), Some(b)) if a.cmp(&b) == std::cmp::Ordering::Equal
                         )
-                        || (base != v_s
-                            && (rv == base
-                                || matches!(
-                                    (ReleaseVersion::parse(rv), ReleaseVersion::parse(base)),
-                                    (Some(a), Some(b)) if a.cmp(&b) == std::cmp::Ordering::Equal
-                                )))
                 });
                 if matched {
                     PackageThreatAssessment::ExactMatch(summary)
@@ -1117,22 +1550,8 @@ impl ThreatDb {
                 reason: UnresolvedReason::UnspecifiedVersion,
                 affected_versions: affected,
             },
-            VersionIntent::Constraint { parsed, raw } => {
+            VersionIntent::Constraint { parsed, .. } => {
                 let Some(constraint) = parsed else {
-                    // Raw-token exact fallback: an explicit-but-unparseable token (a Docker
-                    // digest, a dist-tag like `latest`, a non-semver selector) still names a
-                    // concrete identity. If it LITERALLY equals an affected version that is a
-                    // definite malicious hit, not an unresolved guess, so return ExactMatch
-                    // rather than downgrading a known-bad pin to a Medium warning. A raw that
-                    // LOOKS LIKE A PLAIN VERSION is NOT such a token, though: it is a range
-                    // requirement we did not parse (e.g. Cargo's caret default, where
-                    // `1.0.0` means `^1.0.0`), so exact-matching it would wrongly upgrade a
-                    // range request to a confirmed hit. Those stay Unresolved (a warning).
-                    if !crate::version_intent::looks_like_plain_version(raw)
-                        && rec.versions.iter().any(|rv| rv == raw)
-                    {
-                        return PackageThreatAssessment::ExactMatch(summary);
-                    }
                     return PackageThreatAssessment::Unresolved {
                         summary,
                         reason: UnresolvedReason::ConstraintUnsupported,
@@ -1409,6 +1828,149 @@ impl ThreatDb {
         None
     }
 
+    /// Read a length-prefixed entry from the v2 campaign string table at a
+    /// relative `offset` (`0xFFFF_FFFF` = none). Mirrors the v1 string-table
+    /// reader but keyed off the v2 campaign section's absolute base.
+    fn read_campaign_string(&self, offset: u32) -> Option<&str> {
+        if offset == 0xFFFF_FFFF {
+            return None;
+        }
+        let v2 = self.v2.as_ref()?;
+        let abs = v2.campaign_offset.checked_add(offset as u64)? as usize;
+        let len = read_u16_le(&self.data, abs)? as usize;
+        let start = abs.checked_add(2)?;
+        let end = start.checked_add(len)?;
+        // The string must stay inside the campaign section's own extent.
+        if end as u64 > v2.campaign_offset + v2.campaign_length {
+            return None;
+        }
+        std::str::from_utf8(&self.data[start..end]).ok()
+    }
+
+    /// Binary-search a fixed-record v2 index (artifact or file-hash) whose first
+    /// 32 bytes per record are the full SHA-256, sorted ascending. Returns the
+    /// absolute byte offset of the matching record, or `None`.
+    fn binary_search_hash_index(
+        &self,
+        section_offset: u64,
+        section_count: u64,
+        record_size: usize,
+        target: &[u8; 32],
+    ) -> Option<usize> {
+        if section_count == 0 {
+            return None;
+        }
+        let mut lo: u64 = 0;
+        let mut hi: u64 = section_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let base = (section_offset + mid * record_size as u64) as usize;
+            let stored = self.data.get(base..base + 32)?;
+            match stored.cmp(&target[..]) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(base),
+            }
+        }
+        None
+    }
+
+    /// Look up a wheel/sdist artifact by the FULL 32-byte SHA-256 of its bytes.
+    ///
+    /// Returns `None` for a v1 file (no artifact index) and defers to the
+    /// supplemental overlay on a local miss, exactly mirroring [`check_hostname`].
+    /// This is one of the two methods PR B8 reserved a feature-gated seam for;
+    /// DB-B only ADDS it.
+    ///
+    /// [`check_hostname`]: Self::check_hostname
+    pub fn check_artifact_sha256(&self, sha256: &[u8; 32]) -> Option<ArtifactMatch> {
+        if let Some(v2) = self.v2.as_ref() {
+            if let Some(base) = self.binary_search_hash_index(
+                v2.artifact_sha_offset,
+                v2.artifact_sha_count,
+                ARTIFACT_SHA_RECORD_SIZE,
+                sha256,
+            ) {
+                // Record layout: sha[32] confidence(u8) source(u8) flags(u8)
+                // reserved(u8) campaign_offset(u32).
+                let confidence = Confidence::from_u8(*self.data.get(base + 32)?)?;
+                let source = ThreatSource::from_u8(*self.data.get(base + 33)?)?;
+                let flags = *self.data.get(base + 34)?;
+                let all_versions_malicious = flags & 1 != 0;
+                let campaign_offset = read_u32_le(&self.data, base + 36)?;
+                let campaign = self.read_campaign_string(campaign_offset).map(String::from);
+                return Some(ArtifactMatch {
+                    source,
+                    confidence,
+                    all_versions_malicious,
+                    campaign,
+                });
+            }
+        }
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_artifact_sha256(sha256))
+    }
+
+    /// Look up a file by the FULL 32-byte SHA-256 of its content against the v2
+    /// file-hash index. `None` for v1; defers to supplemental on a miss.
+    pub fn check_file_sha256(&self, sha256: &[u8; 32]) -> Option<FileIndicatorMatch> {
+        if let Some(v2) = self.v2.as_ref() {
+            if let Some(base) = self.binary_search_hash_index(
+                v2.file_hash_offset,
+                v2.file_hash_count,
+                FILE_HASH_RECORD_SIZE,
+                sha256,
+            ) {
+                // Record layout: sha[32] confidence(u8) source(u8)
+                // behavior_tags(u16) campaign_offset(u32).
+                let confidence = Confidence::from_u8(*self.data.get(base + 32)?)?;
+                let source = ThreatSource::from_u8(*self.data.get(base + 33)?)?;
+                let tag_bits = read_u16_le(&self.data, base + 34)?;
+                let campaign_offset = read_u32_le(&self.data, base + 36)?;
+                let campaign = self.read_campaign_string(campaign_offset).map(String::from);
+                return Some(FileIndicatorMatch {
+                    source,
+                    confidence,
+                    behavior_tags: BehaviorTag::from_bits(tag_bits),
+                    campaign,
+                });
+            }
+        }
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_file_sha256(sha256))
+    }
+
+    /// Look up a normalized URL string against the v2 malicious-URL index. The
+    /// index is keyed on the SHA-256 of the normalized URL; after locating the
+    /// hash, the stored URL is compared for an exact match (so a hash collision
+    /// cannot produce a false positive). `None` for v1; defers to supplemental.
+    pub fn check_malicious_url(&self, normalized_url: &str) -> Option<ThreatSource> {
+        if let Some(v2) = self.v2.as_ref() {
+            let digest = Sha256::digest(normalized_url.as_bytes());
+            let mut target = [0u8; 32];
+            target.copy_from_slice(&digest);
+            if let Some(base) = self.binary_search_hash_index(
+                v2.url_offset,
+                v2.url_count,
+                URL_INDEX_RECORD_SIZE,
+                &target,
+            ) {
+                // Record layout: sha[32] url_offset(u32) source(u8) reserved(u8).
+                let url_offset = read_u32_le(&self.data, base + 32)?;
+                let source = ThreatSource::from_u8(*self.data.get(base + 36)?)?;
+                // Compare the stored URL after locating the hash range.
+                if self.read_campaign_string(url_offset) == Some(normalized_url) {
+                    return Some(source);
+                }
+            }
+        }
+        self.supplemental
+            .as_deref()
+            .and_then(|db| db.check_malicious_url(normalized_url))
+    }
+
     /// Whether `name` is itself a known-popular package in `eco`. Exact-match
     /// companion to [`check_popular_distance`], which instead flags near-misses.
     ///
@@ -1591,51 +2153,49 @@ fn merge_assessments(
             _ => None,
         }
     };
+    let merge_affected = || {
+        let mut v = affected_from(&primary);
+        v.extend(affected_from(&overlay));
+        v.sort();
+        v.dedup();
+        v
+    };
+
     // 2. Any unresolved layer makes the result unresolved (primary's reason and
-    // summary preferred). The affected versions come from the SAME layer whose summary
-    // is returned, NOT a union of both: the merged finding phrases the list as flagged by
-    // that one summary's `source_label`, so unioning would misattribute an overlay-only
-    // version to the primary's source. (The package is still flagged regardless; only the
-    // affected-version list is scoped to the reported source.)
+    // summary preferred), carrying the union of affected versions.
     let primary_unresolved = matches!(primary, P::Unresolved { .. });
     let overlay_unresolved = matches!(overlay, P::Unresolved { .. });
     if primary_unresolved || overlay_unresolved {
-        let (reason, summary, affected_versions) = if let P::Unresolved {
+        let (reason, summary) = if let P::Unresolved {
             reason, summary, ..
         } = &primary
         {
-            (*reason, summary.clone(), affected_from(&primary))
+            (*reason, summary.clone())
         } else if let P::Unresolved {
             reason, summary, ..
         } = &overlay
         {
-            (*reason, summary.clone(), affected_from(&overlay))
+            (*reason, summary.clone())
         } else {
             unreachable!("one layer is Unresolved")
         };
         return P::Unresolved {
             summary,
             reason,
-            affected_versions,
+            affected_versions: merge_affected(),
         };
     }
 
-    // 3. A concrete intersection in either layer (primary summary preferred). Same
-    // provenance rule: the affected versions come from the layer whose summary is returned.
+    // 3. A concrete intersection in either layer (primary summary preferred).
     let primary_intersects = matches!(primary, P::ConstraintIntersectsAffected { .. });
     let overlay_intersects = matches!(overlay, P::ConstraintIntersectsAffected { .. });
     if primary_intersects || overlay_intersects {
-        let (summary, affected_versions) = if let Some(s) = summary_from(&primary) {
-            (s, affected_from(&primary))
-        } else {
-            (
-                summary_from(&overlay).expect("an intersecting layer carries a summary"),
-                affected_from(&overlay),
-            )
-        };
+        let summary = summary_from(&primary)
+            .or_else(|| summary_from(&overlay))
+            .expect("an intersecting layer carries a summary");
         return P::ConstraintIntersectsAffected {
             summary,
-            affected_versions,
+            affected_versions: merge_affected(),
         };
     }
 
@@ -1793,10 +2353,57 @@ fn path_mtime_epoch(path: &Path) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+/// Derive the `*-v2.dat` sibling of a `.dat` path: replace a trailing `.dat`
+/// extension with `-v2.dat`, falling back to appending `-v2` for any other name.
+fn v2_sibling(path: &Path) -> PathBuf {
+    if path.extension().and_then(|e| e.to_str()) == Some("dat") {
+        let mut s = path.as_os_str().to_os_string();
+        // Strip ".dat" (4 bytes) and append "-v2.dat".
+        let lossy = s.to_string_lossy();
+        if let Some(stem) = lossy.strip_suffix(".dat") {
+            return PathBuf::from(format!("{stem}-v2.dat"));
+        }
+        s.push("-v2");
+        return PathBuf::from(s);
+    }
+    let mut s = path.as_os_str().to_os_string();
+    s.push("-v2");
+    PathBuf::from(s)
+}
+
+/// Prefer `v2_path` when it exists AND loads (any format), else `v1_path` when
+/// it exists, else `None`. "Loads" means [`ThreatDb::load_from_path`] succeeds;
+/// when `require_signature` is set, the v2 file must ALSO pass
+/// [`ThreatDb::verify_signature`]. A present-but-corrupt (or, for the signed
+/// primary, wrongly-signed) v2 file is skipped so it never shadows a good v1.
+fn resolve_preferring_v2(
+    v2_path: Option<PathBuf>,
+    v1_path: Option<PathBuf>,
+    require_signature: bool,
+) -> Option<PathBuf> {
+    if let Some(ref v2) = v2_path {
+        if v2.exists() {
+            if let Ok(db) = ThreatDb::load_from_path(v2, 0) {
+                if !require_signature || db.verify_signature().is_ok() {
+                    return v2_path;
+                }
+            }
+        }
+    }
+    match v1_path {
+        Some(p) if p.exists() => Some(p),
+        // No v1 file but a (corrupt-or-not) v2 path: fall back to whatever v1
+        // path was configured so the caller's "missing" handling is unchanged.
+        _ => v1_path,
+    }
+}
+
 fn current_cache_source() -> Option<CacheSource> {
-    let primary_path = ThreatDb::default_path()?;
+    // Prefer the v2 primary/supplemental files when present and parseable; an
+    // old binary never reaches this code and only ever reads the v1 names.
+    let primary_path = ThreatDb::resolve_primary_path()?;
     let primary_mtime = path_mtime_epoch(&primary_path)?;
-    let supplemental_path = ThreatDb::supplemental_path().filter(|path| path.exists());
+    let supplemental_path = ThreatDb::resolve_supplemental_path().filter(|path| path.exists());
     let supplemental_mtime = supplemental_path
         .as_ref()
         .and_then(|path| path_mtime_epoch(path))
@@ -1838,6 +2445,34 @@ pub struct ThreatDbWriter {
     typosquats: Vec<WriterTyposquat>,
     popular: Vec<WriterPopular>,
     string_table: StringTable,
+    // v2-only inputs. Empty for a v1 build; only emitted by `build_format(V2,..)`.
+    artifact_shas: Vec<WriterArtifactSha>,
+    file_hashes: Vec<WriterFileHash>,
+    malicious_urls: Vec<WriterMaliciousUrl>,
+}
+
+struct WriterArtifactSha {
+    sha256: [u8; 32],
+    source: ThreatSource,
+    confidence: Confidence,
+    all_versions_malicious: bool,
+    /// Campaign label offset into the v2 campaign string table (set at build).
+    campaign: Option<String>,
+}
+
+struct WriterFileHash {
+    sha256: [u8; 32],
+    source: ThreatSource,
+    confidence: Confidence,
+    behavior_tags: u16,
+    campaign: Option<String>,
+}
+
+struct WriterMaliciousUrl {
+    /// The normalized URL string (stored in the campaign string table) and
+    /// keyed in the index by its SHA-256.
+    normalized_url: String,
+    source: ThreatSource,
 }
 
 struct WriterPkg {
@@ -1919,7 +2554,59 @@ impl ThreatDbWriter {
             typosquats: Vec::new(),
             popular: Vec::new(),
             string_table: StringTable::new(),
+            artifact_shas: Vec::new(),
+            file_hashes: Vec::new(),
+            malicious_urls: Vec::new(),
         }
+    }
+
+    /// Add a malicious-artifact record keyed by the FULL 32-byte SHA-256 of the
+    /// artifact bytes. v2-only: ignored by a `ThreatDbFormat::V1` build.
+    pub fn add_artifact_sha256(
+        &mut self,
+        sha256: [u8; 32],
+        source: ThreatSource,
+        confidence: Confidence,
+        all_versions_malicious: bool,
+        campaign: Option<&str>,
+    ) {
+        self.artifact_shas.push(WriterArtifactSha {
+            sha256,
+            source,
+            confidence,
+            all_versions_malicious,
+            campaign: campaign.map(str::to_string),
+        });
+    }
+
+    /// Add a malicious-file record keyed by the FULL 32-byte SHA-256 of the file
+    /// content, carrying a behavior-tag bitset. v2-only.
+    pub fn add_file_sha256(
+        &mut self,
+        sha256: [u8; 32],
+        source: ThreatSource,
+        confidence: Confidence,
+        behavior_tags: &[BehaviorTag],
+        campaign: Option<&str>,
+    ) {
+        let bits = behavior_tags.iter().fold(0u16, |acc, t| acc | t.mask());
+        self.file_hashes.push(WriterFileHash {
+            sha256,
+            source,
+            confidence,
+            behavior_tags: bits,
+            campaign: campaign.map(str::to_string),
+        });
+    }
+
+    /// Add a malicious-URL record. The normalized URL is stored and the index is
+    /// keyed by its SHA-256. Populate ONLY from explicit indicator fields, never
+    /// OpenSSF `references`. v2-only.
+    pub fn add_malicious_url(&mut self, normalized_url: &str, source: ThreatSource) {
+        self.malicious_urls.push(WriterMaliciousUrl {
+            normalized_url: normalized_url.to_string(),
+            source,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1977,7 +2664,7 @@ impl ThreatDbWriter {
         });
     }
 
-    /// Build and write the database to a file. Signs with the provided keypair.
+    /// Build and write a v1 database to a file. Signs with the provided keypair.
     pub fn write_to(
         mut self,
         path: &Path,
@@ -1988,9 +2675,35 @@ impl ThreatDbWriter {
         Ok(())
     }
 
-    /// Build the database into bytes (for testing or in-memory use).
+    /// Build and write a database of the requested format to a file.
+    pub fn write_to_format(
+        mut self,
+        format: ThreatDbFormat,
+        path: &Path,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), ThreatDbError> {
+        let bytes = self.build_format(format, signing_key)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    /// Build a v1 database into bytes (the legacy default). Byte-for-byte the
+    /// pre-v2 layout: no footer, no v2 sections, version stamp 1.
     pub fn build(
         &mut self,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<Vec<u8>, ThreatDbError> {
+        self.build_format(ThreatDbFormat::V1, signing_key)
+    }
+
+    /// Build a database of the requested format into bytes. A v1 build emits the
+    /// legacy layout unchanged; a v2 build appends the artifact / file-hash /
+    /// URL / campaign / behavior sections, a checked descriptor trailer, and a
+    /// fixed EOF footer, all AFTER `HEADER_SIZE` so the existing signed range
+    /// (`[0..SIG_OFFSET)` ++ `[HEADER_SIZE..)`) covers them unchanged.
+    pub fn build_format(
+        &mut self,
+        format: ThreatDbFormat,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<Vec<u8>, ThreatDbError> {
         // Sort and deduplicate each section.
@@ -2176,8 +2889,14 @@ impl ThreatDbWriter {
         let mut buf = vec![0u8; total_size];
 
         // Header (signature + fingerprint filled in after the data is written).
+        // The version stamp is format-selected: a v1 build stamps 1 (so existing
+        // signed DBs and an old binary are unaffected), a v2 build stamps 2.
+        let stamped_version: u32 = match format {
+            ThreatDbFormat::V1 => 1,
+            ThreatDbFormat::V2 => 2,
+        };
         buf[0..8].copy_from_slice(MAGIC);
-        buf[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&stamped_version.to_le_bytes());
         buf[12..20].copy_from_slice(&self.build_timestamp.to_le_bytes());
         buf[20..28].copy_from_slice(&self.build_sequence.to_le_bytes());
         buf[28..32].copy_from_slice(&pkg_index_offset.to_le_bytes());
@@ -2237,7 +2956,17 @@ impl ThreatDbWriter {
         let st = self.string_table.bytes();
         buf[pos..pos + st.len()].copy_from_slice(st);
 
-        // Sign: header before sig ++ all data after header.
+        // v2: append the new sections, a checked descriptor trailer, and a fixed
+        // EOF footer. All of this lands at >= `HEADER_SIZE`, so the existing
+        // signed range covers it with no change to `SIG_OFFSET`. A v1 build skips
+        // this entirely and is byte-for-byte the legacy layout.
+        if format == ThreatDbFormat::V2 {
+            self.append_v2_sections(&mut buf);
+        }
+
+        // Sign: header before sig ++ all data after header. Unchanged from v1:
+        // for a v2 file the appended trailing bytes are simply part of the
+        // `[HEADER_SIZE..]` tail and are signed automatically.
         let mut signed_data = Vec::with_capacity(SIG_OFFSET + (buf.len() - HEADER_SIZE));
         signed_data.extend_from_slice(&buf[..SIG_OFFSET]);
         signed_data.extend_from_slice(&buf[HEADER_SIZE..]);
@@ -2247,6 +2976,171 @@ impl ThreatDbWriter {
         buf[SIG_OFFSET..SIG_OFFSET + SIGNATURE_LENGTH].copy_from_slice(&signature.to_bytes());
 
         Ok(buf)
+    }
+
+    /// Append the v2 sections, descriptor trailer, and fixed EOF footer to a
+    /// freshly-built v1 body. The layout (all after `HEADER_SIZE`):
+    ///
+    /// ```text
+    /// [v1 body up to the v1 string table]
+    /// artifact_sha index      (sorted by full SHA-256)
+    /// file_hash index         (sorted by full SHA-256)
+    /// url index               (sorted by full SHA-256 of the normalized URL)
+    /// campaign string table   (length-prefixed; also holds URL strings)
+    /// behavior-tag bitset      (a single u16 bitset for emitted file hashes)
+    /// descriptor trailer      (one [`Descriptor`] per present section)
+    /// fixed EOF footer        (magic + trailer_offset/length + version + flags)
+    /// ```
+    fn append_v2_sections(&mut self, buf: &mut Vec<u8>) {
+        // Build a dedicated v2 campaign string table. Both campaign labels and
+        // malicious-URL strings live here; the index records carry offsets into
+        // it. Keep it separate from the v1 string table so v1 offsets are
+        // untouched.
+        let mut campaign_table = StringTable::new();
+
+        // Sort + dedup the artifact/file/URL inputs by their hash so binary
+        // search is sound; store and sort the FULL 32-byte SHA-256.
+        self.artifact_shas.sort_by_key(|a| a.sha256);
+        self.artifact_shas.dedup_by(|a, b| a.sha256 == b.sha256);
+        self.file_hashes.sort_by_key(|f| f.sha256);
+        self.file_hashes.dedup_by(|a, b| a.sha256 == b.sha256);
+
+        // URL records: key on SHA-256 of the normalized URL, sort + dedup by it.
+        let mut url_records: Vec<([u8; 32], &WriterMaliciousUrl)> = self
+            .malicious_urls
+            .iter()
+            .map(|u| {
+                let digest = Sha256::digest(u.normalized_url.as_bytes());
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&digest);
+                (key, u)
+            })
+            .collect();
+        url_records.sort_by_key(|r| r.0);
+        url_records.dedup_by(|a, b| a.0 == b.0);
+
+        // Artifact-SHA section bytes.
+        let mut artifact_bytes: Vec<u8> =
+            Vec::with_capacity(self.artifact_shas.len() * ARTIFACT_SHA_RECORD_SIZE);
+        for a in &self.artifact_shas {
+            let campaign_offset = match &a.campaign {
+                Some(c) => campaign_table.intern(c),
+                None => 0xFFFF_FFFF,
+            };
+            artifact_bytes.extend_from_slice(&a.sha256);
+            artifact_bytes.push(a.confidence as u8);
+            artifact_bytes.push(a.source as u8);
+            artifact_bytes.push(if a.all_versions_malicious { 1 } else { 0 });
+            artifact_bytes.push(0); // reserved
+            artifact_bytes.extend_from_slice(&campaign_offset.to_le_bytes());
+        }
+
+        // File-hash section bytes.
+        let mut file_bytes: Vec<u8> =
+            Vec::with_capacity(self.file_hashes.len() * FILE_HASH_RECORD_SIZE);
+        for f in &self.file_hashes {
+            let campaign_offset = match &f.campaign {
+                Some(c) => campaign_table.intern(c),
+                None => 0xFFFF_FFFF,
+            };
+            file_bytes.extend_from_slice(&f.sha256);
+            file_bytes.push(f.confidence as u8);
+            file_bytes.push(f.source as u8);
+            file_bytes.extend_from_slice(&f.behavior_tags.to_le_bytes());
+            file_bytes.extend_from_slice(&campaign_offset.to_le_bytes());
+        }
+
+        // URL section bytes (the URL string itself is interned in the campaign
+        // table; the record stores only its offset + source).
+        let mut url_bytes: Vec<u8> = Vec::with_capacity(url_records.len() * URL_INDEX_RECORD_SIZE);
+        for (key, u) in &url_records {
+            let url_offset = campaign_table.intern(&u.normalized_url);
+            url_bytes.extend_from_slice(key);
+            url_bytes.extend_from_slice(&url_offset.to_le_bytes());
+            url_bytes.push(u.source as u8);
+            url_bytes.push(0); // reserved
+        }
+
+        // The campaign table is now final (all interns done above).
+        let campaign_bytes = campaign_table.bytes().to_vec();
+
+        // Behavior-tag bitset section: an OR of every emitted file-hash record's
+        // tags. The per-record tags are authoritative for lookup; this aggregate
+        // section exists so the format carries an explicit, descriptor-anchored
+        // bitset (and so future readers can summarize without scanning records).
+        let aggregate_tags = self
+            .file_hashes
+            .iter()
+            .fold(0u16, |acc, f| acc | f.behavior_tags);
+        let behavior_bytes = aggregate_tags.to_le_bytes().to_vec();
+
+        // Lay the sections out contiguously after the current `buf` end, all of
+        // which is already past `HEADER_SIZE`.
+        let mut descriptors: Vec<(SectionType, u64, u64, u64)> = Vec::new(); // (type, offset, length, count)
+        let place = |buf: &mut Vec<u8>,
+                     descriptors: &mut Vec<(SectionType, u64, u64, u64)>,
+                     ty: SectionType,
+                     bytes: &[u8],
+                     count: u64| {
+            let offset = buf.len() as u64;
+            buf.extend_from_slice(bytes);
+            descriptors.push((ty, offset, bytes.len() as u64, count));
+        };
+
+        place(
+            buf,
+            &mut descriptors,
+            SectionType::ArtifactSha,
+            &artifact_bytes,
+            self.artifact_shas.len() as u64,
+        );
+        place(
+            buf,
+            &mut descriptors,
+            SectionType::FileHash,
+            &file_bytes,
+            self.file_hashes.len() as u64,
+        );
+        place(
+            buf,
+            &mut descriptors,
+            SectionType::MaliciousUrl,
+            &url_bytes,
+            url_records.len() as u64,
+        );
+        place(
+            buf,
+            &mut descriptors,
+            SectionType::CampaignStrings,
+            &campaign_bytes,
+            // count is informational for a byte-blob section; report bytes.
+            campaign_bytes.len() as u64,
+        );
+        place(
+            buf,
+            &mut descriptors,
+            SectionType::BehaviorTags,
+            &behavior_bytes,
+            behavior_bytes.len() as u64,
+        );
+
+        // Descriptor trailer, in section-type order.
+        let trailer_offset = buf.len() as u64;
+        for (ty, offset, length, count) in &descriptors {
+            buf.extend_from_slice(&(*ty as u16).to_le_bytes());
+            buf.extend_from_slice(&1u16.to_le_bytes()); // record_version
+            buf.extend_from_slice(&offset.to_le_bytes());
+            buf.extend_from_slice(&length.to_le_bytes());
+            buf.extend_from_slice(&count.to_le_bytes());
+        }
+        let trailer_length = buf.len() as u64 - trailer_offset;
+
+        // Fixed EOF footer.
+        buf.extend_from_slice(FOOTER_MAGIC);
+        buf.extend_from_slice(&trailer_offset.to_le_bytes());
+        buf.extend_from_slice(&trailer_length.to_le_bytes());
+        buf.extend_from_slice(&TRAILER_VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // flags (reserved)
     }
 }
 
@@ -2320,6 +3214,75 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join("test-threatdb.dat")
+    }
+
+    /// A FROZEN v1 DB blob, captured once from `ThreatDbWriter::build` with a
+    /// fixed key `[7u8; 32]`, timestamp 1_700_000_000, sequence 7, one npm
+    /// package `frozen-evil@1.0.0` (Confirmed, OSSF, ref) and one Feodo IP. It is
+    /// hard-coded (not regenerated) so the v1-load path is pinned: any future
+    /// writer change that would alter the v1 byte layout fails
+    /// `frozen_v1_blob_still_loads`, and the range-accepting v2 reader must keep
+    /// loading this exact blob with every v2 lookup returning None.
+    #[rustfmt::skip]
+    const FROZEN_V1_DB: &[u8] = &[
+        0x54, 0x49, 0x52, 0x49, 0x54, 0x48, 0x44, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x53, 0x65,
+        0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0xd2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd2, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0xd7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd7, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xd7, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0xfe, 0x81, 0x2c, 0x12,
+        0xf3, 0xab, 0x4c, 0xe6, 0xac, 0x5d, 0xb6, 0x9a, 0xc3, 0x52, 0xf9, 0x06, 0xcb, 0x1b, 0x11, 0xef,
+        0x43, 0xfb, 0x33, 0xe2, 0x52, 0xef, 0x7f, 0xf5, 0x52, 0x26, 0x38, 0x89, 0x1d, 0xb2, 0x0a, 0x25,
+        0xd4, 0x1b, 0x74, 0xcc, 0x95, 0xe5, 0x50, 0x6e, 0x37, 0x52, 0x8b, 0x3b, 0xa8, 0x43, 0xaa, 0xb8,
+        0x97, 0xd6, 0xf5, 0x2f, 0x44, 0xa6, 0xaa, 0xf1, 0x3e, 0x1f, 0xae, 0x90, 0x01, 0x06, 0xdb, 0x73,
+        0xd4, 0x2c, 0x21, 0x70, 0xf3, 0x17, 0x25, 0x94, 0x4e, 0x3e, 0x7e, 0xd4, 0xc6, 0xf5, 0xaa, 0x5d,
+        0x9b, 0xb1, 0xa7, 0x52, 0xe0, 0x28, 0xa1, 0x95, 0xc9, 0x64, 0x0c, 0x07, 0xb4, 0x00, 0x00, 0x00,
+        0xfa, 0x0d, 0x42, 0xcb, 0x00, 0x0b, 0x00, 0x66, 0x72, 0x6f, 0x7a, 0x65, 0x6e, 0x2d, 0x65, 0x76,
+        0x69, 0x6c, 0x00, 0x02, 0x00, 0x01, 0x00, 0x05, 0x00, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, 0x00,
+        0x00, 0x00, 0x07, 0x71, 0x00, 0xcb, 0x02, 0x1a, 0x00, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f,
+        0x2f, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x66, 0x72, 0x6f,
+        0x7a, 0x65, 0x6e,
+    ];
+
+    /// A v1 blob frozen at the byte level loads on the range-accepting reader,
+    /// keeps its v1 lookups, and returns None for every v2 lookup. This is the
+    /// regression guard that the v1-load path never breaks, even after future
+    /// writer changes.
+    #[test]
+    fn frozen_v1_blob_still_loads() {
+        let db = ThreatDb::from_bytes(FROZEN_V1_DB.to_vec(), 0).expect("frozen v1 blob must load");
+        assert_eq!(db.stats().format_version, 1);
+        assert_eq!(db.stats().build_sequence, 7);
+        // v1 lookups still resolve.
+        let m = db
+            .check_package(Ecosystem::Npm, "frozen-evil", Some("1.0.0"))
+            .expect("frozen package must match");
+        assert_eq!(m.source, ThreatSource::OssfMalicious);
+        assert_eq!(
+            m.reference_url.as_deref(),
+            Some("https://example.com/frozen")
+        );
+        assert!(db.check_ip(Ipv4Addr::new(203, 0, 113, 7)).is_some());
+        // Every v2 lookup returns None on a v1 file.
+        assert!(db.check_artifact_sha256(&[0u8; 32]).is_none());
+        assert!(db.check_file_sha256(&[0u8; 32]).is_none());
+        assert!(db.check_malicious_url("http://evil.example/x").is_none());
+    }
+
+    /// The committed shared v1 fixture (`tests/fixtures/test-threatdb.dat`) also
+    /// loads on the new reader and exposes no v2 sections, so the production v1
+    /// asset is never rejected by a v2-capable binary.
+    #[test]
+    fn committed_v1_fixture_loads_with_no_v2_sections() {
+        let path = signed_fixture_db_path();
+        let db = ThreatDb::load_from_path(&path, 0).expect("committed v1 fixture must load");
+        assert_eq!(db.stats().format_version, 1);
+        assert!(db.check_artifact_sha256(&[0u8; 32]).is_none());
+        assert!(db.check_file_sha256(&[0u8; 32]).is_none());
+    }
+
+    /// Helper: a 32-byte SHA-256-shaped array seeded from a single byte.
+    fn sha(seed: u8) -> [u8; 32] {
+        [seed; 32]
     }
 
     #[test]
@@ -3325,109 +4288,6 @@ mod tests {
     }
 
     #[test]
-    fn constraint_unparsed_raw_token_exact_match_is_malicious() {
-        // A non-semver token (a dist-tag like `latest`) is preserved as
-        // Constraint{parsed:None,raw}. If it LITERALLY equals an affected version it
-        // is a definite malicious hit (ExactMatch), not a downgraded warn.
-        let key = SigningKey::generate(&mut OsRng);
-        let mut writer = ThreatDbWriter::new(1700000000, 1);
-        writer.add_package(
-            Ecosystem::Npm,
-            "tagged-evil",
-            &["latest"],
-            ThreatSource::OssfMalicious,
-            Confidence::Confirmed,
-            false,
-            None,
-        );
-        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
-        let hit = crate::version_intent::VersionIntent::Constraint {
-            parsed: None,
-            raw: "latest".to_string(),
-        };
-        assert!(matches!(
-            db.assess_package(Ecosystem::Npm, "tagged-evil", &hit),
-            PackageThreatAssessment::ExactMatch(_)
-        ));
-        let miss = crate::version_intent::VersionIntent::Constraint {
-            parsed: None,
-            raw: "sha256:beef".to_string(),
-        };
-        assert!(matches!(
-            db.assess_package(Ecosystem::Npm, "tagged-evil", &miss),
-            PackageThreatAssessment::Unresolved { .. }
-        ));
-    }
-
-    #[test]
-    fn constraint_against_empty_affected_versions_is_unresolved_not_excluded() {
-        // A version-specific malicious record with NO affected versions (and not
-        // all-versions-malicious) gives nothing to test a constraint against, so it
-        // must stay Unresolved, not be silently treated as a proven exclusion.
-        let key = SigningKey::generate(&mut OsRng);
-        let mut writer = ThreatDbWriter::new(1700000000, 1);
-        writer.add_package(
-            Ecosystem::Npm,
-            "no-versions-evil",
-            &[],
-            ThreatSource::OssfMalicious,
-            Confidence::Confirmed,
-            false, // NOT all-versions-malicious
-            None,
-        );
-        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
-        let constraint = crate::version_intent::VersionIntent::from_pep440_specifier(">=1.0,<2.0");
-        assert!(matches!(
-            db.assess_package(Ecosystem::Npm, "no-versions-evil", &constraint),
-            PackageThreatAssessment::Unresolved { .. }
-        ));
-        // The guard runs BEFORE the intent match, so an Exact request is Unresolved too
-        // (not a silent NoRecord that would drop the malicious finding entirely).
-        let exact = crate::version_intent::VersionIntent::Exact("1.0".to_string());
-        assert!(matches!(
-            db.assess_package(Ecosystem::Npm, "no-versions-evil", &exact),
-            PackageThreatAssessment::Unresolved { .. }
-        ));
-    }
-
-    #[test]
-    fn exact_local_version_matches_base_record() {
-        // A PEP 440 local version (`1.0+ubuntu1`) is a rebuild of its base `1.0`: a
-        // record listing the malicious base must still hard-match the local pin, and an
-        // exact-local record must match literally. Neither may downgrade to Unresolved.
-        let key = SigningKey::generate(&mut OsRng);
-        let mut writer = ThreatDbWriter::new(1700000000, 1);
-        writer.add_package(
-            Ecosystem::Npm,
-            "base-evil",
-            &["1.0"],
-            ThreatSource::OssfMalicious,
-            Confidence::Confirmed,
-            false,
-            None,
-        );
-        writer.add_package(
-            Ecosystem::Npm,
-            "exact-local-evil",
-            &["1.0+ubuntu1"],
-            ThreatSource::OssfMalicious,
-            Confidence::Confirmed,
-            false,
-            None,
-        );
-        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
-        let local = crate::version_intent::VersionIntent::Exact("1.0+ubuntu1".to_string());
-        assert!(matches!(
-            db.assess_package(Ecosystem::Npm, "base-evil", &local),
-            PackageThreatAssessment::ExactMatch(_)
-        ));
-        assert!(matches!(
-            db.assess_package(Ecosystem::Npm, "exact-local-evil", &local),
-            PackageThreatAssessment::ExactMatch(_)
-        ));
-    }
-
-    #[test]
     fn assess_exact_version_not_in_list_is_no_record() {
         let key = SigningKey::generate(&mut OsRng);
         let db = build_test_db(&key);
@@ -3559,66 +4419,10 @@ mod tests {
     }
 
     #[test]
-    fn assess_record_with_no_versions_is_missing_not_unparsed() {
-        // A version-specific record (not all-versions-malicious) that enumerates NO affected
-        // versions is AffectedVersionsMissing - distinct from AffectedVersionUnparsed (a
-        // present-but-uncomparable version) - so a JSON consumer can tell the two apart.
-        let key = SigningKey::generate(&mut OsRng);
-        let mut writer = ThreatDbWriter::new(1700000000, 9);
-        writer.add_package(
-            Ecosystem::PyPI,
-            "no-vers",
-            &[],
-            ThreatSource::OssfMalicious,
-            Confidence::Confirmed,
-            false,
-            None,
-        );
-        let bytes = writer.build(&key).expect("build failed");
-        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
-        let a = db.assess_package(Ecosystem::PyPI, "no-vers", &constraint_intent(">=1.0.0"));
-        match a {
-            PackageThreatAssessment::Unresolved { reason, .. } => {
-                assert_eq!(reason, UnresolvedReason::AffectedVersionsMissing);
-            }
-            other => panic!("expected Unresolved (AffectedVersionsMissing), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cargo_caret_constraint_does_not_become_exact_malicious_hit() {
-        // A Cargo plain version is a caret requirement: from_cargo_version("1.0.0") ->
-        // Constraint{parsed:None, raw:"1.0.0"}. Even though raw LITERALLY equals an affected
-        // version in the DB, it must NOT upgrade to a confirmed ExactMatch - it is a RANGE
-        // request, so it stays Unresolved (an overlap warning). The raw-token exact fallback
-        // is only for opaque concrete tokens (digests/dist-tags), not plain versions.
-        let key = SigningKey::generate(&mut OsRng);
-        let mut writer = ThreatDbWriter::new(1700000000, 9);
-        writer.add_package(
-            Ecosystem::Crates,
-            "evil-crate",
-            &["1.0.0"],
-            ThreatSource::OssfMalicious,
-            Confidence::Confirmed,
-            false,
-            None,
-        );
-        let bytes = writer.build(&key).expect("build failed");
-        let db = ThreatDb::from_bytes(bytes, 0).expect("load failed");
-        let caret = VersionIntent::from_cargo_version("1.0.0");
-        let a = db.assess_package(Ecosystem::Crates, "evil-crate", &caret);
-        assert!(
-            matches!(a, PackageThreatAssessment::Unresolved { .. }),
-            "a cargo caret requirement must stay Unresolved, not become an ExactMatch; got {a:?}"
-        );
-    }
-
-    #[test]
-    fn assess_supplemental_merge_keeps_per_layer_affected() {
+    fn assess_supplemental_unresolved_dedups_affected() {
         // Primary excludes (>=1.4.4 over 1.4.2/1.4.3) but a supplemental overlay
-        // is unresolved for the same name; the merge must surface Unresolved (never the
-        // primary's exclusion). Affected versions come from the SAME layer whose summary is
-        // returned - NOT a union - so a version is never misattributed to another source.
+        // is unresolved for the same name; the merge must surface Unresolved
+        // (never the primary's exclusion) with deduplicated affected versions.
         let key = SigningKey::generate(&mut OsRng);
         let primary_bytes = {
             let mut w = ThreatDbWriter::new(1700000000, 11);
@@ -3663,17 +4467,16 @@ mod tests {
             other => panic!("expected ConstraintIntersectsAffected from overlay, got {other:?}"),
         }
 
-        // An Unspecified request is unresolved in both layers; the merged result keeps the
-        // PRIMARY layer's summary AND the primary's affected versions (NOT a union), so the
-        // overlay-only version (1.4.9) is not misattributed to the primary's source_label.
+        // An Unspecified request is unresolved in both layers; affected versions
+        // are the deduplicated union across both.
         let a2 = db.assess_package(Ecosystem::PyPI, "split-pkg", &VersionIntent::Unspecified);
         match a2 {
             PackageThreatAssessment::Unresolved {
                 affected_versions, ..
             } => {
-                assert_eq!(affected_versions, vec!["1.4.2", "1.4.3"]);
+                assert_eq!(affected_versions, vec!["1.4.2", "1.4.3", "1.4.9"]);
             }
-            other => panic!("expected Unresolved with the primary layer's affected, got {other:?}"),
+            other => panic!("expected Unresolved with merged affected, got {other:?}"),
         }
     }
 
@@ -3694,5 +4497,456 @@ mod tests {
         assert!(db
             .check_package(Ecosystem::PyPI, "malware-pkg", None)
             .is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // v2 format (DB-B): writer/reader roundtrip, backward compat, footer/
+    // trailer rejection, signature, and per-format cache-filename selection.
+    // ------------------------------------------------------------------
+
+    /// Build a v2 DB carrying one v1 package plus one artifact hash, one file
+    /// hash (with behavior tags + campaign), and one malicious URL.
+    fn build_v2_db(key: &SigningKey) -> Vec<u8> {
+        let mut writer = ThreatDbWriter::new(1_700_000_500, 100);
+        // A v1 package so the v1 sections are non-empty too.
+        writer.add_package(
+            Ecosystem::PyPI,
+            "v2-pkg",
+            &["1.2.3"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            Some("https://example.com/v2"),
+        );
+        writer.add_artifact_sha256(
+            sha(0xAA),
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            true,
+            Some("miasma"),
+        );
+        writer.add_file_sha256(
+            sha(0xBB),
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            &[BehaviorTag::ProcessSpawn, BehaviorTag::CrossRuntime],
+            Some("miasma"),
+        );
+        writer.add_malicious_url(
+            "http://sfrclak.com:8000/6202033",
+            ThreatSource::ExfilEndpoint,
+        );
+        writer
+            .build_format(ThreatDbFormat::V2, key)
+            .expect("v2 build")
+    }
+
+    #[test]
+    fn v2_roundtrip_artifact_file_url_hits() {
+        let key = SigningKey::generate(&mut OsRng);
+        let bytes = build_v2_db(&key);
+        let db = ThreatDb::from_bytes(bytes, 0).expect("v2 load");
+
+        assert_eq!(db.stats().format_version, 2);
+
+        // v1 package still resolves on a v2 file.
+        assert!(db
+            .check_package(Ecosystem::PyPI, "v2-pkg", Some("1.2.3"))
+            .is_some());
+
+        // Artifact hash hit.
+        let am = db.check_artifact_sha256(&sha(0xAA)).expect("artifact hit");
+        assert_eq!(am.source, ThreatSource::OssfMalicious);
+        assert!(am.all_versions_malicious);
+        assert_eq!(am.campaign.as_deref(), Some("miasma"));
+        // Artifact miss.
+        assert!(db.check_artifact_sha256(&sha(0xAB)).is_none());
+
+        // File hash hit with behavior tags + campaign.
+        let fm = db.check_file_sha256(&sha(0xBB)).expect("file hit");
+        assert_eq!(fm.source, ThreatSource::OssfMalicious);
+        assert!(fm.behavior_tags.contains(&BehaviorTag::ProcessSpawn));
+        assert!(fm.behavior_tags.contains(&BehaviorTag::CrossRuntime));
+        assert!(!fm.behavior_tags.contains(&BehaviorTag::NetworkExfil));
+        assert_eq!(fm.campaign.as_deref(), Some("miasma"));
+        assert!(db.check_file_sha256(&sha(0xBC)).is_none());
+
+        // URL hit (exact compare after locating the hash) + miss.
+        assert_eq!(
+            db.check_malicious_url("http://sfrclak.com:8000/6202033"),
+            Some(ThreatSource::ExfilEndpoint)
+        );
+        assert!(db
+            .check_malicious_url("http://sfrclak.com:8000/other")
+            .is_none());
+    }
+
+    #[test]
+    fn v2_signature_verifies_against_signing_key() {
+        // Freshly-signed v2 verifies against the key that signed it (the
+        // embedded production key is a placeholder in tests, so we verify
+        // against the signer directly, like test_signature_with_matching_key).
+        let key = SigningKey::generate(&mut OsRng);
+        let bytes = build_v2_db(&key);
+        let sig_bytes = &bytes[SIG_OFFSET..SIG_OFFSET + SIGNATURE_LENGTH];
+        let signature = Signature::from_slice(sig_bytes).expect("parse sig");
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&bytes[..SIG_OFFSET]);
+        signed_data.extend_from_slice(&bytes[HEADER_SIZE..]);
+        use ed25519_dalek::Verifier;
+        assert!(
+            key.verifying_key().verify(&signed_data, &signature).is_ok(),
+            "v2 signature must verify over [0..SIG_OFFSET) ++ [HEADER_SIZE..)"
+        );
+    }
+
+    #[test]
+    fn v2_corrupt_section_byte_fails_signature() {
+        // A byte flipped inside the appended v2 region must break the signature,
+        // proving the v2 sections + trailer + footer are inside the signed range.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut bytes = build_v2_db(&key);
+        // Flip a byte well after the v1 header (in the v2 area / trailer / footer).
+        let idx = bytes.len() - 10;
+        bytes[idx] ^= 0xFF;
+        let sig_bytes = &bytes[SIG_OFFSET..SIG_OFFSET + SIGNATURE_LENGTH];
+        let signature = Signature::from_slice(sig_bytes).expect("parse sig");
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&bytes[..SIG_OFFSET]);
+        signed_data.extend_from_slice(&bytes[HEADER_SIZE..]);
+        use ed25519_dalek::Verifier;
+        assert!(
+            key.verifying_key()
+                .verify(&signed_data, &signature)
+                .is_err(),
+            "tampering with the v2 region must invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn v2_rollback_still_enforced() {
+        // The rollback build_sequence check is preserved verbatim for v2.
+        let key = SigningKey::generate(&mut OsRng);
+        let bytes = build_v2_db(&key); // sequence 100
+        let err = ThreatDb::from_bytes(bytes, 200).expect_err("v2 rollback must reject");
+        assert!(matches!(err, ThreatDbError::RollbackDetected { .. }));
+    }
+
+    #[test]
+    fn v2_empty_sections_roundtrip() {
+        // A v2 DB with no v2 records at all still loads and every v2 lookup
+        // returns None (empty sections are valid).
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        writer.add_ip(Ipv4Addr::new(1, 2, 3, 4), ThreatSource::FeodoTracker);
+        let bytes = writer
+            .build_format(ThreatDbFormat::V2, &key)
+            .expect("v2 build");
+        let db = ThreatDb::from_bytes(bytes, 0).expect("empty v2 load");
+        assert_eq!(db.stats().format_version, 2);
+        assert!(db.check_artifact_sha256(&sha(1)).is_none());
+        assert!(db.check_file_sha256(&sha(1)).is_none());
+        assert!(db.check_malicious_url("http://x").is_none());
+    }
+
+    #[test]
+    fn v2_supplemental_overlay_resolves_v2_lookups() {
+        // A v2 lookup that misses the primary defers to a v2 supplemental.
+        let key = SigningKey::generate(&mut OsRng);
+        let primary = ThreatDb::from_bytes(
+            ThreatDbWriter::new(1, 1)
+                .build_format(ThreatDbFormat::V2, &key)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        let mut overlay_writer = ThreatDbWriter::new(2, 1);
+        overlay_writer.add_artifact_sha256(
+            sha(0xCC),
+            ThreatSource::DatadogMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let overlay = ThreatDb::from_bytes(
+            overlay_writer
+                .build_format(ThreatDbFormat::V2, &key)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        let db = primary.with_supplemental(Some(overlay));
+        let am = db
+            .check_artifact_sha256(&sha(0xCC))
+            .expect("supplemental artifact hit");
+        assert_eq!(am.source, ThreatSource::DatadogMalicious);
+    }
+
+    /// Take a valid v2 DB and overwrite the fixed footer fields via a closure,
+    /// returning the mutated bytes (for rejection tests).
+    fn v2_with_footer_mut(mutate: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut bytes = build_v2_db(&key);
+        let foot = bytes.len() - FOOTER_SIZE;
+        mutate(&mut bytes[foot..]);
+        bytes
+    }
+
+    #[test]
+    fn v2_reject_bad_footer_magic() {
+        let bytes = v2_with_footer_mut(|f| f[0] ^= 0xFF);
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_unsupported_trailer_version() {
+        // trailer_version is at footer[24..26].
+        let bytes = v2_with_footer_mut(|f| f[24..26].copy_from_slice(&999u16.to_le_bytes()));
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_trailer_offset_out_of_bounds() {
+        // trailer_offset at footer[8..16]: push it past EOF.
+        let bytes = v2_with_footer_mut(|f| {
+            f[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_trailer_offset_inside_header() {
+        // A trailer_offset inside the signature header (< HEADER_SIZE) is rejected.
+        let bytes = v2_with_footer_mut(|f| {
+            f[8..16].copy_from_slice(&10u64.to_le_bytes());
+            // keep a small length so only the offset rule trips.
+            f[16..24].copy_from_slice(&(DESCRIPTOR_SIZE as u64).to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_trailer_length_not_descriptor_multiple() {
+        // trailer_length at footer[16..24]: set to a non-multiple.
+        let bytes = v2_with_footer_mut(|f| {
+            f[16..24].copy_from_slice(&((DESCRIPTOR_SIZE as u64) + 1).to_le_bytes())
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    /// Build a v2 DB and rewrite a chosen descriptor field in the trailer, given
+    /// a mutator over the descriptor index and a mutable slice of its 32 bytes.
+    fn v2_with_descriptor_mut(which: usize, mutate: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut bytes = build_v2_db(&key);
+        let foot = bytes.len() - FOOTER_SIZE;
+        let trailer_offset =
+            u64::from_le_bytes(bytes[foot + 8..foot + 16].try_into().unwrap()) as usize;
+        let dbase = trailer_offset + which * DESCRIPTOR_SIZE;
+        mutate(&mut bytes[dbase..dbase + DESCRIPTOR_SIZE]);
+        bytes
+    }
+
+    #[test]
+    fn v2_reject_duplicate_section_type() {
+        // Rewrite descriptor 1's section_type to equal descriptor 0's.
+        let bytes = v2_with_descriptor_mut(1, |d| {
+            d[0..2].copy_from_slice(&(SectionType::ArtifactSha as u16).to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_unknown_section_type() {
+        let bytes = v2_with_descriptor_mut(0, |d| {
+            d[0..2].copy_from_slice(&4242u16.to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_section_offset_inside_header() {
+        // descriptor offset field is at descriptor[4..12].
+        let bytes = v2_with_descriptor_mut(0, |d| {
+            d[4..12].copy_from_slice(&10u64.to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_section_count_times_record_size_mismatch() {
+        // Inflate the artifact-sha descriptor count so count*record_size != length.
+        let bytes = v2_with_descriptor_mut(0, |d| {
+            d[20..28].copy_from_slice(&9999u64.to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_reject_section_running_into_trailer() {
+        // Extend the artifact-sha section length so it overlaps the trailer.
+        let bytes = v2_with_descriptor_mut(0, |d| {
+            d[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+        });
+        assert!(matches!(
+            ThreatDb::from_bytes(bytes, 0),
+            Err(ThreatDbError::InvalidTrailer(_))
+        ));
+    }
+
+    #[test]
+    fn v2_full_32_byte_hash_no_short_prefix_collision() {
+        // Two hashes sharing a long common prefix but differing in the LAST byte
+        // must be distinguished (the index keys on the full 32 bytes).
+        let key = SigningKey::generate(&mut OsRng);
+        let mut a = [0x11u8; 32];
+        let mut b = [0x11u8; 32];
+        a[31] = 0x01;
+        b[31] = 0x02;
+        let mut writer = ThreatDbWriter::new(1, 1);
+        writer.add_artifact_sha256(
+            a,
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            false,
+            None,
+        );
+        let bytes = writer.build_format(ThreatDbFormat::V2, &key).unwrap();
+        let db = ThreatDb::from_bytes(bytes, 0).unwrap();
+        assert!(
+            db.check_artifact_sha256(&a).is_some(),
+            "exact 32-byte match hits"
+        );
+        assert!(
+            db.check_artifact_sha256(&b).is_none(),
+            "a hash differing only in the last byte must NOT match"
+        );
+    }
+
+    #[test]
+    fn v2_sibling_path_derivation() {
+        assert_eq!(
+            v2_sibling(Path::new("/x/tirith-threatdb.dat")),
+            PathBuf::from("/x/tirith-threatdb-v2.dat")
+        );
+        assert_eq!(
+            v2_sibling(Path::new("/x/custom.bin")),
+            PathBuf::from("/x/custom.bin-v2")
+        );
+    }
+
+    #[test]
+    fn resolve_preferring_v2_parseable_else_v1() {
+        // Drive the resolver directly with require_signature=false (the
+        // supplemental discipline), so a self-signed v2 can be exercised. The
+        // signed-primary discipline is covered by
+        // `resolve_primary_requires_valid_signature` below.
+        let key = SigningKey::generate(&mut OsRng);
+        let tmp = tempfile::tempdir().unwrap();
+        let v1_path = tmp.path().join("v1.dat");
+        let v2_path = tmp.path().join("v2.dat");
+        ThreatDbWriter::new(1, 1)
+            .write_to(&v1_path, &key)
+            .expect("write v1");
+
+        // Only v1 present -> v1.
+        assert_eq!(
+            resolve_preferring_v2(Some(v2_path.clone()), Some(v1_path.clone()), false),
+            Some(v1_path.clone())
+        );
+        // Both present, v2 parseable -> v2.
+        ThreatDbWriter::new(2, 2)
+            .write_to_format(ThreatDbFormat::V2, &v2_path, &key)
+            .expect("write v2");
+        assert_eq!(
+            resolve_preferring_v2(Some(v2_path.clone()), Some(v1_path.clone()), false),
+            Some(v2_path.clone())
+        );
+        // v2 corrupt -> falls back to v1 (corrupt v2 never shadows).
+        std::fs::write(&v2_path, b"not a db").unwrap();
+        assert_eq!(
+            resolve_preferring_v2(Some(v2_path.clone()), Some(v1_path.clone()), false),
+            Some(v1_path.clone())
+        );
+    }
+
+    #[test]
+    fn resolve_primary_requires_valid_signature() {
+        // The signed-primary resolver (require_signature=true) must NOT prefer a
+        // structurally-valid v2 that fails signature verification against the
+        // embedded key (a self-signed DB does), so a planted unsigned v2 cannot
+        // shadow a good v1 and fail-open the DB.
+        let key = SigningKey::generate(&mut OsRng);
+        let tmp = tempfile::tempdir().unwrap();
+        let v1_path = tmp.path().join("v1.dat");
+        let v2_path = tmp.path().join("v2.dat");
+        ThreatDbWriter::new(1, 1)
+            .write_to(&v1_path, &key)
+            .expect("write v1");
+        ThreatDbWriter::new(2, 2)
+            .write_to_format(ThreatDbFormat::V2, &v2_path, &key)
+            .expect("write v2");
+        // Self-signed v2 fails the embedded-key signature check -> falls back to v1.
+        assert_eq!(
+            resolve_preferring_v2(Some(v2_path.clone()), Some(v1_path.clone()), true),
+            Some(v1_path.clone()),
+            "an unverifiable v2 must not shadow a good v1 under the signed-primary discipline"
+        );
+    }
+
+    #[test]
+    fn resolve_primary_path_falls_back_to_v1_for_self_signed_v2() {
+        // End-to-end through resolve_primary_path (which requires a valid
+        // signature): a self-signed v2 beside a v1 resolves to v1.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = SigningKey::generate(&mut OsRng);
+        let tmp = tempfile::tempdir().unwrap();
+        let v1_path = tmp.path().join("tirith-threatdb.dat");
+        let v2_path = tmp.path().join("tirith-threatdb-v2.dat");
+        ThreatDbWriter::new(1, 1)
+            .write_to(&v1_path, &key)
+            .expect("write v1");
+        ThreatDbWriter::new(2, 2)
+            .write_to_format(ThreatDbFormat::V2, &v2_path, &key)
+            .expect("write v2");
+        unsafe {
+            std::env::set_var("TIRITH_THREATDB_PATH", &v1_path);
+        }
+        // v2 exists and parses but is self-signed, so the signed-primary resolver
+        // falls back to the v1 path.
+        assert_eq!(ThreatDb::resolve_primary_path(), Some(v1_path.clone()));
+        // With no v2 at all, still v1.
+        std::fs::remove_file(&v2_path).unwrap();
+        assert_eq!(ThreatDb::resolve_primary_path(), Some(v1_path.clone()));
+        unsafe {
+            std::env::remove_var("TIRITH_THREATDB_PATH");
+        }
     }
 }
