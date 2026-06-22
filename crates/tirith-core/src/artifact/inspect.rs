@@ -343,10 +343,11 @@ fn inspect_wheel<R: std::io::Read + std::io::Seek>(
     }
 
     // B7: triage each native handoff. The artifact path has no ownership index (a
-    // single wheel is its own distribution), so `known_malicious_indicator` is
-    // false here; the artifact-set path supplies cross-distribution corroboration.
+    // single wheel is its own distribution), so BOTH `known_malicious_indicator` and
+    // `unowned` are false here; the artifact-set path supplies cross-distribution
+    // corroboration.
     for handoff in &visitor.native {
-        let triage = triage_native(handoff, false);
+        let triage = triage_native(handoff, false, false);
         inspection.signals.extend(triage.signals);
         inspection.execution_edges.extend(triage.edges);
         if let Some(finding) = triage.finding {
