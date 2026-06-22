@@ -15,8 +15,9 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbFormat, ThreatDbWriter, ThreatSource};
 use tirith_core::threatdb_feeds::{
-    parse_domain_blocklist, parse_exfil_endpoint_list, parse_phishtank_csv, parse_threatfox_zip,
-    parse_tor_exit_list, parse_urlhaus_csv,
+    parse_curated_file_hashes, parse_domain_blocklist, parse_exfil_endpoint_list,
+    parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list, parse_urlhaus_csv,
+    CuratedFileHashes, FileHashProvenance,
 };
 
 #[derive(Parser)]
@@ -77,6 +78,13 @@ struct Cli {
     /// ThreatSource::ExfilEndpoint. Optional — skipped if not supplied.
     #[arg(long)]
     exfil_endpoints: Option<PathBuf>,
+
+    /// Curated malicious file-hash companion feed. One record per line:
+    /// `<sha256-hex>  tags=process_spawn,...  campaign=<id>  source=ossf|registry-yank`.
+    /// Compiled into the v2 FileHash + BehaviorTags sections (so `check_file_sha256`
+    /// goes live); ignored by a v1 build. Optional; skipped if not supplied.
+    #[arg(long)]
+    file_hashes: Option<PathBuf>,
 
     /// Env var name containing Ed25519 private key (base64-encoded)
     #[arg(long)]
@@ -802,6 +810,18 @@ fn parse_exfil_endpoints_file(path: &Path) -> std::io::Result<Vec<String>> {
     Ok(parse_exfil_endpoint_list(&contents).hostnames)
 }
 
+/// Read and parse the curated malicious file-hash companion feed. Fail-closed for
+/// the same reason as [`parse_exfil_endpoints_file`]: `--file-hashes <path>` means
+/// the operator INTENDED that feed, so an unreadable path must abort the build
+/// rather than silently sign a DB with an empty FileHash section. A feed that is
+/// simply not supplied stays a no-op (the call site skips this entirely). Per-line
+/// malformed records (bad digest / unknown tag) are tolerated and counted inside
+/// [`parse_curated_file_hashes`]; only an unreadable file is fatal.
+fn parse_curated_file_hashes_file(path: &Path) -> std::io::Result<CuratedFileHashes> {
+    let contents = std::fs::read_to_string(path)?;
+    Ok(parse_curated_file_hashes(&contents))
+}
+
 fn parse_phishtank_file(path: &Path) -> Vec<String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -1259,6 +1279,28 @@ fn main() {
         Vec::new()
     };
 
+    let curated_file_hashes = if let Some(ref path) = cli.file_hashes {
+        eprintln!("  parsing curated file hashes from {}", path.display());
+        // Fail closed: an explicitly-supplied feed that cannot be read must abort
+        // rather than sign a DB with an empty FileHash section (a weakened DB).
+        let parsed = parse_curated_file_hashes_file(path).unwrap_or_else(|e| {
+            eprintln!(
+                "error: cannot read explicitly-supplied file-hash feed {}: {e}",
+                path.display()
+            );
+            std::process::exit(1);
+        });
+        eprintln!(
+            "    {} file hashes ({} bad sha skipped, {} unknown tags skipped)",
+            parsed.records.len(),
+            parsed.skipped_bad_sha,
+            parsed.skipped_unknown_tags,
+        );
+        parsed
+    } else {
+        CuratedFileHashes::default()
+    };
+
     // Load signing key
     let signing_key = load_signing_key(cli.sign_key_env.as_deref(), cli.sign_key_file.as_deref());
 
@@ -1360,6 +1402,28 @@ fn main() {
         }
     }
 
+    // v2-only: persist the curated malicious file-content hashes into the FileHash
+    // + BehaviorTags sections, so `check_file_sha256` goes live. Behavior tags and
+    // the campaign label come ONLY from the feed's explicit structured fields
+    // (never advisory prose). Both OSSF-derived and registry-yank provenance are
+    // recorded under the Primary OssfMalicious source at Confirmed confidence; the
+    // hash IS the positive indicator and the tags are correlation-only enrichment.
+    let mut v2_file_hash_count = 0usize;
+    let mut v2_file_hash_yank_count = 0usize;
+    for rec in &curated_file_hashes.records {
+        if rec.provenance == FileHashProvenance::RegistryYank {
+            v2_file_hash_yank_count += 1;
+        }
+        writer.add_file_sha256(
+            rec.sha256,
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            &rec.behavior_tags,
+            rec.campaign.as_deref(),
+        );
+        v2_file_hash_count += 1;
+    }
+
     // Always build and write the v1 DB. (A v1 build ignores the v2 inputs above,
     // so an old binary and the legacy manifest keep getting exactly v1.)
     let data = writer
@@ -1397,10 +1461,12 @@ fn main() {
             std::process::exit(1);
         });
         eprintln!(
-            "  v2 output:             {} ({} bytes; {} artifact sha256, {} urls; {} bad sha skipped)",
+            "  v2 output:             {} ({} bytes; {} artifact sha256, {} file sha256 ({} yank), {} urls; {} bad sha skipped)",
             v2_path.display(),
             v2_data.len(),
             v2_artifact_count,
+            v2_file_hash_count,
+            v2_file_hash_yank_count,
             v2_url_count,
             v2_skipped_bad_sha,
         );
@@ -1440,6 +1506,7 @@ fn main() {
 mod tests {
     use super::*;
     use std::io::Write;
+    use tirith_core::threatdb::BehaviorTag;
 
     #[test]
     fn test_normalize_pypi() {
@@ -1650,6 +1717,30 @@ mod tests {
             ossf_confidence("MAL-2026-9999", Some("BRAND_NEW_TYPE")),
             Confidence::Confirmed
         );
+
+        // G1: the curated file-hash companion feed maps to the same Confirmed
+        // confidence the artifact-SHA records use, regardless of provenance
+        // (OSSF-derived or registry-yank). Behavior tags ride along as structured
+        // enrichment only and never change the confidence: a record with rich
+        // tags and a bare record both resolve to Confirmed.
+        let sha = "e".repeat(64);
+        let rich = parse_curated_file_hashes(&format!(
+            "{sha}  tags=process_spawn,credential_access  campaign=miasma  source=ossf\n"
+        ));
+        let bare = parse_curated_file_hashes(&format!("{sha}  source=registry-yank\n"));
+        assert_eq!(rich.records.len(), 1);
+        assert_eq!(bare.records.len(), 1);
+        // The compiler writes every curated file hash at Confirmed (see the
+        // add_file_sha256 call), independent of how many tags it carries.
+        assert_eq!(
+            rich.records[0].provenance,
+            FileHashProvenance::OssfMalicious
+        );
+        assert_eq!(bare.records[0].provenance, FileHashProvenance::RegistryYank);
+        assert!(rich.records[0]
+            .behavior_tags
+            .contains(&BehaviorTag::CredentialAccess));
+        assert!(bare.records[0].behavior_tags.is_empty());
     }
 
     // Real OpenSSF malicious-packages records fetched from the OSV API and
@@ -1809,6 +1900,86 @@ mod tests {
         assert!(db
             .check_package(Ecosystem::PyPI, "compiler-v2-pkg", Some("1.0.0"))
             .is_some());
+    }
+
+    #[test]
+    fn test_curated_file_hashes_go_live_in_v2() {
+        use ed25519_dalek::SigningKey;
+        use tirith_core::threatdb::{ThreatDb, ThreatDbFormat};
+
+        // Parse the curated companion feed exactly as main() does, feed it into the
+        // v2 writer via add_file_sha256, and assert check_file_sha256 resolves with
+        // the structured behavior tags and campaign label carried through.
+        let sha_hex = "503284900929e333b801f9f47419a2b4c21e4022d13a03fc14e4b5390767a51d";
+        let feed = format!(
+            "# curated malicious file hashes\n\
+             {sha_hex}  tags=runtime_loader,cross_runtime  campaign=miasma  source=ossf\n"
+        );
+        let parsed = parse_curated_file_hashes(&feed);
+        assert_eq!(parsed.records.len(), 1);
+
+        let key = SigningKey::from_bytes(&[12u8; 32]);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        for rec in &parsed.records {
+            writer.add_file_sha256(
+                rec.sha256,
+                ThreatSource::OssfMalicious,
+                Confidence::Confirmed,
+                &rec.behavior_tags,
+                rec.campaign.as_deref(),
+            );
+        }
+
+        let v2 = writer
+            .build_format(ThreatDbFormat::V2, &key)
+            .expect("v2 build");
+        let db = ThreatDb::from_bytes(v2, 0).expect("v2 load");
+        assert_eq!(db.stats().format_version, 2);
+
+        let target = decode_sha256_hex(sha_hex).unwrap();
+        let fm = db
+            .check_file_sha256(&target)
+            .expect("curated file hash must resolve");
+        assert_eq!(fm.source, ThreatSource::OssfMalicious);
+        assert_eq!(fm.confidence, Confidence::Confirmed);
+        assert!(fm.behavior_tags.contains(&BehaviorTag::RuntimeLoader));
+        assert!(fm.behavior_tags.contains(&BehaviorTag::CrossRuntime));
+        assert_eq!(fm.campaign.as_deref(), Some("miasma"));
+
+        // A hash that was never listed does not resolve (no false positive).
+        let absent = decode_sha256_hex(&"f".repeat(64)).unwrap();
+        assert!(db.check_file_sha256(&absent).is_none());
+    }
+
+    #[test]
+    fn test_file_hashes_read_error_is_fatal_err() {
+        // The curated file-hash feed is fail-closed like the exfil feed: an
+        // explicitly-supplied path that cannot be read returns Err so main() exits
+        // non-zero rather than signing a DB with an empty FileHash section.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.txt");
+        assert!(
+            parse_curated_file_hashes_file(&missing).is_err(),
+            "an unreadable explicit file-hash feed must return Err"
+        );
+
+        // A readable feed parses and a registry-yank line is preserved.
+        let path = dir.path().join("file-hashes.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "# curated file hashes").unwrap();
+        writeln!(
+            f,
+            "{}  tags=process_spawn  source=registry-yank",
+            "a".repeat(64)
+        )
+        .unwrap();
+        drop(f);
+        let parsed = parse_curated_file_hashes_file(&path).expect("readable feed must parse");
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(
+            parsed.records[0].provenance,
+            FileHashProvenance::RegistryYank
+        );
     }
 
     #[test]
