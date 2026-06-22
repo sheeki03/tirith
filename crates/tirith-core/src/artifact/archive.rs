@@ -644,22 +644,34 @@ pub fn read_wheel<R: Read + Seek>(
                     let left = limits
                         .max_total_uncompressed
                         .saturating_sub(total_uncompressed);
-                    let (handoff, view_consumed) =
+                    let (handoff, view_consumed, crc_failed) =
                         stream_native_view(&mut archive, meta.index, location.clone(), left);
                     total_uncompressed = total_uncompressed.saturating_add(view_consumed);
-                    if let Some(h) = handoff {
-                        visitor.on_native_member(h);
+                    if crc_failed {
+                        // A CRC failure on the streaming-view path is the SAME structural
+                        // fault as on the buffered path (stream_member's CrcFailed): REJECT
+                        // the wheel via a CrcMismatch violation. Without this, a native
+                        // module larger than the per-member cap would be a size-gated escape
+                        // hatch from the CRC-rejection path the rest of the reader enforces.
+                        violations.push(ArchiveViolation::CrcMismatch {
+                            member: meta.raw_name.clone(),
+                        });
+                    } else {
+                        if let Some(h) = handoff {
+                            visitor.on_native_member(h);
+                        }
+                        // NativeTruncated UNCONDITIONALLY (for the budget-truncation case),
+                        // matching the declared-oversized path: a native member reaching this
+                        // arm was truncated whether or not a streaming handoff was produced
+                        // (handoff is None when the total budget is already exhausted). A B8
+                        // consumer enumerating NativeTruncated gaps must see EVERY
+                        // under-analyzed native module.
+                        inspection.coverage.gaps.push(CoverageGap {
+                            location: location.clone(),
+                            kind: CoverageGapKind::NativeTruncated,
+                            sha256: None,
+                        });
                     }
-                    // NativeTruncated UNCONDITIONALLY, matching the declared-oversized
-                    // path: a native member reaching this arm was truncated whether or not
-                    // a streaming handoff was produced (handoff is None when the total
-                    // budget is already exhausted). A B8 consumer enumerating
-                    // NativeTruncated gaps must see EVERY under-analyzed native module.
-                    inspection.coverage.gaps.push(CoverageGap {
-                        location: location.clone(),
-                        kind: CoverageGapKind::NativeTruncated,
-                        sha256: None,
-                    });
                 }
                 if total_uncompressed >= limits.max_total_uncompressed {
                     total_budget_hit = true;
@@ -1181,17 +1193,18 @@ fn stream_member<R: Read + Seek>(
 /// analysis cap, so it is NOT bounded by `max_member_uncompressed`.
 ///
 /// Returns the streaming view (or `None` on an open/read failure or a member that
-/// blows the budget) ALONG WITH the REAL bytes this call consumed, so the caller
-/// debits them against the shared total-uncompressed budget. The streamed bytes
-/// are bounded by `remaining_budget`: the caller passes the total budget LEFT (not
-/// the full total budget), so N oversized native members can never each read the
-/// whole budget. `remaining_budget` of 0 reads nothing and returns `(None, 0)`.
+/// blows the budget) ALONG WITH the REAL bytes this call consumed (so the caller
+/// debits them against the shared total-uncompressed budget) and a `crc_failed` bool
+/// that is `true` ONLY when the member's decompression failed its CRC. The streamed
+/// bytes are bounded by `remaining_budget`: the caller passes the total budget LEFT
+/// (not the full total budget), so N oversized native members can never each read the
+/// whole budget. `remaining_budget` of 0 reads nothing and returns `(None, 0, false)`.
 fn stream_native_view<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     index: usize,
     location: SubjectLocation,
     remaining_budget: u64,
-) -> (Option<NativeMemberHandoff>, u64) {
+) -> (Option<NativeMemberHandoff>, u64, bool) {
     // Bound the streamed work to whatever of the total budget remains. The declared
     // size is attacker-controlled, so a member that lies small still cannot read
     // past `remaining_budget` real bytes here, and the bytes read are debited so
@@ -1200,11 +1213,11 @@ fn stream_native_view<R: Read + Seek>(
     // No budget left: read nothing (not even one chunk) so the total budget, once
     // exhausted, halts further native streaming entirely.
     if cap == 0 {
-        return (None, 0);
+        return (None, 0, false);
     }
     let mut file = match archive.by_index(index) {
         Ok(f) => f,
-        Err(_) => return (None, 0),
+        Err(_) => return (None, 0, false),
     };
 
     let mut hasher = Sha256::new();
@@ -1216,16 +1229,20 @@ fn stream_native_view<R: Read + Seek>(
         let n = match file.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            // A CRC failure or I/O error on a streaming-view member: give up the
-            // view (the member is already a coverage gap), but still report the
-            // bytes we read so the caller debits them.
-            Err(_) => return (None, total),
+            // A CRC mismatch surfaces as InvalidData while the zip reader finalizes the
+            // member; report it (crc_failed = true) so the caller REJECTS the wheel rather
+            // than downgrading it to a coverage gap. Any other I/O error gives up the view
+            // WITHOUT claiming a CRC fault. Either way the bytes read are still debited.
+            Err(e) => {
+                let crc_failed = e.kind() == std::io::ErrorKind::InvalidData;
+                return (None, total, crc_failed);
+            }
         };
         total = total.saturating_add(n as u64);
         if total > cap {
             // The member blows the remaining budget (or the per-member cap): give
             // up the view rather than read unbounded, and report what we consumed.
-            return (None, total);
+            return (None, total, false);
         }
         hasher.update(&buf[..n]);
         if (header_window.len() as u64) < NATIVE_HEADER_WINDOW_BYTES {
@@ -1246,6 +1263,7 @@ fn stream_native_view<R: Read + Seek>(
             printable_strings: printable.finish(),
         }),
         total,
+        false,
     )
 }
 
@@ -1781,6 +1799,48 @@ mod tests {
             &outcome,
             "CRC mismatch",
             |v| matches!(v, ArchiveViolation::CrcMismatch { member } if member.contains("data.bin")),
+        );
+    }
+
+    #[test]
+    fn oversized_native_member_with_bad_crc_is_rejected_not_truncated() {
+        // A native module LARGER than the per-member cap is read by stream_native_view (the
+        // streaming-view path). If its bytes fail CRC (tampered on a mirror without updating
+        // the CRC), it must be REJECTED as a CrcMismatch - the same as the buffered path -
+        // NOT silently Accepted with a NativeTruncated gap (a size-gated CRC escape hatch).
+        let mut native_body = Vec::new();
+        native_body.extend_from_slice(b"\x7fELF\x02\x01\x01\x00");
+        native_body.extend_from_slice(b"the original native member body for crc ");
+        native_body.resize(8 * 1024, 0u8); // 8 KiB, STORED so a flipped byte breaks the CRC
+        let mut bytes = ZipBuilder::new()
+            .stored("demo/_big.abi3.so", &native_body)
+            .build();
+        let needle = b"original";
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("stored body present verbatim");
+        bytes[pos] ^= 0xff; // corrupt one byte -> stored CRC no longer matches
+
+        let sha = sha256_hex(&bytes);
+        let limits = ArchiveLimits {
+            max_member_uncompressed: 1024, // 1 KiB: below the 8 KiB member -> streaming view
+            max_total_uncompressed: 1024 * 1024, // 1 MiB: the view reads the member fully
+            ..ArchiveLimits::default()
+        };
+        struct NoopVisitor;
+        impl MemberVisitor for NoopVisitor {}
+        let outcome = read_wheel(
+            Cursor::new(bytes),
+            "demo-1.0-py3-none-any.whl",
+            &sha,
+            &limits,
+            &mut NoopVisitor,
+        );
+        assert_rejected_with(
+            &outcome,
+            "CRC mismatch on an oversized native member",
+            |v| matches!(v, ArchiveViolation::CrcMismatch { member } if member.contains("_big.abi3.so")),
         );
     }
 
