@@ -1374,7 +1374,28 @@ fn download_url(url: &str, declared_size: u64) -> Result<Vec<u8>, String> {
 /// legacy manifest".
 fn fetch_index_v2() -> Result<IndexV2, String> {
     match fetch_index_v2_from(INDEX_V2_URL_PRIMARY) {
-        Ok(idx) => Ok(idx),
+        Ok(idx) => {
+            // If the primary index is at or below the installed DB, try the fallback in
+            // case it's ahead (the release index can lag the raw path). Mirrors the legacy
+            // fetch_manifest stale-primary handling: without it the v2 path gets stuck on a
+            // stale primary and returns AlreadyCurrent while a newer DB is live on the
+            // fallback release. The caller verifies the signature on whatever we return.
+            if let Some(db) = ThreatDb::cached() {
+                if idx.sequence <= db.build_sequence() {
+                    eprintln!(
+                        "tirith: primary v2 index is stale (seq {} <= current v{}), trying fallback...",
+                        idx.sequence,
+                        db.build_sequence()
+                    );
+                    if let Ok(fallback) = fetch_index_v2_from(INDEX_V2_URL_FALLBACK) {
+                        if fallback.sequence > db.build_sequence() {
+                            return Ok(fallback);
+                        }
+                    }
+                }
+            }
+            Ok(idx)
+        }
         Err(primary_err) => {
             eprintln!("tirith: v2 index primary unavailable ({primary_err}), trying fallback...");
             fetch_index_v2_from(INDEX_V2_URL_FALLBACK).map_err(|fallback_err| {
