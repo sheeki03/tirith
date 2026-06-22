@@ -489,8 +489,31 @@ fn print_coverage_gaps_human(gaps: &[scan::CoverageGap]) {
         gaps.len()
     );
     for gap in gaps {
-        eprintln!("  {} ({})", gap.location, gap.kind.as_str());
+        // A coverage-gap location is an attacker-controlled file name from the scanned
+        // tree; neutralize control characters so a malicious name cannot inject terminal
+        // escape sequences into tirith's OWN stderr.
+        eprintln!(
+            "  {} ({})",
+            sanitize_location_for_terminal(&gap.location.to_string()),
+            gap.kind.as_str()
+        );
     }
+}
+
+/// Escape control characters (ANSI ESC, CR, BEL, etc.) in an attacker-controlled location
+/// before it is printed to a terminal, so a hostile file name in a scanned tree cannot
+/// inject escape sequences into tirith's own output. Printable and non-ASCII characters are
+/// kept as-is so legitimate paths stay readable.
+fn sanitize_location_for_terminal(loc: &str) -> String {
+    loc.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<char>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
 }
 
 fn parse_severity(s: &str) -> Severity {
@@ -823,6 +846,21 @@ fn should_skip_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_location_neutralizes_control_chars() {
+        // An attacker-controlled file name with ANSI/control chars must not reach the
+        // terminal raw; printable + non-ASCII content stays readable.
+        let safe = sanitize_location_for_terminal("evil\x1b[31m\rname.so");
+        assert!(!safe.contains('\x1b'), "ESC must be escaped: {safe:?}");
+        assert!(!safe.contains('\r'), "CR must be escaped: {safe:?}");
+        assert!(
+            safe.contains("evil") && safe.contains("name.so"),
+            "printable text kept: {safe:?}"
+        );
+        // A clean non-ASCII path is unchanged.
+        assert_eq!(sanitize_location_for_terminal("café/x.whl"), "café/x.whl");
+    }
     use tirith_core::verdict::Finding;
 
     fn finding(rule: RuleId, sev: Severity) -> Finding {
