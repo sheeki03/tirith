@@ -85,7 +85,9 @@ To roll back, FIRST disable v2 publishing, then remove the published artifacts:
    ```sh
    gh release view threatdb-latest --repo <owner>/<repo> \
      --json assets --jq '.assets[].name | select(startswith("tirith-threatdb-v2-"))' \
-   | xargs -r -I{} gh release delete-asset threatdb-latest {} --repo <owner>/<repo> --yes
+   | while IFS= read -r asset; do
+       gh release delete-asset threatdb-latest "$asset" --repo <owner>/<repo> --yes
+     done
    ```
 4. Revert `threatdb-index-v2.json` on main.
 
