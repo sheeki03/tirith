@@ -70,6 +70,11 @@ pub mod wheel;
 /// the duplicate-aware cross-distribution ownership index (PR B5).
 pub mod record;
 
+/// Python startup-hook EXECUTION analysis (PR B6): classifies `.pth`/`.start`
+/// lines and `sitecustomize`/`usercustomize` bodies, emits the granular startup
+/// signals, and correlates them into the two startup-hook findings.
+pub mod pth;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.
@@ -303,7 +308,10 @@ pub enum ExecutionTrigger {
 /// The granular observation an [`ArtifactSignal`] records. Each variant is one
 /// thing an analyzer can notice; correlation upstream decides which combinations
 /// become a finding. These are NOT [`crate::verdict::RuleId`]s.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Derives `Ord` (it is fieldless) so a set of signal kinds can be collected into
+/// a `BTreeSet` for a stable, deduplicated evidence summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactSignalKind {
     /// A `.pth` line begins with `import ` and so executes at startup.
@@ -319,6 +327,12 @@ pub enum ArtifactSignalKind {
     PthUntrustedPathAddition,
     /// A startup hook's executable content is obfuscated.
     StartupHookObfuscated,
+    /// A startup hook could not be inspected (read refused: a symlinked or
+    /// non-regular final component, a permission-denied body, or an I/O error),
+    /// so its content is unknown rather than known-clean. Low confidence: this is
+    /// a coverage gap, not proof of execution, and does not on its own promote to
+    /// a Block.
+    StartupHookUninspectable,
     /// A RECORD entry's recorded hash does not match the file on disk.
     RecordHashMismatch,
     /// A file RECORD lists is missing from the install.

@@ -333,7 +333,11 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::AnalysisIncomplete
         // B5: installed-distribution integrity, correlated from artifact signals,
         // not a threat-DB indicator.
-        | RuleId::PythonInstalledIntegrityViolation => false,
+        | RuleId::PythonInstalledIntegrityViolation
+        // B6: Python startup-hook execution, correlated from artifact signals
+        // (structural body analysis), not a threat-DB indicator.
+        | RuleId::PythonStartupHookSuspicious
+        | RuleId::PythonStartupHookCrossRuntime => false,
     }
 }
 

@@ -1258,6 +1258,15 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "python_installed_integrity_violation",
         "PythonInstalledIntegrityViolation",
     ),
+    // B6 Python startup-hook execution (correlated by the installed-tree scan).
+    (
+        "python_startup_hook_suspicious",
+        "PythonStartupHookSuspicious",
+    ),
+    (
+        "python_startup_hook_cross_runtime",
+        "PythonStartupHookCrossRuntime",
+    ),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
