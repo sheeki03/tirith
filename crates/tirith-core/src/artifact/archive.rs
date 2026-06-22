@@ -815,7 +815,12 @@ fn check_dist_info_roots(metas: &[MemberMeta], violations: &mut Vec<ArchiveViola
 /// inside one. `pkg-1.0.dist-info/METADATA` -> `Some("pkg-1.0.dist-info")`.
 fn dist_info_root(member: &str) -> Option<String> {
     let first = member.split('/').next()?;
-    if first.ends_with(".dist-info") {
+    // Case-INsensitive `.dist-info` match: a case-insensitive filesystem (macOS/Windows)
+    // installs `EVIL.DIST-INFO/` as the metadata dir, yet a case-sensitive check would miss it
+    // - leaving the wheel-identity invariant vacuously satisfied (no root found) so a
+    // filename/metadata-distribution mismatch goes undetected. Returns the ORIGINAL-case name
+    // (the identity comparison normalizes it per PEP 503).
+    if first.to_ascii_lowercase().ends_with(".dist-info") {
         Some(first.to_string())
     } else {
         None
@@ -995,8 +1000,11 @@ fn classify_member(member: &str) -> ArtifactFileKind {
     let lower = member.to_ascii_lowercase();
     let base = lower.rsplit('/').next().unwrap_or(&lower);
 
-    // dist-info / egg-info metadata.
-    if member.contains(".dist-info/") || member.contains(".egg-info/") {
+    // dist-info / egg-info metadata. Match on `lower` (case-INsensitive), like every other
+    // extension check here: a case-insensitive filesystem treats `EVIL.DIST-INFO/RECORD` as
+    // dist-info metadata, so a case-sensitive check would misclassify it as unstructured
+    // content and skip the B5-B8 correlation.
+    if lower.contains(".dist-info/") || lower.contains(".egg-info/") {
         return ArtifactFileKind::DistInfoMetadata;
     }
     if base.ends_with(".pth") {
@@ -1327,7 +1335,10 @@ fn read_symlink_target<R: Read + Seek>(archive: &mut zip::ZipArchive<R>, index: 
 /// Parse a `.dist-info/METADATA` member's `Name:`/`Version:` headers, if THIS
 /// member is the METADATA file. Returns `(name, Option<version>)`.
 fn parse_metadata_identity(member: &str, bytes: &[u8]) -> Option<(String, Option<String>)> {
-    if !member.ends_with(".dist-info/METADATA") {
+    // Case-INsensitive match (both `.dist-info/` and the `METADATA` filename vary on a
+    // case-insensitive filesystem), mirroring dist_info_root: an `EVIL.DIST-INFO/METADATA`
+    // member must still be parsed for the wheel-identity check, not skipped.
+    if !member.to_ascii_lowercase().ends_with(".dist-info/metadata") {
         return None;
     }
     let text = String::from_utf8_lossy(bytes);
@@ -1699,6 +1710,21 @@ mod tests {
             .build();
         let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
         assert_rejected_with(&outcome, "identity mismatch", |v| {
+            matches!(v, ArchiveViolation::IdentityMismatch { .. })
+        });
+    }
+
+    #[test]
+    fn uppercase_dist_info_does_not_bypass_identity_check() {
+        // A case-insensitive filesystem (macOS/Windows) installs `EVIL-1.0.DIST-INFO/` as the
+        // metadata dir, so a wheel named `demo-...whl` carrying UPPERCASE dist-info metadata for
+        // a DIFFERENT distribution must still be rejected - the `.dist-info` match is
+        // case-insensitive, so the identity check is not vacuously satisfied (no root found).
+        let bytes = ZipBuilder::new()
+            .file("EVIL-1.0.DIST-INFO/METADATA", b"Name: evil\nVersion: 1.0\n")
+            .build();
+        let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
+        assert_rejected_with(&outcome, "identity mismatch via uppercase dist-info", |v| {
             matches!(v, ArchiveViolation::IdentityMismatch { .. })
         });
     }
