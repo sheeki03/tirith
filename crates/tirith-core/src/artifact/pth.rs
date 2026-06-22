@@ -463,6 +463,32 @@ fn has_injected_code_exec(line: &str) -> bool {
     any_contains(&haystacks, &tokens)
 }
 
+/// `true` if the line MUTATES `sys.path` (insert / append / extend / `+=`). A benign editable
+/// or namespace bootstrap NEVER does this: it imports via `importlib` / `__import__` and
+/// appends to a MODULE's `__path__`, never to the global `sys.path`. That is why
+/// `caps.sys_path_search` is too broad to gate the templates (the canonical namespace line
+/// trips it via `importlib` / `__import__`), whereas a `sys.path.insert(0, '/evil')` smuggled
+/// into a template-shaped line is a path-injection payload that MUST disqualify the template.
+fn mutates_sys_path(line: &str) -> bool {
+    const SYS_PATH_MUTATORS: &[&str] = &[
+        "sys.path.insert",
+        "sys.path.append",
+        "sys.path.extend",
+        "sys.path+=",
+    ];
+    // capability_haystacks gives lowercased + deobfuscated forms; add a fully
+    // whitespace-stripped form too, so `sys.path += [x]` / `sys . path . insert(...)` cannot
+    // evade the match via spacing.
+    let mut haystacks = capability_haystacks(line);
+    haystacks.push(
+        line.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase(),
+    );
+    any_contains(&haystacks, SYS_PATH_MUTATORS)
+}
+
 /// `true` if the COMPLETE normalized line matches a canonical benign bootstrap.
 ///
 /// These are real setuptools / editable-install / namespace-package one-liners
@@ -491,7 +517,11 @@ fn is_benign_template(line: &str) -> bool {
         // alone is bypassable, e.g. `import os; os.system('curl|sh'); __import__(
         // '_distutils_hack').add_shim()`, so a payload capability disqualifies it.
         let caps = scan_capabilities(line);
-        if !caps.subprocess && !caps.network && !caps.cross_runtime && !has_injected_code_exec(line)
+        if !caps.subprocess
+            && !caps.network
+            && !caps.cross_runtime
+            && !has_injected_code_exec(line)
+            && !mutates_sys_path(line)
         {
             return true;
         }
@@ -517,6 +547,7 @@ fn is_benign_template(line: &str) -> bool {
                     && !caps.network
                     && !caps.cross_runtime
                     && !has_injected_code_exec(line)
+                    && !mutates_sys_path(line)
                 {
                     return true;
                 }
@@ -541,7 +572,11 @@ fn is_benign_template(line: &str) -> bool {
         // cross-runtime launch means the template was trojaned, so fall through and
         // analyze it on its merits.
         let caps = scan_capabilities(line);
-        if !caps.subprocess && !caps.network && !caps.cross_runtime && !has_injected_code_exec(line)
+        if !caps.subprocess
+            && !caps.network
+            && !caps.cross_runtime
+            && !has_injected_code_exec(line)
+            && !mutates_sys_path(line)
         {
             return true;
         }
@@ -1010,6 +1045,31 @@ mod tests {
         // The canonical (payload-free) shim is still recognized as benign.
         let canonical = "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim()";
         assert!(is_benign_template(canonical));
+    }
+
+    #[test]
+    fn injected_sys_path_mutation_breaks_benign_template() {
+        // A `sys.path.insert`/`append`/`extend`/`+=` smuggled between a template's prefix and
+        // suffix is a path-injection payload. The canonical templates legitimately trip the
+        // BROAD `sys_path_search` capability (via `importlib`/`__import__`), so the gate must
+        // key on sys.path MUTATION specifically, not that capability.
+        let distutils_inject =
+            "import os; sys.path.insert(0, '/tmp/x'); __import__('_distutils_hack').add_shim()";
+        assert!(
+            !is_benign_template(distutils_inject),
+            "a distutils shim injecting sys.path must not be benign"
+        );
+        let namespace_inject = "import sys, types, os; sys.path.append('/tmp/evil'); has_mfs = sys.version_info > (3, 5); importlib = has_mfs and __import__('importlib.util'); m = has_mfs and sys.modules.setdefault('ns', types.ModuleType('ns'))";
+        assert!(
+            !is_benign_template(namespace_inject),
+            "a namespace bootstrap injecting sys.path must not be benign"
+        );
+        // A spaced `sys.path += [...]` must not evade via whitespace.
+        let spaced = "import os; sys.path += ['/tmp/x']; __import__('_distutils_hack').add_shim()";
+        assert!(
+            !is_benign_template(spaced),
+            "spaced sys.path += must not be benign"
+        );
     }
 
     #[test]
