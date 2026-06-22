@@ -514,6 +514,14 @@ fn python_requirement_spec(line: &str) -> String {
             _ => {}
         }
     }
+    // Drop an inline `#` comment (pip treats ` #` / `\t#` as a comment start): without this,
+    // `malware==1.0.0 # pinned` carries the comment into the version token, so an EXACT pin
+    // degrades to a Constraint/Unresolved - a confirmed Critical hit silently downgraded to
+    // a Warn, and a safe pin (`malware==99.9.9 # not the bad one`) gets a spurious warn.
+    let buf = match buf.split_once(" #").or_else(|| buf.split_once("\t#")) {
+        Some((before, _)) => before.trim_end().to_string(),
+        None => buf,
+    };
     // Search for a version operator ONLY in the part before the `;` marker, so a
     // comparator INSIDE the marker (`python_version < "3.9"`) is not mistaken for the
     // dependency's version. When a real operator IS found before the marker, keep the
@@ -1917,7 +1925,7 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
     // hooks, and correlates the granular signals into one
     // `PythonInstalledIntegrityViolation` finding folded into the same verdict.
     let integrity = if matches!(request.mode, ScanMode::Installed) {
-        let report = collect_installed_integrity(request.root);
+        let report = collect_installed_integrity(request.root, request.installed_max_entries);
         findings.extend(report.correlated_findings(effective_policy));
         // B6: the startup-hook execution correlation (the two startup findings)
         // runs over the same report's startup signals, folded into the same
@@ -2709,7 +2717,7 @@ fn startup_distinct_kind_strings(signals: &[crate::artifact::ArtifactSignal]) ->
 /// inventories `.pth`/`.start`/`.egg-link` for the later B6 analyzer). Never
 /// follows a symlinked final component when reading a file. Best-effort: an
 /// unreadable directory contributes nothing rather than failing the scan.
-fn collect_installed_integrity(root: &Path) -> InstalledIntegrityReport {
+fn collect_installed_integrity(root: &Path, max_entries: usize) -> InstalledIntegrityReport {
     use crate::artifact::record::{
         index_distribution_ownership, verify_installed_record, EnvironmentLayout, FileVerification,
         OwnershipIndex,
@@ -2733,8 +2741,17 @@ fn collect_installed_integrity(root: &Path) -> InstalledIntegrityReport {
             index_distribution_ownership(dist_info, identity, &mut index);
         }
 
-        // 2. Per-distribution lenient RECORD verification.
-        for (dist_info, identity) in &dist_infos {
+        // 2. Per-distribution lenient RECORD verification, BOUNDED by `max_entries` (the
+        //    caller's --installed scan cap, 0 = unlimited): verification hashes every
+        //    RECORD-listed file, so a large environment must not bypass the cap and make
+        //    `--installed` unexpectedly expensive. The cheaper ownership index above stays
+        //    full so cross-distribution duplicate detection is not weakened.
+        let verify_cap = if max_entries == 0 {
+            usize::MAX
+        } else {
+            max_entries
+        };
+        for (dist_info, identity) in dist_infos.iter().take(verify_cap) {
             let result = verify_installed_record(dist_info, &layout, identity, false);
             report.distributions_checked += 1;
             // An externally-managed distribution (conda / distro-packaged) legitimately
@@ -2800,13 +2817,17 @@ fn discover_dist_infos(site: &Path) -> Vec<(PathBuf, crate::artifact::Distributi
     };
     let mut dist_infos: Vec<PathBuf> = rd
         .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
+        // Use the DirEntry's file type (NO symlink follow): a planted
+        // `foo.dist-info -> /outside` symlink must not be accepted as a dist-info directory
+        // and route later METADATA/RECORD reads through the symlink (the no-follow read
+        // helpers protect only the FINAL component). The directory must be a REAL directory.
+        .filter(|e| {
+            e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && e.file_name()
+                    .to_str()
                     .is_some_and(|n| n.ends_with(".dist-info"))
         })
+        .map(|e| e.path())
         .collect();
     dist_infos.sort();
     for dist_info in dist_infos {
@@ -3422,6 +3443,23 @@ git+https://github.com/x/y.git
             Some("pkg")
         );
         assert_eq!(python_requirement_name(""), None);
+    }
+
+    #[test]
+    fn python_requirement_spec_strips_inline_comment() {
+        // An inline `#` comment must not leak into the version token: otherwise an EXACT pin
+        // (`malware==1.0.0 # note`) degrades to a Constraint/Unresolved and a confirmed
+        // Critical hit is silently downgraded to a Warn.
+        assert_eq!(
+            python_requirement_spec("malware==1.0.0 # pinned safe version"),
+            "==1.0.0"
+        );
+        assert_eq!(
+            python_requirement_spec("pkg==2.3.4\t# tab comment"),
+            "==2.3.4"
+        );
+        // No inline comment: unchanged (a `#` without leading whitespace is not a comment).
+        assert_eq!(python_requirement_spec("pkg>=1.0,<2.0"), ">=1.0,<2.0");
     }
 
     #[test]
