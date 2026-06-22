@@ -789,13 +789,12 @@ fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
             block_stack.push(is_dev_group);
             continue;
         }
-        if let Some(name) = gemfile_gem_name(line) {
+        if let Some((name, version)) = gemfile_gem_spec(line) {
             if seen.insert(name.clone()) {
                 out.push(DeclaredDependency {
                     name,
                     ecosystem: Ecosystem::RubyGems,
-                    // Gemfile parsing keeps only the name today.
-                    version: VersionIntent::Unspecified,
+                    version,
                     dev: block_stack.iter().any(|&is_dev| is_dev),
                 });
             }
@@ -804,20 +803,30 @@ fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
     out
 }
 
-/// Extract the gem name from a `gem "name", ...` Gemfile line.
-fn gemfile_gem_name(line: &str) -> Option<String> {
+/// Extract the gem name and version intent from a `gem "name", "<spec>", ...` Gemfile line.
+/// The version is the quoted token that DIRECTLY follows the name (`gem "x", "= 1.0"`); an
+/// option hash (`gem "x", :require => false`) carries no version, so the intent is
+/// Unspecified.
+fn gemfile_gem_spec(line: &str) -> Option<(String, VersionIntent)> {
     let rest = line.strip_prefix("gem ")?.trim_start();
-    let (quote, after) = match rest.chars().next()? {
-        '"' => ('"', &rest[1..]),
-        '\'' => ('\'', &rest[1..]),
+    let quote = match rest.chars().next()? {
+        '"' => '"',
+        '\'' => '\'',
         _ => return None,
     };
-    let name = after.split(quote).next()?.trim();
+    // Split on the quote char: parts = ["", name, sep, version, ...]. A version is present
+    // only when `sep` (between the name's closing quote and the next opening quote) is just
+    // a comma - otherwise the next quoted token is an option value, not a version.
+    let parts: Vec<&str> = rest.split(quote).collect();
+    let name = parts.get(1)?.trim();
     if name.is_empty() || !is_plausible_package_name(name) {
-        None
-    } else {
-        Some(name.to_string())
+        return None;
     }
+    let version = match (parts.get(2), parts.get(3)) {
+        (Some(sep), Some(spec)) if sep.trim() == "," => VersionIntent::from_gem_version(spec),
+        _ => VersionIntent::Unspecified,
+    };
+    Some((name.to_string(), version))
 }
 
 /// `true` when `name` is shaped like a real package name. Deliberately
@@ -2985,6 +2994,32 @@ end
         assert!(names.contains(&"puma"));
         let rspec = deps.iter().find(|d| d.name == "rspec").unwrap();
         assert!(rspec.dev, "a gem in a :test group must be dev-tagged");
+    }
+
+    #[test]
+    fn parse_gemfile_carries_version_intent() {
+        // The Gemfile parser must carry version intent (like requirements.txt / Cargo.toml)
+        // so a safe PINNED version does not raise a version-agnostic false-positive warning.
+        let text = "\
+gem 'pinned', '= 1.2.3'
+gem 'bare', '4.5.6'
+gem 'ranged', '~> 2.0'
+gem 'optioned', require: false
+gem 'plain'
+";
+        let deps = parse_gemfile(text);
+        let v = |n: &str| deps.iter().find(|d| d.name == n).map(|d| d.version.clone());
+        // `= 1.2.3` and a bare `4.5.6` are exact gem pins.
+        assert_eq!(v("pinned"), Some(VersionIntent::Exact("1.2.3".to_string())));
+        assert_eq!(v("bare"), Some(VersionIntent::Exact("4.5.6".to_string())));
+        // `~> 2.0` is a range constraint.
+        assert!(matches!(
+            v("ranged"),
+            Some(VersionIntent::Constraint { .. })
+        ));
+        // An option value (not a version) and a bare name are Unspecified.
+        assert_eq!(v("optioned"), Some(VersionIntent::Unspecified));
+        assert_eq!(v("plain"), Some(VersionIntent::Unspecified));
     }
 
     #[test]
