@@ -739,6 +739,14 @@ pub enum RuleId {
     /// recursive wipe). Build-artifact paths are excluded via
     /// `crate::util_build_dirs::is_build_artifact_path`.
     MassFileDeletion,
+    /// A2 — the scan could not fully cover a relevant file (an oversized
+    /// priority/text file, an unreadable file, an unsupported native/packaging
+    /// artifact like a `.so`/`.whl`, a file too large to even hash, or a
+    /// rule panic), so the result is NOT "complete and clean". Assembled by the
+    /// scan driver from the recorded `CoverageGap`s, NOT a fixture-driven rule,
+    /// so it lives in `EXTERNALLY_TRIGGERED_RULES`. Medium by default; High when
+    /// the gap's effective policy action is Fail (whence the action is Block).
+    AnalysisIncomplete,
 }
 
 impl fmt::Display for RuleId {

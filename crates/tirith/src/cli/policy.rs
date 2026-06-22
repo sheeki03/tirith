@@ -523,13 +523,17 @@ fn test_file(file_path: &str, json: bool) -> i32 {
 
     // Guarded so a crafted file that panics a rule reports an error instead of
     // crashing the process.
+    use scan::{GuardedScanOutcome, ScanFileOutcome};
     let result = match scan::scan_single_file_guarded(&path) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            eprintln!("tirith policy test: could not read file: {file_path}");
+        GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(r)) => r,
+        GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => {
+            eprintln!(
+                "tirith policy test: could not analyze {file_path}: coverage gap ({})",
+                gap.kind.as_str()
+            );
             return 1;
         }
-        Err(scan::RulePanic) => {
+        GuardedScanOutcome::RulePanic(_) => {
             eprintln!("tirith policy test: internal error scanning {file_path}: a rule panicked");
             return 1;
         }

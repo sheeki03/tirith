@@ -191,6 +191,57 @@ pub fn read_text_no_follow_capped(path: &Path, cap: u64) -> Result<Vec<u8>, Open
     Ok(buf)
 }
 
+/// Outcome of [`sha256_from_handle`]: either the streamed digest, or a signal
+/// that the file exceeded the hash budget so no unbounded hashing occurred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HashOutcome {
+    /// The whole file fit within the budget; the lowercase-hex SHA-256.
+    Digest(String),
+    /// The file exceeded `budget` bytes; hashing was abandoned to avoid an
+    /// unbounded read (a multi-terabyte file must not become a hashing DoS).
+    BudgetExceeded,
+}
+
+/// Stream a SHA-256 over AT MOST `budget` bytes read from an ALREADY-OPEN handle,
+/// returning the lowercase-hex digest, or [`HashOutcome::BudgetExceeded`] if the
+/// file is larger than `budget` (so a giant payload cannot trigger an unbounded
+/// hash).
+///
+/// Hashing FROM THE HANDLE (not re-opening by path) is the TOCTOU-safety point:
+/// the caller opens the file once (no-follow, fstat the open fd), then hands that
+/// same `File` here, so the bytes hashed are exactly the bytes the inode held —
+/// a path swap after the open cannot substitute a different file between the stat
+/// and the hash. It reads through `take(budget + 1)` so a file that grew past the
+/// budget after the caller's stat is still caught here, not hashed unbounded.
+pub fn sha256_from_handle(mut file: File, budget: u64) -> std::io::Result<HashOutcome> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+
+    let mut hasher = Sha256::new();
+    // 64 KiB streaming buffer — bounded memory regardless of file size.
+    let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    // Read one byte past the budget so an exactly-budget file hashes but a
+    // larger one is detected (the extra byte is never folded into the digest).
+    let cap = budget.saturating_add(1);
+    let mut reader = (&mut file).take(cap);
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > budget {
+            // Over budget: abandon without folding the overflow byte(s) in.
+            return Ok(HashOutcome::BudgetExceeded);
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(HashOutcome::Digest(hex))
+}
+
 /// Return `true` only when `path`'s REAL filesystem location resolves to
 /// somewhere inside the canonical `root`. Unlike the `O_NOFOLLOW` openers (which
 /// only guard the final component), this canonicalizes through ALL intermediate
@@ -928,6 +979,46 @@ mod no_follow_tests {
         assert!(
             !canonical_within(&traversal, &inner),
             "a ../ escape must resolve outside the root and be rejected"
+        );
+    }
+
+    /// `sha256_from_handle` streams a digest that matches an independent Rust
+    /// computation, and a file over the budget yields `BudgetExceeded` (no
+    /// unbounded hash, no digest).
+    #[test]
+    fn sha256_from_handle_matches_and_respects_budget() {
+        use super::{open_read_no_follow_capped, sha256_from_handle, HashOutcome};
+        use sha2::{Digest, Sha256};
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("payload.bin");
+        let bytes = b"the quick brown fox jumps over the lazy dog";
+        std::fs::write(&p, bytes).unwrap();
+
+        // Independent reference digest (NEVER shelling out to sha256sum).
+        let expected: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        // Within budget: the streamed digest matches the reference exactly.
+        let f = open_read_no_follow_capped(&p, u64::MAX).unwrap();
+        assert_eq!(
+            sha256_from_handle(f, 1024).unwrap(),
+            HashOutcome::Digest(expected.clone())
+        );
+
+        // Exactly at the budget still hashes (boundary).
+        let f = open_read_no_follow_capped(&p, u64::MAX).unwrap();
+        assert_eq!(
+            sha256_from_handle(f, bytes.len() as u64).unwrap(),
+            HashOutcome::Digest(expected)
+        );
+
+        // One byte under the size: over budget, abandoned with no digest.
+        let f = open_read_no_follow_capped(&p, u64::MAX).unwrap();
+        assert_eq!(
+            sha256_from_handle(f, (bytes.len() as u64) - 1).unwrap(),
+            HashOutcome::BudgetExceeded
         );
     }
 

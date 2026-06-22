@@ -35,6 +35,7 @@ pub mod install_script_analysis;
 pub mod install_txn;
 pub mod intent;
 pub mod license;
+pub mod location;
 pub mod lsp_profiles;
 pub mod mcp;
 pub mod mcp_lock;

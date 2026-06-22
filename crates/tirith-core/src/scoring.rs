@@ -328,7 +328,9 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::SecretWriteThenNetwork
         | RuleId::DependencyChangeThenNetwork
         | RuleId::DeleteThenForcePush
-        | RuleId::MassFileDeletion => false,
+        | RuleId::MassFileDeletion
+        // A2: scan-coverage incompleteness, not a threat-DB indicator.
+        | RuleId::AnalysisIncomplete => false,
     }
 }
 

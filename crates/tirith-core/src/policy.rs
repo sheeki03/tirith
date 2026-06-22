@@ -769,6 +769,74 @@ pub struct ScanPolicyConfig {
     /// Named scan profiles with preset include/exclude/fail_on.
     #[serde(default)]
     pub profiles: HashMap<String, ScanProfile>,
+    /// A2 — fail the scan (in CI) when ANY security-relevant coverage gap exists
+    /// (an oversized priority file, an unreadable file, an unsupported artifact,
+    /// a hash-budget-exceeded file). TIGHTENING, so a repo-scoped policy may set
+    /// it and it survives [`Policy::sanitize_repo_scoped`]. Default false.
+    #[serde(default)]
+    pub require_complete: bool,
+    /// A2 — action for an oversized-file coverage gap. `None` means the built-in
+    /// default ([`GapAction::Warn`]). A repo-scoped value is clamped UP to the
+    /// default (`max(Warn, repo)`), so a repo can raise Warn to Fail but never
+    /// lower it to Ignore; operator scopes are honored fully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oversized_file_action: Option<GapAction>,
+    /// A2 — action for an unreadable-file coverage gap (same scoping as
+    /// [`Self::oversized_file_action`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable_file_action: Option<GapAction>,
+    /// A2 — action for an unsupported-artifact coverage gap (`.so`/`.whl`/...;
+    /// same scoping as [`Self::oversized_file_action`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupported_artifact_action: Option<GapAction>,
+}
+
+/// A2 — what to do about a coverage gap of a given class. Declaration order is
+/// the precedence order (`Ignore < Warn < Fail`), so deriving `PartialOrd`/`Ord`
+/// lets the repo-scope merge be a simple `max(default Warn, repo value)`: a repo
+/// may only RAISE the action, never lower it. Default is [`GapAction::Warn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GapAction {
+    /// Do not surface the gap at all.
+    Ignore,
+    /// Surface the gap as a warning (the default).
+    #[default]
+    Warn,
+    /// Treat the gap as a failure (Block-grade; fails CI).
+    Fail,
+}
+
+impl ScanPolicyConfig {
+    /// Effective action for an oversized-file gap: the configured value, or the
+    /// [`GapAction::Warn`] default when unset.
+    pub fn oversized_action(&self) -> GapAction {
+        self.oversized_file_action.unwrap_or_default()
+    }
+    /// Effective action for an unreadable-file gap (Warn default).
+    pub fn unreadable_action(&self) -> GapAction {
+        self.unreadable_file_action.unwrap_or_default()
+    }
+    /// Effective action for an unsupported-artifact gap (Warn default).
+    pub fn unsupported_action(&self) -> GapAction {
+        self.unsupported_artifact_action.unwrap_or_default()
+    }
+
+    /// Effective action for an arbitrary coverage-gap kind, mapping each kind to
+    /// its configured action. A `Panicked`, `Truncated`, or `HashBudgetExceeded`
+    /// gap has no dedicated key; it is treated as an oversized-class gap (the
+    /// most conservative of the three configurable buckets) so the strictest
+    /// configured coverage action still governs it.
+    pub fn action_for_gap_kind(&self, kind: crate::scan::CoverageGapKind) -> GapAction {
+        use crate::scan::CoverageGapKind as K;
+        match kind {
+            K::Oversized | K::HashBudgetExceeded | K::Truncated | K::Panicked => {
+                self.oversized_action()
+            }
+            K::Unreadable => self.unreadable_action(),
+            K::Unsupported => self.unsupported_action(),
+        }
+    }
 }
 
 /// Per-rule allowlist scoping.
@@ -1429,6 +1497,42 @@ impl Policy {
         self.scan.ignore_patterns = defaults.scan.ignore_patterns.clone();
         self.scan.fail_on = defaults.scan.fail_on.clone();
         self.scan.profiles = defaults.scan.profiles.clone();
+
+        // A2 coverage gap actions — MONOTONIC merge against the built-in default
+        // (`GapAction::Warn`), NOT a reset: a repo may RAISE an action (Warn ->
+        // Fail) but never LOWER it (a repo `ignore` is clamped back up to Warn, so
+        // a hostile repo can't silence coverage). `max(Warn, repo)` over
+        // `Ignore < Warn < Fail`. `None` means "default Warn" already, so it is
+        // left as-is. Only a clamped-DOWN value is a weakening attempt worth
+        // recording. `require_complete` is TIGHTENING (a repo can only turn it on)
+        // so it is KEPT untouched, like the other opt-in guard toggles.
+        let default_gap = GapAction::default();
+        let clamp =
+            |field: &mut Option<GapAction>, key: &'static str, sink: &mut Vec<&'static str>| {
+                if let Some(v) = *field {
+                    if v < default_gap {
+                        // The repo tried to LOWER the action below the default —
+                        // clamp it back up and record the neutralization.
+                        *field = Some(default_gap);
+                        sink.push(key);
+                    }
+                }
+            };
+        clamp(
+            &mut self.scan.oversized_file_action,
+            "scan.oversized_file_action",
+            &mut neutralized,
+        );
+        clamp(
+            &mut self.scan.unreadable_file_action,
+            "scan.unreadable_file_action",
+            &mut neutralized,
+        );
+        clamp(
+            &mut self.scan.unsupported_artifact_action,
+            "scan.unsupported_artifact_action",
+            &mut neutralized,
+        );
 
         self.neutralized_fields = neutralized;
     }
@@ -3262,6 +3366,13 @@ custom_rules:
                 // KEPT scan sub-fields set hostile-distinct too (must survive):
                 additional_config_files: vec!["extra.toml".into()],
                 mcp_allowed_tools: HashMap::from([("srv".into(), vec!["read".into()])]),
+                // A2 — `require_complete` is TIGHTENING (KEPT). The three gap
+                // actions are set to the WEAKENING `Ignore`, which the monotonic
+                // merge must clamp UP to `Warn` (a repo cannot silence coverage).
+                require_complete: true,
+                oversized_file_action: Some(GapAction::Ignore),
+                unreadable_file_action: Some(GapAction::Ignore),
+                unsupported_artifact_action: Some(GapAction::Ignore),
             },
             // --- fields the sanitizer KEEPS (tightening-only; set distinct so a
             //     stray reset would be caught) ---
@@ -3470,6 +3581,30 @@ custom_rules:
         );
         assert_eq!(scan.fail_on, d.scan.fail_on, "RESET: scan.fail_on");
         assert!(scan.profiles.is_empty(), "RESET: scan.profiles");
+
+        // ---- CLAMP (A2 monotonic merge): a repo `ignore` gap action is raised to
+        //      the default Warn (a repo cannot LOWER coverage), but `Fail` would
+        //      survive. Distinct from RESET (which would drop a repo `Fail` raise)
+        //      and from KEPT (which would let a repo `ignore` silence coverage). ----
+        assert_eq!(
+            scan.oversized_file_action,
+            Some(GapAction::Warn),
+            "CLAMP: scan.oversized_file_action (ignore raised to default Warn)"
+        );
+        assert_eq!(
+            scan.unreadable_file_action,
+            Some(GapAction::Warn),
+            "CLAMP: scan.unreadable_file_action (ignore raised to default Warn)"
+        );
+        assert_eq!(
+            scan.unsupported_artifact_action,
+            Some(GapAction::Warn),
+            "CLAMP: scan.unsupported_artifact_action (ignore raised to default Warn)"
+        );
+        assert!(
+            scan.require_complete,
+            "KEPT: scan.require_complete (tightening; a repo can only turn it on)"
+        );
 
         // ---- KEPT: tightening-only knobs survive (hostile-distinct values) ----
         // scan's tightening sub-fields must NOT have been reset.

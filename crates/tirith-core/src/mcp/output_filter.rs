@@ -460,7 +460,8 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::SecretWriteThenNetwork
         | RuleId::DependencyChangeThenNetwork
         | RuleId::DeleteThenForcePush
-        | RuleId::MassFileDeletion => false,
+        | RuleId::MassFileDeletion
+        | RuleId::AnalysisIncomplete => false,
     }
 }
 

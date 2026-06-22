@@ -1184,12 +1184,19 @@ fn snapshot_update(force: bool, json: bool) -> i32 {
         };
         let pre_hash = tirith_core::clipboard::content_sha256_hex(content.as_bytes());
 
-        // A `None` scan is a HARD failure, not a silent skip (CodeRabbit M13 PR
+        // A skipped scan is a HARD failure, not a silent skip (CodeRabbit M13 PR
         // #132 R7-3): recording an un-scanned file would bless un-assessed risk.
-        // Abort the whole update rather than record a half-validated set.
-        let result = match tirith_core::scan::scan_single_file(f) {
-            Some(r) => r,
-            None => return snapshot_scan_failed_code(json, f),
+        // Abort the whole update rather than record a half-validated set. Any
+        // coverage gap (oversized / unreadable / unsupported / hash-budget) is
+        // treated the same way the old `None` skip was.
+        let result = match tirith_core::scan::scan_single_file_guarded(f) {
+            tirith_core::scan::GuardedScanOutcome::Completed(
+                tirith_core::scan::ScanFileOutcome::Scanned(r),
+            ) => r,
+            // A skip OR a rule panic is a HARD failure: an un-scanned file must not be
+            // recorded as validated, and a rule panic must surface a CONTROLLED failure
+            // code rather than unwinding and aborting the whole `ai snapshot --update`.
+            _ => return snapshot_scan_failed_code(json, f),
         };
         for finding in &result.findings {
             if finding.severity >= Severity::High {

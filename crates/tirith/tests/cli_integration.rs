@@ -5041,18 +5041,30 @@ fn scan_directory_walk_finds_dockerfile_workflow_and_notebook() {
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
 
-    // Schema v4 (#123): the directory-scan envelope advertises version 4 and
-    // always carries the panic-incomplete-scan fields. A clean walk panics on
-    // nothing, so the count is 0 and the list is present-and-empty.
+    // Schema v5 (A2): the directory-scan envelope advertises version 5 and adds
+    // the coverage fields. A clean walk panics on nothing, so the count is 0 and
+    // the list is present-and-empty; with no coverage gaps `analysis_incomplete`
+    // is false and `coverage_gaps` is empty.
     assert_eq!(
-        json["schema_version"], 4,
-        "scan JSON must advertise schema_version 4"
+        json["schema_version"], 5,
+        "scan JSON must advertise schema_version 5"
     );
     assert_eq!(json["panic_count"], 0, "a clean scan reports zero panics");
     assert!(
         json["panic_files"].as_array().is_some_and(|a| a.is_empty()),
         "panic_files must be present and empty on a clean scan, got: {}",
         json["panic_files"]
+    );
+    assert_eq!(
+        json["analysis_incomplete"], false,
+        "a clean scan is not incomplete"
+    );
+    assert!(
+        json["coverage_gaps"]
+            .as_array()
+            .is_some_and(|a| a.is_empty()),
+        "coverage_gaps must be present and empty on a clean scan, got: {}",
+        json["coverage_gaps"]
     );
 
     // Collect every rule_id and the relative file path of every finding across
@@ -15516,5 +15528,176 @@ fn fix_on_non_tty_prints_rerun_hint() {
     assert!(
         err.contains("--non-interactive") && err.contains("--json"),
         "fix on a non-TTY prints the rerun hint; stderr: {err}"
+    );
+}
+
+// ---- A2: scan coverage gaps, require_complete, and gap-action scoping ----
+
+/// A2 — `tirith scan --ci` with a repo-scoped `require_complete: true` over a
+/// tree containing an OVERSIZED PRIORITY file fails closed (exit 1) and the JSON
+/// reports `analysis_incomplete` with the oversized gap.
+#[test]
+fn scan_ci_require_complete_fails_on_oversized_priority_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("project");
+    // Policy discovery walks up to `.git`; `require_complete` is a repo-scoped
+    // tightening field, so it survives sanitization.
+    fs::create_dir_all(proj.join(".git")).unwrap();
+    fs::create_dir_all(proj.join(".tirith")).unwrap();
+    fs::write(
+        proj.join(".tirith").join("policy.yaml"),
+        "scan:\n  require_complete: true\n",
+    )
+    .unwrap();
+    // A PRIORITY file (CLAUDE.md) just over the 10 MiB analysis ceiling -> an
+    // Oversized, security-relevant coverage gap.
+    let big = vec![b'x'; 11 * 1024 * 1024];
+    fs::write(proj.join("CLAUDE.md"), &big).unwrap();
+
+    let out = tirith_in_proj(&proj)
+        .args(["scan", "--ci", "--format", "json", "."])
+        .output()
+        .expect("failed to run tirith scan --ci");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "require_complete + an oversized priority gap must fail CI (exit 1); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
+    assert_eq!(
+        json["analysis_incomplete"], true,
+        "the oversized priority file must mark the scan incomplete; got: {json}"
+    );
+    let gaps = json["coverage_gaps"]
+        .as_array()
+        .expect("coverage_gaps array");
+    assert!(
+        gaps.iter().any(|g| g["kind"] == "oversized"
+            && g["location"]
+                .as_str()
+                .is_some_and(|l| l.contains("CLAUDE.md"))),
+        "an oversized CLAUDE.md gap must be reported; gaps: {gaps:?}"
+    );
+}
+
+/// A2 — an OPERATOR-scoped (`XDG_CONFIG_HOME`) policy with
+/// `oversized_file_action: ignore` AND `require_complete: false` makes the same
+/// oversized-priority tree pass (exit 0): an operator policy is honored fully, so
+/// it CAN silence the coverage gap.
+#[test]
+fn scan_operator_policy_ignore_oversized_passes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("project");
+    // No repo policy; a `.git` so the walk has a boundary but discovery falls
+    // through to the operator (user) policy under XDG_CONFIG_HOME.
+    fs::create_dir_all(proj.join(".git")).unwrap();
+    let big = vec![b'x'; 11 * 1024 * 1024];
+    fs::write(proj.join("CLAUDE.md"), &big).unwrap();
+
+    // Operator-scoped policy: ignore the oversized gap and do not require
+    // completeness. An operator policy is honored fully (no clamp).
+    let xdg = tmp.path().join("xdg");
+    fs::create_dir_all(xdg.join("tirith")).unwrap();
+    fs::write(
+        xdg.join("tirith").join("policy.yaml"),
+        "scan:\n  require_complete: false\n  oversized_file_action: ignore\n",
+    )
+    .unwrap();
+
+    let out = tirith_in_proj(&proj)
+        // config_dir() goes through etcetera: XDG_CONFIG_HOME on Unix and macOS,
+        // but %APPDATA% on Windows. Point all three at `xdg` so the operator
+        // policy at `xdg/tirith/policy.yaml` is discovered on every platform
+        // (tirith_in_proj otherwise defaults APPDATA elsewhere).
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("APPDATA", &xdg)
+        .env("LOCALAPPDATA", &xdg)
+        .args(["scan", "--ci", "--format", "json", "."])
+        .output()
+        .expect("failed to run tirith scan --ci");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an operator `oversized_file_action: ignore` + `require_complete: false` must pass (exit 0); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
+    // The gap is still RECORDED in the envelope (transparency), but it emits no
+    // finding and does not fail CI because the operator ignored it.
+    assert!(
+        json["files"].as_array().is_some_and(|files| {
+            files.iter().all(|f| {
+                f["findings"].as_array().is_some_and(|fs| {
+                    fs.iter()
+                        .all(|finding| finding["rule_id"] != "analysis_incomplete")
+                })
+            })
+        }),
+        "an ignored oversized gap must emit no analysis_incomplete finding; got: {json}"
+    );
+    // ...but the gap itself is STILL recorded in the envelope (transparency), so an
+    // ignore can never silently drop the gap from the output.
+    let gaps = json["coverage_gaps"]
+        .as_array()
+        .expect("coverage_gaps must be an array");
+    assert!(
+        gaps.iter().any(|g| g.to_string().contains("CLAUDE.md")),
+        "the ignored oversized gap must still be recorded in coverage_gaps; got: {json}"
+    );
+}
+
+/// A2 — a REPO-scoped `oversized_file_action: ignore` is CLAMPED up to Warn (a
+/// repo cannot silence coverage), so under `--ci require_complete: true` the
+/// oversized priority gap still fails CI. Mirrors the operator test but proves
+/// the repo-scope monotonic merge.
+#[test]
+fn scan_repo_policy_ignore_oversized_is_clamped_to_warn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("project");
+    fs::create_dir_all(proj.join(".git")).unwrap();
+    fs::create_dir_all(proj.join(".tirith")).unwrap();
+    // Repo tries to IGNORE oversized AND requires completeness. The ignore is
+    // clamped to Warn; require_complete survives, so the gap fails CI.
+    fs::write(
+        proj.join(".tirith").join("policy.yaml"),
+        "scan:\n  require_complete: true\n  oversized_file_action: ignore\n",
+    )
+    .unwrap();
+    let big = vec![b'x'; 11 * 1024 * 1024];
+    fs::write(proj.join("CLAUDE.md"), &big).unwrap();
+
+    let out = tirith_in_proj(&proj)
+        .args(["scan", "--ci", "--format", "json", "."])
+        .output()
+        .expect("failed to run tirith scan --ci");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a repo `oversized_file_action: ignore` is clamped to Warn, so require_complete still fails CI (exit 1); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must produce valid JSON");
+    assert_eq!(
+        json["analysis_incomplete"], true,
+        "the clamped repo policy still surfaces the oversized gap; got: {json}"
+    );
+    // Assert the exact cause so this cannot regress to incompleteness for some other
+    // reason: an `oversized` gap for CLAUDE.md must be present.
+    let gaps = json["coverage_gaps"]
+        .as_array()
+        .expect("coverage_gaps must be an array");
+    assert!(
+        gaps.iter().any(|g| {
+            let s = g.to_string();
+            s.contains("CLAUDE.md") && s.contains("oversized")
+        }),
+        "the clamped policy must surface an oversized CLAUDE.md gap; got: {json}"
     );
 }
