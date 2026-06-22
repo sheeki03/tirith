@@ -781,6 +781,7 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "dlp_custom_patterns",
         "injection_seeds_custom",
         "mcp_redact_injection",
+        "gateway_profile",
         "strict_warn",
         "action_overrides",
         "escalation",

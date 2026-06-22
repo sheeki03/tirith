@@ -815,7 +815,7 @@ fn cache_path(ecosystem: Ecosystem, name: &str) -> Option<PathBuf> {
     let state = policy::state_dir()?;
     let key = format!("{ecosystem}:{name}");
     let digest = sha2::Sha256::digest(key.as_bytes());
-    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    let hex: String = hex::encode(&digest[..16]);
     Some(
         state
             .join("registry-api-cache")

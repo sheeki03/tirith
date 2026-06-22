@@ -16,7 +16,7 @@ COMMANDS BY CATEGORY:
   Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
   Policy & Trust:   policy trust rule output
   Shell & System:   daemon hooks exec env path sudo ssh context persistence hygiene aliases
-  Supply-chain:     package ecosystem threat-db iac canary secret command-card commands
+  Supply-chain:     package pkg ecosystem threat-db iac canary secret command-card commands
   Integrations:     mcp mcp-server gateway agent ai lsp license
   Forensics:        audit incident checkpoint pending share redact clipboard
 
@@ -104,13 +104,17 @@ Exit code:
   reported but never overrides the child's exit code.
 
 JSON:
-  Every --json envelope carries `\"isolation_kind\": \"file_only_not_a_sandbox\"`
-  so a downstream consumer can never mistake this for a security boundary.
+  Every --json envelope carries `\"isolation_kind\"`. Without `--capsule` it is
+  `\"file_only_not_a_sandbox\"`, so a downstream consumer can never mistake plain
+  temp-run for a security boundary. With `--capsule`, when an OS backend actually
+  contains the run, it is `\"capsule_contained\"`; a degraded `--capsule` run that
+  fell back to uncontained keeps the not-a-sandbox marker.
 
 Examples:
   tirith temp-run -- ./script.sh
   tirith temp-run --copy-repo -- make build
   tirith temp-run --strip-env -- ./untrusted-installer.sh
+  tirith temp-run --capsule -- ./untrusted-installer.sh
   tirith temp-run --json -- npm install left-pad";
 
 #[derive(Subcommand)]
@@ -264,6 +268,13 @@ Examples:
         #[arg(long)]
         no_exec: bool,
 
+        /// Execute the downloaded script inside the OS containment capsule
+        /// (deny-network, scrubbed env, resource limits, FS confined to the
+        /// script's cache dir). Enforcing: a host whose backend cannot enforce
+        /// the containment refuses to run rather than running uncontained.
+        #[arg(long)]
+        capsule: bool,
+
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -367,6 +378,23 @@ Examples:
         /// Expected SHA-256 of the downloaded script (url form only)
         #[arg(long)]
         sha256: Option<String>,
+    },
+
+    /// Package firewall: resolve, inspect, and install ONLY the verified bytes,
+    /// inside a containment capsule, with a tamper-evident receipt (Python only).
+    #[command(after_help = "\
+Examples:
+  tirith pkg approve pip requests==2.31.0       # resolve+inspect, print the plan digest
+  tirith pkg install pip requests==2.31.0       # install only the approved, inspected bytes
+  tirith pkg install pip flask --target .venv --yes
+  tirith pkg verify-env --target .venv requests flask
+  tirith pkg receipt list
+
+`tirith pkg install` is the ENFORCING path (contained, hash-pinned, fails closed
+on degraded coverage); `tirith install` is the analysis path. They are distinct.")]
+    Pkg {
+        #[command(subcommand)]
+        action: PkgAction,
     },
 
     /// Run adversarial training scenarios (experimental)
@@ -2225,8 +2253,17 @@ Examples:
         #[arg(long)]
         strip_env: bool,
 
-        /// Output the run + file diff as JSON. The envelope always carries
-        /// `"isolation_kind": "file_only_not_a_sandbox"`.
+        /// Additionally run the command through the OS containment capsule
+        /// (Landlock/seccomp, Seatbelt, or AppContainer), confined to the temp
+        /// dir with no network. Best-effort hardening: a host without a working
+        /// backend runs the command UNCONTAINED and says so. The JSON envelope
+        /// reports the real backend and whether containment was achieved.
+        #[arg(long)]
+        capsule: bool,
+
+        /// Output the run + file diff as JSON. The envelope carries
+        /// `"isolation_kind"` (`file_only_not_a_sandbox`, or `capsule_contained`
+        /// when `--capsule` actually contained the run).
         #[arg(long)]
         json: bool,
 
@@ -2248,7 +2285,13 @@ Examples:
         #[arg(long)]
         strip_env: bool,
 
-        /// Output JSON (carries `"isolation_kind": "file_only_not_a_sandbox"`).
+        /// Additionally run the command through the OS containment capsule,
+        /// confined to the temp dir with no network (best-effort; runs
+        /// uncontained on a host with no working backend and says so).
+        #[arg(long)]
+        capsule: bool,
+
+        /// Output JSON (carries `"isolation_kind"`).
         #[arg(long)]
         json: bool,
 
@@ -4375,6 +4418,33 @@ Examples:
         json: bool,
     },
 
+    /// Compose a provenance graph over an installed environment (ownership /
+    /// execution / payload), plus this repo's MCP surface. Read model only.
+    #[command(after_help = "\
+What it shows:
+  The same provenance read model as `tirith pkg graph --installed`: every
+  installed distribution in the environment, the paths each owns, any path two
+  distributions both claim, and this repo's declared MCP servers/tools. It
+  introduces no new detection and never blocks.
+
+Examples:
+  tirith env graph --installed .venv
+  tirith env graph --installed .venv --json
+  tirith env graph --installed .venv --dot")]
+    Graph {
+        /// The installed environment tree to graph (a venv root or `--target` dir).
+        #[arg(long = "installed", value_name = "ENV")]
+        installed: std::path::PathBuf,
+        /// Render as Graphviz DOT.
+        #[arg(long, conflicts_with = "json")]
+        dot: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
     /// Internal: write the shell-start env snapshot (used by the shell hook)
     #[command(hide = true)]
     Snapshot,
@@ -5050,6 +5120,250 @@ enum PendingAction {
     },
 }
 
+/// The ecosystem `tirith pkg` enforces for. Only `pip` installs; `npm`/`cargo`
+/// resolve-and-inspect lives behind hidden experimental flags and cannot install.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PkgEcosystem {
+    /// Python wheels (the only enforced ecosystem).
+    Pip,
+    /// npm, not enforced in this version.
+    Npm,
+    /// cargo, not enforced in this version.
+    Cargo,
+}
+
+impl PkgEcosystem {
+    fn into_core(self) -> cli::pkg::Ecosystem {
+        match self {
+            PkgEcosystem::Pip => cli::pkg::Ecosystem::Pip,
+            PkgEcosystem::Npm => cli::pkg::Ecosystem::Npm,
+            PkgEcosystem::Cargo => cli::pkg::Ecosystem::Cargo,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum PkgAction {
+    /// Resolve + inspect a requirement set and approve its install plan, printing
+    /// the plan digest the approval binds to. Does NOT install.
+    #[command(after_help = "\
+Examples:
+  tirith pkg approve pip requests==2.31.0
+  tirith pkg approve pip flask --target .venv")]
+    Approve {
+        /// The ecosystem (only `pip` is enforced).
+        #[arg(value_enum)]
+        ecosystem: PkgEcosystem,
+        /// Requirement specs (e.g. `requests==2.31.0`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        requirements: Vec<String>,
+        /// Install target directory (pip `--target`); defaults to the interpreter
+        /// prefix.
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
+        /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
+        #[arg(long = "index-url")]
+        index_url: Vec<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Resolve + inspect + install ONLY the verified, hash-pinned bytes, inside the
+    /// containment capsule, recording a tamper-evident receipt. Fails closed on
+    /// degraded containment.
+    #[command(after_help = "\
+Examples:
+  tirith pkg install pip requests==2.31.0
+  tirith pkg install pip flask --target .venv --yes")]
+    Install {
+        /// The ecosystem (only `pip` is enforced).
+        #[arg(value_enum)]
+        ecosystem: PkgEcosystem,
+        /// Requirement specs (e.g. `requests==2.31.0`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        requirements: Vec<String>,
+        /// Install target directory (pip `--target`); defaults to the interpreter
+        /// prefix.
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
+        /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
+        #[arg(long = "index-url")]
+        index_url: Vec<String>,
+        /// Install without a prior `tirith pkg approve` (unattended). The receipt
+        /// still attests the install honestly.
+        #[arg(long)]
+        yes: bool,
+        /// Acknowledge degraded containment (still routes through the fail-closed
+        /// installer; does not weaken the requirement).
+        #[arg(long = "allow-degraded")]
+        allow_degraded: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Verify an already-installed environment's RECORD integrity (D5), without
+    /// installing anything.
+    #[command(after_help = "\
+Examples:
+  tirith pkg verify-env --target .venv requests flask")]
+    VerifyEnv {
+        /// The environment tree to verify (a venv root or `--target` dir).
+        #[arg(long)]
+        target: std::path::PathBuf,
+        /// The distribution names to verify (PEP 503 normalized internally).
+        #[arg(trailing_var_arg = true)]
+        packages: Vec<String>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Compose a provenance graph (ownership / execution / payload) over a wheel
+    /// set or an installed environment, plus this repo's MCP surface. Read model
+    /// only: no detection, never blocks.
+    #[command(after_help = "\
+What it shows:
+  A directed graph that answers ownership / execution / payload questions by
+  COMPOSING already-computed signals: each artifact/distribution, the files it
+  carries, the loader -> payload execution edges (a .pth import, a native init, a
+  cross-runtime launch), the duplicate-aware ownership across distributions, and
+  this repo's declared MCP servers/tools. It introduces no new detection.
+
+Examples:
+  tirith pkg graph requests-2.31.0-py3-none-any.whl
+  tirith pkg graph a.whl b.whl --dot
+  tirith pkg graph --installed .venv --json")]
+    Graph {
+        /// Wheel artifact paths to graph (omit when using --installed).
+        #[arg(value_name = "WHEEL")]
+        wheels: Vec<std::path::PathBuf>,
+        /// Graph an installed environment tree (a venv root or `--target` dir)
+        /// instead of wheel files.
+        #[arg(long = "installed", value_name = "ENV")]
+        installed: Option<std::path::PathBuf>,
+        /// Render as Graphviz DOT.
+        #[arg(long, conflicts_with = "json")]
+        dot: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Release differential: compare an OLD wheel against a NEW wheel of the same
+    /// distribution and flag the execution-shape changes that mark a benign release
+    /// turning malicious. Local-artifact-only; warns (never auto-blocks) on an
+    /// anomaly, so a strict policy can escalate it.
+    #[command(after_help = "\
+What it flags:
+  A pure-Python release that now ships a compiled extension, a release that newly
+  carries an interpreter-startup hook, a release that now bundles a multi-megabyte
+  JavaScript payload, a changed distribution identity, or a newly-gained execution
+  capability (a startup or native subprocess spawn, a network or runtime download,
+  a native execution entry) the prior release did not have. Each is a heuristic
+  delta, so it warns; the conclusive cases are caught at block strength by
+  inspecting the new wheel directly. No registry or network access.
+
+Examples:
+  tirith pkg diff requests-2.31.0-py3-none-any.whl requests-2.32.0-py3-none-any.whl
+  tirith pkg diff old.whl new.whl --json")]
+    Diff {
+        /// The OLD (prior) wheel artifact.
+        #[arg(value_name = "OLD_WHEEL")]
+        old: std::path::PathBuf,
+        /// The NEW (candidate) wheel artifact.
+        #[arg(value_name = "NEW_WHEEL")]
+        new: std::path::PathBuf,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Fetch a wheel's PyPI publish provenance (the Integrity API attestation),
+    /// bind the attested subject digest to the wheel's SHA-256, and report the
+    /// outcome. Provenance EVIDENCE only: it never blocks and is never an
+    /// auto-allow; the install verdict is over the bytes, not the attestation.
+    #[command(after_help = "\
+What it does:
+  Inspects the wheel for its exact PyPI identity + SHA-256, fetches its publish
+  provenance from the PyPI Integrity API, and binds the attestation's in-toto
+  subject digest to the wheel's hash. A digest that covers DIFFERENT bytes is a
+  subject mismatch (an artifact-swap / stale-attestation tell, caught structurally).
+  Cryptographic Sigstore verification + a publisher-identity policy check run only
+  with the (MSRV-gated) `sigstore-attestations` feature; without it the outcome is
+  'verification-unavailable' (fetched and bound, but not verified), never 'verified'.
+  A missing or invalid attestation is evidence a reviewer reads, not a block.
+
+Examples:
+  tirith pkg attest requests-2.31.0-py3-none-any.whl
+  tirith pkg attest demo-1.0-py3-none-any.whl --json")]
+    Attest {
+        /// The wheel artifact to fetch + bind provenance for.
+        #[arg(value_name = "WHEEL")]
+        wheel: std::path::PathBuf,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// List or show the package-firewall tamper-evident receipts.
+    #[command(after_help = "\
+Examples:
+  tirith pkg receipt list
+  tirith pkg receipt last
+  tirith pkg receipt show <receipt-id>")]
+    Receipt {
+        #[command(subcommand)]
+        query: PkgReceiptQuery,
+    },
+}
+
+#[derive(Subcommand)]
+enum PkgReceiptQuery {
+    /// List all artifact-scan receipts (newest first).
+    List {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Show the newest artifact-scan receipt.
+    Last {
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Show one receipt by its id (content hash).
+    Show {
+        /// The receipt id (64-char content hash).
+        receipt_id: String,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum ReceiptAction {
     /// Show the last receipt
@@ -5223,6 +5537,16 @@ field-tested.")]
         /// pass-through (current behavior).
         #[arg(long)]
         filter_output: bool,
+
+        /// Spawn the upstream MCP server inside the OS containment capsule
+        /// (deny-network, scrubbed env, resource limits, no inherited handles).
+        /// Enforcing: if this host's backend cannot enforce the containment, the
+        /// gateway refuses to launch the upstream rather than running it
+        /// uncontained. Default is the current uncontained spawn. The `secure`
+        /// gateway profile (policy `gateway_profile: secure`) requires this
+        /// containment even without the flag.
+        #[arg(long)]
+        capsule: bool,
     },
     /// Validate gateway config file
     #[command(after_help = "\
@@ -6460,6 +6784,19 @@ Examples:
 /// main-thread stack overflows it once the CLI grows. A generous stack keeps
 /// startup safe on every platform regardless of how the command set expands.
 fn main() {
+    // Internal capsule launcher (`tirith __capsule-child ...`, Stack E unit E2)
+    // must run while the process is single-threaded: seccomp filters only the
+    // calling thread and Landlock is incompatible with thread-sync, so containment
+    // has to be applied before any worker thread exists. Intercept it HERE, before
+    // the `tirith-main` worker spawn below, and handle it on the genuinely
+    // single-threaded main thread. `run_on_main_thread` never returns on success
+    // (it `execve`s the contained target) and exits non-zero on failure; it never
+    // falls through to running the target uncontained.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if cli::capsule_child::is_invocation(&raw_args) {
+        cli::capsule_child::run_on_main_thread(&raw_args);
+    }
+
     let handle = std::thread::Builder::new()
         .name("tirith-main".to_string())
         .stack_size(16 * 1024 * 1024)
@@ -6548,12 +6885,13 @@ fn run() {
         Commands::Run {
             url,
             no_exec,
+            capsule,
             format,
             json,
             sha256,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::run::run(&url, no_exec, json, sha256)
+            cli::run::run(&url, no_exec, json, capsule, sha256)
         }
 
         Commands::Install {
@@ -6569,6 +6907,138 @@ fn run() {
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::install::run(source, &args, online, offline, json, yes, no_exec, sha256)
+        }
+
+        Commands::Pkg {
+            action:
+                PkgAction::Graph {
+                    wheels,
+                    installed,
+                    dot,
+                    format,
+                    json,
+                },
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            let graph_format = cli::provenance::GraphFormat::resolve(json, dot);
+            let target = match installed {
+                Some(env) => cli::provenance::GraphTarget::InstalledEnv(env),
+                None => cli::provenance::GraphTarget::Wheels(wheels),
+            };
+            cli::provenance::run(target, graph_format)
+        }
+        Commands::Pkg {
+            action:
+                PkgAction::Diff {
+                    old,
+                    new,
+                    format,
+                    json,
+                },
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::provenance::run_diff(&old, &new, json)
+        }
+        Commands::Pkg {
+            action:
+                PkgAction::Attest {
+                    wheel,
+                    format,
+                    json,
+                },
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::pypi_integrity::run(&wheel, json)
+        }
+        Commands::Pkg { action } => {
+            let pkg_action = match action {
+                PkgAction::Approve {
+                    ecosystem,
+                    requirements,
+                    target,
+                    index_url,
+                    format,
+                    json,
+                } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::pkg::PkgAction::Approve {
+                        ecosystem: ecosystem.into_core(),
+                        requirements,
+                        target,
+                        index_url,
+                        json,
+                    }
+                }
+                PkgAction::Install {
+                    ecosystem,
+                    requirements,
+                    target,
+                    index_url,
+                    yes,
+                    allow_degraded,
+                    format,
+                    json,
+                } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::pkg::PkgAction::Install {
+                        ecosystem: ecosystem.into_core(),
+                        requirements,
+                        target,
+                        index_url,
+                        yes,
+                        allow_degraded,
+                        json,
+                    }
+                }
+                PkgAction::VerifyEnv {
+                    target,
+                    packages,
+                    format,
+                    json,
+                } => {
+                    let (_, json) = HumanJsonFormat::resolve(format, json);
+                    cli::pkg::PkgAction::VerifyEnv {
+                        target,
+                        packages,
+                        json,
+                    }
+                }
+                PkgAction::Receipt { query } => {
+                    let (which, json) = match query {
+                        PkgReceiptQuery::List { format, json } => {
+                            let (_, json) = HumanJsonFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::List, json)
+                        }
+                        PkgReceiptQuery::Last { format, json } => {
+                            let (_, json) = HumanJsonFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::Last, json)
+                        }
+                        PkgReceiptQuery::Show {
+                            receipt_id,
+                            format,
+                            json,
+                        } => {
+                            let (_, json) = HumanJsonFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::Show(receipt_id), json)
+                        }
+                    };
+                    cli::pkg::PkgAction::Receipt { which, json }
+                }
+                // `Graph` is handled by the earlier `Commands::Pkg { action:
+                // PkgAction::Graph { .. } }` arm (it returns its own exit code
+                // through `cli::provenance::run`), so it can never reach this inner
+                // match.
+                PkgAction::Graph { .. } => unreachable!("pkg graph handled above"),
+                // `Diff` is likewise handled by its own earlier arm (it returns the
+                // release-differential verdict's exit code through
+                // `cli::provenance::run_diff`), so it never reaches here.
+                PkgAction::Diff { .. } => unreachable!("pkg diff handled above"),
+                // `Attest` is handled by its own earlier arm (it returns its own
+                // exit code through `cli::pypi_integrity::run`), so it never reaches
+                // here.
+                PkgAction::Attest { .. } => unreachable!("pkg attest handled above"),
+            };
+            cli::pkg::run(pkg_action)
         }
 
         Commands::Lab {
@@ -6777,11 +7247,15 @@ fn run() {
                 upstream_arg,
                 config,
                 filter_output,
+                capsule,
             } => cli::gateway::run_gateway_with_options(
                 &upstream_bin,
                 &upstream_arg,
                 &config,
-                cli::gateway::GatewayOptions { filter_output },
+                cli::gateway::GatewayOptions {
+                    filter_output,
+                    capsule,
+                },
             ),
             GatewayAction::ValidateConfig { config } => cli::gateway::validate_config(&config),
         },
@@ -7702,6 +8176,19 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::env_guard::explain(&var, json)
             }
+            EnvAction::Graph {
+                installed,
+                dot,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                let graph_format = cli::provenance::GraphFormat::resolve(json, dot);
+                cli::provenance::run(
+                    cli::provenance::GraphTarget::InstalledEnv(installed),
+                    graph_format,
+                )
+            }
             EnvAction::Snapshot => cli::env_guard::snapshot_write(),
         },
         Commands::Exec { action } => match action {
@@ -8045,15 +8532,17 @@ fn run() {
         Commands::TempRun {
             copy_repo,
             strip_env,
+            capsule,
             json,
             command,
         }
         | Commands::SandboxDir {
             copy_repo,
             strip_env,
+            capsule,
             json,
             command,
-        } => cli::temp_run::run(&command, copy_repo, strip_env, json),
+        } => cli::temp_run::run(&command, copy_repo, strip_env, capsule, json),
     };
 
     std::process::exit(exit_code);

@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn test_sign_and_verify_roundtrip() {
         let sk = SigningKey::generate(&mut OsRng);
-        let seed_hex: String = sk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let seed_hex: String = hex::encode(sk.to_bytes());
 
         let signer = TokenSigner::from_hex_seed(&seed_hex, "k2".into()).unwrap();
         let token = signer.sign_token("pro", 4070908800);
@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn test_sign_token_full() {
         let sk = SigningKey::generate(&mut OsRng);
-        let seed_hex: String = sk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let seed_hex: String = hex::encode(sk.to_bytes());
 
         let signer = TokenSigner::from_hex_seed(&seed_hex, "k2".into()).unwrap();
         let token =

@@ -1164,7 +1164,7 @@ fn resolve_cache(
 fn manifest_cache_key(url: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(url.as_bytes());
-    let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let hex = hex::encode(&hash[..8]);
     format!("threatdb-manifest-{hex}")
 }
 
@@ -1488,8 +1488,15 @@ fn current_sequence() -> u64 {
 
 /// Hex encoding helper (avoids a hex crate dependency).
 mod hex {
+    use std::fmt::Write as _;
     pub fn encode(data: impl AsRef<[u8]>) -> String {
-        data.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+        let bytes = data.as_ref();
+        bytes
+            .iter()
+            .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            })
     }
 }
 

@@ -92,6 +92,50 @@ pub mod correlate;
 /// cross-distribution loader/payload splits across multiple wheels.
 pub mod inspect;
 
+/// Content-addressed quarantine store for the package firewall (PR D1): land
+/// resolver downloads as immutable verified blobs and materialise per-install
+/// transaction copies, with atomic publishes, path containment, file leases, and
+/// GC. The store the D3 inspection and D4 install-from-digest stand on.
+pub mod quarantine;
+
+/// Hash-locked Python wheel resolver for the package firewall (PR D2): turn
+/// requirement specs into a fully hash-pinned lock
+/// (`uv pip compile --generate-hashes --no-build`), download only the pinned,
+/// binary-only wheels (`python -m pip download --only-binary=:all:
+/// --require-hashes`) into the D1 quarantine, and refuse sdist / VCS / editable /
+/// local-path / direct-URL / credentialed-index / repo-config inputs. The
+/// controlled-network step D3 inspection and D4 install-from-digest stand on.
+pub mod resolver;
+
+/// The package firewall's inspect-and-verdict layer (PR D3): re-hash each
+/// content-addressed quarantine blob (the TOCTOU re-bind), run the wheel-set
+/// inspection over the verified bytes, fold the signal/native/cross findings plus
+/// the threat-DB hash lookup through `finalize_static_verdict`, and surface a
+/// download-vs-expected hash mismatch as the Critical
+/// [`crate::verdict::RuleId::ArtifactDownloadIntegrityMismatch`]. The verdict D4
+/// install-from-digest gates on.
+pub mod firewall;
+
+/// Install-from-digest planning for the package firewall (PR D4): re-bind the
+/// approval against the live threat DB immediately before launch (re-hash every
+/// quarantine blob via the firewall, reject a stale DB sequence), generate the
+/// `approved.txt` direct-reference requirements (`name @ file://... --hash=...`),
+/// the pinned `python -m pip install --isolated --no-index --no-deps
+/// --require-hashes --no-cache-dir --force-reinstall` argv, and the locked-down
+/// deny-all capsule spec. The pure planning half; the CLI crate runs the plan
+/// through the fail-closed capsule launcher (never the uncontained install runner).
+pub mod install;
+
+/// Local release differential between two versions of the same distribution (PR
+/// F2): compose the two wheels' already-computed inspections (reusing the A4
+/// [`archive::read_wheel`] via [`inspect::inspect_artifact_file`] and the B5/B6/B7
+/// native/startup signals) and flag the structural deltas that mark a benign
+/// release turning malicious (pure -> native, no-hook -> startup hook, a multi-MB
+/// JavaScript payload, an identity change, a newly-gained execution capability),
+/// correlating them into the single Medium
+/// [`crate::verdict::RuleId::ArtifactReleaseAnomaly`]. Local-artifact-only.
+pub mod release_diff;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.
@@ -506,6 +550,19 @@ pub fn evaluate_inspected_artifact(
         threat_db,
     );
     crate::escalation::finalize_static_verdict(findings, policy, 3, Timings::default())
+}
+
+/// PEP 503 distribution-name normalization (lowercase; collapse any run of
+/// `-`/`_`/`.` to a single `-`), the public entry point for callers outside the
+/// crate. The D7 `tirith pkg verify-env` command normalizes the operator-supplied
+/// package names with this BEFORE handing them to
+/// [`crate::artifact::install::verify_post_install_record`], whose `.dist-info`
+/// lookup compares against the SAME normalizer; so a name spelled `Flask` /
+/// `typing_extensions` still matches the on-disk `flask-*.dist-info` /
+/// `typing_extensions-*.dist-info`. Thin wrapper over the internal
+/// [`archive::normalize_project_name`] so the normalization stays single-sourced.
+pub fn normalize_project_name_public(name: &str) -> String {
+    archive::normalize_project_name(name)
 }
 
 /// Correlate the inspection's signals/edges into user-facing findings.

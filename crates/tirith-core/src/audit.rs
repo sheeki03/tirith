@@ -780,6 +780,34 @@ fn sign_canonical(canonical: &[u8]) -> Option<String> {
     Some(base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()))
 }
 
+/// Whether ed25519 audit signing is available right now: a `config_dir()`
+/// signing key exists AND passes the same ownership/permission gate the chain
+/// signer uses. The D6 receipt path consults this to decide whether its
+/// hash-chain anchor is cryptographically SIGNED ("mandatory for `pkg install`")
+/// or only chained ("tamper-evident"). It performs no I/O beyond stat+read of the
+/// key, exactly like a single [`sign_canonical`] attempt would.
+pub fn audit_signing_available() -> bool {
+    audit_signing_secret().is_some()
+}
+
+/// Canonical JSON of `value` for content-hashing/signing: object keys sorted
+/// recursively, compact, no insignificant whitespace, so re-serializing the same
+/// logical value reproduces identical bytes. Exposed for the D6
+/// [`crate::receipt::ArtifactScanReceipt`] so its content hash and the chain
+/// anchor share ONE canonicalizer with the audit chain (a divergent second
+/// canonicalizer would let a receipt hash drift from what the chain recorded).
+pub fn canonical_json_for_hash(value: &serde_json::Value) -> String {
+    canonical_json_string(value)
+}
+
+/// Sign `canonical` bytes with the ed25519 audit key, returning the base64
+/// signature, or `None` when no usable signing key is configured. Exposed so the
+/// D6 receipt's OPTIONAL detached signature is produced by the same key + routine
+/// as the audit chain, never a second key path.
+pub fn sign_canonical_bytes(canonical: &[u8]) -> Option<String> {
+    sign_canonical(canonical)
+}
+
 /// Result of verifying the audit chain over a log file.
 #[derive(Debug, Clone)]
 pub struct AuditVerifyReport {
@@ -1367,6 +1395,110 @@ pub fn log_trust_change(
 
     // Best-effort: a write failure here is not surfaced to the user.
     let _ = append_to_audit_log(&entry, None);
+}
+
+/// The outcome of anchoring a D6 [`crate::receipt::ArtifactScanReceipt`] in the
+/// audit hash-chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptAnchor {
+    /// The receipt's content hash was appended to the chain. `signed` is true when
+    /// the entry carries an ed25519 signature (the chain is signed): a SIGNED
+    /// anchor is "mandatory for `pkg install`"; an unsigned one is only
+    /// "tamper-evident" (hash-chained). The chain `prev_hash` link makes either
+    /// detectable on edit.
+    Recorded { signed: bool },
+    /// The anchor was intentionally not written (`TIRITH_LOG=0` or no log path).
+    /// NOT an error, but it means there is no chain record of this receipt.
+    Skipped,
+    /// A real append failure (the carried string is the reason). The receipt file
+    /// may still have been saved, but it is NOT anchored in the chain.
+    Failed(String),
+}
+
+/// Anchor a D6 [`crate::receipt::ArtifactScanReceipt`] in the audit hash-chain.
+///
+/// This records ONE `entry_type = "artifact_receipt"` line whose content binds the
+/// receipt's `receipt_id` and `content_sha256` (plus the install verdict's action
+/// and rule ids) into the tamper-evident chain via [`append_to_audit_log`], so the
+/// receipt inherits the same `prev_hash` chaining, optional ed25519 signature, and
+/// head-receipt truncation anchor as every verdict line. The receipt FILE is the
+/// authoritative artifact; this chain line is the anchor that makes a later edit or
+/// deletion of the receipt detectable.
+///
+/// No secrets are recorded here: only the receipt id, the receipt's own content
+/// hash, the verdict action, and the verdict rule ids (the [`crate::receipt`]
+/// builder already redacted everything the receipt itself carries). `detail`
+/// carries a compact `"<id> sha256:<hash>"` so a human reading the raw log can tie
+/// the line back to the saved receipt.
+///
+/// Returns a [`ReceiptAnchor`] telling the caller whether the line was written and,
+/// if so, whether it was ed25519-SIGNED: the signal a `pkg install` surface uses
+/// to enforce that a signed anchor is mandatory (vs. the default "tamper-evident"
+/// wording when signing is not configured).
+#[must_use = "the caller must know whether the receipt was anchored (and signed) in the chain"]
+pub fn log_artifact_scan_receipt(
+    receipt_id: &str,
+    content_sha256: &str,
+    verdict_action: &str,
+    verdict_rule_ids: &[String],
+) -> ReceiptAnchor {
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: crate::session::resolve_session_id(),
+        // The verdict the receipt records its install gated on. Drives nothing for a
+        // non-verdict entry; it is here so the chain line is self-describing.
+        action: verdict_action.to_string(),
+        rule_ids: verdict_rule_ids.to_vec(),
+        command_redacted: String::new(),
+        bypass_requested: false,
+        bypass_honored: false,
+        interactive: false,
+        policy_path: None,
+        event_id: None,
+        tier_reached: 3,
+        entry_type: "artifact_receipt".to_string(),
+        event: None,
+        integration: None,
+        hook_type: None,
+        // The link back to the saved receipt: its id and its own content hash. Both
+        // are non-secret by construction (an id label + a sha256 of redacted JSON).
+        detail: Some(format!("{receipt_id} sha256:{content_sha256}")),
+        elapsed_ms: None,
+        raw_action: None,
+        raw_rule_ids: None,
+        trust_pattern: None,
+        trust_rule_id: None,
+        trust_action: None,
+        trust_ttl_expires: None,
+        trust_scope: None,
+        // An install receipt is an operator/tool action, not an agent-attributed
+        // command, so no synthetic origin.
+        agent_origin: None,
+        manifest_allowed_match: None,
+        prev_hash: None,
+        sig: None,
+    };
+
+    match append_to_audit_log(&entry, None) {
+        // The serialized line carries `sig` iff the chain signed it; detect that
+        // without re-parsing by checking for the field. (A signed log always
+        // produces a non-empty `"sig":"..."`.)
+        AuditWrite::Written(line) => ReceiptAnchor::Recorded {
+            signed: line_is_signed(&line),
+        },
+        AuditWrite::Skipped => ReceiptAnchor::Skipped,
+        AuditWrite::Failed(reason) => ReceiptAnchor::Failed(reason),
+    }
+}
+
+/// Whether a serialized audit line carries a non-empty ed25519 `sig`. Used by
+/// [`log_artifact_scan_receipt`] to report whether the receipt's chain anchor was
+/// signed without re-deriving the key state.
+fn line_is_signed(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line.trim())
+        .ok()
+        .and_then(|v| v.get("sig").and_then(|s| s.as_str()).map(|s| !s.is_empty()))
+        .unwrap_or(false)
 }
 
 fn default_log_path() -> Option<PathBuf> {
@@ -3098,5 +3230,68 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    /// The D6 chain anchor: when audit signing is configured, the
+    /// `artifact_receipt` line is ed25519-SIGNED and `ReceiptAnchor::Recorded`
+    /// reports `signed: true` (the "mandatory for `pkg install`" signal); the chain
+    /// then verifies with the matching public key.
+    #[test]
+    fn artifact_receipt_anchor_is_signed_when_signing_enabled() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // Isolate BOTH the data dir (so the anchor lands in our temp log) and the
+        // config dir (so the signing key is the one we plant).
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", dir.path());
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            std::env::set_var("APPDATA", dir.path());
+            std::env::set_var("LOCALAPPDATA", dir.path());
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::remove_var("TIRITH_AUDIT_DEBUG");
+        }
+
+        // Plant a signing keypair so the chain signs (and verifies).
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let vk = sk.verifying_key();
+        let cfg = crate::policy::config_dir().expect("config dir under isolated env");
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_signing_key(&cfg.join("audit-signing.key"), &[9u8; 32]);
+        std::fs::write(cfg.join("audit-signing.pub"), vk.to_bytes()).unwrap();
+
+        assert!(
+            audit_signing_available(),
+            "the planted key must make signing available"
+        );
+
+        let anchor = log_artifact_scan_receipt(
+            &"a".repeat(64),
+            &"a".repeat(64),
+            "Block",
+            &["ArtifactKnownMalicious".to_string()],
+        );
+        assert_eq!(
+            anchor,
+            ReceiptAnchor::Recorded { signed: true },
+            "a signed log must produce a signed anchor"
+        );
+
+        let log_path = audit_log_path().expect("log path");
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(body.contains("\"entry_type\":\"artifact_receipt\""));
+        // The chain (with the head receipt + signature) verifies under the pubkey.
+        let report = verify_audit_log(&log_path, None);
+        assert!(report.ok, "signed chain must verify: {:?}", report.problems);
+        assert!(report.signed_lines >= 1, "the anchor line must be signed");
+
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("APPDATA");
+            std::env::remove_var("LOCALAPPDATA");
+            std::env::remove_var("TIRITH_LOG");
+        }
     }
 }

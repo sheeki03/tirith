@@ -397,6 +397,22 @@ pub mod bash_capability;
 pub mod browser;
 pub mod browser_host;
 pub mod canary;
+/// Consumer-facing capsule launch surface (Stack E, unit E5): the single seam
+/// `runner.rs`, `temp_run.rs`, the package-firewall install, and the gateway
+/// upstream spawn route through. Selects the host backend (Landlock/seccomp,
+/// Seatbelt, AppContainer, or NoOp), probes deliverable coverage, fails closed for
+/// enforcing surfaces under degraded coverage, and offers both a run-to-completion
+/// and a piped-stdio launch on top of one fail-closed gate.
+pub mod capsule;
+pub mod capsule_child;
+pub mod capsule_proxy;
+/// Windows capsule executor (Stack E, unit E4): the `windows`-crate Win32 half that
+/// applies a `tirith_core::capsule::windows::WindowsLaunchPlan` (AppContainer +
+/// ACLs + Job Object + suspended `CreateProcessW`). `cfg(windows)`-gated so the
+/// `windows` crate is only required on the Windows target; the portable planning +
+/// honesty logic it consumes lives in `tirith-core` and is tested on every platform.
+#[cfg(windows)]
+pub mod capsule_windows;
 pub mod check;
 pub mod checkpoint;
 pub mod clipboard;
@@ -425,6 +441,7 @@ pub mod init;
 pub mod install;
 pub mod intent;
 pub mod lab;
+pub mod lab_artifacts;
 pub mod last_trigger;
 pub mod license_cmd;
 pub mod logs;
@@ -439,9 +456,27 @@ pub mod paste;
 pub mod path;
 pub mod pending;
 pub mod persistence;
+/// The package-firewall CLI surface (PR D7): `tirith pkg install | verify-env |
+/// approve | receipt`. Drives the D1-D6 resolve -> firewall -> re-bind -> contained
+/// install -> receipt pipeline, binding an operator approval to an
+/// `InstallPlanDigest`. Distinct from `tirith install` (analysis-only).
+pub mod pkg;
+/// Contained install-from-digest for the package firewall (PR D4, CLI half): write
+/// the re-bound plan's `approved.txt`, build the pinned `python -m pip install`
+/// argv, and run it through the fail-closed capsule launcher (never the uncontained
+/// `ProcessInstallRunner`).
+pub mod pkg_install;
 pub mod policy;
 pub mod preview;
 pub mod prompt_status;
+pub mod provenance;
+/// `tirith pkg attest` (PR F3, the `sigstore-attestations` spike): fetch a wheel's
+/// PyPI publish provenance from the Integrity API, bind the attestation's subject
+/// digest to the wheel's quarantined SHA-256, optionally verify the Sigstore bundle
+/// (feature-gated; off on the workspace MSRV), and check the publisher identity
+/// against policy. Provenance evidence only: never an auto-allow, never blocks. The
+/// network / `sigstore-*` half the plan keeps out of `tirith-core`.
+pub mod pypi_integrity;
 pub mod receipt;
 pub mod rule;
 pub mod scan;

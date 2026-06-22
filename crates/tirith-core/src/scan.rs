@@ -2009,10 +2009,7 @@ mod tests {
         );
 
         // The recorded hash matches an independent digest of the whole file.
-        let expected: String = Sha256::digest(&body)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let expected: String = hex::encode(Sha256::digest(&body));
         assert_eq!(gap.sha256.as_deref(), Some(expected.as_str()));
 
         // And it is security-relevant (a priority file), so it drives a finding.
@@ -2178,10 +2175,7 @@ mod tests {
             ScanFileOutcome::Scanned(_) => panic!("a .so must not be scanned as text"),
         };
         assert_eq!(gap.kind, CoverageGapKind::Unsupported);
-        let expected: String = Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let expected: String = hex::encode(Sha256::digest(bytes));
         assert_eq!(gap.sha256.as_deref(), Some(expected.as_str()));
     }
 
@@ -2380,14 +2374,8 @@ mod tests {
             other => panic!("expected a digest from the handle, got {other:?}"),
         };
 
-        let from_handle: String = Sha256::digest(handle_bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let from_reopened_path: String = Sha256::digest(swapped_bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let from_handle: String = hex::encode(Sha256::digest(handle_bytes));
+        let from_reopened_path: String = hex::encode(Sha256::digest(swapped_bytes));
         assert_eq!(
             recovered, from_handle,
             "the hash must be of the bytes read from the handle"

@@ -239,7 +239,7 @@ fn seed_match<'a>(seed: &Seed, text: &'a str) -> Option<regex::Match<'a>> {
 }
 
 /// Iterate the built-in [`SEEDS`] followed by the caller's `extra` seeds.
-fn all_seeds<'a>(extra: &'a CompiledSeeds) -> impl Iterator<Item = &'a Seed> + 'a {
+fn all_seeds(extra: &CompiledSeeds) -> impl Iterator<Item = &Seed> + '_ {
     SEEDS.iter().chain(extra.0.iter())
 }
 

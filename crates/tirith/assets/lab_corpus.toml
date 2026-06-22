@@ -19,6 +19,18 @@
 #                      (overrides input.as_bytes()). Required for scenarios whose
 #                      input contains characters that don't survive TOML string
 #                      escaping cleanly (e.g. bidi controls).
+#   binary_fixture   — optional name of a synthetic, inert artifact fixture (a
+#                      cli/lab_artifacts.rs token, e.g. "pth_cross_runtime_wheel").
+#                      When set, the scenario builds inert wheel bytes and runs them
+#                      through the artifact pipeline (inspect_artifact_set) instead
+#                      of engine::analyze; expected_action is the artifact verdict.
+#                      Mutually exclusive with artifact_path.
+#   artifact_path    — optional path (relative, inside assets/lab_artifacts/) of a
+#                      prebuilt artifact to inspect through the same pipeline.
+#
+# Note: binary_fixture / artifact_path scenarios are evaluated by the artifact
+# pipeline, so the engine-side test_lab_corpus_reaches_tier3 safeguard skips them;
+# they are covered by the tirith crate's lab_artifact_scenarios integration test.
 #
 # Adding a scenario:
 #   1. Pick a tag from the existing taxonomy where possible.
@@ -290,3 +302,64 @@ input = "npm install --save lodash"
 context = "exec"
 expected_action = "allow"
 tags = ["posix", "allow"]
+
+# ── Artifact fixtures (G2) ──────────────────────────────────────────────────
+# Synthetic, inert byte-level wheels built at lab time by cli/lab_artifacts.rs.
+# These exercise the artifact inspection pipeline (.pth / native .so / cross
+# distribution split) over honest bytes that contain no real payload; every
+# network-shaped string uses the reserved example.invalid domain. The `input`
+# field is a human-readable description only (the bytes come from the fixture).
+
+[[scenario]]
+name = "artifact_pth_cross_runtime_wheel"
+description = "Wheel whose .pth import line launches a cross-runtime (node) payload via os.system"
+input = "(synthetic wheel: .pth -> node launch)"
+context = "exec"
+expected_action = "block"
+tags = ["artifact", "pth", "cross-runtime"]
+binary_fixture = "pth_cross_runtime_wheel"
+
+[[scenario]]
+name = "artifact_pth_subprocess_wheel"
+description = "Wheel whose .pth import line spawns a subprocess that reaches a URL"
+input = "(synthetic wheel: .pth -> subprocess + url)"
+context = "exec"
+expected_action = "block"
+tags = ["artifact", "pth", "subprocess"]
+binary_fixture = "pth_subprocess_wheel"
+
+[[scenario]]
+name = "artifact_native_chain_wheel"
+description = "Wheel with a synthetic native .so carrying a constructor and loader/spawn strings"
+input = "(synthetic wheel: native .so import-execution chain)"
+context = "exec"
+expected_action = "block"
+tags = ["artifact", "native"]
+binary_fixture = "native_chain_wheel"
+
+[[scenario]]
+name = "artifact_cross_distribution_split"
+description = "Loader wheel whose .pth searches sys.path and runs a payload member owned by a separate wheel"
+input = "(synthetic wheel pair: cross-distribution loader -> payload)"
+context = "exec"
+expected_action = "block"
+tags = ["artifact", "cross-distribution"]
+binary_fixture = "cross_distribution_split"
+
+[[scenario]]
+name = "artifact_benign_editable_wheel"
+description = "Benign editable-install .pth wheel (negative control: no finding)"
+input = "(synthetic wheel: benign editable .pth)"
+context = "exec"
+expected_action = "allow"
+tags = ["artifact", "allow"]
+binary_fixture = "benign_editable_wheel"
+
+[[scenario]]
+name = "artifact_benign_pure_wheel"
+description = "Benign pure-Python wheel with a single module (negative control: no finding)"
+input = "(synthetic wheel: benign pure-python module)"
+context = "exec"
+expected_action = "allow"
+tags = ["artifact", "allow"]
+binary_fixture = "benign_pure_wheel"

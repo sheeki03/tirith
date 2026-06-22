@@ -131,7 +131,7 @@ fn compute_scope() -> String {
 
 /// Encode the first 4 bytes (8 hex chars) of a digest.
 fn hex_encode_8(bytes: &[u8]) -> String {
-    bytes.iter().take(4).map(|b| format!("{b:02x}")).collect()
+    hex::encode(&bytes[..bytes.len().min(4)])
 }
 
 /// Path for a fallback session file.

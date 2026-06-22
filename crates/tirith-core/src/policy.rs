@@ -335,6 +335,17 @@ pub struct Policy {
     #[serde(default)]
     pub allowed_install_domains: Vec<String>,
 
+    /// **C5a** — opt-in named MCP-gateway posture (aligned with the
+    /// `ai-agent-heavy` template). `Option` so the gateway can tell "field
+    /// omitted" (no opinion -> permissive built-in gateway defaults) from "field
+    /// set" (`Some(Secure)` -> secure baseline fills the unset gateway-config
+    /// knobs). TIGHTENING-only (the enum has no downgrade value), so this is
+    /// KEPT by [`Self::sanitize_repo_scoped`] — a repo may opt in but can never
+    /// weaken through it. Default `None` (backward-compatible). Read offline by
+    /// the gateway via [`Self::discover_local_only`].
+    #[serde(default)]
+    pub gateway_profile: Option<GatewayProfile>,
+
     /// Presentation bookkeeping (NOT a policy knob). When this policy is repo-
     /// scoped, [`Self::sanitize_repo_scoped`] records here the YAML key name of
     /// every field whose hostile value it neutralized, so the UX layer can show
@@ -945,6 +956,33 @@ pub enum FailMode {
     Closed,
 }
 
+/// C5a — a named, hardened posture for the MCP gateway, aligned with the
+/// `ai-agent-heavy` policy template. The field is intentionally an `enum` with
+/// only TIGHTENING variants (today just [`GatewayProfile::Secure`]); there is no
+/// "less secure" / "off" value a policy could downgrade TO. Absence of the
+/// field (`Option::None` on [`Policy::gateway_profile`]) means "no opinion" and
+/// leaves the gateway's own permissive built-in defaults untouched.
+///
+/// The gateway (`crates/tirith/src/cli/gateway.rs`) reads this OFFLINE via
+/// [`Self::discover_local_only`] and, when it is `Some(Secure)`, fills any
+/// gateway-config knob the operator did NOT explicitly set with a secure
+/// baseline (fail-closed, warn-as-deny, tighter message cap). A knob the
+/// operator set in the gateway config always wins, so this is a default
+/// overlay, never an override.
+///
+/// Because every variant is strictly tightening, this is KEPT (never reset) by
+/// [`Self::sanitize_repo_scoped`] — a repo may opt INTO the secure profile but
+/// can never use it to weaken protection. New variants MUST preserve that
+/// property or the sanitize classification has to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GatewayProfile {
+    /// Hardened MCP gateway posture (aligned with `ai-agent-heavy`): unset
+    /// gateway-config knobs default to fail-closed / warn-as-deny / a tighter
+    /// transport cap instead of the permissive built-ins.
+    Secure,
+}
+
 impl Default for Policy {
     fn default() -> Self {
         Self {
@@ -994,6 +1032,7 @@ impl Default for Policy {
             hooks_guard_enabled: false,
             baseline_enabled: false,
             allowed_install_domains: Vec::new(),
+            gateway_profile: None,
             neutralized_fields: Vec::new(),
         }
     }
@@ -1372,6 +1411,10 @@ impl Policy {
     /// * `agent_rules` — `deny` tightens; `allow` is NOT a bypass (escalation.rs).
     /// * `checkpoints`, `sudo_session_ttl`, `scan.additional_config_files`/
     ///   `mcp_allowed_tools` — retention/coverage/tightening, never a guard relax.
+    /// * `gateway_profile` — TIGHTENING: the enum has only the hardened `Secure`
+    ///   variant, so a repo can opt the gateway INTO secure defaults but cannot
+    ///   express a downgrade (absence = no opinion). KEPT, like
+    ///   `injection_seeds_custom`.
     /// * `share` (`customer_id_patterns`) — only ADDS redactions (more scrubbing).
     /// * `schema_version`, `fail_mode`, `webhooks` `min_severity` — inert here
     ///   (`fail_mode: open` is already the default; a repo `closed` only tightens).
@@ -1545,6 +1588,117 @@ impl Policy {
         );
 
         self.neutralized_fields = neutralized;
+    }
+
+    /// A canonical, **redacted** security projection of this policy as JSON: the
+    /// security-relevant settings that change a verdict, with every secret and
+    /// machine-specific value excluded. This is the basis of the D6
+    /// [`crate::receipt::ArtifactScanReceipt`]'s policy hash: a stable fingerprint
+    /// that lets a receipt attest "this is the security posture the install ran
+    /// under" without ever serializing a credential or a local path.
+    ///
+    /// # What is included (verdict-affecting posture)
+    ///
+    /// Scalar gates (`fail_mode`, `paranoia`, the two `allow_bypass_env*` flags,
+    /// `strict_warn`, `mcp_redact_injection`, `context_guard_enabled`,
+    /// `gateway_profile`), the threat-intel enable flags, the package-policy
+    /// scalar thresholds/toggles, and the SORTED values of the host/URL deny &
+    /// allow lists (`blocklist`, `network_deny`, `network_allow`,
+    /// `additional_known_domains`) plus the sorted KEYS of `severity_overrides` /
+    /// `action_overrides`. The discovery `scope` is included so a repo-scoped
+    /// (sanitized) policy fingerprints differently from a user/org one.
+    ///
+    /// # What is excluded (secrets + identifying + machine-specific)
+    ///
+    /// NEVER serialized here: `policy_server_url` / `policy_server_api_key` /
+    /// `threat_intel` API keys (credentials), `webhooks` (a URL may embed a
+    /// token), the loaded `path` (a machine path), and the free-text/identifying
+    /// list VALUES (`dlp_custom_patterns`, `injection_seeds_custom`,
+    /// `package_policy.internal_package_names`), only their COUNTS are recorded,
+    /// so the fingerprint reflects "N custom seeds present" without leaking the
+    /// pattern text. Counts keep the projection sensitive to a posture change
+    /// while staying redaction-safe.
+    ///
+    /// Keys are emitted in a fixed order and any list is sorted, so the value is
+    /// canonical input for [`crate::audit::canonical_json_for_hash`]; the same
+    /// logical policy always hashes identically.
+    pub fn security_projection(&self) -> serde_json::Value {
+        let sorted = |v: &[String]| -> Vec<String> {
+            let mut out = v.to_vec();
+            out.sort();
+            out
+        };
+        let override_keys = |m: &HashMap<String, String>| -> Vec<String> {
+            let mut keys: Vec<String> = m.keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let mut sev_keys: Vec<String> = self.severity_overrides.keys().cloned().collect();
+        sev_keys.sort();
+
+        let pkg = &self.package_policy;
+        let ti = &self.threat_intel;
+
+        serde_json::json!({
+            "schema_version": self.schema_version,
+            "scope": format!("{:?}", self.scope),
+            "fail_mode": format!("{:?}", self.fail_mode),
+            "paranoia": self.paranoia,
+            "strict_warn": self.strict_warn,
+            "allow_bypass_env": self.allow_bypass_env,
+            "allow_bypass_env_noninteractive": self.allow_bypass_env_noninteractive,
+            "mcp_redact_injection": self.mcp_redact_injection,
+            "context_guard_enabled": self.context_guard_enabled,
+            "gateway_profile": self.gateway_profile.as_ref().map(|p| format!("{p:?}")),
+            "blocklist": sorted(&self.blocklist),
+            "network_deny": sorted(&self.network_deny),
+            "network_allow": sorted(&self.network_allow),
+            "additional_known_domains": sorted(&self.additional_known_domains),
+            "allowlist_len": self.allowlist.len(),
+            "allowlist_rules_len": self.allowlist_rules.len(),
+            "severity_override_keys": sev_keys,
+            "action_override_keys": override_keys(&self.action_overrides),
+            "approval_rules_len": self.approval_rules.len(),
+            "custom_rules_len": self.custom_rules.len(),
+            "escalation_rules_len": self.escalation.len(),
+            // Counts only for the free-text/identifying lists (values are redacted).
+            "dlp_custom_patterns_len": self.dlp_custom_patterns.len(),
+            "injection_seeds_custom_len": self.injection_seeds_custom.len(),
+            "internal_package_names_len": pkg.internal_package_names.len(),
+            "threat_intel": {
+                "osv_enabled": ti.osv_enabled,
+                "deps_dev_enabled": ti.deps_dev_enabled,
+                "phishing_army_enabled": ti.phishing_army_enabled,
+            },
+            "package_policy": {
+                "block_not_found": pkg.block_not_found,
+                "block_newer_than_days": pkg.block_newer_than_days,
+                "warn_newer_than_days": pkg.warn_newer_than_days,
+                "warn_low_downloads_below": pkg.warn_low_downloads_below,
+                "block_install_scripts_for_unknown_packages":
+                    pkg.block_install_scripts_for_unknown_packages,
+                "block_typosquat_distance": pkg.block_typosquat_distance,
+                "block_aggregate_score": pkg.block_aggregate_score,
+                "warn_aggregate_score": pkg.warn_aggregate_score,
+                "block_osv_min_cvss": pkg.block_osv_min_cvss,
+                "block_repo_mismatch": pkg.block_repo_mismatch,
+                "warn_install_script_network_call": pkg.warn_install_script_network_call,
+                "block_dependency_confusion": pkg.block_dependency_confusion,
+            },
+        })
+    }
+
+    /// The lowercase-hex SHA-256 of the canonicalized [`Self::security_projection`].
+    /// This is the stable "policy hash" the D6 receipt records: a redacted,
+    /// machine-independent fingerprint of the security posture, computed through the
+    /// SAME canonical JSON the audit chain uses so it cannot drift from a chained
+    /// anchor's view of the same value.
+    pub fn security_projection_hash(&self) -> String {
+        let canon = crate::audit::canonical_json_for_hash(&self.security_projection());
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(canon.as_bytes());
+        format!("{:x}", h.finalize())
     }
 
     /// Return a fail-closed policy that blocks everything.
@@ -2606,6 +2760,38 @@ custom_rules:
         crate::incident::invalidate_cache();
     }
 
+    /// C5a: the gateway reads `gateway_profile` OFFLINE via `discover_local_only`
+    /// to harden its effective defaults. The field is tightening-only (the enum
+    /// has just the `Secure` variant), so a repo-scoped `.tirith/policy.yaml` that
+    /// opts INTO it must survive sanitize unchanged — the gateway seam relies on
+    /// this (a repo can tighten the gateway, never weaken it).
+    #[test]
+    fn discover_local_only_keeps_repo_gateway_profile_secure() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        let state = tempfile::tempdir().unwrap();
+        let _xdg_state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
+        crate::incident::invalidate_cache();
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".tirith");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        std::fs::write(policy_dir.join("policy.yaml"), "gateway_profile: secure\n").unwrap();
+
+        let policy = Policy::discover_local_only(Some(dir.path().to_str().unwrap()));
+        assert_eq!(policy.scope, PolicyScope::Repo, "cwd walk-up is repo scope");
+        assert_eq!(
+            policy.gateway_profile,
+            Some(GatewayProfile::Secure),
+            "a repo-scoped gateway_profile: secure is KEPT (tightening); got {:?}",
+            policy.gateway_profile
+        );
+
+        crate::incident::invalidate_cache();
+    }
+
     /// Snapshot an env var on construction and restore it on `Drop` (the
     /// `TEST_ENV_LOCK` serializes env-mutating tests but does not restore).
     struct EnvVarGuard {
@@ -3419,6 +3605,9 @@ custom_rules:
             exec_guard_enabled: true,
             hooks_guard_enabled: true,
             baseline_enabled: true,
+            // KEPT (C5a): the only variant is the hardened `Secure`, so a repo
+            // opting in is tightening; a `Some(Secure)` must survive sanitize.
+            gateway_profile: Some(GatewayProfile::Secure),
             context_destructive_verbs: HashMap::from([("aws".into(), vec!["nuke".into()])]),
             agent_rules: AgentRules {
                 allow: Vec::new(),
@@ -3492,6 +3681,7 @@ custom_rules:
             exec_guard_enabled,
             hooks_guard_enabled,
             baseline_enabled,
+            gateway_profile,
             context_destructive_verbs,
             agent_rules,
             share,
@@ -3666,6 +3856,11 @@ custom_rules:
         assert!(exec_guard_enabled, "KEPT: exec_guard_enabled");
         assert!(hooks_guard_enabled, "KEPT: hooks_guard_enabled");
         assert!(baseline_enabled, "KEPT: baseline_enabled");
+        assert_eq!(
+            gateway_profile,
+            Some(GatewayProfile::Secure),
+            "KEPT: gateway_profile (only the hardened Secure variant exists; opting in tightens, a repo cannot downgrade)"
+        );
         assert!(
             context_destructive_verbs.contains_key("aws"),
             "KEPT: context_destructive_verbs (widens destructive verbs)"
@@ -3770,6 +3965,122 @@ custom_rules:
             all_default.neutralized_fields.is_empty(),
             "an all-default (tightening-only) policy must record nothing; got {:?}",
             all_default.neutralized_fields
+        );
+    }
+
+    // ── D6: security projection / policy hash ───────────────────────────────
+
+    #[test]
+    fn security_projection_excludes_secrets_and_paths() {
+        // A policy carrying credentials + a machine path must never serialize them
+        // into the projection (the basis of the D6 receipt's policy hash).
+        let mut p = Policy {
+            path: Some("/Users/someone/.config/tirith/policy.yaml".to_string()),
+            policy_server_url: Some("https://policy.internal.example".to_string()),
+            policy_server_api_key: Some("ghp_SUPERSECRETTOKEN1234567890".to_string()),
+            dlp_custom_patterns: vec!["INTERNAL-(?P<id>[0-9]{6})".to_string()],
+            ..Default::default()
+        };
+        p.threat_intel.google_safe_browsing_key = Some("GSB_SECRET_KEY".to_string());
+        p.threat_intel.abusech_auth_key = Some("ABUSECH_SECRET".to_string());
+        p.webhooks.push(WebhookConfig {
+            url: "https://hooks.example/secret-token-abc".to_string(),
+            min_severity: Severity::High,
+            headers: HashMap::new(),
+            payload_template: None,
+        });
+        p.package_policy
+            .internal_package_names
+            .push(InternalPackageSpec {
+                ecosystem: None,
+                name: "acme-internal-lib".to_string(),
+            });
+
+        let projection = serde_json::to_string(&p.security_projection()).unwrap();
+        for needle in [
+            "ghp_SUPERSECRETTOKEN1234567890",
+            "GSB_SECRET_KEY",
+            "ABUSECH_SECRET",
+            "policy.internal.example",
+            "hooks.example",
+            "secret-token-abc",
+            "/Users/someone",
+            "policy.yaml",
+            "INTERNAL-",         // the dlp pattern VALUE must not appear
+            "acme-internal-lib", // the internal package NAME must not appear
+        ] {
+            assert!(
+                !projection.contains(needle),
+                "the security projection must not contain {needle:?}: {projection}"
+            );
+        }
+        // But the COUNTS of the redacted lists are present (posture-sensitive).
+        assert!(projection.contains("\"dlp_custom_patterns_len\":1"));
+        assert!(projection.contains("\"internal_package_names_len\":1"));
+        // And the projection hash is stable hex.
+        let h = p.security_projection_hash();
+        assert_eq!(h.len(), 64);
+        assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn security_projection_hash_ignores_secret_only_changes() {
+        // Two policies that differ ONLY in secret values (which are redacted out of
+        // the projection) must hash identically; a posture change must not.
+        let base = Policy {
+            policy_server_api_key: Some("key-A".to_string()),
+            ..Default::default()
+        };
+        let same_posture = Policy {
+            policy_server_api_key: Some("key-B-different".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            base.security_projection_hash(),
+            same_posture.security_projection_hash(),
+            "a secret-only difference must not change the policy hash"
+        );
+
+        // A real posture change (paranoia tier) MUST change the hash.
+        let stricter = Policy {
+            paranoia: base.paranoia.wrapping_add(1),
+            ..Default::default()
+        };
+        assert_ne!(
+            base.security_projection_hash(),
+            stricter.security_projection_hash(),
+            "a paranoia change must change the policy hash"
+        );
+
+        // Adding a blocklist entry (tightening posture) also changes the hash.
+        let blocked = Policy {
+            blocklist: vec!["evil.example".to_string()],
+            ..Default::default()
+        };
+        assert_ne!(
+            base.security_projection_hash(),
+            blocked.security_projection_hash(),
+        );
+    }
+
+    #[test]
+    fn security_projection_hash_is_order_independent_for_lists() {
+        // The projection sorts list values, so the same set in a different order
+        // hashes identically (a canonical fingerprint, not order-sensitive).
+        let a = Policy {
+            blocklist: vec!["b.example".to_string(), "a.example".to_string()],
+            network_deny: vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()],
+            ..Default::default()
+        };
+        let b = Policy {
+            blocklist: vec!["a.example".to_string(), "b.example".to_string()],
+            network_deny: vec!["192.168.0.0/16".to_string(), "10.0.0.0/8".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            a.security_projection_hash(),
+            b.security_projection_hash(),
+            "list order must not affect the policy hash"
         );
     }
 }

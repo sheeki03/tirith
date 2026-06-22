@@ -579,8 +579,7 @@ fn copy_no_follow_from_reader<R: Read>(
             .open(dst)?;
         // Reject any reparse point (symlink/junction/mount) BEFORE mutating anything.
         if out.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "refusing to restore through a reparse point at destination",
             ));
         }

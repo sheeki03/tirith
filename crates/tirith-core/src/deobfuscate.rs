@@ -684,7 +684,7 @@ mod tests {
     }
 
     fn to_hex(s: &str) -> String {
-        s.bytes().map(|b| format!("{b:02x}")).collect()
+        hex::encode(s.as_bytes())
     }
 
     #[test]
@@ -1034,7 +1034,7 @@ mod tests {
         raw.extend_from_slice(&[0x00, 0x01, 0x1F, 0x7F, 0xFF, 0xFE]);
         // Hex-encode the raw bytes directly (the `to_hex` test helper takes a &str
         // and would mangle the non-UTF-8 high bytes).
-        let encoded: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        let encoded: String = hex::encode(raw);
         let input = format!("payload {encoded}");
         let forms = normalized_forms(&input);
         let hit = forms

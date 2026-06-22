@@ -1,0 +1,631 @@
+# tirith capability manifest
+#
+# Single source of truth for the capability matrix in docs/capability-matrix.md.
+# This file is versioned (manifest_version) and consumed by the
+# `capability_matrix_is_in_sync` CI test in crates/tirith/tests/cli_integration.rs,
+# which re-renders the matrix from this manifest and fails the build if
+# docs/capability-matrix.md has drifted. Edit this file, then run
+# `cargo test -p tirith capability_matrix_is_in_sync` to regenerate the matrix.
+#
+# Per command we record what tirith actually inspects on the surface that
+# command governs, so a reader can tell at a glance whether a command sees the
+# full artifact, a partial signal set, or nothing at all.
+#
+# Fields per [[command]]:
+#   name            the invocation (group prefix omitted where obvious)
+#   group           the --help category this command lists under
+#   inspected       one of: full | partial | none
+#                     full    = tirith inspects the bytes/structure it acts on
+#                     partial = tirith inspects some signals but not the whole
+#                               artifact (e.g. metadata only, name match only)
+#                     none    = tirith does not inspect content here; the
+#                               command reports, gates, or configures
+#   coverage        plain-language "why": what is inspected, or why not
+#   policy_complete true when the active policy can fully govern this surface
+#                   (allowlist/blocklist/severity/profile reach every decision
+#                   the command makes); false when policy covers only part
+
+manifest_version = 1
+
+# ---------------------------------------------------------------------------
+# Scan & analyze
+# ---------------------------------------------------------------------------
+
+[[command]]
+name = "check"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Tokenizes the command and inspects every extracted URL, path, and Docker ref through the full rule pipeline."
+policy_complete = true
+
+[[command]]
+name = "paste"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Scans the pasted bytes and rich-text HTML for injection, invisible characters, and homograph attacks."
+policy_complete = true
+
+[[command]]
+name = "scan"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Walks files, directories, and configs; inspects bytes, embedded URLs, and wheel/native artifact members."
+policy_complete = true
+
+[[command]]
+name = "run"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Downloads to a quarantined file, inspects the script and its interpreter shebang before any execution (Unix)."
+policy_complete = true
+
+[[command]]
+name = "fix"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Re-analyzes the command being rewritten so the suggested safer form is itself checked."
+policy_complete = true
+
+[[command]]
+name = "view"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Neutralizes terminal-deception escape sequences in the rendered bytes before they reach the terminal."
+policy_complete = true
+
+[[command]]
+name = "score"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Decomposes a URL into fixed, inspectable trust factors that sum to the final score."
+policy_complete = true
+
+[[command]]
+name = "diff"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Byte-level inspection of where suspicious characters hide in a URL versus a known-good pattern."
+policy_complete = true
+
+[[command]]
+name = "fetch"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Fetches and inspects server responses for cloaking; --save quarantines without executing and marks the file tainted (Unix)."
+policy_complete = true
+
+[[command]]
+name = "preview"
+group = "Scan & analyze"
+inspected = "partial"
+coverage = "Simulates the filesystem blast radius of destructive commands; models the impact rather than inspecting content."
+policy_complete = true
+
+[[command]]
+name = "watch"
+group = "Scan & analyze"
+inspected = "partial"
+coverage = "Runs a command, then diffs filesystem, PATH, and shell-rc impact; observes effects, not the command bytes."
+policy_complete = true
+
+[[command]]
+name = "temp-run"
+group = "Scan & analyze"
+inspected = "partial"
+coverage = "Runs a command in a throwaway directory and diffs file impact. File isolation, not full containment, unless --capsule is set."
+policy_complete = false
+
+[[command]]
+name = "taint"
+group = "Scan & analyze"
+inspected = "none"
+coverage = "Tracks provenance of files downloaded from risky sources; flags execution of a tainted file. Bookkeeping, not content inspection."
+policy_complete = true
+
+[[command]]
+name = "intend"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Inspects the command and flags high-impact behavior the stated intent does not justify (advisory)."
+policy_complete = true
+
+[[command]]
+name = "lab"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Runs the detection engine against a curated, inert adversarial corpus to show what it catches. Offline."
+policy_complete = true
+
+[[command]]
+name = "explain"
+group = "Scan & analyze"
+inspected = "none"
+coverage = "Prints rule documentation, examples, remediation, and MITRE mapping. Documentation surface."
+policy_complete = true
+
+[[command]]
+name = "why"
+group = "Scan & analyze"
+inspected = "none"
+coverage = "Explains the last rule that triggered. Reporting surface over an existing verdict."
+policy_complete = true
+
+[[command]]
+name = "visual-audit"
+group = "Scan & analyze"
+inspected = "none"
+coverage = "Tests whether the terminal and font can distinguish confusable glyph pairs. Environment probe."
+policy_complete = true
+
+# ---------------------------------------------------------------------------
+# Status & health
+# ---------------------------------------------------------------------------
+
+[[command]]
+name = "status"
+group = "Status & health"
+inspected = "none"
+coverage = "Reports protection mode, hook health, active policy, and threat-DB freshness. Reporting surface."
+policy_complete = true
+
+[[command]]
+name = "doctor"
+group = "Status & health"
+inspected = "none"
+coverage = "Diagnoses install, hooks, policy, and per-OS capsule coverage. Reports state and can --fix configuration."
+policy_complete = true
+
+[[command]]
+name = "prompt-status"
+group = "Status & health"
+inspected = "none"
+coverage = "One-line protection and active-context indicator for the shell prompt. Reporting surface (30s cache)."
+policy_complete = true
+
+[[command]]
+name = "dashboard"
+group = "Status & health"
+inspected = "none"
+coverage = "Renders a local-only HTML dashboard from the audit log, policy, and trust store. Reporting surface."
+policy_complete = true
+
+[[command]]
+name = "warnings"
+group = "Status & health"
+inspected = "none"
+coverage = "Shows accumulated session warnings. Reporting surface over prior verdicts."
+policy_complete = true
+
+[[command]]
+name = "receipt"
+group = "Status & health"
+inspected = "none"
+coverage = "Tracks and verifies scripts run through tirith run against the audit hash-chain. Verification surface."
+policy_complete = true
+
+[[command]]
+name = "logs"
+group = "Status & health"
+inspected = "full"
+coverage = "Inspects agent and CLI logs for injection seeds, secrets, and escape bytes."
+policy_complete = true
+
+[[command]]
+name = "baseline"
+group = "Status & health"
+inspected = "none"
+coverage = "Opt-in per-user anomaly baseline (off by default). Learns observed activity; does not inspect content."
+policy_complete = true
+
+# ---------------------------------------------------------------------------
+# Setup & onboarding
+# ---------------------------------------------------------------------------
+
+[[command]]
+name = "init"
+group = "Setup & onboarding"
+inspected = "none"
+coverage = "Prints the shell hook for the active profile. Configuration surface."
+policy_complete = true
+
+[[command]]
+name = "onboard"
+group = "Setup & onboarding"
+inspected = "none"
+coverage = "Guided first-run wizard: detects the environment and recommends a policy template. Configuration surface."
+policy_complete = true
+
+[[command]]
+name = "setup"
+group = "Setup & onboarding"
+inspected = "none"
+coverage = "One-command AI-tool setup. Writes integration config; does not inspect content."
+policy_complete = true
+
+[[command]]
+name = "install"
+group = "Setup & onboarding"
+inspected = "partial"
+coverage = "Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run."
+policy_complete = false
+
+[[command]]
+name = "verify-self"
+group = "Setup & onboarding"
+inspected = "full"
+coverage = "Verifies the running binary and its build/install provenance against signed checksums."
+policy_complete = true
+
+[[command]]
+name = "update"
+group = "Setup & onboarding"
+inspected = "full"
+coverage = "Signature-verified self-update: inspects the downloaded binary before replacing the running one."
+policy_complete = true
+
+[[command]]
+name = "version"
+group = "Setup & onboarding"
+inspected = "none"
+coverage = "Prints version and, with --provenance, build/install provenance. Reporting surface."
+policy_complete = true
+
+[[command]]
+name = "browser"
+group = "Setup & onboarding"
+inspected = "none"
+coverage = "Installs the Chrome native-messaging host that records clipboard provenance. Configuration surface."
+policy_complete = true
+
+[[command]]
+name = "devcontainer"
+group = "Setup & onboarding"
+inspected = "partial"
+coverage = "Guards container operations and injects tirith into devcontainer.json. Inspects the guarded operation, not container contents."
+policy_complete = true
+
+[[command]]
+name = "codespaces"
+group = "Setup & onboarding"
+inspected = "none"
+coverage = "Sets up and injects tirith into Codespaces. Configuration surface."
+policy_complete = true
+
+[[command]]
+name = "activate"
+group = "Setup & onboarding"
+inspected = "none"
+coverage = "Activates a commercial license key. Licensing surface."
+policy_complete = true
+
+[[command]]
+name = "license"
+group = "Setup & onboarding"
+inspected = "none"
+coverage = "Shows and manages license status. Licensing surface."
+policy_complete = true
+
+# ---------------------------------------------------------------------------
+# Policy, trust & rule authoring
+# ---------------------------------------------------------------------------
+
+[[command]]
+name = "policy"
+group = "Policy, trust & rule authoring"
+inspected = "none"
+coverage = "Scaffolds, validates, dry-runs, tunes, and shows the resolved effective policy with neutralized repo fields. Policy surface."
+policy_complete = true
+
+[[command]]
+name = "trust"
+group = "Policy, trust & rule authoring"
+inspected = "none"
+coverage = "Manages trusted patterns (narrow scope, 30-day TTL by default). Policy surface."
+policy_complete = true
+
+[[command]]
+name = "rule"
+group = "Policy, trust & rule authoring"
+inspected = "full"
+coverage = "Authors and tests custom detection rules (regex or the when: semantic DSL) against sample input."
+policy_complete = true
+
+[[command]]
+name = "output wrap"
+group = "Policy, trust & rule authoring"
+inspected = "full"
+coverage = "Installs or removes the tirith-out wrapper that runs a command's output through tirith view."
+policy_complete = true
+
+# ---------------------------------------------------------------------------
+# Shell & system guards
+# ---------------------------------------------------------------------------
+
+[[command]]
+name = "daemon"
+group = "Shell & system guards"
+inspected = "none"
+coverage = "Background daemon for faster checks and network enrichment (Unix). Process management; inspection happens in check/scan."
+policy_complete = true
+
+[[command]]
+name = "hooks"
+group = "Shell & system guards"
+inspected = "full"
+coverage = "Inventories and classifies git / husky / lefthook / pre-commit hooks by inspecting their scripts."
+policy_complete = true
+
+[[command]]
+name = "exec"
+group = "Shell & system guards"
+inspected = "full"
+coverage = "Reports a binary's package owner, signature, permissions, and whether it shadows a system command."
+policy_complete = true
+
+[[command]]
+name = "env"
+group = "Shell & system guards"
+inspected = "partial"
+coverage = "Monitors sensitive env-var lifecycle. Inspects variable names and shape; values are never stored."
+policy_complete = true
+
+[[command]]
+name = "path"
+group = "Shell & system guards"
+inspected = "full"
+coverage = "Flags PATH-hijack risk by inspecting each PATH entry (repo-local, /tmp, or writable-before-system directories)."
+policy_complete = true
+
+[[command]]
+name = "sudo"
+group = "Shell & system guards"
+inspected = "partial"
+coverage = "Sudo-escalation gates with a reasoned session window. Inspects the escalated command, not the target process."
+policy_complete = true
+
+[[command]]
+name = "ssh"
+group = "Shell & system guards"
+inspected = "partial"
+coverage = "Labels SSH hosts; destructive commands on a labeled-prod host escalate. Inspects the command against the host label."
+policy_complete = true
+
+[[command]]
+name = "context"
+group = "Shell & system guards"
+inspected = "partial"
+coverage = "Labels and guards active cloud / k8s contexts; prod-destructive operations escalate. Inspects the operation against the context label."
+policy_complete = true
+
+[[command]]
+name = "persistence"
+group = "Shell & system guards"
+inspected = "full"
+coverage = "Inventories and diffs persistence footholds (rc files, authorized_keys, crontab, LaunchAgents) by inspecting them."
+policy_complete = true
+
+[[command]]
+name = "hygiene"
+group = "Shell & system guards"
+inspected = "full"
+coverage = "Inspects ~/.ssh, ~/.aws, ~/.kube, .npmrc, and more for loose permissions or plaintext tokens (fix is chmod-only)."
+policy_complete = true
+
+[[command]]
+name = "aliases"
+group = "Shell & system guards"
+inspected = "full"
+coverage = "Inspects shell aliases that shadow critical commands, call the network, or read credentials."
+policy_complete = true
+
+# ---------------------------------------------------------------------------
+# Supply-chain
+# ---------------------------------------------------------------------------
+
+[[command]]
+name = "package"
+group = "Supply-chain"
+inspected = "partial"
+coverage = "Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise."
+policy_complete = false
+
+[[command]]
+name = "ecosystem"
+group = "Supply-chain"
+inspected = "partial"
+coverage = "Scores every declared dependency in a project, slopsquat-aware. Inspects manifests and installed trees; registry depth needs --online."
+policy_complete = false
+
+[[command]]
+name = "threat-db"
+group = "Supply-chain"
+inspected = "none"
+coverage = "Manages the signed local threat database. Data management surface consumed by the inspecting commands."
+policy_complete = true
+
+[[command]]
+name = "iac"
+group = "Supply-chain"
+inspected = "full"
+coverage = "Terraform / Pulumi / OpenTofu apply gates: inspects the saved-plan hash and blocks no-plan applies."
+policy_complete = true
+
+[[command]]
+name = "canary"
+group = "Supply-chain"
+inspected = "none"
+coverage = "Plants synthetic honeytokens; a touch fires canary_token_touched. Detection by tripwire, not content inspection."
+policy_complete = true
+
+[[command]]
+name = "secret"
+group = "Supply-chain"
+inspected = "none"
+coverage = "Guidance-only secret-rotation assistant for 11 providers (no network). Advisory surface."
+policy_complete = true
+
+[[command]]
+name = "command-card"
+group = "Supply-chain"
+inspected = "full"
+coverage = "Creates and verifies Ed25519-signed attestations that a known-good command is what it claims."
+policy_complete = true
+
+[[command]]
+name = "commands"
+group = "Supply-chain"
+inspected = "full"
+coverage = "Repo command manifest: a bounded allowlist plus an elevation-only dangerous[] list, inspected against the invoked command."
+policy_complete = true
+
+# ---------------------------------------------------------------------------
+# AI-agent integrations
+# ---------------------------------------------------------------------------
+
+[[command]]
+name = "mcp-server"
+group = "AI-agent integrations"
+inspected = "full"
+coverage = "Runs tirith as an MCP server (7 tools) over JSON-RPC stdio; inspects tool inputs and, with --sanitize-tool-output, outputs."
+policy_complete = true
+
+[[command]]
+name = "mcp"
+group = "AI-agent integrations"
+inspected = "full"
+coverage = "Inventories and gates a repo's MCP servers into .tirith/mcp.lock; inspects tool descriptors, schemas, and per-capability surfaces."
+policy_complete = true
+
+[[command]]
+name = "gateway"
+group = "AI-agent integrations"
+inspected = "full"
+coverage = "MCP gateway proxy that intercepts AI-agent tool calls; inspects requests and filters responses for injection and exfil."
+policy_complete = true
+
+[[command]]
+name = "agent"
+group = "AI-agent integrations"
+inspected = "partial"
+coverage = "Caller-origin governance (human / agent / MCP / CI / IDE); an agent_rules.deny match forces a block. Inspects origin and rules, not payloads."
+policy_complete = true
+
+[[command]]
+name = "ai"
+group = "AI-agent integrations"
+inspected = "full"
+coverage = "AI-config workflow: scans, snapshots, and quarantines config files, detecting drift or poisoning by inspecting them."
+policy_complete = true
+
+[[command]]
+name = "lsp"
+group = "AI-agent integrations"
+inspected = "full"
+coverage = "Language server that surfaces tirith diagnostics inline in an editor; inspects buffer contents through the engine."
+policy_complete = true
+
+# ---------------------------------------------------------------------------
+# Forensics & response
+# ---------------------------------------------------------------------------
+
+[[command]]
+name = "audit"
+group = "Forensics & response"
+inspected = "none"
+coverage = "Audit-log management; verify checks the tamper-evident hash chain. Verification and export surface."
+policy_complete = true
+
+[[command]]
+name = "incident"
+group = "Forensics & response"
+inspected = "none"
+coverage = "Declares an under-attack posture: fail-closed, bypass disabled, key rules elevated. Posture control."
+policy_complete = true
+
+[[command]]
+name = "checkpoint"
+group = "Forensics & response"
+inspected = "full"
+coverage = "Snapshots files before risky operations; restore sha256-verifies each blob and reports per-file outcomes."
+policy_complete = true
+
+[[command]]
+name = "pending"
+group = "Forensics & response"
+inspected = "none"
+coverage = "Pending-decision registry for deferred blocks and suppressed-finding rollups. Bookkeeping surface."
+policy_complete = true
+
+[[command]]
+name = "share"
+group = "Forensics & response"
+inspected = "full"
+coverage = "Audience-aware redaction before sharing; inspects the payload and strips secrets per target audience."
+policy_complete = true
+
+[[command]]
+name = "redact"
+group = "Forensics & response"
+inspected = "full"
+coverage = "Audience-aware redaction of arbitrary text; inspects and removes secret-shaped content per audience."
+policy_complete = true
+
+[[command]]
+name = "clipboard"
+group = "Forensics & response"
+inspected = "full"
+coverage = "Clipboard with secret-shape gating and browser source attribution; inspects copied content before it leaves."
+policy_complete = true
+
+# ---------------------------------------------------------------------------
+# Package firewall (Python-only enforcement)
+# ---------------------------------------------------------------------------
+
+[[command]]
+name = "pkg install"
+group = "Package firewall"
+inspected = "full"
+coverage = "Resolves with hashes, quarantines the exact wheel bytes, inspects them, then installs only the verified bytes inside a containment capsule with a tamper-evident receipt. Python-only enforcement."
+policy_complete = true
+
+[[command]]
+name = "pkg verify-env"
+group = "Package firewall"
+inspected = "full"
+coverage = "Verifies an installed environment's files against their RECORD and the threat DB. Python-only."
+policy_complete = true
+
+[[command]]
+name = "pkg approve"
+group = "Package firewall"
+inspected = "full"
+coverage = "Binds an approval to an InstallPlanDigest over the inspected artifact hashes, packages, target env, policy projection, and DB sequence."
+policy_complete = true
+
+[[command]]
+name = "pkg graph"
+group = "Package firewall"
+inspected = "full"
+coverage = "Renders the execution/ownership provenance graph from inspected artifact execution edges and the ownership map."
+policy_complete = true
+
+[[command]]
+name = "pkg diff"
+group = "Package firewall"
+inspected = "full"
+coverage = "Local release differential between two wheels; inspects members for execution-shape drift (pure to native, hooks added)."
+policy_complete = true
+
+[[command]]
+name = "pkg attest"
+group = "Package firewall"
+inspected = "full"
+coverage = "Binds a PyPI provenance attestation subject digest to the quarantined sha256 and verifies it (optional sigstore feature). Missing or invalid attestation is evidence, never an auto-allow."
+policy_complete = true
+
+[[command]]
+name = "pkg receipt"
+group = "Package firewall"
+inspected = "none"
+coverage = "Lists and shows tamper-evident artifact-scan receipts. Reporting surface over recorded receipts."
+policy_complete = true

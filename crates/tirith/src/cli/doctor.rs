@@ -661,6 +661,11 @@ struct DoctorInfo {
     /// M10 ch5 — opt-in anomaly-baseline status. Always present; `enabled`
     /// reflects `policy.baseline_enabled`.
     baseline: BaselineDoctorInfo,
+    /// Stack E (E5) — runtime-containment capsule coverage for this host: the
+    /// selected backend and the per-capability flags it can actually enforce, so
+    /// an operator sees whether enforcing surfaces (`pkg install`, the contained
+    /// gateway) would work here or fail closed.
+    capsule: crate::cli::capsule::CapsuleDoctorInfo,
 }
 
 /// M10 ch5 — anomaly-baseline status: enabled flag, in-window observation
@@ -918,6 +923,7 @@ fn gather_info() -> DoctorInfo {
         detection_gaps,
         threat_db,
         baseline,
+        capsule: crate::cli::capsule::gather_doctor_info(),
     }
 }
 
@@ -2282,6 +2288,47 @@ fn print_human(info: &DoctorInfo) {
         }
     } else {
         println!("  anomaly base: off (opt-in — enable with 'tirith baseline learn')");
+    }
+
+    // Stack E (E5) — runtime-containment capsule coverage for this host. An
+    // operator sees, at a glance, whether enforcing surfaces (`pkg install`, the
+    // contained gateway / `tirith run --capsule`) work here or fail closed.
+    {
+        let c = &info.capsule;
+        if c.deny_all_enforceable {
+            println!(
+                "  capsule:      backend '{}' — deny-all containment ENFORCEABLE \
+                 (fs={}, exec={}, raw-net-deny={}, rlimits={}, env={}, handles={})",
+                c.backend_id,
+                c.fs_read_enforced && c.fs_write_enforced,
+                c.exec_limited,
+                c.network_raw_denied,
+                c.resource_limits_enforced,
+                c.env_isolated,
+                c.handles_isolated,
+            );
+        } else {
+            println!(
+                "  capsule:      backend '{}' — containment NOT fully enforceable on this host; \
+                 enforcing surfaces fail closed",
+                c.backend_id
+            );
+        }
+        // Domain egress is never enforceable on the current backends (the broker is
+        // not yet wired to a verified raw-socket block); report it honestly.
+        println!(
+            "                domain-egress enforceable: {}{}",
+            c.domain_egress_enforceable,
+            if c.external_helpers.is_empty() {
+                String::new()
+            } else {
+                let names: Vec<&str> = c.external_helpers.iter().map(|h| h.name).collect();
+                format!(
+                    " | external helper(s) detected on PATH: {}",
+                    names.join(", ")
+                )
+            }
+        );
     }
 
     if let Some(ref gaps) = info.detection_gaps {

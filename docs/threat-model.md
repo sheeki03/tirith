@@ -32,7 +32,14 @@
 
 ## Explicit Non-Goals
 
-- **Runtime sandboxing**: tirith does not sandbox or contain executed commands
+- **Runtime sandboxing of arbitrary shell commands by default**: tirith does not
+  sandbox or contain the commands a user runs in their shell. The shell hook is a
+  detection layer, not a containment boundary. There is one narrow, opt-in
+  exception (see "Opt-in runtime containment" below): the `tirith run --capsule`,
+  `tirith temp-run --capsule`, `tirith gateway run --capsule`, and (future) `tirith
+  pkg install` surfaces route the program they launch through an OS containment
+  capsule. This is an explicit, per-invocation choice for tirith-launched
+  processes, not blanket containment of the shell.
 - **Network monitoring**: tirith does not inspect network traffic after command execution
 - **Malware detection**: tirith analyzes command structure, not payload content (except via `run`)
 - **Privileged attacker defense**: a root/admin user can bypass tirith trivially
@@ -53,14 +60,40 @@ its JSON envelope:
 
 The ONLY thing `temp-run` changes is the working directory, so files the
 command *writes* land in the temp dir instead of polluting your tree. It is a
-file-isolation workflow for previewing filesystem impact — not a containment
-boundary. A malicious command run under `temp-run` can still read every secret
-on the machine, reach the network, and modify anything outside the temp dir
-(e.g. `$HOME`) exactly as it could if run directly. `--strip-env` trims the
-child environment to a small allowlist (HOME, PATH, USER, LANG, TERM) as a
-convenience, but a trimmed environment is likewise not a security control.
-Real kernel sandboxing (`bwrap`, `sandbox-exec`, seccomp) remains a deliberate
-non-goal.
+file-isolation workflow for previewing filesystem impact, not a containment
+boundary. A malicious command run under plain `temp-run` (without `--capsule`)
+can still read every secret on the machine, reach the network, and modify
+anything outside the temp dir (e.g. `$HOME`) exactly as it could if run directly.
+`--strip-env` trims the child environment to a small allowlist (HOME, PATH, USER,
+LANG, TERM) as a convenience, but a trimmed environment is likewise not a
+security control.
+
+### Opt-in runtime containment (the capsule)
+
+The blanket "no kernel sandboxing" stance has one deliberate, opt-in exception.
+tirith ships an OS containment capsule (Landlock + seccomp on Linux, Seatbelt on
+macOS, an AppContainer + Job Object on Windows) that a handful of
+tirith-launched surfaces can route their child process through:
+
+- `tirith run --capsule` runs the downloaded script contained (deny-network,
+  scrubbed environment, resource limits, filesystem confined to the script's
+  cache dir).
+- `tirith temp-run --capsule` additionally contains the previewed command, on top
+  of the temp-dir file isolation.
+- `tirith gateway run --capsule` spawns the upstream MCP server contained
+  (deny-network).
+- `tirith pkg install` (a later milestone) installs only inside the capsule.
+
+The capsule is **honest about what it enforces**. Every backend reports a
+per-capability coverage ledger and never claims a control it did not apply. The
+loopback egress broker is a broker, NOT the boundary: domain-egress is only
+claimed where the OS backend blocks raw outbound sockets except to the broker.
+Enforcing surfaces (`pkg install`, the contained gateway, `tirith run --capsule`)
+**fail closed** when the host backend cannot deliver the required containment;
+`temp-run --capsule` is a best-effort hardening that runs uncontained, and says
+so, when no backend is available. `tirith doctor` reports the real per-platform
+capsule coverage. See `docs/capsule.md` for the full model. Containment of
+arbitrary, non-tirith-launched shell commands remains a non-goal.
 
 ## Trust Boundaries
 

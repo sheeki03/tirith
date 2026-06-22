@@ -962,6 +962,7 @@ Disable: `export TIRITH_LOG=0`
 ## Docs
 
 - [Command reference](docs/commands.md): every subcommand, grouped by category
+- [Capability matrix](docs/capability-matrix.md): per-command coverage (what tirith inspects, and whether policy fully governs it)
 - [Threat model](docs/threat-model.md), what tirith defends against and what it doesn't
 - [Cookbook](docs/cookbook.md), policy examples for common setups
 - [Troubleshooting](docs/troubleshooting.md), shell quirks, latency, false positives

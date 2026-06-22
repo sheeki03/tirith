@@ -1279,6 +1279,15 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     // B8 wheel structurally rejected by the hardened reader (path traversal, encrypted
     // member, CRC mismatch, duplicate-path collision); synthesized by `package inspect`.
     ("wheel_structurally_rejected", "WheelStructurallyRejected"),
+    // D3 package-firewall download-vs-expected hash mismatch (externally
+    // triggered by `artifact::firewall` re-hashing a quarantine blob; no fixture).
+    (
+        "artifact_download_integrity_mismatch",
+        "ArtifactDownloadIntegrityMismatch",
+    ),
+    // F2 package-firewall release differential anomaly (externally triggered by
+    // `artifact::release_diff` comparing two on-disk wheels; no fixture).
+    ("artifact_release_anomaly", "ArtifactReleaseAnomaly"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
