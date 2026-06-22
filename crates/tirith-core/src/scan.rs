@@ -100,6 +100,33 @@ pub enum CoverageGapKind {
     /// would be unbounded; hashing was abandoned (a multi-terabyte file must not
     /// become a hashing DoS). Security-relevant regardless of extension.
     HashBudgetExceeded,
+    /// An archive hit its entry-count budget ([`crate::artifact::archive::ArchiveLimits`]),
+    /// so members beyond the cap were not inspected. A COVERAGE limit (the
+    /// archive is `Accepted` with this gap), not a structural violation.
+    EntryCountCapped,
+    /// An archive reached its total-uncompressed byte budget while streaming, so
+    /// the remaining members were not fully analyzed. A coverage limit, not a
+    /// structural violation.
+    TotalBytesCapped,
+    /// An archive member's REAL streamed compression ratio exceeded the limit
+    /// (a zip bomb), so the member was abandoned mid-stream. The declared
+    /// uncompressed size is attacker-controlled, so this is enforced on the bytes
+    /// actually read, never the declared size.
+    CompressionRatioExceeded,
+    /// An archive member's uncompressed size exceeds the per-member analysis cap,
+    /// so it was not decompressed for analysis (a whole-member hash / streaming
+    /// view may still be recorded). A coverage limit.
+    MemberTooLarge,
+    /// An archive member uses a compression method this build cannot decode (only
+    /// deflate/store are enabled), so its content could not be inspected. A
+    /// coverage limit, distinct from [`CoverageGapKind::Unsupported`] (a file
+    /// KIND with no analyzer): here the bytes are simply undecodable.
+    UnsupportedCompression,
+    /// A native archive member was handed to the native triage as a streaming
+    /// view (whole-member hash plus a printable-string scan) rather than a full
+    /// random-access buffer, because it exceeds the native-parse cap; the deep
+    /// native analysis is therefore truncated. A coverage limit.
+    NativeTruncated,
 }
 
 impl CoverageGapKind {
@@ -112,6 +139,12 @@ impl CoverageGapKind {
             CoverageGapKind::Panicked => "panicked",
             CoverageGapKind::Unsupported => "unsupported",
             CoverageGapKind::HashBudgetExceeded => "hash_budget_exceeded",
+            CoverageGapKind::EntryCountCapped => "entry_count_capped",
+            CoverageGapKind::TotalBytesCapped => "total_bytes_capped",
+            CoverageGapKind::CompressionRatioExceeded => "compression_ratio_exceeded",
+            CoverageGapKind::MemberTooLarge => "member_too_large",
+            CoverageGapKind::UnsupportedCompression => "unsupported_compression",
+            CoverageGapKind::NativeTruncated => "native_truncated",
         }
     }
 }

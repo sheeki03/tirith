@@ -823,18 +823,28 @@ impl ScanPolicyConfig {
     }
 
     /// Effective action for an arbitrary coverage-gap kind, mapping each kind to
-    /// its configured action. A `Panicked`, `Truncated`, or `HashBudgetExceeded`
-    /// gap has no dedicated key; it is treated as an oversized-class gap (the
-    /// most conservative of the three configurable buckets) so the strictest
-    /// configured coverage action still governs it.
+    /// its configured action. A `Panicked`, `Truncated`, `HashBudgetExceeded`, or
+    /// any archive coverage-limit gap (`EntryCountCapped`, `TotalBytesCapped`,
+    /// `CompressionRatioExceeded`, `MemberTooLarge`, `NativeTruncated`) has no
+    /// dedicated key; it is treated as an oversized-class gap (the most
+    /// conservative of the three configurable buckets) so the strictest configured
+    /// coverage action still governs it. An undecodable-compression member maps to
+    /// the unsupported-artifact bucket (it is, like an unanalyzable file kind,
+    /// content with no analyzer).
     pub fn action_for_gap_kind(&self, kind: crate::scan::CoverageGapKind) -> GapAction {
         use crate::scan::CoverageGapKind as K;
         match kind {
-            K::Oversized | K::HashBudgetExceeded | K::Truncated | K::Panicked => {
-                self.oversized_action()
-            }
+            K::Oversized
+            | K::HashBudgetExceeded
+            | K::Truncated
+            | K::Panicked
+            | K::EntryCountCapped
+            | K::TotalBytesCapped
+            | K::CompressionRatioExceeded
+            | K::MemberTooLarge
+            | K::NativeTruncated => self.oversized_action(),
             K::Unreadable => self.unreadable_action(),
-            K::Unsupported => self.unsupported_action(),
+            K::Unsupported | K::UnsupportedCompression => self.unsupported_action(),
         }
     }
 }

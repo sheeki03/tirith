@@ -58,6 +58,10 @@ use crate::scan::CoverageGap;
 use crate::threatdb::{Ecosystem, ThreatDb};
 use crate::verdict::{Finding, Timings, Verdict};
 
+/// The hardened, streaming, wheel-only ZIP reader (PR A4). Separates hard
+/// structural violations from coverage limits and hands native members to B7.
+pub mod archive;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.
