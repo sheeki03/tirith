@@ -2337,10 +2337,14 @@ fn walk_site_packages(
             rd.filter_map(Result::ok)
                 .map(|e| e.path())
                 .filter(|p| {
+                    // Case-INsensitive `.dist-info` match: on a case-insensitive filesystem a
+                    // distribution installed as `Foo-1.0.DIST-INFO` still imports, so a
+                    // case-sensitive suffix check would skip enumerating it and its name/version
+                    // would never be matched against the threat DB.
                     p.is_dir()
                         && p.file_name()
                             .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.ends_with(".dist-info"))
+                            .is_some_and(|n| n.to_ascii_lowercase().ends_with(".dist-info"))
                 })
                 .collect()
         })
