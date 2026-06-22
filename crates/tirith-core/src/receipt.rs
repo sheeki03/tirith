@@ -325,6 +325,14 @@ pub struct RecordedReceipt {
     /// cryptographically signed; `false` => it is "tamper-evident" (hash-chained
     /// only). A `pkg install` surface words its output from this.
     pub signed: bool,
+    /// `Some(reason)` when the receipt was SAVED but its audit-chain anchor could NOT
+    /// be appended (a non-fatal degrade reached only for the unsigned case, e.g. the
+    /// audit-log lock is unavailable on Windows). The receipt exists on disk but is
+    /// NOT tamper-evident-chained, so a caller that cares about audit integrity should
+    /// surface this rather than treat the install as fully anchored. `None` on a
+    /// normally-anchored receipt or a deliberately-disabled chain (those are not a
+    /// failure, so they must not look like one).
+    pub anchor_warning: Option<String>,
 }
 
 impl ArtifactScanReceipt {
@@ -434,14 +442,18 @@ impl ArtifactScanReceipt {
             &self.verdict.action,
             &self.verdict.rule_ids,
         ) {
-            crate::audit::ReceiptAnchor::Recorded { signed } => {
-                Ok(RecordedReceipt { path, signed })
-            }
+            crate::audit::ReceiptAnchor::Recorded { signed } => Ok(RecordedReceipt {
+                path,
+                signed,
+                anchor_warning: None,
+            }),
             // No chain at all (logging off). The file is saved; report it as
             // unsigned/unanchored so the caller does not over-claim tamper-evidence.
+            // This is a deliberate config choice, NOT a failure, so no anchor_warning.
             crate::audit::ReceiptAnchor::Skipped => Ok(RecordedReceipt {
                 path,
                 signed: false,
+                anchor_warning: None,
             }),
             // The receipt file is saved but the chain anchor could not be appended.
             // When a signature is mandatory this is fatal. Otherwise (unsigned /
@@ -454,9 +466,16 @@ impl ArtifactScanReceipt {
                 if require_signature {
                     Err(ReceiptError::AnchorFailed(reason))
                 } else {
+                    // Never SILENTLY swallow the anchor failure: log it AND record it
+                    // on the result, so the caller can surface the degraded (saved but
+                    // unanchored) state instead of reporting a fully-anchored install.
+                    eprintln!(
+                        "tirith: package receipt saved but could not be audit-anchored: {reason}"
+                    );
                     Ok(RecordedReceipt {
                         path,
                         signed: false,
+                        anchor_warning: Some(reason),
                     })
                 }
             }
