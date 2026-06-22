@@ -2660,10 +2660,14 @@ fn discover_dist_infos(site: &Path) -> Vec<(PathBuf, crate::artifact::Distributi
         // and route later METADATA/RECORD reads through the symlink (the no-follow read
         // helpers protect only the FINAL component). The directory must be a REAL directory.
         .filter(|e| {
+            // Case-INsensitive `.dist-info` match: on a case-insensitive filesystem a tampered
+            // distribution installed as `Evil-1.0.DIST-INFO` still imports, but a case-sensitive
+            // suffix check would skip it entirely - so its RECORD integrity is never verified and
+            // its duplicate-owned paths / unowned startup hooks are never detected.
             e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
                 && e.file_name()
                     .to_str()
-                    .is_some_and(|n| n.ends_with(".dist-info"))
+                    .is_some_and(|n| n.to_ascii_lowercase().ends_with(".dist-info"))
         })
         .map(|e| e.path())
         .collect();
@@ -4486,6 +4490,23 @@ version = "1.0.61"
             installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
             policy: None,
         }
+    }
+
+    #[test]
+    fn discover_dist_infos_matches_dist_info_case_insensitively() {
+        // On a case-insensitive filesystem an UPPERCASE `.DIST-INFO` dir still imports; it must
+        // be discovered so its RECORD integrity is verified (and duplicate/unowned detection
+        // runs), not skipped because of a case-sensitive suffix check.
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path();
+        let di = site.join("Evil-1.0.DIST-INFO");
+        std::fs::create_dir_all(&di).unwrap();
+        std::fs::write(di.join("METADATA"), b"Name: evil\nVersion: 1.0\n").unwrap();
+        let found = discover_dist_infos(site);
+        assert!(
+            found.iter().any(|(p, _)| p.ends_with("Evil-1.0.DIST-INFO")),
+            "an uppercase .DIST-INFO dir must be discovered: {found:?}"
+        );
     }
 
     #[test]
