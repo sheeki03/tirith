@@ -30,6 +30,17 @@ fn split_name_version(s: &str, sep: char) -> (&str, VersionIntent) {
     }
 }
 
+/// Like [`split_name_version`] but for Cargo, where a PLAIN version is a caret
+/// REQUIREMENT (`serde@1.0` == `^1.0`), not an exact pin (see
+/// [`VersionIntent::from_cargo_version`]).
+fn split_name_version_cargo(s: &str, sep: char) -> (&str, VersionIntent) {
+    if let Some(pos) = s.find(sep) {
+        (&s[..pos], VersionIntent::from_cargo_version(&s[pos + 1..]))
+    } else {
+        (s, VersionIntent::Unspecified)
+    }
+}
+
 /// Build a [`VersionIntent`] from an optional explicit version token; `None`
 /// (and empty) becomes [`Unspecified`](VersionIntent::Unspecified).
 fn intent_from_opt_token(token: Option<&str>) -> VersionIntent {
@@ -350,7 +361,7 @@ fn extract_cargo_packages(args: &[String], packages: &mut Vec<PackageRef>) {
                             if last.ecosystem == Ecosystem::Crates
                                 && matches!(last.version, VersionIntent::Unspecified)
                             {
-                                last.version = VersionIntent::from_explicit_version(ver);
+                                last.version = VersionIntent::from_cargo_version(ver);
                             }
                         }
                     }
@@ -367,7 +378,7 @@ fn extract_cargo_packages(args: &[String], packages: &mut Vec<PackageRef>) {
             continue;
         }
 
-        let (name, version) = split_name_version(arg, '@');
+        let (name, version) = split_name_version_cargo(arg, '@');
 
         if !name.is_empty() {
             packages.push(PackageRef {
@@ -1193,18 +1204,38 @@ mod tests {
 
     #[test]
     fn cargo_add_with_version() {
+        // Cargo's plain `serde@1.0.193` is a caret REQUIREMENT (^1.0.193), not an exact
+        // pin: resolution selects the highest compatible release, so it is a Constraint
+        // (matching then resolves the real installed version, not the literal lower bound).
         let pkgs = tokenize_and_extract("cargo add serde@1.0.193");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "serde");
+        assert!(
+            matches!(&pkgs[0].version, VersionIntent::Constraint { raw, .. } if raw == "1.0.193"),
+            "cargo add serde@1.0.193 is a caret constraint, got {:?}",
+            pkgs[0].version
+        );
+    }
+
+    #[test]
+    fn cargo_add_equals_is_an_exact_pin() {
+        // Cargo's `=` operator IS an exact pin.
+        let pkgs = tokenize_and_extract("cargo add serde@=1.0.193");
+        assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].version, VersionIntent::Exact("1.0.193".to_string()));
     }
 
     #[test]
     fn cargo_install_with_version_flag() {
+        // `--version 14.0.0` is likewise a SemVer requirement, not an exact pin.
         let pkgs = tokenize_and_extract("cargo install ripgrep --version 14.0.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "ripgrep");
-        assert_eq!(pkgs[0].version, VersionIntent::Exact("14.0.0".to_string()));
+        assert!(
+            matches!(&pkgs[0].version, VersionIntent::Constraint { raw, .. } if raw == "14.0.0"),
+            "cargo install --version 14.0.0 is a constraint, got {:?}",
+            pkgs[0].version
+        );
     }
 
     #[test]
