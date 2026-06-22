@@ -4296,6 +4296,14 @@ mod tests {
             resolve_preferring_v2(Some(v2_path.clone()), Some(v1_path.clone()), false),
             Some(v2_path.clone())
         );
+        // v2 present + NO v1 path configured -> v2. A v2-only machine must resolve to the
+        // valid v2 via the early return, NOT fall through to the `_ => v1_path` arm and
+        // report None (which would make the cache treat a present, valid DB as "not
+        // installed").
+        assert_eq!(
+            resolve_preferring_v2(Some(v2_path.clone()), None, false),
+            Some(v2_path.clone())
+        );
         // v2 corrupt -> falls back to v1 (corrupt v2 never shadows).
         std::fs::write(&v2_path, b"not a db").unwrap();
         assert_eq!(
