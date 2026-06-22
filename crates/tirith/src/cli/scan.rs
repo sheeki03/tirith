@@ -446,16 +446,26 @@ fn run_single_file(
 }
 
 /// Whether a set of coverage gaps must FAIL a CI run under `policy`: either
-/// `scan.require_complete` is set and a security-relevant gap exists, or any gap
-/// whose effective per-kind action is [`GapAction::Fail`]. Shared by the
-/// directory and single-file paths so both fail closed identically.
+/// `scan.require_complete` is set and a security-relevant gap exists, or a
+/// SECURITY-RELEVANT gap whose effective per-kind action is [`GapAction::Fail`].
+/// Both conditions gate on security-relevance so the exit decision matches the
+/// AnalysisIncomplete finding assembly (which only emits for security-relevant gaps) -
+/// the scan never exits non-zero with an empty findings list. Shared by the directory
+/// and single-file paths so both fail closed identically.
 fn coverage_requires_failure(gaps: &[scan::CoverageGap], policy: &Policy) -> bool {
     use tirith_core::policy::GapAction;
     if policy.scan.require_complete && gaps.iter().any(scan::gap_is_security_relevant) {
         return true;
     }
-    gaps.iter()
-        .any(|g| policy.scan.action_for_gap_kind(g.kind) == GapAction::Fail)
+    // A Fail-action gap fails the run ONLY when it is security-relevant. Without this gate,
+    // a non-security-relevant gap with a Fail action (e.g. an oversized benign `notes.txt`
+    // under `oversized_file_action: fail`) exits 1 with ZERO findings, since finding
+    // assembly skips non-security-relevant gaps - a self-inconsistent exit-code/findings
+    // pair for a CI consumer.
+    gaps.iter().any(|g| {
+        scan::gap_is_security_relevant(g)
+            && policy.scan.action_for_gap_kind(g.kind) == GapAction::Fail
+    })
 }
 
 /// Print coverage gaps to stderr for the human output path (so `--json`/SARIF
