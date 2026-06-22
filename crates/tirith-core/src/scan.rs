@@ -178,16 +178,23 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     );
     let mut files = collected.text_candidates;
     // Artifact candidates (`.so`/`.whl`/...) have no analyzer yet; each becomes
-    // an `Unsupported` coverage gap so they are never silently dropped.
+    // an `Unsupported` coverage gap so they are never silently dropped. `max_files` bounds
+    // this hashing too (open/read/hash is the expensive work): an artifact-heavy tree must
+    // not force unbounded hashing here before the text-file cap below is applied. Cap the
+    // artifacts hashed; any beyond the cap are folded into the skip accounting below (not
+    // dropped silently).
+    let artifact_total = collected.artifact_candidates.len();
     let mut coverage_gaps: Vec<CoverageGap> = collected
         .artifact_candidates
         .iter()
+        .take(config.max_files.unwrap_or(usize::MAX))
         .map(|p| CoverageGap {
             location: SubjectLocation::from_path(p.clone()),
             kind: CoverageGapKind::Unsupported,
             sha256: hash_path_within_budget(p),
         })
         .collect();
+    let artifact_skipped = artifact_total.saturating_sub(coverage_gaps.len());
 
     files.sort_by(|a, b| {
         let a_priority = is_priority_file(a);
@@ -199,17 +206,19 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         }
     });
 
-    let mut truncated = false;
+    let mut truncated = artifact_skipped > 0;
     let mut truncation_reason = None;
-    let mut skipped_count = 0;
+    let mut skipped_count = artifact_skipped;
 
     if let Some(max) = config.max_files {
         if files.len() > max {
-            skipped_count = files.len() - max;
+            skipped_count += files.len() - max;
             files.truncate(max);
             truncated = true;
+        }
+        if skipped_count > 0 {
             truncation_reason = Some(format!(
-                "Scan capped at {max} files ({skipped_count} skipped)."
+                "Scan capped at {max} files/artifacts ({skipped_count} skipped)."
             ));
         }
     }
