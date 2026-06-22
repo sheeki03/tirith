@@ -803,6 +803,11 @@ mod tests {
     }
 
     #[test]
+    // Unix-only: the audit-chain anchor needs the audit-log lock, which fs2 cannot
+    // take on a Windows append handle, so the "anchor succeeds" assertions below
+    // cannot hold there. The Windows degrade (receipt saved, unanchored) is covered
+    // by the pkg_install receipt tests.
+    #[cfg(unix)]
     fn record_saves_file_and_anchors_in_audit_chain() {
         let _lock = crate::TEST_ENV_LOCK
             .lock()

@@ -3237,6 +3237,9 @@ mod tests {
     /// reports `signed: true` (the "mandatory for `pkg install`" signal); the chain
     /// then verifies with the matching public key.
     #[test]
+    // Unix-only: signing the anchor requires writing the audit log (taking the fs2
+    // lock), which is unavailable on a Windows append handle.
+    #[cfg(unix)]
     fn artifact_receipt_anchor_is_signed_when_signing_enabled() {
         let _guard = crate::TEST_ENV_LOCK
             .lock()
