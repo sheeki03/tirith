@@ -2856,6 +2856,11 @@ const MAX_NATIVE_MODULES_PER_SITE: usize = 4096;
 /// native modules (package -> subpackage nesting is shallow in practice).
 const MAX_NATIVE_WALK_DEPTH: usize = 12;
 
+/// Maximum TOTAL filesystem entries visited during the native-module walk (across all
+/// directories), so a tree padded with non-native files cannot force unbounded
+/// read_dir/sort/symlink_metadata work. Far above any real site-packages.
+const MAX_NATIVE_WALK_ENTRIES: usize = 100_000;
+
 /// Walk a `site-packages` root for native modules (`.so`/`.dylib`/`.pyd`/`.node`),
 /// read each whole (no-follow, capped), build an A4-style buffered handoff, and run
 /// B7 triage. Folds the granular native signals, execution edges, and any correlated
@@ -2880,30 +2885,46 @@ fn scan_native_modules(
     // read is no-follow).
     let mut native_paths: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<(PathBuf, usize)> = vec![(site.to_path_buf(), 0)];
+    // Bound the walk by TOTAL filesystem entries visited, not only native hits: an attacker
+    // can plant many NON-native files/dirs between hits, so the native-hit cap alone leaves
+    // read_dir / sort / symlink_metadata work unbounded. `take(remaining)` also caps the
+    // per-directory materialization so one giant directory cannot be fully read into memory.
+    let mut entries_visited = 0usize;
     while let Some((dir, depth)) = stack.pop() {
-        if native_paths.len() >= MAX_NATIVE_MODULES_PER_SITE {
+        if native_paths.len() >= MAX_NATIVE_MODULES_PER_SITE
+            || entries_visited >= MAX_NATIVE_WALK_ENTRIES
+        {
             break;
         }
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let mut entries: Vec<PathBuf> = rd.filter_map(Result::ok).map(|e| e.path()).collect();
+        let remaining = MAX_NATIVE_WALK_ENTRIES.saturating_sub(entries_visited);
+        let mut entries: Vec<PathBuf> = rd
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .take(remaining)
+            .collect();
         entries.sort();
         for entry in entries {
-            if native_paths.len() >= MAX_NATIVE_MODULES_PER_SITE {
+            if native_paths.len() >= MAX_NATIVE_MODULES_PER_SITE
+                || entries_visited >= MAX_NATIVE_WALK_ENTRIES
+            {
                 break;
             }
-            // `symlink_metadata` does not follow the link, so a symlinked directory
-            // is seen as a symlink (is_dir() is false, so we do not descend it) and a
-            // symlinked file is seen as a symlink (is_file() is false), so it is not
-            // enqueued below and is intentionally never triaged (this avoids following
-            // a link out of the tree).
+            entries_visited += 1;
+            // `symlink_metadata` does not follow the link, so a symlinked directory is seen as
+            // a symlink (is_dir() is false, so we never descend it - no following out of the
+            // tree). A native-LOOKING non-directory (regular file OR symlink) IS enqueued: a
+            // symlinked `.so`/`.pyd`/`.node` must not be silently skipped. The no-follow capped
+            // read below returns NotRegularFile for the symlink and records a
+            // NativeUninspectable coverage signal, so it is surfaced rather than ignored.
             let Ok(meta) = std::fs::symlink_metadata(&entry) else {
                 continue;
             };
             if meta.file_type().is_dir() && depth < MAX_NATIVE_WALK_DEPTH {
                 stack.push((entry, depth + 1));
-            } else if meta.file_type().is_file() && is_native_module_path(&entry) {
+            } else if !meta.file_type().is_dir() && is_native_module_path(&entry) {
                 native_paths.push(entry);
             }
         }
