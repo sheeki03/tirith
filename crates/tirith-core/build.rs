@@ -1253,6 +1253,11 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("mass_file_deletion", "MassFileDeletion"),
     // A2 — scan coverage incompleteness (assembled by the scan driver).
     ("analysis_incomplete", "AnalysisIncomplete"),
+    // B5 installed-distribution integrity (correlated by the installed-tree scan).
+    (
+        "python_installed_integrity_violation",
+        "PythonInstalledIntegrityViolation",
+    ),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[

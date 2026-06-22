@@ -62,6 +62,14 @@ use crate::verdict::{Finding, Timings, Verdict};
 /// structural violations from coverage limits and hands native members to B7.
 pub mod archive;
 
+/// Pure parsers for a distribution's `.dist-info` metadata files (PR B5):
+/// METADATA, WHEEL, entry_points.txt, direct_url.json, and RECORD. No I/O.
+pub mod wheel;
+
+/// Wheel-RECORD (strict) and installed-RECORD (lax) integrity verification plus
+/// the duplicate-aware cross-distribution ownership index (PR B5).
+pub mod record;
+
 /// Schema version for the serialized [`ArtifactInspection`]. Bump when the wire
 /// shape changes incompatibly; a consumer calls
 /// [`ArtifactInspection::check_schema`] before trusting a deserialized value.

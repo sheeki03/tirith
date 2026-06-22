@@ -330,7 +330,10 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::DeleteThenForcePush
         | RuleId::MassFileDeletion
         // A2: scan-coverage incompleteness, not a threat-DB indicator.
-        | RuleId::AnalysisIncomplete => false,
+        | RuleId::AnalysisIncomplete
+        // B5: installed-distribution integrity, correlated from artifact signals,
+        // not a threat-DB indicator.
+        | RuleId::PythonInstalledIntegrityViolation => false,
     }
 }
 

@@ -461,7 +461,8 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::DependencyChangeThenNetwork
         | RuleId::DeleteThenForcePush
         | RuleId::MassFileDeletion
-        | RuleId::AnalysisIncomplete => false,
+        | RuleId::AnalysisIncomplete
+        | RuleId::PythonInstalledIntegrityViolation => false,
     }
 }
 

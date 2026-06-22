@@ -747,6 +747,19 @@ pub enum RuleId {
     /// so it lives in `EXTERNALLY_TRIGGERED_RULES`. Medium by default; High when
     /// the gap's effective policy action is Fail (whence the action is Block).
     AnalysisIncomplete,
+    /// B5: an installed Python distribution's integrity does not hold: a RECORD
+    /// hash mismatch, a RECORD-listed file missing, an installed file owned by no
+    /// distribution, a single path owned by two distributions, or an unowned
+    /// `sitecustomize.py`/`usercustomize.py` startup hook. Correlated from the
+    /// granular `crate::artifact::ArtifactSignalKind`s by the installed-tree scan,
+    /// NOT a command/paste fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`
+    /// with no PATTERN_TABLE entry. Medium by default (installed-environment drift
+    /// is common: conda, distro packaging, instrumentation, editable installs);
+    /// High/Critical/Block only with corroboration (a known malicious hash, an
+    /// unowned startup hook, startup execution plus an integrity mismatch, an
+    /// unowned native executable, or cross-distribution execution). A strict
+    /// integrity policy upgrades the action to Block via `action_overrides`.
+    PythonInstalledIntegrityViolation,
 }
 
 impl fmt::Display for RuleId {
