@@ -145,6 +145,31 @@ impl VersionIntent {
             }
         }
     }
+
+    /// Build an intent from a Cargo version requirement (`cargo add serde@1.0`,
+    /// `cargo install --version 1.0`). Unlike pip's `==` or an npm FULL pin, Cargo treats a
+    /// PLAIN version as a caret REQUIREMENT (`1.0` == `^1.0`); resolution then selects the
+    /// highest SemVer-compatible release, so the literal token is NOT what gets installed.
+    /// A plain token is therefore a [`Constraint`] (matching resolves the real installed
+    /// version), NOT an [`Exact`] pin. Only Cargo's `=` operator (`=1.0.0`) is an exact pin.
+    pub fn from_cargo_version(token: &str) -> VersionIntent {
+        let t = token.trim();
+        if t.is_empty() {
+            return VersionIntent::Unspecified;
+        }
+        // Cargo's `=` operator is the only exact pin: `=1.0.0` -> Exact("1.0.0").
+        if let Some(pinned) = t.strip_prefix('=') {
+            let pinned = pinned.trim();
+            if looks_like_plain_version(pinned) {
+                return VersionIntent::Exact(pinned.to_string());
+            }
+        }
+        // A plain version (Cargo's caret default) or any other sigil/range is a Constraint.
+        VersionIntent::Constraint {
+            parsed: None,
+            raw: t.to_string(),
+        }
+    }
 }
 
 /// Whether a token looks like a plain, fully-specified version (an exact pin)
