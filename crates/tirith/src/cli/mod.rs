@@ -469,6 +469,13 @@ pub mod policy;
 pub mod preview;
 pub mod prompt_status;
 pub mod provenance;
+/// `tirith pkg attest` (PR F3, the `sigstore-attestations` spike): fetch a wheel's
+/// PyPI publish provenance from the Integrity API, bind the attestation's subject
+/// digest to the wheel's quarantined SHA-256, optionally verify the Sigstore bundle
+/// (feature-gated; off on the workspace MSRV), and check the publisher identity
+/// against policy. Provenance evidence only: never an auto-allow, never blocks. The
+/// network / `sigstore-*` half the plan keeps out of `tirith-core`.
+pub mod pypi_integrity;
 pub mod receipt;
 pub mod rule;
 pub mod scan;

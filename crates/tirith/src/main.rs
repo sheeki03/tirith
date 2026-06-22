@@ -5290,6 +5290,35 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Fetch a wheel's PyPI publish provenance (the Integrity API attestation),
+    /// bind the attested subject digest to the wheel's SHA-256, and report the
+    /// outcome. Provenance EVIDENCE only: it never blocks and is never an
+    /// auto-allow; the install verdict is over the bytes, not the attestation.
+    #[command(after_help = "\
+What it does:
+  Inspects the wheel for its exact PyPI identity + SHA-256, fetches its publish
+  provenance from the PyPI Integrity API, and binds the attestation's in-toto
+  subject digest to the wheel's hash. A digest that covers DIFFERENT bytes is a
+  subject mismatch (an artifact-swap / stale-attestation tell, caught structurally).
+  Cryptographic Sigstore verification + a publisher-identity policy check run only
+  with the (MSRV-gated) `sigstore-attestations` feature; without it the outcome is
+  'verification-unavailable' (fetched and bound, but not verified), never 'verified'.
+  A missing or invalid attestation is evidence a reviewer reads, not a block.
+
+Examples:
+  tirith pkg attest requests-2.31.0-py3-none-any.whl
+  tirith pkg attest demo-1.0-py3-none-any.whl --json")]
+    Attest {
+        /// The wheel artifact to fetch + bind provenance for.
+        #[arg(value_name = "WHEEL")]
+        wheel: std::path::PathBuf,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
     /// List or show the package-firewall tamper-evident receipts.
     #[command(after_help = "\
 Examples:
@@ -6910,6 +6939,17 @@ fn run() {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::provenance::run_diff(&old, &new, json)
         }
+        Commands::Pkg {
+            action:
+                PkgAction::Attest {
+                    wheel,
+                    format,
+                    json,
+                },
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::pypi_integrity::run(&wheel, json)
+        }
         Commands::Pkg { action } => {
             let pkg_action = match action {
                 PkgAction::Approve {
@@ -6993,6 +7033,10 @@ fn run() {
                 // release-differential verdict's exit code through
                 // `cli::provenance::run_diff`), so it never reaches here.
                 PkgAction::Diff { .. } => unreachable!("pkg diff handled above"),
+                // `Attest` is handled by its own earlier arm (it returns its own
+                // exit code through `cli::pypi_integrity::run`), so it never reaches
+                // here.
+                PkgAction::Attest { .. } => unreachable!("pkg attest handled above"),
             };
             cli::pkg::run(pkg_action)
         }

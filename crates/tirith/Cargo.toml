@@ -26,18 +26,27 @@ path = "src/bin/tirith_threatdb_compile.rs"
 # change. OFF by default; building `tirith` with this on compiles and tests today.
 default = []
 artifact-hash-lookup = ["tirith-core/artifact-hash-lookup"]
-# sigstore-attestations (sigstore-verify / -trust-root / -types): DEFERRED by the
-# PR-0 dependency spike, NOT wired here. The modular sigstore crates DO exist at a
-# consistent 0.9.0 line with the `rustls` feature the plan assumed (the earlier
-# 0.1.x guess mis-resolved to stale 0.1.1 copies). However, sigstore-verify 0.9
+# sigstore-attestations (Stack F3 spike): the OFF-by-default gate for the PyPI
+# attestation Sigstore VERIFICATION path in `cli::pypi_integrity`. The feature key
+# exists so the `#[cfg(feature = "sigstore-attestations")]` verification branch
+# compiles as a recognized cfg, but it pulls NO `sigstore-*` dependency yet, and
+# stays OFF on the workspace MSRV. Why no deps: the modular sigstore crates exist at
+# a consistent 0.9.0 line with the `rustls` feature the plan assumed (the earlier
+# 0.1.x guess mis-resolved to stale 0.1.1 copies), but sigstore-verify 0.9
 # transitively requires reqwest 0.13, hyper-rustls 0.27, rustls-platform-verifier
 # 0.7 and zeroize 1.9 — all of which require Rust >= 1.85 — and the closure is not
 # pinnable down to MSRV 1.83. There is also no standalone `sigstore-attestations`
 # crate (that functionality lives inside the umbrella `sigstore` crate). So the
-# feature and its `dep:sigstore-*` deps are intentionally omitted. Stack F3 is an
-# optional spike that only merges once it verifies a real PyPI fixture end to end;
-# it gets wired when the workspace MSRV rises to >= 1.85. Until then, a missing or
-# invalid attestation is treated as provenance evidence, never an auto-allow.
+# `dep:sigstore-*` wiring is intentionally omitted until the workspace MSRV rises to
+# >= 1.85; F3 is an optional spike that only fully activates (and the "verify one
+# real PyPI fixture end to end" gate runs) once it can build. Crucially, with the
+# feature OFF the command still RUNS — it fetches the provenance and binds the
+# subject digest structurally — but reports `verification-unavailable`, never
+# `verified`: a missing, invalid, or unverifiable attestation is provenance
+# evidence, never an auto-allow. When the MSRV allows it, add the `dep:sigstore-*`
+# block here (e.g. `sigstore-attestations = ["dep:sigstore-verify",
+# "dep:sigstore-trust-root", "dep:sigstore-types"]`).
+sigstore-attestations = []
 
 [dependencies]
 tirith-core = { workspace = true }
