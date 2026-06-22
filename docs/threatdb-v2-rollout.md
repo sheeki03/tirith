@@ -73,11 +73,15 @@ To roll back, FIRST disable v2 publishing, then remove the published artifacts:
 1. Set the repository variable `PUBLISH_V2` to `false` (Settings, then Secrets and
    variables, then Actions, then Variables). DB-D gates the v2 generate, publish,
    and commit steps on this variable, so the next cron run stops re-publishing.
-2. Cancel any in-progress or queued release/cron runs. GitHub Actions reads
+2. Cancel any release/cron run that has not yet COMPLETED (queued, in-progress,
+   waiting for deployment approval, pending, or requested). GitHub Actions reads
    repository variables at job-dispatch time, so a run already dispatched (or
-   queued) before step 1 still completes with `PUBLISH_V2=true` and would
-   re-publish v2, silently undoing steps 3 and 4. List and cancel them first:
-   `gh run list --workflow threatdb.yml --json databaseId,status --jq '.[] | select(.status=="in_progress" or .status=="queued") | .databaseId'`, then `gh run cancel <id>` for each.
+   queued, or held `waiting` for an environment reviewer) before step 1 still
+   completes with `PUBLISH_V2=true` and would re-publish v2, silently undoing
+   steps 3 and 4 — a `waiting` run re-publishes the moment a reviewer approves
+   it. Filter on "not completed" rather than an allowlist of states, so no
+   non-terminal status is missed. List and cancel them first:
+   `gh run list --workflow threatdb.yml --json databaseId,status --jq '.[] | select(.status != "completed") | .databaseId'`, then `gh run cancel <id>` for each.
 3. Delete the rolling-release v2 asset(s). The shell does NOT expand `*.dat` against a
    remote release (no local file matches the glob), and `gh release delete-asset` takes
    an EXACT asset name, so resolve the names first, then delete each:
