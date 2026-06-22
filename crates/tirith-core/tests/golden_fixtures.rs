@@ -778,6 +778,8 @@ const ALL_RULE_IDS: &[&str] = &[
     "native_import_execution_chain",
     // B8 + DB-D artifact/member known-malicious hash match (feature-gated)
     "artifact_known_malicious",
+    // B8 wheel structural rejection (synthesized by package inspect, not the engine)
+    "wheel_structurally_rejected",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1047,6 +1049,11 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // PATTERN_TABLE entry and no fixture. Covered by the feature-gated emission
     // seam in `artifact/correlate.rs` once DB-B ships.
     "artifact_known_malicious",
+    // B8: `wheel_structurally_rejected` is synthesized by `tirith package inspect` for a
+    // structurally rejected wheel (path traversal, encrypted member, CRC mismatch,
+    // duplicate-path collision). It is triggered by artifact inspection at the CLI, not by
+    // the engine over a fixture string, so it has no PATTERN_TABLE entry and no fixture.
+    "wheel_structurally_rejected",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1322,6 +1329,8 @@ rule_id_variant_registry! {
     NativeImportExecutionChain,
     // Artifact/member known-malicious hash match (B8 + DB-D, feature-gated)
     ArtifactKnownMalicious,
+    // Wheel structurally rejected by the hardened reader (B8, externally triggered)
+    WheelStructurallyRejected,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is

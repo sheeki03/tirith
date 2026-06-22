@@ -2794,3 +2794,13 @@ examples_good = ["a wheel whose hash and member hashes match no known-malicious 
 false_positive_guidance = "A known-malicious hash match is exact, so a false positive means the database itself is wrong; report a mistaken record to the feed maintainer rather than suppressing the rule."
 remediation = "Do not install or run the artifact. Remove it from caches and mirrors, identify how it entered the supply chain, and rotate any credentials that may have been exposed to it. Pull the dependency only from a trusted source after confirming a clean hash."
 mitre_id = "T1195"
+
+[[rule]]
+id = "wheel_structurally_rejected"
+title = "A wheel was structurally rejected by the hardened archive reader"
+category = "ecosystem"
+severity_rationale = "High, mapping to block: the hardened wheel reader rejects an archive for a hard structural fault - a path-traversal member name, an encrypted member, a CRC mismatch, or a duplicate-path collision - any of which means the artifact cannot be safely trusted or installed. These faults do not occur in well-formed wheels from a trusted build, so a rejection is a strong tamper or attack signal rather than a benign packaging quirk."
+description = "Synthesized by `tirith package inspect` (not by the engine over a string fixture, so it has no PATTERN_TABLE entry and is in EXTERNALLY_TRIGGERED_RULES) whenever the hardened archive reader marks a member structurally rejected. The reader rejects a member whose name escapes the archive root via `..` or an absolute path (a path-traversal install primitive), an encrypted member whose bytes cannot be inspected, a member whose decompressed bytes fail their stored CRC (tampering), and two members that collide on the same normalized path (a shadowing primitive). Because these faults produce no B5/B6/B7 signal on their own, the rejection is surfaced as this finding carrying the reader's violation detail strings, so a consumer that gates on the findings list - not only the action or exit code - still sees the block."
+false_positive_guidance = "A wheel built by a normal toolchain from a trusted source does not contain a path-traversal member, an encrypted member, a CRC mismatch, or a duplicate path, so a rejection is not expected for legitimate artifacts. If an in-house build legitimately trips one of these (rare), fix the build rather than allowlisting it; a path-traversal or duplicate-path member should never ship."
+remediation = "Do not install or extract the wheel. Treat it as tampered or malicious: identify how it entered the supply chain, remove it from caches and mirrors, and pull the dependency only from a trusted source after confirming a clean, well-formed artifact."
+mitre_id = "T1195"

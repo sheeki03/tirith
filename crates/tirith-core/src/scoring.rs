@@ -343,7 +343,10 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::NativeImportExecutionChain
         // B8 + DB-D: artifact/member known-malicious hash match — a structural
         // artifact verdict (feature-gated), not a reputation/threat-intel score.
-        | RuleId::ArtifactKnownMalicious => false,
+        | RuleId::ArtifactKnownMalicious
+        // B8: a wheel structurally rejected by the hardened reader — a structural
+        // artifact verdict, not a threat-DB indicator.
+        | RuleId::WheelStructurallyRejected => false,
     }
 }
 

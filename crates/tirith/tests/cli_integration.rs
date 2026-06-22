@@ -15951,6 +15951,17 @@ fn package_inspect_rejected_wheel_does_not_pass_as_allow() {
         json["artifacts"][0]["rejected"], true,
         "the artifact must be marked rejected: {json}"
     );
+    // The rejection is ALSO a top-level finding, so a CI consumer gating on `findings`
+    // length (not only `action`/exit/the nested `rejected` field) still blocks it.
+    let findings = json["findings"].as_array().expect("findings array");
+    assert!(
+        !findings.is_empty(),
+        "a rejected wheel must surface at least one finding; got: {json}"
+    );
+    assert!(
+        json.to_string().contains("wheel_structurally_rejected"),
+        "the synthetic WheelStructurallyRejected finding must appear in findings; got: {json}"
+    );
 }
 
 #[test]

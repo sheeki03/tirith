@@ -811,6 +811,15 @@ pub enum RuleId {
     /// NO fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`. Critical severity
     /// (whence the action is Block).
     ArtifactKnownMalicious,
+    /// A wheel/archive STRUCTURALLY REJECTED by the hardened reader (a path-traversal
+    /// entry, an encrypted member, a CRC mismatch, or a duplicate-path collision) - a hard
+    /// fault the B5/B6/B7 signal correlation does not surface as a finding. `package
+    /// inspect` synthesizes this finding (carrying the violation detail strings) for a
+    /// rejected artifact so the `findings` array is non-empty whenever the action is Block
+    /// due to a rejection (a CI consumer gating on `findings.length` must not pass a
+    /// path-traversal wheel). Triggered by artifact inspection, not a PATTERN_TABLE string,
+    /// so it lives in `EXTERNALLY_TRIGGERED_RULES` with no fixture. High severity.
+    WheelStructurallyRejected,
 }
 
 impl fmt::Display for RuleId {

@@ -251,12 +251,30 @@ fn inspect_artifacts(paths: &[PathBuf], json: bool) -> i32 {
     );
 
     // A structurally REJECTED artifact (path traversal, duplicate-path collision, an
-    // encrypted member) is a hard archive violation that `all_findings` (B5/B6/B7 signal
-    // correlation) does NOT see. It must NOT pass as `allow` / exit 0, or a CI consumer
-    // keying off the exit code or the JSON `action` would pass a path-traversal wheel that
-    // the human output already flags `[REJECTED]`. Force Block.
-    if set.members.iter().any(|m| m.inspected.rejected) {
+    // encrypted member, a CRC mismatch) is a hard archive violation that `all_findings`
+    // (B5/B6/B7 signal correlation) does NOT see. Force Block AND synthesize a
+    // WheelStructurallyRejected finding (carrying the violation details) for each rejected
+    // member, so `findings` is non-empty whenever the action is Block due to a rejection:
+    // a CI consumer gating on `findings.length` (not only the action, exit code, or the
+    // nested `rejected`/`violations` fields) must not pass a path-traversal wheel.
+    for m in set.members.iter().filter(|m| m.inspected.rejected) {
         verdict.action = Action::Block;
+        let detail = if m.inspected.violation_details.is_empty() {
+            "structural archive violation".to_string()
+        } else {
+            m.inspected.violation_details.join("; ")
+        };
+        verdict.findings.push(tirith_core::verdict::Finding {
+            rule_id: tirith_core::verdict::RuleId::WheelStructurallyRejected,
+            severity: tirith_core::verdict::Severity::High,
+            title: "Wheel structurally rejected".to_string(),
+            description: format!("{}: {}", m.path.display(), detail),
+            evidence: Vec::new(),
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
     }
 
     // The verdict's own exit code, computed up front so a write failure can preserve it.
