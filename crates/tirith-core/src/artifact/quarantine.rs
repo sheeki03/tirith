@@ -253,9 +253,22 @@ impl QuarantineStore {
             });
         }
         let final_path = self.blob_path(&expected);
-        // Idempotent fast path: an already-published blob is immutable, so if the
-        // content-addressed name exists we trust it (its name IS its verified
-        // hash) and skip the rewrite. A later install re-hashes regardless.
+        // Idempotent fast path: an already-published blob is immutable (it was
+        // written `0o400` and hardened by `harden_file_perms_immutable` on first
+        // ingest), so if the content-addressed name exists we trust it by name --
+        // the filename IS the verified hash -- and skip the rewrite WITHOUT
+        // re-hashing here.
+        //
+        // LOAD-BEARING INVARIANT (do not relax): this fast path is safe ONLY
+        // because every consumer re-hashes the blob from a FRESH no-follow handle
+        // before it uses or installs the bytes. The two reaching sites:
+        //   * `crate::artifact::firewall` re-hashes each blob immediately before
+        //     evaluation and fails closed (`ArtifactDownloadIntegrityMismatch`,
+        //     T1565) if it does not reproduce the approved digest.
+        //   * `Self::materialize_blob` streams the blob through a no-follow handle
+        //     and re-hashes before publishing the install copy.
+        // If a future caller installs directly off `blob_path` without that
+        // re-hash, move the verification here (re-hash on this branch) instead.
         if final_path.is_file() {
             return Ok(expected);
         }

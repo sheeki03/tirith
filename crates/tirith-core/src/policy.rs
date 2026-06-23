@@ -1806,11 +1806,29 @@ impl Policy {
     }
 
     /// Get severity override for a rule.
+    ///
+    /// This is the SINGLE chokepoint every override call site reads through
+    /// (engine, escalation, install_txn, session warnings, scoring), so the
+    /// floor below applies uniformly and cannot be bypassed by editing one site.
+    ///
+    /// Floor: for an integrity / reputation / malicious-supply-chain rule
+    /// ([`RuleId::has_severity_floor`]), the override may RAISE severity but must
+    /// not LOWER it below [`Severity::High`]. Tamper- and known-bad detection
+    /// cannot be silently downgraded to Warn: a Warn would let `is_block()` be
+    /// false and the firewall / install transaction run on unapproved or
+    /// malicious bytes. An override at or above High (or one that raises to
+    /// Critical) is honored unchanged; an override below High for a floored rule
+    /// is clamped up to High. This holds for EVERY policy scope (user, org, and
+    /// repo), because the clamp lives in the method, not at the call sites.
     pub fn severity_override(&self, rule_id: &RuleId) -> Option<Severity> {
         let key = serde_json::to_value(rule_id)
             .ok()
             .and_then(|v| v.as_str().map(String::from))?;
-        self.severity_overrides.get(&key).copied()
+        let sev = self.severity_overrides.get(&key).copied()?;
+        if rule_id.has_severity_floor() && sev < Severity::High {
+            return Some(Severity::High);
+        }
+        Some(sev)
     }
 
     /// **M11 ch5** — merge incident-mode runtime overrides in place. On an
@@ -3491,6 +3509,111 @@ custom_rules:
         // incident pointing at this now-deleted tempdir.
         let _ = crate::incident::stop_at(&flag);
         crate::incident::invalidate_cache();
+    }
+
+    // ----------------------------- I1 severity floor -----------------------
+
+    /// I1: a policy cannot downgrade a floored integrity/malicious rule below
+    /// High via `severity_overrides`. An override of `medium` or `low` for
+    /// `ArtifactDownloadIntegrityMismatch` must still read back as `High` (so it
+    /// maps to Block), keeping a tampered install from proceeding as a mere Warn.
+    #[test]
+    fn severity_override_floors_integrity_rule_to_high() {
+        let rule = RuleId::ArtifactDownloadIntegrityMismatch;
+        for hostile in [Severity::Medium, Severity::Low, Severity::Info] {
+            let mut policy = Policy::default();
+            policy.severity_overrides.insert(rule_key(&rule), hostile);
+            assert_eq!(
+                policy.severity_override(&rule),
+                Some(Severity::High),
+                "a {hostile:?} override of a floored rule must clamp up to High"
+            );
+            // And the clamped severity must derive Block, not Warn.
+            let finding = crate::verdict::Finding {
+                rule_id: rule,
+                severity: policy.severity_override(&rule).unwrap(),
+                title: String::new(),
+                description: String::new(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            };
+            assert_eq!(
+                crate::verdict::action_from_findings(std::slice::from_ref(&finding)),
+                crate::verdict::Action::Block,
+                "the floored severity must map to Block"
+            );
+        }
+    }
+
+    /// I1: the floor applies to EVERY rule in the floored set, at every scope
+    /// (the clamp lives in `severity_override`, not at a call site, so scope is
+    /// irrelevant — we assert the set membership the floor keys on).
+    #[test]
+    fn severity_override_floors_every_floored_rule() {
+        for rule in [
+            RuleId::ArtifactKnownMalicious,
+            RuleId::ArtifactDownloadIntegrityMismatch,
+            RuleId::PythonStartupHookCrossRuntime,
+            RuleId::NativeImportExecutionChain,
+        ] {
+            assert!(
+                rule.has_severity_floor(),
+                "{rule:?} must be in the severity-floor set"
+            );
+            let mut policy = Policy::default();
+            policy
+                .severity_overrides
+                .insert(rule_key(&rule), Severity::Low);
+            assert_eq!(
+                policy.severity_override(&rule),
+                Some(Severity::High),
+                "{rule:?} must be floored to High"
+            );
+        }
+    }
+
+    /// I1: the floor only blocks LOWERING past High — an override that RAISES a
+    /// floored rule to Critical is still honored unchanged.
+    #[test]
+    fn severity_override_floor_still_honors_raise_to_critical() {
+        let rule = RuleId::ArtifactDownloadIntegrityMismatch;
+        let mut policy = Policy::default();
+        policy
+            .severity_overrides
+            .insert(rule_key(&rule), Severity::Critical);
+        assert_eq!(
+            policy.severity_override(&rule),
+            Some(Severity::Critical),
+            "a floored rule may still be RAISED to Critical"
+        );
+        // An override exactly at the floor is passed through unchanged.
+        policy
+            .severity_overrides
+            .insert(rule_key(&rule), Severity::High);
+        assert_eq!(policy.severity_override(&rule), Some(Severity::High));
+    }
+
+    /// I1: a NON-floored rule still downgrades normally — the floor must not leak
+    /// to ordinary rules. `CurlPipeShell` lowered to `Low` reads back as `Low`.
+    #[test]
+    fn severity_override_does_not_floor_unfloored_rule() {
+        let rule = RuleId::CurlPipeShell;
+        assert!(
+            !rule.has_severity_floor(),
+            "CurlPipeShell must NOT be floored"
+        );
+        let mut policy = Policy::default();
+        policy
+            .severity_overrides
+            .insert(rule_key(&rule), Severity::Low);
+        assert_eq!(
+            policy.severity_override(&rule),
+            Some(Severity::Low),
+            "a non-floored rule must downgrade as before"
+        );
     }
 
     // ----------------------------- F9 sanitize exhaustiveness tripwire -----

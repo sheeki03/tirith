@@ -385,7 +385,17 @@ impl ArtifactScanReceipt {
     /// ([`crate::audit::canonical_json_for_hash`]) so the hash a receipt advertises
     /// is exactly what the chain anchor records.
     pub fn compute_content_hash(&self) -> String {
-        let mut value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        let serialized = serde_json::to_value(self);
+        // A derive-`Serialize` receipt cannot fail to serialize today, so the
+        // `Null` fallback is unreachable. Guard it: a future non-serializable
+        // field would otherwise silently hash `null` (a constant), collapsing
+        // every receipt id to the same value. Caught in tests/debug; release
+        // keeps the lenient fallback rather than panicking on the hash path.
+        debug_assert!(
+            serialized.is_ok(),
+            "receipt failed to serialize for content hash; a field is not serializable"
+        );
+        let mut value = serialized.unwrap_or(serde_json::Value::Null);
         if let Some(obj) = value.as_object_mut() {
             obj.insert(
                 "receipt_id".to_string(),

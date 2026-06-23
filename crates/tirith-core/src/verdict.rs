@@ -855,6 +855,30 @@ pub enum RuleId {
     ArtifactReleaseAnomaly,
 }
 
+impl RuleId {
+    /// Whether this rule's severity has a HIGH floor that a policy
+    /// `severity_overrides` entry may not drop below.
+    ///
+    /// These are the integrity / reputation / malicious-supply-chain findings
+    /// where a downgrade would let a tampered or known-bad install proceed: an
+    /// override that lowered the severity below [`Severity::High`] would map the
+    /// finding to Warn (via [`action_from_findings`]), `is_block()` would be
+    /// false, and the firewall / install transaction would run on unapproved or
+    /// malicious bytes. The override may still RAISE severity (e.g. to Critical);
+    /// the floor only blocks lowering it past High. Enforced at the single
+    /// chokepoint [`crate::policy::Policy::severity_override`], so it applies
+    /// regardless of policy scope (user, org, and repo are all floored).
+    pub const fn has_severity_floor(&self) -> bool {
+        matches!(
+            self,
+            RuleId::ArtifactKnownMalicious
+                | RuleId::ArtifactDownloadIntegrityMismatch
+                | RuleId::PythonStartupHookCrossRuntime
+                | RuleId::NativeImportExecutionChain
+        )
+    }
+}
+
 impl fmt::Display for RuleId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = serde_json::to_value(self)
