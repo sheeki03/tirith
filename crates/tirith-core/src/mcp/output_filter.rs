@@ -736,9 +736,7 @@ pub fn sanitize_structured_content(v: &mut serde_json::Value) {
 fn apply_block(result: &mut ToolCallResult, event_id: &str) {
     result.content = vec![ContentItem {
         content_type: "text".to_string(),
-        text: format!(
-            "[tirith: tool output blocked \u{2014} see audit log entry {event_id} for details]"
-        ),
+        text: format!("[tirith: tool output blocked - see audit log entry {event_id} for details]"),
     }];
     // Drop structured output too — it can carry the same taint and would
     // otherwise pass through raw on a Block (F10).
@@ -753,7 +751,7 @@ fn apply_warn(result: &mut ToolCallResult, event_id: &str, findings: &[Finding])
     let warning = ContentItem {
         content_type: "text".to_string(),
         text: format!(
-            "[tirith: WARNING \u{2014} {n} finding{plural}; see audit log entry {event_id}]",
+            "[tirith: WARNING: {n} finding{plural}; see audit log entry {event_id}]",
             plural = if n == 1 { "" } else { "s" }
         ),
     };

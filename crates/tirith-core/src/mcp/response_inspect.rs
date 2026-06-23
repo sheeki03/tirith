@@ -185,6 +185,14 @@ pub fn inspect_response(
         collect_blob_violations(result, &mut violations);
     }
 
+    // CR1: the same offending URL can be reached by both the canonical typed /
+    // descriptor screen AND the generic `metadata_uri_ssrf` pass (which now also
+    // screens `uri`/`uriTemplate` keys, so a `uri` on a non-typed object or in a
+    // `tools/list` is no longer skipped by nothing). Collapse those so a URL
+    // screened canonically is not ALSO emitted as `metadata_uri_ssrf`, and drop
+    // exact duplicates, keeping the canonical, single-violation contract.
+    dedup_violations(&mut violations);
+
     // Any non-RuleId violation forces a Block: an SSRF resource_link or a
     // MIME-spoofed blob must never be forwarded, even if the text scan was clean.
     if !violations.is_empty() {
@@ -267,8 +275,10 @@ fn collect_uri_violations(result: &Value, kind: ResponseKind, out: &mut Vec<Resp
 /// malicious server) tucks into a non-typed key — a `callbackUrl`, an `iconUrl`,
 /// a `prompts/get` extension field — does not slip past with only the text
 /// scanner (which never runs the URL validator). The typed `uri` fields keep
-/// their canonical codes; the generic pass skips exactly those already-screened
-/// `uri` fields so no URL is double-emitted.
+/// their canonical codes; the generic pass (CR1) ALSO screens `uri`/`uriTemplate`
+/// keys, so a `uri` on a non-typed object or in a `tools/list` is no longer
+/// screened by nothing, and `dedup_violations` collapses the canonical+generic
+/// pair for a genuinely typed `uri` so no URL is double-emitted.
 fn walk_for_resource_uris(v: &Value, out: &mut Vec<ResponseViolation>) {
     match v {
         Value::Object(map) => {
@@ -290,20 +300,19 @@ fn walk_for_resource_uris(v: &Value, out: &mut Vec<ResponseViolation>) {
                 }
                 _ => {}
             }
-            // C3 generic pass: screen every OTHER string leaf in this object that
-            // parses as an http(s) URL. The canonically-coded URI fields (`uri` on
-            // a content block / resource descriptor / read content, and a
-            // `uriTemplate`) are owned by the typed arm above or the kind-specific
-            // descriptor screen in `collect_uri_violations`, so they are skipped
-            // here to avoid emitting two violations for the same URL. Everything
-            // else — a `callbackUrl`, an `iconUrl`/`icons[].src`, any custom or
-            // future extension field — reaches the same SSRF validator under
-            // `metadata_uri_ssrf`, closing the gap where such a field previously
-            // saw only the text scanner (which never runs the URL validator).
-            for (key, child) in map {
-                if key == "uri" || key == "uriTemplate" {
-                    continue;
-                }
+            // C3/CR1 generic pass: screen EVERY string leaf in this object that
+            // parses as an http(s) URL, including a `uri` / `uriTemplate` key.
+            // The canonically-coded URI fields are ALSO screened by the typed arm
+            // above (or the kind-specific descriptor screen in
+            // `collect_uri_violations`), but a `uri` on a NON-typed object (e.g.
+            // `tools[].annotations.uri`), nested deeper, or in a `tools/list` /
+            // `prompts/get` response is screened by NEITHER of those, so skipping
+            // it here (the pre-CR1 behavior) left an SSRF / cloud-metadata target
+            // screened by nothing. We now screen it under `metadata_uri_ssrf`;
+            // `dedup_violations` in `inspect_response` collapses the case where a
+            // URL is reached by both a canonical code and this generic pass, so a
+            // genuinely typed `uri` still yields exactly its canonical violation.
+            for child in map.values() {
                 if let Some(s) = child.as_str() {
                     screen_http_string(s, out);
                 }
@@ -321,6 +330,40 @@ fn walk_for_resource_uris(v: &Value, out: &mut Vec<ResponseViolation>) {
     }
 }
 
+/// CR1: collapse duplicate URI violations so one offending URL yields one
+/// violation, preferring the canonical code over the generic `metadata_uri_ssrf`.
+///
+/// The generic pass now also screens `uri` / `uriTemplate` keys (so a `uri` on a
+/// non-typed object or in a `tools/list` no longer slips past every screen), which
+/// means a genuinely typed `uri` can be reported twice: once under its canonical
+/// code (`resource_link_ssrf`, `resource_descriptor_ssrf`, …) and once under
+/// `metadata_uri_ssrf`. Both go through the SAME `validate_fetch_url(uri)`, so for
+/// one URL the two entries share an identical `detail` and differ only in `code`.
+/// We therefore: (1) drop any `metadata_uri_ssrf` whose `detail` also appears under
+/// a non-generic code, then (2) drop exact `(code, detail)` duplicates, order
+/// preserved. A forbidden-scheme URL never reaches the generic pass (it screens
+/// only http(s)), so its single canonical violation is untouched.
+fn dedup_violations(violations: &mut Vec<ResponseViolation>) {
+    // Details that already have a canonical (non-generic) violation. Owned so the
+    // immutable borrow of `violations` ends before the `retain` below.
+    let canonical_details: std::collections::HashSet<String> = violations
+        .iter()
+        .filter(|v| v.code != "metadata_uri_ssrf")
+        .map(|v| v.detail.clone())
+        .collect();
+
+    let mut seen: std::collections::HashSet<(&'static str, String)> =
+        std::collections::HashSet::new();
+    violations.retain(|v| {
+        // Drop a generic violation shadowed by a canonical one for the same URL.
+        if v.code == "metadata_uri_ssrf" && canonical_details.contains(v.detail.as_str()) {
+            return false;
+        }
+        // Drop exact duplicates (same code + same detail).
+        seen.insert((v.code, v.detail.clone()))
+    });
+}
+
 /// C3: screen one string leaf ONLY if it parses as an http(s) URL, under the
 /// generic `metadata_uri_ssrf` code (a URL in a non-typed/custom field). Non-URL
 /// strings and non-http schemes are ignored here — a forbidden non-http scheme in
@@ -329,9 +372,18 @@ fn walk_for_resource_uris(v: &Value, out: &mut Vec<ResponseViolation>) {
 /// `file://` / `data:` rejection. This keeps the broadened screen focused on the
 /// gap it closes: network-fetchable metadata / SSRF targets hidden outside the
 /// modeled URI fields.
+///
+/// An http(s) string carrying an RFC 6570 expansion (`{var}`) is an unexpanded
+/// URI TEMPLATE, not a resolvable URL, running it through the SSRF validator
+/// would spuriously fail to resolve the literal `{var}` host. The generic pass now
+/// also reaches `uri` / `uriTemplate` keys (CR1), so it must mirror the
+/// `uriTemplate` template skip the kind-specific descriptor screen already applies.
 fn screen_http_string(s: &str, out: &mut Vec<ResponseViolation>) {
     let lower = s.trim().to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
+        if s.contains('{') {
+            return;
+        }
         screen_uri(s, "metadata_uri_ssrf", out);
     }
 }
@@ -901,6 +953,35 @@ mod tests {
             codes,
             vec!["resource_link_ssrf"],
             "typed uri must be a single canonical violation, not double-emitted: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_uri_in_tool_annotations_blocks() {
+        // CR1 regression: a `uri` key on a NON-typed object (here
+        // `tools[].annotations`, not a `resource_link`/`resource` block, and on a
+        // `tools/list` surface that has no kind-specific `uri` descriptor screen)
+        // used to be skipped by the generic pass and screened by nothing -> Allow.
+        // It must now be screened under `metadata_uri_ssrf` and block.
+        let result = json!({
+            "tools": [{
+                "name": "weather",
+                "description": "Look up the weather.",
+                "inputSchema": {"type": "object"},
+                "annotations": { "uri": "http://169.254.169.254/latest/meta-data/iam/security-credentials/" }
+            }]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ToolsList, &ctx());
+        assert!(
+            outcome.is_block(),
+            "a metadata `uri` in tools[].annotations must block: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .violations
+                .iter()
+                .any(|v| v.code == "metadata_uri_ssrf"),
+            "the annotations.uri must be flagged under metadata_uri_ssrf: {outcome:?}"
         );
     }
 
