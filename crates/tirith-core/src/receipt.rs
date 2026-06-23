@@ -428,6 +428,13 @@ impl ArtifactScanReceipt {
     /// unsigned case a failed anchor degrades to a saved-but-unanchored receipt
     /// (`signed: false`), like a disabled chain, so a platform that cannot take the
     /// audit-log lock (Windows) still produces a receipt rather than blocking install.
+    ///
+    /// When a signature is mandatory, "logging is off" (`TIRITH_LOG=0`, the anchor is
+    /// [`crate::audit::ReceiptAnchor::Skipped`]) is ALSO fail-closed: even with a
+    /// signing key present, a `pkg install` that asked for a signed, anchored receipt
+    /// must not accept a config that anchors and signs nothing. Only the
+    /// `require_signature = false` path treats `Skipped` as an acceptable
+    /// (unsigned/unanchored) outcome.
     pub fn record(&self, require_signature: bool) -> Result<RecordedReceipt, ReceiptError> {
         // Fail closed BEFORE writing anything if a signature is mandatory but
         // unavailable: a `pkg install` that asked for a signed receipt must not get
@@ -457,9 +464,21 @@ impl ArtifactScanReceipt {
                 signed,
                 anchor_warning: None,
             }),
-            // No chain at all (logging off). The file is saved; report it as
-            // unsigned/unanchored so the caller does not over-claim tamper-evidence.
-            // This is a deliberate config choice, NOT a failure, so no anchor_warning.
+            // No chain at all (logging off). When a SIGNED anchor is mandatory this is
+            // fatal: "logging is off" is not an acceptable reason to skip the chain a
+            // `pkg install` demanded. The signing key may be present (so the key-absence
+            // gate above passed), yet with `TIRITH_LOG=0` nothing is anchored or signed,
+            // and the caller would otherwise print "tamper-evident" + exit 0 over an
+            // unsigned, unanchored receipt. Fail closed instead, mirroring the
+            // key-absent refusal. (The file was already saved above; it is left on disk
+            // but the install does NOT succeed.)
+            crate::audit::ReceiptAnchor::Skipped if require_signature => {
+                Err(ReceiptError::SignatureRequiredButUnavailable)
+            }
+            // No chain at all (logging off) and a signature is NOT mandatory. The file is
+            // saved; report it as unsigned/unanchored so the caller does not over-claim
+            // tamper-evidence. This is a deliberate config choice, NOT a failure, so no
+            // anchor_warning.
             crate::audit::ReceiptAnchor::Skipped => Ok(RecordedReceipt {
                 path,
                 signed: false,
@@ -770,6 +789,70 @@ mod tests {
         assert!(!a.content_hash_matches());
     }
 
+    /// TG5: every SECURITY-relevant field must be inside the content-hash preimage,
+    /// so a future `#[serde(skip)]` (or a tamperer flipping just that field) is
+    /// caught by the receipt id. We mutate each in isolation from a fresh sample and
+    /// assert the recomputed content hash diverges from the original id and that
+    /// `content_hash_matches()` then reports the edit. Covers the verdict ACTION
+    /// (Block->Allow), the fired RULE IDS, and the capsule coverage's
+    /// `network_raw_denied` flag (the deny-by-default network attestation).
+    #[test]
+    fn receipt_content_hash_covers_security_relevant_fields() {
+        // verdict.action: a Block downgraded to Allow must change the hash.
+        {
+            let mut r = sample_receipt();
+            let original = r.receipt_id.clone();
+            assert_eq!(r.verdict.action, "Allow");
+            r.verdict.action = "Block".to_string();
+            assert_ne!(
+                r.compute_content_hash(),
+                original,
+                "flipping verdict.action (Allow<->Block) must change the content hash"
+            );
+            assert!(
+                !r.content_hash_matches(),
+                "a mutated verdict.action with a stale id must be detected as edited"
+            );
+        }
+
+        // verdict.rule_ids: dropping (or adding) a fired rule must change the hash.
+        {
+            // Start from a receipt that actually carries a fired rule, then drop it.
+            let mut r = sample_receipt();
+            r.verdict.rule_ids = vec!["WheelStructurallyRejected".to_string()];
+            r.receipt_id = r.compute_content_hash();
+            let with_rule = r.receipt_id.clone();
+            r.verdict.rule_ids.clear(); // drop the fired rule
+            assert_ne!(
+                r.compute_content_hash(),
+                with_rule,
+                "dropping a fired rule id must change the content hash"
+            );
+            assert!(
+                !r.content_hash_matches(),
+                "a mutated verdict.rule_ids with a stale id must be detected as edited"
+            );
+        }
+
+        // capsule.coverage.network_raw_denied: flipping the raw-net-deny attestation
+        // (true->false) must change the hash.
+        {
+            let mut r = sample_receipt();
+            let original = r.receipt_id.clone();
+            assert!(r.capsule.coverage.network_raw_denied);
+            r.capsule.coverage.network_raw_denied = false;
+            assert_ne!(
+                r.compute_content_hash(),
+                original,
+                "flipping capsule.coverage.network_raw_denied must change the content hash"
+            );
+            assert!(
+                !r.content_hash_matches(),
+                "a mutated capsule coverage flag with a stale id must be detected as edited"
+            );
+        }
+    }
+
     #[test]
     fn receipt_roundtrips_through_json() {
         let r = sample_receipt();
@@ -945,6 +1028,144 @@ mod tests {
         assert!(
             !saved.exists(),
             "no receipt file may be saved when the mandatory signature is unavailable"
+        );
+    }
+
+    /// Write a 32-byte ed25519 signing key the way an operator must (0600,
+    /// owner-only) so `audit_signing_available()` accepts it under the isolated
+    /// config dir. A plain `fs::write` lands at the process umask (often 0644 =
+    /// group/other-readable), which the audit signing-key gate correctly refuses.
+    #[cfg(unix)]
+    fn plant_signing_key(config_dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(config_dir).unwrap();
+        let key = config_dir.join("audit-signing.key");
+        std::fs::write(&key, [7u8; 32]).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// IM1 (fail-open fix): a mandatory-signature install must NOT silently downgrade
+    /// to "unsigned, success" when `TIRITH_LOG=0`. With the signing KEY present (so
+    /// the key-absence gate passes) but logging OFF, the anchor is `Skipped` (nothing
+    /// is anchored OR signed); `record(true)` must therefore fail closed with
+    /// `SignatureRequiredButUnavailable`, exactly like the key-absent case, rather
+    /// than returning `Ok(signed: false)`.
+    #[cfg(unix)]
+    #[test]
+    fn record_fails_closed_when_signature_required_but_logging_off() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _guards = isolate_dirs(root.path());
+        // config_dir() == data_dir() == <root>/tirith under the isolated XDG vars.
+        let tirith_dir = root.path().join("tirith");
+        plant_signing_key(&tirith_dir);
+        // Logging OFF -> the receipt anchor is Skipped.
+        let _log = EnvGuard {
+            key: "TIRITH_LOG",
+            prev: std::env::var_os("TIRITH_LOG"),
+        };
+        std::env::set_var("TIRITH_LOG", "0");
+
+        // Sanity: the signing key IS available (so this is NOT the key-absent path).
+        assert!(
+            crate::audit::audit_signing_available(),
+            "the planted signing key must be accepted so we exercise the Skipped-under-mandatory \
+             path, not the key-absent path"
+        );
+
+        let r = sample_receipt();
+        let err = r.record(true).expect_err(
+            "a mandatory-signature install must fail closed when logging is off (anchor Skipped), \
+             never downgrade to an unsigned success",
+        );
+        assert!(
+            matches!(err, ReceiptError::SignatureRequiredButUnavailable),
+            "logging-off under a mandatory signature must map to SignatureRequiredButUnavailable, \
+             got {err:?}"
+        );
+    }
+
+    /// IM1 negative control: with the SAME logging-off config but
+    /// `require_signature = false`, `Skipped` stays an acceptable
+    /// unsigned/unanchored success (no behavior change for the non-mandatory path).
+    #[cfg(unix)]
+    #[test]
+    fn record_skipped_is_ok_unsigned_when_signature_not_required() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _guards = isolate_dirs(root.path());
+        let _log = EnvGuard {
+            key: "TIRITH_LOG",
+            prev: std::env::var_os("TIRITH_LOG"),
+        };
+        std::env::set_var("TIRITH_LOG", "0");
+
+        let r = sample_receipt();
+        let recorded = r
+            .record(false)
+            .expect("logging-off with no mandatory signature is an acceptable unsigned record");
+        assert!(recorded.path.exists(), "the receipt file is still saved");
+        assert!(!recorded.signed, "a skipped anchor is not signed");
+        assert!(
+            recorded.anchor_warning.is_none(),
+            "a deliberately-disabled chain is NOT a failure, so it carries no anchor_warning"
+        );
+    }
+
+    /// TG3: drive the `ReceiptAnchor::Failed -> anchor_warning: Some(_)` degrade that
+    /// the unsigned (Windows audit-log-lock) case relies on. We force a REAL append
+    /// failure by putting a DIRECTORY where the audit log file must be opened: the
+    /// append `open()` then fails (EISDIR), so the anchor is `Failed`. With
+    /// `require_signature = false` this degrades to a saved-but-unanchored receipt
+    /// (the file exists, `!signed`, and `anchor_warning` is set) instead of a hard
+    /// failure. Unix-only: the deterministic directory-at-path failure and the
+    /// audit-log lock semantics are a unix construction.
+    #[cfg(unix)]
+    #[test]
+    fn record_degrades_to_anchor_warning_when_chain_append_fails() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _guards = isolate_dirs(root.path());
+        // Keep logging ON so the anchor is attempted (not Skipped).
+        let _log = EnvGuard {
+            key: "TIRITH_LOG",
+            prev: std::env::var_os("TIRITH_LOG"),
+        };
+        std::env::set_var("TIRITH_LOG", "1");
+
+        // Put a DIRECTORY at the audit log path so the append open() fails (EISDIR)
+        // -> AuditWrite::Failed -> ReceiptAnchor::Failed.
+        let log_path = crate::audit::audit_log_path().expect("log path under isolated dir");
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::create_dir_all(&log_path).unwrap();
+        assert!(
+            log_path.is_dir(),
+            "the log path must be a directory to force the append failure"
+        );
+
+        let r = sample_receipt();
+        // require_signature=false: a failed anchor degrades (saved but unanchored)
+        // rather than failing the install.
+        let recorded = r
+            .record(false)
+            .expect("an unsigned receipt with a failed anchor must still save (degraded)");
+        assert!(
+            recorded.path.exists(),
+            "the receipt file must exist even when the chain anchor failed"
+        );
+        assert!(!recorded.signed, "a failed anchor is not signed");
+        assert!(
+            recorded.anchor_warning.is_some(),
+            "a failed (non-skipped) anchor must surface an anchor_warning so the caller does not \
+             over-claim tamper-evidence"
         );
     }
 }

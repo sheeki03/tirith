@@ -741,6 +741,108 @@ fn failed_install_verdict(exit_code: i32) -> tirith_core::verdict::Verdict {
     }
 }
 
+/// The honest, redaction-safe projection of an install outcome + receipt status that
+/// both the human banner and the `--json` output are rendered from. Built purely from
+/// the outcome and the receipt record so it is unit-testable without capturing stderr
+/// (the IM7/IM8 fixes live here): the install-completed-but-not-fully-verified wording
+/// (RECORD hash mismatches / missing RECORDs) and the receipt anchor state (signed /
+/// tamper-evident / saved-but-unanchored) are decided once, here.
+struct InstallReport {
+    install_ok: bool,
+    post_blocked: bool,
+    success: bool,
+    /// RECORD-listed files whose on-disk bytes did not match (the tamper signal). A
+    /// `success` install can still carry these because a Medium
+    /// `PythonInstalledIntegrityViolation` maps to Warn under the current policy.
+    hash_mismatches: usize,
+    /// Located distributions with no RECORD file (a coverage gap).
+    records_missing: usize,
+    receipt_path: Option<String>,
+    /// Whether the receipt's audit-chain anchor was ed25519-SIGNED.
+    signed: bool,
+    /// `Some(reason)` when the receipt was SAVED but its chain anchor could NOT be
+    /// appended (the unsigned Windows degrade): the receipt is NOT tamper-evident-
+    /// chained, so the banner must not claim it is.
+    anchor_warning: Option<String>,
+    receipt_error: Option<String>,
+}
+
+impl InstallReport {
+    fn from_outcome(
+        outcome: &crate::cli::pkg_install::ContainedInstallOutcome,
+        recorded: &Result<
+            tirith_core::receipt::RecordedReceipt,
+            tirith_core::receipt::ReceiptError,
+        >,
+    ) -> Self {
+        let install_ok = outcome.exit_code == 0;
+        let post_blocked = outcome
+            .post_install
+            .as_ref()
+            .map(|p| p.is_block())
+            .unwrap_or(false);
+        let success = install_ok && !post_blocked && recorded.is_ok();
+        let hash_mismatches = outcome
+            .post_install
+            .as_ref()
+            .map(|p| p.hash_mismatches)
+            .unwrap_or(0);
+        let records_missing = outcome
+            .post_install
+            .as_ref()
+            .map(|p| p.records_missing)
+            .unwrap_or(0);
+        let (receipt_path, signed, anchor_warning, receipt_error) = match recorded {
+            Ok(r) => (
+                Some(r.path.display().to_string()),
+                r.signed,
+                r.anchor_warning.clone(),
+                None,
+            ),
+            Err(e) => (None, false, None, Some(e.to_string())),
+        };
+        InstallReport {
+            install_ok,
+            post_blocked,
+            success,
+            hash_mismatches,
+            records_missing,
+            receipt_path,
+            signed,
+            anchor_warning,
+            receipt_error,
+        }
+    }
+
+    /// Whether the post-install RECORD check found no tamper signal and no coverage
+    /// gap. Only a clean check earns the word "verified" (IM8).
+    fn record_integrity_clean(&self) -> bool {
+        self.hash_mismatches == 0 && self.records_missing == 0
+    }
+
+    fn to_json(
+        &self,
+        digest: &InstallPlanDigest,
+        outcome: &crate::cli::pkg_install::ContainedInstallOutcome,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "installed": self.install_ok,
+            "post_install_blocked": self.post_blocked,
+            "plan_digest": digest.plan_digest,
+            "exit_code": outcome.exit_code,
+            "capsule_backend": outcome.backend_id,
+            "coverage": outcome.coverage_summary,
+            "receipt_path": self.receipt_path,
+            "receipt_signed": self.signed,
+            "receipt_anchor_warning": self.anchor_warning,
+            "receipt_error": self.receipt_error,
+            "record_hash_mismatches": self.hash_mismatches,
+            "record_records_missing": self.records_missing,
+            "success": self.success,
+        })
+    }
+}
+
 /// Report the install outcome + receipt status, returning the process exit code.
 fn report_install_outcome(
     digest: &InstallPlanDigest,
@@ -748,58 +850,59 @@ fn report_install_outcome(
     recorded: Result<tirith_core::receipt::RecordedReceipt, tirith_core::receipt::ReceiptError>,
     json: bool,
 ) -> i32 {
-    let install_ok = outcome.exit_code == 0;
-    let post_blocked = outcome
-        .post_install
-        .as_ref()
-        .map(|p| p.is_block())
-        .unwrap_or(false);
-    let success = install_ok && !post_blocked && recorded.is_ok();
-
-    let (receipt_id, signed, receipt_err) = match &recorded {
-        Ok(r) => (Some(r.path.display().to_string()), r.signed, None),
-        Err(e) => (None, false, Some(e.to_string())),
-    };
+    let report = InstallReport::from_outcome(outcome, &recorded);
 
     if json {
-        let out = serde_json::json!({
-            "installed": install_ok,
-            "post_install_blocked": post_blocked,
-            "plan_digest": digest.plan_digest,
-            "exit_code": outcome.exit_code,
-            "capsule_backend": outcome.backend_id,
-            "coverage": outcome.coverage_summary,
-            "receipt_path": receipt_id,
-            "receipt_signed": signed,
-            "receipt_error": receipt_err,
-            "success": success,
-        });
+        let out = report.to_json(digest, outcome);
         let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
         println!();
-    } else if success {
-        eprintln!("tirith pkg install: install complete and verified");
+    } else if report.success {
+        // Only claim "verified" when the post-install RECORD check found no mismatch and
+        // no missing RECORD; otherwise the install completed but was NOT fully verified.
+        if report.record_integrity_clean() {
+            eprintln!("tirith pkg install: install complete and verified");
+        } else {
+            eprintln!(
+                "tirith pkg install: install completed with {} RECORD hash mismatch(es) and {} \
+                 missing RECORD(s) (not blocked under the current policy)",
+                report.hash_mismatches, report.records_missing
+            );
+        }
         eprintln!("  plan digest: {}", digest.plan_digest);
         eprintln!("  capsule:     {}", outcome.backend_id);
         eprintln!("  coverage:    {}", outcome.coverage_summary);
-        eprintln!(
-            "  receipt:     {} ({})",
-            receipt_id.as_deref().unwrap_or("<unsaved>"),
-            if signed { "signed" } else { "tamper-evident" }
-        );
+        // Word the receipt line from the REAL anchor state: signed > tamper-evident >
+        // saved-but-unanchored. An anchor_warning means the chain anchor never landed,
+        // so the receipt is not tamper-evident-chained.
+        match &report.anchor_warning {
+            Some(reason) => eprintln!(
+                "  receipt:     {} (saved but NOT audit-anchored: {reason})",
+                report.receipt_path.as_deref().unwrap_or("<unsaved>")
+            ),
+            None => eprintln!(
+                "  receipt:     {} ({})",
+                report.receipt_path.as_deref().unwrap_or("<unsaved>"),
+                if report.signed {
+                    "signed"
+                } else {
+                    "tamper-evident"
+                }
+            ),
+        }
     } else {
         eprintln!("tirith pkg install: install did NOT complete cleanly");
-        if !install_ok {
+        if !report.install_ok {
             eprintln!("  pip exit code: {}", outcome.exit_code);
         }
-        if post_blocked {
+        if report.post_blocked {
             eprintln!("  post-install RECORD verification blocked the install");
         }
-        if let Some(err) = &receipt_err {
+        if let Some(err) = &report.receipt_error {
             eprintln!("  receipt: {err}");
         }
     }
 
-    if success {
+    if report.success {
         0
     } else {
         1
@@ -1366,5 +1469,154 @@ mod tests {
         let t = InstallTarget::derive(&tools, None);
         // No --target: the interpreter prefix is the environment.
         assert_eq!(t.environment, PathBuf::from("/opt/py"));
+    }
+
+    // ── install reporting (IM7 / IM8) ───────────────────────────────────────
+
+    use tirith_core::capsule::CapsuleCoverage;
+    use tirith_core::receipt::RecordedReceipt;
+
+    /// A contained-install outcome with a clean post-install RECORD result and a given
+    /// exit code, for the reporting tests.
+    fn outcome_with_post(
+        exit_code: i32,
+        hash_mismatches: usize,
+        records_missing: usize,
+    ) -> crate::cli::pkg_install::ContainedInstallOutcome {
+        use tirith_core::artifact::install::PostInstallIntegrity;
+        use tirith_core::verdict::{Action, Timings, Verdict};
+        let verdict = Verdict {
+            // A RECORD mismatch maps to Warn (Medium, uncorroborated) -> not a Block.
+            action: Action::Warn,
+            findings: vec![],
+            tier_reached: 3,
+            timings_ms: Timings::default(),
+            bypass_requested: false,
+            bypass_honored: false,
+            bypass_available: false,
+            interactive_detected: false,
+            policy_path_used: None,
+            urls_extracted_count: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
+            escalation_reason: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
+        };
+        crate::cli::pkg_install::ContainedInstallOutcome {
+            exit_code,
+            backend_id: "landlock-seccomp",
+            coverage_summary: "fs+net+exec".to_string(),
+            coverage: CapsuleCoverage {
+                fs_read_enforced: true,
+                fs_write_enforced: true,
+                exec_limited: true,
+                network_raw_denied: true,
+                domain_proxy_enforced: false,
+                resource_limits_enforced: true,
+                env_isolated: true,
+                handles_isolated: true,
+            },
+            bound_db_sequence: 7,
+            approved_requirements_path: PathBuf::from("/q/txn/approved.txt"),
+            post_install: Some(PostInstallIntegrity {
+                verdict,
+                distributions_verified: 1,
+                distributions_not_found: 0,
+                records_missing,
+                hash_mismatches,
+            }),
+        }
+    }
+
+    /// A saved receipt record with the given signed / anchor_warning state.
+    fn recorded_ok(signed: bool, anchor_warning: Option<String>) -> RecordedReceipt {
+        RecordedReceipt {
+            path: PathBuf::from("/data/receipts/abc.json"),
+            signed,
+            anchor_warning,
+        }
+    }
+
+    #[test]
+    fn install_report_anchor_warning_is_surfaced_not_claimed_tamper_evident() {
+        // IM7: an unsigned saved-but-unanchored receipt (anchor_warning = Some) must
+        // NOT be reported as tamper-evident/chained; the warning must reach --json.
+        let outcome = outcome_with_post(0, 0, 0);
+        let recorded = Ok(recorded_ok(
+            false,
+            Some("audit log lock unavailable on this platform".to_string()),
+        ));
+        let report = InstallReport::from_outcome(&outcome, &recorded);
+        // The install still succeeds (the anchor degrade is non-fatal for unsigned).
+        assert!(report.success);
+        assert_eq!(
+            report.anchor_warning.as_deref(),
+            Some("audit log lock unavailable on this platform")
+        );
+
+        let digest = digest_with_expiry("");
+        let json = report.to_json(&digest, &outcome);
+        // The warning is surfaced in JSON, NOT dropped.
+        assert_eq!(
+            json["receipt_anchor_warning"],
+            serde_json::json!("audit log lock unavailable on this platform")
+        );
+        assert_eq!(json["receipt_signed"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn install_report_clean_signed_receipt_has_no_anchor_warning() {
+        // The normal path: a signed, fully-anchored, clean-RECORD install.
+        let outcome = outcome_with_post(0, 0, 0);
+        let recorded = Ok(recorded_ok(true, None));
+        let report = InstallReport::from_outcome(&outcome, &recorded);
+        assert!(report.success);
+        assert!(report.signed);
+        assert!(report.anchor_warning.is_none());
+        assert!(report.record_integrity_clean());
+    }
+
+    #[test]
+    fn install_report_record_mismatch_is_not_verified_but_still_succeeds() {
+        // IM8: a post-install RECORD hash mismatch is Medium -> Warn (not Block), so the
+        // install is still `success` (exit 0, behavior unchanged), but it must NOT be
+        // called "verified": the count is surfaced and record_integrity_clean() is false.
+        let outcome = outcome_with_post(0, 2, 1);
+        let recorded = Ok(recorded_ok(true, None));
+        let report = InstallReport::from_outcome(&outcome, &recorded);
+        assert!(
+            report.success,
+            "a RECORD mismatch is Warn, not Block, so the install still succeeds (unchanged)"
+        );
+        assert!(
+            !report.record_integrity_clean(),
+            "a hash mismatch / missing RECORD must disqualify the 'verified' wording"
+        );
+
+        let digest = digest_with_expiry("");
+        let json = report.to_json(&digest, &outcome);
+        assert_eq!(json["record_hash_mismatches"], serde_json::json!(2));
+        assert_eq!(json["record_records_missing"], serde_json::json!(1));
+        assert_eq!(json["success"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn install_report_receipt_error_fails_the_install() {
+        // A receipt that failed to record (e.g. mandatory signature unavailable, IM1)
+        // makes the whole install report a failure (success=false, exit 1).
+        let outcome = outcome_with_post(0, 0, 0);
+        let recorded = Err(tirith_core::receipt::ReceiptError::SignatureRequiredButUnavailable);
+        let report = InstallReport::from_outcome(&outcome, &recorded);
+        assert!(!report.success, "an unrecordable receipt fails the install");
+        assert!(report.receipt_error.is_some());
+
+        let digest = digest_with_expiry("");
+        let json = report.to_json(&digest, &outcome);
+        assert_eq!(json["success"], serde_json::json!(false));
+        assert!(json["receipt_error"].is_string());
     }
 }

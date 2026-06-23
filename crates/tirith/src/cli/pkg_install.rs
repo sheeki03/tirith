@@ -399,30 +399,84 @@ mod tests {
         }
     }
 
+    /// Write an EXECUTABLE interpreter stub at `path` (a shell script) that, IF it
+    /// ever runs, creates `sentinel` and exits 0. Used by the fail-closed test to
+    /// (a) satisfy the `interpreter.exists()` pre-check with a real `+x` file so we
+    /// pass it and reach the capsule, and (b) prove no spawn happened (the sentinel
+    /// must NOT appear). Unix-only: the `+x`-script-stub construction is unix.
+    #[cfg(unix)]
+    fn executable_stub(path: &Path, sentinel: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = format!("#!/bin/sh\ntouch '{}'\nexit 0\n", sentinel.display());
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// TG4: a GENUINELY degraded capsule under the enforcing FailClosed install path
+    /// must refuse with the specific `CapsuleRefused` BEFORE spawning, not merely
+    /// `is_err()` for the wrong reason (the old test pointed at a non-existent
+    /// interpreter, so it tripped the `InterpreterNotFound` pre-check and never
+    /// exercised the capsule at all).
+    ///
+    /// We force degraded deterministically on ANY host: the plan's spec asks for
+    /// `AllowListedDomains` egress, which `required_coverage()` says needs
+    /// `domain_proxy_enforced = true`; no OS backend (landlock/seatbelt/appcontainer)
+    /// claims that flag (the broker is unwired), so `select_backend(...).is_degraded()`
+    /// is true everywhere -> `run_to_completion` returns `CapsuleRefused` before any
+    /// spawn. We give the install a REAL `+x` interpreter stub so the
+    /// `interpreter.exists()` pre-check passes and we actually reach the capsule, and
+    /// we assert the stub never ran (its sentinel file is absent), proving the refusal
+    /// happened before the spawn.
+    #[cfg(unix)]
     #[test]
     fn install_fails_closed_when_capsule_is_degraded() {
-        // On a host whose backend cannot enforce containment (NoOp, or a CI host
-        // without Landlock/Seatbelt), the enforcing FailClosed path must REFUSE
-        // before spawning. We point the install at a non-existent interpreter: if the
-        // capsule were degraded-and-permissive it would try to spawn and fail with a
-        // spawn error; if it fails closed it refuses with a CapsuleRefused naming the
-        // shortfall. Either way it must NOT silently succeed, and on a host that
-        // genuinely lacks a backend the error is the fail-closed refusal.
-        let (dir, plan) = planned();
-        let fake_python = dir.path().join("no-such-python");
+        let (dir, mut plan) = planned();
+        // Make the spec genuinely degraded on every host: an allow-listed-domains
+        // egress requires domain_proxy_enforced, which no backend delivers (unwired
+        // broker) -> Coverage::Degraded -> FailClosed refuses before spawn.
+        plan.spec.network = tirith_core::capsule::NetworkPolicy::AllowListedDomains {
+            domains: ["pypi.org".to_string()].into_iter().collect(),
+            ports: [443u16].into_iter().collect(),
+        };
+
+        // A REAL executable interpreter stub so the .exists() pre-check passes and we
+        // reach the capsule. Its sentinel proves whether it ever ran.
+        let interp = dir.path().join("python-stub");
+        let sentinel = dir.path().join("STUB_RAN");
+        executable_stub(&interp, &sentinel);
+        assert!(interp.exists(), "the interpreter stub must exist on disk");
+
         let env = dir.path().join("env");
         let res = run_contained_install(
             &plan,
             dir.path(),
-            &fake_python,
+            &interp,
             &env,
             &["demo".to_string()],
             &Policy::default(),
         );
-        // It must be an error (never a clean success against a missing interpreter /
-        // absent backend). The fail-closed refusal (or the spawn error) happens BEFORE
-        // the post-install verification, so the post-install field is never reached.
-        assert!(res.is_err(), "a missing backend/interpreter must error");
+
+        // The SPECIFIC fail-closed refusal, not just any error.
+        match res {
+            Err(ContainedInstallError::CapsuleRefused(reason)) => {
+                // The shortfall names the missing domain-proxy enforcement.
+                assert!(
+                    reason.contains("domain_proxy_enforced") || reason.contains("degraded"),
+                    "the refusal should name the containment shortfall: {reason}"
+                );
+            }
+            other => panic!(
+                "a degraded capsule under FailClosed must refuse with CapsuleRefused before \
+                 spawning; got {other:?}"
+            ),
+        }
+
+        // The refusal happened BEFORE the spawn: the interpreter stub never ran, so its
+        // sentinel does not exist.
+        assert!(
+            !sentinel.exists(),
+            "the install must refuse BEFORE spawning: the interpreter stub must not have run"
+        );
     }
 
     /// Guard the grep-test invariant: the enforcing install-from-digest source must
