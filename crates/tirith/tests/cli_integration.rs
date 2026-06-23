@@ -16365,3 +16365,270 @@ fn scan_directory_with_wheel_inspects_member() {
         "the SARIF artifactLocation must be member-qualified (foo.whl!/evil.pth): {sarif_text}"
     );
 }
+
+// ── I5: end-to-end refusal on the enforcing package-firewall surface ─────────
+// All other tests in this file (and the rest of the suite) exercise units; these
+// drive the real `tirith pkg` binary so a "wired vs claimed" gap on an enforcing
+// surface — where the negative path is supposed to REFUSE rather than proceed —
+// fails CI. The full `pkg install` happy path needs a real `uv` + `python`
+// resolver and the OS containment backend, so it stays integration-only off-CI;
+// these tests pin the parts that refuse deterministically with no network / index.
+
+/// An empty PATH (no `uv`/`python` resolver) for the enforcing install: forces
+/// `ResolverTools::discover` to fail, so `tirith pkg install` cannot reach a real
+/// index or spawn anything. The dir is created so PATH resolution finds nothing
+/// there rather than reading the host's tools.
+fn empty_path_dir(home: &std::path::Path) -> std::path::PathBuf {
+    let empty_bin = home.join("empty-bin");
+    let _ = fs::create_dir_all(&empty_bin);
+    empty_bin
+}
+
+/// `tirith pkg install pip <req>` on a host whose resolver toolchain is ABSENT must
+/// fail closed: a non-zero exit and a refusal message, never a clean success or a
+/// silent uncontained install. This is the real enforcing-surface negative path —
+/// the resolver-discovery gate refuses before any download/spawn. (The deeper
+/// `InterpreterNotFound` leg, reached only AFTER a successful resolve, is unit-
+/// tested in `cli/pkg_install.rs::install_fails_closed_when_capsule_is_degraded`;
+/// it cannot be driven end to end here without a real `uv`.)
+#[test]
+fn pkg_install_pip_fails_closed_when_toolchain_absent() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let target = home.path().join("env");
+    let out = tirith()
+        // No resolver tools on PATH -> discover() returns ToolNotFound, the install
+        // refuses. PATH is the only thing steering tool discovery here.
+        .env("PATH", empty_path_dir(home.path()))
+        // Isolate the data dir on every OS so no approval/receipt state leaks in.
+        .env("XDG_DATA_HOME", home.path())
+        .env("APPDATA", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args([
+            "pkg",
+            "install",
+            "pip",
+            "requests==2.31.0",
+            "--target",
+            target.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run tirith pkg install");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "pkg install with no resolver toolchain must fail closed (exit 1); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tirith pkg install:") && stderr.contains("resolve failed"),
+        "the refusal must name the failed resolve, not silently proceed: {stderr}"
+    );
+    // The enforcing surface must NOT have installed into the target environment.
+    assert!(
+        !target.exists()
+            || fs::read_dir(&target)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+        "a refused install must not populate the target environment"
+    );
+}
+
+/// `tirith pkg install pip` with the same toolchain absent but `--json` must still
+/// refuse with exit 1 (the JSON surface does not weaken the fail-closed contract).
+#[test]
+fn pkg_install_pip_json_still_fails_closed_when_toolchain_absent() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .env("PATH", empty_path_dir(home.path()))
+        .env("XDG_DATA_HOME", home.path())
+        .env("APPDATA", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["pkg", "install", "pip", "requests==2.31.0", "--json"])
+        .output()
+        .expect("failed to run tirith pkg install --json");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "pkg install --json must fail closed when the toolchain is absent; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `tirith pkg install` only enforces `pip` in v1; a non-pip ecosystem must be a
+/// hard usage refusal (exit 2) that points at the analysis-only path, never an
+/// attempt to install. Refused at the `precheck` gate before any resolve, so this
+/// is host-independent.
+#[test]
+fn pkg_install_non_pip_ecosystem_is_refused() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .env("PATH", empty_path_dir(home.path()))
+        .env("XDG_DATA_HOME", home.path())
+        .env("APPDATA", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["pkg", "install", "npm", "lodash"])
+        .output()
+        .expect("failed to run tirith pkg install npm");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a non-pip ecosystem must be a usage refusal (exit 2); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("only `pip` is enforced"),
+        "the refusal must explain only pip is enforced: {stderr}"
+    );
+}
+
+/// `tirith pkg install pip` with no requirements is a usage error (exit 2), not a
+/// no-op success.
+#[test]
+fn pkg_install_empty_requirements_is_usage_error() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let out = tirith()
+        .env("PATH", empty_path_dir(home.path()))
+        .env("XDG_DATA_HOME", home.path())
+        .env("APPDATA", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["pkg", "install", "pip"])
+        .output()
+        .expect("failed to run tirith pkg install pip");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "empty requirements must be a usage error (exit 2); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `tirith pkg receipt show` on a TAMPERED receipt must detect the edit and exit
+/// non-zero with a warning, never report it as a clean receipt. We build a real,
+/// content-addressed `ArtifactScanReceipt`, save it under an isolated data dir,
+/// then flip a field in the on-disk JSON while leaving the `receipt_id` (the
+/// content hash, also the filename) stale. `pkg receipt show <id>` recomputes the
+/// content hash, sees the mismatch, and refuses.
+#[test]
+fn pkg_receipt_show_detects_a_tampered_receipt() {
+    use tirith_core::capsule::CapsuleCoverage;
+    use tirith_core::receipt::{ArtifactScanReceipt, CapsuleReceipt, VerdictSummary};
+
+    let home = tempfile::tempdir().expect("tempdir");
+    // `data_dir()` honors XDG_DATA_HOME on Unix and %APPDATA% on Windows; receipts
+    // live under `<data_dir>/tirith/receipts/<receipt_id>.json`.
+    let receipts_dir = home.path().join("tirith").join("receipts");
+    fs::create_dir_all(&receipts_dir).expect("create receipts dir");
+
+    // A valid receipt whose `receipt_id` is the content hash of its own bytes.
+    let receipt = ArtifactScanReceipt::new(
+        "0.0.0-test".to_string(),
+        "deadbeef".repeat(8),
+        7,
+        "uv pip compile --generate-hashes --no-build".to_string(),
+        String::new(),
+        String::new(),
+        CapsuleReceipt {
+            backend_id: "noop".to_string(),
+            coverage: CapsuleCoverage::NONE,
+        },
+        vec!["a".repeat(64)],
+        None,
+        VerdictSummary {
+            action: "Allow".to_string(),
+            rule_ids: vec![],
+            finding_count: 0,
+        },
+    );
+    assert!(
+        receipt.content_hash_matches(),
+        "freshly built receipt must be self-consistent before tampering"
+    );
+    let id = receipt.receipt_id.clone();
+
+    // TAMPER: change the bound DB sequence in the serialized JSON but keep the
+    // stale `receipt_id` (and the filename), exactly the on-disk edit the
+    // content-hash check is meant to catch.
+    let mut value: serde_json::Value =
+        serde_json::to_value(&receipt).expect("receipt serializes to JSON");
+    value["threat_db_sequence"] = serde_json::json!(999_999);
+    let tampered = serde_json::to_string_pretty(&value).expect("serialize tampered receipt");
+    let path = receipts_dir.join(format!("{id}.json"));
+    fs::write(&path, tampered).expect("write tampered receipt");
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", home.path())
+        .env("APPDATA", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["pkg", "receipt", "show", &id])
+        .output()
+        .expect("failed to run tirith pkg receipt show");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a tampered receipt must be reported as exit 1; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not match its content") || stderr.contains("edited"),
+        "the output must flag the content-hash mismatch: {stderr}"
+    );
+}
+
+/// The same receipt, UNTAMPERED, must load cleanly (exit 0) — a guard that the
+/// tamper test above is detecting a real edit, not just an always-failing path.
+#[test]
+fn pkg_receipt_show_accepts_an_untampered_receipt() {
+    use tirith_core::capsule::CapsuleCoverage;
+    use tirith_core::receipt::{ArtifactScanReceipt, CapsuleReceipt, VerdictSummary};
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let receipts_dir = home.path().join("tirith").join("receipts");
+    fs::create_dir_all(&receipts_dir).expect("create receipts dir");
+
+    let receipt = ArtifactScanReceipt::new(
+        "0.0.0-test".to_string(),
+        "deadbeef".repeat(8),
+        7,
+        "uv pip compile --generate-hashes --no-build".to_string(),
+        String::new(),
+        String::new(),
+        CapsuleReceipt {
+            backend_id: "noop".to_string(),
+            coverage: CapsuleCoverage::NONE,
+        },
+        vec!["a".repeat(64)],
+        None,
+        VerdictSummary {
+            action: "Allow".to_string(),
+            rule_ids: vec![],
+            finding_count: 0,
+        },
+    );
+    let id = receipt.receipt_id.clone();
+    // Write the receipt verbatim (no edit), keyed by its content-hash id.
+    let json = serde_json::to_string_pretty(&receipt).expect("serialize receipt");
+    fs::write(receipts_dir.join(format!("{id}.json")), json).expect("write receipt");
+
+    let out = tirith()
+        .env("XDG_DATA_HOME", home.path())
+        .env("APPDATA", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["pkg", "receipt", "show", &id])
+        .output()
+        .expect("failed to run tirith pkg receipt show");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an untampered receipt must load cleanly (exit 0); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -1054,7 +1054,8 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // and has no PATTERN_TABLE entry and no fixture. Covered by the feature-gated
     // `hash_lookup` tests in `artifact/correlate.rs`.
     "artifact_known_malicious",
-    // B8: `wheel_structurally_rejected` is synthesized by `tirith package inspect` for a
+    // B8: `wheel_structurally_rejected` is synthesized by `tirith package inspect`
+    // (`crate::cli::package::inspect_artifacts` in the sibling `tirith` crate) for a
     // structurally rejected wheel (path traversal, encrypted member, CRC mismatch,
     // duplicate-path collision). It is triggered by artifact inspection at the CLI, not by
     // the engine over a fixture string, so it has no PATTERN_TABLE entry and no fixture.
