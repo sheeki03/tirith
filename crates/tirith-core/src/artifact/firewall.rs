@@ -510,4 +510,71 @@ mod tests {
         assert!(detail.contains(&"a".repeat(64)));
         assert!(detail.contains(&"b".repeat(64)));
     }
+
+    /// CR3 fail-closed: a wheel whose blob hash-matches its lock (so it
+    /// materialises INTACT, no integrity mismatch) but which is STRUCTURALLY
+    /// REJECTED by the hardened reader (a `..` path-traversal member) must Block.
+    /// Before the chokepoint fix, `all_findings` ignored `inspected.rejected`, so
+    /// `firewall_resolved_set` returned Allow and the install proceeded to extract
+    /// the traversal member. Now the synthesized `WheelStructurallyRejected` finding
+    /// makes the verdict Block by construction.
+    #[test]
+    fn firewall_blocks_structurally_rejected_wheel_that_matches_its_lock() {
+        // A wheel with a `../etc/passwd` member: read_wheel REJECTS it, but its bytes
+        // hash fine, so the quarantine blob materialises intact (no integrity miss).
+        let bytes = build_wheel(&[
+            ("../etc/passwd", b"root:x:0:0\n"),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n",
+            ),
+        ]);
+        let digest = sha256_hex(&bytes);
+        let filename = "demo-1.0-py3-none-any.whl";
+
+        let (_root, store, txn) = store_with_txn("fw-rejected");
+        store.ingest_bytes(&bytes, &digest).unwrap();
+
+        let resolved = ResolvedSet {
+            locked_requirements: format!("demo==1.0 \\\n    --hash=sha256:{digest}\n"),
+            artifacts: vec![ResolvedArtifact {
+                wheel_filename: filename.to_string(),
+                sha256: digest.clone(),
+            }],
+        };
+
+        let outcome = firewall_resolved_set(&resolved, &txn, &Policy::default(), None);
+
+        // The blob materialised intact (the rejection is structural, not an integrity
+        // mismatch), so the ONLY thing forcing Block is the structural-rejection finding.
+        assert!(
+            !outcome.has_integrity_mismatch(),
+            "a structurally-rejected wheel still hashes to its approved digest"
+        );
+        assert_eq!(
+            outcome.materialized.len(),
+            1,
+            "the wheel materialises intact"
+        );
+        assert_eq!(
+            outcome.verdict.action,
+            Action::Block,
+            "a structurally-rejected wheel must Block, not Allow: {:?}",
+            outcome.verdict.findings
+        );
+        assert!(
+            outcome
+                .verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::WheelStructurallyRejected),
+            "the Block is carried by a WheelStructurallyRejected finding: {:?}",
+            outcome
+                .verdict
+                .findings
+                .iter()
+                .map(|f| f.rule_id)
+                .collect::<Vec<_>>()
+        );
+    }
 }

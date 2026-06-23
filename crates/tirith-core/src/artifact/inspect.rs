@@ -456,9 +456,20 @@ pub struct ArtifactSetMember {
 
 impl ArtifactSetInspection {
     /// Every finding in the set: each member's own signal-correlated + native
-    /// findings, plus the cross-distribution findings. Built by re-correlating each
-    /// member (so the per-member native findings are included) and appending the
-    /// cross findings; the caller finalizes this into ONE verdict.
+    /// findings, a synthesized [`RuleId::WheelStructurallyRejected`] finding for
+    /// every member the hardened reader REJECTED, plus the cross-distribution
+    /// findings. Built by re-correlating each member (so the per-member native
+    /// findings are included) and appending the cross findings; the caller
+    /// finalizes this into ONE verdict.
+    ///
+    /// The structural-rejection synthesis is the fail-closed chokepoint: a
+    /// rejected wheel (a path-traversal `..` member, a symlink member, an
+    /// encrypted/CRC-forged member, a conflicting dist-info) is a hard archive
+    /// violation the B5/B6/B7 signal correlation never surfaces as a finding, yet
+    /// it must BLOCK every firewall consumer (firewall / lab / `package inspect`).
+    /// Synthesizing it here means a wheel that hash-matches its lock but is
+    /// structurally rejected can never resolve to Allow by construction, no matter
+    /// which surface calls `all_findings` -> `finalize_static_verdict`.
     pub fn all_findings(&self, threat_db: Option<&crate::threatdb::ThreatDb>) -> Vec<Finding> {
         let mut findings: Vec<Finding> = Vec::new();
         for m in &self.members {
@@ -467,9 +478,37 @@ impl ArtifactSetInspection {
                 &m.inspected.native_findings,
                 threat_db,
             ));
+            if m.inspected.rejected {
+                findings.push(structural_rejection_finding(&m.path, &m.inspected));
+            }
         }
         findings.extend(self.cross_findings.iter().cloned());
         findings
+    }
+}
+
+/// Build the [`RuleId::WheelStructurallyRejected`] finding for a member the
+/// hardened archive reader rejected, carrying the member path and the reader's
+/// violation detail strings. High severity, which derives to [`Action::Block`]
+/// in [`crate::verdict::action_from_findings`], so every consumer that finalizes
+/// [`ArtifactSetInspection::all_findings`] fails closed on a rejected wheel.
+fn structural_rejection_finding(path: &Path, inspected: &InspectedArtifact) -> Finding {
+    use crate::verdict::{RuleId, Severity};
+    let detail = if inspected.violation_details.is_empty() {
+        "structural archive violation".to_string()
+    } else {
+        inspected.violation_details.join("; ")
+    };
+    Finding {
+        rule_id: RuleId::WheelStructurallyRejected,
+        severity: Severity::High,
+        title: "Wheel structurally rejected".to_string(),
+        description: format!("{}: {}", path.display(), detail),
+        evidence: Vec::new(),
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
     }
 }
 
@@ -1543,6 +1582,86 @@ mod tests {
             sniff_head(&mut empty),
             Ok(ArtifactMagic::Unknown),
             "a clean empty read is Unknown magic, not an Unreadable fault"
+        );
+    }
+
+    /// `all_findings` synthesizes a `WheelStructurallyRejected` finding for a member
+    /// the hardened reader rejected (a `..` traversal member), and NONE for a clean
+    /// wheel. This is the chokepoint that makes every firewall consumer fail closed
+    /// on a structurally-rejected wheel by construction.
+    #[test]
+    fn all_findings_synthesizes_structural_rejection_for_rejected_member() {
+        use crate::verdict::{action_from_findings, Action, RuleId};
+
+        // A wheel with a `../etc/passwd` member is structurally REJECTED by read_wheel.
+        let dir = tempfile::tempdir().unwrap();
+        let rejected_bytes = build_wheel(&[
+            ("../etc/passwd", b"root:x:0:0\n"),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n",
+            ),
+        ]);
+        let rejected_path = write_temp(&dir, "demo-1.0-py3-none-any.whl", &rejected_bytes);
+
+        let set = inspect_artifact_set(&[rejected_path.clone()]);
+        assert_eq!(set.members.len(), 1, "the wheel is a member, not a gap");
+        assert!(
+            set.members[0].inspected.rejected,
+            "a path-traversal wheel is structurally rejected"
+        );
+
+        let findings = set.all_findings(None);
+        let rejection: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == RuleId::WheelStructurallyRejected)
+            .collect();
+        assert_eq!(
+            rejection.len(),
+            1,
+            "exactly one WheelStructurallyRejected finding is synthesized (no double-emit): {:?}",
+            findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+        assert!(
+            rejection[0]
+                .description
+                .contains("demo-1.0-py3-none-any.whl"),
+            "the finding names the rejected member path: {}",
+            rejection[0].description
+        );
+        assert_eq!(
+            action_from_findings(&findings),
+            Action::Block,
+            "a structurally-rejected member makes the set verdict Block"
+        );
+
+        // CONTRAST: a clean wheel synthesizes no structural-rejection finding. Its
+        // filename, dist-info dir, and METADATA name agree (`cleanpkg`), so the
+        // reader does not reject it on an identity mismatch.
+        let clean_bytes = build_wheel(&[
+            ("cleanpkg/__init__.py", b"print('hi')\n"),
+            (
+                "cleanpkg-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: cleanpkg\nVersion: 1.0\n\n",
+            ),
+            ("cleanpkg-1.0.dist-info/WHEEL", b"Wheel-Version: 1.0\n"),
+            (
+                "cleanpkg-1.0.dist-info/RECORD",
+                b"cleanpkg-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let clean_path = write_temp(&dir, "cleanpkg-1.0-py3-none-any.whl", &clean_bytes);
+        let clean_set = inspect_artifact_set(&[clean_path]);
+        assert!(
+            !clean_set.members[0].inspected.rejected,
+            "a clean wheel is not rejected"
+        );
+        assert!(
+            clean_set
+                .all_findings(None)
+                .iter()
+                .all(|f| f.rule_id != RuleId::WheelStructurallyRejected),
+            "a clean wheel synthesizes no WheelStructurallyRejected finding"
         );
     }
 }

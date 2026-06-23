@@ -800,15 +800,18 @@ pub enum RuleId {
     NativeImportExecutionChain,
     /// B8 + DB-D: an inspected artifact (a wheel/sdist) or one of its members has a
     /// SHA-256 that matches a KNOWN-MALICIOUS hash in the threat DB (MITRE T1195
-    /// supply-chain compromise). Emitted by `crate::artifact::evaluate_artifact`
-    /// only when the `artifact-hash-lookup` cargo feature is enabled AND the DB-B
-    /// hash-lookup methods (`ThreatDb::check_artifact_sha256` /
-    /// `check_file_sha256`) resolve a match. Those methods are the DB-B deliverable
-    /// and DO NOT EXIST YET, so this milestone ships the feature OFF by default and
-    /// the emission behind a reserved seam (see `crate::artifact::correlate`); the
-    /// RuleId is therefore UNREACHABLE until the feature + DB land. Registered now
-    /// (the registry tests must see every variant), with NO PATTERN_TABLE entry and
-    /// NO fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`. Critical severity
+    /// supply-chain compromise). The hash lookup is ACTIVATED behind the
+    /// `artifact-hash-lookup` cargo feature, now that DB-D shipped the v2 hash
+    /// indices and their readers (`ThreatDb::check_artifact_sha256` /
+    /// `check_file_sha256`). With the feature ON and a v2 hash index present,
+    /// `crate::artifact::correlate` decodes the artifact's whole-file hash and each
+    /// member's content hash, queries the DB, and emits this finding on the first
+    /// match (the test
+    /// `crate::artifact::correlate::tests::hash_lookup::artifact_sha_match_fires_critical`
+    /// exercises it). In the DEFAULT build the feature is OFF: the lookup compiles to
+    /// a no-op and the RuleId is unreachable there. Registered unconditionally (the
+    /// registry tests must see every variant), with NO PATTERN_TABLE entry and NO
+    /// fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`. Critical severity
     /// (whence the action is Block).
     ArtifactKnownMalicious,
     /// A wheel/archive STRUCTURALLY REJECTED by the hardened reader (a path-traversal

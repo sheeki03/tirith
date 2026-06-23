@@ -27,13 +27,17 @@
 //!
 //! 3. **The pip argv.** [`InstallCommand::pip_install_args`] is exactly the plan's
 //!    pin: `-m pip install --isolated --no-index --no-deps --require-hashes
-//!    --no-cache-dir --force-reinstall -r approved.txt`. `--force-reinstall` (or a
-//!    fresh target) is mandatory: without it pip SKIPS a package whose version is
-//!    already installed, so a re-verified install of a pinned version would no-op.
-//!    `--no-index` + the `file://` references mean pip never touches the network;
-//!    `--no-deps` because the resolver already produced a transitively-complete,
-//!    fully-pinned set; `--isolated` + `--no-cache-dir` so no ambient pip config or
-//!    cache can redirect the install.
+//!    --no-cache-dir --no-input --disable-pip-version-check --force-reinstall -r
+//!    approved.txt`. `--force-reinstall` (or a fresh target) is mandatory: without
+//!    it pip SKIPS a package whose version is already installed, so a re-verified
+//!    install of a pinned version would no-op. `--no-index` + the `file://`
+//!    references mean pip never touches the network; `--no-deps` because the
+//!    resolver already produced a transitively-complete, fully-pinned set;
+//!    `--isolated` + `--no-cache-dir` so no ambient pip config or cache can redirect
+//!    the install; `--no-input` so a contained install never blocks on an
+//!    interactive prompt; `--disable-pip-version-check` so pip skips its own
+//!    network self-update check (which would otherwise reach out under a deny-all
+//!    spec).
 //!
 //! 4. **The capsule spec.** [`build_install_spec`] is a locked-down, **deny-all
 //!    network** [`CapsuleSpec`]: the install needs no outbound traffic once the
@@ -241,14 +245,18 @@ impl InstallCommand {
     /// interpreter path), exactly the plan's pin:
     ///
     /// `-m pip install --isolated --no-index --no-deps --require-hashes
-    /// --no-cache-dir --force-reinstall -r <approved.txt>`
+    /// --no-cache-dir --no-input --disable-pip-version-check --force-reinstall -r
+    /// <approved.txt>`
     ///
     /// `--force-reinstall` is mandatory so pip does not silently skip a package
     /// whose version is already installed; `--no-index` + the `file://` references
     /// in `approved.txt` keep the install fully offline; `--require-hashes` makes
     /// pip refuse any file whose content does not hash to the pinned digest;
     /// `--no-deps` because the lock is transitively complete; `--isolated` +
-    /// `--no-cache-dir` so no ambient pip config / cache can redirect it.
+    /// `--no-cache-dir` so no ambient pip config / cache can redirect it;
+    /// `--no-input` so the contained install never blocks on an interactive prompt;
+    /// `--disable-pip-version-check` so pip skips its own network version self-check
+    /// (which a deny-all spec would otherwise stall).
     ///
     /// The interpreter is invoked as `python -m pip` (never a PATH `pip` shim), the
     /// same hardening the D2 resolver uses; the caller supplies the resolved
@@ -1255,7 +1263,7 @@ mod tests {
         (root, store, txn)
     }
 
-    // ── the pip argv ────────────────────────────────────────────────────────
+    // ---- the pip argv --------------------------------------------------------
 
     #[test]
     fn pip_install_args_are_the_pinned_flags() {
@@ -1296,7 +1304,7 @@ mod tests {
             .any(|a| a == "--force-reinstall"));
     }
 
-    // ── file:// URL building ───────────────────────────────────────────────
+    // ---- file:// URL building ------------------------------------------------
 
     #[test]
     #[cfg(unix)]
@@ -1328,7 +1336,7 @@ mod tests {
         ));
     }
 
-    // ── approved.txt generation ────────────────────────────────────────────
+    // ---- approved.txt generation ---------------------------------------------
 
     #[test]
     #[cfg(unix)]
@@ -1395,7 +1403,7 @@ mod tests {
         ));
     }
 
-    // ── the capsule spec ───────────────────────────────────────────────────
+    // ---- the capsule spec ----------------------------------------------------
 
     #[test]
     fn install_spec_is_deny_all_and_confines_the_right_roots() {
@@ -1424,7 +1432,7 @@ mod tests {
         assert!(spec.environment.deny_sensitive);
     }
 
-    // ── the re-bind ────────────────────────────────────────────────────────
+    // ---- the re-bind ---------------------------------------------------------
 
     #[test]
     fn rebind_produces_a_plan_for_a_clean_set() {
@@ -1572,7 +1580,7 @@ mod tests {
         }
     }
 
-    // ── D5: post-install RECORD verification ────────────────────────────────
+    // ---- D5: post-install RECORD verification --------------------------------
 
     /// The RECORD `sha256=<base64url-no-pad>` cell for a body, as a CSV cell.
     fn record_cell(body: &[u8]) -> String {
@@ -1958,7 +1966,7 @@ mod tests {
         assert_eq!(res.distributions_not_found, 0);
     }
 
-    // ── D7: InstallPlanDigest ────────────────────────────────────────────────
+    // ---- D7: InstallPlanDigest -----------------------------------------------
 
     /// A full set of binding inputs for a digest, every field populated so a test
     /// can mutate exactly one and observe the digest change.
