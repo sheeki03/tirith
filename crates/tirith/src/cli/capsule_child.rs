@@ -146,16 +146,16 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
     // because the caller invokes us before the worker-thread spawn, but a hard
     // fail-closed check here means neither a future refactor nor an unreadable
     // `/proc` can silently weaken the guarantee.
-    match current_thread_count() {
-        Some(1) => {}
-        Some(threads) => {
+    match thread_decision(current_thread_count()) {
+        ThreadDecision::Proceed => {}
+        ThreadDecision::RefuseMultiThreaded(threads) => {
             eprintln!(
                 "tirith __capsule-child: refusing to contain a multi-threaded process \
                  ({threads} threads); this is an internal invariant violation"
             );
             std::process::exit(2);
         }
-        None => {
+        ThreadDecision::RefuseUnknown => {
             eprintln!(
                 "tirith __capsule-child: refusing to apply containment; could not confirm the \
                  process is single-threaded (unable to read /proc/self/stat). Failing closed \
@@ -252,11 +252,60 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
 /// (field 20). `None` if it cannot be determined; the caller treats `None` as
 /// fail-closed (it cannot confirm single-threadedness, so it refuses to apply
 /// containment) rather than proceeding on an unverified assumption. Linux-only.
+///
+/// The `/proc/self/stat` PARSE is factored into [`parse_num_threads_from_stat`] so
+/// it is unit-testable without a live `/proc`.
 #[cfg(target_os = "linux")]
 fn current_thread_count() -> Option<usize> {
     let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    // /proc/self/stat: the comm field (2nd) is in parens and may contain spaces, so
-    // split AFTER the closing paren to keep the remaining fields aligned.
+    parse_num_threads_from_stat(&stat)
+}
+
+/// The fail-closed thread-count decision the launcher acts on. Kept as a pure value
+/// (not cfg-gated) so the security-critical "refuse unless provably single-threaded"
+/// logic is unit-testable on any platform. It is consumed by the launcher only on
+/// Linux (the re-exec backend); off Linux it exists solely for those unit tests, so
+/// dead-code is allowed there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadDecision {
+    /// Exactly one thread was confirmed: safe to apply per-thread seccomp/Landlock.
+    Proceed,
+    /// More than one thread: refuse (a per-thread filter would not bind the others).
+    RefuseMultiThreaded(usize),
+    /// The thread count could not be read: refuse, because single-threadedness is
+    /// unproven (fail closed rather than assume).
+    RefuseUnknown,
+}
+
+/// Map a (possibly-unknown) thread count to the fail-closed [`ThreadDecision`].
+/// **Pure**, so the refuse-by-default contract is unit-testable: `None` and any
+/// count other than exactly 1 must refuse. Applying a per-thread seccomp filter or
+/// Landlock `restrict_self` in a multi-threaded process is unsound (it binds only
+/// the calling thread), and an unknown count cannot prove single-threadedness, so
+/// both are refusals.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn thread_decision(count: Option<usize>) -> ThreadDecision {
+    match count {
+        Some(1) => ThreadDecision::Proceed,
+        Some(threads) => ThreadDecision::RefuseMultiThreaded(threads),
+        None => ThreadDecision::RefuseUnknown,
+    }
+}
+
+/// Parse `num_threads` (field 20) out of the contents of `/proc/self/stat`.
+/// **Pure** and platform-independent, so it can be unit-tested without `/proc`.
+///
+/// `/proc/<pid>/stat` is: `pid (comm) state ppid ...`. The `comm` field is wrapped
+/// in parens and may itself contain spaces and `)` characters, so we split after the
+/// LAST `") "` to keep the trailing fixed-position fields aligned. Counting from
+/// `state` as field 1, `num_threads` is field 18 (the 20th overall field). Returns
+/// `None` on any malformed input (a missing closing paren, too few fields, or a
+/// non-integer), which the caller treats as fail-closed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_num_threads_from_stat(stat: &str) -> Option<usize> {
+    // Split AFTER the closing paren of `comm` (use the LAST one so a `)` inside the
+    // command name does not throw off the alignment).
     let after = stat.rsplit_once(") ")?.1;
     // After the ") ", fields are: state(1) ppid(2) ... num_threads is field 18
     // counting from `state` as field 1 (i.e. the 20th overall field).
@@ -334,6 +383,93 @@ mod tests {
     fn parse_args_rejects_non_capsule_invocation() {
         let a = argv(&["tirith", "scan", "{}", "--", "ls"]);
         assert!(parse_args(&a).is_err());
+    }
+
+    // ── TG1: /proc/self/stat num_threads parse + fail-closed thread decision ──
+
+    /// Build a `/proc/self/stat`-shaped line with the given `comm` and `num_threads`,
+    /// with the surrounding fixed fields in their correct positions (state is field
+    /// 3, num_threads is field 20). This mirrors the real kernel format closely
+    /// enough to exercise the field-20 alignment, including the `comm`-in-parens
+    /// quirk.
+    fn stat_line(comm: &str, num_threads: usize) -> String {
+        // Fields after comm, with `state` as the first: state ppid pgrp session
+        // tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime
+        // priority nice num_threads (18 fields = field 3..20). The values are
+        // arbitrary placeholders except num_threads (the 18th here).
+        let tail = format!(
+            "R 5678 1234 1234 34816 1234 4194304 100 0 0 0 1 2 0 0 20 0 {num_threads} \
+             0 1 0 0 0 0",
+        );
+        format!("1234 ({comm}) {tail}")
+    }
+
+    #[test]
+    fn parse_num_threads_normal_stat_is_one() {
+        let stat = stat_line("cat", 1);
+        assert_eq!(parse_num_threads_from_stat(&stat), Some(1));
+    }
+
+    #[test]
+    fn parse_num_threads_handles_comm_with_spaces_and_parens() {
+        // The comm field can contain spaces AND parens; the parser splits on the LAST
+        // ") " so the trailing fixed fields stay aligned.
+        let stat = stat_line("weird )( name", 1);
+        assert_eq!(
+            parse_num_threads_from_stat(&stat),
+            Some(1),
+            "comm with spaces/parens must not throw off field-20 alignment"
+        );
+        // And with a higher count, still aligned.
+        let stat3 = stat_line("a (b) c", 3);
+        assert_eq!(parse_num_threads_from_stat(&stat3), Some(3));
+    }
+
+    #[test]
+    fn parse_num_threads_multi_thread_count() {
+        let stat = stat_line("server", 3);
+        assert_eq!(parse_num_threads_from_stat(&stat), Some(3));
+    }
+
+    #[test]
+    fn parse_num_threads_garbage_is_none() {
+        // No closing paren -> None.
+        assert_eq!(parse_num_threads_from_stat("garbage with no parens"), None);
+        // Closing paren but too few trailing fields -> None.
+        assert_eq!(parse_num_threads_from_stat("1234 (x) R 5 6"), None);
+        // Field 20 (num_threads) present but not an integer -> None. After the
+        // ") ", `notanumber` must land at 0-indexed token 17 (the num_threads slot:
+        // state at index 0 plus 17 more before it).
+        let bad = "1234 (x) R 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 notanumber 22";
+        // Sanity: confirm the fixture really puts `notanumber` in the num_threads slot.
+        assert_eq!(
+            bad.rsplit_once(") ").unwrap().1.split_whitespace().nth(17),
+            Some("notanumber")
+        );
+        assert_eq!(parse_num_threads_from_stat(bad), None);
+        // Empty -> None.
+        assert_eq!(parse_num_threads_from_stat(""), None);
+    }
+
+    #[test]
+    fn thread_decision_fails_closed_unless_exactly_one() {
+        // The dispositive fail-closed contract: only a confirmed single thread
+        // proceeds; an unknown count or any multi-thread count refuses.
+        assert_eq!(thread_decision(Some(1)), ThreadDecision::Proceed);
+        assert_eq!(
+            thread_decision(Some(2)),
+            ThreadDecision::RefuseMultiThreaded(2)
+        );
+        assert_eq!(
+            thread_decision(Some(64)),
+            ThreadDecision::RefuseMultiThreaded(64)
+        );
+        assert_eq!(thread_decision(None), ThreadDecision::RefuseUnknown);
+        // Zero is not "single-threaded" either (impossible, but must not proceed).
+        assert_eq!(
+            thread_decision(Some(0)),
+            ThreadDecision::RefuseMultiThreaded(0)
+        );
     }
 
     /// The spec JSON round-trips into a `CapsuleSpec` so the launcher and the

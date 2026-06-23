@@ -494,14 +494,23 @@ fn apply_seccomp() -> Result<bool, ContainError> {
 /// HOME/TMPDIR/XDG_* at `temp_home`. Pure libc/std memory work; safe to run after
 /// the seccomp filter (no special syscalls).
 fn apply_env(policy: &EnvironmentPolicy, temp_home: Option<&Path>) {
-    // The names currently present in this process's environment.
-    let present: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
+    // The names currently present in this process's environment, as raw `OsString`
+    // so a name that is not valid UTF-8 is still considered for removal. We only
+    // need the UTF-8-decodable names to compute the survivor set (the allow-list is
+    // UTF-8), but the REMOVE pass must iterate every name, including non-UTF-8 ones.
+    let present: Vec<OsString> = std::env::vars_os().map(|(k, _)| k).collect();
+    let utf8_present: Vec<String> = present
+        .iter()
+        .filter_map(|k| k.to_str().map(str::to_owned))
         .collect();
-    let survivors = env_survivors(policy, &present);
+    let survivors = env_survivors(policy, &utf8_present);
 
+    // Remove every variable not in the survivor set, operating on the raw name so a
+    // non-UTF-8-named variable is removed too. A non-UTF-8 name can never match a
+    // UTF-8 allow-list entry, so `env_name_survives` is false for it and it is
+    // dropped (the fail-closed direction: deny-by-default with no UTF-8 leak hole).
     for name in &present {
-        if !survivors.contains(name) {
+        if !env_name_survives(name, &survivors) {
             std::env::remove_var(name);
         }
     }
@@ -526,6 +535,21 @@ fn apply_env(policy: &EnvironmentPolicy, temp_home: Option<&Path>) {
 /// allowed to survive when `temporary_home` will overwrite them anyway).
 pub fn env_survivors(policy: &EnvironmentPolicy, present: &[String]) -> BTreeSet<String> {
     policy.surviving_vars(present.iter().map(|s| s.as_str()))
+}
+
+/// Whether the environment variable named `name` (a raw `OsStr`, so it may not be
+/// valid UTF-8) should survive into the contained child, given the UTF-8 survivor
+/// set. A name keeps iff it decodes to UTF-8 AND is in `survivors`; a non-UTF-8
+/// name can never match a (UTF-8) allow-list entry, so it is dropped. Pure and
+/// unit-testable, and the basis for the fail-closed removal pass in [`apply_env`]:
+/// removing a non-UTF-8-named variable is correct because deny-by-default means
+/// anything not explicitly allowed (which a non-UTF-8 name can never be) is scrubbed.
+fn env_name_survives(name: &std::ffi::OsStr, survivors: &BTreeSet<String>) -> bool {
+    match name.to_str() {
+        Some(s) => survivors.contains(s),
+        // Non-UTF-8 name: cannot be in a UTF-8 allow-list, so never survives.
+        None => false,
+    }
 }
 
 /// Build the argv for `execve`: `prog` followed by `args`, as NUL-terminated
@@ -685,6 +709,46 @@ mod tests {
         assert!(!survivors.contains("AWS_SECRET_ACCESS_KEY"));
         // Not allow-listed and not inheriting -> dropped.
         assert!(!survivors.contains("HOME"));
+    }
+
+    #[test]
+    fn env_name_survives_keeps_allowed_utf8_drops_others() {
+        // IM6: the keep/remove predicate the scrub pass uses. A UTF-8 name keeps iff
+        // it is in the survivor set; anything else is dropped (fail-closed).
+        let survivors: BTreeSet<String> = ["PATH".to_string(), "LANG".to_string()]
+            .into_iter()
+            .collect();
+        assert!(env_name_survives(std::ffi::OsStr::new("PATH"), &survivors));
+        assert!(!env_name_survives(
+            std::ffi::OsStr::new("AWS_SECRET_ACCESS_KEY"),
+            &survivors
+        ));
+        // An empty survivor set drops everything.
+        assert!(!env_name_survives(
+            std::ffi::OsStr::new("PATH"),
+            &BTreeSet::new()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_name_survives_drops_non_utf8_name() {
+        // IM6 (the actual leak): a variable whose NAME is not valid UTF-8 must be
+        // dropped, never silently kept. It cannot decode, so it cannot be in a UTF-8
+        // allow-list; `env_name_survives` returns false even if the allow-list is
+        // non-empty. Before the fix the scrub pass iterated only the UTF-8-decodable
+        // names, so such a variable survived into the deny-by-default child.
+        use std::os::unix::ffi::OsStrExt;
+        // 0xFF is never valid UTF-8.
+        let bad = std::ffi::OsStr::from_bytes(b"BAD\xFFNAME");
+        assert!(bad.to_str().is_none(), "test name must be non-UTF-8");
+        let survivors: BTreeSet<String> = ["PATH".to_string(), "BAD\u{FFFD}NAME".to_string()]
+            .into_iter()
+            .collect();
+        assert!(
+            !env_name_survives(bad, &survivors),
+            "a non-UTF-8-named var must never survive (no UTF-8 allow-list can name it)"
+        );
     }
 
     #[test]

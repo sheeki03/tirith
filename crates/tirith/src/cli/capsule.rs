@@ -560,8 +560,14 @@ fn macos_contained_command(
     // Environment scrub: clear, then re-add the surviving names from the current
     // environment, and (when temporary_home) point HOME/TMPDIR/XDG_* at a fresh
     // temp dir. We do this on the parent `Command` (env_clear + env) so the child
-    // and the sandbox-exec wrapper both see the scrubbed set.
-    apply_macos_env(&mut cmd, spec);
+    // and the sandbox-exec wrapper both see the scrubbed set. Fails closed if the
+    // temporary HOME cannot be created for a `temporary_home` spec: skipping it
+    // would leave the real `$HOME` reachable (env_clear already ran, but
+    // `getpwuid()->pw_dir` still resolves it) while `env_isolated` claims true.
+    apply_macos_env(&mut cmd, spec).map_err(|reason| CapsuleRefused {
+        backend_id: sel.backend_id,
+        reason,
+    })?;
 
     // rlimits + fd closure run in the child just before exec (pre_exec), so they
     // affect the sandbox-exec process and, by inheritance, the target.
@@ -589,8 +595,42 @@ fn macos_contained_command(
 /// surviving variable names from the current process, then (when `temporary_home`)
 /// repoint HOME/TMPDIR/XDG_* at a fresh temp directory. The temp dir intentionally
 /// leaks for the child's lifetime (matching the Linux launcher).
+///
+/// **Fails closed** when `temporary_home` is set but the temporary directory cannot
+/// be created: returning `Err` here propagates to a [`CapsuleRefused`] so the launch
+/// is refused rather than running with the real `$HOME` reachable. `env_clear`
+/// alone is NOT enough to hide the home directory, because macOS `getpwuid()` (used
+/// by libc / the shell to resolve `~`) reads `pw_dir` from the password database,
+/// not the environment; only repointing HOME/TMPDIR/XDG_* at a fresh dir isolates
+/// the child. Skipping the repoint while still reporting `env_isolated = true` would
+/// be a silent over-report (the gap the Linux launcher fails closed on too).
 #[cfg(target_os = "macos")]
-fn apply_macos_env(cmd: &mut Command, spec: &CapsuleSpec) {
+fn apply_macos_env(cmd: &mut Command, spec: &CapsuleSpec) -> Result<(), String> {
+    apply_macos_env_with(cmd, spec, || {
+        // Production temp-home factory: a fresh, leaked temp dir. `keep()` detaches
+        // it from the guard so it survives for the child's lifetime (the E5 wrapper
+        // removes it after the child exits).
+        tempfile::Builder::new()
+            .prefix("tirith-capsule-")
+            .tempdir()
+            .map(tempfile::TempDir::keep)
+    })
+}
+
+/// The env-scrub core, with the temporary-HOME directory creation injected as
+/// `make_temp_home` so the fail-closed propagation is deterministically testable
+/// (a test can pass a factory that returns `Err` without mutating the process-wide
+/// `TMPDIR`, which would race other tests). Production passes the real tempfile
+/// factory via [`apply_macos_env`].
+#[cfg(target_os = "macos")]
+fn apply_macos_env_with<F>(
+    cmd: &mut Command,
+    spec: &CapsuleSpec,
+    make_temp_home: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> std::io::Result<std::path::PathBuf>,
+{
     let policy = &spec.environment;
     let present: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
@@ -607,16 +647,22 @@ fn apply_macos_env(cmd: &mut Command, spec: &CapsuleSpec) {
         }
     }
     if policy.temporary_home {
-        if let Ok(dir) = tempfile::Builder::new().prefix("tirith-capsule-").tempdir() {
-            let home = dir.keep();
-            cmd.env("HOME", &home);
-            cmd.env("TMPDIR", &home);
-            cmd.env("XDG_CONFIG_HOME", home.join(".config"));
-            cmd.env("XDG_CACHE_HOME", home.join(".cache"));
-            cmd.env("XDG_DATA_HOME", home.join(".local/share"));
-            cmd.env("XDG_STATE_HOME", home.join(".local/state"));
-        }
+        // Fail closed on a temp-home error: the alternative (skip the repoint) leaves
+        // the real home reachable while env_isolated would still report true.
+        let home = make_temp_home().map_err(|e| {
+            format!(
+                "capsule env isolation requires a temporary HOME but one could not be \
+                 created ({e}); refusing to run with the real HOME reachable"
+            )
+        })?;
+        cmd.env("HOME", &home);
+        cmd.env("TMPDIR", &home);
+        cmd.env("XDG_CONFIG_HOME", home.join(".config"));
+        cmd.env("XDG_CACHE_HOME", home.join(".cache"));
+        cmd.env("XDG_DATA_HOME", home.join(".local/share"));
+        cmd.env("XDG_STATE_HOME", home.join(".local/state"));
     }
+    Ok(())
 }
 
 /// Apply the rlimit dimensions of [`tirith_core::capsule::ResourceLimits`] via
@@ -648,8 +694,14 @@ fn apply_macos_rlimits(limits: &tirith_core::capsule::ResourceLimits) -> std::io
     if let Some(nofile) = limits.max_open_files {
         set_one(libc::RLIMIT_NOFILE, u64::from(nofile))?;
     }
-    // RLIMIT_NPROC is per-user on macOS and not reliably enforceable per-process;
-    // wall_clock/output bytes are the launcher/broker's job, not rlimits.
+    // `max_processes` is intentionally NOT applied: RLIMIT_NPROC is per real UID on
+    // macOS, so it would cap the whole user (and could deny the user's own shell a
+    // fork) without bounding the contained child's subtree, a false fork-bomb cap.
+    // The honesty contract handles this by EXCLUDING max_processes from the macOS
+    // `resource_limits_enforced` claim (see `tirith_core::capsule::macos::
+    // derive_coverage`), so a spec that relies on it degrades rather than trusting a
+    // cap that is not here. `wall_clock`/`max_output` are launcher-enforced, not
+    // rlimits.
     Ok(())
 }
 
@@ -703,12 +755,25 @@ fn fd_scan_ceiling() -> i32 {
     if rc != 0 {
         return MAX_FD_SCAN;
     }
-    // `RLIM_INFINITY` (or anything past our cap) clamps to MAX_FD_SCAN.
-    if rl.rlim_cur == libc::RLIM_INFINITY || rl.rlim_cur > MAX_FD_SCAN as libc::rlim_t {
+    clamp_fd_ceiling(rl.rlim_cur)
+}
+
+/// Clamp a raw `RLIMIT_NOFILE` soft limit to the fd-closure walk ceiling. **Pure**,
+/// so the bounds (floor of 1024, cap of [`MAX_FD_SCAN`], `RLIM_INFINITY` handling)
+/// are unit-testable without `getrlimit`.
+///
+/// - `RLIM_INFINITY`, or any value above [`MAX_FD_SCAN`], clamps DOWN to
+///   `MAX_FD_SCAN` so the async-signal-safe `pre_exec` loop is always bounded.
+/// - Anything below the historical hardcoded floor of 1024 is raised UP to 1024, so
+///   the walk is never narrower than it used to be (a low `RLIMIT_NOFILE` must not
+///   let a higher-numbered inherited fd survive the closure).
+#[cfg(target_os = "macos")]
+fn clamp_fd_ceiling(rlim_cur: libc::rlim_t) -> i32 {
+    if rlim_cur == libc::RLIM_INFINITY || rlim_cur > MAX_FD_SCAN as libc::rlim_t {
         return MAX_FD_SCAN;
     }
     // Never scan a narrower range than the previous hardcoded floor.
-    (rl.rlim_cur as i32).max(1024)
+    (rlim_cur as i32).max(1024)
 }
 
 /// Windows run-to-completion: apply the AppContainer + Job launcher and wait. Only
@@ -731,8 +796,20 @@ fn windows_run_to_completion(
         backend_id: sel.backend_id,
         reason: format!("waiting for contained child failed: {e}"),
     })?;
-    // Revert ACL grants now that the child has exited.
-    let _ = child.finish();
+    // Revert ACL grants now that the child has exited. A revert FAILURE leaves a
+    // container-SID ACE on a read/write root, a residual grant that widens what a
+    // future contained (or uncontained) process can reach, i.e. a containment-
+    // boundary leak. Fail closed: surface it as a refusal rather than reporting a
+    // clean success, so an enforcing caller (and the receipt) sees the boundary did
+    // not fully revert. (`finish` already attempts ALL guards before returning the
+    // first error, so the best-effort revert still happened.)
+    child.finish().map_err(|e| CapsuleRefused {
+        backend_id: sel.backend_id,
+        reason: format!(
+            "contained child exited (code {exit_code}) but reverting the capsule's ACL grants \
+             failed ({e}); a residual grant may remain, refusing to report a clean run"
+        ),
+    })?;
     Ok(CapsuleOutcome {
         exit_code,
         backend_id: sel.backend_id,
@@ -1018,6 +1095,103 @@ mod tests {
         );
     }
 
+    // ── IM5: macOS env isolation fails closed on a temp-HOME creation failure ──
+
+    /// IM5: when `temporary_home` is set and the temp-HOME factory fails,
+    /// `apply_macos_env_with` returns `Err` (instead of silently skipping the
+    /// repoint and leaving the real `$HOME` reachable while env_isolated claims true).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_env_fails_closed_when_temp_home_unavailable() {
+        let spec = CapsuleSpec::locked_down(); // temporary_home is true by default
+        assert!(spec.environment.temporary_home);
+        let mut cmd = Command::new("/usr/bin/true");
+        let err = apply_macos_env_with(&mut cmd, &spec, || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "synthetic tempdir failure",
+            ))
+        })
+        .expect_err("must fail closed when the temp HOME cannot be created");
+        assert!(
+            err.contains("refusing to run with the real HOME reachable"),
+            "reason must name the fail-closed cause: {err}"
+        );
+    }
+
+    /// IM5: the success path repoints HOME at the created temp dir (so the child
+    /// never sees the real home). Uses an injected dir so it is deterministic.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_env_repoints_home_on_success() {
+        let spec = CapsuleSpec::locked_down();
+        let injected = std::env::temp_dir().join("tirith-im5-success-marker");
+        let mut cmd = Command::new("/usr/bin/true");
+        apply_macos_env_with(&mut cmd, &spec, || Ok(injected.clone()))
+            .expect("success factory must succeed");
+        let envs: std::collections::BTreeMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get("HOME").and_then(|v| v.clone()).as_deref(),
+            Some(injected.to_string_lossy().as_ref()),
+            "HOME must be repointed at the temp dir: {envs:?}"
+        );
+    }
+
+    /// IM5: the failure propagates all the way through `macos_contained_command` to a
+    /// `CapsuleRefused` when the real temp-HOME creation fails. We force the failure
+    /// deterministically by pointing the temp dir at an uncreatable path via
+    /// `TMPDIR`, restored immediately after (the window is this test only). Only
+    /// meaningful where sandbox-exec is usable (otherwise the build path differs).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_contained_command_refuses_when_temp_home_creation_fails() {
+        if !tirith_core::capsule::macos::probe_sandbox_exec().sandbox_exec_usable {
+            eprintln!("skipping: /usr/bin/sandbox-exec not usable on this host");
+            return;
+        }
+        let spec = CapsuleSpec::locked_down();
+        let sel = select_backend(&spec);
+        assert_eq!(sel.backend_id, "seatbelt");
+
+        // Save and repoint TMPDIR at a path that cannot be created (a component is a
+        // non-existent file), so the production tempfile factory errors. Restored in
+        // the guard's Drop so a panic still cleans up.
+        struct TmpdirGuard(Option<std::ffi::OsString>);
+        impl Drop for TmpdirGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("TMPDIR", v),
+                    None => std::env::remove_var("TMPDIR"),
+                }
+            }
+        }
+        let _guard = TmpdirGuard(std::env::var_os("TMPDIR"));
+        std::env::set_var(
+            "TMPDIR",
+            "/tirith-im5-nonexistent-base-xyz/deeper/still-missing",
+        );
+
+        let result = build_contained_command(&spec, "/usr/bin/true", &[], &sel);
+        assert!(
+            result.is_err(),
+            "macOS contained command must refuse (CapsuleRefused) when the temp HOME \
+             cannot be created"
+        );
+        let refused = result.err().unwrap();
+        assert!(
+            refused.reason.contains("real HOME reachable"),
+            "refusal must carry the env-isolation fail-closed reason: {refused}"
+        );
+    }
+
     #[test]
     fn fail_closed_when_backend_degraded() {
         // Force the NoOp-degraded situation by checking the gate directly: a NoOp
@@ -1137,6 +1311,29 @@ mod tests {
         assert!(s.contains("fs_read=true"));
         assert!(s.contains("raw_net_denied=true"));
         assert!(s.contains("domain_proxy=false"));
+    }
+
+    // ── TG2: fd-scan ceiling clamp ──
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clamp_fd_ceiling_applies_floor_cap_and_infinity() {
+        // Below the floor -> raised to 1024 (never narrower than the old hardcoded
+        // walk, so a high-numbered inherited fd cannot survive on a low NOFILE host).
+        assert_eq!(clamp_fd_ceiling(256), 1024);
+        assert_eq!(clamp_fd_ceiling(0), 1024);
+        assert_eq!(clamp_fd_ceiling(1024), 1024);
+        // A normal mid-range value passes through unchanged.
+        assert_eq!(clamp_fd_ceiling(65536), 65536);
+        // Exactly the cap passes through.
+        assert_eq!(clamp_fd_ceiling(MAX_FD_SCAN as libc::rlim_t), MAX_FD_SCAN);
+        // Just over the cap clamps DOWN to the cap (bounded pre_exec loop).
+        assert_eq!(
+            clamp_fd_ceiling(MAX_FD_SCAN as libc::rlim_t + 1),
+            MAX_FD_SCAN
+        );
+        // RLIM_INFINITY clamps to the cap, never an unbounded walk.
+        assert_eq!(clamp_fd_ceiling(libc::RLIM_INFINITY), MAX_FD_SCAN);
     }
 
     #[test]

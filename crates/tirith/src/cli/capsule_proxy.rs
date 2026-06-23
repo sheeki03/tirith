@@ -111,13 +111,28 @@ impl BrokerConfig {
     /// Construct a TLS-only broker config for `network` with a freshly-minted
     /// session token. The caller hands the token to the OS backend, which injects
     /// it into the child.
-    pub fn new(network: NetworkPolicy, session_token: String) -> Self {
-        BrokerConfig {
+    ///
+    /// **Rejects an empty `session_token`.** An empty token is never a valid
+    /// per-session secret: paired with a missing/empty presented token it would make
+    /// `constant_time_eq(b"", b"")` authenticate an anonymous client (the broker
+    /// would become an open proxy for any loopback peer). A correctly-minted token is
+    /// always non-empty, so this only rejects a misuse, and it fails closed at
+    /// construction rather than relying solely on the per-request guard in
+    /// [`decide_connect`].
+    pub fn new(network: NetworkPolicy, session_token: String) -> Result<Self, String> {
+        if session_token.is_empty() {
+            return Err(
+                "broker session token must not be empty (an empty token would authenticate \
+                 an anonymous client)"
+                    .to_string(),
+            );
+        }
+        Ok(BrokerConfig {
             network,
             session_token,
             allow_plaintext: false,
             limits: BrokerLimits::default(),
-        }
+        })
     }
 }
 
@@ -243,6 +258,17 @@ pub fn decide_connect(
     // 1. Token. Compared in a way that does not short-circuit on the first
     //    differing byte, to avoid a timing oracle on the secret.
     let presented = req.bearer_token.as_deref().unwrap_or("");
+    // Reject an empty token on EITHER side before the comparison: an empty
+    // configured token (a config bug) plus a missing/empty presented token would
+    // otherwise satisfy `constant_time_eq(b"", b"") == true` and authenticate an
+    // anonymous client. The token is always non-empty in correct operation
+    // (`BrokerConfig::new` refuses an empty one), so this can only fire on a misuse,
+    // and it must fail closed.
+    if presented.is_empty() || cfg.session_token.is_empty() {
+        return ConnectDecision::Deny {
+            reason: "missing or invalid proxy-authorization token".to_string(),
+        };
+    }
     if !constant_time_eq(presented.as_bytes(), cfg.session_token.as_bytes()) {
         return ConnectDecision::Deny {
             reason: "missing or invalid proxy-authorization token".to_string(),
@@ -855,6 +881,7 @@ mod tests {
 
     fn cfg_for(domains: &[&str]) -> BrokerConfig {
         BrokerConfig::new(allowlist(domains, &[443]), "s3cr3t-token".to_string())
+            .expect("non-empty token")
     }
 
     fn req(host: &str, port: u16, token: Option<&str>) -> ConnectRequest {
@@ -1137,6 +1164,59 @@ mod tests {
         assert!(!constant_time_eq(&token, &wrong));
         // A correct prefix but a shorter guess never matches.
         assert!(!constant_time_eq(&token, &token[..32]));
+    }
+
+    // ---- MN7: empty token must never authenticate ----
+
+    #[test]
+    fn broker_config_rejects_empty_token() {
+        // Construction fails closed on an empty token (an empty per-session secret is
+        // never valid and would otherwise authenticate an anonymous client).
+        let err = BrokerConfig::new(allowlist(&["pypi.org"], &[443]), String::new())
+            .expect_err("empty token must be rejected at construction");
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn decide_denies_when_configured_token_is_empty() {
+        // Defense in depth: even if a BrokerConfig somehow carries an empty token
+        // (constructed bypassing `new`), decide_connect must DENY rather than let an
+        // empty/missing presented token satisfy constant_time_eq(b"", b"").
+        let cfg = BrokerConfig {
+            network: allowlist(&["pypi.org"], &[443]),
+            session_token: String::new(),
+            allow_plaintext: false,
+            limits: BrokerLimits::default(),
+        };
+        // Presented token also empty (the open-proxy case the old code allowed).
+        let d_empty = decide_connect(
+            &cfg,
+            &req("pypi.org", 443, Some("")),
+            &["93.184.216.34".parse().unwrap()],
+        );
+        assert!(
+            matches!(d_empty, ConnectDecision::Deny { .. }),
+            "empty configured + empty presented token must DENY, not authenticate"
+        );
+        // And a missing token (None -> "") must also deny.
+        let d_missing = decide_connect(
+            &cfg,
+            &req("pypi.org", 443, None),
+            &["93.184.216.34".parse().unwrap()],
+        );
+        assert!(matches!(d_missing, ConnectDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn decide_denies_empty_presented_against_real_token() {
+        // An empty presented token never matches a real configured token.
+        let cfg = cfg_for(&["pypi.org"]);
+        let d = decide_connect(
+            &cfg,
+            &req("pypi.org", 443, Some("")),
+            &["93.184.216.34".parse().unwrap()],
+        );
+        assert!(matches!(d, ConnectDecision::Deny { .. }));
     }
 
     #[test]

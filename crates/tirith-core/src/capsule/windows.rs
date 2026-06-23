@@ -260,13 +260,22 @@ pub struct AppContainerProfile {
 /// The moniker is `APP_CONTAINER_NAME_PREFIX` + 16 hex chars = 30 chars, safely
 /// under `APP_CONTAINER_NAME_MAX` (64). It contains only `[a-z0-9.]`, all valid in
 /// an AppContainer name.
-pub fn app_container_name(spec: &CapsuleSpec) -> String {
-    // A spec that does not serialize is impossible (every field is plain serde),
-    // but be defensive: fall back to a constant suffix rather than panic, so the
-    // launcher never aborts on a name-derivation edge.
-    let serialized = serde_json::to_string(spec).unwrap_or_default();
+///
+/// **Fails closed on a serialize error.** Every spec field is plain serde so this
+/// should never happen, but falling back to a constant suffix (the old behavior)
+/// would collapse EVERY un-serializable spec onto one moniker (hence one package
+/// SID and one shared ACL identity), silently widening containment across distinct
+/// specs. Returning `Err` instead makes [`windows_launch_plan`] refuse the launch,
+/// which already fails closed, rather than derive a colliding identity.
+pub fn app_container_name(spec: &CapsuleSpec) -> Result<String, WindowsCapsuleError> {
+    let serialized = serde_json::to_string(spec).map_err(|e| {
+        WindowsCapsuleError::Unsupported(format!(
+            "cannot derive a unique AppContainer moniker: spec did not serialize ({e}); \
+             refusing rather than collapse distinct specs onto one container SID"
+        ))
+    })?;
     let digest = fnv1a_64(serialized.as_bytes());
-    format!("{APP_CONTAINER_NAME_PREFIX}{digest:016x}")
+    Ok(format!("{APP_CONTAINER_NAME_PREFIX}{digest:016x}"))
 }
 
 /// 64-bit FNV-1a over `bytes`. A tiny, allocation-free, deterministic hash used
@@ -289,14 +298,20 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 /// `DenyAll` needs none; an `AllowListedDomains` is reported degraded and routed
 /// through the broker, never via a granted capability), so the profile can never
 /// silently widen network access.
-pub fn app_container_profile(spec: &CapsuleSpec) -> AppContainerProfile {
-    AppContainerProfile {
-        name: app_container_name(spec),
+///
+/// Fails closed if the moniker cannot be derived (see [`app_container_name`]): an
+/// underivable moniker would otherwise collapse distinct specs onto one container
+/// SID, so the launch is refused instead.
+pub fn app_container_profile(
+    spec: &CapsuleSpec,
+) -> Result<AppContainerProfile, WindowsCapsuleError> {
+    Ok(AppContainerProfile {
+        name: app_container_name(spec)?,
         display_name: APP_CONTAINER_DISPLAY_NAME.to_string(),
         // E4 grants NO networking capability. DenyAll wants none; an allow-list is
         // degraded (the broker, not a capability, is the intended egress path).
         networking_capabilities: Vec::new(),
-    }
+    })
 }
 
 /// The access an ACL grant confers on the container package SID for one path.
@@ -464,7 +479,7 @@ pub fn windows_launch_plan(
 
     let grants = acl_grants(&spec.filesystem)?;
     Ok(WindowsLaunchPlan {
-        profile: app_container_profile(spec),
+        profile: app_container_profile(spec)?,
         acl_grants: grants,
         job_limits: job_object_limits(&spec.resources),
         program: program.to_string(),
@@ -654,8 +669,8 @@ mod tests {
     #[test]
     fn app_container_name_is_deterministic_and_bounded() {
         let spec = CapsuleSpec::locked_down();
-        let a = app_container_name(&spec);
-        let b = app_container_name(&spec);
+        let a = app_container_name(&spec).expect("moniker derivable");
+        let b = app_container_name(&spec).expect("moniker derivable");
         // Same spec -> same moniker (idempotent create / unambiguous delete).
         assert_eq!(a, b);
         assert!(a.starts_with(APP_CONTAINER_NAME_PREFIX));
@@ -671,18 +686,22 @@ mod tests {
 
     #[test]
     fn app_container_name_differs_for_different_specs() {
+        // MN6: distinct specs derive DISTINCT monikers (hence distinct package SIDs /
+        // ACL identities). Before the fix a serialize failure fell back to a constant
+        // suffix, collapsing every such spec onto ONE SID; now derivation is fallible
+        // and never silently collides. Two normal specs serialize fine and differ.
         let deny = CapsuleSpec::locked_down();
         let mut other = CapsuleSpec::locked_down();
         other.filesystem.read_roots.push(PathBuf::from("/tmp/work"));
-        // Different specs -> (almost surely) different monikers; with FNV-1a over
-        // distinct JSON these will differ.
-        assert_ne!(app_container_name(&deny), app_container_name(&other));
+        let a = app_container_name(&deny).expect("moniker derivable");
+        let b = app_container_name(&other).expect("moniker derivable");
+        assert_ne!(a, b);
     }
 
     #[test]
     fn app_container_profile_grants_no_network_for_denyall() {
         let spec = CapsuleSpec::locked_down();
-        let prof = app_container_profile(&spec);
+        let prof = app_container_profile(&spec).expect("profile derivable");
         assert!(prof.networking_capabilities.is_empty());
         assert_eq!(prof.display_name, APP_CONTAINER_DISPLAY_NAME);
         assert!(prof.name.starts_with(APP_CONTAINER_NAME_PREFIX));
@@ -698,7 +717,7 @@ mod tests {
             domains: ["pypi.org".to_string()].into_iter().collect(),
             ports: [443u16].into_iter().collect(),
         };
-        let prof = app_container_profile(&spec);
+        let prof = app_container_profile(&spec).expect("profile derivable");
         assert!(prof.networking_capabilities.is_empty());
     }
 

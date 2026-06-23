@@ -168,6 +168,24 @@ fn path_is_executable_file(path: &Path) -> bool {
 ///     whenever the spec sets a dimension the wrapper enforces. Honest: it
 ///     describes what a contained macOS launch actually delivers, not the profile
 ///     in isolation.
+///
+///     **macOS gap (do NOT over-report): `max_processes` is not enforced.** Unlike
+///     Linux (`RLIMIT_NPROC`) and Windows (Job Object `ActiveProcessLimit`), macOS
+///     has no per-process process-count cap: `RLIMIT_NPROC` is per real UID, so
+///     applying it would throttle the whole user (and could lock the user's own
+///     shell out of forking) without bounding the contained child's subtree, a
+///     false fork-bomb cap, not a real one. The wrapper therefore does NOT apply it
+///     (see `apply_macos_rlimits`), and `max_processes` is deliberately excluded
+///     from `rlimitable` below. Consequence, kept honest by construction: a spec
+///     whose ONLY resource limit is `max_processes` reports
+///     `resource_limits_enforced = false` here, so `required_coverage` (which
+///     demands the flag whenever any dimension is set) is degraded and an enforcing
+///     surface fails closed rather than running believing the fork-bomb cap holds.
+///     When other macOS-enforceable dimensions are ALSO set (the conservative
+///     locked-down spec sets CPU+memory), the flag is `true` for THOSE dimensions;
+///     it never promised a per-dimension fork-bomb guarantee (just as
+///     `wall_clock`/`max_output` are launcher-enforced, not setrlimit). The absence
+///     of a macOS process-tree cap is a documented limitation, not a silent `true`.
 ///   - `env_isolated` / `handles_isolated`: likewise applied by the E5 wrapper,
 ///     not the SBPL profile. The wrapper `env_clear`s and re-adds only the
 ///     surviving (sensitive-stripped) variables, points HOME/TMPDIR/XDG_* at a
@@ -187,9 +205,15 @@ pub fn derive_coverage(spec: &CapsuleSpec, probe: &SeatbeltProbe) -> CapsuleCove
         return CapsuleCoverage::NONE;
     }
     // The wrapper applies CPU/memory/open-files rlimits; report the flag when the
-    // spec sets any dimension it actually enforces (mirrors the Linux backend's
-    // `rlimitable` set). `wall_clock`/`max_output`/`max_processes` are the
-    // launcher's job, not setrlimit on macOS, so they do not raise this alone.
+    // spec sets any dimension it actually enforces. `wall_clock`/`max_output` are
+    // launcher-enforced (not setrlimit), so they do not raise this alone. CRUCIALLY,
+    // `max_processes` is EXCLUDED: macOS has no per-process process-count cap
+    // (RLIMIT_NPROC is per-UID; see the doc above and `apply_macos_rlimits`), so the
+    // fork-bomb dimension is enforced by nothing here. Excluding it keeps the flag
+    // honest: a `max_processes`-only spec then reports false and an enforcing
+    // surface degrades/fails closed instead of trusting an absent cap. (Linux's
+    // `rlimitable` includes max_processes because RLIMIT_NPROC there is per-process;
+    // macOS genuinely cannot, so the two backends legitimately differ on this one.)
     let rlimitable = spec.resources.cpu_seconds.is_some()
         || spec.resources.memory_bytes.is_some()
         || spec.resources.max_open_files.is_some();
@@ -643,6 +667,34 @@ mod tests {
         if p.sandbox_exec_usable {
             assert!(path_is_executable_file(Path::new(SANDBOX_EXEC_PATH)));
         }
+    }
+
+    #[test]
+    fn max_processes_alone_is_not_reported_enforced_on_macos() {
+        // IM4: macOS cannot enforce a per-process fork-bomb cap (RLIMIT_NPROC is
+        // per-UID), so a spec whose ONLY resource limit is `max_processes` must NOT
+        // claim resource_limits_enforced. Otherwise an enforcing surface would run
+        // believing the fork-bomb cap holds when it does not (a DoS over-report).
+        let probe = SeatbeltProbe {
+            sandbox_exec_usable: true,
+        };
+        let mut spec = CapsuleSpec::locked_down();
+        spec.resources = ResourceLimits {
+            max_processes: Some(256),
+            ..ResourceLimits::default()
+        };
+        let cov = derive_coverage(&spec, &probe);
+        assert!(
+            !cov.resource_limits_enforced,
+            "macOS must not claim resource_limits_enforced for a max_processes-only spec \
+             (it has no per-process process cap): {cov:?}"
+        );
+        // And because required_coverage demands the flag whenever ANY dimension is
+        // set, this spec is degraded -> an enforcing surface fails closed on the gap.
+        assert!(
+            cov.is_degraded_against(&spec.required_coverage()),
+            "a max_processes-only spec must be degraded on macOS so the surface fails closed"
+        );
     }
 
     #[test]

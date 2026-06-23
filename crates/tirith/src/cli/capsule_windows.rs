@@ -65,7 +65,7 @@ use std::os::windows::ffi::OsStrExt;
 use windows::core::{Error as WinError, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, GENERIC_EXECUTE, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, HLOCAL, WIN32_ERROR,
+    GENERIC_WRITE, HANDLE, HLOCAL, WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
@@ -111,6 +111,10 @@ pub enum WindowsLaunchError {
     CreateProcess(String, WinError),
     /// Creating or configuring the Job Object failed.
     JobObject(String, WinError),
+    /// Waiting for the contained child to exit did not complete cleanly: the wait
+    /// returned something other than `WAIT_OBJECT_0`, so the process is not known to
+    /// have exited and its "exit code" would be unreliable (e.g. `STILL_ACTIVE`).
+    Wait(String),
     /// Encoding a string for a Win32 wide-string argument failed (interior NUL).
     Encoding(String),
 }
@@ -123,6 +127,7 @@ impl std::fmt::Display for WindowsLaunchError {
             WindowsLaunchError::AttributeList(m, e) => write!(f, "attribute-list: {m}: {e}"),
             WindowsLaunchError::CreateProcess(m, e) => write!(f, "create-process: {m}: {e}"),
             WindowsLaunchError::JobObject(m, e) => write!(f, "job-object: {m}: {e}"),
+            WindowsLaunchError::Wait(m) => write!(f, "wait: {m}"),
             WindowsLaunchError::Encoding(m) => write!(f, "encoding: {m}"),
         }
     }
@@ -203,7 +208,20 @@ pub fn wait_for(child: &ContainedChild) -> Result<i32, WindowsLaunchError> {
     let handle = child.process_handle();
     // SAFETY: `handle` is the valid child process handle owned by `child` for the
     // duration of the call; WaitForSingleObject does not consume it.
-    let _ = unsafe { WaitForSingleObject(handle, INFINITE) };
+    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    // Only `WAIT_OBJECT_0` means the process actually exited. WAIT_TIMEOUT (can't
+    // happen with INFINITE, but be exhaustive), WAIT_ABANDONED, or WAIT_FAILED mean
+    // the process is NOT known to have terminated, so `GetExitCodeProcess` would
+    // return `STILL_ACTIVE` (259) and we would otherwise report that as a clean exit
+    // code. Fail closed instead: the caller must treat this as a launch failure, not
+    // a successful run with exit 259.
+    if wait != WAIT_OBJECT_0 {
+        return Err(WindowsLaunchError::Wait(format!(
+            "WaitForSingleObject did not report the child as exited (returned {:#x}); \
+             the child may still be running, refusing to synthesize an exit code",
+            wait.0
+        )));
+    }
     let mut code: u32 = 0;
     // SAFETY: `handle` is valid; `&mut code` is a valid u32 out-param.
     unsafe { GetExitCodeProcess(handle, &mut code) }.map_err(|e| {
