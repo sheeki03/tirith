@@ -751,9 +751,10 @@ struct InstallReport {
     install_ok: bool,
     post_blocked: bool,
     success: bool,
-    /// RECORD-listed files whose on-disk bytes did not match (the tamper signal). A
-    /// `success` install can still carry these because a Medium
-    /// `PythonInstalledIntegrityViolation` maps to Warn under the current policy.
+    /// RECORD-listed files whose on-disk bytes did not match (the install-time tamper
+    /// signal). `hash_mismatches > 0` makes the enforcing install fail closed (IM8), so a
+    /// `success` install always carries 0 here; the count is still surfaced (in JSON and
+    /// on the failure path) for the audit trail.
     hash_mismatches: usize,
     /// Located distributions with no RECORD file (a coverage gap).
     records_missing: usize,
@@ -781,7 +782,6 @@ impl InstallReport {
             .as_ref()
             .map(|p| p.is_block())
             .unwrap_or(false);
-        let success = install_ok && !post_blocked && recorded.is_ok();
         let hash_mismatches = outcome
             .post_install
             .as_ref()
@@ -792,6 +792,14 @@ impl InstallReport {
             .as_ref()
             .map(|p| p.records_missing)
             .unwrap_or(0);
+        // IM8: the enforcing `pkg install` fails CLOSED on a post-install RECORD hash
+        // mismatch. A RECORD-listed file whose on-disk bytes differ from the RECORD pip
+        // just wrote is install-time tampering: this is a fresh, contained, wheel-only
+        // --force-reinstall, so a mismatch in that window is not the benign environment
+        // drift that scanning a pre-existing env (`verify-env`) can see. `records_missing`
+        // stays a non-fatal coverage gap (warning), and the finding's Medium severity is
+        // unchanged, so `verify-env` / scan keep warning rather than blocking.
+        let success = install_ok && !post_blocked && recorded.is_ok() && hash_mismatches == 0;
         let (receipt_path, signed, anchor_warning, receipt_error) = match recorded {
             Ok(r) => (
                 Some(r.path.display().to_string()),
@@ -857,15 +865,17 @@ fn report_install_outcome(
         let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
         println!();
     } else if report.success {
-        // Only claim "verified" when the post-install RECORD check found no mismatch and
-        // no missing RECORD; otherwise the install completed but was NOT fully verified.
+        // `success` implies hash_mismatches == 0 (a mismatch fails closed, IM8). Claim
+        // "verified" only when there is also no missing RECORD; a coverage gap
+        // (records_missing) is a non-fatal warning, not a tamper signal, so the install
+        // still succeeds but is not called fully verified.
         if report.record_integrity_clean() {
             eprintln!("tirith pkg install: install complete and verified");
         } else {
             eprintln!(
-                "tirith pkg install: install completed with {} RECORD hash mismatch(es) and {} \
-                 missing RECORD(s) (not blocked under the current policy)",
-                report.hash_mismatches, report.records_missing
+                "tirith pkg install: install complete; {} RECORD(s) could not be located \
+                 (coverage gap, not a tamper signal)",
+                report.records_missing
             );
         }
         eprintln!("  plan digest: {}", digest.plan_digest);
@@ -896,6 +906,13 @@ fn report_install_outcome(
         }
         if report.post_blocked {
             eprintln!("  post-install RECORD verification blocked the install");
+        }
+        if report.hash_mismatches > 0 {
+            eprintln!(
+                "  post-install RECORD integrity violation: {} installed file(s) do not match \
+                 the RECORD pip wrote (install-time tampering); refusing (fail closed)",
+                report.hash_mismatches
+            );
         }
         if let Some(err) = &report.receipt_error {
             eprintln!("  receipt: {err}");
@@ -1581,25 +1598,42 @@ mod tests {
     }
 
     #[test]
-    fn install_report_record_mismatch_is_not_verified_but_still_succeeds() {
-        // IM8: a post-install RECORD hash mismatch is Medium -> Warn (not Block), so the
-        // install is still `success` (exit 0, behavior unchanged), but it must NOT be
-        // called "verified": the count is surfaced and record_integrity_clean() is false.
-        let outcome = outcome_with_post(0, 2, 1);
+    fn install_report_record_hash_mismatch_fails_closed() {
+        // IM8: a post-install RECORD hash mismatch on the ENFORCING install is install-time
+        // tampering (a RECORD-listed file changed after pip wrote RECORD), so the install
+        // fails CLOSED (success=false, exit 1) even though the finding is Medium. The count
+        // is still surfaced for the audit trail.
+        let outcome = outcome_with_post(0, 2, 0);
         let recorded = Ok(recorded_ok(true, None));
         let report = InstallReport::from_outcome(&outcome, &recorded);
         assert!(
-            report.success,
-            "a RECORD mismatch is Warn, not Block, so the install still succeeds (unchanged)"
+            !report.success,
+            "a RECORD hash mismatch must fail the enforcing install closed (IM8)"
         );
-        assert!(
-            !report.record_integrity_clean(),
-            "a hash mismatch / missing RECORD must disqualify the 'verified' wording"
-        );
+        assert!(!report.record_integrity_clean());
 
         let digest = digest_with_expiry("");
         let json = report.to_json(&digest, &outcome);
         assert_eq!(json["record_hash_mismatches"], serde_json::json!(2));
+        assert_eq!(json["success"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn install_report_records_missing_only_is_a_warning_not_a_block() {
+        // A missing RECORD with NO hash mismatch is a coverage gap, not a positive tamper
+        // signal, so the install still SUCCEEDS (it is just not called fully "verified").
+        // verify-env / scan keep their Medium-Warn behavior; only a hash mismatch blocks.
+        let outcome = outcome_with_post(0, 0, 1);
+        let recorded = Ok(recorded_ok(true, None));
+        let report = InstallReport::from_outcome(&outcome, &recorded);
+        assert!(
+            report.success,
+            "a coverage gap (missing RECORD) without a hash mismatch is a warning, not a block"
+        );
+        assert!(!report.record_integrity_clean());
+
+        let digest = digest_with_expiry("");
+        let json = report.to_json(&digest, &outcome);
         assert_eq!(json["record_records_missing"], serde_json::json!(1));
         assert_eq!(json["success"], serde_json::json!(true));
     }

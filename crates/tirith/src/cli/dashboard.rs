@@ -117,16 +117,15 @@ fn is_loopback_host(host: &str) -> bool {
     hostname.eq_ignore_ascii_case("127.0.0.1") || hostname.eq_ignore_ascii_case("localhost")
 }
 
-/// Constant-time byte comparison — avoids leaking via timing how many leading
-/// bytes matched. Length mismatch returns `false` (the token is fixed-length
-/// hex, so that reveals nothing); equal lengths fold every byte.
+/// Constant-time byte comparison. Folds over the longer input and seeds the
+/// accumulator with a length-mismatch flag, so neither the length nor the first
+/// differing byte position leaks through timing (no early return on a length
+/// difference).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let max = a.len().max(b.len());
+    let mut diff = (a.len() != b.len()) as u8;
+    for i in 0..max {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
     }
     diff == 0
 }

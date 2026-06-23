@@ -324,17 +324,16 @@ fn normalize_sha256_hex(s: &str) -> Option<String> {
     Some(t.to_ascii_lowercase())
 }
 
-/// A length-checked constant-time byte equality. Equal length is required by the
-/// callers (both are normalized 64-char digests), but the function still guards
-/// against unequal lengths by returning `false` without an early branch on
-/// content. Avoids leaking the first differing position through timing.
+/// A constant-time byte equality. Folds over the longer input and seeds the
+/// accumulator with a length-mismatch flag, so neither the length nor the first
+/// differing position leaks through timing (no early return on a length
+/// difference). The callers pass normalized 64-char digests, so lengths are equal
+/// in practice; the fold is defense in depth.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let max = a.len().max(b.len());
+    let mut diff: u8 = (a.len() != b.len()) as u8;
+    for i in 0..max {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
     }
     diff == 0
 }
