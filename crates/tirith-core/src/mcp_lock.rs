@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 /// Lockfile format version. Bump only on a breaking schema change.
 ///
 /// **Enforced at load:** [`parse_lockfile`] rejects a `format_version` other
-/// than this (or v4, the migration carve-out) with a dedicated
+/// than this (or v4 / v5, the migration carve-outs) with a dedicated
 /// [`McpLockLoadError::UnsupportedVersion`], distinct from "the JSON is corrupt"
 /// so the operator gets a precise re-lock / upgrade message.
 ///
@@ -45,7 +45,22 @@ use sha2::{Digest, Sha256};
 ///   lockfile loaded under v5 is tagged [`LockfileSchema::LegacyV4Migration`]
 ///   and [`compute_drift`] returns a single [`McpDrift::SchemaUpgradeRequired`]
 ///   (re-lock once) instead of phantom-drifting every server.
-pub const MCP_LOCK_FORMAT_VERSION: u32 = 5;
+/// * `6` — captures the LIVE `tools/list` descriptors a server actually
+///   advertises (description / inputSchema / outputSchema / annotations / icons),
+///   each hashed via the explicit [`canonical_json`] so a re-ordered-key or
+///   whitespace-only re-serialization is NOT drift but a real surface change is.
+///   The new [`McpLockServer::descriptors`] is captured at runtime (the static
+///   config files do not carry it), so a `tirith mcp lock` over config alone
+///   produces an empty descriptor list — descriptors are populated when the
+///   gateway observes a `tools/list` response. The descriptor set folds into a
+///   SEPARATE [`McpLockServer::descriptor_hash`], NOT `content_hash`, so static
+///   config drift is byte-for-byte unchanged from v5. A v5 lockfile under v6 is
+///   tagged [`LockfileSchema::LegacyV5Migration`]; its on-disk shape is identical
+///   (the descriptor field serde-defaults to empty), so per-server static drift
+///   runs normally and [`compute_drift`] adds a single
+///   [`McpDrift::SchemaUpgradeRequired`] (re-lock once to capture live
+///   descriptors). See [`ToolDescriptor`] / [`compute_descriptor_drift`].
+pub const MCP_LOCK_FORMAT_VERSION: u32 = 6;
 
 /// Basename of the lockfile, written under `<repo_root>/.tirith/`.
 pub const MCP_LOCK_FILENAME: &str = "mcp.lock";
@@ -306,6 +321,520 @@ pub(crate) fn salted_sha256_hex(salt: &str, value: &str) -> String {
     hex_lower(&hasher.finalize())
 }
 
+// ---------------------------------------------------------------------------
+// v6 — live `tools/list` descriptor capture, lock, and drift (Stack C / C3)
+// ---------------------------------------------------------------------------
+
+/// Serialize a [`serde_json::Value`] into a stable, canonical string: object keys
+/// sorted lexicographically (recursively), no insignificant whitespace, and
+/// numbers in their `serde_json` canonical form. This is the load-bearing
+/// primitive behind descriptor hashing — two descriptors that differ ONLY in key
+/// order or whitespace must hash identically (not drift), while any value-level
+/// change must hash differently.
+///
+/// Why hand-rolled rather than `serde_json::to_string`: `serde_json` preserves a
+/// `Map`'s insertion/parse order, so `{"a":1,"b":2}` and `{"b":2,"a":1}` would
+/// serialize to two different strings and falsely register as drift. (The
+/// crate's `preserve_order` feature is not enabled here, and even default
+/// `BTreeMap` ordering is not guaranteed stable across versions for our hashing
+/// contract.) We therefore walk the tree and emit keys in sorted order
+/// explicitly.
+///
+/// Number handling: emitted via `serde_json::Number`'s own `Display`, which is
+/// the parsed canonical form (`1`, `1.5`, `-0.0` → `-0.0`). We do NOT attempt to
+/// re-normalize numeric spellings (`1e2` vs `100`) — `serde_json` already folds
+/// integer/float representations on parse, and re-spelling risks precision loss.
+/// A descriptor whose schema spells a literal differently across captures is a
+/// real, surfaced change (conservative: prefer a false drift over a missed one).
+pub fn canonical_json(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(value, &mut out);
+    out
+}
+
+/// Recursive worker for [`canonical_json`]. Appends the canonical encoding of
+/// `value` to `out`. Strings are escaped via `serde_json` (so control bytes,
+/// quotes, and non-ASCII are encoded exactly as the parser would), keeping the
+/// output valid JSON and collision-free at string boundaries.
+fn write_canonical_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => {
+            use std::fmt::Write as _;
+            // `Number`'s Display is the canonical parsed form; write! into a
+            // String never fails.
+            let _ = write!(out, "{n}");
+        }
+        serde_json::Value::String(s) => {
+            // Reuse serde_json's string escaper for an exact, valid-JSON encoding.
+            // `to_string` on a `Value::String` cannot fail.
+            let encoded = serde_json::Value::String(s.clone()).to_string();
+            out.push_str(&encoded);
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            // Sort keys lexicographically by their bytes for a stable order
+            // regardless of the map's parse/insertion order.
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                // Encode the key as a JSON string (escaped) then `:` then value.
+                let encoded_key = serde_json::Value::String(key.clone()).to_string();
+                out.push_str(&encoded_key);
+                out.push(':');
+                // The key came from `map.keys()`, so the lookup is always Some.
+                if let Some(v) = map.get(key) {
+                    write_canonical_json(v, out);
+                }
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// One MCP tool (or prompt) descriptor as advertised by a live `tools/list`
+/// response, reduced to its security-relevant surface and a stable hash. The hash
+/// is over the [`canonical_json`] of the captured fields, so a server that
+/// re-orders schema keys or reformats whitespace does NOT register as drift, but
+/// any material change (a swapped description, a widened `inputSchema`, a new
+/// destructive annotation, a changed icon URI) does.
+///
+/// **Hash-only by design.** Only the tool `name` and the descriptor `*_hash` are
+/// stored — never the raw description / schema text. A tool description is
+/// attacker-controlled and the lockfile is committed, so persisting the full text
+/// would both bloat the file and re-introduce attacker bytes into a committed,
+/// rendered artifact; the hash is sufficient for exact drift. (The raw text IS
+/// scanned for injection/exfil before exposure, at the gateway, every string leaf
+/// of a `tools/list` / `prompts/*` response, descriptions included, is run through
+/// [`crate::mcp::response_inspect::inspect_response`], but that scan feeds a
+/// gateway decision, never the stored lock.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDescriptor {
+    /// The tool's name (the `name` field of a `tools/list` entry). The stable
+    /// identity used to pair descriptors across two locks for drift.
+    pub name: String,
+    /// Hash over the [`canonical_json`] of the whole captured descriptor
+    /// (`description` + `inputSchema` + `outputSchema` + `annotations` + `icons`,
+    /// each present-or-null), framed with the tool name. The single value drift
+    /// compares.
+    pub descriptor_hash: String,
+}
+
+impl ToolDescriptor {
+    /// Build a descriptor from one `tools/list` entry object. Captures the
+    /// security-relevant fields (`description`, `inputSchema`, `outputSchema`,
+    /// `annotations`, `icons`) into a single canonical object and hashes it. A
+    /// missing field is captured as JSON `null` (so "field absent" and "field
+    /// present but null" are distinct: absent → our synthesized `null`; an
+    /// explicit `null` in the source is also `null`, which is acceptable — the
+    /// security signal is the same).
+    ///
+    /// `name` falls back to the empty string when the entry omits `name` (a
+    /// malformed entry the caller still wants captured rather than dropped).
+    pub fn from_tool_entry(entry: &serde_json::Value) -> Self {
+        let name = entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Assemble exactly the fields we lock, in a fixed key set. `canonical_json`
+        // sorts the keys, so the literal insertion order here does not matter.
+        let mut captured = serde_json::Map::new();
+        for field in DESCRIPTOR_HASHED_FIELDS {
+            let v = entry
+                .get(*field)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            captured.insert((*field).to_string(), v);
+        }
+        let canonical = canonical_json(&serde_json::Value::Object(captured));
+        let descriptor_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(b"mcp-tool-descriptor-v6\0");
+            hash_field(&mut hasher, name.as_bytes());
+            hash_field(&mut hasher, canonical.as_bytes());
+            hex_lower(&hasher.finalize())
+        };
+
+        ToolDescriptor {
+            name,
+            descriptor_hash,
+        }
+    }
+}
+
+/// The exact field set captured into a [`ToolDescriptor`]'s hash. Fixed and
+/// explicit so adding a field is a deliberate, reviewable change (and a hash
+/// bump). Mirrors the MCP `Tool` shape: `description`, `inputSchema`,
+/// `outputSchema`, `annotations`, `icons`.
+pub(crate) const DESCRIPTOR_HASHED_FIELDS: &[&str] = &[
+    "description",
+    "inputSchema",
+    "outputSchema",
+    "annotations",
+    "icons",
+];
+
+/// Hash an ordered descriptor list into one per-server `descriptor_hash`.
+/// Length-prefixed framing (via [`hash_field`]) so no two distinct lists collide.
+/// Empty list → empty string (the "no descriptors captured" sentinel, distinct
+/// from any real hash).
+pub fn compute_descriptor_hash(descriptors: &[ToolDescriptor]) -> String {
+    if descriptors.is_empty() {
+        return String::new();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"mcp-descriptor-set-v6\0");
+    hash_field(&mut hasher, &(descriptors.len() as u64).to_le_bytes());
+    for d in descriptors {
+        hash_field(&mut hasher, d.name.as_bytes());
+        hash_field(&mut hasher, d.descriptor_hash.as_bytes());
+    }
+    hex_lower(&hasher.finalize())
+}
+
+/// Normalize a freshly-captured `tools/list` descriptor vector for storage:
+/// de-duplicate by tool name (last write wins, matching a server that re-declares
+/// a tool) and sort by name, so the stored order and the `descriptor_hash` are
+/// stable regardless of the order the server listed its tools.
+pub fn normalize_descriptors(mut descriptors: Vec<ToolDescriptor>) -> Vec<ToolDescriptor> {
+    // De-dup by name keeping the LAST occurrence (a later entry overrides an
+    // earlier same-name one). Build a name→descriptor map, then collect sorted.
+    let mut by_name: std::collections::BTreeMap<String, ToolDescriptor> =
+        std::collections::BTreeMap::new();
+    for d in descriptors.drain(..) {
+        by_name.insert(d.name.clone(), d);
+    }
+    by_name.into_values().collect()
+}
+
+/// Extract and normalize the descriptor list from a parsed `tools/list` RESULT
+/// object (`result.tools` array). A non-array / missing `tools` yields an empty
+/// vec (no panic — the "malformed → empty" convention). Each entry is reduced to
+/// a [`ToolDescriptor`]; entries that are not objects are skipped.
+///
+/// `result` is the JSON-RPC `result` value (the object that holds `tools`), NOT
+/// the whole response envelope — the caller unwraps `response["result"]` first.
+pub fn descriptors_from_tools_list(result: &serde_json::Value) -> Vec<ToolDescriptor> {
+    let Some(tools) = result.get("tools").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let captured: Vec<ToolDescriptor> = tools
+        .iter()
+        .filter(|e| e.is_object())
+        .map(ToolDescriptor::from_tool_entry)
+        .collect();
+    normalize_descriptors(captured)
+}
+
+/// How a server's live `tools/list` descriptor surface differs between two locks
+/// (the previously approved one and the freshly captured one). Each variant
+/// carries only the tool NAME — descriptions can contain attacker-controlled text
+/// and drift reports are rendered, so the raw description is never echoed (it is
+/// represented by its hash inside the lock).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpDescriptorChange {
+    /// A tool advertised in the new capture that the locked set did not have.
+    ToolAdded { name: String },
+    /// A tool in the locked set the new capture no longer advertises.
+    ToolRemoved { name: String },
+    /// A tool present on both sides whose descriptor hash changed — its
+    /// description / inputSchema / outputSchema / annotations / icons were
+    /// materially altered after approval.
+    ToolChanged { name: String },
+}
+
+impl McpDescriptorChange {
+    /// Deterministic sort key: kind-bucket (Removed=0, Added=1, Changed=2) then
+    /// name. Removed first as the most security-relevant (a tool that vanished may
+    /// be a server hiding capability).
+    fn sort_key(&self) -> (u8, &str) {
+        match self {
+            McpDescriptorChange::ToolRemoved { name } => (0, name),
+            McpDescriptorChange::ToolAdded { name } => (1, name),
+            McpDescriptorChange::ToolChanged { name } => (2, name),
+        }
+    }
+
+    /// The tool name this change refers to.
+    pub fn name(&self) -> &str {
+        match self {
+            McpDescriptorChange::ToolAdded { name }
+            | McpDescriptorChange::ToolRemoved { name }
+            | McpDescriptorChange::ToolChanged { name } => name,
+        }
+    }
+
+    /// Whether this change introduces a NEW or CHANGED tool that must be suspended
+    /// pending re-approval (an added or changed tool exposes a surface the
+    /// operator never approved). A removed tool is reported but does not gate a
+    /// re-approval (there is nothing new to approve).
+    pub fn requires_reapproval(&self) -> bool {
+        matches!(
+            self,
+            McpDescriptorChange::ToolAdded { .. } | McpDescriptorChange::ToolChanged { .. }
+        )
+    }
+}
+
+/// Compute the descriptor drift between a previously locked descriptor set and a
+/// freshly captured one. Both are normalized (sorted by name) on the way in
+/// (defensively re-normalized here so a hand-built input still works). A merge
+/// walk emits Added / Removed / Changed; the result is sorted via
+/// [`McpDescriptorChange::sort_key`].
+///
+/// This is the v6 analogue of [`compute_drift`] for the LIVE descriptor surface
+/// rather than the static config inventory. The caller (gateway / C4) turns a
+/// non-empty result into a High [`crate::verdict::RuleId::McpServerDrift`] finding
+/// via [`descriptor_drift_finding`] and suspends the added/changed tools.
+pub fn compute_descriptor_drift(
+    locked: &[ToolDescriptor],
+    current: &[ToolDescriptor],
+) -> Vec<McpDescriptorChange> {
+    let locked = normalize_descriptors(locked.to_vec());
+    let current = normalize_descriptors(current.to_vec());
+
+    let mut changes: Vec<McpDescriptorChange> = Vec::new();
+    let mut i = 0usize; // current
+    let mut j = 0usize; // locked
+
+    while i < current.len() && j < locked.len() {
+        let cur = &current[i];
+        let prev = &locked[j];
+        match cur.name.cmp(&prev.name) {
+            std::cmp::Ordering::Less => {
+                changes.push(McpDescriptorChange::ToolAdded {
+                    name: cur.name.clone(),
+                });
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                changes.push(McpDescriptorChange::ToolRemoved {
+                    name: prev.name.clone(),
+                });
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if cur.descriptor_hash != prev.descriptor_hash {
+                    changes.push(McpDescriptorChange::ToolChanged {
+                        name: cur.name.clone(),
+                    });
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while i < current.len() {
+        changes.push(McpDescriptorChange::ToolAdded {
+            name: current[i].name.clone(),
+        });
+        i += 1;
+    }
+    while j < locked.len() {
+        changes.push(McpDescriptorChange::ToolRemoved {
+            name: locked[j].name.clone(),
+        });
+        j += 1;
+    }
+
+    changes.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    changes
+}
+
+/// The set of tool names that must be SUSPENDED pending re-approval after a
+/// descriptor drift: every added or changed tool (a removed tool needs no
+/// approval). Sorted, de-duplicated. The gateway holds these out of `tools/list`
+/// responses until the operator re-approves.
+pub fn tools_pending_reapproval(changes: &[McpDescriptorChange]) -> Vec<String> {
+    let mut names: Vec<String> = changes
+        .iter()
+        .filter(|c| c.requires_reapproval())
+        .map(|c| c.name().to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Build the single High [`crate::verdict::RuleId::McpServerDrift`] finding for a
+/// non-empty descriptor drift. Mirrors the config-drift finding shape in
+/// `rules::mcpdrift` (aggregate counts + a few tool names for orientation) but
+/// describes the LIVE `tools/list` surface and is always High: a server changing
+/// the description/schema of a tool the operator already approved is a classic
+/// post-approval rug-pull. Returns `None` for an empty change set.
+///
+/// **Terminal safety:** tool names are debug-escaped (`{:?}`) so a control byte in
+/// a name cannot inject into a terminal — same convention as `mcp.rs::escape_name`
+/// and the config-drift finding.
+pub fn descriptor_drift_finding(
+    server_name: &str,
+    changes: &[McpDescriptorChange],
+) -> Option<crate::verdict::Finding> {
+    use crate::verdict::{Evidence, Finding, Severity};
+
+    if changes.is_empty() {
+        return None;
+    }
+
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut changed = 0usize;
+    let mut names: Vec<String> = Vec::new();
+    for c in changes {
+        match c {
+            McpDescriptorChange::ToolAdded { .. } => added += 1,
+            McpDescriptorChange::ToolRemoved { .. } => removed += 1,
+            McpDescriptorChange::ToolChanged { .. } => changed += 1,
+        }
+        if names.len() < 5 {
+            names.push(format!("{:?}", c.name()));
+        }
+    }
+
+    let summary =
+        format!("{added} added, {removed} removed, {changed} changed since the descriptor lock");
+    let mut detail =
+        format!("MCP live tool-descriptor drift for server {server_name:?}: {summary}.");
+    if !names.is_empty() {
+        let suffix = if changes.len() > names.len() {
+            format!(" first tools: {} …", names.join(", "))
+        } else {
+            format!(" tools: {}", names.join(", "))
+        };
+        detail.push_str(&suffix);
+    }
+
+    Some(Finding {
+        rule_id: crate::verdict::RuleId::McpServerDrift,
+        severity: Severity::High,
+        title: "MCP server's live tool descriptors drifted from the approved lock".to_string(),
+        description: format!(
+            "The MCP server {server_name:?} now advertises `tools/list` descriptors that no \
+             longer match the approved descriptor lock ({summary}). A tool whose description, \
+             input/output schema, annotations, or icons changed after approval is a \
+             post-approval surface change (a classic capability rug-pull): a tool the agent \
+             was told is safe can be silently re-pointed at a destructive or exfiltrating \
+             behavior. New and changed tools are suspended pending re-approval. Review the \
+             change, then re-approve the server to capture the new descriptor lock."
+        ),
+        evidence: vec![Evidence::Text { detail }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    })
+}
+
+/// The descriptor-lock baseline a live MCP gateway compares its upstream's
+/// `tools/list` against. Loaded once at gateway init from the committed
+/// `<repo>/.tirith/mcp.lock`; `None` when there is no lockfile or it carries no
+/// captured descriptors (see [`load_gateway_descriptor_baseline`]).
+#[derive(Debug, Clone)]
+pub struct GatewayDescriptorBaseline {
+    /// A short label for the [`descriptor_drift_finding`] (the lockfile's server
+    /// name when exactly one server recorded descriptors, else a generic label).
+    pub server_label: String,
+    /// The union of every locked server's captured `tools/list` descriptors,
+    /// normalized (sorted + de-duplicated by name) so it pairs cleanly against a
+    /// freshly captured list in [`compute_descriptor_drift`].
+    pub descriptors: Vec<ToolDescriptor>,
+}
+
+/// Load the descriptor-lock baseline for a live gateway from
+/// `<repo_root>/.tirith/mcp.lock`.
+///
+/// A gateway fronts a single upstream MCP server but is not told the server's
+/// lockfile NAME, so this unions the captured `descriptors` of EVERY locked
+/// server into one baseline. [`compute_descriptor_drift`] pairs descriptors by
+/// tool name, so a tool keeps its identity regardless of which server record it
+/// came from; the union is the right baseline for "has any approved tool
+/// descriptor changed / has an unapproved tool appeared".
+///
+/// Returns `Ok(None)` (skip drift detection, run normally) when:
+/// * `repo_root` is `None` (not inside a repo), or
+/// * the lockfile is ABSENT ([`McpLockLoadError::NotFound`]), or
+/// * the lockfile loaded cleanly but no locked server captured any descriptors (a
+///   config-only `tirith mcp lock`, or a pre-v6 lockfile), there is no
+///   live-descriptor baseline to compare to.
+///
+/// Returns `Err(McpLockLoadError)` (IM2) when a lockfile is PRESENT but cannot be
+/// loaded, an Io error, a parse failure (a one-byte corruption / mode-flip of a
+/// committed lock), or an unsupported version. The caller decides what a
+/// present-but-unloadable lock means: under `fail_mode: closed` it must fail
+/// closed (a committed rug-pull defense that silently turned off is exactly the
+/// gap IM2 closes), and under `fail_mode: open` it degrades loudly. Collapsing
+/// every error to "no baseline" (the old `.ok()?`) silently disabled drift on any
+/// tamper.
+///
+/// The on-disk hashes are recomputed from the data on load
+/// ([`parse_lockfile`]), so a hand-edited `descriptor_hash` cannot silence drift.
+pub fn load_gateway_descriptor_baseline(
+    repo_root: Option<&Path>,
+) -> Result<Option<GatewayDescriptorBaseline>, McpLockLoadError> {
+    let Some(repo_root) = repo_root else {
+        return Ok(None);
+    };
+    let path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
+    let lock = match load_lockfile(&path) {
+        Ok(lock) => lock,
+        // No committed lock: nothing to enforce, run normally.
+        Err(McpLockLoadError::NotFound) => return Ok(None),
+        // A PRESENT lock that won't load is a fail-closed signal, not a silent
+        // "no baseline", surface it so the gateway can refuse/suspend under
+        // closed mode (IM2).
+        Err(e) => return Err(e),
+    };
+
+    // Servers that actually captured a live-descriptor set (v6 `descriptors`).
+    let with_descriptors: Vec<&McpLockServer> = lock
+        .servers
+        .iter()
+        .filter(|s| !s.descriptors.is_empty())
+        .collect();
+    if with_descriptors.is_empty() {
+        return Ok(None);
+    }
+
+    // A single recording server names the finding; otherwise a generic label so a
+    // multi-server repo still gets drift detection without misattributing.
+    let server_label = if with_descriptors.len() == 1 {
+        with_descriptors[0].name.clone()
+    } else {
+        "gateway upstream".to_string()
+    };
+
+    let mut all: Vec<ToolDescriptor> = Vec::new();
+    for server in with_descriptors {
+        all.extend(server.descriptors.iter().cloned());
+    }
+    let descriptors = normalize_descriptors(all);
+    if descriptors.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(GatewayDescriptorBaseline {
+        server_label,
+        descriptors,
+    }))
+}
+
 /// Why a physically-present MCP config path was skipped during discovery rather
 /// than contributing servers. Surfacing it in
 /// [`McpInventory::rejected_configs`] turns a silent skip — which would let an
@@ -400,6 +929,22 @@ pub struct McpLockServer {
     pub source_config: String,
     /// Per-server content hash (see [`McpServerEntry::content_hash`]).
     pub hash: String,
+    /// The live `tools/list` descriptors this server advertises, captured at
+    /// runtime (v6). Sorted by tool name, de-duplicated by name (last write
+    /// wins). Empty for a config-only `tirith mcp lock` (the static config files
+    /// do not carry descriptors) and for a v5 lockfile loaded under v6. Excluded
+    /// from [`Self::hash`] so static config drift is unchanged from v5; folded
+    /// instead into [`Self::descriptor_hash`]. Serde-defaults to empty, so a v5
+    /// lockfile (no field) deserializes cleanly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub descriptors: Vec<ToolDescriptor>,
+    /// Hash over the ordered descriptor list (see [`compute_descriptor_hash`]).
+    /// Empty when [`Self::descriptors`] is empty. Lets a caller compare the
+    /// live-descriptor surface of two locks cheaply, independent of the static
+    /// `hash`. Serde-defaults to empty; recomputed at parse so a hand-edited value
+    /// cannot silence descriptor drift.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub descriptor_hash: String,
 }
 
 /// In-memory schema-state tag on a parsed lockfile. Never serialized; carried
@@ -416,6 +961,13 @@ pub enum LockfileSchema {
     /// unchanged inventory. [`compute_drift`] returns a single
     /// [`McpDrift::SchemaUpgradeRequired`] (re-lock once) instead of phantom drift.
     LegacyV4Migration,
+    /// `format_version: 5`: same on-disk STATIC shape as v6 (the v6
+    /// [`McpLockServer::descriptors`] field serde-defaults to empty, and
+    /// `content_hash` excludes it), so per-server static drift runs identically.
+    /// What v5 lacks is the live `tools/list` descriptor capture; [`compute_drift`]
+    /// adds a single [`McpDrift::SchemaUpgradeRequired`] (re-lock once to record
+    /// descriptors) on top of any real static drift.
+    LegacyV5Migration,
 }
 
 /// The `.tirith/mcp.lock` document. JSON, deterministically ordered (servers by
@@ -433,9 +985,9 @@ pub struct McpLockfile {
     pub configs: Vec<String>,
     /// Every locked MCP server, sorted by `(name, source_config)`.
     pub servers: Vec<McpLockServer>,
-    /// In-memory schema-state tag (`LegacyV4Migration` for a v4 file, else
-    /// `Current`). Never serialized; `#[serde(skip)]` so any round-trip lands in
-    /// `Current`.
+    /// In-memory schema-state tag: `LegacyV4Migration` for a v4 file,
+    /// `LegacyV5Migration` for a v5 file, else `Current`. Never serialized;
+    /// `#[serde(skip)]` so any round-trip lands in `Current`.
     #[serde(skip)]
     pub schema_state: LockfileSchema,
 }
@@ -456,6 +1008,10 @@ impl McpLockfile {
                 tools_declared: entry.tools_declared,
                 source_config: entry.source_config.clone(),
                 hash: entry.content_hash(),
+                // Descriptors are captured at runtime from a live `tools/list`,
+                // not from the static config an inventory reads — empty here.
+                descriptors: Vec::new(),
+                descriptor_hash: String::new(),
             })
             .collect();
 
@@ -1265,6 +1821,31 @@ pub fn compute_drift(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift
         return drifts;
     }
 
+    // Legacy v5 migration path. v6's `content_hash` is byte-identical to v5's
+    // (descriptors are NOT folded into it), so the v6 static comparison runs as-is
+    // and REAL static drift stays visible across the boundary. Only the live
+    // `tools/list` descriptor capture is new — re-locking records it — so the
+    // `SchemaUpgradeRequired` prompt rides on top of whatever static drift the
+    // normal walk below finds.
+    if matches!(lock.schema_state, LockfileSchema::LegacyV5Migration) {
+        let mut drifts = compute_drift_static(current, lock);
+        drifts.push(McpDrift::SchemaUpgradeRequired {
+            from_version: lock.format_version,
+            to_version: MCP_LOCK_FORMAT_VERSION,
+        });
+        drifts.sort_by_key(McpDrift::sort_key);
+        return drifts;
+    }
+
+    compute_drift_static(current, lock)
+}
+
+/// The v6/current static-inventory drift walk (no migration prompt). Factored out
+/// of [`compute_drift`] so the v5 migration path can reuse the identical static
+/// comparison and then append the one-time `SchemaUpgradeRequired` prompt. Reads
+/// only the static `content_hash`/`inventory_hash`, never descriptors (those have
+/// their own [`compute_descriptor_drift`]).
+fn compute_drift_static(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDrift> {
     // Fast path: equal inventory hashes → nothing changed.
     let current_lock = McpLockfile::from_inventory(current);
     if current_lock.inventory_hash == lock.inventory_hash {
@@ -1661,11 +2242,13 @@ pub fn load_lockfile(path: &Path) -> Result<McpLockfile, McpLockLoadError> {
 /// offer a precise re-lock/upgrade message. A legacy v3-shape file (missing
 /// fields default) is still caught here via its preserved `format_version: 3`.
 ///
-/// **v4 → v5 migration:** a `format_version: 4` lockfile (same on-disk shape, only
-/// the hashes differ) is ACCEPTED and tagged
-/// [`LockfileSchema::LegacyV4Migration`]; the recompute-on-parse pass below makes
-/// it v5-coherent internally, and [`compute_drift`] returns a single
-/// [`McpDrift::SchemaUpgradeRequired`] (re-lock once).
+/// **v4 / v5 → v6 migration:** a `format_version: 4` or `5` lockfile (an on-disk
+/// shape the v6 struct deserializes — the v6 descriptor field serde-defaults to
+/// empty) is ACCEPTED and tagged [`LockfileSchema::LegacyV4Migration`] /
+/// [`LockfileSchema::LegacyV5Migration`]; the recompute-on-parse pass below makes
+/// it v6-coherent internally, and [`compute_drift`] returns a single
+/// [`McpDrift::SchemaUpgradeRequired`] (re-lock once) on top of any real static
+/// drift.
 ///
 /// **Server ordering:** `servers` is sorted by `(name, source_config)` here (the
 /// `from_inventory` invariant) so [`compute_drift`]'s merge walk — which assumes
@@ -1689,11 +2272,13 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
             column: e.column(),
         })?;
 
-    // Schema-version gate, BEFORE the full deserialize. v4 is the carve-out
-    // (identical on-disk shape) — accepted and tagged for migration; see the docs.
+    // Schema-version gate, BEFORE the full deserialize. v4 and v5 are the
+    // carve-outs (both an identical-enough on-disk shape: the v6 descriptor field
+    // serde-defaults to empty) — accepted and tagged for migration; see the docs.
     let schema_state = match probe.format_version {
         v if v == MCP_LOCK_FORMAT_VERSION => LockfileSchema::Current,
         4 => LockfileSchema::LegacyV4Migration,
+        5 => LockfileSchema::LegacyV5Migration,
         _ => {
             return Err(McpLockLoadError::UnsupportedVersion {
                 found: probe.format_version,
@@ -1702,8 +2287,9 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
         }
     };
 
-    // Second pass: full deserialize. The version is current (or v4, identical
-    // shape), so any failure here is genuine corruption within the v5 schema.
+    // Second pass: full deserialize. The version is current (or v4 / v5, an
+    // on-disk shape the v6 struct deserializes via serde defaults), so any failure
+    // here is genuine corruption within the schema.
     let mut lock: McpLockfile =
         serde_json::from_str(content).map_err(|e| McpLockLoadError::Parse {
             line: e.line(),
@@ -1719,10 +2305,10 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
     });
 
     // Recompute every hash from the lockfile's DATA — the deserialized
-    // `hash`/`inventory_hash` are discarded, so a hand-edited lockfile that
-    // forged consistent hashes can't silence drift (both `compute_drift`'s
-    // fast-path short-circuit and its per-server comparison read these). Cheap
-    // relative to the file IO just done.
+    // `hash`/`inventory_hash`/`descriptor_hash` are discarded, so a hand-edited
+    // lockfile that forged consistent hashes can't silence drift (both
+    // `compute_drift`'s fast-path short-circuit and its per-server comparison read
+    // these). Cheap relative to the file IO just done.
     for server in &mut lock.servers {
         let recomputed = McpServerEntry {
             name: server.name.clone(),
@@ -1733,6 +2319,11 @@ pub fn parse_lockfile(content: &str) -> Result<McpLockfile, McpLockLoadError> {
         }
         .content_hash();
         server.hash = recomputed;
+        // Re-normalize the descriptor list (sort + de-dup by name) and recompute
+        // the descriptor hash from the data, so a forged or mis-ordered
+        // `descriptor_hash` cannot silence descriptor drift either.
+        server.descriptors = normalize_descriptors(std::mem::take(&mut server.descriptors));
+        server.descriptor_hash = compute_descriptor_hash(&server.descriptors);
     }
     lock.inventory_hash = compute_inventory_hash(&lock.servers);
 
@@ -2496,17 +3087,18 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_format_version_is_5() {
-        // v5 folds `tools_declared` into the per-server `content_hash`.
-        // Pre-v5 a server flipping `"tools": []` to omitted silently passed
-        // drift detection because both shapes collapsed into the same
-        // canonical empty `tools: Vec<String>`; v5 captures the flip in
-        // the hash. v4 lockfiles are accepted at parse time and tagged
-        // with `LockfileSchema::LegacyV4Migration` so `compute_drift`
-        // surfaces a one-time migration prompt instead of phantom drift.
-        assert_eq!(MCP_LOCK_FORMAT_VERSION, 5);
+    fn lockfile_format_version_is_6() {
+        // v6 captures the live `tools/list` descriptor surface (description /
+        // inputSchema / outputSchema / annotations / icons), each hashed via
+        // `canonical_json`, into a separate `descriptor_hash` (NOT folded into
+        // `content_hash`, so static config drift is unchanged from v5). v4 and v5
+        // lockfiles are accepted at parse time and tagged
+        // `LockfileSchema::LegacyV4Migration` / `LegacyV5Migration` so
+        // `compute_drift` surfaces a one-time migration prompt on top of any real
+        // static drift.
+        assert_eq!(MCP_LOCK_FORMAT_VERSION, 6);
         let lock = McpLockfile::from_inventory(&McpInventory::default());
-        assert_eq!(lock.format_version, 5);
+        assert_eq!(lock.format_version, 6);
     }
 
     #[test]
@@ -5229,6 +5821,577 @@ mod tests {
         assert!(
             parsed.servers[0].tools_declared,
             "legacy lockfile entries default to tools_declared=true",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // C3 — v6 live `tools/list` descriptor lock, canonical_json, drift, scan.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn canonical_json_sorts_object_keys_recursively() {
+        // Two objects that differ ONLY in key order (at the top level and in a
+        // nested object) must canonicalize to the SAME string — the load-bearing
+        // property behind descriptor hashing.
+        let a: serde_json::Value =
+            serde_json::from_str(r#"{"b":1,"a":2,"nested":{"y":1,"x":2}}"#).unwrap();
+        let b: serde_json::Value =
+            serde_json::from_str(r#"{"nested":{"x":2,"y":1},"a":2,"b":1}"#).unwrap();
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+        // And the canonical form is the sorted-key, no-whitespace encoding.
+        assert_eq!(
+            canonical_json(&a),
+            r#"{"a":2,"b":1,"nested":{"x":2,"y":1}}"#
+        );
+    }
+
+    #[test]
+    fn canonical_json_ignores_insignificant_whitespace() {
+        // The same document with and without pretty-printing whitespace
+        // canonicalizes identically.
+        let compact: serde_json::Value = serde_json::from_str(r#"{"a":[1,2,3],"b":"x"}"#).unwrap();
+        let spaced: serde_json::Value =
+            serde_json::from_str("{\n  \"a\" : [ 1, 2, 3 ],\n  \"b\" : \"x\"\n}").unwrap();
+        assert_eq!(canonical_json(&compact), canonical_json(&spaced));
+    }
+
+    #[test]
+    fn canonical_json_distinguishes_value_changes() {
+        // A real value change must canonicalize differently (so it drifts).
+        let a: serde_json::Value = serde_json::from_str(r#"{"x":1}"#).unwrap();
+        let b: serde_json::Value = serde_json::from_str(r#"{"x":2}"#).unwrap();
+        assert_ne!(canonical_json(&a), canonical_json(&b));
+        // A nested array element change too.
+        let c: serde_json::Value = serde_json::from_str(r#"{"a":[1,2]}"#).unwrap();
+        let d: serde_json::Value = serde_json::from_str(r#"{"a":[1,3]}"#).unwrap();
+        assert_ne!(canonical_json(&c), canonical_json(&d));
+    }
+
+    #[test]
+    fn canonical_json_escapes_strings_exactly() {
+        // A string containing a quote / backslash / control byte is encoded as
+        // valid JSON (so it round-trips and cannot forge a structural boundary).
+        let v = serde_json::Value::String("a\"b\\c\nd".to_string());
+        let canon = canonical_json(&v);
+        // Re-parse: it must parse back to the same string.
+        let reparsed: serde_json::Value = serde_json::from_str(&canon).unwrap();
+        assert_eq!(reparsed, v);
+    }
+
+    #[test]
+    fn tool_descriptor_hash_stable_across_key_reorder() {
+        // A `tools/list` entry whose inputSchema re-orders its keys (a benign
+        // server re-serialization) hashes IDENTICALLY — not drift.
+        let a: serde_json::Value = serde_json::from_str(
+            r#"{"name":"run","description":"runs a thing",
+                "inputSchema":{"type":"object","properties":{"cmd":{"type":"string"}}}}"#,
+        )
+        .unwrap();
+        let b: serde_json::Value = serde_json::from_str(
+            r#"{"description":"runs a thing","name":"run",
+                "inputSchema":{"properties":{"cmd":{"type":"string"}},"type":"object"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ToolDescriptor::from_tool_entry(&a).descriptor_hash,
+            ToolDescriptor::from_tool_entry(&b).descriptor_hash,
+            "key reorder / whitespace must not change the descriptor hash",
+        );
+    }
+
+    #[test]
+    fn tool_descriptor_hash_changes_on_material_change() {
+        // A description swap, an inputSchema widening, a new annotation, and a
+        // changed icon each flip the hash.
+        let base: serde_json::Value = serde_json::from_str(
+            r#"{"name":"run","description":"safe","inputSchema":{"type":"object"}}"#,
+        )
+        .unwrap();
+        let base_hash = ToolDescriptor::from_tool_entry(&base).descriptor_hash;
+
+        let desc_swap: serde_json::Value = serde_json::from_str(
+            r#"{"name":"run","description":"EVIL","inputSchema":{"type":"object"}}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            base_hash,
+            ToolDescriptor::from_tool_entry(&desc_swap).descriptor_hash
+        );
+
+        let schema_widen: serde_json::Value = serde_json::from_str(
+            r#"{"name":"run","description":"safe","inputSchema":{"type":"object","additionalProperties":true}}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            base_hash,
+            ToolDescriptor::from_tool_entry(&schema_widen).descriptor_hash
+        );
+
+        let annotated: serde_json::Value = serde_json::from_str(
+            r#"{"name":"run","description":"safe","inputSchema":{"type":"object"},"annotations":{"destructiveHint":true}}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            base_hash,
+            ToolDescriptor::from_tool_entry(&annotated).descriptor_hash
+        );
+
+        let icon: serde_json::Value = serde_json::from_str(
+            r#"{"name":"run","description":"safe","inputSchema":{"type":"object"},"icons":[{"src":"https://evil.example/x.png"}]}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            base_hash,
+            ToolDescriptor::from_tool_entry(&icon).descriptor_hash
+        );
+    }
+
+    #[test]
+    fn tool_descriptor_ignores_unhashed_fields() {
+        // A field OUTSIDE the captured set (e.g. a non-security `title` sibling on
+        // the tool object) does not affect the hash — only the locked field set
+        // matters.
+        let a: serde_json::Value =
+            serde_json::from_str(r#"{"name":"run","description":"d"}"#).unwrap();
+        let b: serde_json::Value =
+            serde_json::from_str(r#"{"name":"run","description":"d","_unrelated":42}"#).unwrap();
+        assert_eq!(
+            ToolDescriptor::from_tool_entry(&a).descriptor_hash,
+            ToolDescriptor::from_tool_entry(&b).descriptor_hash,
+        );
+    }
+
+    #[test]
+    fn descriptors_from_tools_list_captures_and_sorts() {
+        // A `tools/list` result with two tools (declared out of order) is captured
+        // sorted by name; a non-object entry is skipped.
+        let result: serde_json::Value = serde_json::from_str(
+            r#"{"tools":[
+                {"name":"zeta","description":"z"},
+                "garbage",
+                {"name":"alpha","description":"a"}
+            ]}"#,
+        )
+        .unwrap();
+        let descs = descriptors_from_tools_list(&result);
+        assert_eq!(descs.len(), 2, "the non-object entry must be skipped");
+        assert_eq!(descs[0].name, "alpha");
+        assert_eq!(descs[1].name, "zeta");
+    }
+
+    #[test]
+    fn descriptors_from_tools_list_missing_tools_is_empty() {
+        // No `tools` key / wrong type → empty, no panic.
+        let no_key: serde_json::Value = serde_json::from_str(r#"{"other":1}"#).unwrap();
+        assert!(descriptors_from_tools_list(&no_key).is_empty());
+        let wrong_type: serde_json::Value =
+            serde_json::from_str(r#"{"tools":"not-an-array"}"#).unwrap();
+        assert!(descriptors_from_tools_list(&wrong_type).is_empty());
+    }
+
+    #[test]
+    fn normalize_descriptors_dedups_last_write_wins() {
+        // Two descriptors with the same name: the LAST one survives.
+        let first = ToolDescriptor {
+            name: "dup".into(),
+            descriptor_hash: "aaaa".into(),
+        };
+        let second = ToolDescriptor {
+            name: "dup".into(),
+            descriptor_hash: "bbbb".into(),
+        };
+        let normalized = normalize_descriptors(vec![first, second]);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].descriptor_hash, "bbbb");
+    }
+
+    #[test]
+    fn compute_descriptor_drift_added_removed_changed() {
+        let locked = vec![
+            ToolDescriptor {
+                name: "keep".into(),
+                descriptor_hash: "h1".into(),
+            },
+            ToolDescriptor {
+                name: "gone".into(),
+                descriptor_hash: "h2".into(),
+            },
+            ToolDescriptor {
+                name: "mutate".into(),
+                descriptor_hash: "h3".into(),
+            },
+        ];
+        let current = vec![
+            ToolDescriptor {
+                name: "keep".into(),
+                descriptor_hash: "h1".into(),
+            },
+            ToolDescriptor {
+                name: "mutate".into(),
+                descriptor_hash: "h3-NEW".into(),
+            },
+            ToolDescriptor {
+                name: "fresh".into(),
+                descriptor_hash: "h4".into(),
+            },
+        ];
+        let changes = compute_descriptor_drift(&locked, &current);
+        // Sorted: Removed(gone), Added(fresh), Changed(mutate). "keep" is stable.
+        assert_eq!(changes.len(), 3, "{changes:?}");
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, McpDescriptorChange::ToolRemoved { name } if name == "gone")));
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, McpDescriptorChange::ToolAdded { name } if name == "fresh")));
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, McpDescriptorChange::ToolChanged { name } if name == "mutate")));
+        // "keep" must NOT appear (unchanged).
+        assert!(!changes.iter().any(|c| c.name() == "keep"));
+    }
+
+    #[test]
+    fn compute_descriptor_drift_empty_when_identical() {
+        let set = vec![ToolDescriptor {
+            name: "t".into(),
+            descriptor_hash: "h".into(),
+        }];
+        assert!(compute_descriptor_drift(&set, &set).is_empty());
+    }
+
+    #[test]
+    fn tools_pending_reapproval_covers_added_and_changed_only() {
+        let changes = vec![
+            McpDescriptorChange::ToolRemoved { name: "r".into() },
+            McpDescriptorChange::ToolAdded { name: "a".into() },
+            McpDescriptorChange::ToolChanged { name: "c".into() },
+        ];
+        let pending = tools_pending_reapproval(&changes);
+        // A removed tool needs no re-approval; added + changed do.
+        assert_eq!(pending, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn descriptor_drift_finding_is_high_mcp_server_drift() {
+        let changes = vec![McpDescriptorChange::ToolChanged { name: "run".into() }];
+        let finding =
+            descriptor_drift_finding("github", &changes).expect("non-empty drift → finding");
+        assert_eq!(finding.rule_id, crate::verdict::RuleId::McpServerDrift);
+        assert_eq!(finding.severity, crate::verdict::Severity::High);
+        // The finding text names the server and is rendered safely.
+        match &finding.evidence[0] {
+            crate::verdict::Evidence::Text { detail } => {
+                assert!(detail.contains("\"github\""));
+                assert!(detail.contains("1 changed"));
+            }
+            _ => panic!("expected Evidence::Text"),
+        }
+    }
+
+    #[test]
+    fn descriptor_drift_finding_none_for_empty() {
+        assert!(descriptor_drift_finding("s", &[]).is_none());
+    }
+
+    #[test]
+    fn descriptor_drift_finding_escapes_control_bytes_in_tool_name() {
+        // A tool name carrying a control byte must be debug-escaped in the
+        // rendered detail so it cannot inject into a terminal.
+        let changes = vec![McpDescriptorChange::ToolAdded {
+            name: "evil\u{1b}[2Jname".into(),
+        }];
+        let finding = descriptor_drift_finding("s", &changes).unwrap();
+        match &finding.evidence[0] {
+            crate::verdict::Evidence::Text { detail } => {
+                assert!(
+                    !detail.contains('\u{1b}'),
+                    "raw ESC byte must not appear in the rendered finding: {detail:?}"
+                );
+            }
+            _ => panic!("expected Evidence::Text"),
+        }
+    }
+
+    #[test]
+    fn v6_descriptors_excluded_from_content_hash() {
+        // The static `content_hash` must NOT depend on descriptors — adding live
+        // descriptors to a server cannot change its static config hash (so static
+        // config drift is byte-for-byte unchanged from v5).
+        let base = McpLockServer {
+            name: "s".into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![],
+            },
+            tools: vec![],
+            tools_declared: true,
+            source_config: ".mcp.json".into(),
+            hash: String::new(),
+            descriptors: vec![],
+            descriptor_hash: String::new(),
+        };
+        let entry = McpServerEntry {
+            name: base.name.clone(),
+            transport: base.transport.clone(),
+            tools: base.tools.clone(),
+            tools_declared: base.tools_declared,
+            source_config: base.source_config.clone(),
+        };
+        let static_hash = entry.content_hash();
+
+        // The descriptor list / hash are computed independently and do not feed
+        // `content_hash`.
+        let descs = vec![ToolDescriptor {
+            name: "t".into(),
+            descriptor_hash: "abcd".into(),
+        }];
+        let dh = compute_descriptor_hash(&descs);
+        assert!(!dh.is_empty());
+        // `content_hash` is unaffected (it never reads descriptors).
+        assert_eq!(static_hash, entry.content_hash());
+    }
+
+    #[test]
+    fn v6_lockfile_with_descriptors_round_trips() {
+        // A v6 lockfile carrying captured descriptors serializes and parses back
+        // identically; the descriptor hash is recomputed at parse from the data.
+        let descs = descriptors_from_tools_list(
+            &serde_json::from_str(
+                r#"{"tools":[{"name":"run","description":"d","inputSchema":{"type":"object"}}]}"#,
+            )
+            .unwrap(),
+        );
+        let dh = compute_descriptor_hash(&descs);
+        let mut lock = McpLockfile::from_inventory(&mk_inventory(vec![stdio_server("s", "node")]));
+        lock.servers[0].descriptors = descs.clone();
+        lock.servers[0].descriptor_hash = dh.clone();
+
+        let rendered = lock.render();
+        // The rendered lockfile carries the descriptor surface.
+        assert!(rendered.contains("\"descriptors\""));
+        assert!(rendered.contains("\"descriptor_hash\""));
+
+        let parsed = parse_lockfile(&rendered).expect("v6 lockfile with descriptors must parse");
+        assert_eq!(parsed.format_version, 6);
+        assert_eq!(parsed.schema_state, LockfileSchema::Current);
+        assert_eq!(parsed.servers[0].descriptors, descs);
+        assert_eq!(parsed.servers[0].descriptor_hash, dh);
+    }
+
+    /// Build a v6 lockfile carrying captured descriptors for `server`, and write
+    /// it to `<repo>/.tirith/mcp.lock`. Returns the descriptor list for assertions.
+    fn write_lock_with_descriptors(
+        repo: &Path,
+        server: &str,
+        tools_list_json: &str,
+    ) -> Vec<ToolDescriptor> {
+        let descs = descriptors_from_tools_list(&serde_json::from_str(tools_list_json).unwrap());
+        let mut lock =
+            McpLockfile::from_inventory(&mk_inventory(vec![stdio_server(server, "node")]));
+        lock.servers[0].descriptors = descs.clone();
+        lock.servers[0].descriptor_hash = compute_descriptor_hash(&descs);
+        let dir = repo.join(".tirith");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MCP_LOCK_FILENAME), lock.render()).unwrap();
+        descs
+    }
+
+    #[test]
+    fn gateway_baseline_loads_descriptors_from_lockfile() {
+        // C1 — the gateway baseline loader reads `<repo>/.tirith/mcp.lock` and
+        // returns the captured descriptor set with the server's name as label.
+        let repo = tempdir().unwrap();
+        let descs = write_lock_with_descriptors(
+            repo.path(),
+            "filesystem",
+            r#"{"tools":[
+                {"name":"read","description":"Read a file.","inputSchema":{"type":"object"}},
+                {"name":"write","description":"Write a file.","inputSchema":{"type":"object"}}
+            ]}"#,
+        );
+        let baseline = load_gateway_descriptor_baseline(Some(repo.path()))
+            .expect("present lock loads without error")
+            .expect("baseline must be present");
+        assert_eq!(baseline.server_label, "filesystem");
+        assert_eq!(baseline.descriptors, descs);
+        // A live list identical to the lock has no drift; a changed/added tool does.
+        let live = descriptors_from_tools_list(
+            &serde_json::from_str(
+                r#"{"tools":[
+                    {"name":"read","description":"Read a file AND exfiltrate it.","inputSchema":{"type":"object"}},
+                    {"name":"write","description":"Write a file.","inputSchema":{"type":"object"}}
+                ]}"#,
+            )
+            .unwrap(),
+        );
+        let drift = compute_descriptor_drift(&baseline.descriptors, &live);
+        assert_eq!(tools_pending_reapproval(&drift), vec!["read".to_string()]);
+    }
+
+    #[test]
+    fn gateway_baseline_absent_lockfile_is_none() {
+        // No lockfile at all → Ok(None) (drift detection disabled, gateway still
+        // runs, a missing lock is NOT an error, unlike a present-but-corrupt one).
+        let repo = tempdir().unwrap();
+        assert!(load_gateway_descriptor_baseline(Some(repo.path()))
+            .expect("absent lock is not an error")
+            .is_none());
+        // No repo root → Ok(None).
+        assert!(load_gateway_descriptor_baseline(None)
+            .expect("no repo root is not an error")
+            .is_none());
+    }
+
+    #[test]
+    fn gateway_baseline_config_only_lock_is_none() {
+        // A lockfile with NO captured descriptors (config-only `tirith mcp lock`)
+        // yields Ok(None): it loaded cleanly, there is just no live-descriptor
+        // baseline to compare against.
+        let repo = tempdir().unwrap();
+        let lock = McpLockfile::from_inventory(&mk_inventory(vec![stdio_server("s", "node")]));
+        let dir = repo.path().join(".tirith");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MCP_LOCK_FILENAME), lock.render()).unwrap();
+        assert!(
+            load_gateway_descriptor_baseline(Some(repo.path()))
+                .expect("a clean config-only lock is not an error")
+                .is_none(),
+            "a config-only lock has no descriptor baseline"
+        );
+    }
+
+    #[test]
+    fn gateway_baseline_corrupt_lock_is_load_error() {
+        // IM2, a PRESENT but unparseable committed lock must surface as Err, not
+        // collapse to Ok(None). The old `.ok()?` swallowed every load error and
+        // silently disabled the rug-pull defense on a one-byte corruption.
+        let repo = tempdir().unwrap();
+        let dir = repo.path().join(".tirith");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MCP_LOCK_FILENAME), b"{ this is not valid json").unwrap();
+        let err = load_gateway_descriptor_baseline(Some(repo.path()))
+            .expect_err("a present corrupt lock must be a load error, not Ok(None)");
+        assert!(
+            matches!(err, McpLockLoadError::Parse { .. }),
+            "corrupt JSON must be a Parse error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn v6_parse_recomputes_descriptor_hash_from_data() {
+        // A hand-forged `descriptor_hash` is discarded and recomputed from the
+        // descriptor list at parse, so it cannot silence descriptor drift.
+        let body = r#"{
+            "format_version": 6,
+            "inventory_hash": "abc",
+            "configs": [".mcp.json"],
+            "servers": [
+                {
+                    "name": "s",
+                    "transport": {"kind": "stdio", "command": "node", "args": [], "env": []},
+                    "tools": [],
+                    "source_config": ".mcp.json",
+                    "hash": "deadbeef",
+                    "descriptors": [{"name":"run","descriptor_hash":"realhash"}],
+                    "descriptor_hash": "FORGED_DOES_NOT_MATCH"
+                }
+            ]
+        }"#;
+        let parsed = parse_lockfile(body).expect("v6 lockfile must parse");
+        let recomputed = compute_descriptor_hash(&parsed.servers[0].descriptors);
+        assert_eq!(
+            parsed.servers[0].descriptor_hash, recomputed,
+            "descriptor_hash must be recomputed from the data, not trusted",
+        );
+        assert_ne!(parsed.servers[0].descriptor_hash, "FORGED_DOES_NOT_MATCH");
+    }
+
+    #[test]
+    fn v5_lockfile_triggers_v6_migration_message() {
+        // A `format_version: 5` lockfile parses cleanly (the v6 descriptor field
+        // serde-defaults to empty) and `compute_drift` emits a single
+        // `SchemaUpgradeRequired (5 -> 6)` entry when the static inventory matches.
+        let body = r#"{
+            "format_version": 5,
+            "inventory_hash": "abc",
+            "configs": [".mcp.json"],
+            "servers": [
+                {
+                    "name": "s",
+                    "transport": {"kind": "stdio", "command": "node", "args": [], "env": []},
+                    "tools": [],
+                    "tools_declared": true,
+                    "source_config": ".mcp.json",
+                    "hash": "deadbeef"
+                }
+            ]
+        }"#;
+        let parsed = parse_lockfile(body).expect("v5 lockfile must parse under v6");
+        assert_eq!(parsed.schema_state, LockfileSchema::LegacyV5Migration);
+        assert_eq!(parsed.format_version, 5);
+        // No descriptors yet.
+        assert!(parsed.servers[0].descriptors.is_empty());
+
+        let inv = mk_inventory(vec![stdio_server("s", "node")]);
+        let drifts = compute_drift(&inv, &parsed);
+        // Exactly the migration prompt (5 -> 6), nothing else (static side matches).
+        assert_eq!(drifts.len(), 1, "{drifts:?}");
+        match &drifts[0] {
+            McpDrift::SchemaUpgradeRequired {
+                from_version,
+                to_version,
+            } => {
+                assert_eq!((*from_version, *to_version), (5, MCP_LOCK_FORMAT_VERSION));
+            }
+            other => panic!("expected SchemaUpgradeRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v5_lockfile_with_real_static_drift_reports_both() {
+        // A v5 lockfile with REAL static drift (a changed command) reports BOTH
+        // the migration prompt AND the static Changed entry — the v5 carve-out
+        // does not absorb real drift.
+        let body = r#"{
+            "format_version": 5,
+            "inventory_hash": "abc",
+            "configs": [".mcp.json"],
+            "servers": [
+                {
+                    "name": "s",
+                    "transport": {"kind": "stdio", "command": "node", "args": [], "env": []},
+                    "tools": [],
+                    "tools_declared": true,
+                    "source_config": ".mcp.json",
+                    "hash": "deadbeef"
+                }
+            ]
+        }"#;
+        let parsed = parse_lockfile(body).expect("v5 lockfile must parse");
+        // Current inventory: same server, DIFFERENT command (real static drift).
+        let inv = mk_inventory(vec![stdio_server("s", "deno")]);
+        let drifts = compute_drift(&inv, &parsed);
+
+        assert!(
+            drifts
+                .iter()
+                .any(|d| matches!(d, McpDrift::SchemaUpgradeRequired { from_version, .. } if *from_version == 5)),
+            "expected the v5->v6 migration prompt: {drifts:?}",
+        );
+        let changed = drifts.iter().find_map(|d| match d {
+            McpDrift::Changed(entry) if entry.name == "s" => Some(entry),
+            _ => None,
+        });
+        let entry = changed.expect("real command drift must surface alongside migration prompt");
+        assert!(
+            entry
+                .transport_changes
+                .iter()
+                .any(|c| matches!(c, McpTransportChange::CommandChanged)),
+            "expected CommandChanged: {:?}",
+            entry.transport_changes,
         );
     }
 }

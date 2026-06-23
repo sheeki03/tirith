@@ -40,7 +40,7 @@ use crate::artifact::archive::{
 };
 use crate::artifact::native::triage_native;
 use crate::artifact::pth::{self, StartupHookKind};
-use crate::artifact::record::verify_wheel_record;
+use crate::artifact::record::{verify_wheel_record, NormalizedInstalledPath, OwnershipIndex};
 use crate::artifact::wheel::parse_record;
 use crate::artifact::{
     ArtifactFileKind, ArtifactInspection, ArtifactSignalKind, DistributionIdentity, EdgeConfidence,
@@ -456,9 +456,20 @@ pub struct ArtifactSetMember {
 
 impl ArtifactSetInspection {
     /// Every finding in the set: each member's own signal-correlated + native
-    /// findings, plus the cross-distribution findings. Built by re-correlating each
-    /// member (so the per-member native findings are included) and appending the
-    /// cross findings; the caller finalizes this into ONE verdict.
+    /// findings, a synthesized [`RuleId::WheelStructurallyRejected`] finding for
+    /// every member the hardened reader REJECTED, plus the cross-distribution
+    /// findings. Built by re-correlating each member (so the per-member native
+    /// findings are included) and appending the cross findings; the caller
+    /// finalizes this into ONE verdict.
+    ///
+    /// The structural-rejection synthesis is the fail-closed chokepoint: a
+    /// rejected wheel (a path-traversal `..` member, a symlink member, an
+    /// encrypted/CRC-forged member, a conflicting dist-info) is a hard archive
+    /// violation the B5/B6/B7 signal correlation never surfaces as a finding, yet
+    /// it must BLOCK every firewall consumer (firewall / lab / `package inspect`).
+    /// Synthesizing it here means a wheel that hash-matches its lock but is
+    /// structurally rejected can never resolve to Allow by construction, no matter
+    /// which surface calls `all_findings` -> `finalize_static_verdict`.
     pub fn all_findings(&self, threat_db: Option<&crate::threatdb::ThreatDb>) -> Vec<Finding> {
         let mut findings: Vec<Finding> = Vec::new();
         for m in &self.members {
@@ -467,9 +478,37 @@ impl ArtifactSetInspection {
                 &m.inspected.native_findings,
                 threat_db,
             ));
+            if m.inspected.rejected {
+                findings.push(structural_rejection_finding(&m.path, &m.inspected));
+            }
         }
         findings.extend(self.cross_findings.iter().cloned());
         findings
+    }
+}
+
+/// Build the [`RuleId::WheelStructurallyRejected`] finding for a member the
+/// hardened archive reader rejected, carrying the member path and the reader's
+/// violation detail strings. High severity, which derives to [`Action::Block`]
+/// in [`crate::verdict::action_from_findings`], so every consumer that finalizes
+/// [`ArtifactSetInspection::all_findings`] fails closed on a rejected wheel.
+fn structural_rejection_finding(path: &Path, inspected: &InspectedArtifact) -> Finding {
+    use crate::verdict::{RuleId, Severity};
+    let detail = if inspected.violation_details.is_empty() {
+        "structural archive violation".to_string()
+    } else {
+        inspected.violation_details.join("; ")
+    };
+    Finding {
+        rule_id: RuleId::WheelStructurallyRejected,
+        severity: Severity::High,
+        title: "Wheel structurally rejected".to_string(),
+        description: format!("{}: {}", path.display(), detail),
+        evidence: Vec::new(),
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
     }
 }
 
@@ -494,12 +533,25 @@ pub fn inspect_artifact_set(paths: &[PathBuf]) -> ArtifactSetInspection {
         }
     }
 
-    // ---- Resolve cross-artifact references and correlate ---------------------
-    // The cross-distribution correlation walks the members directly (every
-    // payload-shaped member of another distribution is treated as reachable when a
-    // loader searches sys.path); it does not consult an ownership map, so none is
-    // built here.
-    let cross_findings = correlate_cross_distribution(&members);
+    // ---- Pass 2: virtual ownership map across all artifacts ------------------
+    // Each wheel's members become "installed" paths owned by that wheel's
+    // distribution identity, so a loader in wheel A that references a path owned by
+    // wheel B resolves across the set. The ownership KEY is the member path inside
+    // the wheel (the same forward-slash module path a `.pth`/import would name).
+    let mut index = OwnershipIndex::new();
+    for m in &members {
+        let Some(dist) = member_distribution_identity(m) else {
+            continue;
+        };
+        for file in &m.inspected.inspection.files {
+            if let Some(member) = &file.location.member_path {
+                index.insert(NormalizedInstalledPath::new(member), dist.clone());
+            }
+        }
+    }
+
+    // ---- Pass 3/4: resolve cross-artifact references and correlate -----------
+    let cross_findings = correlate_cross_distribution(&members, &index);
 
     ArtifactSetInspection {
         members,
@@ -535,7 +587,10 @@ fn member_distribution_identity(member: &ArtifactSetMember) -> Option<Distributi
 /// PAYLOAD owned by a DIFFERENT artifact. The finding is attached to the loader and
 /// NAMES the payload, reusing the existing startup/native RuleIds (cross-cutting
 /// invariant 1: no new RuleId for the cross-artifact context).
-fn correlate_cross_distribution(members: &[ArtifactSetMember]) -> Vec<Finding> {
+fn correlate_cross_distribution(
+    members: &[ArtifactSetMember],
+    index: &OwnershipIndex,
+) -> Vec<Finding> {
     use crate::verdict::{Evidence, RuleId, Severity};
     let mut findings: Vec<Finding> = Vec::new();
 
@@ -562,13 +617,14 @@ fn correlate_cross_distribution(members: &[ArtifactSetMember]) -> Vec<Finding> {
             continue;
         }
 
-        // Resolve which OTHER artifacts own a payload the loader could reach. We use
-        // the loader's executing startup lines as the reference set: any module-ish
-        // token they name that is owned by a DIFFERENT distribution in the set is a
-        // cross-distribution payload. To stay generic (a rename must not evade), we
-        // also treat ANY payload-shaped member (a script / native / wasm) owned by
-        // another distribution as reachable when the loader searches sys.path.
-        let payload_refs = resolve_cross_payloads(loader, &loader_dist, members);
+        // Resolve which OTHER artifacts own a payload the loader actually
+        // REFERENCES. A reference token in the loader's executing startup lines must
+        // resolve, through the ownership map, to a payload-shaped member owned by a
+        // DIFFERENT distribution in the set. This keys on the ownership relationship
+        // (a rename does not evade, because the member path is what the loader names
+        // and what the map owns) and does NOT fire on an unrelated payload-shaped
+        // member the loader never references.
+        let payload_refs = resolve_cross_payloads(loader, &loader_dist, index, members);
         if payload_refs.is_empty() {
             continue;
         }
@@ -603,18 +659,15 @@ fn correlate_cross_distribution(members: &[ArtifactSetMember]) -> Vec<Finding> {
             });
         }
 
-        // The cross-distribution split is the cross-runtime campaign mechanism.
-        // When the loader ALSO launches a foreign runtime (Bun/Node/Deno), it is the
-        // real campaign signature: Critical, and a hard Block. When it does NOT, the
-        // signal is just "a sys.path-searching, executing startup hook co-inspected
-        // with some payload-shaped member owned by another distribution" — which a
-        // benign wheel shipping a `.so`/`.sh` alongside an unrelated `.pth` can
-        // trip, since the breadth here is intentionally rename-resistant (it does
-        // not require the loader to NAME the payload). So the non-cross-runtime case
-        // is Medium (a Warn), not a hard Block: full evidence is still attached (the
-        // loader and every payload member are named), but it does not block install
-        // without the stronger cross-runtime corroboration. Either way the finding is
-        // attached to the loader and names the payload.
+        // The reference now genuinely resolves through the ownership map to a
+        // foreign-owned payload-shaped member, so the earlier Medium severity
+        // "downgrade stopgap" (which guarded against the over-broad
+        // any-foreign-payload heuristic) no longer applies. When the loader ALSO
+        // launches a foreign runtime (Bun/Node/Deno) it is the full cross-runtime
+        // campaign signature: Critical, a hard Block. When it does not, an executing
+        // startup hook that names and reaches another distribution's payload is still
+        // High (a Block-worthy supply-chain signal), not a Warn. Either way the
+        // finding is attached to the loader and names the payload.
         let loader_cross_runtime = loader
             .inspected
             .inspection
@@ -625,7 +678,7 @@ fn correlate_cross_distribution(members: &[ArtifactSetMember]) -> Vec<Finding> {
         let (rule_id, severity) = if loader_cross_runtime {
             (RuleId::PythonStartupHookCrossRuntime, Severity::Critical)
         } else {
-            (RuleId::PythonStartupHookSuspicious, Severity::Medium)
+            (RuleId::PythonStartupHookSuspicious, Severity::High)
         };
 
         findings.push(Finding {
@@ -662,21 +715,35 @@ struct CrossPayloadRef {
     payload_member: String,
 }
 
-/// Resolve the payloads a loader can reach in OTHER distributions of the set. A
-/// loader that searches `sys.path` can run any payload-shaped member (a script,
-/// native module, or wasm) owned by a different distribution; we report each such
-/// member, naming its owning artifact. Generic by construction (no payload-filename
-/// allowlist), so a rename does not evade.
+/// The maximum number of distinct candidate paths extracted from a loader's
+/// startup lines before resolution stops, so a pathological line cannot drive a
+/// quadratic blow-up over a large set.
+const MAX_CROSS_REFERENCE_CANDIDATES: usize = 256;
+
+/// Resolve the payloads a loader's startup hook actually REFERENCES that are owned
+/// by a DIFFERENT distribution in the set (PR-I real ownership resolution, replacing
+/// the earlier "any foreign payload-shaped member is reachable" stopgap).
+///
+/// A reference qualifies only when:
+/// 1. the loader's executing startup line names a token that normalizes to an
+///    installed path the ownership `index` records (`index.owners(path)` is
+///    non-empty), AND
+/// 2. an owner of that path is a DIFFERENT distribution than the loader, AND
+/// 3. the OWNED member at that path is payload-shaped (script / native / wasm) in
+///    the owning artifact.
+///
+/// This keys on the ownership relationship, not a payload-filename allowlist, so a
+/// rename of the payload does not evade (its member path is what the loader names
+/// and what the map owns). It does NOT fire on an unrelated payload-shaped member in
+/// another wheel that the loader never references.
 fn resolve_cross_payloads(
     loader: &ArtifactSetMember,
     loader_dist: &DistributionIdentity,
+    index: &OwnershipIndex,
     members: &[ArtifactSetMember],
 ) -> Vec<CrossPayloadRef> {
-    let mut refs: Vec<CrossPayloadRef> = Vec::new();
-
-    // The loader's executing startup lines (the reference site that names the
-    // sys.path search). We attribute the cross reference to the first executing
-    // startup member for the evidence.
+    // The loader's executing startup lines (the reference site). We attribute the
+    // cross reference to the first executing startup member for the evidence.
     let loader_member = loader
         .inspected
         .inspection
@@ -686,33 +753,215 @@ fn resolve_cross_payloads(
         .map(|s| s.location.to_string())
         .unwrap_or_else(|| "loader startup hook".to_string());
 
-    for payload in members {
-        let Some(payload_dist) = member_distribution_identity(payload) else {
-            continue;
-        };
-        // Skip the loader itself (a SAME-distribution member is not a
-        // cross-distribution split).
-        if same_distribution(loader_dist, &payload_dist) {
-            continue;
-        }
-        // Any payload-shaped member (script / native / wasm) owned by this other
-        // distribution is reachable by a sys.path-searching loader.
-        for file in &payload.inspected.inspection.files {
-            if is_payload_kind(file.kind) {
+    // Extract the candidate installed paths the loader's executing lines reference.
+    let candidates = loader_reference_candidates(loader);
+
+    let mut refs: Vec<CrossPayloadRef> = Vec::new();
+    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for candidate in &candidates {
+        // Resolve the reference against the ownership map. Every distribution that
+        // owns this exact path is a candidate owner; we keep only a DIFFERENT one
+        // whose member at this path is payload-shaped.
+        for owner in index.owners(candidate) {
+            if same_distribution(loader_dist, owner) {
+                continue;
+            }
+            // Find the owning set member and confirm the OWNED member at this path is
+            // payload-shaped (the index maps path -> distribution, not path -> kind,
+            // so we re-look-up the actual member kind in the owner).
+            let Some(owner_member) = members.iter().find(|m| {
+                member_distribution_identity(m)
+                    .as_ref()
+                    .is_some_and(|d| same_distribution(d, owner))
+            }) else {
+                continue;
+            };
+            let Some(file) = owner_member.inspected.inspection.files.iter().find(|f| {
+                f.location
+                    .member_path
+                    .as_deref()
+                    .map(|mp| NormalizedInstalledPath::new(mp) == *candidate)
+                    .unwrap_or(false)
+            }) else {
+                continue;
+            };
+            if !is_payload_kind(file.kind) {
+                continue;
+            }
+            let payload_artifact = owner_member
+                .inspected
+                .filename()
+                .unwrap_or("payload artifact")
+                .to_string();
+            let payload_member = file.location.to_string();
+            // Dedupe by (artifact, member) so two reference tokens naming the same
+            // owned member produce one entry.
+            if seen.insert((payload_artifact.clone(), payload_member.clone())) {
                 refs.push(CrossPayloadRef {
                     loader_member: loader_member.clone(),
-                    payload_artifact: payload
-                        .inspected
-                        .filename()
-                        .unwrap_or("payload artifact")
-                        .to_string(),
-                    payload_member: file.location.to_string(),
+                    payload_artifact,
+                    payload_member,
                 });
             }
         }
     }
 
     refs
+}
+
+/// Extract the set of candidate installed paths a loader's EXECUTING startup lines
+/// reference, for resolution against the ownership map. Sources, all from the
+/// `PthExecutableLine` signal evidence (which embeds the literal source line):
+/// * quoted path-ish / script-ish string literals (`'pkg/run.sh'`, `"pkg/_boot.py"`),
+///   including a runtime argument inside a shell string (`node pkg/run.sh`);
+/// * dotted module names that follow an `import` / `__import__` /
+///   `importlib.import_module` (`import pkg.run` -> `pkg/run`, `pkg/run.py`,
+///   `pkg/__init__.py`).
+///
+/// A token containing `..` is dropped (the normalizer does not resolve traversal,
+/// so such a token cannot soundly resolve to an owned path). Candidates are
+/// deduplicated and capped at [`MAX_CROSS_REFERENCE_CANDIDATES`].
+fn loader_reference_candidates(loader: &ArtifactSetMember) -> Vec<NormalizedInstalledPath> {
+    let mut out: std::collections::BTreeSet<NormalizedInstalledPath> =
+        std::collections::BTreeSet::new();
+
+    for sig in loader
+        .inspected
+        .inspection
+        .signals
+        .iter()
+        .filter(|s| s.kind == ArtifactSignalKind::PthExecutableLine)
+    {
+        for raw in extract_reference_tokens(&sig.evidence) {
+            if out.len() >= MAX_CROSS_REFERENCE_CANDIDATES {
+                break;
+            }
+            // A token must not contain a parent-directory traversal: the normalizer
+            // keeps `..` verbatim, and an installed member path never legitimately
+            // contains one, so such a token cannot resolve to a real owned path.
+            if raw.split('/').any(|seg| seg == "..") || raw.contains("..\\") {
+                continue;
+            }
+            let norm = NormalizedInstalledPath::new(&raw);
+            if norm.as_str().is_empty() {
+                continue;
+            }
+            out.insert(norm);
+        }
+    }
+
+    out.into_iter().collect()
+}
+
+/// Pull the path/module reference tokens out of one executing-line evidence string.
+///
+/// The evidence wraps the literal source line as `<label> ... : '<source line>'`,
+/// and the source line itself contains quotes, so naive quote-pairing across the
+/// whole evidence string mis-splits. We therefore first UNWRAP the source line (the
+/// run between the wrapper's `: '` and its final `'`), then tokenize THAT on shell /
+/// Python separators and whitespace, collecting only path-ish tokens (those with a
+/// path separator or a filename extension). A bare identifier (`os`, `sys`) is not
+/// path-ish, so a stdlib name cannot accidentally resolve to an owned member. Dotted
+/// `import` module names are expanded separately into their candidate file paths.
+fn extract_reference_tokens(evidence: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+
+    // The actual source line, unwrapped from the evidence wrapper. The wrapper marker
+    // is `: '` and the source line is the rest up to the final `'`. If the wrapper is
+    // absent (a body-level evidence string), fall back to the whole evidence.
+    let source_line = unwrap_source_line(evidence);
+
+    // 1) Path-ish tokens anywhere in the source line. Split on the shell / Python
+    //    punctuation that separates a path argument from surrounding code (quotes,
+    //    parentheses, commas, semicolons, whitespace, `=`), then keep the path-ish
+    //    pieces. `node payloadpkg/run.sh` -> `payloadpkg/run.sh`;
+    //    `sys.path.insert(0, '/tmp')` contributes no path-ish OWNED token (a leading
+    //    `/tmp` is absolute and not an installed member path).
+    for word in source_line.split(|c: char| {
+        c.is_whitespace() || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';' | '=' | '`')
+    }) {
+        if looks_path_ish(word) {
+            tokens.push(word.to_string());
+        }
+    }
+
+    // 2) Dotted module names after an import keyword. `import a.b.c` and
+    //    `import_module('a.b')` both name a module path; expand to the file
+    //    candidates Python would resolve it to: a `.py` module, a package
+    //    `__init__.py`, the bare directory, or a compiled extension
+    //    (`.so`/`.pyd`/`.abi3.so`/`.dylib`) — the campaign's payload split commonly
+    //    hands off to a native extension module imported by name.
+    for module in dotted_import_modules(&source_line) {
+        let slashed = module.replace('.', "/");
+        tokens.push(format!("{slashed}.py"));
+        tokens.push(slashed.clone());
+        tokens.push(format!("{slashed}/__init__.py"));
+        for ext in ["so", "pyd", "abi3.so", "dylib", "node"] {
+            tokens.push(format!("{slashed}.{ext}"));
+        }
+    }
+
+    tokens
+}
+
+/// Unwrap the literal source line from an executing-line evidence string. The
+/// evidence is formatted `<label> line N executes at interpreter start: '<line>'`
+/// (and similar), so the source line is the run between the LAST `: '` marker and
+/// the final `'`. When no wrapper is present (a body-level evidence string with no
+/// embedded source), the whole evidence is returned unchanged.
+fn unwrap_source_line(evidence: &str) -> String {
+    if let Some(marker) = evidence.rfind(": '") {
+        let after = &evidence[marker + 3..];
+        let inner = after.strip_suffix('\'').unwrap_or(after);
+        return inner.to_string();
+    }
+    evidence.to_string()
+}
+
+/// Whether a token looks like a file/dir reference worth resolving: it contains a
+/// path separator or a filename extension, and is not a bare URL/scheme. A plain
+/// word with neither (`payload`, `os`) is rejected here — resolution is by exact
+/// owned PATH, not a basename guess (a bare-name match would reintroduce the
+/// unrelated-payload false positive the ownership tightening removes).
+fn looks_path_ish(token: &str) -> bool {
+    let t = token.trim();
+    if t.is_empty() || t.len() > 256 {
+        return false;
+    }
+    // Reject obvious URLs/schemes — those are handled by the network rules, not
+    // ownership resolution.
+    if t.contains("://") {
+        return false;
+    }
+    t.contains('/') || t.contains('\\') || (t.contains('.') && !t.starts_with('.'))
+}
+
+/// The dotted module names named by an `import` / `__import__` / `import_module` in
+/// a line. Conservative: it scans for the keyword and takes the following
+/// dotted-identifier run. Only modules with a `.` (a package path) are returned, so
+/// a top-level single-segment import (`import os`) is not turned into a candidate
+/// (it could not own a multi-segment member path anyway, and the payload split is
+/// always into a package subpath).
+fn dotted_import_modules(line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for keyword in ["import_module", "__import__", "import "] {
+        let mut search_from = 0usize;
+        while let Some(pos) = line[search_from..].find(keyword) {
+            let abs = search_from + pos + keyword.len();
+            // Skip separators/openers between the keyword and the module name.
+            let tail = line[abs..].trim_start_matches([' ', '(', '\'', '"']);
+            let module: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                .collect();
+            let module = module.trim_matches('.').to_string();
+            if module.contains('.') {
+                out.push(module);
+            }
+            search_from = abs;
+        }
+    }
+    out
 }
 
 /// Whether a member kind is a PAYLOAD a cross-distribution loader could execute (a
@@ -820,12 +1069,14 @@ mod tests {
 
     #[test]
     fn artifact_set_cross_distribution_loads_payload() {
-        // Wheel A (the LOADER) bundles a `.pth` that searches sys.path and executes.
-        // Wheel B (the PAYLOAD) bundles a bun-launching native member / script. The
-        // set inspection must produce exactly ONE cross-distribution finding,
-        // attached to A and naming B.
+        // Wheel A (the LOADER) bundles a `.pth` that searches sys.path and executes,
+        // and NAMES wheel B's payload member by its installed path. Wheel B (the
+        // PAYLOAD) owns that script member. The set inspection must produce exactly
+        // ONE cross-distribution finding, attached to A and naming B, because the
+        // loader's reference resolves through the ownership map to B's member.
         let dir = tempfile::tempdir().unwrap();
-        let loader_pth = b"import sys, os; sys.path.insert(0, '/tmp'); os.system('node payload')\n";
+        let loader_pth =
+            b"import sys, os; sys.path.insert(0, '/tmp'); os.system('node payloadpkg/run.sh')\n";
         let a_bytes = build_wheel(&[
             ("loader.pth", loader_pth),
             (
@@ -909,6 +1160,132 @@ mod tests {
     }
 
     #[test]
+    fn artifact_set_unrelated_payload_in_other_wheel_no_cross_finding() {
+        // PR-I: real ownership resolution. The loader has an executing,
+        // sys.path-searching startup hook, but it references its OWN sibling module
+        // path ('loaderpkg/local.py'), NOT anything wheel B owns. Wheel B carries an
+        // unrelated payload-shaped member ('otherpkg/analytics.js'). Under the old
+        // any-foreign-payload heuristic this produced a (Medium) cross finding; with
+        // ownership resolution it must produce NONE, because the loader never names
+        // B's member.
+        let dir = tempfile::tempdir().unwrap();
+        let loader_pth =
+            b"import sys, os; sys.path.insert(0, '.'); os.system('python loaderpkg/local.py')\n";
+        let a_bytes = build_wheel(&[
+            ("loader.pth", loader_pth),
+            ("loaderpkg/local.py", b"print('local')\n"),
+            (
+                "loaderpkg-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: loaderpkg\nVersion: 1.0\n\n",
+            ),
+            (
+                "loaderpkg-1.0.dist-info/RECORD",
+                b"loaderpkg-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let a = write_temp(&dir, "loaderpkg-1.0-py3-none-any.whl", &a_bytes);
+
+        let b_bytes = build_wheel(&[
+            ("otherpkg/analytics.js", b"console.log('unrelated')\n"),
+            (
+                "otherpkg-2.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: otherpkg\nVersion: 2.0\n\n",
+            ),
+            (
+                "otherpkg-2.0.dist-info/RECORD",
+                b"otherpkg-2.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let b = write_temp(&dir, "otherpkg-2.0-py3-none-any.whl", &b_bytes);
+
+        let set = inspect_artifact_set(&[a, b]);
+        assert!(
+            set.cross_findings.is_empty(),
+            "an unrelated payload the loader never references must not cross-correlate: {:?}",
+            set.cross_findings
+        );
+    }
+
+    #[test]
+    fn artifact_set_reference_resolves_only_to_named_owner() {
+        // PR-I: a loader reference resolves only to the ACTUAL owner. The loader
+        // names a payload by its installed path; wheel B owns exactly that path and
+        // wheel C owns a DIFFERENT, unreferenced payload member. The cross finding
+        // must name B (the referenced owner) and must NOT name C. The loader does not
+        // launch a foreign runtime, so the finding is High (not the old Medium
+        // stopgap, not Critical).
+        let dir = tempfile::tempdir().unwrap();
+        let loader_pth = b"import sys; sys.path.insert(0, '.'); import targetpkg.payload\n";
+        let a_bytes = build_wheel(&[
+            ("loader.pth", loader_pth),
+            (
+                "loaderpkg-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: loaderpkg\nVersion: 1.0\n\n",
+            ),
+            (
+                "loaderpkg-1.0.dist-info/RECORD",
+                b"loaderpkg-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let a = write_temp(&dir, "loaderpkg-1.0-py3-none-any.whl", &a_bytes);
+
+        // Wheel B owns the referenced module path as a NATIVE payload member.
+        let b_bytes = build_wheel(&[
+            ("targetpkg/payload.so", b"\x7fELF stub\n"),
+            (
+                "targetpkg-2.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: targetpkg\nVersion: 2.0\n\n",
+            ),
+            (
+                "targetpkg-2.0.dist-info/RECORD",
+                b"targetpkg-2.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let b = write_temp(&dir, "targetpkg-2.0-py3-none-any.whl", &b_bytes);
+
+        // Wheel C owns an UNREFERENCED payload member.
+        let c_bytes = build_wheel(&[
+            ("decoypkg/other.sh", b"#!/bin/sh\necho decoy\n"),
+            (
+                "decoypkg-3.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: decoypkg\nVersion: 3.0\n\n",
+            ),
+            (
+                "decoypkg-3.0.dist-info/RECORD",
+                b"decoypkg-3.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let c = write_temp(&dir, "decoypkg-3.0-py3-none-any.whl", &c_bytes);
+
+        let set = inspect_artifact_set(&[a, b, c]);
+        assert_eq!(
+            set.cross_findings.len(),
+            1,
+            "exactly one cross finding (the referenced owner) expected: {:?}",
+            set.cross_findings
+        );
+        let finding = &set.cross_findings[0];
+        assert_eq!(
+            finding.severity,
+            crate::verdict::Severity::High,
+            "a resolved reference without a foreign-runtime launch is High"
+        );
+        let evidence_text: String = finding
+            .evidence
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap_or_default())
+            .collect();
+        assert!(
+            evidence_text.contains("targetpkg-2.0-py3-none-any.whl"),
+            "finding must name the referenced owner B: {evidence_text}"
+        );
+        assert!(
+            !evidence_text.contains("decoypkg-3.0-py3-none-any.whl"),
+            "finding must NOT name the unreferenced wheel C: {evidence_text}"
+        );
+    }
+
+    #[test]
     fn wheel_with_executable_pth_fires_suspicious() {
         let dir = tempfile::tempdir().unwrap();
         // A .pth that executes a subprocess at startup (the B6 case).
@@ -963,10 +1340,7 @@ mod tests {
         let path = write_temp(&dir, "demo-1.0-py3-none-any.whl", &bytes);
 
         // Independent reference digest of the exact file bytes (NEVER shelling out).
-        let expected: String = Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let expected: String = hex::encode(Sha256::digest(&bytes));
 
         let inspected = inspect_artifact_file(&path).expect("inspect");
         let recorded = match &inspected.inspection.subject {
@@ -991,8 +1365,11 @@ mod tests {
     #[test]
     fn cross_distribution_cross_runtime_still_critical() {
         let dir = tempfile::tempdir().unwrap();
-        // Loader `.pth`: searches sys.path AND launches node (cross-runtime).
-        let loader_pth = b"import sys, os; sys.path.insert(0, '/tmp'); os.system('node payload')\n";
+        // Loader `.pth`: searches sys.path AND launches node (cross-runtime) on a
+        // script member OWNED by the payload wheel (`payloadpkg/run.sh`), so the
+        // reference resolves through the ownership map.
+        let loader_pth =
+            b"import sys, os; sys.path.insert(0, '/tmp'); os.system('node payloadpkg/run.sh')\n";
         let a_bytes = build_wheel(&[
             ("loader.pth", loader_pth),
             (
@@ -1034,19 +1411,22 @@ mod tests {
         );
     }
 
-    /// T1.5 (conservative severity downgrade, NOT a name-gate): a
-    /// cross-distribution split with NO cross-runtime launch (a sys.path-searching,
-    /// executing loader co-inspected with a payload-shaped member in another
-    /// distribution) is surfaced as Medium (a Warn), not a hard Block — so a benign
-    /// wheel that merely ships a `.sh`/`.so` next to an unrelated executing `.pth`
-    /// is not block-graded. Full evidence (loader + payload named) is still present.
+    /// PR-I (real ownership resolution): a cross-distribution split with NO
+    /// cross-runtime launch, but where the loader's executing startup line RESOLVES a
+    /// reference through the ownership map to a payload-shaped member owned by another
+    /// distribution, is now High (a hard Block) — the earlier Medium "severity
+    /// downgrade stopgap" is gone, because the reference now genuinely names the
+    /// foreign-owned payload (an unrelated payload the loader never names produces no
+    /// cross finding at all; see `artifact_set_unrelated_payload_in_other_wheel_*`).
     #[test]
-    fn cross_distribution_non_cross_runtime_is_warn_not_block() {
+    fn cross_distribution_non_cross_runtime_resolved_reference_is_block() {
         use crate::verdict::{action_from_findings, Action, Severity};
         let dir = tempfile::tempdir().unwrap();
-        // Loader `.pth`: searches sys.path AND executes a subprocess, but launches
-        // NO foreign runtime (no node/bun/deno) — so it is NOT cross-runtime.
-        let loader_pth = b"import sys, os; sys.path.insert(0, '/tmp'); os.system('sh /tmp/x')\n";
+        // Loader `.pth`: searches sys.path AND executes a subprocess on a script
+        // member OWNED by the payload wheel (`payloadpkg/helper.sh`), but launches NO
+        // foreign runtime (no node/bun/deno) — so it is NOT cross-runtime.
+        let loader_pth =
+            b"import sys, os; sys.path.insert(0, '/tmp'); os.system('sh payloadpkg/helper.sh')\n";
         let a_bytes = build_wheel(&[
             ("loader.pth", loader_pth),
             (
@@ -1059,7 +1439,7 @@ mod tests {
             ),
         ]);
         let a = write_temp(&dir, "loaderpkg-1.0-py3-none-any.whl", &a_bytes);
-        // A benign payload wheel that merely ships a script member.
+        // The payload wheel ships the referenced script member.
         let b_bytes = build_wheel(&[
             ("payloadpkg/helper.sh", b"#!/bin/sh\necho hi\n"),
             (
@@ -1078,13 +1458,13 @@ mod tests {
         let f = &set.cross_findings[0];
         assert_eq!(
             f.severity,
-            Severity::Medium,
-            "a non-cross-runtime split is downgraded to Medium (a Warn), not High"
+            Severity::High,
+            "a resolved non-cross-runtime reference is High (a Block), not the old Medium stopgap"
         );
         assert_eq!(
             action_from_findings(std::slice::from_ref(f)),
-            Action::Warn,
-            "Medium derives to Warn, so the non-cross-runtime case is not a hard Block"
+            Action::Block,
+            "High derives to Block, so a resolved cross-distribution reference hard-Blocks on its own"
         );
         // Full evidence is still attached: loader and payload artifacts are named.
         let evidence_text: String = f
@@ -1095,28 +1475,19 @@ mod tests {
         assert!(
             evidence_text.contains("loaderpkg-1.0-py3-none-any.whl")
                 && evidence_text.contains("payloadpkg-2.0-py3-none-any.whl"),
-            "the downgraded finding must still name the loader and payload: {evidence_text}"
+            "the finding must name the loader and payload: {evidence_text}"
         );
 
-        // The load-bearing invariant that makes the downgrade safe: it is ADDITIVE,
-        // not a weakening. The loader wheel's OWN per-artifact correlation (an
-        // executing .pth line plus a subprocess danger capability) still produces a
-        // block-grade finding, so the FULL set verdict (all_findings = every member's
-        // findings plus the cross findings) is still a hard Block. Only the
-        // cross-distribution finding itself was downgraded to a Warn.
+        // The full set verdict is a hard Block (both the cross finding and the
+        // loader's own per-artifact correlation contribute).
         let all = set.all_findings(None);
-        assert!(
-            all.iter()
-                .any(|f| matches!(f.severity, Severity::High | Severity::Critical)),
-            "the loader's own per-artifact finding must still be block-grade: {:?}",
-            all.iter()
-                .map(|f| (f.rule_id, f.severity))
-                .collect::<Vec<_>>()
-        );
         assert_eq!(
             action_from_findings(&all),
             Action::Block,
-            "the full set verdict still hard-Blocks via the loader's own finding, despite the cross-dist downgrade"
+            "the full set verdict hard-Blocks: {:?}",
+            all.iter()
+                .map(|f| (f.rule_id, f.severity))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1132,8 +1503,10 @@ mod tests {
         std::fs::create_dir_all(&dir_b).unwrap();
 
         // Both wheels share the project NAME and FILENAME, differing only in dir.
-        // Wheel A is the cross-runtime loader; wheel B ships the script payload.
-        let loader_pth = b"import sys, os; sys.path.insert(0, '/tmp'); os.system('node payload')\n";
+        // Wheel A is the cross-runtime loader and references wheel B's payload member
+        // by its installed path (`dup/run.sh`); wheel B ships that script payload.
+        let loader_pth =
+            b"import sys, os; sys.path.insert(0, '/tmp'); os.system('node dup/run.sh')\n";
         let a_bytes = build_wheel(&[
             ("loader.pth", loader_pth),
             (
@@ -1209,6 +1582,86 @@ mod tests {
             sniff_head(&mut empty),
             Ok(ArtifactMagic::Unknown),
             "a clean empty read is Unknown magic, not an Unreadable fault"
+        );
+    }
+
+    /// `all_findings` synthesizes a `WheelStructurallyRejected` finding for a member
+    /// the hardened reader rejected (a `..` traversal member), and NONE for a clean
+    /// wheel. This is the chokepoint that makes every firewall consumer fail closed
+    /// on a structurally-rejected wheel by construction.
+    #[test]
+    fn all_findings_synthesizes_structural_rejection_for_rejected_member() {
+        use crate::verdict::{action_from_findings, Action, RuleId};
+
+        // A wheel with a `../etc/passwd` member is structurally REJECTED by read_wheel.
+        let dir = tempfile::tempdir().unwrap();
+        let rejected_bytes = build_wheel(&[
+            ("../etc/passwd", b"root:x:0:0\n"),
+            (
+                "demo-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n",
+            ),
+        ]);
+        let rejected_path = write_temp(&dir, "demo-1.0-py3-none-any.whl", &rejected_bytes);
+
+        let set = inspect_artifact_set(std::slice::from_ref(&rejected_path));
+        assert_eq!(set.members.len(), 1, "the wheel is a member, not a gap");
+        assert!(
+            set.members[0].inspected.rejected,
+            "a path-traversal wheel is structurally rejected"
+        );
+
+        let findings = set.all_findings(None);
+        let rejection: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == RuleId::WheelStructurallyRejected)
+            .collect();
+        assert_eq!(
+            rejection.len(),
+            1,
+            "exactly one WheelStructurallyRejected finding is synthesized (no double-emit): {:?}",
+            findings.iter().map(|f| f.rule_id).collect::<Vec<_>>()
+        );
+        assert!(
+            rejection[0]
+                .description
+                .contains("demo-1.0-py3-none-any.whl"),
+            "the finding names the rejected member path: {}",
+            rejection[0].description
+        );
+        assert_eq!(
+            action_from_findings(&findings),
+            Action::Block,
+            "a structurally-rejected member makes the set verdict Block"
+        );
+
+        // CONTRAST: a clean wheel synthesizes no structural-rejection finding. Its
+        // filename, dist-info dir, and METADATA name agree (`cleanpkg`), so the
+        // reader does not reject it on an identity mismatch.
+        let clean_bytes = build_wheel(&[
+            ("cleanpkg/__init__.py", b"print('hi')\n"),
+            (
+                "cleanpkg-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: cleanpkg\nVersion: 1.0\n\n",
+            ),
+            ("cleanpkg-1.0.dist-info/WHEEL", b"Wheel-Version: 1.0\n"),
+            (
+                "cleanpkg-1.0.dist-info/RECORD",
+                b"cleanpkg-1.0.dist-info/RECORD,,\n",
+            ),
+        ]);
+        let clean_path = write_temp(&dir, "cleanpkg-1.0-py3-none-any.whl", &clean_bytes);
+        let clean_set = inspect_artifact_set(&[clean_path]);
+        assert!(
+            !clean_set.members[0].inspected.rejected,
+            "a clean wheel is not rejected"
+        );
+        assert!(
+            clean_set
+                .all_findings(None)
+                .iter()
+                .all(|f| f.rule_id != RuleId::WheelStructurallyRejected),
+            "a clean wheel synthesizes no WheelStructurallyRejected finding"
         );
     }
 }

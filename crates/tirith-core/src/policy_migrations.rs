@@ -224,6 +224,10 @@ mod tests {
             );
             expected = m.to;
         }
+        // Guard kept for forward-compat: today MIGRATIONS is a non-empty const
+        // (so clippy's `const_is_empty` fires), but if it is ever emptied this
+        // check must not force `expected == CURRENT_SCHEMA_VERSION`.
+        #[allow(clippy::const_is_empty)]
         if !MIGRATIONS.is_empty() {
             assert_eq!(
                 expected, CURRENT_SCHEMA_VERSION,

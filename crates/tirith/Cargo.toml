@@ -26,6 +26,27 @@ path = "src/bin/tirith_threatdb_compile.rs"
 # change. OFF by default; building `tirith` with this on compiles and tests today.
 default = []
 artifact-hash-lookup = ["tirith-core/artifact-hash-lookup"]
+# sigstore-attestations (Stack F3 spike): the OFF-by-default gate for the PyPI
+# attestation Sigstore VERIFICATION path in `cli::pypi_integrity`. The feature key
+# exists so the `#[cfg(feature = "sigstore-attestations")]` verification branch
+# compiles as a recognized cfg, but it pulls NO `sigstore-*` dependency yet, and
+# stays OFF on the workspace MSRV. Why no deps: the modular sigstore crates exist at
+# a consistent 0.9.0 line with the `rustls` feature the plan assumed (the earlier
+# 0.1.x guess mis-resolved to stale 0.1.1 copies), but sigstore-verify 0.9
+# transitively requires reqwest 0.13, hyper-rustls 0.27, rustls-platform-verifier
+# 0.7 and zeroize 1.9 — all of which require Rust >= 1.85 — and the closure is not
+# pinnable down to MSRV 1.83. There is also no standalone `sigstore-attestations`
+# crate (that functionality lives inside the umbrella `sigstore` crate). So the
+# `dep:sigstore-*` wiring is intentionally omitted until the workspace MSRV rises to
+# >= 1.85; F3 is an optional spike that only fully activates (and the "verify one
+# real PyPI fixture end to end" gate runs) once it can build. Crucially, with the
+# feature OFF the command still RUNS — it fetches the provenance and binds the
+# subject digest structurally — but reports `verification-unavailable`, never
+# `verified`: a missing, invalid, or unverifiable attestation is provenance
+# evidence, never an auto-allow. When the MSRV allows it, add the `dep:sigstore-*`
+# block here (e.g. `sigstore-attestations = ["dep:sigstore-verify",
+# "dep:sigstore-trust-root", "dep:sigstore-types"]`).
+sigstore-attestations = []
 
 [dependencies]
 tirith-core = { workspace = true }
@@ -49,7 +70,10 @@ tempfile = "3"
 # `tokio::io::stdin()` / `stdout()` for the LSP stdio transport. tower-lsp's
 # `runtime-tokio` feature enables the tokio crate but pins NO tokio features, so
 # we must request `io-std` ourselves rather than rely on feature unification.
-tokio = { workspace = true, features = ["io-std"] }
+# `time` is added for the capsule egress broker's connect / handshake / idle
+# timeouts (Stack E, `capsule_proxy.rs`); requested here for the same
+# feature-unification reason as `io-std`.
+tokio = { workspace = true, features = ["io-std", "time"] }
 walkdir = { workspace = true }
 csv = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -62,6 +86,11 @@ fs2 = { workspace = true }
 portable-pty = "0.9"
 # Parses the embedded `tirith lab` corpus (assets/lab_corpus.toml).
 toml = "0.8"
+# Builds the synthetic, inert `tirith lab` artifact fixtures (wheels) at lab time
+# (`cli::lab_artifacts`, plan unit G2). Same line tirith-core already depends on
+# (2.x, deflate only); already in the lockfile, no new transitive resolution.
+# License: MIT.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # Synchronous loopback HTTP server for `tirith dashboard serve` (M13 ch3).
 # Bound to 127.0.0.1 ONLY; never exposed off-host.
 tiny_http = { workspace = true }
@@ -71,12 +100,38 @@ tiny_http = { workspace = true }
 # types can never drift from the version tower-lsp was built against. Bin-crate
 # only — tirith-core stays LSP-agnostic.
 tower-lsp = "0.20"
+# Capsule egress broker (Stack E, `capsule_proxy.rs`). A loopback-only CONNECT
+# broker — NOT the security boundary — that the OS sandbox backend funnels
+# outbound traffic through. hyper 1 + hyper-util + http-body-util give us an
+# async HTTP/1 server for the broker loop on top of the tokio runtime that already
+# lives in this crate (tirith-core stays async-free). All three proven on MSRV
+# 1.83 in the PR-0 spike. Licenses: MIT.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [dev-dependencies]
 mockito = "1"
 # Build synthetic wheels (ZIP archives) in the `package inspect` / `scan`
 # artifact-inspection integration tests. Matches tirith-core's `zip` features.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Windows runtime-containment capsule backend (Stack E4): AppContainer profile +
+# SID derivation, SECURITY_CAPABILITIES / PROC_THREAD_ATTRIBUTE / STARTUPINFOEXW
+# CreateProcessW (create-suspended -> assign Job -> resume), Job Objects, and ACLs.
+# `default-features = false` with an explicit minimal feature set keeps the binding
+# surface to exactly the Win32 areas the backend calls. `cfg(windows)`-gated so
+# non-Windows targets compile without it. Proven to resolve on MSRV 1.83 for the
+# windows-msvc target in the PR-0 spike (crate MSRV 1.82). License MIT/Apache-2.0.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"

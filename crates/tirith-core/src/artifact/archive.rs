@@ -729,6 +729,22 @@ pub fn is_wheel_filename(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".whl")
 }
 
+/// The PEP 503-normalised distribution (project) name parsed from a wheel
+/// filename, or `None` if `filename` is not a parseable wheel name.
+///
+/// A wheel is `name-version-...tags....whl`; the first `-`-separated field is the
+/// distribution name (with the name's own separators normalised to `_` in the
+/// filename). This returns that field run through PEP 503 normalisation
+/// (lowercase, runs of `-`/`_`/`.` collapsed to a single `-`), the canonical form
+/// a `name @ file://...` direct-reference requirement should use so pip records the
+/// install under the right distribution. Reuses the same internal parsers the
+/// wheel-identity check uses, so the name derived here cannot drift from the one
+/// the inspection validates the wheel against.
+pub fn wheel_distribution_name(filename: &str) -> Option<String> {
+    let parsed = parse_wheel_filename(filename)?;
+    Some(normalize_project_name(&parsed.name))
+}
+
 /// The structural check for traversal / Windows-path members. `enclosed_name`
 /// fail-closes absolute / `..` / non-UTF-8 paths, so a `None` enclosed name is a
 /// traversal violation; we ALSO scan the raw name for backslash / drive-letter /
@@ -928,7 +944,13 @@ fn parse_dist_info_dir(root: &str) -> Option<(String, String)> {
 
 /// PEP 503 name normalization: lowercase and collapse any run of `-`, `_`, or `.`
 /// into a single `-`. So `Foo.Bar_baz` and `foo-bar-baz` compare equal.
-fn normalize_project_name(name: &str) -> String {
+///
+/// `pub(crate)` so the D5 post-install RECORD check
+/// ([`crate::artifact::install::verify_post_install_record`]) scopes its
+/// verification to exactly the just-installed distributions using the SAME
+/// normalizer the resolver's `name @ file://...` line uses, so a `.dist-info`
+/// directory name and an approved distribution name cannot drift apart.
+pub(crate) fn normalize_project_name(name: &str) -> String {
     let lowered = name.to_ascii_lowercase();
     let mut out = String::with_capacity(lowered.len());
     let mut prev_sep = false;
@@ -1171,7 +1193,7 @@ fn stream_member<R: Read + Seek>(
     }
 
     let digest = hasher.finalize();
-    let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let sha256: String = hex::encode(digest);
     MemberStream::Complete {
         bytes,
         sha256,
@@ -1246,7 +1268,7 @@ fn stream_native_view<R: Read + Seek>(
         printable.feed(&buf[..n]);
     }
     let digest = hasher.finalize();
-    let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let sha256: String = hex::encode(digest);
     (
         Some(NativeMemberHandoff::Streaming {
             location,
@@ -1431,7 +1453,7 @@ mod tests {
     /// `outer_sha256`). Tests compute it independently of the reader.
     fn sha256_hex(bytes: &[u8]) -> String {
         let digest = Sha256::digest(bytes);
-        digest.iter().map(|b| format!("{b:02x}")).collect()
+        hex::encode(digest)
     }
 
     /// A builder over an in-memory zip, so each test reads like the hostile shape

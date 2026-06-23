@@ -15,11 +15,26 @@ pub struct RunResult {
     pub exit_code: Option<i32>,
 }
 
+/// A pluggable executor for the final "run the downloaded script" step. The core
+/// `runner` owns download / hashing / analysis / the confirmation prompt, but the
+/// *execution* can be delegated so the CLI crate (E5) can run the interpreter
+/// inside the OS containment capsule without `tirith-core` depending on the
+/// capsule launcher (which is async/OS-API-bound and lives in the CLI crate).
+///
+/// Given the resolved `interpreter` and the cached script `path`, it runs the
+/// script and returns its exit code. When `None`, the runner uses its built-in
+/// uncontained `Command::new(interpreter).arg(path)` execution (the historical
+/// behavior).
+pub type ScriptExecutor = Box<dyn Fn(&str, &std::path::Path) -> Result<i32, String>>;
+
 pub struct RunOptions {
     pub url: String,
     pub no_exec: bool,
     pub interactive: bool,
     pub expected_sha256: Option<String>,
+    /// Optional contained executor for the run step (E5). `None` keeps the
+    /// built-in uncontained execution.
+    pub exec_fn: Option<ScriptExecutor>,
 }
 
 /// Interpreters matched by exact name only.
@@ -274,15 +289,23 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
 
     receipt.save().map_err(|e| format!("save receipt: {e}"))?;
 
-    let status = Command::new(interpreter)
-        .arg(&cached_path)
-        .status()
-        .map_err(|e| format!("execute: {e}"))?;
+    // E5: when the caller supplied a contained executor, run the script through it
+    // (the CLI crate routes this to the OS capsule). Otherwise run uncontained, as
+    // before. The executor returns the child's exit code directly.
+    let exit_code = if let Some(exec) = opts.exec_fn.as_ref() {
+        Some(exec(interpreter, &cached_path)?)
+    } else {
+        let status = Command::new(interpreter)
+            .arg(&cached_path)
+            .status()
+            .map_err(|e| format!("execute: {e}"))?;
+        status.code()
+    };
 
     Ok(RunResult {
         receipt,
         executed: true,
-        exit_code: status.code(),
+        exit_code,
     })
 }
 

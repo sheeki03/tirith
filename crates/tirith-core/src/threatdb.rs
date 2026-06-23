@@ -594,6 +594,35 @@ impl BehaviorTag {
             .filter(|t| bits & t.mask() != 0)
             .collect()
     }
+
+    /// Stable snake_case identifier for this tag. Used as the token in the
+    /// curated file-hash feed and any machine-readable enrichment output, so it
+    /// must stay stable across releases (the on-disk format keys on the bit
+    /// position, not the name, but the name is a public contract for the feed).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessSpawn => "process_spawn",
+            Self::NetworkExfil => "network_exfil",
+            Self::RuntimeLoader => "runtime_loader",
+            Self::DynamicCodeLoad => "dynamic_code_load",
+            Self::StartupHook => "startup_hook",
+            Self::NativeInit => "native_init",
+            Self::CrossRuntime => "cross_runtime",
+            Self::CredentialAccess => "credential_access",
+        }
+    }
+
+    /// Parse a stable snake_case identifier back into a tag. Case-insensitive and
+    /// surrounding-whitespace tolerant. Returns `None` for an unknown token so a
+    /// feed entry carrying a tag this build does not recognize is skipped rather
+    /// than mismapped (the curated-feed parser reports the skip).
+    pub fn from_name(s: &str) -> Option<Self> {
+        let needle = s.trim();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|t| t.as_str().eq_ignore_ascii_case(needle))
+    }
 }
 
 /// Result of an artifact-SHA-256 lookup against the v2 artifact index. Returned

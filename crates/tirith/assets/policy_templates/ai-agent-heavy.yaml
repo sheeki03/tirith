@@ -20,6 +20,16 @@ allow_bypass_env_noninteractive: false
 # Require explicit acknowledgement for warn findings.
 strict_warn: true
 
+# MCP gateway posture: "secure". When you run `tirith gateway run`, any gateway
+# config knob you did NOT set yourself takes a hardened default instead of the
+# permissive built-in: the gateway fails CLOSED on an analysis error, treats a
+# warn verdict as a denial, and uses a tighter per-message size cap. A value you
+# set explicitly in the gateway config always wins, so this only fills the gaps.
+# This is the agent-heavy default because an autonomous agent benefits from a
+# gateway that denies on doubt rather than forwarding. Remove this line to keep
+# the permissive gateway defaults.
+gateway_profile: secure
+
 # Escalate remote-execution and Docker-registry rules — the patterns agents
 # most often produce from hallucinated or copy-pasted instructions.
 severity_overrides:

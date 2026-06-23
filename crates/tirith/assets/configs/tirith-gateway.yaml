@@ -52,3 +52,15 @@ policy:
   # Maximum bytes per JSON-RPC message line (DoS protection)
   # Oversize messages trigger immediate session termination
   max_message_bytes: 1048576  # 1 MiB
+
+  # How long (ms) an in-flight request waits for its response before it becomes a
+  # TimedOut tombstone. The entry is NOT deleted at the deadline: a response that
+  # arrives later is still matched against the tombstone and handled per fail_mode
+  # (closed -> blocked, open -> dropped), so a slow upstream can never let a stale
+  # response through unfiltered.
+  pending_timeout_ms: 30000  # 30s
+
+  # How long (ms) a tombstone is retained after it is created before garbage
+  # collection. Bounds memory while keeping late-response detection effective for
+  # the retention window.
+  tombstone_retention_ms: 60000  # 60s

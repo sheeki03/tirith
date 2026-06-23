@@ -780,6 +780,10 @@ const ALL_RULE_IDS: &[&str] = &[
     "artifact_known_malicious",
     // B8 wheel structural rejection (synthesized by package inspect, not the engine)
     "wheel_structurally_rejected",
+    // D3 package-firewall download-vs-expected hash mismatch (externally triggered)
+    "artifact_download_integrity_mismatch",
+    // F2 package-firewall release differential anomaly (externally triggered)
+    "artifact_release_anomaly",
 ];
 
 /// Collect all expected_rules from all fixture files into a set.
@@ -1043,17 +1047,30 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "native_import_execution_chain",
     // B8 + DB-D: `artifact_known_malicious` is emitted by
     // `crate::artifact::evaluate_artifact` ONLY under the `artifact-hash-lookup`
-    // cargo feature (OFF by default) once the DB-B hash-lookup methods land. The
-    // RuleId is registered now so the registry tests see every variant, but it is
-    // UNREACHABLE in the default build (no feature, no DB method), so it has no
-    // PATTERN_TABLE entry and no fixture. Covered by the feature-gated emission
-    // seam in `artifact/correlate.rs` once DB-B ships.
+    // cargo feature (OFF by default). DB-D shipped the v2 hash indices and their
+    // `check_artifact_sha256` / `check_file_sha256` readers, and PR-I activated the
+    // lookup behind the feature, so the RuleId is now reachable WITH the feature on.
+    // In the default build the lookup is compiled out, so the RuleId is unreachable
+    // and has no PATTERN_TABLE entry and no fixture. Covered by the feature-gated
+    // `hash_lookup` tests in `artifact/correlate.rs`.
     "artifact_known_malicious",
-    // B8: `wheel_structurally_rejected` is synthesized by `tirith package inspect` for a
+    // B8: `wheel_structurally_rejected` is synthesized by `tirith package inspect`
+    // (`crate::cli::package::inspect_artifacts` in the sibling `tirith` crate) for a
     // structurally rejected wheel (path traversal, encrypted member, CRC mismatch,
     // duplicate-path collision). It is triggered by artifact inspection at the CLI, not by
     // the engine over a fixture string, so it has no PATTERN_TABLE entry and no fixture.
     "wheel_structurally_rejected",
+    // D3: `artifact_download_integrity_mismatch` is produced by the package
+    // firewall (`crate::artifact::firewall`) when a content-addressed quarantine
+    // blob no longer hashes to the resolver-pinned digest at firewall time, never
+    // from a command/paste fixture, so it has no PATTERN_TABLE entry. Covered by
+    // unit tests in `artifact/firewall.rs`.
+    "artifact_download_integrity_mismatch",
+    // F2: `artifact_release_anomaly` is produced by the package-firewall release
+    // differential (`crate::artifact::release_diff`) comparing two on-disk wheels
+    // of the same distribution, never from a command/paste fixture, so it has no
+    // PATTERN_TABLE entry. Covered by unit tests in `artifact/release_diff.rs`.
+    "artifact_release_anomaly",
 ];
 
 /// Collect expected_rules across the output-direction fixture files.
@@ -1331,6 +1348,10 @@ rule_id_variant_registry! {
     ArtifactKnownMalicious,
     // Wheel structurally rejected by the hardened reader (B8, externally triggered)
     WheelStructurallyRejected,
+    // Package-firewall download-vs-expected hash mismatch (D3, externally triggered)
+    ArtifactDownloadIntegrityMismatch,
+    // Package-firewall release differential anomaly (F2, externally triggered)
+    ArtifactReleaseAnomaly,
 }
 
 /// Verify ALL_RULE_IDS stays in sync with the RuleId enum (the variant count is
@@ -1713,6 +1734,23 @@ struct LabScenario {
     tags: Vec<String>,
     #[serde(default)]
     raw_bytes: Vec<u8>,
+    /// G2 artifact-fixture scenarios. When either is set the scenario is driven by
+    /// the artifact pipeline (built in the `tirith` CLI crate, where the wheel
+    /// builder lives), NOT `engine::analyze`, so this engine-side safeguard skips
+    /// it. Coverage for those scenarios lives in the `tirith` crate's
+    /// `lab_artifact_scenarios` integration test.
+    #[serde(default)]
+    artifact_path: Option<String>,
+    #[serde(default)]
+    binary_fixture: Option<String>,
+}
+
+impl LabScenario {
+    /// Whether this scenario is an artifact-fixture scenario (G2). These bypass the
+    /// engine and so are excluded from `test_lab_corpus_reaches_tier3`.
+    fn is_artifact_fixture(&self) -> bool {
+        self.artifact_path.is_some() || self.binary_fixture.is_some()
+    }
 }
 
 fn default_lab_shell() -> String {
@@ -1739,6 +1777,13 @@ fn test_lab_corpus_reaches_tier3() {
     );
 
     for scenario in &file.scenarios {
+        // G2 artifact-fixture scenarios run through the artifact pipeline (built in
+        // the `tirith` crate), not the engine, so this engine-side safeguard cannot
+        // evaluate them; the `tirith` crate's `lab_artifact_scenarios` test does.
+        if scenario.is_artifact_fixture() {
+            continue;
+        }
+
         // Shared `FromStr` impls (one parse table with `cli/lab.rs`); panic-on-unknown.
         let shell: ShellType = scenario.shell.parse().unwrap_or_else(|_| {
             panic!(

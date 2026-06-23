@@ -400,14 +400,14 @@ fn finding_for_drift(drifts: &[mcp_lock::McpDrift], severity: Severity) -> Findi
     }
 }
 
-/// Finding fired when the lockfile `format_version` predates this build (e.g. v4 in a v5
-/// build). Same `McpServerDrift`/Medium as generic drift (paperwork unchanged); the title
+/// Finding fired when the lockfile `format_version` predates this build (e.g. v4 or v5 in a
+/// v6 build). Same `McpServerDrift`/Medium as generic drift (paperwork unchanged); the title
 /// names the migration so the operator runs `tirith mcp lock --force` once — avoiding the
-/// phantom-drift storm of every v5 hash differing from every stored v4 hash.
+/// phantom-drift storm an older hashing/shape would otherwise produce.
 fn finding_for_schema_upgrade_required(from_version: u32, to_version: u32) -> Finding {
     let detail = format!(
         "MCP lockfile is at schema v{from_version}; re-lock with `tirith mcp lock --force` \
-         to migrate to v{to_version} and enable `tools_declared` drift detection. Real \
+         to migrate to v{to_version} and enable the latest drift detection. Real \
          drift (if any) is reported separately."
     );
     Finding {
@@ -422,9 +422,9 @@ fn finding_for_schema_upgrade_required(from_version: u32, to_version: u32) -> Fi
              semantics during the migration window — so any real drift (URL changed, command \
              changed, env added/removed, tools added/removed, server added/removed) is still \
              reported as its own finding. Re-run `tirith mcp lock --force` once to regenerate \
-             the lockfile under v{to_version}'s hashing rules; subsequent scans will then also \
-             detect a `\"tools\": []` ↔ omitted flip on the `tools_declared` field that \
-             v{from_version} silently ignored."
+             the lockfile under v{to_version}'s hashing rules and to capture the newer surface \
+             (the live `tools/list` descriptor lock added in v6, and the `tools_declared` flip \
+             v4 silently ignored)."
         ),
         evidence: vec![Evidence::Text { detail }],
         human_view: None,
@@ -1695,9 +1695,13 @@ mod tests {
         write_lockfile_for(repo.path(), &old_inv);
 
         // Doctor the lockfile to ALSO record disallowed tool "evil" (snuck past `mcp lock`).
+        // Use the CURRENT format version (v6) so no schema-migration finding fires — this
+        // test pins the dual-firing of the lockfile-side + per-server drift findings, not the
+        // migration prompt (which has its own tests). `hash` is recomputed from data at parse,
+        // so the placeholder is discarded but the doctored `tools` still surface.
         let lock_path = repo.path().join(".tirith").join("mcp.lock");
         let lockfile_doctored = r#"{
-            "format_version": 5,
+            "format_version": 6,
             "inventory_hash": "x",
             "configs": [".mcp.json"],
             "servers": [
@@ -1705,6 +1709,7 @@ mod tests {
                     "name": "s",
                     "transport": { "kind": "stdio", "command": "node", "args": [], "env": [] },
                     "tools": ["evil", "read"],
+                    "tools_declared": true,
                     "source_config": ".mcp.json",
                     "hash": "deadbeef"
                 }

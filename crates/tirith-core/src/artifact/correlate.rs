@@ -248,8 +248,9 @@ fn integrity_findings(signals: &[ArtifactSignal]) -> Vec<Finding> {
 
 /// The DB-gated, FEATURE-GATED known-malicious hash correlation. Emits a Critical
 /// [`RuleId::ArtifactKnownMalicious`] when the artifact's whole-file hash or any
-/// member's hash matches a known-malicious record. See [`artifact_hash_indicator`]
-/// for why this is a reserved no-op in the shipped default build.
+/// member's hash matches a known-malicious record. The lookup is compiled in only
+/// under the `artifact-hash-lookup` feature (see [`artifact_hash_indicator`]); in
+/// the default library build it is a no-op and the RuleId is unreachable.
 fn known_malicious_findings(
     inspection: &ArtifactInspection,
     threat_db: Option<&ThreatDb>,
@@ -276,31 +277,101 @@ fn known_malicious_findings(
 
 /// The DB-gated known-malicious hash indicator for an inspection.
 ///
-/// B8g cross-track seam. The threat-DB methods this WOULD call
-/// (`ThreatDb::check_artifact_sha256` / `check_file_sha256`) are the DB-B
-/// deliverable and DO NOT EXIST YET. Per the plan, this milestone does NOT
-/// reference them (even behind the cfg), so the function compiles and tests
-/// cleanly BOTH with the feature off (the default) AND with
-/// `--features artifact-hash-lookup` on. It returns `None` (no match) in both
-/// builds today; the only difference the feature makes is that the call site is
-/// retained. When DB-B lands, the body below (under the cfg) is replaced with the
-/// real lookup over `inspection.subject`'s hash and each `inspection.files[].sha256`,
-/// and `ArtifactKnownMalicious` becomes reachable. Until then it is unreachable,
-/// which is why the RuleId is in `EXTERNALLY_TRIGGERED_RULES` with no fixture.
+/// B8g cross-track seam, ACTIVATED in PR-I now that DB-D shipped the v2 hash
+/// indices and their readers (`ThreatDb::check_artifact_sha256` /
+/// `check_file_sha256`). Under the `artifact-hash-lookup` feature this decodes the
+/// inspected artifact's whole-file SHA-256 (the `subject`'s lowercase-hex hash,
+/// when the subject carries one) and each `inspection.files[].sha256`, queries the
+/// DB, and returns the matching record's wire string for the evidence. The
+/// whole-artifact hash is checked first (a positive there means the distributed
+/// artifact itself is known-malicious); then each member's content hash (a bundled
+/// known-malicious file). The first hit wins; an empty / v1 DB, an unparseable hex
+/// string, or a subject without bytes (an installed distribution) simply yields no
+/// match, so there is no false positive.
 #[cfg(feature = "artifact-hash-lookup")]
 fn artifact_hash_indicator(
     inspection: &ArtifactInspection,
     threat_db: Option<&ThreatDb>,
 ) -> Option<String> {
-    // Touch the inputs so enabling the feature does not introduce unused warnings,
-    // while NOT calling the not-yet-existing DB methods.
-    let _ = (inspection, threat_db);
-    // TODO(DB-B): wire `threat_db?.check_artifact_sha256(&subject_hash)` and
-    // `check_file_sha256(&file.sha256)` here and return the matching record's
-    // wire string. Until those methods land (DB-B deliverable), this seam reports
-    // no match so the build is self-contained and `ArtifactKnownMalicious` stays
-    // unreachable. Wired in the post-DB-B integration.
+    let db = threat_db?;
+
+    // 1) The whole-artifact hash, when the subject has exact bytes. An installed
+    //    distribution carries no source-artifact hash (its installed bytes are not
+    //    the artifact bytes), so it is skipped here; its members are still checked
+    //    below by content hash.
+    if let Some(artifact_sha) = subject_artifact_sha256(&inspection.subject) {
+        if let Some(digest) = decode_sha256(artifact_sha) {
+            if let Some(m) = db.check_artifact_sha256(&digest) {
+                return Some(format!(
+                    "the artifact's SHA-256 matches a known-malicious record \
+                     (source: {}, confidence: {}{}{})",
+                    m.source.as_str(),
+                    m.confidence.as_str(),
+                    if m.all_versions_malicious {
+                        ", all versions malicious"
+                    } else {
+                        ""
+                    },
+                    campaign_suffix(m.campaign.as_deref()),
+                ));
+            }
+        }
+    }
+
+    // 2) Each member's content hash against the file-hash index. The location names
+    //    WHICH bundled member matched, so the evidence points at the file.
+    for file in &inspection.files {
+        let Some(digest) = decode_sha256(&file.sha256) else {
+            continue;
+        };
+        if let Some(m) = db.check_file_sha256(&digest) {
+            return Some(format!(
+                "a bundled member's SHA-256 matches a known-malicious record \
+                 (member: {}, source: {}, confidence: {}{})",
+                file.location,
+                m.source.as_str(),
+                m.confidence.as_str(),
+                campaign_suffix(m.campaign.as_deref()),
+            ));
+        }
+    }
+
     None
+}
+
+/// The whole-artifact SHA-256 (lowercase hex) the subject carries, if any. Only a
+/// subject with EXACT bytes has one: an [`InspectionSubject::Artifact`], a
+/// [`InspectionSubject::GenericArchive`], or an [`InspectionSubject::InstalledFile`]
+/// that was hashed. An [`InspectionSubject::InstalledDistribution`] has none (its
+/// installed bytes are not the distributed-artifact bytes), so this returns `None`
+/// and the artifact-hash lookup is skipped for it.
+#[cfg(feature = "artifact-hash-lookup")]
+fn subject_artifact_sha256(subject: &crate::artifact::InspectionSubject) -> Option<&str> {
+    use crate::artifact::InspectionSubject as S;
+    match subject {
+        S::Artifact(a) => Some(a.sha256.as_str()),
+        S::GenericArchive(g) => Some(g.sha256.as_str()),
+        S::InstalledFile(f) => f.sha256.as_deref(),
+        S::InstalledDistribution(_) => None,
+    }
+}
+
+/// Decode a lowercase-hex SHA-256 string into the fixed `[u8; 32]` the v2 hash
+/// indices take. Returns `None` for any string that is not exactly 32 decoded
+/// bytes (a short / malformed / non-hex value), so a bad hash never panics and
+/// never produces a false match.
+#[cfg(feature = "artifact-hash-lookup")]
+fn decode_sha256(hex_str: &str) -> Option<[u8; 32]> {
+    hex::decode(hex_str).ok()?.try_into().ok()
+}
+
+/// Render the optional campaign label as an evidence suffix, or empty when absent.
+#[cfg(feature = "artifact-hash-lookup")]
+fn campaign_suffix(campaign: Option<&str>) -> String {
+    match campaign {
+        Some(c) => format!(", campaign: {c}"),
+        None => String::new(),
+    }
 }
 
 /// The DB-gated known-malicious hash indicator — DEFAULT build (feature off). The
@@ -529,10 +600,11 @@ mod tests {
     }
 
     #[test]
-    fn known_malicious_unreachable_without_db_methods() {
-        // The hash-lookup seam returns None in BOTH builds today (the DB methods do
-        // not exist yet), so no ArtifactKnownMalicious finding is produced even with
-        // a populated inspection.
+    fn known_malicious_not_emitted_without_db() {
+        // With no DB threaded the seam cannot match: no ArtifactKnownMalicious
+        // finding is produced even from a populated inspection. (In the default
+        // library build the lookup is compiled out entirely, so this also holds
+        // there; under the feature it holds because `threat_db` is `None`.)
         let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
         inspection.files.push(crate::artifact::ArtifactFile {
             location: SubjectLocation::member("demo-1.0-py3-none-any.whl", "demo/__init__.py"),
@@ -544,5 +616,180 @@ mod tests {
         assert!(findings
             .iter()
             .all(|f| f.rule_id != RuleId::ArtifactKnownMalicious));
+    }
+
+    // The activated hash-lookup seam: only compiled under the feature the firewall
+    // flips on. A throwaway in-memory v2 DB carries a known artifact hash and a
+    // known file hash; the seam must resolve an inspection's subject / member hash
+    // to a Critical ArtifactKnownMalicious finding, and must NOT false-positive on
+    // an unrelated hash or an empty / v1 DB.
+    #[cfg(feature = "artifact-hash-lookup")]
+    mod hash_lookup {
+        use super::*;
+        use crate::threatdb::Confidence;
+        use crate::threatdb::{ThreatDb, ThreatDbFormat, ThreatDbWriter, ThreatSource};
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+
+        /// A deterministic 32-byte digest from a seed (matches the threatdb test
+        /// helper), plus its lowercase-hex form for an inspection's `sha256` field.
+        fn sha(seed: u8) -> [u8; 32] {
+            [seed; 32]
+        }
+        fn sha_hex(seed: u8) -> String {
+            hex::encode(sha(seed))
+        }
+
+        /// Build a throwaway signed v2 DB with one malicious artifact hash
+        /// (seed 0xAA) and one malicious file hash (seed 0xBB). The signing key is
+        /// generated fresh and discarded; `from_bytes` does not verify against the
+        /// embedded production key, so a self-signed DB loads for the read path.
+        fn malicious_db() -> ThreatDb {
+            let key = SigningKey::generate(&mut OsRng);
+            let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+            writer.add_artifact_sha256(
+                sha(0xAA),
+                ThreatSource::OssfMalicious,
+                Confidence::Confirmed,
+                true,
+                Some("miasma"),
+            );
+            writer.add_file_sha256(
+                sha(0xBB),
+                ThreatSource::DatadogMalicious,
+                Confidence::Confirmed,
+                &[],
+                None,
+            );
+            let bytes = writer
+                .build_format(ThreatDbFormat::V2, &key)
+                .expect("v2 build");
+            ThreatDb::from_bytes(bytes, 0).expect("v2 load")
+        }
+
+        /// An EMPTY signed v2 DB (no hash records) — a present DB that knows nothing.
+        fn empty_db() -> ThreatDb {
+            let key = SigningKey::generate(&mut OsRng);
+            let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+            let bytes = writer
+                .build_format(ThreatDbFormat::V2, &key)
+                .expect("v2 build");
+            ThreatDb::from_bytes(bytes, 0).expect("v2 load")
+        }
+
+        #[test]
+        fn artifact_sha_match_fires_critical() {
+            let db = malicious_db();
+            // The wheel's whole-file hash equals the malicious artifact record.
+            let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
+            if let crate::artifact::InspectionSubject::Artifact(a) = &mut inspection.subject {
+                a.sha256 = sha_hex(0xAA);
+            }
+            let findings = correlate_inspection_findings(&inspection, &[], Some(&db));
+            let f = findings
+                .iter()
+                .find(|f| f.rule_id == RuleId::ArtifactKnownMalicious)
+                .expect("artifact-hash match must fire ArtifactKnownMalicious");
+            assert_eq!(f.severity, Severity::Critical);
+        }
+
+        #[test]
+        fn member_sha_match_fires_critical() {
+            let db = malicious_db();
+            // A bundled member's content hash equals the malicious file record; the
+            // whole-artifact hash is unrelated (NOT the 0xAA artifact record, which
+            // `wheel_inspection`'s default "a"*64 == hex(0xAA*32) would otherwise be).
+            let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
+            if let crate::artifact::InspectionSubject::Artifact(a) = &mut inspection.subject {
+                a.sha256 = sha_hex(0x33);
+            }
+            inspection.files.push(crate::artifact::ArtifactFile {
+                location: SubjectLocation::member("demo-1.0-py3-none-any.whl", "demo/_payload.so"),
+                size: 100,
+                sha256: sha_hex(0xBB),
+                kind: crate::artifact::ArtifactFileKind::NativeModule,
+            });
+            let findings = correlate_inspection_findings(&inspection, &[], Some(&db));
+            let f = findings
+                .iter()
+                .find(|f| f.rule_id == RuleId::ArtifactKnownMalicious)
+                .expect("member-hash match must fire ArtifactKnownMalicious");
+            assert_eq!(f.severity, Severity::Critical);
+            // The evidence names the offending member.
+            let txt: String = f
+                .evidence
+                .iter()
+                .map(|e| serde_json::to_string(e).unwrap_or_default())
+                .collect();
+            assert!(
+                txt.contains("demo/_payload.so"),
+                "evidence must name the matched member: {txt}"
+            );
+        }
+
+        #[test]
+        fn unrelated_hashes_do_not_match() {
+            let db = malicious_db();
+            // Neither the artifact hash nor any member hash is in the DB.
+            let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
+            if let crate::artifact::InspectionSubject::Artifact(a) = &mut inspection.subject {
+                a.sha256 = sha_hex(0x11);
+            }
+            inspection.files.push(crate::artifact::ArtifactFile {
+                location: SubjectLocation::member("demo-1.0-py3-none-any.whl", "demo/ok.py"),
+                size: 10,
+                sha256: sha_hex(0x22),
+                kind: crate::artifact::ArtifactFileKind::PythonSource,
+            });
+            let findings = correlate_inspection_findings(&inspection, &[], Some(&db));
+            assert!(findings
+                .iter()
+                .all(|f| f.rule_id != RuleId::ArtifactKnownMalicious));
+        }
+
+        #[test]
+        fn empty_db_yields_no_false_positive() {
+            // `check_file_sha256` (and the artifact index) are present but empty: no
+            // match, no finding — the PR-I "absent/empty -> no false positive" gate.
+            let db = empty_db();
+            let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
+            if let crate::artifact::InspectionSubject::Artifact(a) = &mut inspection.subject {
+                a.sha256 = sha_hex(0xAA);
+            }
+            inspection.files.push(crate::artifact::ArtifactFile {
+                location: SubjectLocation::member("demo-1.0-py3-none-any.whl", "demo/x.so"),
+                size: 10,
+                sha256: sha_hex(0xBB),
+                kind: crate::artifact::ArtifactFileKind::NativeModule,
+            });
+            let findings = correlate_inspection_findings(&inspection, &[], Some(&db));
+            assert!(findings
+                .iter()
+                .all(|f| f.rule_id != RuleId::ArtifactKnownMalicious));
+        }
+
+        #[test]
+        fn malformed_hex_hash_is_skipped_not_panicked() {
+            // A subject hash that is not valid 32-byte hex must be skipped (no panic,
+            // no match), and a valid member hash still resolves.
+            let db = malicious_db();
+            let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
+            if let crate::artifact::InspectionSubject::Artifact(a) = &mut inspection.subject {
+                a.sha256 = "not-hex".to_string();
+            }
+            inspection.files.push(crate::artifact::ArtifactFile {
+                location: SubjectLocation::member("demo-1.0-py3-none-any.whl", "demo/_p.so"),
+                size: 10,
+                sha256: sha_hex(0xBB),
+                kind: crate::artifact::ArtifactFileKind::NativeModule,
+            });
+            let findings = correlate_inspection_findings(&inspection, &[], Some(&db));
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.rule_id == RuleId::ArtifactKnownMalicious),
+                "a bad subject hash must not abort the member lookup"
+            );
+        }
     }
 }

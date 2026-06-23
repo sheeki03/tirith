@@ -34,6 +34,11 @@ allow = [
     # BSL-1.0 (Boost Software License 1.0) — permissive, OSI/FSF approved.
     # Reached transitively via `arboard` (M7 ch3 clipboard dep).
     "BSL-1.0",
+    # MIT-0 (MIT No Attribution) — permissive, OSI approved; strictly looser than
+    # MIT (drops the attribution clause). Reached transitively via the new
+    # jsonschema dep (PR-0 spike): jsonschema -> referencing -> fluent-uri ->
+    # borrow-or-share, which is MIT-0.
+    "MIT-0",
     "OpenSSL",
     "Zlib",
     "CC0-1.0",

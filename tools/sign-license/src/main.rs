@@ -125,7 +125,7 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
     let pk = sk.verifying_key();
     let seed = sk.to_bytes();
 
-    let hex_seed: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+    let hex_seed: String = bytes_to_hex(&seed);
 
     // Unix: mode 0600; fall back to default permissions on other platforms.
     #[cfg(unix)]
@@ -192,7 +192,7 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
     println!("\n    ],");
     println!("}}\n");
 
-    let pk_hex: String = pk_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let pk_hex: String = bytes_to_hex(&pk_bytes);
     eprintln!("Public key (hex): {pk_hex}");
 
     Ok(())
@@ -410,6 +410,18 @@ fn parse_timestamp(s: &str) -> Result<i64, String> {
     Ok(dt.and_utc().timestamp())
 }
 
+/// Lowercase hex-encode a byte slice. A tiny local helper so the three call
+/// sites do not each `format!`-collect (which clippy's `format_collect` flags).
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
         return Err("hex string has odd length".to_string());
@@ -448,7 +460,7 @@ mod tests {
     #[test]
     fn test_hex_roundtrip() {
         let bytes = vec![0u8, 255, 128, 1];
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = bytes_to_hex(&bytes);
         assert_eq!(hex_to_bytes(&hex).unwrap(), bytes);
     }
 

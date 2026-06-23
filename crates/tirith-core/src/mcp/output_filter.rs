@@ -17,17 +17,20 @@
 //! (that signals transport failure, not content policy). See
 //! [`docs/mcp-output-filter.md`](../../../docs/mcp-output-filter.md).
 //!
-//! Risks handled: per-call scan capped at [`MAX_SCAN_BYTES`] (truncation noted,
-//! content never silently dropped); the M7 ch1 ruleset flags only the dangerous
-//! subset (plain SGR colour passes); and `fail_mode_closed=true` callers DENY on
-//! analysis error rather than passing content through.
+//! Risks handled: the response is scanned IN FULL via the engine's streaming
+//! output analyzer (C2 removed the former 1 MiB per-call scan cap; the gateway's
+//! `max_message_bytes` transport cap is the real upstream bound, so nothing
+//! reaching this filter is silently truncated or dropped); the M7 ch1 ruleset
+//! flags only the dangerous subset (plain SGR colour passes); and
+//! `fail_mode_closed=true` callers DENY on analysis error rather than passing
+//! content through.
 
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
 use crate::deobfuscate;
-use crate::engine::{analyze_output, OutputContext};
+use crate::engine::{analyze_output_finalize_mut, OutputAnalyzerState};
 use crate::rules::prompt_injection::{self, CompiledSeeds};
 use crate::verdict::{Action, Finding, RuleId, Severity};
 
@@ -82,10 +85,6 @@ impl OutputFilterContext {
     }
 }
 
-/// Per-call scan cap. Beyond it the result is marked truncated and only the first
-/// `MAX_SCAN_BYTES` of concatenated text is scanned. Never drop content silently.
-pub const MAX_SCAN_BYTES: usize = 1_048_576;
-
 /// Outcome of one filter pass (the `event_id` is the join key against the audit log).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterOutcome {
@@ -97,12 +96,16 @@ pub struct FilterOutcome {
     pub rule_ids: Vec<String>,
     /// Highest severity that fired (None if no findings).
     pub max_severity: Option<Severity>,
-    /// Wall time spent in `analyze_output`.
+    /// Wall time spent scanning the response.
     pub elapsed_ms: f64,
-    /// `true` when the scanned slice was truncated to `MAX_SCAN_BYTES`.
+    /// Retained for serde/audit stability. Always `false` since C2: the response
+    /// is streamed through the engine in full (no scan-cap truncation); the
+    /// gateway's `max_message_bytes` transport cap bounds oversized responses
+    /// upstream instead.
     pub truncated: bool,
-    /// `true` when the response was force-blocked because the scan couldn't
-    /// complete in budget under `fail_mode_closed` (v1: the truncation path only).
+    /// Retained for serde/audit stability. Always `false` since C2 (the scan-cap
+    /// fail-closed path it tracked no longer exists; oversized responses fail
+    /// closed at the transport cap upstream).
     pub fail_mode_triggered: bool,
 }
 
@@ -133,36 +136,29 @@ pub fn filter_tool_result(
 ) -> FilterOutcome {
     let event_id = uuid::Uuid::new_v4().to_string();
 
-    // Concatenate `content[].text` (text items only; others pass through). A NUL
-    // separates items so an OSC payload split across items isn't rejoined. The
-    // STRING leaves of `structured_content` are appended (also NUL-separated) so
-    // taint living only in structured output is still analyzed (F10).
-    let mut joined = String::new();
-    let mut total_bytes: usize = 0;
-    let mut truncated = false;
+    // C2: stream every scannable leaf through the engine's chunked output
+    // analyzer instead of truncating a joined buffer at the old 1 MiB scan cap.
+    // The transport cap (`max_message_bytes`, enforced by the gateway's bounded
+    // reader BEFORE a response reaches this filter) is the real upper bound, so a
+    // result above the former scan cap but below the transport cap is now scanned
+    // IN FULL rather than failing open after 1 MiB. Each `content[].text` item is
+    // one chunk and each `structured_content` string leaf is one chunk; the
+    // analyzer NUL-isolates chunks internally for boundary detection, so an OSC /
+    // injection payload split across items or chunks still fires.
+    let start = std::time::Instant::now();
+    let mut state = OutputAnalyzerState::with_custom_seeds(ctx.custom_seeds.clone());
     for item in &result.content {
         if item.content_type != "text" {
             continue;
         }
-        if !append_scan_chunk(&mut joined, &mut total_bytes, &item.text) {
-            truncated = true;
-            break;
-        }
+        feed_chunk(&mut state, &item.text);
     }
-    if !truncated {
-        if let Some(sc) = &result.structured_content {
-            truncated = !collect_json_string_leaves(sc, &mut joined, &mut total_bytes);
-        }
+    if let Some(sc) = &result.structured_content {
+        stream_json_string_leaves(sc, &mut state);
     }
-
-    let start = std::time::Instant::now();
-    let verdict = analyze_output(
-        &joined,
-        OutputContext {
-            custom_seeds: ctx.custom_seeds.clone(),
-            ..Default::default()
-        },
-    );
+    let verdict = analyze_output_finalize_mut(&mut state);
+    // The scan is no longer cap-truncated; the transport cap is enforced upstream.
+    let truncated = false;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let rule_ids: Vec<String> = verdict
@@ -207,12 +203,13 @@ pub fn filter_tool_result(
             outcome.action = Action::Warn; // normalize WarnAck → Warn for transport
         }
         Action::Allow => {
-            if truncated && fail_mode_closed {
-                // Closed fail-mode: refuse to forward content not analyzed in full.
-                apply_block(result, &event_id);
-                outcome.action = Action::Block;
-                outcome.fail_mode_triggered = true;
-            }
+            // C2: the response is always scanned in full now (no scan-cap
+            // truncation), so the former "closed fail-mode blocks a truncated
+            // Allow" branch can no longer fire here. Oversized responses are
+            // refused upstream by the gateway's `max_message_bytes` transport cap
+            // before reaching this filter. `fail_mode_closed` is retained in the
+            // signature for the analysis-error contract documented on the struct.
+            let _ = fail_mode_closed;
         }
     }
 
@@ -225,6 +222,30 @@ pub fn filter_tool_result(
     }
 
     outcome
+}
+
+/// C4 — scan every string leaf (object keys AND values) of an arbitrary JSON
+/// value through the SAME streaming engine output analyzer
+/// [`filter_tool_result`] uses, seeded with the operator's compiled custom
+/// injection seeds, and return the resulting [`crate::verdict::Verdict`].
+///
+/// This is the read-only counterpart of [`filter_tool_result`] for the
+/// listing/reading MCP responses ([`crate::mcp::response_inspect`]) whose shapes
+/// are NOT a `tools/call` result (`tools[]`, `resources[]`, `prompts[]`,
+/// `messages[]`, `contents[]`): it produces the injection / exfil / OSC verdict
+/// without rewriting anything (the gateway, not this scan, applies the Block /
+/// Warn rewrite, exactly as it does on the `tools/call` path). Like
+/// `filter_tool_result`, there is no per-call byte cap — the gateway's
+/// `max_message_bytes` transport cap bounds the whole response upstream, so every
+/// reachable leaf is scanned in full and a payload split across leaves still
+/// fires via the analyzer's cross-chunk join.
+pub fn scan_value_leaves(
+    value: &serde_json::Value,
+    ctx: &OutputFilterContext,
+) -> crate::verdict::Verdict {
+    let mut state = OutputAnalyzerState::with_custom_seeds(ctx.custom_seeds.clone());
+    stream_json_string_leaves(value, &mut state);
+    analyze_output_finalize_mut(&mut state)
 }
 
 /// `true` if `rule_id` is one of the three injection-SEED rules eligible for the
@@ -472,7 +493,13 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         // artifact finding (feature-gated), never an injection seed.
         | RuleId::ArtifactKnownMalicious
         // B8 wheel structural rejection: a structural artifact finding, never a seed.
-        | RuleId::WheelStructurallyRejected => false,
+        | RuleId::WheelStructurallyRejected
+        // D3 package-firewall download-vs-expected hash mismatch: a structural
+        // integrity finding, never an injection seed.
+        | RuleId::ArtifactDownloadIntegrityMismatch
+        // F2 package-firewall release differential anomaly: a structural
+        // execution-shape-change finding, never an injection seed.
+        | RuleId::ArtifactReleaseAnomaly => false,
     }
 }
 
@@ -630,68 +657,38 @@ fn redact_injection_spans(result: &mut ToolCallResult, seeds: &CompiledSeeds) {
     }
 }
 
-/// Append `text` to the scan buffer `joined`, NUL-separating from prior content
-/// and honoring the [`MAX_SCAN_BYTES`] budget tracked in `total_bytes`. Returns
-/// `false` if the cap was hit (caller should mark the scan truncated and stop).
-fn append_scan_chunk(joined: &mut String, total_bytes: &mut usize, text: &str) -> bool {
-    if !joined.is_empty() {
-        joined.push('\0');
-        *total_bytes += 1;
-    }
-    let remaining = MAX_SCAN_BYTES.saturating_sub(*total_bytes);
-    if remaining == 0 {
-        return false;
-    }
-    if text.len() > remaining {
-        // Char-boundary safe truncate.
-        let mut cut = remaining;
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        joined.push_str(&text[..cut]);
-        return false;
-    }
-    joined.push_str(text);
-    *total_bytes += text.len();
-    true
+/// Feed one scannable text leaf into the streaming output analyzer. A thin
+/// wrapper over [`crate::engine::analyze_output_chunk`] so the call sites read as
+/// "feed this chunk" and the chunked byte-scanner state carries across leaves
+/// (an OSC / injection / exfil payload split across `content[].text` items or
+/// structured leaves is still detected, by the engine's cross-boundary join).
+/// There is no per-call byte cap: the gateway's transport cap
+/// (`max_message_bytes`) bounds the whole response upstream, so everything
+/// reaching this filter is scanned IN FULL (C2 removed the old 1 MiB fail-open).
+fn feed_chunk(state: &mut OutputAnalyzerState, text: &str) {
+    let _ = crate::engine::analyze_output_chunk(text, state);
 }
 
-/// Recursively append every string leaf of `v` (object keys + values, array
-/// elements, and bare strings) to the scan buffer via [`append_scan_chunk`].
-/// Object KEYS are attacker-controlled MCP tool output too — a control/zero-width
-/// payload hidden in a key must reach the scanner, or it escapes detection and
-/// rides through on Allow/Warn (F10). Returns `false` if the scan budget was
-/// exhausted partway (the caller marks the scan truncated).
-fn collect_json_string_leaves(
-    v: &serde_json::Value,
-    joined: &mut String,
-    total_bytes: &mut usize,
-) -> bool {
+/// Stream every string leaf of `v` (object keys + values, array elements, and
+/// bare strings) into the analyzer via [`feed_chunk`]. Object KEYS are
+/// attacker-controlled MCP tool output too: a control/zero-width payload hidden
+/// in a key must reach the scanner, or it escapes detection and rides through on
+/// Allow/Warn (F10). Numbers/bools/null carry no scannable text.
+fn stream_json_string_leaves(v: &serde_json::Value, state: &mut OutputAnalyzerState) {
     match v {
-        serde_json::Value::String(s) => append_scan_chunk(joined, total_bytes, s),
+        serde_json::Value::String(s) => feed_chunk(state, s),
         serde_json::Value::Array(items) => {
             for item in items {
-                if !collect_json_string_leaves(item, joined, total_bytes) {
-                    return false;
-                }
+                stream_json_string_leaves(item, state);
             }
-            true
         }
         serde_json::Value::Object(map) => {
             for (key, val) in map {
-                // Scan the key first, then recurse into the value; both honor the
-                // shared MAX_SCAN_BYTES budget via append_scan_chunk's early return.
-                if !append_scan_chunk(joined, total_bytes, key) {
-                    return false;
-                }
-                if !collect_json_string_leaves(val, joined, total_bytes) {
-                    return false;
-                }
+                feed_chunk(state, key);
+                stream_json_string_leaves(val, state);
             }
-            true
         }
-        // Numbers/bools/null carry no scannable text.
-        _ => true,
+        _ => {}
     }
 }
 
@@ -724,14 +721,22 @@ fn sanitize_json_strings(v: &mut serde_json::Value) {
     }
 }
 
+/// Public scrub for an MCP `structuredContent` value: strips ANSI/OSC/control/
+/// zero-width bytes from every string leaf (values AND object keys) in place,
+/// identically to the on-every-verdict scrub `filter_tool_result` applies (F10).
+/// Exposed so the gateway's lossless C2 re-emit can scrub the ORIGINAL structured
+/// content (the filter operates on a synthetic scan view), keeping display
+/// sanitization consistent across both paths.
+pub fn sanitize_structured_content(v: &mut serde_json::Value) {
+    sanitize_json_strings(v);
+}
+
 /// Block path: replace `content` with one placeholder text item and set
 /// `isError: true` (structure preserved so MCP clients render uniformly).
 fn apply_block(result: &mut ToolCallResult, event_id: &str) {
     result.content = vec![ContentItem {
         content_type: "text".to_string(),
-        text: format!(
-            "[tirith: tool output blocked \u{2014} see audit log entry {event_id} for details]"
-        ),
+        text: format!("[tirith: tool output blocked - see audit log entry {event_id} for details]"),
     }];
     // Drop structured output too — it can carry the same taint and would
     // otherwise pass through raw on a Block (F10).
@@ -746,7 +751,7 @@ fn apply_warn(result: &mut ToolCallResult, event_id: &str, findings: &[Finding])
     let warning = ContentItem {
         content_type: "text".to_string(),
         text: format!(
-            "[tirith: WARNING \u{2014} {n} finding{plural}; see audit log entry {event_id}]",
+            "[tirith: WARNING: {n} finding{plural}; see audit log entry {event_id}]",
             plural = if n == 1 { "" } else { "s" }
         ),
     };
@@ -982,46 +987,60 @@ mod tests {
         }
     }
 
+    /// The former 1 MiB per-call scan cap (removed in C2). Large fixtures below
+    /// straddle it to prove a response above the old cap is now scanned in full.
+    const FORMER_SCAN_CAP: usize = 1_048_576;
+
     #[test]
-    fn fail_mode_closed_blocks_on_truncation() {
-        // Force truncation by exceeding MAX_SCAN_BYTES with benign content.
-        let huge = "x".repeat(MAX_SCAN_BYTES + 1024);
-        let mut result = ToolCallResult {
-            content: vec![text_item(&huge)],
-            is_error: false,
-            structured_content: None,
-        };
-        let outcome = filter_tool_result(&mut result, true, &OutputFilterContext::default());
-        assert_eq!(
-            outcome.action,
-            Action::Block,
-            "closed fail-mode must deny on truncated scan"
-        );
-        assert!(outcome.truncated);
-        assert!(outcome.fail_mode_triggered);
-        assert!(result.is_error);
+    fn large_benign_response_is_scanned_in_full_not_truncated() {
+        // C2: a benign response above the former 1 MiB scan cap is now scanned in
+        // full and allowed, with NO scan-cap truncation, under BOTH fail modes.
+        let huge = "x".repeat(FORMER_SCAN_CAP + 4096);
+        for fail_mode_closed in [true, false] {
+            let mut result = ToolCallResult {
+                content: vec![text_item(&huge)],
+                is_error: false,
+                structured_content: None,
+            };
+            let outcome = filter_tool_result(
+                &mut result,
+                fail_mode_closed,
+                &OutputFilterContext::default(),
+            );
+            assert_eq!(
+                outcome.action,
+                Action::Allow,
+                "benign oversized content must pass (fail_mode_closed={fail_mode_closed})",
+            );
+            assert!(
+                !outcome.truncated,
+                "C2 removed the scan cap: no truncation flag"
+            );
+            assert!(!outcome.fail_mode_triggered);
+            assert!(!result.is_error);
+        }
     }
 
     #[test]
-    fn fail_mode_open_allows_on_truncation() {
-        let huge = "x".repeat(MAX_SCAN_BYTES + 1024);
+    fn dangerous_payload_beyond_former_cap_is_caught() {
+        // C2's whole point: a dangerous sequence sitting AFTER the former 1 MiB
+        // scan cap used to ride through (fail-open). It must now be detected and
+        // blocked, because the full response is streamed through the engine.
+        let mut payload = "x".repeat(FORMER_SCAN_CAP + 4096);
+        payload.push_str(&osc52_text());
         let mut result = ToolCallResult {
-            content: vec![text_item(&huge)],
+            content: vec![text_item(&payload)],
             is_error: false,
             structured_content: None,
         };
         let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
-        // Open fail-mode: benign content truncated past the cap still passes
-        // (rules that fired on the first MAX_SCAN_BYTES are honored; if none
-        // fired, the residual passes through).
-        assert!(
-            matches!(outcome.action, Action::Allow),
-            "open fail-mode must pass truncated benign content; got {:?}",
+        assert_eq!(
             outcome.action,
+            Action::Block,
+            "an OSC52 payload past the former scan cap must now be caught; rules: {:?}",
+            outcome.rule_ids
         );
-        assert!(outcome.truncated);
-        assert!(!outcome.fail_mode_triggered);
-        assert!(!result.is_error);
+        assert!(result.is_error);
     }
 
     #[test]

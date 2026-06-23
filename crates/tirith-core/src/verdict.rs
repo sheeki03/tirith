@@ -800,15 +800,18 @@ pub enum RuleId {
     NativeImportExecutionChain,
     /// B8 + DB-D: an inspected artifact (a wheel/sdist) or one of its members has a
     /// SHA-256 that matches a KNOWN-MALICIOUS hash in the threat DB (MITRE T1195
-    /// supply-chain compromise). Emitted by `crate::artifact::evaluate_artifact`
-    /// only when the `artifact-hash-lookup` cargo feature is enabled AND the DB-B
-    /// hash-lookup methods (`ThreatDb::check_artifact_sha256` /
-    /// `check_file_sha256`) resolve a match. Those methods are the DB-B deliverable
-    /// and DO NOT EXIST YET, so this milestone ships the feature OFF by default and
-    /// the emission behind a reserved seam (see `crate::artifact::correlate`); the
-    /// RuleId is therefore UNREACHABLE until the feature + DB land. Registered now
-    /// (the registry tests must see every variant), with NO PATTERN_TABLE entry and
-    /// NO fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`. Critical severity
+    /// supply-chain compromise). The hash lookup is ACTIVATED behind the
+    /// `artifact-hash-lookup` cargo feature, now that DB-D shipped the v2 hash
+    /// indices and their readers (`ThreatDb::check_artifact_sha256` /
+    /// `check_file_sha256`). With the feature ON and a v2 hash index present,
+    /// `crate::artifact::correlate` decodes the artifact's whole-file hash and each
+    /// member's content hash, queries the DB, and emits this finding on the first
+    /// match (the test
+    /// `crate::artifact::correlate::tests::hash_lookup::artifact_sha_match_fires_critical`
+    /// exercises it). In the DEFAULT build the feature is OFF: the lookup compiles to
+    /// a no-op and the RuleId is unreachable there. Registered unconditionally (the
+    /// registry tests must see every variant), with NO PATTERN_TABLE entry and NO
+    /// fixture, so it lives in `EXTERNALLY_TRIGGERED_RULES`. Critical severity
     /// (whence the action is Block).
     ArtifactKnownMalicious,
     /// A wheel/archive STRUCTURALLY REJECTED by the hardened reader (a path-traversal
@@ -820,6 +823,63 @@ pub enum RuleId {
     /// path-traversal wheel). Triggered by artifact inspection, not a PATTERN_TABLE string,
     /// so it lives in `EXTERNALLY_TRIGGERED_RULES` with no fixture. High severity.
     WheelStructurallyRejected,
+    /// D3: the bytes the package firewall is about to inspect/install do NOT hash
+    /// to the digest the resolver pinned and the quarantine recorded (MITRE T1565
+    /// data manipulation). The firewall operates only on content-addressed
+    /// quarantine blobs and RE-HASHES each one immediately before evaluation
+    /// (cross-cutting invariant 4, the TOCTOU re-bind); if the on-disk blob is
+    /// absent, unreadable, or hashes to anything other than the approved digest,
+    /// the approved bytes are gone and installing would run unapproved content, so
+    /// this fires and the enforcing surface fails closed. DISTINCT from
+    /// [`Self::ArtifactKnownMalicious`], which is a POSITIVE threat-DB match on a
+    /// known-malicious hash: this is an integrity failure (the bytes are not the
+    /// approved bytes), not a reputation hit. Produced by
+    /// `crate::artifact::firewall`, not from a command/paste fixture, so it has no
+    /// PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`. Critical
+    /// severity (whence the action is Block).
+    ArtifactDownloadIntegrityMismatch,
+    /// F2: a local release differential between two versions of the SAME
+    /// distribution found that the NEW wheel changed its EXECUTION SHAPE versus the
+    /// OLD wheel in a way that, in the live supply-chain campaign, marks a benign
+    /// release turning malicious (MITRE T1195): a pure-Python release that now
+    /// ships a compiled extension, a release that newly carries an
+    /// interpreter-startup hook, a release that now bundles a multi-megabyte
+    /// JavaScript payload, a changed distribution identity, or a newly-gained
+    /// execution capability (a `.pth`/native subprocess spawn, a network/runtime
+    /// download, a native execution entry) the prior release lacked. Each is a
+    /// HEURISTIC delta a legitimate release can sometimes have, so this is MEDIUM
+    /// severity (it WARNS, never auto-blocks; a strict policy can upgrade it via
+    /// `action_overrides`); the conclusive conjunctions are caught at Block strength
+    /// by `python_startup_hook_*` / `native_import_execution_chain` when the new
+    /// wheel is inspected directly. Produced by `crate::artifact::release_diff`
+    /// comparing two on-disk wheels (local-artifact-only), never from a
+    /// command/paste fixture, so it has no PATTERN_TABLE entry and lives in
+    /// `EXTERNALLY_TRIGGERED_RULES`.
+    ArtifactReleaseAnomaly,
+}
+
+impl RuleId {
+    /// Whether this rule's severity has a HIGH floor that a policy
+    /// `severity_overrides` entry may not drop below.
+    ///
+    /// These are the integrity / reputation / malicious-supply-chain findings
+    /// where a downgrade would let a tampered or known-bad install proceed: an
+    /// override that lowered the severity below [`Severity::High`] would map the
+    /// finding to Warn (via [`action_from_findings`]), `is_block()` would be
+    /// false, and the firewall / install transaction would run on unapproved or
+    /// malicious bytes. The override may still RAISE severity (e.g. to Critical);
+    /// the floor only blocks lowering it past High. Enforced at the single
+    /// chokepoint [`crate::policy::Policy::severity_override`], so it applies
+    /// regardless of policy scope (user, org, and repo are all floored).
+    pub const fn has_severity_floor(&self) -> bool {
+        matches!(
+            self,
+            RuleId::ArtifactKnownMalicious
+                | RuleId::ArtifactDownloadIntegrityMismatch
+                | RuleId::PythonStartupHookCrossRuntime
+                | RuleId::NativeImportExecutionChain
+        )
+    }
 }
 
 impl fmt::Display for RuleId {

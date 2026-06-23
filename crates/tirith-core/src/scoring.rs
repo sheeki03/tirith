@@ -346,7 +346,15 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::ArtifactKnownMalicious
         // B8: a wheel structurally rejected by the hardened reader — a structural
         // artifact verdict, not a threat-DB indicator.
-        | RuleId::WheelStructurallyRejected => false,
+        | RuleId::WheelStructurallyRejected
+        // D3: package-firewall download-vs-expected hash mismatch — a structural
+        // integrity verdict (the bytes are not the approved bytes), not a
+        // reputation/threat-intel score.
+        | RuleId::ArtifactDownloadIntegrityMismatch
+        // F2: package-firewall release differential anomaly is a structural
+        // execution-shape-change verdict over two local wheels, not a
+        // reputation/threat-intel score.
+        | RuleId::ArtifactReleaseAnomaly => false,
     }
 }
 

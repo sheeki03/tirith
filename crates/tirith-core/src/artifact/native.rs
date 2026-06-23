@@ -1407,8 +1407,7 @@ mod tests {
     fn buffered(bytes: Vec<u8>) -> NativeMemberHandoff {
         let sha256 = {
             use sha2::{Digest, Sha256};
-            let d = Sha256::digest(&bytes);
-            d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            hex::encode(Sha256::digest(&bytes))
         };
         NativeMemberHandoff::Buffered {
             location: SubjectLocation::member(
@@ -2336,10 +2335,7 @@ mod tests {
         // Read the wheel, collecting native handoffs.
         let sha: String = {
             use sha2::{Digest, Sha256};
-            Sha256::digest(&wheel)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
+            hex::encode(Sha256::digest(&wheel))
         };
         let mut visitor = CollectingVisitor::default();
         let _ = read_wheel(
