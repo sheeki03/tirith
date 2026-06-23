@@ -1604,7 +1604,7 @@ mod tests {
         ]);
         let rejected_path = write_temp(&dir, "demo-1.0-py3-none-any.whl", &rejected_bytes);
 
-        let set = inspect_artifact_set(&[rejected_path.clone()]);
+        let set = inspect_artifact_set(std::slice::from_ref(&rejected_path));
         assert_eq!(set.members.len(), 1, "the wheel is a member, not a gap");
         assert!(
             set.members[0].inspected.rejected,

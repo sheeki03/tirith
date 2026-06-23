@@ -1107,10 +1107,7 @@ mod tests {
         assert!(spec.environment.temporary_home);
         let mut cmd = Command::new("/usr/bin/true");
         let err = apply_macos_env_with(&mut cmd, &spec, || {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "synthetic tempdir failure",
-            ))
+            Err(std::io::Error::other("synthetic tempdir failure"))
         })
         .expect_err("must fail closed when the temp HOME cannot be created");
         assert!(
