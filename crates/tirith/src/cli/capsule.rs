@@ -76,6 +76,15 @@ impl SelectedBackend {
 }
 
 /// How a launch should treat a backend that cannot fully satisfy the spec.
+///
+/// **Invariant (enforcing surfaces must hold):** an *enforcing* surface — one that
+/// promises containment (`pkg install`, the contained MCP gateway,
+/// `tirith run --require-capsule`) — must ALWAYS pass [`Self::FailClosed`].
+/// [`Self::AllowDegraded`] runs the program fully uncontained on a degraded host
+/// and is reserved for best-effort, explicitly-not-a-boundary surfaces
+/// (`temp-run --capsule`) that print an honest banner. An enforcing surface that
+/// passed `AllowDegraded` would silently run an attacker's code uncontained.
+/// Enforcing call sites assert this with [`Self::guard_enforcing`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DegradedPolicy {
     /// Enforcing surface: refuse to run if coverage is degraded (the default for
@@ -86,6 +95,32 @@ pub enum DegradedPolicy {
     /// `temp-run --capsule` (a best-effort hardening over an explicitly
     /// not-a-boundary command).
     AllowDegraded,
+}
+
+impl DegradedPolicy {
+    /// Whether this policy fails closed (refuses to run under degraded coverage).
+    /// An enforcing surface is exactly one for which this is `true`.
+    pub fn is_enforcing(self) -> bool {
+        matches!(self, DegradedPolicy::FailClosed)
+    }
+}
+
+/// Guard the security-critical "proceed uncontained because the backend is
+/// degraded" decision: reaching it with an *enforcing* policy
+/// ([`DegradedPolicy::FailClosed`]) is an invariant violation (an enforcing
+/// surface would have failed closed before here). In a debug build this trips a
+/// `debug_assert!`; the structural fail-closed check upstream already guarantees an
+/// enforcing caller never reaches a degraded run in release. Centralizing the guard
+/// here means every degraded-run path (`run_to_completion` and `spawn_piped`)
+/// asserts the same contract, so a future enforcing surface that mis-wires its
+/// policy is caught in tests rather than silently running an attacker's code
+/// uncontained.
+fn assert_degraded_run_is_permitted(policy: DegradedPolicy) {
+    debug_assert!(
+        !policy.is_enforcing(),
+        "enforcing capsule surface (FailClosed) must never reach an uncontained degraded run; \
+         it would run the program uncontained on a degraded host"
+    );
 }
 
 /// The result of a contained run-to-completion.
@@ -278,13 +313,17 @@ pub fn run_to_completion(
             return windows_run_to_completion(spec, program, args, &sel);
         }
         // Degraded + AllowDegraded on Windows: run uncontained via a plain Command.
+        // An enforcing surface would have failed closed above; assert it here.
+        assert_degraded_run_is_permitted(degraded);
         return uncontained_run(program, args, cwd, extra_env, &sel, true);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         if is_degraded {
-            // AllowDegraded: run uncontained but honestly flagged.
+            // AllowDegraded: run uncontained but honestly flagged. An enforcing
+            // surface would have failed closed above; assert it here.
+            assert_degraded_run_is_permitted(degraded);
             return uncontained_run(program, args, cwd, extra_env, &sel, true);
         }
         let mut cmd = build_contained_command(spec, program, args, &sel)?;
@@ -373,6 +412,8 @@ pub fn spawn_piped(
                     .to_string(),
             });
         }
+        // Only an AllowDegraded caller reaches here (FailClosed returned above).
+        assert_degraded_run_is_permitted(degraded);
         let child = spawn_uncontained_piped(program, args, extra_env, &sel)?;
         return Ok((child, sel, true));
     }
@@ -386,6 +427,8 @@ pub fn spawn_piped(
                     reason: shortfall_reason(sel.backend_id, &sel),
                 });
             }
+            // Only an AllowDegraded caller reaches here (FailClosed returned above).
+            assert_degraded_run_is_permitted(degraded);
             let child = spawn_uncontained_piped(program, args, extra_env, &sel)?;
             return Ok((child, sel, true));
         }
@@ -524,13 +567,18 @@ fn macos_contained_command(
     // affect the sandbox-exec process and, by inheritance, the target.
     let resources = spec.resources.clone();
     let handles = spec.handles.clone();
-    // SAFETY: the closure only calls async-signal-safe libc functions (setrlimit,
-    // close) on values captured by move; it allocates nothing and touches no shared
-    // state of the parent.
+    // SAFETY: the closure only calls async-signal-safe libc functions (getrlimit,
+    // setrlimit, close) on values captured by move; it allocates nothing and
+    // touches no shared state of the parent.
+    //
+    // Order matters: close inherited fds FIRST, while `RLIMIT_NOFILE` still reflects
+    // the inherited (higher) ceiling, so a high-numbered inherited fd is found and
+    // closed. Lowering `RLIMIT_NOFILE` does not close already-open fds, so applying
+    // rlimits first would shrink the scan ceiling and let a high fd survive.
     unsafe {
         cmd.pre_exec(move || {
-            apply_macos_rlimits(&resources)?;
             close_extra_fds(&handles);
+            apply_macos_rlimits(&resources)?;
             Ok(())
         });
     }
@@ -606,14 +654,21 @@ fn apply_macos_rlimits(limits: &tirith_core::capsule::ResourceLimits) -> std::io
 }
 
 /// Close every inherited file descriptor above stdio that is not in the handle
-/// allow-list (macOS, `pre_exec`). Best-effort and async-signal-safe: it walks a
-/// bounded fd range and `close()`s anything not permitted. Stdio (0/1/2) and the
-/// explicit extras survive.
+/// allow-list (macOS, `pre_exec`). Best-effort and async-signal-safe: it walks the
+/// fd range up to the process `RLIMIT_NOFILE` ceiling and `close()`s anything not
+/// permitted. Stdio (0/1/2) and the explicit extras survive.
+///
+/// The upper bound is the current `RLIMIT_NOFILE` soft limit (an fd can never be
+/// numbered at or above it), so an inherited descriptor numbered above a hardcoded
+/// 1024 cannot survive. This runs BEFORE `apply_macos_rlimits` lowers
+/// `RLIMIT_NOFILE`, so the ceiling reflects the inherited (higher) limit and a
+/// high-numbered inherited fd is still found. It is clamped to [`MAX_FD_SCAN`] so a
+/// process that raised `RLIMIT_NOFILE` to a huge value (or `RLIM_INFINITY`) does
+/// not make the `pre_exec` walk run unboundedly.
 #[cfg(target_os = "macos")]
 fn close_extra_fds(handles: &tirith_core::capsule::HandlePolicy) {
     let allowed = handles.allowed_unix_fds();
-    // A conservative upper bound; the resource limit caps open files well below.
-    let max_fd: i32 = 1024;
+    let max_fd = fd_scan_ceiling();
     for fd in 3..max_fd {
         if !allowed.contains(&fd) {
             // SAFETY: close on a possibly-unopened fd is harmless (returns EBADF);
@@ -623,6 +678,37 @@ fn close_extra_fds(handles: &tirith_core::capsule::HandlePolicy) {
             }
         }
     }
+}
+
+/// A hard upper bound on the fd-closure walk so a pathological `RLIMIT_NOFILE`
+/// (e.g. `RLIM_INFINITY`) cannot make the async-signal-safe `pre_exec` loop run
+/// effectively forever. 1 MiB of fds is far more than any real inherited set.
+#[cfg(target_os = "macos")]
+const MAX_FD_SCAN: i32 = 1 << 20;
+
+/// The fd number to walk up to when closing inherited descriptors: the current
+/// `RLIMIT_NOFILE` soft limit (no open fd can be numbered at or above it), clamped
+/// to [`MAX_FD_SCAN`]. Falls back to [`MAX_FD_SCAN`] if the limit cannot be read or
+/// is unbounded, so the walk is never narrower than the old hardcoded 1024.
+/// Async-signal-safe: only calls `getrlimit`.
+#[cfg(target_os = "macos")]
+fn fd_scan_ceiling() -> i32 {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rl` is a valid, fully-initialized rlimit for the call; getrlimit
+    // does not retain the pointer.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+    if rc != 0 {
+        return MAX_FD_SCAN;
+    }
+    // `RLIM_INFINITY` (or anything past our cap) clamps to MAX_FD_SCAN.
+    if rl.rlim_cur == libc::RLIM_INFINITY || rl.rlim_cur > MAX_FD_SCAN as libc::rlim_t {
+        return MAX_FD_SCAN;
+    }
+    // Never scan a narrower range than the previous hardcoded floor.
+    (rl.rlim_cur as i32).max(1024)
 }
 
 /// Windows run-to-completion: apply the AppContainer + Job launcher and wait. Only
@@ -775,6 +861,161 @@ mod tests {
         // The required coverage always demands raw-net-deny for a locked-down spec.
         assert!(sel.required.network_raw_denied);
         assert!(!sel.required.domain_proxy_enforced);
+    }
+
+    #[test]
+    fn degraded_policy_enforcing_classification() {
+        // S6: FailClosed is the enforcing policy; AllowDegraded is not.
+        assert!(DegradedPolicy::FailClosed.is_enforcing());
+        assert!(!DegradedPolicy::AllowDegraded.is_enforcing());
+    }
+
+    #[test]
+    fn assert_degraded_run_permits_allow_degraded() {
+        // S6: the guard at the uncontained-degraded-run path accepts AllowDegraded
+        // (the only policy that should ever reach it). It must not panic for it.
+        assert_degraded_run_is_permitted(DegradedPolicy::AllowDegraded);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "enforcing capsule surface")]
+    fn assert_degraded_run_rejects_fail_closed_in_debug() {
+        // S6: an enforcing surface (FailClosed) reaching the uncontained degraded
+        // run is an invariant violation; the guard trips in a debug build so a
+        // future mis-wired enforcing surface is caught by tests, never silently
+        // running uncontained.
+        assert_degraded_run_is_permitted(DegradedPolicy::FailClosed);
+    }
+
+    // ── C4: macOS contained launch honestly delivers env/handle/rlimit coverage ──
+
+    /// On macOS with a usable `sandbox-exec`, a locked-down (deny-all) spec must NOT
+    /// be degraded: the Seatbelt backend + this wrapper together supply FS/exec/
+    /// raw-net-deny AND the env/handle/rlimit coverage the wrapper applies. Before
+    /// the C4 fix the backend hard-coded env/handle/rlimit to false, so every
+    /// enforcing surface (`pkg install`, `gateway --capsule`, `run --capsule`)
+    /// refused on macOS. This asserts the live coverage on the host.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_locked_down_is_not_degraded_when_sandbox_exec_present() {
+        // Only meaningful where sandbox-exec is actually usable (the macOS CI runner
+        // and dev hosts). If it is somehow missing, the honest answer IS degraded;
+        // skip rather than assert a false expectation.
+        if !tirith_core::capsule::macos::probe_sandbox_exec().sandbox_exec_usable {
+            eprintln!("skipping: /usr/bin/sandbox-exec not usable on this host");
+            return;
+        }
+        let spec = CapsuleSpec::locked_down();
+        let sel = select_backend(&spec);
+        assert_eq!(sel.backend_id, "seatbelt");
+        assert!(
+            !sel.is_degraded(),
+            "locked-down macOS capsule must not be degraded with sandbox-exec present: \
+             coverage={:?} required={:?}",
+            sel.coverage,
+            sel.required
+        );
+        // The wrapper-supplied flags are honestly reported.
+        assert!(sel.coverage.env_isolated);
+        assert!(sel.coverage.handles_isolated);
+        assert!(sel.coverage.resource_limits_enforced);
+    }
+
+    /// C4 env-scrub proof on macOS: the contained `Command` the wrapper builds has
+    /// a planted secret (`AWS_SECRET_ACCESS_KEY`) scrubbed from the child's
+    /// environment while an explicitly-allowed benign var survives. This inspects
+    /// the real `Command` produced by `macos_contained_command` (via `env_clear` +
+    /// `EnvironmentPolicy::surviving_vars`), which is exactly the environment the
+    /// child receives — the concrete mechanism behind the `env_isolated` coverage
+    /// claim. We inspect the built env rather than launch through `sandbox-exec`
+    /// because exec'ing an arbitrary binary under a `(deny default)` Seatbelt
+    /// profile is host/macOS-version-dependent (the dyld loader needs paths the
+    /// minimal profile does not grant), which would make a CI test flaky; the env
+    /// scrub itself is deterministic and is what this finding is about.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_contained_command_scrubs_planted_secret_env() {
+        use tirith_core::capsule::{
+            CapsuleSpec, EnvironmentPolicy, FilesystemPolicy, HandlePolicy, NetworkPolicy,
+            ResourceLimits,
+        };
+
+        if !tirith_core::capsule::macos::probe_sandbox_exec().sandbox_exec_usable {
+            eprintln!("skipping: /usr/bin/sandbox-exec not usable on this host");
+            return;
+        }
+
+        // Uniquely-named planted vars so a parallel test never collides with these.
+        let secret_name = "AWS_SECRET_ACCESS_KEY";
+        let secret_val = "tirith-capsule-secret-DEADBEEF";
+        let marker_name = "TIRITH_CAPSULE_C4_MARKER";
+        let marker_val = "tirith-capsule-marker-OK";
+
+        // A deny-all spec that explicitly ALLOWS the benign marker (sensitive names
+        // are stripped regardless of the allow-list — the whole point). temporary_home
+        // off so the only env the child gets is the surviving allow-list set.
+        let spec = CapsuleSpec {
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::DenyAll,
+            environment: EnvironmentPolicy {
+                inherit: false,
+                allow: vec![
+                    marker_name.to_string(),
+                    secret_name.to_string(), // allow-listed but still stripped
+                ],
+                deny_sensitive: true,
+                temporary_home: false,
+            },
+            handles: HandlePolicy::default(),
+            resources: ResourceLimits::conservative(),
+        };
+
+        let sel = select_backend(&spec);
+        assert_eq!(sel.backend_id, "seatbelt");
+        assert!(!sel.is_degraded(), "spec must be enforceable: {sel:?}");
+
+        // Plant the vars, build the command (which snapshots the env via env_clear +
+        // surviving_vars), then immediately remove them — keeping the global-env
+        // window minimal so parallel tests are unaffected.
+        std::env::set_var(secret_name, secret_val);
+        std::env::set_var(marker_name, marker_val);
+        let cmd = build_contained_command(&spec, "/usr/bin/printenv", &[], &sel)
+            .expect("build contained command");
+        // The env the child WILL receive: the Command's explicit env overrides.
+        let child_env: std::collections::BTreeMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        std::env::remove_var(secret_name);
+        std::env::remove_var(marker_name);
+
+        // The sensitive var must be ABSENT from the child's environment (env_clear
+        // dropped the inherited copy and surviving_vars refused to re-add it).
+        assert!(
+            !child_env.contains_key(secret_name),
+            "sensitive {secret_name} must be scrubbed from the contained child env: {child_env:?}"
+        );
+        // Its value must not appear anywhere in the scrubbed env either.
+        assert!(
+            !child_env.values().any(|v| v.as_deref() == Some(secret_val)),
+            "the planted secret value leaked into the contained child env: {child_env:?}"
+        );
+        // The explicitly-allowed benign marker DID survive (proves selective
+        // scrubbing, not a blanket wipe that drops everything).
+        assert_eq!(
+            child_env
+                .get(marker_name)
+                .and_then(|v| v.clone())
+                .as_deref(),
+            Some(marker_val),
+            "benign allow-listed marker should survive into the child: {child_env:?}"
+        );
     }
 
     #[test]

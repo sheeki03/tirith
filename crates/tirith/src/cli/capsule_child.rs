@@ -138,16 +138,28 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         }
     };
 
-    // Defense in depth: refuse to apply containment if we are somehow not
-    // single-threaded (a multi-threaded process cannot be soundly contained by a
-    // per-thread seccomp filter + Landlock). This should never trip because the
-    // caller invokes us before the worker-thread spawn, but a hard check here means
-    // a future refactor cannot silently weaken the guarantee.
-    if let Some(threads) = current_thread_count() {
-        if threads > 1 {
+    // Defense in depth: refuse to apply containment unless we can CONFIRM the
+    // process is single-threaded. Applying a per-thread seccomp filter + Landlock
+    // in a multi-threaded process is unsound (the filter binds only the calling
+    // thread), so this must fail CLOSED: if we cannot read the thread count, we
+    // cannot prove single-threadedness and must not proceed. This should never trip
+    // because the caller invokes us before the worker-thread spawn, but a hard
+    // fail-closed check here means neither a future refactor nor an unreadable
+    // `/proc` can silently weaken the guarantee.
+    match current_thread_count() {
+        Some(1) => {}
+        Some(threads) => {
             eprintln!(
                 "tirith __capsule-child: refusing to contain a multi-threaded process \
                  ({threads} threads); this is an internal invariant violation"
+            );
+            std::process::exit(2);
+        }
+        None => {
+            eprintln!(
+                "tirith __capsule-child: refusing to apply containment; could not confirm the \
+                 process is single-threaded (unable to read /proc/self/stat). Failing closed \
+                 rather than risk an unsound multi-threaded seccomp/Landlock apply."
             );
             std::process::exit(2);
         }
@@ -237,8 +249,9 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
 }
 
 /// The number of threads in the current process, read from `/proc/self/stat`
-/// (field 20). `None` if it cannot be determined (the caller then skips the check
-/// rather than failing closed on a read error). Linux-only.
+/// (field 20). `None` if it cannot be determined; the caller treats `None` as
+/// fail-closed (it cannot confirm single-threadedness, so it refuses to apply
+/// containment) rather than proceeding on an unverified assumption. Linux-only.
 #[cfg(target_os = "linux")]
 fn current_thread_count() -> Option<usize> {
     let stat = std::fs::read_to_string("/proc/self/stat").ok()?;

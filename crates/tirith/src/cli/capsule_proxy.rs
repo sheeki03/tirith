@@ -414,13 +414,31 @@ pub struct BrokerAuditEvent {
 }
 
 /// Constant-time byte-slice equality. Avoids a timing side channel on the
-/// per-session token: always compares the full length and never short-circuits.
+/// per-session token: it never early-returns on a length mismatch (which would
+/// leak the token length through timing). Instead it folds the length difference
+/// into the accumulator and walks the FULL length of both slices, so the work done
+/// (and thus the timing) does not branch on whether the lengths matched. Unequal
+/// lengths can never compare equal because the length XOR seeds a non-zero
+/// accumulator.
+///
+/// Note: the loop count depends on the slice lengths (an attacker already controls
+/// the length of the value they submit, and the secret length is fixed), but the
+/// comparison no longer reveals the secret's length via an early return on
+/// mismatch, and a wrong-length guess is never accepted.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    // Seed with the length difference: if the lengths differ this is non-zero, so
+    // the result can never be `true` regardless of the byte comparison below. This
+    // is what makes an unequal-length pair always compare false WITHOUT an early
+    // return that would leak the length via timing.
+    let mut diff: u8 = ((a.len() ^ b.len()) != 0) as u8;
+    // Walk both slices to their full length so the loop never short-circuits on a
+    // matching prefix. An index past the end of a slice reads as 0 (a missing byte
+    // contributes `other ^ 0`); correctness rests on the length seed above, not on
+    // these out-of-range slots.
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
         diff |= x ^ y;
     }
     diff == 0
@@ -1105,6 +1123,20 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(constant_time_eq(b"", b""));
+        // Length mismatches in either direction are unequal, and an empty vs
+        // non-empty pair is handled without panicking (no early-return on length).
+        assert!(!constant_time_eq(b"ab", b"abc"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(!constant_time_eq(b"a", b""));
+        // A long token differing only in its final byte is still rejected (the full
+        // walk runs; no short-circuit on the matching prefix).
+        let token = vec![0x5au8; 64];
+        let mut wrong = token.clone();
+        *wrong.last_mut().unwrap() ^= 0x01;
+        assert!(constant_time_eq(&token, &token));
+        assert!(!constant_time_eq(&token, &wrong));
+        // A correct prefix but a shorter guess never matches.
+        assert!(!constant_time_eq(&token, &token[..32]));
     }
 
     #[test]

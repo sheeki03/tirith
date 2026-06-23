@@ -242,7 +242,19 @@ pub fn apply_containment(
     set_no_new_privs()?;
 
     // 3. Landlock filesystem confinement.
-    let fs_status = apply_landlock(spec)?;
+    let fs_outcome = apply_landlock(spec)?;
+    if fs_outcome == LandlockOutcome::Partially {
+        // Honest signal: FS is still confined to the grants (default-deny holds in
+        // the safe direction), but the kernel honored only a subset of the
+        // requested access set, so we do NOT silently present this as full
+        // enforcement. Surfaced to stderr; the coverage flag stays true because the
+        // granted roots ARE confined (a partial downgrade narrows, never widens).
+        eprintln!(
+            "tirith __capsule-child: note: Landlock partially enforced (best-effort kernel \
+             downgrade); the granted roots are confined but some requested access restrictions \
+             were not applied"
+        );
+    }
 
     // 4. seccomp (default-deny syscall policy, no socket creation).
     let seccomp_applied = apply_seccomp()?;
@@ -251,8 +263,8 @@ pub fn apply_containment(
     apply_env(&spec.environment, temp_home);
 
     Ok(CapsuleCoverage {
-        fs_read_enforced: fs_status,
-        fs_write_enforced: fs_status,
+        fs_read_enforced: fs_outcome.fs_confined(),
+        fs_write_enforced: fs_outcome.fs_confined(),
         exec_limited: true,
         network_raw_denied: seccomp_applied,
         domain_proxy_enforced: false,
@@ -320,16 +332,47 @@ fn set_no_new_privs() -> Result<(), ContainError> {
     Ok(())
 }
 
+/// The outcome of applying the Landlock ruleset, distinguishing full enforcement
+/// from a best-effort partial enforcement from no enforcement at all. Kept distinct
+/// (rather than collapsed to a `bool`) so [`apply_containment`] never silently
+/// claims FULL filesystem enforcement when the kernel only partially honored the
+/// requested access set — the "never over-report coverage" invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandlockOutcome {
+    /// Every requested access restriction is enforced.
+    Fully,
+    /// Landlock is active and the granted roots are confined (default-deny still
+    /// holds, in the safe direction), but the kernel honored only a SUBSET of the
+    /// requested V1 access rights (best-effort downgrade on an older kernel). FS is
+    /// still confined to the grants, so coverage stays `true`, but the partial
+    /// status is surfaced rather than masquerading as full enforcement.
+    Partially,
+    /// Landlock is not in force (kernel lacks it / disabled); FS is NOT confined.
+    NotEnforced,
+}
+
+impl LandlockOutcome {
+    /// Whether the granted roots are actually confined. True for both full and
+    /// partial enforcement: in either case Landlock's default-deny means only the
+    /// granted roots are reachable (a partial downgrade drops requested access
+    /// *types*, never widens reachable paths), so the FS-confinement coverage flag
+    /// is honestly `true`. Only [`Self::NotEnforced`] leaves the FS unconfined.
+    fn fs_confined(self) -> bool {
+        matches!(self, LandlockOutcome::Fully | LandlockOutcome::Partially)
+    }
+}
+
 /// Build and apply the Landlock ruleset from the spec's read/write roots. Returns
-/// whether the ruleset was actually enforced (false when the kernel lacks
-/// Landlock, in which case the caller's coverage reflects unenforced FS).
+/// the [`LandlockOutcome`] (full / partial / not enforced) so the caller can record
+/// the honest status instead of coercing a partial result into a full-enforcement
+/// claim.
 ///
 /// Landlock is default-deny: only the granted roots are reachable. Roots in
 /// `deny_roots` that are not under any grant are therefore already denied. (v1
 /// Landlock cannot carve a denied subtree OUT of a broader grant; a caller that
 /// needs that must not grant the parent. The locked-down default grants nothing,
 /// so the sensitive subtrees are denied.)
-fn apply_landlock(spec: &CapsuleSpec) -> Result<bool, ContainError> {
+fn apply_landlock(spec: &CapsuleSpec) -> Result<LandlockOutcome, ContainError> {
     use landlock::{
         Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetStatus, ABI,
     };
@@ -361,10 +404,15 @@ fn apply_landlock(spec: &CapsuleSpec) -> Result<bool, ContainError> {
         .restrict_self()
         .map_err(|e| ContainError::Landlock(format!("restrict_self: {e}")))?;
 
-    Ok(matches!(
-        status.ruleset,
-        RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced
-    ))
+    // Map the kernel's enforcement status honestly. A PartiallyEnforced ruleset is
+    // a best-effort downgrade (fewer access *types* enforced) but still confines
+    // the granted roots in the deny direction; it is NOT collapsed into the same
+    // value as FullyEnforced, so the caller can surface the difference.
+    Ok(match status.ruleset {
+        RulesetStatus::FullyEnforced => LandlockOutcome::Fully,
+        RulesetStatus::PartiallyEnforced => LandlockOutcome::Partially,
+        RulesetStatus::NotEnforced => LandlockOutcome::NotEnforced,
+    })
 }
 
 /// Add one path-beneath rule to the ruleset, ignoring a non-existent path (a grant
@@ -661,5 +709,21 @@ mod tests {
         if p.usable {
             assert!(p.abi.is_some());
         }
+    }
+
+    #[test]
+    fn landlock_outcome_fs_confinement_is_honest() {
+        // I6: a PartiallyEnforced ruleset still confines the granted roots (default-
+        // deny holds; a partial downgrade narrows access, never widens), so it
+        // reports fs_confined = true alongside FullyEnforced. Only NotEnforced
+        // leaves the FS unconfined. The point is the two enforced states are kept
+        // DISTINCT (so the partial case can be surfaced) without flipping a normal
+        // partial result to degraded.
+        assert!(LandlockOutcome::Fully.fs_confined());
+        assert!(LandlockOutcome::Partially.fs_confined());
+        assert!(!LandlockOutcome::NotEnforced.fs_confined());
+        // The variants are genuinely distinct (not collapsed to a bool), so a future
+        // reader can tell full from partial.
+        assert_ne!(LandlockOutcome::Fully, LandlockOutcome::Partially);
     }
 }
