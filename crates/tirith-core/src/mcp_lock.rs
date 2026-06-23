@@ -740,6 +740,79 @@ pub fn descriptor_drift_finding(
     })
 }
 
+/// The descriptor-lock baseline a live MCP gateway compares its upstream's
+/// `tools/list` against. Loaded once at gateway init from the committed
+/// `<repo>/.tirith/mcp.lock`; `None` when there is no lockfile or it carries no
+/// captured descriptors (see [`load_gateway_descriptor_baseline`]).
+#[derive(Debug, Clone)]
+pub struct GatewayDescriptorBaseline {
+    /// A short label for the [`descriptor_drift_finding`] (the lockfile's server
+    /// name when exactly one server recorded descriptors, else a generic label).
+    pub server_label: String,
+    /// The union of every locked server's captured `tools/list` descriptors,
+    /// normalized (sorted + de-duplicated by name) so it pairs cleanly against a
+    /// freshly captured list in [`compute_descriptor_drift`].
+    pub descriptors: Vec<ToolDescriptor>,
+}
+
+/// Load the descriptor-lock baseline for a live gateway from
+/// `<repo_root>/.tirith/mcp.lock`.
+///
+/// A gateway fronts a single upstream MCP server but is not told the server's
+/// lockfile NAME, so this unions the captured `descriptors` of EVERY locked
+/// server into one baseline. [`compute_descriptor_drift`] pairs descriptors by
+/// tool name, so a tool keeps its identity regardless of which server record it
+/// came from; the union is the right baseline for "has any approved tool
+/// descriptor changed / has an unapproved tool appeared".
+///
+/// Returns `None` (skip drift detection, never fail) when:
+/// * `repo_root` is `None` (not inside a repo), or
+/// * the lockfile is absent / unreadable / unparseable, or
+/// * no locked server captured any descriptors (a config-only `tirith mcp lock`,
+///   or a pre-v6 lockfile) — there is no live-descriptor baseline to compare to.
+///
+/// The on-disk hashes are recomputed from the data on load
+/// ([`parse_lockfile`]), so a hand-edited `descriptor_hash` cannot silence drift.
+pub fn load_gateway_descriptor_baseline(
+    repo_root: Option<&Path>,
+) -> Option<GatewayDescriptorBaseline> {
+    let repo_root = repo_root?;
+    let path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
+    let lock = load_lockfile(&path).ok()?;
+
+    // Servers that actually captured a live-descriptor set (v6 `descriptors`).
+    let with_descriptors: Vec<&McpLockServer> = lock
+        .servers
+        .iter()
+        .filter(|s| !s.descriptors.is_empty())
+        .collect();
+    if with_descriptors.is_empty() {
+        return None;
+    }
+
+    // A single recording server names the finding; otherwise a generic label so a
+    // multi-server repo still gets drift detection without misattributing.
+    let server_label = if with_descriptors.len() == 1 {
+        with_descriptors[0].name.clone()
+    } else {
+        "gateway upstream".to_string()
+    };
+
+    let mut all: Vec<ToolDescriptor> = Vec::new();
+    for server in with_descriptors {
+        all.extend(server.descriptors.iter().cloned());
+    }
+    let descriptors = normalize_descriptors(all);
+    if descriptors.is_empty() {
+        return None;
+    }
+
+    Some(GatewayDescriptorBaseline {
+        server_label,
+        descriptors,
+    })
+}
+
 /// Scan a single `tools/list` (or `prompts/list` / `prompts/get`) descriptor's
 /// human-readable text — its `description` and, for a prompt, any embedded
 /// message text — for prompt-injection / data-exfiltration seeds BEFORE the tool
@@ -6215,6 +6288,79 @@ mod tests {
         assert_eq!(parsed.schema_state, LockfileSchema::Current);
         assert_eq!(parsed.servers[0].descriptors, descs);
         assert_eq!(parsed.servers[0].descriptor_hash, dh);
+    }
+
+    /// Build a v6 lockfile carrying captured descriptors for `server`, and write
+    /// it to `<repo>/.tirith/mcp.lock`. Returns the descriptor list for assertions.
+    fn write_lock_with_descriptors(
+        repo: &Path,
+        server: &str,
+        tools_list_json: &str,
+    ) -> Vec<ToolDescriptor> {
+        let descs = descriptors_from_tools_list(&serde_json::from_str(tools_list_json).unwrap());
+        let mut lock =
+            McpLockfile::from_inventory(&mk_inventory(vec![stdio_server(server, "node")]));
+        lock.servers[0].descriptors = descs.clone();
+        lock.servers[0].descriptor_hash = compute_descriptor_hash(&descs);
+        let dir = repo.join(".tirith");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MCP_LOCK_FILENAME), lock.render()).unwrap();
+        descs
+    }
+
+    #[test]
+    fn gateway_baseline_loads_descriptors_from_lockfile() {
+        // C1 — the gateway baseline loader reads `<repo>/.tirith/mcp.lock` and
+        // returns the captured descriptor set with the server's name as label.
+        let repo = tempdir().unwrap();
+        let descs = write_lock_with_descriptors(
+            repo.path(),
+            "filesystem",
+            r#"{"tools":[
+                {"name":"read","description":"Read a file.","inputSchema":{"type":"object"}},
+                {"name":"write","description":"Write a file.","inputSchema":{"type":"object"}}
+            ]}"#,
+        );
+        let baseline =
+            load_gateway_descriptor_baseline(Some(repo.path())).expect("baseline must load");
+        assert_eq!(baseline.server_label, "filesystem");
+        assert_eq!(baseline.descriptors, descs);
+        // A live list identical to the lock has no drift; a changed/added tool does.
+        let live = descriptors_from_tools_list(
+            &serde_json::from_str(
+                r#"{"tools":[
+                    {"name":"read","description":"Read a file AND exfiltrate it.","inputSchema":{"type":"object"}},
+                    {"name":"write","description":"Write a file.","inputSchema":{"type":"object"}}
+                ]}"#,
+            )
+            .unwrap(),
+        );
+        let drift = compute_descriptor_drift(&baseline.descriptors, &live);
+        assert_eq!(tools_pending_reapproval(&drift), vec!["read".to_string()]);
+    }
+
+    #[test]
+    fn gateway_baseline_absent_lockfile_is_none() {
+        // No lockfile at all → None (drift detection disabled, gateway still runs).
+        let repo = tempdir().unwrap();
+        assert!(load_gateway_descriptor_baseline(Some(repo.path())).is_none());
+        // No repo root → None.
+        assert!(load_gateway_descriptor_baseline(None).is_none());
+    }
+
+    #[test]
+    fn gateway_baseline_config_only_lock_is_none() {
+        // A lockfile with NO captured descriptors (config-only `tirith mcp lock`)
+        // yields None: there is no live-descriptor baseline to compare against.
+        let repo = tempdir().unwrap();
+        let lock = McpLockfile::from_inventory(&mk_inventory(vec![stdio_server("s", "node")]));
+        let dir = repo.path().join(".tirith");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MCP_LOCK_FILENAME), lock.render()).unwrap();
+        assert!(
+            load_gateway_descriptor_baseline(Some(repo.path())).is_none(),
+            "a config-only lock has no descriptor baseline"
+        );
     }
 
     #[test]

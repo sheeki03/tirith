@@ -260,6 +260,15 @@ fn collect_uri_violations(result: &Value, kind: ResponseKind, out: &mut Vec<Resp
 /// Recursively find content blocks that carry a resource URI and screen them. A
 /// block is `resource_link`-shaped when `type == "resource_link"` with a `uri`,
 /// or `resource`-shaped when `type == "resource"` with a `resource.uri`.
+///
+/// C3: beyond those two typed shapes, ANY string value anywhere in the tree that
+/// parses as an http(s) URL is also screened (code `metadata_uri_ssrf`), so an
+/// SSRF/metadata target hidden in a custom field a future MCP revision (or a
+/// malicious server) tucks into a non-typed key — a `callbackUrl`, an `iconUrl`,
+/// a `prompts/get` extension field — does not slip past with only the text
+/// scanner (which never runs the URL validator). The typed `uri` fields keep
+/// their canonical codes; the generic pass skips exactly those already-screened
+/// `uri` fields so no URL is double-emitted.
 fn walk_for_resource_uris(v: &Value, out: &mut Vec<ResponseViolation>) {
     match v {
         Value::Object(map) => {
@@ -281,6 +290,24 @@ fn walk_for_resource_uris(v: &Value, out: &mut Vec<ResponseViolation>) {
                 }
                 _ => {}
             }
+            // C3 generic pass: screen every OTHER string leaf in this object that
+            // parses as an http(s) URL. The canonically-coded URI fields (`uri` on
+            // a content block / resource descriptor / read content, and a
+            // `uriTemplate`) are owned by the typed arm above or the kind-specific
+            // descriptor screen in `collect_uri_violations`, so they are skipped
+            // here to avoid emitting two violations for the same URL. Everything
+            // else — a `callbackUrl`, an `iconUrl`/`icons[].src`, any custom or
+            // future extension field — reaches the same SSRF validator under
+            // `metadata_uri_ssrf`, closing the gap where such a field previously
+            // saw only the text scanner (which never runs the URL validator).
+            for (key, child) in map {
+                if key == "uri" || key == "uriTemplate" {
+                    continue;
+                }
+                if let Some(s) = child.as_str() {
+                    screen_http_string(s, out);
+                }
+            }
             for child in map.values() {
                 walk_for_resource_uris(child, out);
             }
@@ -291,6 +318,21 @@ fn walk_for_resource_uris(v: &Value, out: &mut Vec<ResponseViolation>) {
             }
         }
         _ => {}
+    }
+}
+
+/// C3: screen one string leaf ONLY if it parses as an http(s) URL, under the
+/// generic `metadata_uri_ssrf` code (a URL in a non-typed/custom field). Non-URL
+/// strings and non-http schemes are ignored here — a forbidden non-http scheme in
+/// a stray custom field is not a network-fetch SSRF vector, and the typed /
+/// descriptor paths already cover the modeled `uri` fields that matter for the
+/// `file://` / `data:` rejection. This keeps the broadened screen focused on the
+/// gap it closes: network-fetchable metadata / SSRF targets hidden outside the
+/// modeled URI fields.
+fn screen_http_string(s: &str, out: &mut Vec<ResponseViolation>) {
+    let lower = s.trim().to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        screen_uri(s, "metadata_uri_ssrf", out);
     }
 }
 
@@ -791,6 +833,93 @@ mod tests {
         });
         let outcome = inspect_response(&result, ResponseKind::PromptsGet, &ctx());
         assert!(outcome.violations.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.action, Action::Allow);
+    }
+
+    #[test]
+    fn metadata_url_in_non_typed_field_is_screened() {
+        // C3: an http(s) URL hidden in a CUSTOM field (not `uri`, and the block is
+        // not a typed resource_link/resource) must still reach the SSRF validator.
+        // Pre-C3 only the text scanner saw `callbackUrl`, and it never ran the URL
+        // validator, so a cloud-metadata target sailed through.
+        let result = json!({
+            "tools": [{
+                "name": "weather",
+                "description": "Look up the weather.",
+                "inputSchema": {"type": "object"},
+                "callbackUrl": "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+            }]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ToolsList, &ctx());
+        assert!(
+            outcome.is_block(),
+            "metadata URL in callbackUrl must block: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .violations
+                .iter()
+                .any(|v| v.code == "metadata_uri_ssrf"),
+            "must flag the non-typed URL under metadata_uri_ssrf: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_url_in_nested_icons_field_is_screened() {
+        // C3: a URL nested deep in a non-`uri` structure (an icons array) is also
+        // screened — the generic pass walks the whole tree.
+        let result = json!({
+            "tools": [{
+                "name": "t",
+                "description": "ok",
+                "icons": [{ "src": "https://10.0.0.5/admin/icon.png", "sizes": "48x48" }]
+            }]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ToolsList, &ctx());
+        assert!(
+            outcome.is_block(),
+            "private-IP URL in icons.src must block: {outcome:?}"
+        );
+        assert!(outcome
+            .violations
+            .iter()
+            .any(|v| v.code == "metadata_uri_ssrf"));
+    }
+
+    #[test]
+    fn typed_resource_link_url_is_not_double_emitted() {
+        // C3 must not double-count: a typed resource_link `uri` is screened ONCE
+        // under its canonical code, never additionally as metadata_uri_ssrf.
+        let result = json!({
+            "content": [
+                { "type": "resource_link", "uri": "http://169.254.169.254/x", "name": "r" }
+            ]
+        });
+        let outcome = inspect_response(&result, ResponseKind::PromptsGet, &ctx());
+        let codes: Vec<&str> = outcome.violations.iter().map(|v| v.code).collect();
+        assert_eq!(
+            codes,
+            vec!["resource_link_ssrf"],
+            "typed uri must be a single canonical violation, not double-emitted: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn benign_public_url_in_custom_field_is_allowed() {
+        // C3 must not over-block: a public http(s) URL in a custom field passes the
+        // SSRF screen (IP literal so no DNS) and produces no violation.
+        let result = json!({
+            "tools": [{
+                "name": "t",
+                "description": "ok",
+                "homepage": "https://93.184.216.34/docs"
+            }]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ToolsList, &ctx());
+        assert!(
+            outcome.violations.is_empty(),
+            "a benign public URL in a custom field must not be flagged: {outcome:?}"
+        );
         assert_eq!(outcome.action, Action::Allow);
     }
 
