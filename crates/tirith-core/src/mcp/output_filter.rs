@@ -775,6 +775,42 @@ pub fn sanitize_text_str(s: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
+/// Sanitize untrusted text for HUMAN terminal DISPLAY: a strict superset of the
+/// terminal-control scrub that ALSO drops the deceptive / invisible Unicode
+/// classes the terminal scrub leaves intact.
+///
+/// Two passes:
+/// 1. [`sanitize_text_str`] strips ESC/CSI/OSC/APC/DCS escapes, bare CR, C0
+///    controls (except `\t`/`\n`), DEL, the strippable zero-width set, and Unicode
+///    Tags: everything that corrupts a terminal.
+/// 2. The display-DECEPTION codepoints that survive (1) are dropped: bidi
+///    controls, variation selectors, Hangul fillers, invisible math operators, and
+///    stealth whitespace, plus the full zero-width / Unicode-Tag predicate sets.
+///    The latter two are defensive: they also catch the zero-width chars (1) does
+///    not strip, e.g. U+180E, U+034F, U+00AD. A bidi override or Hangul filler in
+///    a finding title would otherwise render deceptively.
+///
+/// This is DISPLAY sanitization ONLY: it strips deceptive / invisible codepoints
+/// but does NOT normalize (no confusable fold, leetspeak, or base64 / hex decode).
+/// Those detection-only transforms live in [`crate::deobfuscate`] and must stay
+/// separate (CLAUDE.md: "do not consolidate the two normalizers"). `\t` / `\n` /
+/// CRLF are kept (the CLI wrapper applies per-field newline policy). The result is
+/// always valid UTF-8 (whole chars are dropped, never split).
+pub fn sanitize_for_display(s: &str) -> String {
+    sanitize_text_str(s)
+        .chars()
+        .filter(|&ch| {
+            !(crate::extract::is_bidi_control(ch)
+                || crate::extract::is_zero_width(ch)
+                || crate::extract::is_unicode_tag(ch)
+                || crate::extract::is_variation_selector(ch)
+                || crate::extract::is_hangul_filler(ch)
+                || crate::extract::is_invisible_math_operator(ch)
+                || crate::extract::is_invisible_whitespace(ch))
+        })
+        .collect()
+}
+
 /// Strip ANSI/OSC/APC/DCS escapes and zero-width chars from `chunk` into `out`.
 /// Mirrors `tirith view` so both surfaces sanitize identically. Keeps `\t`/`\n`
 /// and CRLF; drops bare CR (display-overwriting), other C0 controls, and DEL.
@@ -903,6 +939,26 @@ mod tests {
     fn osc52_text() -> String {
         // A complete OSC 52 (clipboard-write) sequence.
         "before-payload-\x1B]52;c;aGVsbG8=\x07-after-payload".to_string()
+    }
+
+    #[test]
+    fn sanitize_for_display_strips_terminal_and_deceptive_unicode() {
+        // Terminal-control: CSI screen-clear and OSC52 clipboard-write are gone.
+        assert_eq!(sanitize_for_display("a\x1b[2Jb"), "ab");
+        assert_eq!(sanitize_for_display("x\x1b]52;c;aGk=\x07y"), "xy");
+        // Zero-width (U+200B) and Unicode Tag (U+E0001).
+        assert_eq!(sanitize_for_display("a\u{200B}b"), "ab");
+        assert_eq!(sanitize_for_display("a\u{E0001}b"), "ab");
+        // Deceptive classes the terminal scrub does NOT strip: bidi override
+        // (U+202E), variation selector (U+FE0F), Hangul filler (U+3164), invisible
+        // math operator (U+2061).
+        assert_eq!(sanitize_for_display("a\u{202E}b"), "ab");
+        assert_eq!(sanitize_for_display("a\u{FE0F}b"), "ab");
+        assert_eq!(sanitize_for_display("a\u{3164}b"), "ab");
+        assert_eq!(sanitize_for_display("a\u{2061}b"), "ab");
+        // Plain ASCII plus \n / \t are preserved (newline policy is the CLI
+        // wrapper's job, not the core display scrub's).
+        assert_eq!(sanitize_for_display("hello\tworld\nok"), "hello\tworld\nok");
     }
 
     #[test]

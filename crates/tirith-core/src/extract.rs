@@ -949,7 +949,7 @@ mod output_scan_tests {
 }
 
 /// Check if a character is a bidi control.
-fn is_bidi_control(ch: char) -> bool {
+pub(crate) fn is_bidi_control(ch: char) -> bool {
     matches!(
         ch,
         '\u{200E}' // LRM
@@ -967,7 +967,7 @@ fn is_bidi_control(ch: char) -> bool {
 }
 
 /// Check if a character is zero-width.
-fn is_zero_width(ch: char) -> bool {
+pub(crate) fn is_zero_width(ch: char) -> bool {
     matches!(
         ch,
         '\u{180E}' // Mongolian Vowel Separator
@@ -982,17 +982,17 @@ fn is_zero_width(ch: char) -> bool {
 }
 
 /// Check if a character is a Unicode Tag (hidden ASCII encoding).
-fn is_unicode_tag(ch: char) -> bool {
+pub(crate) fn is_unicode_tag(ch: char) -> bool {
     ('\u{E0000}'..='\u{E007F}').contains(&ch)
 }
 
 /// Check if a character is a variation selector (VS1-16 or VS17-256).
-fn is_variation_selector(ch: char) -> bool {
+pub(crate) fn is_variation_selector(ch: char) -> bool {
     ('\u{FE00}'..='\u{FE0F}').contains(&ch) || ('\u{E0100}'..='\u{E01EF}').contains(&ch)
 }
 
 /// Check if a character is a Hangul Filler (invisible Korean character).
-fn is_hangul_filler(ch: char) -> bool {
+pub(crate) fn is_hangul_filler(ch: char) -> bool {
     matches!(
         ch,
         '\u{3164}' // Hangul Filler
@@ -1003,14 +1003,14 @@ fn is_hangul_filler(ch: char) -> bool {
 
 /// Check if a character is an invisible math operator (Function Application,
 /// Invisible Times, Invisible Separator, Invisible Plus).
-fn is_invisible_math_operator(ch: char) -> bool {
+pub(crate) fn is_invisible_math_operator(ch: char) -> bool {
     ('\u{2061}'..='\u{2064}').contains(&ch)
 }
 
 /// Stealth-encoding whitespace variant (steganographic spaces). Layout spaces
 /// (U+00A0 NBSP, U+202F Narrow NBSP, U+3000 Ideographic) are excluded — they
 /// appear legitimately in localized prose.
-fn is_invisible_whitespace(ch: char) -> bool {
+pub(crate) fn is_invisible_whitespace(ch: char) -> bool {
     matches!(
         ch,
         '\u{2000}' // En Quad
