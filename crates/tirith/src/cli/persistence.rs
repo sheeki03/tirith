@@ -208,10 +208,12 @@ fn print_human_scan(entries: &[PersistenceEntry], snapshot_note: &str) {
     );
     for e in entries {
         let state = if e.present { "present" } else { "absent " };
+        // `location` can be a DISCOVERED launch-agent / systemd-unit filename
+        // (attacker-named via read_dir), so sanitize it like the diff path does.
         eprintln!(
             "  [{state}] {:<16} {}\n             sha256: {}",
             e.kind.as_str(),
-            e.location,
+            super::sanitize_for_human_output(&e.location, false),
             e.sha256,
         );
     }
@@ -252,20 +254,26 @@ fn print_human_watch_poll(poll: u64, findings: &[PersistenceFinding]) {
 }
 
 fn print_one_finding(f: &PersistenceFinding) {
+    // location/change/added-lines are attacker-controlled file content (a persisted
+    // change diff); credential-redaction is not terminal-sanitization, so each is
+    // also routed through the display scrub.
     eprintln!(
         "  [{}] {}  ({})\n      surface: {}\n      change:  {}",
         severity_label(f.severity),
         f.rule_id,
         f.kind.as_str(),
-        f.location,
-        f.change,
+        super::sanitize_for_human_output(&f.location, false),
+        super::sanitize_for_human_output(&f.change, false),
     );
     if f.added_lines.is_empty() {
         eprintln!("      added:   (no line content — tracked by hash)\n");
     } else {
         eprintln!("      added lines (credential-redacted):");
         for line in &f.added_lines {
-            eprintln!("        + {line}");
+            eprintln!(
+                "        + {}",
+                super::sanitize_for_human_output(line, false)
+            );
         }
         eprintln!();
     }

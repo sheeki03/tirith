@@ -16632,3 +16632,249 @@ fn pkg_receipt_show_accepts_an_untampered_receipt() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// PR1: human-output sanitization sweep.
+//
+// These drive REAL attacker bytes into the CLI human renderers (paths, finding
+// descriptions, scan roots) and assert the display scrub neutralizes them, while
+// machine (JSON) output is intentionally left intact. The unit tests beside the
+// helper cover the per-codepoint matrix; these prove the WIRING end-to-end.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One representative of every class the display scrub must drop, bracketed by
+/// visible ASCII anchors so we can prove the readable text survives and that the
+/// embedded newline cannot forge a fresh top-level row: CSI, OSC52 (+BEL),
+/// zero-width, bidi override, Unicode tag, variation selector, Hangul filler,
+/// invisible math operator, and an embedded `\n`. The source is pure ASCII (escape
+/// notation); the bytes only materialize at runtime.
+const ATTACK_PAYLOAD: &str = concat!(
+    "evilSTART",
+    "\x1b[2J",                // CSI: clear screen
+    "\x1b]52;c;aGVsbG8=\x07", // OSC 52: clipboard write, BEL-terminated
+    "\u{200b}",               // zero-width space
+    "\u{202e}",               // right-to-left override (bidi)
+    "\u{e0001}",              // Unicode tag
+    "\u{fe0f}",               // variation selector
+    "\u{3164}",               // Hangul filler
+    "\u{2061}",               // function application (invisible math)
+    "\n",                     // would forge a new terminal row
+    "ENDvis",
+);
+
+/// Assert no attacker-class byte/codepoint reached `human` (raw output bytes) and
+/// that both visible anchors survived the scrub.
+fn assert_attack_codepoints_stripped(human: &[u8]) {
+    assert!(
+        !human.contains(&0x1b),
+        "raw ESC (0x1b) must never reach human output"
+    );
+    assert!(
+        !human.contains(&0x07),
+        "raw BEL (0x07) must never reach human output"
+    );
+    let s = String::from_utf8_lossy(human);
+    for (cp, name) in [
+        ('\u{200b}', "zero-width space"),
+        ('\u{202e}', "bidi override"),
+        ('\u{e0001}', "Unicode tag"),
+        ('\u{fe0f}', "variation selector"),
+        ('\u{3164}', "Hangul filler"),
+        ('\u{2061}', "invisible math operator"),
+    ] {
+        assert!(
+            !s.contains(cp),
+            "{name} (U+{:04X}) must be stripped from human output",
+            cp as u32
+        );
+    }
+    assert!(
+        s.contains("evilSTART"),
+        "leading visible anchor must survive the scrub; got: {s:?}"
+    );
+    assert!(
+        s.contains("ENDvis"),
+        "trailing visible anchor must survive the scrub; got: {s:?}"
+    );
+}
+
+/// Build a `.mcp.json` under `dir` whose single server NAME is `ATTACK_PAYLOAD`
+/// and whose URL is plain HTTP, so a scan fires `McpInsecureServer` with the name
+/// echoed verbatim into the finding DESCRIPTION. serde_json escapes every control
+/// byte, so the file on disk is valid JSON; tirith decodes the name back to the
+/// raw bytes in memory. Returns the file path.
+fn write_attacker_mcp_config(dir: &std::path::Path) -> PathBuf {
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        ATTACK_PAYLOAD.to_string(),
+        serde_json::json!({ "url": "http://example.test/mcp" }),
+    );
+    let config = serde_json::json!({ "mcpServers": servers });
+    let path = dir.join(".mcp.json");
+    fs::write(
+        &path,
+        serde_json::to_string(&config).expect("serialize mcp config"),
+    )
+    .expect("write .mcp.json");
+    path
+}
+
+#[test]
+fn scan_human_output_neutralizes_attacker_finding_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let mcp = write_attacker_mcp_config(dir.path());
+
+    let out = tirith_in_proj(dir.path())
+        .arg("scan")
+        .arg(&mcp)
+        .output()
+        .expect("failed to run tirith scan");
+
+    // The MCP insecure-HTTP finding is Critical, so the scan exits non-zero.
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "an insecure-HTTP MCP server must be flagged (non-zero exit); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Human findings render to stderr; the description echoed the server name.
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("connects over unencrypted HTTP"),
+        "the MCP finding description must be present in human output; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_attack_codepoints_stripped(&out.stderr);
+
+    // The description is a multi-line field (allow_multiline=true): the injected
+    // newline is KEPT but re-indented, so the continuation never starts at column 0
+    // where it could impersonate a fresh tirith output row.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.lines().any(|l| l.starts_with("ENDvis")),
+        "an injected newline must be re-indented, not forge a column-0 row; stderr: {stderr}"
+    );
+    let end_line = stderr
+        .lines()
+        .find(|l| l.contains("ENDvis"))
+        .expect("trailing anchor line");
+    assert!(
+        end_line.starts_with(char::is_whitespace),
+        "the continuation row must be indented; got: {end_line:?}"
+    );
+}
+
+#[test]
+fn scan_machine_json_is_not_display_sanitized() {
+    let dir = tempfile::tempdir().unwrap();
+    let mcp = write_attacker_mcp_config(dir.path());
+
+    let out = tirith_in_proj(dir.path())
+        .arg("scan")
+        .arg(&mcp)
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to run tirith scan --format json");
+
+    // Machine output must stay VALID JSON ...
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan --format json must emit valid JSON");
+    assert!(parsed.is_object(), "scan JSON root should be an object");
+
+    // ... and must NOT be display-sanitized: the control byte survives JSON-escaped
+    // and the bidi override survives as a raw codepoint (serde only escapes C0).
+    let raw = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        raw.contains("\\u001b"),
+        "machine JSON must PRESERVE the ESC byte (JSON-escaped), not strip it"
+    );
+    assert!(
+        raw.contains('\u{202e}'),
+        "machine JSON must PRESERVE the bidi override codepoint (it is not a terminal)"
+    );
+}
+
+#[test]
+fn policy_test_file_human_output_neutralizes_attacker_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let mcp = write_attacker_mcp_config(dir.path());
+
+    let out = tirith_in_proj(dir.path())
+        .args(["policy", "test", "--file"])
+        .arg(&mcp)
+        .output()
+        .expect("failed to run tirith policy test --file");
+
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("connects over unencrypted HTTP"),
+        "policy test --file must render the MCP finding; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_attack_codepoints_stripped(&out.stderr);
+}
+
+// File names can carry control bytes / newlines on Unix; Windows rejects them, so
+// the attacker-named-path vectors are Unix-only.
+
+#[cfg(unix)]
+#[test]
+fn scan_single_file_human_output_neutralizes_attacker_path() {
+    let dir = tempfile::tempdir().unwrap();
+    // The scanned file's NAME carries the full attack matrix; benign content so the
+    // "no issues found" branch prints (and sanitizes) the path label.
+    let path = dir.path().join(ATTACK_PAYLOAD);
+    fs::write(&path, b"clean content\n").expect("write attacker-named file");
+
+    let out = tirith_in_proj(dir.path())
+        .arg("scan")
+        .arg(&path)
+        .output()
+        .expect("failed to run tirith scan on attacker-named file");
+
+    assert_attack_codepoints_stripped(&out.stderr);
+    // Single-line label (allow_multiline=false): the newline is dropped outright,
+    // so both anchors land on ONE line — no forged row.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("evilSTART"))
+        .expect("path label line");
+    assert!(
+        line.contains("ENDvis"),
+        "an embedded newline in the path must be stripped (one line), not forge a row; got: {line:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn view_human_output_neutralizes_attacker_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(ATTACK_PAYLOAD);
+    fs::write(&path, b"clean content\n").expect("write attacker-named file");
+
+    let out = tirith_in_proj(dir.path())
+        .arg("view")
+        .arg(&path)
+        .output()
+        .expect("failed to run tirith view on attacker-named file");
+
+    // `tirith view` prints the banner + path label to stderr regardless of findings.
+    assert_attack_codepoints_stripped(&out.stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn ecosystem_scan_human_output_neutralizes_attacker_scan_root() {
+    let parent = tempfile::tempdir().unwrap();
+    // An attacker-named directory with no manifests: scan_root is echoed into the
+    // "no dependency manifests found" line and must be sanitized.
+    let target = parent.path().join(ATTACK_PAYLOAD);
+    fs::create_dir(&target).expect("create attacker-named dir");
+
+    let out = tirith_in_proj(parent.path())
+        .args(["ecosystem", "scan"])
+        .arg(&target)
+        .output()
+        .expect("failed to run tirith ecosystem scan");
+
+    assert_attack_codepoints_stripped(&out.stderr);
+}

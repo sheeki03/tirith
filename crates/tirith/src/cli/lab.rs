@@ -287,7 +287,12 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
                 if pass { "PASS" } else { "FAIL" }
             );
             for f in &verdict.findings {
-                println!("    [{}] {} — {}", f.severity, f.rule_id, f.title);
+                println!(
+                    "    [{}] {} — {}",
+                    f.severity,
+                    f.rule_id,
+                    super::sanitize_for_human_output(&f.title, false)
+                );
             }
         }
 

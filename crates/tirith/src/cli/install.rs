@@ -1043,8 +1043,16 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
     }
     for finding in &plan.verdict.findings {
         let sev = tirith_core::style::severity_label(&finding.severity, s);
-        eprintln!("    {} {} — {}", sev, finding.rule_id, finding.title);
-        eprintln!("      {}", finding.description);
+        eprintln!(
+            "    {} {} — {}",
+            sev,
+            finding.rule_id,
+            super::sanitize_for_human_output(&finding.title, false)
+        );
+        eprintln!(
+            "      {}",
+            super::sanitize_for_human_output(&finding.description, true)
+        );
     }
 
     if !plan.notes.is_empty() {
@@ -1102,8 +1110,16 @@ fn print_url_preflight_human(url: &str, verdict: &Verdict) {
     }
     for finding in &verdict.findings {
         let sev = tirith_core::style::severity_label(&finding.severity, s);
-        eprintln!("    {} {} — {}", sev, finding.rule_id, finding.title);
-        eprintln!("      {}", finding.description);
+        eprintln!(
+            "    {} {} — {}",
+            sev,
+            finding.rule_id,
+            super::sanitize_for_human_output(&finding.title, false)
+        );
+        eprintln!(
+            "      {}",
+            super::sanitize_for_human_output(&finding.description, true)
+        );
     }
 }
 

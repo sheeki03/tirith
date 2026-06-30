@@ -159,14 +159,16 @@ fn print_human_explain(name: &str, ex: &aliases::AliasExplain) {
 }
 
 fn print_one_finding(f: &AliasFinding) {
+    // name/location/detail come from the user's shell-config aliases, an attacker
+    // persistence surface; sanitize each before display.
     eprintln!(
         "  [{}] {}\n      name:     {} ({})\n      location: {}\n      detail:   {}\n",
         severity_label(f.severity),
         f.rule_id,
-        f.name,
+        super::sanitize_for_human_output(&f.name, false),
         f.kind.as_str(),
-        f.location,
-        f.detail,
+        super::sanitize_for_human_output(&f.location, false),
+        super::sanitize_for_human_output(&f.detail, false),
     );
 }
 

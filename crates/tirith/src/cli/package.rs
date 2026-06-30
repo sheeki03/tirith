@@ -374,13 +374,22 @@ fn print_inspect_human(
         } else {
             ""
         };
-        eprintln!("  {}{status}", m.path.display());
+        // Member paths and violation details are attacker-controlled artifact
+        // content (a crafted wheel member can carry escapes/newlines).
+        eprintln!(
+            "  {}{status}",
+            super::sanitize_for_human_output(&m.path.display().to_string(), false)
+        );
         for v in &m.inspected.violation_details {
-            eprintln!("    - {v}");
+            eprintln!("    - {}", super::sanitize_for_human_output(v, false));
         }
     }
     for gap in &set.gaps {
-        eprintln!("  not inspected: {} ({})", gap.location, gap.kind.as_str());
+        eprintln!(
+            "  not inspected: {} ({})",
+            super::sanitize_for_human_output(&gap.location.to_string(), false),
+            gap.kind.as_str()
+        );
     }
 
     if verdict.findings.is_empty() {
@@ -396,13 +405,18 @@ fn print_inspect_human(
             &finding.severity,
             tirith_core::style::Stream::Stdout,
         );
-        println!("  {} {} — {}", sev, finding.rule_id, finding.title);
+        println!(
+            "  {} {} — {}",
+            sev,
+            finding.rule_id,
+            super::sanitize_for_human_output(&finding.title, false)
+        );
         // Surface the member-qualified location lines from the evidence so a
         // reviewer sees `foo.whl!/member`, not just the outer wheel.
         for ev in &finding.evidence {
             if let tirith_core::verdict::Evidence::Text { detail } = ev {
                 if detail.starts_with("location:") || detail.contains("!/") {
-                    println!("    {detail}");
+                    println!("    {}", super::sanitize_for_human_output(detail, true));
                 }
             }
         }

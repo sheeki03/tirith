@@ -98,11 +98,6 @@ fn write_json_to<W: Write, T: serde::Serialize>(out: &mut W, value: &T) -> bool 
 ///
 /// Callers MUST pass only the untrusted VALUE, never a whole formatted line: the
 /// display scrub removes ALL ANSI, including tirith's own severity colors.
-///
-/// Not yet wired into the CLI renderers; that lands in the next checkpoint of this
-/// PR. `#[allow(dead_code)]` bridges the gap in this binary crate until those call
-/// sites arrive.
-#[allow(dead_code)]
 pub fn sanitize_for_human_output(s: &str, allow_multiline: bool) -> String {
     let cleaned = tirith_core::mcp::output_filter::sanitize_for_display(s);
     if allow_multiline {

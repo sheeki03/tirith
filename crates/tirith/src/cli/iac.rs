@@ -272,7 +272,10 @@ pub fn check_plan(plan_path: &Path, forced_tool: Option<&str>, json: bool) -> i3
 
 fn emit_check_plan_human(plan_path: &Path, sha: &str, summary: &PlanSummary, purged: usize) {
     eprintln!("tirith iac check-plan:");
-    eprintln!("  plan:        {}", plan_path.display());
+    eprintln!(
+        "  plan:        {}",
+        super::sanitize_for_human_output(&plan_path.display().to_string(), false)
+    );
     eprintln!("  tool:        {}", summary.tool.as_str());
     eprintln!("  sha256:      {}", sha);
     eprintln!(
@@ -280,27 +283,38 @@ fn emit_check_plan_human(plan_path: &Path, sha: &str, summary: &PlanSummary, pur
         summary.create, summary.update, summary.destroy, summary.total_changes,
     );
     if summary.has_high_risk_changes() {
+        // Resource addresses are parsed from the (untrusted) plan file, so a crafted
+        // module/resource name could carry escapes; sanitize each joined list.
         eprintln!("  high-risk categories:");
         if !summary.iam_changes.is_empty() {
-            eprintln!("    iam:                {}", summary.iam_changes.join(", "));
+            eprintln!(
+                "    iam:                {}",
+                super::sanitize_for_human_output(&summary.iam_changes.join(", "), false)
+            );
         }
         if !summary.security_group_changes.is_empty() {
             eprintln!(
                 "    security_groups:    {}",
-                summary.security_group_changes.join(", ")
+                super::sanitize_for_human_output(&summary.security_group_changes.join(", "), false)
             );
         }
         if !summary.public_bucket_changes.is_empty() {
             eprintln!(
                 "    public_buckets:     {}",
-                summary.public_bucket_changes.join(", ")
+                super::sanitize_for_human_output(&summary.public_bucket_changes.join(", "), false)
             );
         }
         if !summary.db_changes.is_empty() {
-            eprintln!("    db_instances:       {}", summary.db_changes.join(", "));
+            eprintln!(
+                "    db_instances:       {}",
+                super::sanitize_for_human_output(&summary.db_changes.join(", "), false)
+            );
         }
         if !summary.lb_changes.is_empty() {
-            eprintln!("    load_balancers:     {}", summary.lb_changes.join(", "));
+            eprintln!(
+                "    load_balancers:     {}",
+                super::sanitize_for_human_output(&summary.lb_changes.join(", "), false)
+            );
         }
     }
     if purged > 0 {

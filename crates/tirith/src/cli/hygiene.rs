@@ -81,15 +81,17 @@ pub fn fix(dry_run: bool, yes: bool, json: bool) -> i32 {
             continue;
         };
 
+        // The scanned path is untrusted (a repo-root stray file can be
+        // attacker-named); sanitize the DISPLAY copy. `apply_chmod` still uses the
+        // real `f.path`.
+        let path = super::sanitize_for_human_output(&f.path.display().to_string(), false);
+
         if dry_run {
             results.push(FixResult::would_chmod(f, mode));
             if !json {
                 eprintln!(
                     "would chmod {:04o} {}  ({} → {})",
-                    mode,
-                    f.path.display(),
-                    f.actual,
-                    f.expected
+                    mode, path, f.actual, f.expected
                 );
             }
             continue;
@@ -97,11 +99,11 @@ pub fn fix(dry_run: bool, yes: bool, json: bool) -> i32 {
 
         // Per-finding confirmation unless --yes. `confirm` is TTY-gated and
         // returns false in a non-interactive context without --yes.
-        let prompt = format!("chmod {:04o} {}?", mode, f.path.display());
+        let prompt = format!("chmod {mode:04o} {path}?");
         if !confirm(&prompt, yes) {
             results.push(FixResult::skipped(f, mode));
             if !json {
-                eprintln!("skipped {}", f.path.display());
+                eprintln!("skipped {path}");
             }
             continue;
         }
@@ -110,14 +112,14 @@ pub fn fix(dry_run: bool, yes: bool, json: bool) -> i32 {
             Ok(()) => {
                 results.push(FixResult::applied(f, mode));
                 if !json {
-                    eprintln!("chmod {:04o} {}", mode, f.path.display());
+                    eprintln!("chmod {mode:04o} {path}");
                 }
             }
             Err(e) => {
                 had_error = true;
                 results.push(FixResult::failed(f, mode, &e.to_string()));
                 if !json {
-                    eprintln!("FAILED chmod {:04o} {}: {e}", mode, f.path.display());
+                    eprintln!("FAILED chmod {mode:04o} {path}: {e}");
                 }
             }
         }
@@ -177,7 +179,7 @@ fn print_human_scan(findings: &[HygieneFinding]) {
             severity_label(f.severity),
             f.rule_id,
             f.category.as_str(),
-            f.path.display(),
+            super::sanitize_for_human_output(&f.path.display().to_string(), false),
             f.expected,
             f.actual,
             f.fix_suggestion,
@@ -214,7 +216,7 @@ fn print_human_fix_summary(dry_run: bool, results: &[FixResult], manual: &[&Hygi
             eprintln!(
                 "  [{}] {}\n      {}",
                 severity_label(f.severity),
-                f.path.display(),
+                super::sanitize_for_human_output(&f.path.display().to_string(), false),
                 f.fix_suggestion
             );
         }

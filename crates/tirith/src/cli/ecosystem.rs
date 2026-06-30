@@ -281,15 +281,14 @@ fn print_json(report: &EcosystemScanReport) -> bool {
 fn print_human(report: &EcosystemScanReport) {
     let finding_count = report.verdict.findings.len();
 
+    // scan_root and the discovered manifest paths/names are untrusted (the scanned
+    // tree can hold attacker-named files); sanitize each before display.
+    let scan_root = super::sanitize_for_human_output(&report.scan_root, false);
     if report.manifests.is_empty() {
-        eprintln!(
-            "tirith ecosystem scan: {} — no dependency manifests found",
-            report.scan_root
-        );
+        eprintln!("tirith ecosystem scan: {scan_root} — no dependency manifests found");
     } else {
         eprintln!(
-            "tirith ecosystem scan: {} — {} manifest(s), {} dependencies, {} finding(s)",
-            report.scan_root,
+            "tirith ecosystem scan: {scan_root} — {} manifest(s), {} dependencies, {} finding(s)",
             report.manifests.len(),
             report.dependency_count,
             finding_count,
@@ -300,7 +299,7 @@ fn print_human(report: &EcosystemScanReport) {
         eprintln!();
         eprintln!("  manifests:");
         for m in &report.manifests {
-            eprintln!("    - {m}");
+            eprintln!("    - {}", super::sanitize_for_human_output(m, false));
         }
     }
 
@@ -308,9 +307,13 @@ fn print_human(report: &EcosystemScanReport) {
         eprintln!();
         eprintln!("  notes:");
         for note in &report.notes {
+            let note_text = super::sanitize_for_human_output(&note.note, false);
             match &note.manifest {
-                Some(m) => eprintln!("    - [{m}] {}", note.note),
-                None => eprintln!("    - {}", note.note),
+                Some(m) => eprintln!(
+                    "    - [{}] {note_text}",
+                    super::sanitize_for_human_output(m, false)
+                ),
+                None => eprintln!("    - {note_text}"),
             }
         }
     }
@@ -341,8 +344,16 @@ fn print_human(report: &EcosystemScanReport) {
                 &finding.severity,
                 tirith_core::style::Stream::Stdout,
             );
-            println!("  {} {} — {}", sev, finding.rule_id, finding.title);
-            println!("    {}", finding.description);
+            println!(
+                "  {} {} — {}",
+                sev,
+                finding.rule_id,
+                super::sanitize_for_human_output(&finding.title, false)
+            );
+            println!(
+                "    {}",
+                super::sanitize_for_human_output(&finding.description, true)
+            );
         }
     }
 
