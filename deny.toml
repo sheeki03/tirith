@@ -19,6 +19,14 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+    # lopdf 0.34 stack-overflow DoS: a crafted PDF with deeply nested arrays/dicts
+    # aborts the process (uncatchable SIGABRT) during parse. The fix (lopdf >=0.42)
+    # requires Rust 1.85, above tirith's MSRV 1.83, so we cannot bump lopdf. The
+    # only untrusted entry point, check_pdf() in rules/rendered.rs, runs a
+    # nesting-depth preflight (PDF_NESTING_DEPTH_CAP) that rejects the bomb BEFORE
+    # load_mem is ever called, so the crash path is blocked. Remove this ignore
+    # (and the .cargo/audit.toml twin) once MSRV/lopdf can move.
+    "RUSTSEC-2026-0187",
 ]
 
 [licenses]
