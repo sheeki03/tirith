@@ -23,8 +23,9 @@ use serde::Serialize;
 use crate::package_risk::{
     self, ApiSignals, ContentSignals, NameVsPopular, PackageSignals, RiskBreakdown,
 };
-use crate::threatdb::{Ecosystem, ThreatDb};
+use crate::threatdb::{Ecosystem, PackageThreatAssessment, ThreatDb};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings, Verdict};
+use crate::version_intent::VersionIntent;
 
 /// Maximum directory depth the manifest walk descends.
 pub const MAX_WALK_DEPTH: usize = 6;
@@ -206,15 +207,43 @@ pub struct DeclaredDependency {
     /// The ecosystem the manifest is for.
     #[serde(serialize_with = "serialize_ecosystem")]
     pub ecosystem: Ecosystem,
-    /// The version / version-range string as written, when the manifest gives one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
+    /// How the version / version-range was written, when the manifest gives one.
+    /// Serializes as the version string (or is omitted when unspecified), so the
+    /// JSON shape is unchanged from the prior `Option<String>` field; the typed
+    /// form lets the threat assessment tell an exact pin from a range.
+    #[serde(
+        serialize_with = "serialize_version_intent",
+        skip_serializing_if = "version_intent_is_unspecified"
+    )]
+    pub version: VersionIntent,
     /// Whether the manifest declares this as a development-only dependency.
     pub dev: bool,
 }
 
 fn serialize_ecosystem<S: serde::Serializer>(eco: &Ecosystem, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&eco.to_string())
+}
+
+/// Serialize a [`VersionIntent`] as the original version string, preserving the
+/// JSON shape of the former `version: Option<String>` field. `Unspecified` is
+/// skipped via [`version_intent_is_unspecified`], so this only runs for the
+/// other variants (which all have a string form).
+fn serialize_version_intent<S: serde::Serializer>(
+    intent: &VersionIntent,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match intent.as_version_str() {
+        Some(v) => s.serialize_str(v),
+        // Unreachable in practice (Unspecified is skipped), but serialize a unit
+        // rather than panic if the skip predicate is ever bypassed.
+        None => s.serialize_none(),
+    }
+}
+
+/// Skip predicate matching the old `Option::is_none`: omit the field only when
+/// no version was given.
+fn version_intent_is_unspecified(intent: &VersionIntent) -> bool {
+    matches!(intent, VersionIntent::Unspecified)
 }
 
 /// Parse a manifest's text into the dependencies it declares. Total, never
@@ -251,16 +280,63 @@ fn parse_package_json(text: &str) -> Option<Vec<DeclaredDependency>> {
                 if name.is_empty() {
                     continue;
                 }
+                let version = match ver.as_str().filter(|s| !s.is_empty()) {
+                    // package.json declares a semver range/version (not fully
+                    // parsed for npm). A full bare version (`1.2.3`) is an exact
+                    // pin; a PARTIAL bare version (`1`, `1.2`) is an X-range, not
+                    // a too-narrow exact; explicit ranges stay unresolved.
+                    Some(v) => npm_manifest_intent(v),
+                    None => VersionIntent::Unspecified,
+                };
                 out.push(DeclaredDependency {
                     name: name.to_string(),
                     ecosystem: Ecosystem::Npm,
-                    version: ver.as_str().map(str::to_string).filter(|s| !s.is_empty()),
+                    version,
                     dev,
                 });
             }
         }
     }
     Some(out)
+}
+
+/// Classify an npm `package.json` version requirement. node-semver treats a full
+/// bare version (`1.2.3`) as an exact pin but a PARTIAL bare version as an X-range
+/// (`1` == `1.x.x`, `1.2` == `1.2.x`); explicit operators stay unresolved. This
+/// keeps a partial spec from being mistaken for a too-narrow exact match.
+pub(crate) fn npm_manifest_intent(spec: &str) -> VersionIntent {
+    match VersionIntent::from_explicit_version(spec) {
+        VersionIntent::Exact(v) => match npm_partial_xrange(&v) {
+            Some(range) => VersionIntent::from_pep440_specifier(&range),
+            None => VersionIntent::Exact(v),
+        },
+        other => other,
+    }
+}
+
+/// Map an npm PARTIAL version (`1`, `1.2`) to an explicit `>=lo,<hi` X-range, or
+/// `None` for a full `x.y.z` version (an exact pin) or any prerelease/build tail.
+fn npm_partial_xrange(v: &str) -> Option<String> {
+    if v.contains('-') || v.contains('+') {
+        return None;
+    }
+    let body = v.strip_prefix(['v', 'V']).unwrap_or(v);
+    let nums: Vec<u64> = body
+        .split('.')
+        .map(|s| s.parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    // `checked_add` so a pathological segment (`18446744073709551615`) returns None
+    // (treated as an exact pin) instead of overflowing: a panic in debug, or a bogus
+    // `>=MAX,<0` range in release that would never match.
+    match nums.as_slice() {
+        [major] => major
+            .checked_add(1)
+            .map(|hi| format!(">={major}.0.0,<{hi}.0.0")),
+        [major, minor] => minor
+            .checked_add(1)
+            .map(|hi| format!(">={major}.{minor}.0,<{major}.{hi}.0")),
+        _ => None,
+    }
 }
 
 /// npm `package-lock.json`: the fully-resolved tree. v2/v3 keys `packages` by
@@ -287,7 +363,8 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
                 out.push(DeclaredDependency {
                     name,
                     ecosystem: Ecosystem::Npm,
-                    version,
+                    // A lockfile pins a concrete resolved version.
+                    version: lock_version_intent(version),
                     dev,
                 });
             }
@@ -300,6 +377,16 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
     }
 
     Some(out)
+}
+
+/// Map a lockfile's resolved version string to a [`VersionIntent`]. A lockfile
+/// pins one concrete version, so a present value is `Resolved`; an absent one is
+/// `Unspecified`.
+fn lock_version_intent(version: Option<String>) -> VersionIntent {
+    match version {
+        Some(v) => VersionIntent::Resolved(v),
+        None => VersionIntent::Unspecified,
+    }
 }
 
 /// Extract the package name from a `package-lock.json` v2/v3 path key — the
@@ -339,7 +426,8 @@ fn collect_lock_v1_deps(
             out.push(DeclaredDependency {
                 name: name.to_string(),
                 ecosystem: Ecosystem::Npm,
-                version,
+                // A lockfile pins a concrete resolved version.
+                version: lock_version_intent(version),
                 dev,
             });
         }
@@ -376,7 +464,10 @@ fn parse_requirements_txt(text: &str) -> Vec<DeclaredDependency> {
             out.push(DeclaredDependency {
                 name,
                 ecosystem: Ecosystem::PyPI,
-                version: None,
+                // Capture the PEP 508 version specifier so a real pin (`==1.4.0`)
+                // is assessed (Exact/Constraint) instead of degrading to a
+                // spurious "unresolved" warning; a bare name stays Unspecified.
+                version: VersionIntent::from_pep440_specifier(&python_requirement_spec(line)),
                 dev: false,
             });
         }
@@ -403,6 +494,45 @@ fn python_requirement_name(line: &str) -> Option<String> {
     }
 }
 
+/// Extract the version specifier from a PEP 508 requirement line: the part after
+/// the name and optional `[extras]`. Returns an empty string for a bare name (which
+/// `from_pep440_specifier` maps to Unspecified). A `;` environment marker is KEPT in
+/// the specifier so a marker-qualified requirement degrades to an unresolved
+/// Constraint rather than a false exact pin.
+fn python_requirement_spec(line: &str) -> String {
+    // Drop any `[extras]` so its contents are not mistaken for a specifier. The
+    // environment marker is KEPT: a marker-qualified requirement only applies under an
+    // unsupported condition, so keeping the `;` makes `from_pep440_specifier` reject it
+    // (its `looks_like_plain_version` rejects `;`) and degrade to unresolved.
+    let mut buf = String::with_capacity(line.len());
+    let mut depth = 0u32;
+    for c in line.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => buf.push(c),
+            _ => {}
+        }
+    }
+    // Drop an inline `#` comment (pip treats ` #` / `\t#` as a comment start): without this,
+    // `malware==1.0.0 # pinned` carries the comment into the version token, so an EXACT pin
+    // degrades to a Constraint/Unresolved - a confirmed Critical hit silently downgraded to
+    // a Warn, and a safe pin (`malware==99.9.9 # not the bad one`) gets a spurious warn.
+    let buf = match buf.split_once(" #").or_else(|| buf.split_once("\t#")) {
+        Some((before, _)) => before.trim_end().to_string(),
+        None => buf,
+    };
+    // Search for a version operator ONLY in the part before the `;` marker, so a
+    // comparator INSIDE the marker (`python_version < "3.9"`) is not mistaken for the
+    // dependency's version. When a real operator IS found before the marker, keep the
+    // whole tail (marker included) so `from_pep440_specifier` still rejects the marker.
+    let before_marker = buf.split(';').next().unwrap_or(buf.as_str());
+    match before_marker.find(['=', '<', '>', '!', '~']) {
+        Some(i) => buf[i..].trim().to_string(),
+        None => String::new(),
+    }
+}
+
 /// Python `pyproject.toml`: PEP 621 `[project].dependencies` /
 /// `[project.optional-dependencies]`, plus Poetry's
 /// `[tool.poetry.dependencies]` / `[tool.poetry.group.*.dependencies]`.
@@ -411,24 +541,25 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
-    let mut push = |name: &str, dev: bool, out: &mut Vec<DeclaredDependency>| {
-        let name = name.trim();
-        if name.is_empty() || !is_plausible_package_name(name) {
-            return;
-        }
-        // `python` is the interpreter constraint in Poetry tables, not a dep.
-        if name.eq_ignore_ascii_case("python") {
-            return;
-        }
-        if seen.insert(name.to_lowercase()) {
-            out.push(DeclaredDependency {
-                name: name.to_string(),
-                ecosystem: Ecosystem::PyPI,
-                version: None,
-                dev,
-            });
-        }
-    };
+    let mut push =
+        |name: &str, version: VersionIntent, dev: bool, out: &mut Vec<DeclaredDependency>| {
+            let name = name.trim();
+            if name.is_empty() || !is_plausible_package_name(name) {
+                return;
+            }
+            // `python` is the interpreter constraint in Poetry tables, not a dep.
+            if name.eq_ignore_ascii_case("python") {
+                return;
+            }
+            if seen.insert(name.to_lowercase()) {
+                out.push(DeclaredDependency {
+                    name: name.to_string(),
+                    ecosystem: Ecosystem::PyPI,
+                    version,
+                    dev,
+                });
+            }
+        };
 
     // PEP 621 `[project].dependencies` — an array of requirement strings.
     if let Some(deps) = doc
@@ -439,7 +570,9 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
         for item in deps {
             if let Some(req) = item.as_str() {
                 if let Some(name) = python_requirement_name(req) {
-                    push(&name, false, &mut out);
+                    let version =
+                        VersionIntent::from_pep440_specifier(&python_requirement_spec(req));
+                    push(&name, version, false, &mut out);
                 }
             }
         }
@@ -455,7 +588,9 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
                 for item in items {
                     if let Some(req) = item.as_str() {
                         if let Some(name) = python_requirement_name(req) {
-                            push(&name, true, &mut out);
+                            let version =
+                                VersionIntent::from_pep440_specifier(&python_requirement_spec(req));
+                            push(&name, version, true, &mut out);
                         }
                     }
                 }
@@ -470,7 +605,9 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
         .and_then(|d| d.as_table())
     {
         for name in deps.keys() {
-            push(name, false, &mut out);
+            // Poetry value specs (`^2.0`, `{ version = "^2.0" }`) are not modeled;
+            // keep the name with an Unspecified intent.
+            push(name, VersionIntent::Unspecified, false, &mut out);
         }
     }
     // Poetry dev groups + legacy `[tool.poetry.dev-dependencies]`.
@@ -481,7 +618,7 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
         for group in groups.values() {
             if let Some(deps) = group.get("dependencies").and_then(|d| d.as_table()) {
                 for name in deps.keys() {
-                    push(name, true, &mut out);
+                    push(name, VersionIntent::Unspecified, true, &mut out);
                 }
             }
         }
@@ -491,7 +628,7 @@ fn parse_pyproject_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
         .and_then(|d| d.as_table())
     {
         for name in deps.keys() {
-            push(name, true, &mut out);
+            push(name, VersionIntent::Unspecified, true, &mut out);
         }
     }
 
@@ -534,7 +671,14 @@ fn parse_cargo_toml(text: &str) -> Option<Vec<DeclaredDependency>> {
                     out.push(DeclaredDependency {
                         name: real_name.to_string(),
                         ecosystem: Ecosystem::Crates,
-                        version,
+                        // A Cargo.toml requirement is a SemVer range: a plain `1.0.193` is
+                        // a caret requirement (^1.0.193); only `=1.0.193` is an exact pin.
+                        // Use from_cargo_version so the manifest scanner resolves the real
+                        // installed version (deps.dev), matching the CLI cargo path, rather
+                        // than pinning the literal token as Exact.
+                        version: version
+                            .map(|v| VersionIntent::from_cargo_version(&v))
+                            .unwrap_or(VersionIntent::Unspecified),
                         dev,
                     });
                 }
@@ -613,7 +757,10 @@ fn go_mod_require_entry(entry: &str) -> Option<DeclaredDependency> {
     Some(DeclaredDependency {
         name: module.to_string(),
         ecosystem: Ecosystem::Go,
-        version,
+        // go.mod pins a concrete module version (e.g. `v1.2.3`).
+        version: version
+            .map(|v| VersionIntent::from_explicit_version(&v))
+            .unwrap_or(VersionIntent::Unspecified),
         dev: false,
     })
 }
@@ -650,12 +797,12 @@ fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
             block_stack.push(is_dev_group);
             continue;
         }
-        if let Some(name) = gemfile_gem_name(line) {
+        if let Some((name, version)) = gemfile_gem_spec(line) {
             if seen.insert(name.clone()) {
                 out.push(DeclaredDependency {
                     name,
                     ecosystem: Ecosystem::RubyGems,
-                    version: None,
+                    version,
                     dev: block_stack.iter().any(|&is_dev| is_dev),
                 });
             }
@@ -664,20 +811,30 @@ fn parse_gemfile(text: &str) -> Vec<DeclaredDependency> {
     out
 }
 
-/// Extract the gem name from a `gem "name", ...` Gemfile line.
-fn gemfile_gem_name(line: &str) -> Option<String> {
+/// Extract the gem name and version intent from a `gem "name", "<spec>", ...` Gemfile line.
+/// The version is the quoted token that DIRECTLY follows the name (`gem "x", "= 1.0"`); an
+/// option hash (`gem "x", :require => false`) carries no version, so the intent is
+/// Unspecified.
+fn gemfile_gem_spec(line: &str) -> Option<(String, VersionIntent)> {
     let rest = line.strip_prefix("gem ")?.trim_start();
-    let (quote, after) = match rest.chars().next()? {
-        '"' => ('"', &rest[1..]),
-        '\'' => ('\'', &rest[1..]),
+    let quote = match rest.chars().next()? {
+        '"' => '"',
+        '\'' => '\'',
         _ => return None,
     };
-    let name = after.split(quote).next()?.trim();
+    // Split on the quote char: parts = ["", name, sep, version, ...]. A version is present
+    // only when `sep` (between the name's closing quote and the next opening quote) is just
+    // a comma - otherwise the next quoted token is an option value, not a version.
+    let parts: Vec<&str> = rest.split(quote).collect();
+    let name = parts.get(1)?.trim();
     if name.is_empty() || !is_plausible_package_name(name) {
-        None
-    } else {
-        Some(name.to_string())
+        return None;
     }
+    let version = match (parts.get(2), parts.get(3)) {
+        (Some(sep), Some(spec)) if sep.trim() == "," => VersionIntent::from_gem_version(spec),
+        _ => VersionIntent::Unspecified,
+    };
+    Some((name.to_string(), version))
 }
 
 /// `true` when `name` is shaped like a real package name. Deliberately
@@ -978,9 +1135,62 @@ pub struct DependencyAssessment {
     pub risk: RiskBreakdown,
     /// The slopsquat heuristic verdict.
     pub slopsquat: SlopsquatAssessment,
+    /// The constraint-aware threat-DB assessment for this dependency's
+    /// `(ecosystem, name, version-intent)`. A serializable summary, never a
+    /// `ThreatMatch`. Omitted from JSON when there is no record so a clean
+    /// report gains no `"no_record"` noise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threat_assessment: Option<PackageThreatAssessment>,
     /// `true` when a policy allowlist entry suppressed this dependency's
     /// findings (the assessment is still reported, for transparency).
     pub allowlisted: bool,
+}
+
+/// Build the Medium/Warn finding for a dependency whose malicious-package
+/// version could not be resolved (an unpinned/range manifest entry over a
+/// version-specific record, or a constraint that overlaps the affected
+/// versions). Advises pinning to a known non-affected version.
+fn unresolved_dependency_finding(
+    dep: &DeclaredDependency,
+    manifest: &str,
+    summary: &crate::threatdb::ThreatMatchSummary,
+    affected_versions: &[String],
+) -> Finding {
+    let affected_list = if affected_versions.is_empty() {
+        "unknown".to_string()
+    } else {
+        affected_versions.join(", ")
+    };
+    let declared = dep
+        .version
+        .as_version_str()
+        .map(|v| format!("declared as '{v}'"))
+        .unwrap_or_else(|| "declared without a version".to_string());
+    Finding {
+        rule_id: RuleId::ThreatUnresolvedMaliciousPackage,
+        severity: Severity::Medium,
+        title: format!(
+            "Unresolved malicious {} dependency: {}",
+            dep.ecosystem, dep.name
+        ),
+        description: format!(
+            "The {} dependency '{}' {declared} in {} is flagged as malicious by {} for \
+             specific versions ({affected_list}), but the request could not be resolved to a \
+             definite version. Pin an exact non-affected version (or remove the dependency) to \
+             clear this warning.",
+            dep.ecosystem, dep.name, manifest, summary.source_label,
+        ),
+        evidence: vec![Evidence::ThreatIntel {
+            source: summary.source_label.clone(),
+            threat_type: "unresolved_malicious_package".to_string(),
+            confidence: summary.confidence,
+            reference: summary.reference_url.clone(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
 }
 
 /// Build the [`Finding`]s a single [`DependencyAssessment`] produces, reusing
@@ -998,6 +1208,69 @@ pub fn findings_for(
     let mut findings = Vec::new();
     let dep = &assessment.dependency;
     let manifest = &assessment.manifest;
+
+    // 0 — constraint-aware threat-DB assessment (A1e). An exact/all-versions
+    // hit dominates and stands alone (returns); an unresolved or intersecting
+    // constraint emits the Medium/Warn but falls through, since the name may
+    // ALSO be a typosquat or near-popular.
+    match &assessment.threat_assessment {
+        Some(PackageThreatAssessment::ExactMatch(summary)) => {
+            findings.push(Finding {
+                rule_id: RuleId::ThreatMaliciousPackage,
+                severity: crate::rules::threatintel::confidence_to_severity(summary.confidence),
+                title: format!("Known malicious {} dependency: {}", dep.ecosystem, dep.name),
+                description: format!(
+                    "The {} dependency '{}' declared in {} is flagged as malicious by {}. {}",
+                    dep.ecosystem,
+                    dep.name,
+                    manifest,
+                    summary.source_label,
+                    if summary.all_versions_malicious {
+                        "All versions are affected."
+                    } else {
+                        "Specific version(s) affected."
+                    }
+                ),
+                evidence: vec![Evidence::ThreatIntel {
+                    source: summary.source_label.clone(),
+                    threat_type: "malicious_package".to_string(),
+                    confidence: summary.confidence,
+                    reference: summary.reference_url.clone(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+            return findings;
+        }
+        Some(PackageThreatAssessment::ConstraintIntersectsAffected {
+            summary,
+            affected_versions,
+        }) => {
+            findings.push(unresolved_dependency_finding(
+                dep,
+                manifest,
+                summary,
+                affected_versions,
+            ));
+        }
+        Some(PackageThreatAssessment::Unresolved {
+            summary,
+            affected_versions,
+            ..
+        }) => {
+            findings.push(unresolved_dependency_finding(
+                dep,
+                manifest,
+                summary,
+                affected_versions,
+            ));
+        }
+        Some(PackageThreatAssessment::ConstraintExcludesAffected)
+        | Some(PackageThreatAssessment::NoRecord)
+        | None => {}
+    }
 
     // 1 — confirmed malicious typosquat from the threat DB; stands alone.
     if let Some(target) = &assessment.risk.malicious_typosquat_of {
@@ -1638,8 +1911,15 @@ pub fn scan(request: &ScanRequest) -> EcosystemScanReport {
             findings.extend(policy_findings_for_assessment(assessment, effective_policy));
         }
     }
-    // tier_reached is 3 — `ecosystem scan` does the full analysis.
-    let verdict = Verdict::from_findings(findings, 3, Timings::default());
+    // tier_reached is 3 — `ecosystem scan` does the full analysis. Assemble via
+    // the shared finalizer so policy `action_overrides` (and severity overrides
+    // and paranoia) are honored here, not only on the engine hot path.
+    let verdict = crate::escalation::finalize_static_verdict(
+        findings,
+        effective_policy,
+        3,
+        Timings::default(),
+    );
 
     EcosystemScanReport {
         scan_root: root_display,
@@ -1973,7 +2253,8 @@ fn read_node_package(
         DeclaredDependency {
             name: name.to_string(),
             ecosystem: Ecosystem::Npm,
-            version,
+            // An installed package reports its own concrete version.
+            version: lock_version_intent(version),
             dev: false,
         },
         label,
@@ -2034,10 +2315,14 @@ fn walk_site_packages(
             rd.filter_map(Result::ok)
                 .map(|e| e.path())
                 .filter(|p| {
+                    // Case-INsensitive `.dist-info` match: on a case-insensitive filesystem a
+                    // distribution installed as `Foo-1.0.DIST-INFO` still imports, so a
+                    // case-sensitive suffix check would skip enumerating it and its name/version
+                    // would never be matched against the threat DB.
                     p.is_dir()
                         && p.file_name()
                             .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.ends_with(".dist-info"))
+                            .is_some_and(|n| n.to_ascii_lowercase().ends_with(".dist-info"))
                 })
                 .collect()
         })
@@ -2064,7 +2349,8 @@ fn walk_site_packages(
             DeclaredDependency {
                 name,
                 ecosystem: Ecosystem::PyPI,
-                version,
+                // An installed distribution reports its own concrete version.
+                version: lock_version_intent(version),
                 dev: false,
             },
             label,
@@ -2133,7 +2419,8 @@ fn walk_vendor_go(
                 DeclaredDependency {
                     name: module.to_string(),
                     ecosystem: Ecosystem::Go,
-                    version,
+                    // `modules.txt` records the concrete resolved module version.
+                    version: lock_version_intent(version),
                     dev: false,
                 },
                 label.clone(),
@@ -2169,7 +2456,8 @@ fn walk_vendor_go(
                     DeclaredDependency {
                         name: rel,
                         ecosystem: Ecosystem::Go,
-                        version: None,
+                        // Vendored layout carries no version on disk.
+                        version: VersionIntent::Unspecified,
                         dev: false,
                     },
                     label,
@@ -2219,7 +2507,8 @@ fn parse_cargo_lock(text: &str) -> Vec<DeclaredDependency> {
             out.push(DeclaredDependency {
                 name: name.to_string(),
                 ecosystem: Ecosystem::Crates,
-                version,
+                // Cargo.lock pins a concrete resolved version.
+                version: lock_version_intent(version),
                 dev: false,
             });
         }
@@ -2256,7 +2545,7 @@ fn assess_dependency(
         ecosystem: dep.ecosystem,
         name: dep.name.clone(),
         // Manifest-declared version, carried through to OSV correlation.
-        version: dep.version.clone(),
+        version: dep.version.as_version_str().map(str::to_string),
         threat_db_missing: request.db.is_none(),
         name_vs_popular: name_vs_popular.clone(),
         malicious_typosquat_of,
@@ -2269,6 +2558,17 @@ fn assess_dependency(
 
     let slopsquat = slopsquat(&dep.name, &name_vs_popular, request.db, dep.ecosystem);
 
+    // Constraint-aware threat-DB assessment (A1e). A clean `NoRecord` is dropped
+    // so reports gain no noise; only an actual signal is stored. No-DB stays
+    // fail-open (no assessment).
+    let threat_assessment =
+        request.db.and_then(
+            |db| match db.assess_package(dep.ecosystem, &dep.name, &dep.version) {
+                PackageThreatAssessment::NoRecord => None,
+                other => Some(other),
+            },
+        );
+
     let allowlisted = (request.is_allowlisted)(dep.ecosystem, &dep.name);
 
     DependencyAssessment {
@@ -2276,6 +2576,7 @@ fn assess_dependency(
         manifest: manifest.to_string(),
         risk,
         slopsquat,
+        threat_assessment,
         allowlisted,
     }
 }
@@ -2354,7 +2655,16 @@ mod tests {
         assert_eq!(deps.len(), 3);
         let react = deps.iter().find(|d| d.name == "react").unwrap();
         assert!(!react.dev);
-        assert_eq!(react.version.as_deref(), Some("^18.0.0"));
+        // A semver range is preserved as an unresolved Constraint (its text is
+        // still reported as the version string).
+        assert_eq!(react.version.as_version_str(), Some("^18.0.0"));
+        assert!(matches!(
+            react.version,
+            VersionIntent::Constraint { parsed: None, .. }
+        ));
+        // A plain version is an exact pin.
+        let lodash = deps.iter().find(|d| d.name == "lodash").unwrap();
+        assert_eq!(lodash.version, VersionIntent::Exact("4.17.21".to_string()));
         let jest = deps.iter().find(|d| d.name == "jest").unwrap();
         assert!(jest.dev, "devDependencies must be tagged dev");
     }
@@ -2443,6 +2753,16 @@ git+https://github.com/x/y.git
         assert!(names.contains(&"requests"));
         assert!(names.contains(&"flask"), "extras must be stripped");
         assert!(names.contains(&"django"), "env markers must be stripped");
+        // The `<` inside the marker must NOT be read as django's version spec.
+        let django = deps
+            .iter()
+            .find(|d| d.name == "django")
+            .expect("django dep");
+        assert_eq!(
+            django.version,
+            crate::version_intent::VersionIntent::Unspecified,
+            "a marker comparator must not be read as a version constraint"
+        );
         assert!(names.contains(&"numpy"), "inline comment must be stripped");
         // pip directives and VCS installs must NOT yield a name.
         assert!(!names.iter().any(|n| n.contains("other-requirements")));
@@ -2464,6 +2784,80 @@ git+https://github.com/x/y.git
             Some("pkg")
         );
         assert_eq!(python_requirement_name(""), None);
+    }
+
+    #[test]
+    fn python_requirement_spec_strips_inline_comment() {
+        // An inline `#` comment must not leak into the version token: otherwise an EXACT pin
+        // (`malware==1.0.0 # note`) degrades to a Constraint/Unresolved and a confirmed
+        // Critical hit is silently downgraded to a Warn.
+        assert_eq!(
+            python_requirement_spec("malware==1.0.0 # pinned safe version"),
+            "==1.0.0"
+        );
+        assert_eq!(
+            python_requirement_spec("pkg==2.3.4\t# tab comment"),
+            "==2.3.4"
+        );
+        // No inline comment: unchanged (a `#` without leading whitespace is not a comment).
+        assert_eq!(python_requirement_spec("pkg>=1.0,<2.0"), ">=1.0,<2.0");
+    }
+
+    #[test]
+    fn requirements_txt_pinned_dep_carries_version_intent() {
+        let deps = parse_requirements_txt(
+            "requests==2.28.1\nflask>=2.0,<3.0\nbare-pkg\nevil==1.0; python_version<\"3.9\"\n",
+        );
+        let requests = deps.iter().find(|d| d.name == "requests").unwrap();
+        assert_eq!(requests.version, VersionIntent::Exact("2.28.1".to_string()));
+        // A marker-qualified pin only applies conditionally -> unresolved, not Exact.
+        let evil = deps.iter().find(|d| d.name == "evil").unwrap();
+        assert!(
+            matches!(evil.version, VersionIntent::Constraint { parsed: None, .. }),
+            "marker-qualified pin must be an unresolved Constraint: {:?}",
+            evil.version
+        );
+        let flask = deps.iter().find(|d| d.name == "flask").unwrap();
+        assert!(matches!(
+            flask.version,
+            VersionIntent::Constraint {
+                parsed: Some(_),
+                ..
+            }
+        ));
+        let bare = deps.iter().find(|d| d.name == "bare-pkg").unwrap();
+        assert_eq!(bare.version, VersionIntent::Unspecified);
+    }
+
+    #[test]
+    fn pyproject_pep621_pinned_dep_is_exact() {
+        let toml = "[project]\ndependencies = [\"requests==2.28.1\", \"flask\"]\n";
+        let deps = parse_pyproject_toml(toml).unwrap();
+        let requests = deps.iter().find(|d| d.name == "requests").unwrap();
+        assert_eq!(requests.version, VersionIntent::Exact("2.28.1".to_string()));
+        let flask = deps.iter().find(|d| d.name == "flask").unwrap();
+        assert_eq!(flask.version, VersionIntent::Unspecified);
+    }
+
+    #[test]
+    fn npm_partial_version_is_range_not_exact() {
+        // node-semver: `1.2` == `1.2.x` (a range); full `1.2.3` is exact.
+        assert!(matches!(
+            npm_manifest_intent("1.2"),
+            VersionIntent::Constraint {
+                parsed: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            npm_manifest_intent("1.2.3"),
+            VersionIntent::Exact("1.2.3".to_string())
+        );
+        // A pathological u64::MAX segment must not overflow: it stays an exact pin.
+        assert_eq!(
+            npm_manifest_intent("18446744073709551615"),
+            VersionIntent::Exact("18446744073709551615".to_string())
+        );
     }
 
     #[test]
@@ -2537,6 +2931,31 @@ cc = "1.0"
     }
 
     #[test]
+    fn parse_cargo_toml_version_is_a_caret_constraint_not_exact() {
+        // A Cargo.toml requirement is a SemVer range: a plain `serde = "1.0.193"` is a
+        // caret requirement (^1.0.193), NOT an exact pin (only `=1.0.193` is). The manifest
+        // scanner must use from_cargo_version like the CLI cargo path, or it silently
+        // misses a threat whose resolved version differs from the literal token.
+        let text = r#"
+[package]
+name = "app"
+
+[dependencies]
+serde = "1.0.193"
+pinned = "=2.3.4"
+"#;
+        let deps = parse_cargo_toml(text).expect("valid TOML parses");
+        let serde = deps.iter().find(|d| d.name == "serde").unwrap();
+        assert!(
+            matches!(&serde.version, VersionIntent::Constraint { raw, .. } if raw == "1.0.193"),
+            "a plain Cargo.toml version is a caret constraint, got {:?}",
+            serde.version
+        );
+        let pinned = deps.iter().find(|d| d.name == "pinned").unwrap();
+        assert_eq!(pinned.version, VersionIntent::Exact("2.3.4".to_string()));
+    }
+
+    #[test]
     fn parse_cargo_toml_resolves_package_rename() {
         // `[dependencies] foo = { package = "real-crate" }` — the real crate
         // name must be scored, not the table key.
@@ -2604,6 +3023,32 @@ end
         assert!(names.contains(&"puma"));
         let rspec = deps.iter().find(|d| d.name == "rspec").unwrap();
         assert!(rspec.dev, "a gem in a :test group must be dev-tagged");
+    }
+
+    #[test]
+    fn parse_gemfile_carries_version_intent() {
+        // The Gemfile parser must carry version intent (like requirements.txt / Cargo.toml)
+        // so a safe PINNED version does not raise a version-agnostic false-positive warning.
+        let text = "\
+gem 'pinned', '= 1.2.3'
+gem 'bare', '4.5.6'
+gem 'ranged', '~> 2.0'
+gem 'optioned', require: false
+gem 'plain'
+";
+        let deps = parse_gemfile(text);
+        let v = |n: &str| deps.iter().find(|d| d.name == n).map(|d| d.version.clone());
+        // `= 1.2.3` and a bare `4.5.6` are exact gem pins.
+        assert_eq!(v("pinned"), Some(VersionIntent::Exact("1.2.3".to_string())));
+        assert_eq!(v("bare"), Some(VersionIntent::Exact("4.5.6".to_string())));
+        // `~> 2.0` is a range constraint.
+        assert!(matches!(
+            v("ranged"),
+            Some(VersionIntent::Constraint { .. })
+        ));
+        // An option value (not a version) and a bare name are Unspecified.
+        assert_eq!(v("optioned"), Some(VersionIntent::Unspecified));
+        assert_eq!(v("plain"), Some(VersionIntent::Unspecified));
     }
 
     #[test]
@@ -2773,12 +3218,13 @@ gem 'toplevelgem'
             dependency: DeclaredDependency {
                 name: name.to_string(),
                 ecosystem: Ecosystem::Npm,
-                version: None,
+                version: VersionIntent::Unspecified,
                 dev: false,
             },
             manifest: "package.json".to_string(),
             risk: package_risk::score_package(&signals),
             slopsquat: slop,
+            threat_assessment: None,
             allowlisted,
         }
     }
@@ -2914,12 +3360,13 @@ gem 'toplevelgem'
             dependency: DeclaredDependency {
                 name: "totally-unknown-pkg".to_string(),
                 ecosystem: Ecosystem::Npm,
-                version: None,
+                version: VersionIntent::Unspecified,
                 dev: false,
             },
             manifest: "package.json".to_string(),
             risk: breakdown,
             slopsquat: SlopsquatAssessment::clear(),
+            threat_assessment: None,
             allowlisted: false,
         };
         let policy = crate::policy::Policy::default();
@@ -2974,12 +3421,13 @@ gem 'toplevelgem'
             dependency: DeclaredDependency {
                 name: "ordinary-pkg".to_string(),
                 ecosystem: Ecosystem::Npm,
-                version: None,
+                version: VersionIntent::Unspecified,
                 dev: false,
             },
             manifest: "package.json".to_string(),
             risk: breakdown,
             slopsquat: SlopsquatAssessment::clear(),
+            threat_assessment: None,
             allowlisted: false,
         };
         let policy = crate::policy::Policy::default();
@@ -3014,12 +3462,13 @@ gem 'toplevelgem'
             dependency: DeclaredDependency {
                 name: "reaqt".to_string(),
                 ecosystem: Ecosystem::Npm,
-                version: None,
+                version: VersionIntent::Unspecified,
                 dev: false,
             },
             manifest: "package.json".to_string(),
             risk: breakdown,
             slopsquat: SlopsquatAssessment::clear(),
+            threat_assessment: None,
             allowlisted: false,
         };
         // Configure a typosquat-distance policy threshold.
@@ -3230,9 +3679,103 @@ gem 'toplevelgem'
         assert_eq!(report.assessments[0].dependency.name, "evil-package");
         assert_eq!(
             report.assessments[0].dependency.version,
-            Some("1.0.0".to_string())
+            VersionIntent::Resolved("1.0.0".to_string())
         );
         assert_eq!(report.assessments[0].dependency.ecosystem, Ecosystem::Npm);
+    }
+
+    /// Build an in-memory signed threat DB whose only record is a PyPI package
+    /// `eco_name` malicious at exactly `affected` (version-specific, not
+    /// all-versions). Used to exercise the installed-METADATA path (A1e).
+    fn threat_db_with_pypi_version(eco_name: &str, affected: &str) -> ThreatDb {
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = crate::threatdb::ThreatDbWriter::new(1700000000, 5);
+        writer.add_package(
+            Ecosystem::PyPI,
+            eco_name,
+            &[affected],
+            crate::threatdb::ThreatSource::OssfMalicious,
+            crate::threatdb::Confidence::Confirmed,
+            false,
+            Some("https://example.com/advisory/installed"),
+        );
+        let bytes = writer.build(&key).expect("build test DB");
+        ThreatDb::from_bytes(bytes, 0).expect("load test DB")
+    }
+
+    /// Plant a `<root>/site-packages/<name>-<ver>.dist-info/METADATA` file.
+    fn plant_dist_info(root: &Path, name: &str, version: &str) {
+        let dist = root
+            .join("site-packages")
+            .join(format!("{name}-{version}.dist-info"));
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn installed_mode_known_malicious_metadata_blocks() {
+        // An installed distribution whose concrete version is in the malicious
+        // record is an EXACT match: it blocks via ThreatMaliciousPackage, not
+        // the unresolved warn.
+        let dir = tempfile::tempdir().unwrap();
+        plant_dist_info(dir.path(), "evil-installed", "2.3.4");
+        let db = threat_db_with_pypi_version("evil-installed", "2.3.4");
+
+        let request = ScanRequest {
+            root: dir.path(),
+            db: Some(&db),
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
+        };
+        let report = scan(&request);
+        assert_eq!(report.dependency_count, 1);
+        assert_eq!(report.assessments[0].dependency.name, "evil-installed");
+        assert_eq!(
+            report.assessments[0].dependency.version,
+            VersionIntent::Resolved("2.3.4".to_string())
+        );
+        assert_eq!(report.verdict.action, Action::Block);
+        let rules: Vec<RuleId> = report.verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            rules.contains(&RuleId::ThreatMaliciousPackage),
+            "an installed affected version must block as a confirmed exact match; got {rules:?}"
+        );
+        assert!(
+            !rules.contains(&RuleId::ThreatUnresolvedMaliciousPackage),
+            "a resolved exact hit must NOT emit the unresolved warn"
+        );
+    }
+
+    #[test]
+    fn installed_mode_non_affected_metadata_is_clean() {
+        // The installed version is NOT in the malicious record, so there is no
+        // finding at all (NoRecord for this exact version).
+        let dir = tempfile::tempdir().unwrap();
+        plant_dist_info(dir.path(), "evil-installed", "9.9.9");
+        let db = threat_db_with_pypi_version("evil-installed", "2.3.4");
+
+        let request = ScanRequest {
+            root: dir.path(),
+            db: Some(&db),
+            online: OnlineMode::Off,
+            is_allowlisted: &never_allow,
+            mode: ScanMode::Installed,
+            installed_max_entries: DEFAULT_MAX_INSTALLED_ENTRIES,
+            policy: None,
+        };
+        let report = scan(&request);
+        assert_eq!(report.dependency_count, 1);
+        assert_eq!(report.verdict.action, Action::Allow);
+        assert!(report.assessments[0].threat_assessment.is_none());
     }
 
     #[test]

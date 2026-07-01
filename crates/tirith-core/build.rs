@@ -970,6 +970,10 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("threat_malicious_ip", "ThreatMaliciousIp"),
     ("threat_package_typosquat", "ThreatPackageTyposquat"),
     ("threat_package_similar_name", "ThreatPackageSimilarName"),
+    (
+        "threat_unresolved_malicious_package",
+        "ThreatUnresolvedMaliciousPackage",
+    ),
     // Threat intelligence — supplemental feeds
     ("threat_malicious_url", "ThreatMaliciousUrl"),
     ("threat_phishing_url", "ThreatPhishingUrl"),

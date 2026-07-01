@@ -608,10 +608,14 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 
+# Uses a synthetic package name (not `react`/etc): the engine consults the
+# locally-installed threat DB via `ThreatDb::cached()`, and a real popular name
+# can now carry a version-specific malicious record (A1 unresolved-warn), which
+# would make this static-path fixture environment-dependent.
 [[fixture]]
 name = "m6_ch6_package_maintainer_change_static_path_does_not_fire"
 min_milestone = 6
-input = "npm install react"
+input = "npm install maintainer-change-test-pkg"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
