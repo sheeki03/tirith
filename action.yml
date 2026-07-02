@@ -26,7 +26,7 @@ runs:
     # (fail-closed). Install cosign first so the signed path is available; this
     # keeps the action from needing TIRITH_ALLOW_UNSIGNED.
     - name: Install cosign
-      uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
     - name: Install tirith
       shell: bash
       env:
@@ -89,7 +89,7 @@ runs:
         tirith scan "$INPUT_PATH" --ci --fail-on "$INPUT_FAIL_ON" "${IGNORE_ARGS[@]}"
     - name: Upload SARIF
       if: always() && inputs.sarif == 'true'
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: results.sarif
       continue-on-error: true
