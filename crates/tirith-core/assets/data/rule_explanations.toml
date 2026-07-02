@@ -1018,6 +1018,54 @@ remediation = "Pass the untrusted value through an intermediate `env:` variable 
 mitre_id = "T1195.001"
 
 [[rule]]
+id = "workflow_excessive_permissions"
+title = "Workflow grants an excessive GITHUB_TOKEN for a risky trigger"
+category = "ecosystem"
+severity_rationale = "Medium: a workflow reachable from an untrusted actor (a fork pull_request_target, a workflow_run, or an issue/comment event) that runs with a broad GITHUB_TOKEN lets any compromised step push to the repo, publish packages, or alter releases with the repository's credentials."
+description = "The workflow is triggered by an event an untrusted actor can influence and either grants an over-broad token (`permissions: write-all`, or `contents: write`) or sets no `permissions:` block at all so the broad default token is in effect. Job-level `permissions:` are honored: a job that constrains its own token is not flagged even when the workflow top-level is unset."
+examples_bad = ["on: pull_request_target\npermissions: write-all", "on:\n  issue_comment:\njobs:\n  a:\n    steps: [...]"]
+examples_good = ["on: pull_request_target\npermissions:\n  contents: read", "on:\n  issue_comment:\njobs:\n  a:\n    permissions:\n      contents: read"]
+false_positive_guidance = "A plain push/schedule build with no permissions block, or any scoped write other than `contents: write` (for example `issues: write`), is not flagged. Release workflows that legitimately need `write-all` on a non-risky trigger are out of scope; if a risky-trigger workflow genuinely needs broad scopes, set them explicitly per job and allowlist the rule."
+remediation = "Add a least-privilege `permissions:` block (start from `permissions: {}` or `contents: read`) at the workflow or job level and grant only the scopes each job needs."
+mitre_id = "T1195.001"
+
+[[rule]]
+id = "workflow_run_trigger"
+title = "Workflow uses the workflow_run trigger"
+category = "ecosystem"
+severity_rationale = "High: workflow_run runs on the default branch with a read/write token and secrets after another workflow completes, including runs from untrusted forks; trusting the triggering run's artifacts, outputs, or head ref runs fork-controlled data or code with the repository's credentials."
+description = "The workflow is triggered by `workflow_run`. This is a distinct risk from `pull_request_target`: the danger is consuming the triggering run's artifacts, outputs, or head ref, which are attacker-produced when the triggering run came from a fork pull request."
+examples_bad = ["on:\n  workflow_run:\n    workflows: [CI]\n    types: [completed]"]
+examples_good = ["on:\n  workflow_run:\n    workflows: [CI]\n    types: [completed]\npermissions:\n  contents: read"]
+false_positive_guidance = "workflow_run is legitimate for workflows that react to a completed run without trusting its outputs. It is dangerous only when the workflow downloads and trusts artifacts from the triggering run or checks out its head; review the workflow body."
+remediation = "Treat every value from the triggering run as untrusted, restrict `permissions:` to the minimum, validate downloaded artifacts, and never check out or execute the triggering run's head."
+mitre_id = "T1195.001"
+
+[[rule]]
+id = "workflow_checkout_untrusted_ref"
+title = "Workflow checks out an untrusted PR head with elevated privileges"
+category = "ecosystem"
+severity_rationale = "High: checking out a fork pull-request head under pull_request_target or workflow_run runs the fork's code with the base repository's read/write token and secrets, the well-known pwn-request remote-code-execution pattern."
+description = "An `actions/checkout` step checks out a pull-request head ref (`github.event.pull_request.head.*` / `github.head_ref`, or a workflow_run head) under a `pull_request_target` or `workflow_run` trigger. A later build, test, or lint step then executes the fork's tree with the base repository's credentials."
+examples_bad = ["on: pull_request_target\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@<sha>\n        with:\n          ref: ${{ github.event.pull_request.head.ref }}"]
+examples_good = ["on: pull_request\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@<sha>"]
+false_positive_guidance = "Checking out the base (no `ref:`, or a trusted ref) under these triggers does not fire. Under plain `pull_request` a fork PR gets a read-only token, so a head checkout is not this privileged code-exec vector and is not flagged."
+remediation = "Do not check out and run untrusted PR code under a privileged trigger. Use `pull_request`, or check out only the base and never execute the fork's tree; if you must inspect PR content, do it without executing it."
+mitre_id = "T1195.002"
+
+[[rule]]
+id = "workflow_cache_poisoning"
+title = "Workflow cache key interpolates untrusted input"
+category = "ecosystem"
+severity_rationale = "Medium: an attacker who controls the cache key (through a PR title, branch name, or issue body) can seed or overwrite a cache entry that a later, more privileged run restores and trusts, poisoning build inputs such as dependencies or compiled artifacts across runs."
+description = "A cache action (`actions/cache`, `actions/cache/save`, or `actions/cache/restore`) builds its `key:` or `restore-keys:` from an attacker-controllable `${{ github.event.* }}` / `github.head_ref` expression. Cache entries are shared across runs, so an untrusted key is a cross-run tampering channel."
+examples_bad = ["uses: actions/cache@<sha>\nwith:\n  key: deps-${{ github.head_ref }}"]
+examples_good = ["uses: actions/cache@<sha>\nwith:\n  key: deps-${{ runner.os }}-${{ hashFiles('**/lockfile') }}"]
+false_positive_guidance = "A key built only from trusted, content-derived values (`hashFiles(...)`, `runner.os`, `github.sha`) is safe and does not fire. Only the known attacker-controllable contexts are treated as untrusted."
+remediation = "Build cache keys only from trusted, content-derived values such as `hashFiles(...)` and the runner OS; never from untrusted event data like a PR title or branch name."
+mitre_id = "T1195.001"
+
+[[rule]]
 id = "dockerfile_unpinned_image"
 title = "Dockerfile base image is not digest-pinned"
 category = "ecosystem"

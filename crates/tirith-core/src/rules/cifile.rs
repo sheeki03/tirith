@@ -14,7 +14,10 @@
 //! Detection is pure pattern matching — no network. Every function is total: a
 //! malformed file yields no findings, never a panic.
 
+use std::collections::BTreeSet;
 use std::path::Path;
+
+use serde_yaml::Value;
 
 use crate::redact;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
@@ -153,6 +156,7 @@ fn check_workflow(input: &str, findings: &mut Vec<Finding>) {
     check_workflow_unpinned_actions(input, findings);
     check_workflow_dangerous_trigger(input, findings);
     check_workflow_run_steps(input, findings);
+    check_workflow_structural(input, findings);
 }
 
 /// A GitHub Actions `uses:` reference. Only the third-party-action form
@@ -352,6 +356,20 @@ const UNTRUSTED_CONTEXT_MARKERS: &[&str] = &[
     "github.event.discussion.title",
     "github.event.discussion.body",
     "github.head_ref",
+    // Repository-metadata contexts an attacker sets on their own fork, then
+    // carries into the base repo via a fork PR / triggered workflow.
+    "github.event.repository.description",
+    "github.event.repository.homepage",
+    "github.event.pull_request.head.repo.description",
+    "github.event.pull_request.head.repo.homepage",
+    // `workflow_run`-payload contexts: the branch/commit/title of the fork run
+    // that triggered this workflow are attacker-controlled.
+    "github.event.workflow_run.head_branch",
+    "github.event.workflow_run.head_commit.message",
+    "github.event.workflow_run.head_commit.author.name",
+    "github.event.workflow_run.head_commit.author.email",
+    "github.event.workflow_run.display_title",
+    "github.event.workflow_run.head_repository.description",
 ];
 
 /// Whether a `${{ … }}` expression body references an untrusted context
@@ -585,6 +603,478 @@ fn scan_run_line(
             if expression_is_untrusted(expr) {
                 *untrusted = Some((expr.trim().to_string(), truncate(line, 200)));
                 break;
+            }
+        }
+    }
+}
+
+// GitHub Actions workflow checks: structural (parsed-YAML) tier
+
+/// Run the structural workflow checks that need a parsed YAML tree rather than
+/// a line scan: token permissions, the `workflow_run` trigger, a checkout of an
+/// untrusted PR head, and cache-key poisoning. The document is parsed once here
+/// and shared. Line scanning is too easy to fool for these shapes (a permission
+/// can live at the workflow OR job level; a trigger can be written three ways),
+/// so they are done against the parsed tree.
+///
+/// Totality: if the file does not parse as YAML, or the root is not a mapping,
+/// the structural checks are skipped and the line-based checks in
+/// [`check_workflow`] still run. Every navigation below is defensive
+/// (`as_mapping`/`as_sequence`/`as_str`, missing keys tolerated); a
+/// wrong-typed or absent field yields no finding, never a panic.
+fn check_workflow_structural(input: &str, findings: &mut Vec<Finding>) {
+    let Ok(doc) = serde_yaml::from_str::<Value>(input) else {
+        return;
+    };
+    // A workflow is a top-level mapping; a bare scalar / sequence is not one.
+    if doc.as_mapping().is_none() {
+        return;
+    }
+
+    let triggers = workflow_triggers(&doc);
+
+    check_workflow_run_trigger(&triggers, findings);
+    check_workflow_excessive_permissions(&doc, &triggers, findings);
+    check_workflow_checkout_untrusted_ref(&doc, &triggers, findings);
+    check_workflow_cache_poisoning(&doc, findings);
+}
+
+/// Look up a string-keyed field in a YAML mapping. Returns `None` for a
+/// non-mapping value or an absent key. Keys inside these workflow structures
+/// (`jobs`, `permissions`, `steps`, `with`, and similar) are ordinary strings, unlike
+/// the top-level `on:` key, which needs [`workflow_triggers`]' special
+/// handling.
+fn get_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value
+        .as_mapping()?
+        .iter()
+        .find_map(|(k, v)| k.as_str().filter(|s| *s == key).map(|_| v))
+}
+
+/// The set of trigger names declared under the workflow's `on:` key,
+/// lowercased.
+///
+/// Two shapes are normalised here:
+///  * The value may be a single scalar (`on: push`), a sequence
+///    (`on: [push, pull_request]`), or a mapping (`on:\n  push:\n  ...`).
+///  * The `on:` KEY itself: `serde_yaml` 0.9 keeps it as the string `"on"`, but
+///    YAML 1.1 parsers resolve the bare plain scalar `on` to the boolean
+///    `true`. Both key forms are accepted so trigger detection is robust to the
+///    parser's scalar resolution.
+fn workflow_triggers(doc: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(map) = doc.as_mapping() else {
+        return out;
+    };
+    let on = map.iter().find_map(|(k, v)| match k {
+        Value::String(s) if s == "on" => Some(v),
+        Value::Bool(true) => Some(v),
+        _ => None,
+    });
+    let Some(on) = on else {
+        return out;
+    };
+    match on {
+        Value::String(s) => {
+            out.insert(s.trim().to_ascii_lowercase());
+        }
+        Value::Sequence(items) => {
+            for it in items {
+                if let Some(s) = it.as_str() {
+                    out.insert(s.trim().to_ascii_lowercase());
+                }
+            }
+        }
+        Value::Mapping(m) => {
+            for (k, _) in m {
+                if let Some(s) = k.as_str() {
+                    out.insert(s.trim().to_ascii_lowercase());
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The `workflow_run` trigger runs a workflow *after another workflow completes*
+/// (including runs originating from fork pull requests) on the DEFAULT branch
+/// with a full read/write token and secrets. It is a distinct risk from
+/// `pull_request_target` (which the line-based check already flags): the danger
+/// here is treating the triggering run's artifacts / outputs (attacker-produced
+/// in a fork run) as trusted, or checking out its head. Flagged on the trigger's
+/// mere presence; the remediation differs from `pull_request_target`, so it is a
+/// separate rule rather than folded into `WorkflowDangerousTrigger`.
+fn check_workflow_run_trigger(triggers: &BTreeSet<String>, findings: &mut Vec<Finding>) {
+    if !triggers.contains("workflow_run") {
+        return;
+    }
+    findings.push(Finding {
+        rule_id: RuleId::WorkflowRunTrigger,
+        severity: Severity::High,
+        title: "Workflow uses the workflow_run trigger".to_string(),
+        description:
+            "This workflow is triggered by `workflow_run`, which runs after another workflow \
+             completes, on the repository's default branch, with a read/write `GITHUB_TOKEN` and \
+             access to secrets, even when the triggering run came from an untrusted fork's pull \
+             request. Artifacts, outputs, and the head ref of the triggering run are \
+             attacker-controllable; consuming them (downloading and trusting an artifact, or \
+             checking out `github.event.workflow_run.head_*`) lets a fork execute code or exfiltrate \
+             secrets with your repository's credentials. Treat every value from the triggering run \
+             as untrusted input, restrict `permissions:` to the minimum, and never check out or \
+             execute its head."
+                .to_string(),
+        evidence: vec![Evidence::Text {
+            detail: "trigger: workflow_run".to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    });
+}
+
+/// Triggers whose default `GITHUB_TOKEN` is broad AND whose runs are reachable /
+/// influenced by an untrusted actor (a fork PR, an issue/PR comment, or the
+/// re-run of a fork workflow). An over-broad token matters most on these; a
+/// plain `push` / `schedule` build that omits a `permissions:` block is far too
+/// common to flag on its own, so those are deliberately excluded. `pull_request`
+/// is also excluded: for fork PRs GitHub forces a read-only token regardless of
+/// the `permissions:` key, so it is not an escalation surface here.
+fn has_risky_permission_trigger(triggers: &BTreeSet<String>) -> bool {
+    const RISKY: &[&str] = &[
+        "pull_request_target",
+        "workflow_run",
+        "issue_comment",
+        "issues",
+        "discussion",
+        "discussion_comment",
+    ];
+    RISKY.iter().any(|t| triggers.contains(*t))
+}
+
+/// The effective breadth of a `permissions:` declaration (or its absence).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PermState {
+    /// No `permissions:` key at this level; the token inherits the broad
+    /// repository default.
+    Absent,
+    /// An explicit constraint: `read-all`, `none`, an empty map, or a scope
+    /// mapping that does not grant a broad write.
+    Constrained,
+    /// An over-broad grant: `write-all`, or a scope mapping granting
+    /// `contents: write`.
+    Broad,
+}
+
+/// Classify a `permissions:` node (or its absence) into a [`PermState`].
+///
+/// `write-all` is the unambiguous over-broad string form. A scope MAPPING is
+/// treated as a deliberate constraint (the author enumerated scopes) EXCEPT
+/// when it grants `contents: write`. Write access to repository contents is
+/// the canonical push-to-repo / create-release grant and the one this rule
+/// calls out by name. Other scoped writes (`issues: write`, `pull-requests:
+/// write`, and similar) are common and are NOT treated as broad, to keep false positives
+/// low.
+fn permission_state(node: Option<&Value>) -> PermState {
+    let Some(node) = node else {
+        return PermState::Absent;
+    };
+    match node {
+        Value::String(s) => {
+            if s.trim().eq_ignore_ascii_case("write-all") {
+                PermState::Broad
+            } else {
+                // `read-all` / `none` (and any other explicit scalar) constrain.
+                PermState::Constrained
+            }
+        }
+        Value::Mapping(m) => {
+            let grants_contents_write = m.iter().any(|(k, v)| {
+                k.as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("contents"))
+                    && v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("write"))
+            });
+            if grants_contents_write {
+                PermState::Broad
+            } else {
+                PermState::Constrained
+            }
+        }
+        // A null `permissions:` grants nothing beyond metadata, so it is a constraint.
+        _ => PermState::Constrained,
+    }
+}
+
+/// Flag a workflow whose `GITHUB_TOKEN` is broader than it should be for a
+/// risky trigger. Two firing conditions, both gated on a risky trigger:
+///  * an explicit over-broad grant (`write-all` / `contents: write`) at the
+///    workflow OR a job level; or
+///  * neither the workflow top-level NOR the job constrains `permissions`, so
+///    the broad default token is in effect.
+///
+/// Job-level permissions are walked before concluding a job is unconstrained: a
+/// job that sets its own safe `permissions:` is NOT flagged even when the
+/// top-level is absent, and a job that overrides a broad top-level with a
+/// constraint is likewise safe.
+fn check_workflow_excessive_permissions(
+    doc: &Value,
+    triggers: &BTreeSet<String>,
+    findings: &mut Vec<Finding>,
+) {
+    if !has_risky_permission_trigger(triggers) {
+        return;
+    }
+
+    let top = permission_state(get_field(doc, "permissions"));
+    let jobs = get_field(doc, "jobs").and_then(|j| j.as_mapping());
+
+    // Whether any job's *effective* token (its own permissions, else the
+    // workflow default) is over-broad, and whether any level is EXPLICITLY broad
+    // (for the description wording).
+    let mut over_broad = false;
+    let mut explicit_broad = top == PermState::Broad;
+
+    match jobs {
+        Some(jobs) if !jobs.is_empty() => {
+            for (_, job) in jobs {
+                let job_state = permission_state(get_field(job, "permissions"));
+                if job_state == PermState::Broad {
+                    explicit_broad = true;
+                }
+                let effective = if job_state == PermState::Absent {
+                    top
+                } else {
+                    job_state
+                };
+                if matches!(effective, PermState::Broad | PermState::Absent) {
+                    over_broad = true;
+                }
+            }
+        }
+        // No jobs to inspect; evaluate the workflow default alone.
+        _ => {
+            over_broad = matches!(top, PermState::Broad | PermState::Absent);
+        }
+    }
+
+    if !over_broad {
+        return;
+    }
+
+    let reason = if explicit_broad {
+        "grants an over-broad `GITHUB_TOKEN` (`write-all` or `contents: write`)"
+    } else {
+        "does not restrict `permissions:` at the workflow or job level, so the broad default \
+         `GITHUB_TOKEN` is in effect"
+    };
+    findings.push(Finding {
+        rule_id: RuleId::WorkflowExcessivePermissions,
+        severity: Severity::Medium,
+        title: "Workflow grants an excessive GITHUB_TOKEN for a risky trigger".to_string(),
+        description: format!(
+            "This workflow is triggered by an event an untrusted actor can influence (a fork \
+             `pull_request_target`, a `workflow_run`, or an issue/comment event) and {reason}. A \
+             broad token means any compromised step (a malicious dependency, an injected script, \
+             or attacker-controlled input) can push to the repository, publish packages, or alter \
+             releases with your credentials. Set an explicit least-privilege `permissions:` block \
+             (start from `permissions: {{}}` or `contents: read`) at the workflow or job level and \
+             grant only the scopes each job needs."
+        ),
+        evidence: vec![Evidence::Text {
+            detail: "permissions: over-broad for a risky trigger".to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    });
+}
+
+/// `${{ ... }}` contexts that resolve to a fork/PR-controlled ref, SHA, or repo:
+/// the value an attacker sets simply by opening a pull request (or by the fork
+/// run that fired a `workflow_run`). Checking one of these OUT under
+/// `pull_request_target` / `workflow_run` (both run with the BASE repo's
+/// privileges and secrets) is the "pwn request" code-execution-on-fork pattern.
+const PR_HEAD_REF_MARKERS: &[&str] = &[
+    "github.event.pull_request.head.ref",
+    "github.event.pull_request.head.sha",
+    "github.event.pull_request.head.label",
+    "github.event.pull_request.head.repo",
+    "github.head_ref",
+    "github.event.workflow_run.head_branch",
+    "github.event.workflow_run.head_sha",
+    "github.event.workflow_run.head_commit",
+    "github.event.workflow_run.head_repository",
+];
+
+/// Whether `value` interpolates a fork/PR-controlled head ref (see
+/// [`PR_HEAD_REF_MARKERS`]).
+fn interpolates_pr_head_ref(value: &str) -> bool {
+    github_expressions(value).into_iter().any(|expr| {
+        let normalized: String = expr
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        PR_HEAD_REF_MARKERS.iter().any(|m| normalized.contains(m))
+    })
+}
+
+/// Whether a `uses:` value refers to `actions/checkout` (any ref/pin form).
+fn is_checkout_action(uses: &str) -> bool {
+    let v = strip_quotes(uses).trim();
+    let repo = v.split('@').next().unwrap_or(v).trim();
+    repo.eq_ignore_ascii_case("actions/checkout")
+}
+
+/// Flag an `actions/checkout` step that checks out an untrusted PR head under a
+/// `pull_request_target` or `workflow_run` trigger, the classic pattern that
+/// runs a fork's code with the base repository's write token and secrets.
+fn check_workflow_checkout_untrusted_ref(
+    doc: &Value,
+    triggers: &BTreeSet<String>,
+    findings: &mut Vec<Finding>,
+) {
+    // Only the two privileged, fork-reachable triggers make this a code-exec
+    // vector; a `pull_request` checkout of the head runs with a read-only token.
+    if !triggers.contains("pull_request_target") && !triggers.contains("workflow_run") {
+        return;
+    }
+    let Some(jobs) = get_field(doc, "jobs").and_then(|j| j.as_mapping()) else {
+        return;
+    };
+    for (_, job) in jobs {
+        let Some(steps) = get_field(job, "steps").and_then(|s| s.as_sequence()) else {
+            continue;
+        };
+        for step in steps {
+            let Some(uses) = get_field(step, "uses").and_then(|u| u.as_str()) else {
+                continue;
+            };
+            if !is_checkout_action(uses) {
+                continue;
+            }
+            let Some(ref_val) = get_field(step, "with")
+                .and_then(|w| get_field(w, "ref"))
+                .and_then(|r| r.as_str())
+            else {
+                continue;
+            };
+            if interpolates_pr_head_ref(ref_val) {
+                findings.push(Finding {
+                    rule_id: RuleId::WorkflowCheckoutUntrustedRef,
+                    severity: Severity::High,
+                    title: "Workflow checks out an untrusted PR head with elevated privileges"
+                        .to_string(),
+                    description:
+                        "An `actions/checkout` step in this workflow checks out a pull-request head \
+                         ref (`github.event.pull_request.head.*` / `github.head_ref`, or the head \
+                         of a `workflow_run`) under a `pull_request_target` or `workflow_run` \
+                         trigger. Those triggers run with the base repository's read/write \
+                         `GITHUB_TOKEN` and secrets, so a subsequent build/test/lint step executes \
+                         the fork's code with your credentials, the well-known \"pwn request\" \
+                         remote-code-execution pattern. Do not check out and run untrusted PR code \
+                         under a privileged trigger: use `pull_request`, or check out only the base \
+                         and never execute the fork's tree."
+                            .to_string(),
+                    evidence: vec![Evidence::Text {
+                        detail: format!("checkout ref: {}", truncate(ref_val, 160)),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+                return;
+            }
+        }
+    }
+}
+
+/// Whether a `uses:` value refers to one of the `actions/cache` action forms.
+fn is_cache_action(uses: &str) -> bool {
+    let v = strip_quotes(uses).trim();
+    let repo = v.split('@').next().unwrap_or(v).trim().to_ascii_lowercase();
+    matches!(
+        repo.as_str(),
+        "actions/cache" | "actions/cache/save" | "actions/cache/restore"
+    )
+}
+
+/// The first `${{ ... }}` expression body in `value` that references an untrusted
+/// context (see [`UNTRUSTED_CONTEXT_MARKERS`]), if any.
+fn first_untrusted_expression(value: &str) -> Option<String> {
+    github_expressions(value)
+        .into_iter()
+        .find(|expr| expression_is_untrusted(expr))
+        .map(|expr| expr.trim().to_string())
+}
+
+/// Flag a cache action whose `key:` or `restore-keys:` interpolates an
+/// untrusted context (a PR title, `github.head_ref`, or an issue body). An
+/// attacker who controls the cache key can seed a cache entry a later
+/// privileged run restores and trusts: cache poisoning that can smuggle
+/// tampered build inputs across runs.
+fn check_workflow_cache_poisoning(doc: &Value, findings: &mut Vec<Finding>) {
+    let Some(jobs) = get_field(doc, "jobs").and_then(|j| j.as_mapping()) else {
+        return;
+    };
+    for (_, job) in jobs {
+        let Some(steps) = get_field(job, "steps").and_then(|s| s.as_sequence()) else {
+            continue;
+        };
+        for step in steps {
+            let Some(uses) = get_field(step, "uses").and_then(|u| u.as_str()) else {
+                continue;
+            };
+            if !is_cache_action(uses) {
+                continue;
+            }
+            let Some(with) = get_field(step, "with") else {
+                continue;
+            };
+
+            // `key:` is a scalar; `restore-keys:` is a scalar or a sequence.
+            let mut hit: Option<String> = get_field(with, "key")
+                .and_then(|k| k.as_str())
+                .and_then(first_untrusted_expression);
+            if hit.is_none() {
+                if let Some(rk) = get_field(with, "restore-keys") {
+                    hit = match rk {
+                        Value::String(s) => first_untrusted_expression(s),
+                        Value::Sequence(items) => items
+                            .iter()
+                            .filter_map(|it| it.as_str())
+                            .find_map(first_untrusted_expression),
+                        _ => None,
+                    };
+                }
+            }
+
+            if let Some(expr) = hit {
+                findings.push(Finding {
+                    rule_id: RuleId::WorkflowCachePoisoning,
+                    severity: Severity::Medium,
+                    title: "Workflow cache key interpolates untrusted input".to_string(),
+                    description: format!(
+                        "A cache action in this workflow builds its cache key from the \
+                         attacker-controllable expression `${{{{ {expr} }}}}` (a PR title, branch \
+                         name, or issue body). An attacker who controls the key can create or \
+                         overwrite a cache entry that a later, more privileged run restores and \
+                         trusts, poisoning build inputs (dependencies, compiled artifacts) across \
+                         runs. Build cache keys only from trusted, content-derived values such as \
+                         `hashFiles(...)` and the runner OS; never from untrusted event data."
+                    ),
+                    evidence: vec![Evidence::Text {
+                        detail: format!("cache key: {}", truncate(&expr, 160)),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+                return;
             }
         }
     }
@@ -1680,6 +2170,288 @@ mod tests {
             ),
             "the sibling env: of a `- run: |` step is not a shell sink"
         );
+    }
+
+    // --- workflow: structural, workflow_run trigger ---------------------
+
+    #[test]
+    fn workflow_run_trigger_flagged() {
+        let wf = "on:\n  workflow_run:\n    workflows: [CI]\n    types: [completed]\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowRunTrigger
+        ));
+    }
+
+    #[test]
+    fn workflow_run_trigger_distinct_from_pull_request_target() {
+        // workflow_run must NOT be reported as the pull_request_target rule.
+        let wf = "on:\n  workflow_run:\n    workflows: [CI]\n    types: [completed]\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowDangerousTrigger
+        ));
+    }
+
+    #[test]
+    fn workflow_run_trigger_not_on_push_clean() {
+        let wf = "on: [push]\njobs:\n  b:\n    steps:\n      - run: make\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowRunTrigger
+        ));
+    }
+
+    // --- workflow: structural, excessive permissions --------------------
+
+    #[test]
+    fn workflow_excessive_permissions_write_all_flagged() {
+        let wf = "on:\n  issue_comment:\n    types: [created]\npermissions: write-all\n\
+                  jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowExcessivePermissions
+        ));
+    }
+
+    #[test]
+    fn workflow_excessive_permissions_absent_under_risky_flagged() {
+        // A risky trigger with NO permissions block anywhere; the broad
+        // default token is in effect.
+        let wf = "on:\n  issue_comment:\n    types: [created]\n\
+                  jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowExcessivePermissions
+        ));
+    }
+
+    #[test]
+    fn workflow_excessive_permissions_contents_write_flagged() {
+        let wf = "on:\n  issues:\n    types: [opened]\npermissions:\n  contents: write\n\
+                  jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowExcessivePermissions
+        ));
+    }
+
+    #[test]
+    fn workflow_excessive_permissions_job_level_safe_clean() {
+        // Top-level absent, but the job sets its own safe permissions, the
+        // "walk job-level before concluding" requirement. Must NOT fire.
+        let wf = "on:\n  issue_comment:\n    types: [created]\n\
+                  jobs:\n  a:\n    runs-on: ubuntu-latest\n    permissions:\n      \
+                  contents: read\n    steps:\n      - run: echo hi\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowExcessivePermissions
+        ));
+    }
+
+    #[test]
+    fn workflow_excessive_permissions_top_constrained_clean() {
+        let wf = "on:\n  issue_comment:\n    types: [created]\npermissions: read-all\n\
+                  jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowExcessivePermissions
+        ));
+    }
+
+    #[test]
+    fn workflow_excessive_permissions_scoped_write_clean() {
+        // A scoped write that is NOT `contents: write` (issues: write) is a
+        // deliberate least-privilege grant; must NOT fire.
+        let wf = "on:\n  issues:\n    types: [opened]\npermissions:\n  issues: write\n\
+                  jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowExcessivePermissions
+        ));
+    }
+
+    #[test]
+    fn workflow_excessive_permissions_push_not_risky_clean() {
+        // A non-risky trigger (push) with write-all is common (release jobs) and
+        // is deliberately NOT flagged by this rule.
+        let wf = "on: [push]\npermissions: write-all\n\
+                  jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowExcessivePermissions
+        ));
+    }
+
+    // --- workflow: structural, checkout of untrusted PR head ------------
+
+    const SHA_PIN: &str = "8ade135a41bc03ea155e62e844d188df1ea18608";
+
+    #[test]
+    fn workflow_checkout_untrusted_ref_pull_request_target_flagged() {
+        let wf = format!(
+            "on:\n  pull_request_target:\n    types: [opened]\npermissions:\n  contents: read\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/checkout@{SHA_PIN}\n        with:\n          \
+             ref: ${{{{ github.event.pull_request.head.ref }}}}\n      - run: make\n"
+        );
+        assert!(has(
+            &wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCheckoutUntrustedRef
+        ));
+    }
+
+    #[test]
+    fn workflow_checkout_untrusted_ref_workflow_run_flagged() {
+        let wf = format!(
+            "on:\n  workflow_run:\n    workflows: [CI]\n    types: [completed]\n\
+             permissions:\n  contents: read\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/checkout@{SHA_PIN}\n        with:\n          \
+             ref: ${{{{ github.event.workflow_run.head_sha }}}}\n"
+        );
+        assert!(has(
+            &wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCheckoutUntrustedRef
+        ));
+    }
+
+    #[test]
+    fn workflow_checkout_base_no_ref_clean() {
+        // pull_request_target that checks out the base (no untrusted ref) must
+        // NOT fire the checkout rule (it still fires the trigger rule).
+        let wf = format!(
+            "on:\n  pull_request_target:\n    types: [opened]\npermissions:\n  contents: read\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/checkout@{SHA_PIN}\n      - run: echo label\n"
+        );
+        assert!(!has(
+            &wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCheckoutUntrustedRef
+        ));
+    }
+
+    #[test]
+    fn workflow_checkout_untrusted_ref_plain_pull_request_clean() {
+        // Under plain `pull_request` a fork PR gets a read-only token, so a
+        // head checkout is not the privileged code-exec vector; must NOT fire.
+        let wf = format!(
+            "on: [pull_request]\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/checkout@{SHA_PIN}\n        with:\n          \
+             ref: ${{{{ github.event.pull_request.head.ref }}}}\n"
+        );
+        assert!(!has(
+            &wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCheckoutUntrustedRef
+        ));
+    }
+
+    // --- workflow: structural, cache poisoning --------------------------
+
+    #[test]
+    fn workflow_cache_poisoning_untrusted_key_flagged() {
+        let wf = format!(
+            "on: [pull_request]\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/cache@{SHA_PIN}\n        with:\n          path: ~/.cache\n          \
+             key: deps-${{{{ github.head_ref }}}}\n"
+        );
+        assert!(has(
+            &wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCachePoisoning
+        ));
+    }
+
+    #[test]
+    fn workflow_cache_poisoning_restore_keys_flagged() {
+        let wf = format!(
+            "on: [pull_request]\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/cache/restore@{SHA_PIN}\n        with:\n          path: ~/.cache\n          \
+             key: build\n          restore-keys: |\n            \
+             pr-${{{{ github.event.pull_request.title }}}}\n"
+        );
+        assert!(has(
+            &wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCachePoisoning
+        ));
+    }
+
+    #[test]
+    fn workflow_cache_poisoning_static_key_clean() {
+        let wf = format!(
+            "on: [pull_request]\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/cache@{SHA_PIN}\n        with:\n          path: ~/.cache\n          \
+             key: deps-${{{{ hashFiles('**/lock') }}}}\n"
+        );
+        assert!(!has(
+            &wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCachePoisoning
+        ));
+    }
+
+    // --- workflow: extended untrusted-context markers --------------------
+
+    #[test]
+    fn workflow_untrusted_repo_description_in_run_flagged() {
+        // Extended UNTRUSTED_CONTEXT_MARKERS: repository.description is
+        // attacker-controllable and interpolating it into a run step injects.
+        let wf = "on: pull_request_target\njobs:\n  b:\n    steps:\n      \
+                  - run: echo \"${{ github.event.repository.description }}\"\n";
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowUntrustedInput
+        ));
+    }
+
+    // --- workflow: structural totality -----------------------------------
+
+    #[test]
+    fn workflow_malformed_yaml_no_panic_line_checks_still_run() {
+        // A doc that does not parse as YAML must skip the structural checks
+        // gracefully while the line-based checks still fire.
+        let wf = "on: [push]\n  : : : not valid yaml : [\njobs:\n  - run: curl x | bash\n";
+        // Must not panic; the line-based curl|bash check still detects the pipe.
+        assert!(has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowCurlPipeShell
+        ));
+    }
+
+    #[test]
+    fn workflow_env_passthrough_still_clean() {
+        // Regression guard for the deliberate scope decision: passing untrusted
+        // input through `env:` and referencing it as `$VAR` is the SANCTIONED
+        // mitigation and must remain clean (no structural env-value flagging).
+        let wf = "on: pull_request_target\njobs:\n  b:\n    runs-on: ubuntu-latest\n    \
+                  permissions:\n      contents: read\n    steps:\n      - run: echo \"$TITLE\"\n        \
+                  env:\n          TITLE: ${{ github.event.issue.title }}\n";
+        assert!(!has(
+            wf,
+            ".github/workflows/ci.yml",
+            RuleId::WorkflowUntrustedInput
+        ));
     }
 
     // --- Dockerfile -------------------------------------------------------

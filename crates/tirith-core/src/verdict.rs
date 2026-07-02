@@ -125,6 +125,10 @@ pub enum RuleId {
     WorkflowDangerousTrigger,
     WorkflowCurlPipeShell,
     WorkflowUntrustedInput,
+    WorkflowExcessivePermissions,
+    WorkflowRunTrigger,
+    WorkflowCheckoutUntrustedRef,
+    WorkflowCachePoisoning,
     DockerfileUnpinnedImage,
     PackageScriptDangerous,
 

@@ -49,13 +49,18 @@ expected_rules = []
 # ── GitHub Actions: dangerous trigger ───────────────────────────────────
 
 [[fixture]]
+# A constrained `permissions:` block keeps this focused on the trigger rule:
+# without it the structural excessive-permissions check would also fire (a
+# risky trigger with an unset, broad default token). `forbidden_rules` pins
+# that the constraint suppresses it.
 name = "workflow_pull_request_target_trigger"
 min_milestone = 3
-input = "name: PR\non:\n  pull_request_target:\n    branches: [main]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n"
+input = "name: PR\non:\n  pull_request_target:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n"
 context = "file"
 file_path = ".github/workflows/pr.yml"
 expected_action = "block"
 expected_rules = ["workflow_dangerous_trigger"]
+forbidden_rules = ["workflow_excessive_permissions", "workflow_checkout_untrusted_ref"]
 
 [[fixture]]
 name = "workflow_plain_pull_request_clean"
@@ -275,3 +280,136 @@ context = "file"
 file_path = "package.json"
 expected_action = "allow"
 expected_rules = []
+
+# ── GitHub Actions: structural (parsed-YAML) checks ─────────────────────
+#
+# The checks below parse the workflow into a YAML tree (permissions, triggers,
+# steps) rather than scanning lines. Each fixture is hand-authored synthetic
+# content (neutral names, benign commands) representing a well-documented
+# technique class; oracle tools (zizmor / actionlint / poutine / Scorecard) are
+# reference-only and none of their rule text or data is reproduced here.
+
+# ── workflow_run trigger (distinct from pull_request_target) ─────────────
+
+[[fixture]]
+name = "workflow_run_trigger"
+min_milestone = 3
+input = "name: Post CI\non:\n  workflow_run:\n    workflows: [CI]\n    types: [completed]\npermissions:\n  contents: read\njobs:\n  report:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo done\n"
+context = "file"
+file_path = ".github/workflows/post-ci.yml"
+expected_action = "block"
+expected_rules = ["workflow_run_trigger"]
+forbidden_rules = ["workflow_dangerous_trigger", "workflow_excessive_permissions", "workflow_checkout_untrusted_ref", "workflow_cache_poisoning"]
+
+[[fixture]]
+# An all-clean control: SHA-pinned checkout, constrained token, non-risky
+# trigger. None of the new structural rules (nor the line-based ones) fire.
+name = "workflow_normal_push_clean"
+min_milestone = 3
+input = "name: CI\non: [push]\npermissions:\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608\n      - run: make build\n"
+context = "file"
+file_path = ".github/workflows/ci.yml"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["workflow_run_trigger", "workflow_excessive_permissions", "workflow_checkout_untrusted_ref", "workflow_cache_poisoning", "workflow_unpinned_action"]
+
+# ── excessive GITHUB_TOKEN permissions on a risky trigger ────────────────
+
+[[fixture]]
+# Explicit over-broad grant (`write-all`) on a fork-reachable trigger.
+name = "workflow_excessive_permissions_write_all"
+min_milestone = 3
+input = "name: Comment Handler\non:\n  issue_comment:\n    types: [created]\npermissions: write-all\njobs:\n  respond:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo handling\n"
+context = "file"
+file_path = ".github/workflows/comment.yml"
+expected_action = "warn"
+expected_rules = ["workflow_excessive_permissions"]
+forbidden_rules = ["workflow_dangerous_trigger", "workflow_run_trigger", "workflow_checkout_untrusted_ref", "workflow_cache_poisoning", "workflow_unpinned_action"]
+
+[[fixture]]
+# No `permissions:` block anywhere on a risky trigger; the broad default
+# token is in effect.
+name = "workflow_excessive_permissions_default_token"
+min_milestone = 3
+input = "name: Comment Handler\non:\n  issue_comment:\n    types: [created]\njobs:\n  respond:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo handling\n"
+context = "file"
+file_path = ".github/workflows/comment.yml"
+expected_action = "warn"
+expected_rules = ["workflow_excessive_permissions"]
+forbidden_rules = ["workflow_dangerous_trigger", "workflow_run_trigger", "workflow_checkout_untrusted_ref", "workflow_cache_poisoning"]
+
+[[fixture]]
+# Job-level safe permissions with the top-level unset, the "walk job-level
+# before concluding" requirement. Must NOT fire.
+name = "workflow_excessive_permissions_job_level_safe_clean"
+min_milestone = 3
+input = "name: Comment Handler\non:\n  issue_comment:\n    types: [created]\njobs:\n  respond:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    steps:\n      - run: echo handling\n"
+context = "file"
+file_path = ".github/workflows/comment.yml"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["workflow_excessive_permissions"]
+
+[[fixture]]
+# A scoped write that is NOT `contents: write` (issues: write) is a deliberate
+# least-privilege grant on a risky trigger; must NOT fire.
+name = "workflow_excessive_permissions_scoped_write_clean"
+min_milestone = 3
+input = "name: Triage\non:\n  issues:\n    types: [opened]\npermissions:\n  issues: write\njobs:\n  triage:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo triage\n"
+context = "file"
+file_path = ".github/workflows/triage.yml"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["workflow_excessive_permissions"]
+
+# ── checkout of an untrusted PR head under a privileged trigger ──────────
+
+[[fixture]]
+# The "pwn request" pattern: pull_request_target + checkout of the PR head ref.
+# Also fires the (line-based) dangerous-trigger rule; the token is constrained
+# so excessive-permissions does not, and the SHA pin keeps unpinned-action off.
+name = "workflow_checkout_untrusted_pr_head"
+min_milestone = 3
+input = "name: PR Build\non:\n  pull_request_target:\n    types: [opened, synchronize]\npermissions:\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608\n        with:\n          ref: ${{ github.event.pull_request.head.ref }}\n      - run: make test\n"
+context = "file"
+file_path = ".github/workflows/pr-build.yml"
+expected_action = "block"
+expected_rules = ["workflow_checkout_untrusted_ref", "workflow_dangerous_trigger"]
+forbidden_rules = ["workflow_excessive_permissions", "workflow_run_trigger", "workflow_cache_poisoning", "workflow_untrusted_input", "workflow_unpinned_action"]
+
+[[fixture]]
+# pull_request_target that checks out the base (no untrusted ref). Fires only
+# the trigger rule; the checkout rule must NOT fire.
+name = "workflow_checkout_base_ref_clean"
+min_milestone = 3
+input = "name: PR Label\non:\n  pull_request_target:\n    types: [opened]\npermissions:\n  contents: read\njobs:\n  label:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608\n      - run: echo label\n"
+context = "file"
+file_path = ".github/workflows/pr-label.yml"
+expected_action = "block"
+expected_rules = ["workflow_dangerous_trigger"]
+forbidden_rules = ["workflow_checkout_untrusted_ref", "workflow_excessive_permissions", "workflow_unpinned_action"]
+
+# ── cache-key poisoning ──────────────────────────────────────────────────
+
+[[fixture]]
+# A cache key built from an untrusted context (github.head_ref).
+name = "workflow_cache_key_untrusted"
+min_milestone = 3
+input = "name: Build\non: [pull_request]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/cache@8ade135a41bc03ea155e62e844d188df1ea18608\n        with:\n          path: ~/.cache/deps\n          key: deps-${{ github.head_ref }}\n      - run: make build\n"
+context = "file"
+file_path = ".github/workflows/build.yml"
+expected_action = "warn"
+expected_rules = ["workflow_cache_poisoning"]
+forbidden_rules = ["workflow_excessive_permissions", "workflow_dangerous_trigger", "workflow_run_trigger", "workflow_checkout_untrusted_ref", "workflow_untrusted_input", "workflow_unpinned_action"]
+
+[[fixture]]
+# A cache key built only from trusted, content-derived values (hashFiles) is
+# safe and must NOT fire.
+name = "workflow_cache_key_static_clean"
+min_milestone = 3
+input = "name: Build\non: [pull_request]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/cache@8ade135a41bc03ea155e62e844d188df1ea18608\n        with:\n          path: ~/.cache/deps\n          key: deps-${{ hashFiles('**/lockfile') }}\n      - run: make build\n"
+context = "file"
+file_path = ".github/workflows/build.yml"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["workflow_cache_poisoning", "workflow_untrusted_input", "workflow_unpinned_action"]
