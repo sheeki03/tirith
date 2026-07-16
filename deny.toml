@@ -27,6 +27,16 @@ ignore = [
     # load_mem is ever called, so the crash path is blocked. Remove this ignore
     # (and the .cargo/audit.toml twin) once MSRV/lopdf can move.
     "RUSTSEC-2026-0187",
+    # quick-xml 0.32.0 DoS advisories: quadratic run time when checking a start
+    # tag for duplicate attribute names, and unbounded namespace-declaration
+    # allocation in NsReader (memory exhaustion). Reached only via
+    # aws-creds -> rust-s3 -> tirith-license-server, the same transitive chain as
+    # the rustls-pemfile / rustls-webpki / time ignores above. rust-s3 0.35.1 pins
+    # quick-xml 0.32.0 and the fix is a major-version jump it has not taken; tirith
+    # never parses untrusted XML on this path (S3 credential and response handling
+    # only). Remove once rust-s3 moves to a fixed quick-xml.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]

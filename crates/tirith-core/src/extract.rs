@@ -1090,14 +1090,12 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
                         == Some("tirith")
                     {
                         0
-                    } else if let Some(at) = segment
-                        .args
-                        .iter()
-                        .position(|a| command_base_name(a) == "tirith")
-                    {
-                        at + 1
                     } else {
-                        return None;
+                        let at = segment
+                            .args
+                            .iter()
+                            .position(|a| command_base_name(a) == "tirith")?;
+                        at + 1
                     };
                 // Skip flags (e.g. `--quiet`) to land on the subcommand token.
                 let mut i = start_from;

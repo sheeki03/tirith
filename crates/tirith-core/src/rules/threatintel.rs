@@ -284,7 +284,9 @@ fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
 
     let (name, version) = if spec.starts_with('@') {
         // Scoped `@scope/name@version` — find the version `@` after the scope.
-        if let Some(slash_pos) = spec.find('/') {
+        {
+            // No slash means an invalid scoped package, so `?` yields None.
+            let slash_pos = spec.find('/')?;
             let after_scope = &spec[slash_pos + 1..];
             if let Some(at_pos) = after_scope.find('@') {
                 let full_name = &spec[..slash_pos + 1 + at_pos];
@@ -293,8 +295,6 @@ fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
             } else {
                 (spec, None)
             }
-        } else {
-            return None; // invalid scoped package (no slash)
         }
     } else if let Some(at_pos) = spec.find('@') {
         let name = &spec[..at_pos];
