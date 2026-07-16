@@ -262,9 +262,9 @@ fn decode_signed_token(
 
     // exp is required on signed tokens and must be an i64 Unix timestamp.
     // Wrong type → None (fail-closed), and comparison is exclusive.
-    let exp = match payload.get("exp") {
-        Some(v) => v.as_i64()?,
-        None => return None,
+    let exp = {
+        let v = payload.get("exp")?;
+        v.as_i64()?
     };
     if now.timestamp() >= exp {
         return None;

@@ -296,11 +296,11 @@ fn parse_clause(part: &str) -> Option<Clause> {
         (Operator::Ge, r)
     } else if let Some(r) = part.strip_prefix('<') {
         (Operator::Lt, r)
-    } else if let Some(r) = part.strip_prefix('>') {
-        (Operator::Gt, r)
     } else {
-        // A bare version, a caret/tilde range, or anything else: not understood.
-        return None;
+        // Only `>` remains here; a bare version, a caret/tilde range, or anything
+        // else is not a recognized operator, so `?` yields None (not understood).
+        let r = part.strip_prefix('>')?;
+        (Operator::Gt, r)
     };
 
     let ver = rest.trim();

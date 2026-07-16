@@ -62,6 +62,20 @@ jobs:
           wait
           echo "Sources fetched successfully"
 
+      # DigitalSide Threat-Intel (davidonzo/Threat-Intel, MIT-licensed code) is
+      # defined in the compiler as ThreatSource::DigitalSide with a --digitalside
+      # <path> flag and a MISP-CSV parser, but the CI fetch is DELIBERATELY NOT
+      # wired up: the upstream feed is stale. Its automated daily commits stopped
+      # at 2024-10-18 and, re-checked on 2026-07-16, the repository had published
+      # nothing new since (last commit still 2024-10-18T07:09:50Z). The upstream
+      # data license/redistribution terms are also unstated in the repo README and
+      # the MISP feed metadata (distribution flag "0"), which is a second reason to
+      # hold off ingesting it into the signed DB. To re-enable once upstream is
+      # fresh AND the data license permits redistribution: fetch the MISP CSV
+      # export (e.g. the csv/ directory or a concatenated export) into /tmp, vendor
+      # the upstream LICENSE + attribution as the other feeds do, and pass
+      # `--digitalside <path>` in the "Compile threat database" step below.
+
       # Bail early if signing key is not configured
       - name: Check signing key
         env:

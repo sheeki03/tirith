@@ -284,7 +284,9 @@ fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
 
     let (name, version) = if spec.starts_with('@') {
         // Scoped `@scope/name@version` — find the version `@` after the scope.
-        if let Some(slash_pos) = spec.find('/') {
+        {
+            // No slash means an invalid scoped package, so `?` yields None.
+            let slash_pos = spec.find('/')?;
             let after_scope = &spec[slash_pos + 1..];
             if let Some(at_pos) = after_scope.find('@') {
                 let full_name = &spec[..slash_pos + 1 + at_pos];
@@ -293,8 +295,6 @@ fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
             } else {
                 (spec, None)
             }
-        } else {
-            return None; // invalid scoped package (no slash)
         }
     } else if let Some(at_pos) = spec.find('@') {
         let name = &spec[..at_pos];
@@ -647,7 +647,8 @@ fn hostname_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity
         | threatdb::ThreatSource::CisaKev
         | threatdb::ThreatSource::FireholIp
         | threatdb::ThreatSource::TorExit
-        | threatdb::ThreatSource::ExfilEndpoint => (
+        | threatdb::ThreatSource::ExfilEndpoint
+        | threatdb::ThreatSource::DigitalSide => (
             RuleId::ThreatMaliciousUrl,
             Severity::High,
             "malicious hostname",
@@ -673,7 +674,8 @@ fn ip_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity, &'st
         | threatdb::ThreatSource::PhishingArmy
         | threatdb::ThreatSource::PhishTank
         | threatdb::ThreatSource::FireholIp
-        | threatdb::ThreatSource::ExfilEndpoint => {
+        | threatdb::ThreatSource::ExfilEndpoint
+        | threatdb::ThreatSource::DigitalSide => {
             (RuleId::ThreatMaliciousIp, Severity::High, "malicious IP")
         }
     }
@@ -1488,5 +1490,19 @@ mod tests {
         let (rule, sev, _) = ip_rule_for_source(threatdb::ThreatSource::FeodoTracker);
         assert_eq!(rule, RuleId::ThreatMaliciousIp);
         assert_eq!(sev, Severity::High);
+    }
+
+    #[test]
+    fn digitalside_maps_to_generic_malicious_rules() {
+        // DigitalSide is a generic IoC feed: hostnames route to ThreatMaliciousUrl
+        // and IPs to ThreatMaliciousIp, both High, like the other IoC sources.
+        let (host_rule, host_sev, _) =
+            hostname_rule_for_source(threatdb::ThreatSource::DigitalSide);
+        assert_eq!(host_rule, RuleId::ThreatMaliciousUrl);
+        assert_eq!(host_sev, Severity::High);
+
+        let (ip_rule, ip_sev, _) = ip_rule_for_source(threatdb::ThreatSource::DigitalSide);
+        assert_eq!(ip_rule, RuleId::ThreatMaliciousIp);
+        assert_eq!(ip_sev, Severity::High);
     }
 }

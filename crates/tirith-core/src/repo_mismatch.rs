@@ -245,10 +245,9 @@ fn parse_known_git_host(url: &str) -> Option<KnownGitHost> {
         (HostKind::GitLab, rest)
     } else if let Some(rest) = url.strip_prefix("https://bitbucket.org/") {
         (HostKind::Bitbucket, rest)
-    } else if let Some(rest) = url.strip_prefix("http://bitbucket.org/") {
-        (HostKind::Bitbucket, rest)
     } else {
-        return None;
+        let rest = url.strip_prefix("http://bitbucket.org/")?;
+        (HostKind::Bitbucket, rest)
     };
     let mut parts = after_host.split('/');
     let owner = parts.next().filter(|p| !p.is_empty())?.to_string();
