@@ -4085,6 +4085,7 @@ mod tests {
         // Spot-check a couple of stable identifiers.
         assert_eq!(ThreatSource::OssfMalicious.as_str(), "ossf_malicious");
         assert_eq!(ThreatSource::TorExit.as_str(), "tor_exit");
+        assert_eq!(ThreatSource::DigitalSide.as_str(), "digitalside");
     }
 
     #[test]
