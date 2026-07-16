@@ -180,6 +180,101 @@ pub fn parse_phishtank_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
     Ok(entries)
 }
 
+/// Parse a DigitalSide Threat-Intel MISP-style CSV export.
+///
+/// The upstream feed (davidonzo/Threat-Intel) exports one MISP attribute per
+/// row in the standard MISP CSV shape:
+///
+/// ```text
+/// uuid,event_id,category,type,value,comment,to_ids,date,object_relation,...
+/// ```
+///
+/// MISP semantics enforced here:
+/// * Only rows with `to_ids=1` are ingested (an analyst has flagged the
+///   attribute as a detectable indicator); `to_ids=0` context rows are dropped.
+/// * Only network-indicator `type`s are ingested: `url` (mapped through
+///   [`extract_hostname_from_url`]), `domain` / `hostname` (taken directly), and
+///   `ip-src` / `ip-dst` (parsed as IPv4). Every other type -- `filename`,
+///   `md5` / `sha1` / `sha256`, `mime-type`, `comment`, and so on -- is skipped,
+///   so a file name or a hash is never mistaken for a host or IP.
+///
+/// Column positions are resolved from the header row, falling back to the fixed
+/// MISP layout (`type` = 3, `value` = 4, `to_ids` = 6) when a header is absent.
+/// Scope is v1 hostnames plus IPv4; file-hash ingestion is deferred to a
+/// follow-up (the `CuratedFileHashes` path).
+pub fn parse_digitalside_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
+    let mut csv = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(reader);
+    let headers = csv
+        .headers()
+        .map_err(|e| format!("DigitalSide headers: {e}"))?
+        .clone();
+
+    let type_idx = headers
+        .iter()
+        .position(|header| header == "type")
+        .unwrap_or(3);
+    let value_idx = headers
+        .iter()
+        .position(|header| header == "value")
+        .unwrap_or(4);
+    let to_ids_idx = headers
+        .iter()
+        .position(|header| header == "to_ids")
+        .unwrap_or(6);
+
+    let mut entries = FeedEntries::default();
+    for record in csv.records() {
+        let record = match record {
+            Ok(record) => record,
+            Err(_) => continue,
+        };
+
+        // MISP `to_ids` gate: ingest only analyst-flagged detectable indicators.
+        if record.get(to_ids_idx).map(str::trim) != Some("1") {
+            continue;
+        }
+
+        let ioc_type = match record.get(type_idx) {
+            Some(value) => value.trim().to_ascii_lowercase(),
+            None => continue,
+        };
+        let value = match record.get(value_idx) {
+            Some(value) => value.trim(),
+            None => continue,
+        };
+        if value.is_empty() {
+            continue;
+        }
+
+        match ioc_type.as_str() {
+            "url" => {
+                if let Some(host) = extract_hostname_from_url(value) {
+                    entries.hostnames.push(host);
+                }
+            }
+            // A domain/hostname attribute is a bare host; the guard rejects a
+            // stray URL sneaking into the field before it is stored.
+            "domain" | "hostname" if !value.contains('/') => {
+                entries.hostnames.push(value.to_ascii_lowercase());
+            }
+            "ip-src" | "ip-dst" => {
+                if let Ok(ip) = value.parse::<Ipv4Addr>() {
+                    entries.ips.push(ip);
+                }
+            }
+            // filename, md5/sha*, mime-type, comment, and every other type are
+            // deliberately not network indicators and are skipped.
+            _ => {}
+        }
+    }
+
+    entries.sort_and_dedup();
+    Ok(entries)
+}
+
 pub fn parse_domain_blocklist(contents: &str) -> FeedEntries {
     let mut entries = FeedEntries::default();
     for line in contents.lines() {
@@ -427,6 +522,84 @@ mod tests {
         let csv = "phish_id,url,detail_url\n1,https://phish.example/login,https://phishtank.org/phish/1\n";
         let entries = parse_phishtank_csv(csv.as_bytes()).unwrap();
         assert_eq!(entries.hostnames, vec!["phish.example".to_string()]);
+    }
+
+    // Standard MISP CSV export header used by the DigitalSide feed.
+    const DIGITALSIDE_HEADER: &str = "uuid,event_id,category,type,value,comment,to_ids,date,object_relation,attribute_tag,object_uuid,object_name,object_meta_category";
+
+    #[test]
+    fn digitalside_csv_ingests_only_network_indicators_with_to_ids() {
+        // MISP-style rows using synthetic RFC-2606 hosts and RFC-5737 IPs, in the
+        // real quoted export shape (string fields quoted, numerics bare).
+        let rows = [
+            // Ingested: to_ids=1 network indicators (url/domain/hostname/ip-src/ip-dst).
+            r#""u1",100,"Network activity","url","http://malware.example/x","",1,1728745084,"","","","","""#,
+            r#""u2",100,"Network activity","domain","evil.example","",1,1728745084,"","","","","""#,
+            r#""u3",100,"Network activity","hostname","c2.evil.example","",1,1728745084,"","","","","""#,
+            r#""u4",100,"Network activity","ip-src","192.0.2.10","",1,1728745084,"","","","","""#,
+            r#""u5",100,"Network activity","ip-dst","198.51.100.20","",1,1728745084,"","","","","""#,
+            // Dropped: to_ids=0 context row, even though it is a domain.
+            r#""u6",100,"Network activity","domain","benign-context.example","",0,1728745084,"","","","","""#,
+            // Dropped: non-network types, even with to_ids=1. A filename that
+            // happens to look like a host must NOT become a hostname.
+            r#""u7",100,"Payload delivery","filename","dropper.example","",1,1728745084,"","","","","""#,
+            r#""u8",100,"Payload delivery","md5","d41d8cd98f00b204e9800998ecf8427e","",1,1728745084,"","","","","""#,
+            r#""u9",100,"Payload delivery","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","",1,1728745084,"","","","","""#,
+            r#""u10",100,"Other","comment","see evil.example for details","",1,1728745084,"","","","","""#,
+        ];
+        let csv = format!("{DIGITALSIDE_HEADER}\n{}\n", rows.join("\n"));
+        let entries = parse_digitalside_csv(csv.as_bytes()).unwrap();
+
+        // Hostnames come out sorted+deduped: url host, domain, and hostname only.
+        assert_eq!(
+            entries.hostnames,
+            vec![
+                "c2.evil.example".to_string(),
+                "evil.example".to_string(),
+                "malware.example".to_string(),
+            ],
+        );
+        assert_eq!(
+            entries.ips,
+            vec![
+                Ipv4Addr::new(192, 0, 2, 10),
+                Ipv4Addr::new(198, 51, 100, 20)
+            ],
+        );
+        // The to_ids=0 domain, the filename, the hashes, and the comment produced
+        // no host: a non-network attribute is never ingested as an indicator.
+        assert!(!entries
+            .hostnames
+            .contains(&"benign-context.example".to_string()));
+        assert!(!entries.hostnames.contains(&"dropper.example".to_string()));
+    }
+
+    #[test]
+    fn digitalside_csv_dedups_repeated_indicators() {
+        let rows = [
+            r#""u1",100,"Network activity","domain","dup.example","",1,1728745084,"","","","","""#,
+            r#""u2",100,"Network activity","domain","dup.example","",1,1728745084,"","","","","""#,
+            // Same host reached via a url attribute; must fold into one entry.
+            r#""u3",100,"Network activity","url","http://dup.example/other","",1,1728745084,"","","","","""#,
+            r#""u4",100,"Network activity","ip-dst","203.0.113.5","",1,1728745084,"","","","","""#,
+            r#""u5",100,"Network activity","ip-dst","203.0.113.5","",1,1728745084,"","","","","""#,
+        ];
+        let csv = format!("{DIGITALSIDE_HEADER}\n{}\n", rows.join("\n"));
+        let entries = parse_digitalside_csv(csv.as_bytes()).unwrap();
+        assert_eq!(entries.hostnames, vec!["dup.example".to_string()]);
+        assert_eq!(entries.ips, vec![Ipv4Addr::new(203, 0, 113, 5)]);
+    }
+
+    #[test]
+    fn digitalside_csv_drops_to_ids_zero_rows() {
+        // A single to_ids=0 row yields nothing: the MISP flag gate is required.
+        let rows = [
+            r#""u1",100,"Network activity","domain","context-only.example","",0,1728745084,"","","","","""#,
+        ];
+        let csv = format!("{DIGITALSIDE_HEADER}\n{}\n", rows.join("\n"));
+        let entries = parse_digitalside_csv(csv.as_bytes()).unwrap();
+        assert!(entries.hostnames.is_empty());
+        assert!(entries.ips.is_empty());
     }
 
     #[test]

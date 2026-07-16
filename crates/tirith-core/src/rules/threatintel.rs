@@ -647,7 +647,8 @@ fn hostname_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity
         | threatdb::ThreatSource::CisaKev
         | threatdb::ThreatSource::FireholIp
         | threatdb::ThreatSource::TorExit
-        | threatdb::ThreatSource::ExfilEndpoint => (
+        | threatdb::ThreatSource::ExfilEndpoint
+        | threatdb::ThreatSource::DigitalSide => (
             RuleId::ThreatMaliciousUrl,
             Severity::High,
             "malicious hostname",
@@ -673,7 +674,8 @@ fn ip_rule_for_source(source: threatdb::ThreatSource) -> (RuleId, Severity, &'st
         | threatdb::ThreatSource::PhishingArmy
         | threatdb::ThreatSource::PhishTank
         | threatdb::ThreatSource::FireholIp
-        | threatdb::ThreatSource::ExfilEndpoint => {
+        | threatdb::ThreatSource::ExfilEndpoint
+        | threatdb::ThreatSource::DigitalSide => {
             (RuleId::ThreatMaliciousIp, Severity::High, "malicious IP")
         }
     }
@@ -1488,5 +1490,19 @@ mod tests {
         let (rule, sev, _) = ip_rule_for_source(threatdb::ThreatSource::FeodoTracker);
         assert_eq!(rule, RuleId::ThreatMaliciousIp);
         assert_eq!(sev, Severity::High);
+    }
+
+    #[test]
+    fn digitalside_maps_to_generic_malicious_rules() {
+        // DigitalSide is a generic IoC feed: hostnames route to ThreatMaliciousUrl
+        // and IPs to ThreatMaliciousIp, both High, like the other IoC sources.
+        let (host_rule, host_sev, _) =
+            hostname_rule_for_source(threatdb::ThreatSource::DigitalSide);
+        assert_eq!(host_rule, RuleId::ThreatMaliciousUrl);
+        assert_eq!(host_sev, Severity::High);
+
+        let (ip_rule, ip_sev, _) = ip_rule_for_source(threatdb::ThreatSource::DigitalSide);
+        assert_eq!(ip_rule, RuleId::ThreatMaliciousIp);
+        assert_eq!(ip_sev, Severity::High);
     }
 }

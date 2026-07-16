@@ -286,6 +286,14 @@ pub enum ThreatSource {
     /// list supplied at CI time; compiled into the signed primary DB. Appended
     /// as discriminant 11 so older `.dat` files (sources 0-10) still load.
     ExfilEndpoint = 11,
+    /// DigitalSide Threat-Intel (davidonzo/Threat-Intel) MISP-style CSV feed of
+    /// malicious URLs, domains, and IPs. Defined but NOT wired into the CI fetch:
+    /// the upstream feed's automated daily updates stopped at 2024-10-18 (freshness
+    /// gate re-checked and FAILED on 2026-07-16), so the source lands in code for a
+    /// future re-enable but is not compiled into the signed DB yet. Supplemental
+    /// until the gate passes and it ships via the signed CI DB. Appended as
+    /// discriminant 12 so older `.dat` files (sources 0-11) still load.
+    DigitalSide = 12,
 }
 
 impl ThreatSource {
@@ -303,12 +311,13 @@ impl ThreatSource {
             9 => Some(Self::FireholIp),
             10 => Some(Self::TorExit),
             11 => Some(Self::ExfilEndpoint),
+            12 => Some(Self::DigitalSide),
             _ => None,
         }
     }
 
     /// Every threat source variant, in stable declaration order.
-    pub const ALL: [ThreatSource; 12] = [
+    pub const ALL: [ThreatSource; 13] = [
         Self::OssfMalicious,
         Self::DatadogMalicious,
         Self::FeodoTracker,
@@ -321,6 +330,7 @@ impl ThreatSource {
         Self::FireholIp,
         Self::TorExit,
         Self::ExfilEndpoint,
+        Self::DigitalSide,
     ];
 
     /// Stable machine-readable identifier (snake_case). Used as the key in
@@ -339,6 +349,7 @@ impl ThreatSource {
             Self::FireholIp => "firehol_ip",
             Self::TorExit => "tor_exit",
             Self::ExfilEndpoint => "exfil_endpoint",
+            Self::DigitalSide => "digitalside",
         }
     }
 
@@ -357,7 +368,10 @@ impl ThreatSource {
             | Self::PhishTank
             | Self::ThreatFoxIoc
             | Self::FireholIp
-            | Self::TorExit => SourceTier::Supplemental,
+            | Self::TorExit
+            // Gated feed: Supplemental until the freshness gate passes and it is
+            // compiled into the signed CI DB (upstream stale as of 2024-10-18).
+            | Self::DigitalSide => SourceTier::Supplemental,
         }
     }
 
@@ -379,6 +393,7 @@ impl ThreatSource {
             Self::TorExit => "https://www.torproject.org/",
             // Curated in-tree feed, not a third-party project; point at the repo.
             Self::ExfilEndpoint => "https://github.com/sheeki03/tirith",
+            Self::DigitalSide => "https://github.com/davidonzo/Threat-Intel",
         }
     }
 
@@ -397,6 +412,7 @@ impl ThreatSource {
             Self::FireholIp => "FireHOL IP",
             Self::TorExit => "Tor Exit Node",
             Self::ExfilEndpoint => "Exfiltration Endpoint",
+            Self::DigitalSide => "DigitalSide Threat-Intel",
         }
     }
 
@@ -416,7 +432,10 @@ impl ThreatSource {
             | Self::PhishTank
             | Self::ThreatFoxIoc
             | Self::FireholIp
-            | Self::ExfilEndpoint => Confidence::Confirmed,
+            | Self::ExfilEndpoint
+            // DigitalSide indicators are confirmed-bad IoCs, like the other
+            // network-indicator hostname/IP feeds.
+            | Self::DigitalSide => Confidence::Confirmed,
         }
     }
 }
@@ -4042,9 +4061,15 @@ mod tests {
         for src in ThreatSource::ALL {
             assert!(seen.insert(src as u8), "ALL has a duplicate: {src:?}");
         }
-        assert_eq!(ThreatSource::ALL.len(), 12);
+        assert_eq!(ThreatSource::ALL.len(), 13);
+        // Discriminant 12 is now DigitalSide; 13 is the first out-of-range value.
+        assert_eq!(
+            ThreatSource::from_u8(12),
+            Some(ThreatSource::DigitalSide),
+            "discriminant 12 must decode to DigitalSide"
+        );
         assert!(
-            ThreatSource::from_u8(12).is_none(),
+            ThreatSource::from_u8(13).is_none(),
             "from_u8 must reject an out-of-range discriminant"
         );
     }
@@ -4076,7 +4101,8 @@ mod tests {
         ] {
             assert_eq!(src.tier(), SourceTier::Primary, "{src:?} should be primary");
         }
-        // The rest are opt-in supplemental.
+        // The rest are opt-in supplemental (incl. the gated DigitalSide feed,
+        // which stays supplemental until its freshness gate passes).
         for src in [
             ThreatSource::Urlhaus,
             ThreatSource::PhishingArmy,
@@ -4084,6 +4110,7 @@ mod tests {
             ThreatSource::ThreatFoxIoc,
             ThreatSource::FireholIp,
             ThreatSource::TorExit,
+            ThreatSource::DigitalSide,
         ] {
             assert_eq!(
                 src.tier(),
@@ -4091,6 +4118,34 @@ mod tests {
                 "{src:?} should be supplemental"
             );
         }
+    }
+
+    #[test]
+    fn digitalside_hostname_and_ip_roundtrip_with_source_attribution() {
+        // Build an in-memory signed DB with an ephemeral key (the production
+        // verify key is never touched), carrying one DigitalSide-sourced hostname
+        // and one IP, then confirm the lookups attribute the match to DigitalSide.
+        // Synthetic RFC-2606 / RFC-5737 indicators only, never real IoCs.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1700000000, 1);
+        writer.add_hostname("malware.example", ThreatSource::DigitalSide);
+        writer.add_ip(Ipv4Addr::new(192, 0, 2, 66), ThreatSource::DigitalSide);
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        let host_match = db
+            .check_hostname("malware.example")
+            .expect("DigitalSide hostname must be found");
+        assert_eq!(host_match.source, ThreatSource::DigitalSide);
+        assert_eq!(host_match.confidence, Confidence::Confirmed);
+
+        let ip_match = db
+            .check_ip(Ipv4Addr::new(192, 0, 2, 66))
+            .expect("DigitalSide IP must be found");
+        assert_eq!(ip_match.source, ThreatSource::DigitalSide);
+
+        // Attribution also flows through the per-source breakdown.
+        let bd = db.source_breakdown();
+        assert_eq!(bd.count_for(ThreatSource::DigitalSide), 2);
     }
 
     #[test]

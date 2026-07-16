@@ -15,9 +15,9 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbFormat, ThreatDbWriter, ThreatSource};
 use tirith_core::threatdb_feeds::{
-    parse_curated_file_hashes, parse_domain_blocklist, parse_exfil_endpoint_list,
-    parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list, parse_urlhaus_csv,
-    CuratedFileHashes, FileHashProvenance,
+    parse_curated_file_hashes, parse_digitalside_csv, parse_domain_blocklist,
+    parse_exfil_endpoint_list, parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list,
+    parse_urlhaus_csv, CuratedFileHashes, FileHashProvenance,
 };
 
 #[derive(Parser)]
@@ -72,6 +72,14 @@ struct Cli {
     /// Tor bulk exit list (Phase B)
     #[arg(long)]
     tor_exit: Option<PathBuf>,
+
+    /// DigitalSide Threat-Intel MISP-style CSV export (davidonzo/Threat-Intel).
+    /// GATED feed: the source is defined but the CI fetch is disabled while the
+    /// upstream feed is stale (last automatic update 2024-10-18; gate re-checked
+    /// 2026-07-16). Optional -- skipped if not supplied; degrades to empty with a
+    /// warning if unreadable, like the other optional Phase B feeds.
+    #[arg(long)]
+    digitalside: Option<PathBuf>,
 
     /// Curated exfiltration-endpoint / webhook-catcher hostname list. Plain
     /// domain-per-line blocklist; compiled into the signed primary DB under
@@ -861,6 +869,36 @@ fn parse_tor_exit_file(path: &Path) -> Vec<Ipv4Addr> {
     }
 }
 
+/// Parse a DigitalSide MISP-style CSV file into hostnames and IPv4 IoCs.
+///
+/// Best-effort like the other optional Phase B feeds (URLhaus/ThreatFox): an
+/// unreadable or unparseable file warns and degrades to empty rather than
+/// aborting the build. DigitalSide is a gated supplemental source, not a signed
+/// primary feed, so a transient failure must not fail closed here.
+fn parse_digitalside_file(path: &Path) -> (Vec<String>, Vec<Ipv4Addr>) {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!(
+                "warning: cannot open DigitalSide file {}: {e}",
+                path.display()
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
+
+    match parse_digitalside_csv(file) {
+        Ok(entries) => (entries.hostnames, entries.ips),
+        Err(e) => {
+            eprintln!(
+                "warning: cannot parse DigitalSide CSV {}: {e}",
+                path.display()
+            );
+            (Vec::new(), Vec::new())
+        }
+    }
+}
+
 fn parse_typosquats_csv(path: &Path) -> Vec<TyposquatEntry> {
     let mut entries = Vec::new();
 
@@ -1267,6 +1305,15 @@ fn main() {
         Vec::new()
     };
 
+    let (digitalside_hosts, digitalside_ips) = if let Some(ref path) = cli.digitalside {
+        eprintln!("  parsing DigitalSide IOCs from {}", path.display());
+        let parsed = parse_digitalside_file(path);
+        eprintln!("    {} hostnames, {} IPs", parsed.0.len(), parsed.1.len());
+        parsed
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     let exfil_endpoint_hosts = if let Some(ref path) = cli.exfil_endpoints {
         eprintln!("  parsing exfil endpoints from {}", path.display());
         // Fail closed: an explicitly-supplied feed that cannot be read must abort
@@ -1364,6 +1411,14 @@ fn main() {
 
     for ip in &tor_exit_ips {
         writer.add_ip(*ip, ThreatSource::TorExit);
+    }
+
+    for host in &digitalside_hosts {
+        writer.add_hostname(host, ThreatSource::DigitalSide);
+    }
+
+    for ip in &digitalside_ips {
+        writer.add_ip(*ip, ThreatSource::DigitalSide);
     }
 
     for typo in &typosquats {
