@@ -563,11 +563,120 @@ fn check_markdown_comments(
     }
 }
 
+/// Maximum PDF object-nesting depth we will hand to `lopdf::Document::load_mem`.
+///
+/// lopdf 0.34 parses arrays/dictionaries with unbounded recursion, so a PDF that
+/// nests `[`/`<<` thousands deep overflows the stack and aborts the whole process
+/// with SIGABRT during parse, NOT a catchable `Result`/panic (RUSTSEC-2026-0187).
+/// The patched lopdf (>=0.42) needs Rust 1.85, above tirith's MSRV 1.83, so we
+/// cannot simply upgrade. Instead we reject pathological nesting BEFORE parsing.
+///
+/// The cap is deliberately conservative: real-world PDFs nest only a few dozen
+/// levels deep (a page tree, an annotation array, a nested resource dict), while
+/// the advisory's crash needs on the order of 10,000 levels. 256 sits an order of
+/// magnitude above any legitimate document yet two orders of magnitude below the
+/// crash threshold, leaving generous headroom on both sides. Remove this guard
+/// (and the matching deny.toml / .cargo/audit.toml ignores) once MSRV/lopdf move.
+const PDF_NESTING_DEPTH_CAP: usize = 256;
+
+/// Single-pass lexical scan of raw PDF bytes returning the maximum object-nesting
+/// depth, where every `[` (array) and `<<` (dictionary) opens a level and every
+/// `]` / `>>` closes one. This mirrors what lopdf's recursive-descent object
+/// parser recurses on, so it lets us reject a stack-overflow bomb (RUSTSEC-2026-0187)
+/// before `load_mem` is ever called.
+///
+/// It is a lexer, not a parser, so it skips the two byte ranges where stray
+/// brackets are NOT structural and would otherwise inflate the count. PDF literal
+/// strings `( ... )` are skipped as balanced nested parens, with `\` escaping the
+/// next byte (so `\(`, `\)`, `\\` do not open or close the string). `%` comments
+/// are skipped to the end of the line. A hex string `< ... >` (single `<`) needs
+/// no special case: its body is only hex digits and whitespace, so scanning
+/// through it counts nothing.
+///
+/// Known limitation (acceptable for this guard): bytes inside a binary `stream`
+/// are scanned too, and could in theory contain enough unbalanced `[`/`<<` to
+/// register depth. In practice the literal-string skip swallows most binary runs
+/// (a stray `(` starts a skip to the next `)`), and a depth that climbs past 256
+/// without ever unwinding is itself anomalous. A compressed object stream can hide
+/// nested objects from this byte scan entirely; defending that needs the deferred
+/// child-process isolation, out of scope for this preflight.
+fn pdf_max_nesting_depth(raw: &[u8]) -> usize {
+    let mut depth: usize = 0;
+    let mut max_depth: usize = 0;
+    let n = raw.len();
+    let mut i = 0;
+
+    while i < n {
+        match raw[i] {
+            // Comment: skip to end of line (leave the EOL byte for the next pass).
+            b'%' => {
+                i += 1;
+                while i < n && raw[i] != b'\n' && raw[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            // Literal string: skip balanced parens, honoring backslash escapes.
+            b'(' => {
+                i += 1;
+                let mut paren_depth: usize = 1;
+                while i < n && paren_depth > 0 {
+                    match raw[i] {
+                        // `\` escapes the next byte (`\(`, `\)`, `\\`, ...).
+                        b'\\' => {
+                            i += 2;
+                            continue;
+                        }
+                        b'(' => paren_depth += 1,
+                        b')' => paren_depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            // Array open.
+            b'[' => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+                i += 1;
+            }
+            // Array close.
+            b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            // Dictionary open `<<`.
+            b'<' if i + 1 < n && raw[i + 1] == b'<' => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+                i += 2;
+            }
+            // Dictionary close `>>`.
+            b'>' if i + 1 < n && raw[i + 1] == b'>' => {
+                depth = depth.saturating_sub(1);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    max_depth
+}
+
 /// Check PDF bytes for hidden text via sub-pixel scale transforms: font-size 0
 /// or scales that render text below 1px — invisible to humans but extracted by
 /// AI tools. Detection is free (ADR-13).
 pub fn check_pdf(raw_bytes: &[u8]) -> Vec<Finding> {
     let mut findings = Vec::new();
+
+    // RUSTSEC-2026-0187 preflight: reject pathological object nesting BEFORE
+    // handing the bytes to lopdf, whose recursive parser would stack-overflow and
+    // abort the process (uncatchable SIGABRT). See PDF_NESTING_DEPTH_CAP.
+    if pdf_max_nesting_depth(raw_bytes) > PDF_NESTING_DEPTH_CAP {
+        eprintln!(
+            "tirith: scan: PDF rejected: object nesting exceeds safe limit (possible RUSTSEC-2026-0187 DoS)"
+        );
+        return findings;
+    }
 
     let doc = match lopdf::Document::load_mem(raw_bytes) {
         Ok(d) => d,
@@ -1016,6 +1125,199 @@ mod tests {
             findings.is_empty(),
             "invalid PDF should produce no findings"
         );
+    }
+
+    /// Build a genuinely valid, lopdf-parseable PDF (round-tripped through
+    /// `save_to`) containing one page that shows `text` at `font_size`. With
+    /// `font_size = 0` the text renders sub-pixel, which `check_pdf` flags as
+    /// hidden text, proving the full parse+analyze path runs after the preflight.
+    fn build_pdf(font_size: i32, text: &str) -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Dictionary, Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+
+        let mut font = Dictionary::new();
+        font.set("Type", "Font");
+        font.set("Subtype", "Type1");
+        font.set("BaseFont", "Helvetica");
+        let font_id = doc.add_object(font);
+
+        let mut font_dict = Dictionary::new();
+        font_dict.set("F1", font_id);
+        let mut resources = Dictionary::new();
+        resources.set("Font", font_dict);
+        let resources_id = doc.add_object(resources);
+
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), font_size.into()]),
+                Operation::new("Td", vec![100.into(), 600.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), content.encode().unwrap()));
+
+        let mut page = Dictionary::new();
+        page.set("Type", "Page");
+        page.set("Parent", pages_id);
+        page.set("Contents", content_id);
+        let page_id = doc.add_object(page);
+
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", vec![Object::Reference(page_id)]);
+        pages.set("Count", 1);
+        pages.set("Resources", resources_id);
+        pages.set("MediaBox", vec![0.into(), 0.into(), 595.into(), 842.into()]);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", pages_id);
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).expect("save valid pdf");
+        buf
+    }
+
+    #[test]
+    fn test_pdf_preflight_rejects_deep_nesting() {
+        // Advisory-style RUSTSEC-2026-0187 payload: thousands of unclosed array
+        // opens. We assert against the PREFLIGHT directly and NEVER pass this to
+        // `lopdf::Document::load_mem`, which would stack-overflow and SIGABRT the
+        // test process (uncatchable). The guard exists precisely to run first.
+        let mut deep = b"%PDF-1.7\n".to_vec();
+        deep.resize(deep.len() + 5000, b'[');
+
+        let depth = pdf_max_nesting_depth(&deep);
+        assert_eq!(depth, 5000, "5000 unclosed `[` should report depth 5000");
+        assert!(
+            depth > PDF_NESTING_DEPTH_CAP,
+            "depth {depth} must exceed the cap {PDF_NESTING_DEPTH_CAP}"
+        );
+
+        // Now that the preflight has confirmed depth > cap, calling `check_pdf` is
+        // safe: it returns early via the guard and never reaches `load_mem`.
+        let findings = check_pdf(&deep);
+        assert!(
+            findings.is_empty(),
+            "rejected PDF yields no findings (guard short-circuits before parse)"
+        );
+    }
+
+    #[test]
+    fn test_pdf_preflight_allows_valid_pdf_and_analyzes() {
+        // A normal PDF nests only a handful of levels; the preflight must NOT
+        // reject it, and `check_pdf` must still parse + analyze it.
+        let pdf = build_pdf(0, "hidden secret instructions");
+
+        let depth = pdf_max_nesting_depth(&pdf);
+        assert!(
+            depth <= PDF_NESTING_DEPTH_CAP,
+            "valid PDF depth {depth} must be within cap {PDF_NESTING_DEPTH_CAP} (no false rejection)"
+        );
+
+        // Full pipeline runs: sub-pixel (font-size 0) text is flagged as hidden.
+        let findings = check_pdf(&pdf);
+        assert!(
+            findings.iter().any(|f| f.rule_id == RuleId::PdfHiddenText),
+            "valid sub-pixel-text PDF should still be parsed and flagged"
+        );
+
+        // A normal-sized font in the same structure is NOT flagged: confirms the
+        // PDF parsed for real rather than slipping through a rejection path.
+        let visible = build_pdf(12, "ordinary visible text");
+        assert!(
+            pdf_max_nesting_depth(&visible) <= PDF_NESTING_DEPTH_CAP,
+            "visible-text PDF also within cap"
+        );
+        assert!(
+            check_pdf(&visible).is_empty(),
+            "normal-size text must not be flagged as hidden"
+        );
+    }
+
+    #[test]
+    fn test_pdf_preflight_ignores_brackets_in_strings_and_comments() {
+        // `[` inside a literal string or a `%` comment is NOT structural nesting
+        // and must not inflate the depth.
+        let in_string = b"%PDF-1.7\n(this string has [[[[[[[[[[ many brackets) ";
+        assert_eq!(
+            pdf_max_nesting_depth(in_string),
+            0,
+            "brackets inside a literal string must not count"
+        );
+
+        let in_comment = b"%PDF-1.7\n% a comment with [[[[[[[[[[ brackets\n";
+        assert_eq!(
+            pdf_max_nesting_depth(in_comment),
+            0,
+            "brackets inside a comment must not count"
+        );
+
+        // Escaped parens inside the string must not end it early and expose the
+        // brackets that follow.
+        let escaped = b"%PDF-1.7\n(closing paren escaped \\) and then [[[ ) ";
+        assert_eq!(
+            pdf_max_nesting_depth(escaped),
+            0,
+            "escaped `\\)` keeps the string open; inner brackets stay uncounted"
+        );
+
+        // Sanity: real structural nesting IS counted (array nested 3 deep).
+        assert_eq!(pdf_max_nesting_depth(b"[ [ [ ] ] ]"), 3);
+        // Dictionaries count too, and array+dict depth combines.
+        assert_eq!(pdf_max_nesting_depth(b"<< /K [ << >> ] >>"), 3);
+    }
+
+    #[test]
+    fn test_pdf_preflight_tolerates_large_binary_stream() {
+        use lopdf::{Dictionary, Document, Object, Stream};
+        // A media-rich PDF embeds large raw (uncompressed) binary streams (images,
+        // fonts) whose bytes contain stray `[`/`<<`. This is the main real-world
+        // false-positive risk for a byte scanner, so pin it: 2 MiB of pseudo-random
+        // bytes must stay far below the cap (measured depth ~20). The literal-string
+        // skip is what keeps it low: a stray `(` skips to the next `)`.
+        let mut data = vec![0u8; 2 * 1024 * 1024];
+        let mut x: u32 = 0x1234_5678;
+        for b in data.iter_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (x >> 16) as u8;
+        }
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let img_id = doc.add_object(Stream::new(Dictionary::new(), data));
+        let mut page = Dictionary::new();
+        page.set("Type", "Page");
+        page.set("Parent", pages_id);
+        page.set("Contents", img_id);
+        let page_id = doc.add_object(page);
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", vec![Object::Reference(page_id)]);
+        pages.set("Count", 1);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", pages_id);
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+
+        let depth = pdf_max_nesting_depth(&buf);
+        assert!(
+            depth <= PDF_NESTING_DEPTH_CAP,
+            "2 MiB binary stream must not be falsely rejected (depth {depth} > cap {PDF_NESTING_DEPTH_CAP})"
+        );
+        // And the preflight lets it through to lopdf without panicking.
+        let _ = check_pdf(&buf);
     }
 
     #[test]
