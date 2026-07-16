@@ -957,6 +957,16 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("workflow_dangerous_trigger", "WorkflowDangerousTrigger"),
     ("workflow_curl_pipe_shell", "WorkflowCurlPipeShell"),
     ("workflow_untrusted_input", "WorkflowUntrustedInput"),
+    (
+        "workflow_excessive_permissions",
+        "WorkflowExcessivePermissions",
+    ),
+    ("workflow_run_trigger", "WorkflowRunTrigger"),
+    (
+        "workflow_checkout_untrusted_ref",
+        "WorkflowCheckoutUntrustedRef",
+    ),
+    ("workflow_cache_poisoning", "WorkflowCachePoisoning"),
     ("dockerfile_unpinned_image", "DockerfileUnpinnedImage"),
     ("package_script_dangerous", "PackageScriptDangerous"),
     // AI-relevant file hidden-content scan rules

