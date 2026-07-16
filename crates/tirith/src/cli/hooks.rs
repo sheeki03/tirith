@@ -100,9 +100,9 @@ fn print_category(scan: &RepoHookScan, category: HookCategory, header: &str) {
         eprintln!(
             "  {:<10} {:<22} {:<8} {}",
             e.provider.as_str(),
-            e.name,
+            super::sanitize_for_human_output(&e.name, false),
             risk,
-            e.source_path.display(),
+            super::sanitize_for_human_output(&e.source_path.display().to_string(), false),
         );
     }
     eprintln!();
@@ -366,14 +366,16 @@ fn print_human_explain(name: &str, matches: &[RepoHookEntry]) {
 }
 
 fn print_one_finding(f: &RepoHookFinding) {
+    // name/location/detail describe an attacker-controllable repo hook/automation
+    // entry; sanitize each before display.
     eprintln!(
         "  [{}] {}\n      surface:  {} ({})\n      location: {}\n      detail:   {}\n",
         severity_label(f.severity),
         f.rule_id,
-        f.name,
+        super::sanitize_for_human_output(&f.name, false),
         f.provider.as_str(),
-        f.location,
-        f.detail,
+        super::sanitize_for_human_output(&f.location, false),
+        super::sanitize_for_human_output(&f.detail, false),
     );
 }
 

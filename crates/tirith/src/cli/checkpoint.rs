@@ -601,8 +601,14 @@ fn print_watch_human(
         println!();
         for f in findings {
             let sev = tirith_core::style::severity_label(&f.severity, s);
-            println!("  [{sev}] {}", f.title);
-            println!("        {}", f.description);
+            println!(
+                "  [{sev}] {}",
+                super::sanitize_for_human_output(&f.title, false)
+            );
+            println!(
+                "        {}",
+                super::sanitize_for_human_output(&f.description, true)
+            );
         }
     }
 }

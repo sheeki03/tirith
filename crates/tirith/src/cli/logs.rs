@@ -111,7 +111,12 @@ fn print_scan_human(path: &Path, verdict: &tirith_core::verdict::Verdict) {
         if verdict.findings.len() == 1 { "" } else { "s" }
     );
     for f in &verdict.findings {
-        eprintln!("  [{}] {} — {}", f.severity, f.rule_id, f.title);
+        eprintln!(
+            "  [{}] {} — {}",
+            f.severity,
+            f.rule_id,
+            super::sanitize_for_human_output(&f.title, false)
+        );
     }
     eprintln!(
         "  note: prompt-injection seeds are heuristics — treat all agent output as untrusted regardless."

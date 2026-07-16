@@ -140,8 +140,16 @@ fn print_human(
     if !findings.is_empty() {
         println!();
         for f in findings {
-            println!("  [{}] {} — {}", f.severity, f.rule_id, f.title);
-            println!("    {}", f.description);
+            println!(
+                "  [{}] {} — {}",
+                f.severity,
+                f.rule_id,
+                super::sanitize_for_human_output(&f.title, false)
+            );
+            println!(
+                "    {}",
+                super::sanitize_for_human_output(&f.description, true)
+            );
         }
     }
 

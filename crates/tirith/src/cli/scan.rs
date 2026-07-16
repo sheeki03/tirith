@@ -680,13 +680,21 @@ fn print_human_result(result: &scan::ScanResult) {
         } else {
             ""
         };
-        eprintln!("  {}{label}", file_result.path.display());
+        eprintln!(
+            "  {}{label}",
+            super::sanitize_for_human_output(&file_result.path.display().to_string(), false)
+        );
         for finding in &file_result.findings {
             let sev = tirith_core::style::severity_label(
                 &finding.severity,
                 tirith_core::style::Stream::Stderr,
             );
-            eprintln!("    {} {} — {}", sev, finding.rule_id, finding.title);
+            eprintln!(
+                "    {} {} — {}",
+                sev,
+                finding.rule_id,
+                super::sanitize_for_human_output(&finding.title, false)
+            );
         }
     }
 
@@ -767,14 +775,14 @@ fn sarif_location_for_finding(
 }
 
 fn print_human_file_result(result: &scan::FileScanResult) {
+    let path_display = super::sanitize_for_human_output(&result.path.display().to_string(), false);
     if result.findings.is_empty() {
-        eprintln!("tirith scan: {} — no issues found", result.path.display());
+        eprintln!("tirith scan: {path_display} — no issues found");
         return;
     }
 
     eprintln!(
-        "tirith scan: {} — {} finding(s)",
-        result.path.display(),
+        "tirith scan: {path_display} — {} finding(s)",
         result.findings.len()
     );
 
@@ -783,8 +791,16 @@ fn print_human_file_result(result: &scan::FileScanResult) {
             &finding.severity,
             tirith_core::style::Stream::Stderr,
         );
-        eprintln!("  {} {} — {}", sev, finding.rule_id, finding.title);
-        eprintln!("    {}", finding.description);
+        eprintln!(
+            "  {} {} — {}",
+            sev,
+            finding.rule_id,
+            super::sanitize_for_human_output(&finding.title, false)
+        );
+        eprintln!(
+            "    {}",
+            super::sanitize_for_human_output(&finding.description, true)
+        );
     }
 }
 

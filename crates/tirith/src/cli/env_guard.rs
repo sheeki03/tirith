@@ -102,7 +102,8 @@ fn guard_status(json: bool) -> i32 {
             );
             for f in &rc_findings {
                 if let Some(tirith_core::verdict::Evidence::Text { detail }) = f.evidence.first() {
-                    eprintln!("    {detail}");
+                    // detail embeds the rc-file-derived var name (attacker-influenced).
+                    eprintln!("    {}", super::sanitize_for_human_output(detail, false));
                 }
             }
             eprintln!(

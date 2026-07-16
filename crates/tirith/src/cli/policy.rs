@@ -932,7 +932,12 @@ fn print_test_command_human(
             &finding.severity,
             tirith_core::style::Stream::Stderr,
         );
-        eprintln!("    {} {} — {}", sev, finding.rule_id, finding.title);
+        eprintln!(
+            "    {} {} — {}",
+            sev,
+            finding.rule_id,
+            super::sanitize_for_human_output(&finding.title, false)
+        );
     }
 
     if !trace.allowlist_checked.is_empty() || !trace.blocklist_checked.is_empty() {
@@ -950,14 +955,16 @@ fn print_test_command_human(
 }
 
 fn print_test_file_human(file_path: &str, result: &scan::FileScanResult, _policy: &Policy) {
+    // The tested file path is the untrusted scan subject; a crafted name could
+    // carry escapes/newlines into this label.
+    let file_path = super::sanitize_for_human_output(file_path, false);
     if result.findings.is_empty() {
-        eprintln!("tirith policy test: {} — no findings", file_path);
+        eprintln!("tirith policy test: {file_path} — no findings");
         return;
     }
 
     eprintln!(
-        "tirith policy test: {} — {} finding(s)",
-        file_path,
+        "tirith policy test: {file_path} — {} finding(s)",
         result.findings.len()
     );
 
@@ -966,8 +973,16 @@ fn print_test_file_human(file_path: &str, result: &scan::FileScanResult, _policy
             &finding.severity,
             tirith_core::style::Stream::Stderr,
         );
-        eprintln!("  {} {} — {}", sev, finding.rule_id, finding.title);
-        eprintln!("    {}", finding.description);
+        eprintln!(
+            "  {} {} — {}",
+            sev,
+            finding.rule_id,
+            super::sanitize_for_human_output(&finding.title, false)
+        );
+        eprintln!(
+            "    {}",
+            super::sanitize_for_human_output(&finding.description, true)
+        );
     }
 }
 

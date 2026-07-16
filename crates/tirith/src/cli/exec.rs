@@ -333,11 +333,17 @@ fn print_human_check(
     findings: &[Finding],
 ) {
     eprintln!("tirith exec check `{bin}`:");
-    eprintln!("  resolves to: {}", resolved.display());
+    eprintln!(
+        "  resolves to: {}",
+        super::sanitize_for_human_output(&resolved.display().to_string(), false)
+    );
     if hits.len() > 1 {
         eprintln!("  also on PATH ({} total):", hits.len());
         for h in hits.iter().skip(1) {
-            eprintln!("    {}", h.display());
+            eprintln!(
+                "    {}",
+                super::sanitize_for_human_output(&h.display().to_string(), false)
+            );
         }
     }
     print_provenance_body(prov);
@@ -345,7 +351,10 @@ fn print_human_check(
 }
 
 fn print_human_provenance(prov: &Provenance, findings: &[Finding]) {
-    eprintln!("tirith exec provenance `{}`:", prov.path);
+    eprintln!(
+        "tirith exec provenance `{}`:",
+        super::sanitize_for_human_output(&prov.path, false)
+    );
     print_provenance_body(prov);
     print_findings(findings);
 }
@@ -392,7 +401,12 @@ fn print_findings(findings: &[Finding]) {
     }
     eprintln!("\n  {} finding(s):", findings.len());
     for f in findings {
-        eprintln!("    [{}] {} — {}", f.severity, f.rule_id, f.title);
+        eprintln!(
+            "    [{}] {} — {}",
+            f.severity,
+            f.rule_id,
+            super::sanitize_for_human_output(&f.title, false)
+        );
     }
 }
 

@@ -213,13 +213,14 @@ fn resolve_source_attribution(
 /// (potentially sensitive) page title or path can leak into logs / JSON.
 const PROVENANCE_MAX_CHARS: usize = 256;
 
-/// Neutralize one untrusted provenance string before display/logging. Runs through the
-/// shared `output_filter` (strips ANSI/OSC/APC/DCS, bare CR, C0 controls, DEL, zero-width),
-/// then flattens tabs/newlines to spaces and length-caps.
+/// Neutralize one untrusted provenance string before display/logging. Routes through
+/// the shared [`tirith_core::mcp::output_filter::sanitize_for_display`] (strips
+/// ANSI/OSC/APC/DCS, bare CR, C0 controls, DEL, AND the deceptive/invisible Unicode
+/// classes: bidi controls, variation selectors, Hangul fillers, invisible math
+/// operators, zero-width / Unicode-Tag sets), then flattens tabs/newlines to spaces
+/// and length-caps.
 fn sanitize_provenance_text(s: &str) -> String {
-    let mut out = Vec::with_capacity(s.len());
-    tirith_core::mcp::output_filter::sanitize_text_into(s.as_bytes(), &mut out);
-    let cleaned = String::from_utf8(out).unwrap_or_default();
+    let cleaned = tirith_core::mcp::output_filter::sanitize_for_display(s);
     let flattened: String = cleaned
         .chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })

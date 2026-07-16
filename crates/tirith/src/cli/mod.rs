@@ -82,6 +82,43 @@ fn write_json_to<W: Write, T: serde::Serialize>(out: &mut W, value: &T) -> bool 
     serde_json::to_writer_pretty(&mut *out, value).is_ok() && writeln!(out).is_ok()
 }
 
+/// Sanitize untrusted text for human terminal output.
+///
+/// Wraps [`tirith_core::mcp::output_filter::sanitize_for_display`] (which strips
+/// terminal-control escapes AND deceptive / invisible Unicode), then applies the
+/// newline policy for the field kind:
+///
+/// - `allow_multiline == false`: also strip `\n` and `\r`, so a single-line label
+///   (finding title, path, manifest name) cannot break onto extra terminal rows.
+/// - `allow_multiline == true`: KEEP `\n`, but RE-INDENT every continuation line
+///   with a two-space prefix so an injected newline cannot forge a fake top-level
+///   row that impersonates tirith's own output. The display scrub already dropped
+///   any bare `\r` and kept only CRLF, so each line's trailing `\r` is trimmed and
+///   the row re-joined with `\n` + indent.
+///
+/// Callers MUST pass only the untrusted VALUE, never a whole formatted line: the
+/// display scrub removes ALL ANSI, including tirith's own severity colors.
+pub fn sanitize_for_human_output(s: &str, allow_multiline: bool) -> String {
+    let cleaned = tirith_core::mcp::output_filter::sanitize_for_display(s);
+    if allow_multiline {
+        // Keep newlines but re-indent every continuation line so an injected `\n`
+        // cannot fabricate a new top-level row. The display scrub already reduced
+        // any `\r` to CRLF form, so trim a trailing `\r` per line before re-joining
+        // with `\n` + a two-space indent.
+        cleaned
+            .split('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    } else {
+        // Single-line label: drop every newline / carriage return outright.
+        cleaned
+            .chars()
+            .filter(|&c| c != '\n' && c != '\r')
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod write_json_tests {
     use super::write_json_to;
@@ -819,7 +856,8 @@ pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_shim_target, quiet_from_env, resolve_shim_target, shell_join, should_warn_neutralized,
+        parse_shim_target, quiet_from_env, resolve_shim_target, sanitize_for_human_output,
+        shell_join, should_warn_neutralized,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -845,6 +883,43 @@ mod tests {
         // Embedded single quotes escaped as '\''; empty arg shown as ''.
         assert_eq!(q(&["echo", "it's"]), "echo 'it'\\''s'");
         assert_eq!(q(&["x", ""]), "x ''");
+    }
+
+    #[test]
+    fn sanitize_for_human_output_single_line_strips_newlines_and_deception() {
+        // allow_multiline=false strips \n and \r entirely (single-line label).
+        assert_eq!(sanitize_for_human_output("a\nb\r\nc", false), "abc");
+        // The deceptive / invisible set is stripped: bidi override (U+202E),
+        // zero-width (U+200B), Hangul filler (U+3164).
+        assert_eq!(
+            sanitize_for_human_output("a\u{202E}b\u{200B}c\u{3164}d", false),
+            "abcd"
+        );
+        // An embedded ANSI/CSI escape is scrubbed. Callers pass only the untrusted
+        // field, never tirith's own styled line, so stripping all ANSI is correct.
+        assert_eq!(
+            sanitize_for_human_output("a\x1b[31mred\x1b[0mb", false),
+            "aredb"
+        );
+        assert_eq!(sanitize_for_human_output("a\x1b[2Jb", false), "ab");
+    }
+
+    #[test]
+    fn sanitize_for_human_output_multiline_keeps_newline_but_reindents() {
+        // A forged top-level row cannot be fabricated: the injected newline is
+        // kept, but the continuation line is indented so it cannot impersonate a
+        // new tirith output row.
+        assert_eq!(
+            sanitize_for_human_output("real title\nFORGED ROW", true),
+            "real title\n  FORGED ROW"
+        );
+        // CRLF is normalized to \n + indent (the scrub keeps CRLF; the wrapper
+        // trims the trailing CR before re-joining).
+        assert_eq!(sanitize_for_human_output("a\r\nb", true), "a\n  b");
+        // The deceptive set is still stripped in multiline mode.
+        assert_eq!(sanitize_for_human_output("a\u{202E}b", true), "ab");
+        // An embedded ESC sequence is scrubbed here too.
+        assert_eq!(sanitize_for_human_output("x\x1b[2Jy\nz", true), "xy\n  z");
     }
 
     #[test]

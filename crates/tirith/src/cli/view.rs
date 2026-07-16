@@ -232,7 +232,7 @@ fn is_strippable_zero_width(ch: char) -> bool {
 
 fn print_findings_human(verdict: &Verdict, path: Option<&Path>, total_bytes: u64, truncated: bool) {
     let label = path
-        .map(|p| p.display().to_string())
+        .map(|p| super::sanitize_for_human_output(&p.display().to_string(), false))
         .unwrap_or_else(|| "<stdin>".to_string());
 
     let banner = match verdict.action {
@@ -248,8 +248,16 @@ fn print_findings_human(verdict: &Verdict, path: Option<&Path>, total_bytes: u64
     }
 
     for f in &verdict.findings {
-        eprintln!("  [{}] {} — {}", f.severity, f.rule_id, f.title);
-        eprintln!("    {}", f.description);
+        eprintln!(
+            "  [{}] {} — {}",
+            f.severity,
+            f.rule_id,
+            super::sanitize_for_human_output(&f.title, false)
+        );
+        eprintln!(
+            "    {}",
+            super::sanitize_for_human_output(&f.description, true)
+        );
     }
 }
 

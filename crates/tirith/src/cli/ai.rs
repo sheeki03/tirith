@@ -410,15 +410,14 @@ fn truncate_line(s: &str) -> String {
 }
 
 /// Neutralize one untrusted, AI-config-derived string before printing it in HUMAN
-/// mode (CodeRabbit M13 PR #132 R20). Runs it through tirith's own
-/// `output_filter` (strips ANSI/OSC/APC/DCS, bare CR, C0 controls except `\t`,
-/// DEL, zero-width), then flattens kept tabs/newlines to spaces so one display
-/// field stays on a single line.
+/// mode (CodeRabbit M13 PR #132 R20). Routes through the shared
+/// [`tirith_core::mcp::output_filter::sanitize_for_display`] (strips ANSI/OSC/APC/DCS,
+/// bare CR, C0 controls except `\t`/`\n`, DEL, AND the deceptive/invisible Unicode
+/// classes: bidi controls, variation selectors, Hangul fillers, invisible math
+/// operators, zero-width / Unicode-Tag sets), then flattens any kept tabs/newlines
+/// to spaces so one display field stays on a single line.
 fn sanitize_display(s: &str) -> String {
-    let mut out = Vec::with_capacity(s.len());
-    tirith_core::mcp::output_filter::sanitize_text_into(s.as_bytes(), &mut out);
-    let cleaned = String::from_utf8(out).unwrap_or_default();
-    cleaned
+    tirith_core::mcp::output_filter::sanitize_for_display(s)
         .chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .collect()
