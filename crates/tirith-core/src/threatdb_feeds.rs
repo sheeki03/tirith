@@ -198,35 +198,51 @@ pub fn parse_phishtank_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
 ///   `md5` / `sha1` / `sha256`, `mime-type`, `comment`, and so on -- is skipped,
 ///   so a file name or a hash is never mistaken for a host or IP.
 ///
-/// Column positions are resolved from the header row, falling back to the fixed
-/// MISP layout (`type` = 3, `value` = 4, `to_ids` = 6) when a header is absent.
-/// Scope is v1 hostnames plus IPv4; file-hash ingestion is deferred to a
-/// follow-up (the `CuratedFileHashes` path).
+/// The header row is detected rather than assumed: if the first row carries the
+/// `type` / `value` / `to_ids` column names it sets the column positions and is
+/// skipped; otherwise the fixed MISP layout (`type` = 3, `value` = 4,
+/// `to_ids` = 6) is used and that first row is ingested as a real indicator, so a
+/// headerless export never silently drops its first record. Scope is v1 hostnames
+/// plus IPv4; file-hash ingestion is deferred to a follow-up (the
+/// `CuratedFileHashes` path).
 pub fn parse_digitalside_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
-    let mut csv = csv::ReaderBuilder::new()
-        .has_headers(true)
+    // has_headers(false) so we detect the header ourselves. has_headers(true)
+    // would consume the first row of a headerless export as the header and drop
+    // that indicator.
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
         .flexible(true)
         .from_reader(reader);
-    let headers = csv
-        .headers()
-        .map_err(|e| format!("DigitalSide headers: {e}"))?
-        .clone();
+    let mut records = rdr.records();
 
-    let type_idx = headers
-        .iter()
-        .position(|header| header == "type")
-        .unwrap_or(3);
-    let value_idx = headers
-        .iter()
-        .position(|header| header == "value")
-        .unwrap_or(4);
-    let to_ids_idx = headers
-        .iter()
-        .position(|header| header == "to_ids")
-        .unwrap_or(6);
+    let first = match records.next() {
+        Some(Ok(record)) => record,
+        Some(Err(e)) => return Err(format!("DigitalSide first record: {e}")),
+        None => return Ok(FeedEntries::default()),
+    };
+    let has_header = first.iter().any(|field| field == "type")
+        && first.iter().any(|field| field == "value")
+        && first.iter().any(|field| field == "to_ids");
+    let (type_idx, value_idx, to_ids_idx) = if has_header {
+        (
+            first.iter().position(|field| field == "type").unwrap_or(3),
+            first.iter().position(|field| field == "value").unwrap_or(4),
+            first
+                .iter()
+                .position(|field| field == "to_ids")
+                .unwrap_or(6),
+        )
+    } else {
+        // Fixed MISP column layout when the export has no header row.
+        (3, 4, 6)
+    };
+
+    // Skip the first row only if it was the header; a headerless export's first
+    // row is a real indicator and is ingested with the rest.
+    let leading = if has_header { None } else { Some(Ok(first)) };
 
     let mut entries = FeedEntries::default();
-    for record in csv.records() {
+    for record in leading.into_iter().chain(records) {
         let record = match record {
             Ok(record) => record,
             Err(_) => continue,
@@ -600,6 +616,22 @@ mod tests {
         let entries = parse_digitalside_csv(csv.as_bytes()).unwrap();
         assert!(entries.hostnames.is_empty());
         assert!(entries.ips.is_empty());
+    }
+
+    #[test]
+    fn digitalside_csv_headerless_export_keeps_first_indicator() {
+        // A headerless export (no type/value/to_ids header row) must ingest its
+        // first row instead of consuming it as a header. Column positions fall
+        // back to the fixed MISP layout (type=3, value=4, to_ids=6).
+        let rows = [
+            r#""u1",100,"Network activity","domain","first.example","",1,1728745084,"","","","","""#,
+            r#""u2",100,"Network activity","ip-dst","192.0.2.7","",1,1728745084,"","","","","""#,
+        ];
+        let csv = format!("{}\n", rows.join("\n"));
+        let entries = parse_digitalside_csv(csv.as_bytes()).unwrap();
+        // The first indicator is not swallowed as a header.
+        assert_eq!(entries.hostnames, vec!["first.example".to_string()]);
+        assert_eq!(entries.ips, vec![Ipv4Addr::new(192, 0, 2, 7)]);
     }
 
     #[test]
