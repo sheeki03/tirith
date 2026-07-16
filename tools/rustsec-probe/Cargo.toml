@@ -1,0 +1,32 @@
+# Standalone research probe for spike 5a (docs/research/offline-rustsec.md).
+#
+# The empty [workspace] table below DETACHES this crate from the parent tirith
+# workspace, so it is never part of the product build, never added to the root
+# Cargo.lock, and never seen by `cargo build`/`cargo test` at the workspace root.
+# It exists only to answer, empirically and reproducibly, whether the RustSec
+# advisory-db TOML corpus parses with the exact `toml` version the workspace
+# already pins, on Rust 1.83. Build and run it from THIS directory:
+#
+#   cargo +1.83 run --release -- /path/to/advisory-db
+#
+# It adds no runtime dependency to tirith.
+[workspace]
+
+[package]
+name = "rustsec-probe"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.83"
+publish = false
+license = "AGPL-3.0-only"
+
+[[bin]]
+name = "rustsec-probe"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the exact version the tirith workspace resolves (Cargo.lock: toml
+# 0.8.23), so this probe proves the in-tree parser handles the corpus rather than
+# some other 0.8.x. serde derive drives the typed advisory model.
+toml = "=0.8.23"
+serde = { version = "1", features = ["derive"] }
