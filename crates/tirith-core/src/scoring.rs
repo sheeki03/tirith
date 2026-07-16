@@ -130,6 +130,9 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::CredentialFileSweep
         | RuleId::Base64DecodeExecute
         | RuleId::DataExfiltration
+        // PR3 — LOTL command-shape heuristics, not threat-DB hits.
+        | RuleId::ReverseShell
+        | RuleId::InterpreterSuspiciousInlineExec
         // M13 — structural obfuscation heuristic, not a threat-DB hit.
         | RuleId::WrapperChainTooDeep
         | RuleId::PsSetExecutionPolicyBypass

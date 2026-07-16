@@ -299,6 +299,8 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::CredentialFileSweep
         | RuleId::Base64DecodeExecute
         | RuleId::DataExfiltration
+        | RuleId::ReverseShell
+        | RuleId::InterpreterSuspiciousInlineExec
         | RuleId::WrapperChainTooDeep
         | RuleId::PsSetExecutionPolicyBypass
         | RuleId::PsDefenderExclusion

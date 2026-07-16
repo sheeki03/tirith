@@ -45,7 +45,7 @@ struct PatternDef {
 
 #[derive(Deserialize)]
 struct PrivateKeyDef {
-    #[allow(dead_code)]
+    // Read in the `PRIVATE_KEY_RES` panic message on a bad regex.
     id: String,
     #[allow(dead_code)]
     name: String,
@@ -75,15 +75,24 @@ static KNOWN_PATTERNS: Lazy<Vec<CompiledPattern>> = Lazy::new(|| {
         .collect()
 });
 
-static PRIVATE_KEY_RE: Lazy<Regex> = Lazy::new(|| {
+// ALL private-key patterns, not just the first: each `[[private_key_pattern]]`
+// (PEM `private_key`, `pgp_private_key`, …) is detected independently. The
+// header-only `regex` is the detector; the multi-line `redact_regex` (used by
+// `redact.rs`) is not needed here.
+static PRIVATE_KEY_RES: Lazy<Vec<Regex>> = Lazy::new(|| {
     let toml_src = include_str!("../../assets/data/credential_patterns.toml");
     let file: PatternFile = toml::from_str(toml_src).expect("credential_patterns.toml parse error");
-    let pat = &file
-        .private_key_pattern
-        .first()
-        .expect("credential_patterns.toml must contain at least one [[private_key_pattern]]")
-        .regex;
-    Regex::new(pat).expect("bad private key regex")
+    assert!(
+        !file.private_key_pattern.is_empty(),
+        "credential_patterns.toml must contain at least one [[private_key_pattern]]"
+    );
+    file.private_key_pattern
+        .iter()
+        .map(|p| {
+            Regex::new(&p.regex)
+                .unwrap_or_else(|e| panic!("bad private key regex in {}: {e}", p.id))
+        })
+        .collect()
 });
 
 // Generic secret regex: keyword context + assignment + value capture.
@@ -149,22 +158,24 @@ fn check_known_patterns(input: &str) -> Vec<Finding> {
 
 fn check_private_keys(input: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
-    for _ in PRIVATE_KEY_RE.find_iter(input) {
-        findings.push(Finding {
-            rule_id: RuleId::PrivateKeyExposed,
-            severity: Severity::Critical,
-            title: "Private key block detected".to_string(),
-            description: "A PEM-encoded private key header was found in the input. \
-                          Private keys should never be pasted into a terminal or used inline."
-                .to_string(),
-            evidence: vec![Evidence::Text {
-                detail: "Matched BEGIN PRIVATE KEY block".to_string(),
-            }],
-            human_view: None,
-            agent_view: None,
-            mitre_id: None,
-            custom_rule_id: None,
-        });
+    for re in PRIVATE_KEY_RES.iter() {
+        for _ in re.find_iter(input) {
+            findings.push(Finding {
+                rule_id: RuleId::PrivateKeyExposed,
+                severity: Severity::Critical,
+                title: "Private key block detected".to_string(),
+                description: "A private key block header was found in the input. \
+                              Private keys should never be pasted into a terminal or used inline."
+                    .to_string(),
+                evidence: vec![Evidence::Text {
+                    detail: "Matched a BEGIN PRIVATE KEY block".to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+        }
     }
     findings
 }
@@ -960,6 +971,51 @@ mod tests {
                 .filter(|f| f.rule_id == RuleId::PrivateKeyExposed)
                 .all(|f| f.severity == Severity::Critical),
             "private key should be Critical severity"
+        );
+    }
+
+    #[test]
+    fn test_pgp_private_key_detected() {
+        // The second [[private_key_pattern]] must be detected too (not just the
+        // first), and it must be Critical. Regression guard for the `.first()` →
+        // iterate-all change.
+        let input =
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGBF3...\n-----END PGP PRIVATE KEY BLOCK-----";
+        let findings = check(input, ShellType::Posix, ScanContext::Paste);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PrivateKeyExposed
+                    && f.severity == Severity::Critical),
+            "PGP private key block should be detected as Critical: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_pem_private_key_still_detected_alongside_pgp() {
+        // Adding the PGP pattern must not regress the original PEM pattern.
+        let input =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1r\n-----END OPENSSH PRIVATE KEY-----";
+        let findings = check(input, ShellType::Posix, ScanContext::Paste);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.rule_id == RuleId::PrivateKeyExposed)
+                .count(),
+            1,
+            "PEM key should fire exactly once (PGP pattern must not double-match): {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_openai_project_key_detected() {
+        let input = "sk-proj-aB3xK9mP2qR7tV1wY5zC4dF8gH6jL0nQsT2uW4xZ0";
+        let findings = check(input, ShellType::Posix, ScanContext::Paste);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::CredentialInText),
+            "OpenAI sk-proj- key should be detected: {findings:?}"
         );
     }
 

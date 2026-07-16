@@ -71,6 +71,24 @@ pub enum RuleId {
     /// M5 item 16 — PowerShell `iex (iwr https://...)` inline form. The pipe form
     /// (`iwr url | iex`) is handled by `pipe_to_interpreter`.
     PsInlineDownloadExecute,
+    /// PR3 — a shell-level reverse/bind shell: a bash `/dev/tcp/…` or `/dev/udp/…`
+    /// network redirect, or `nc`/`ncat`/`netcat` with an exec-on-connect flag
+    /// (`-e`/`-c`/`--exec`/`--sh-exec`), or `socat … EXEC:`/`SYSTEM:`. High
+    /// (MITRE T1059). Interpreter-based reverse shells (`python -c 'socket…'`)
+    /// classify as [`RuleId::InterpreterSuspiciousInlineExec`] instead, so the two
+    /// rules never double-fire.
+    ReverseShell,
+    /// PR3 — an inline interpreter (`python -c`, `node -e`, `perl -e`, `ruby -e`,
+    /// `php -r`, `bun -e`) whose inline code carries a SUSPICIOUS PAYLOAD: a
+    /// dynamic code-exec call (`exec(`/`eval(`/`system(`/`os.system`/`__import__`),
+    /// a process spawn (`subprocess`/`os.exec`/`child_process`/`execSync`), or a
+    /// network primitive (`socket.socket`/`urllib`/`requests.`/`http.client`). Fires
+    /// ONLY on (inline-interpreter form) AND (payload indicator) — a bare
+    /// `python -c 'print(1)'` never fires. High (MITRE T1059). The base64
+    /// decode-execute shape stays owned by [`RuleId::Base64DecodeExecute`] (this
+    /// rule skips it), and `powershell -Command` inline is owned by
+    /// `rules::powershell`.
+    InterpreterSuspiciousInlineExec,
 
     // Code file scan rules
     DynamicCodeExecution,

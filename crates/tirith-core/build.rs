@@ -485,6 +485,58 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Base64 decode-and-execute patterns (pipe chain, inline, PowerShell)",
     },
     PatternEntry {
+        id: "reverse_shell",
+        // PR3 — shell-level reverse/bind shells. `/dev/tcp` `/dev/udp` are bash
+        // net pseudo-devices (only used for back-connects); the `nc`/`socat` tokens
+        // gate the precise exec-flag / EXEC: match in `check_reverse_shell`.
+        tier1_exec_fragments: &[
+            r"/dev/tcp/",
+            r"/dev/udp/",
+            r"\b(?:nc|ncat|netcat)\b",
+            r"\bsocat\b",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Reverse/bind shell shapes (/dev/tcp, nc -e, socat EXEC:) — PR3",
+    },
+    PatternEntry {
+        id: "interpreter_inline_exec",
+        // PR3 — the suspicious-payload markers an inline interpreter body carries.
+        // These survive interpreter quoting/pathing (they live in the -c/-e body),
+        // unlike an `interpreter\s+-c` gate, so they are the robust superset of
+        // `check_interpreter_suspicious_inline_exec`. Call-paren / dotted / `::`
+        // anchored so they match code syntax, not a bare shell word (`eval x`,
+        // `systemctl` do not match).
+        tier1_exec_fragments: &[
+            r"\bexec\s*\(",
+            r"\beval\s*\(",
+            r"\bsystem\s*\(",
+            r"\bpopen\s*\(",
+            r"\bFunction\s*\(",
+            r"os\.(?:system|popen|exec|spawn)",
+            r"\bsubprocess\b",
+            r"__import__\s*\(",
+            r"\bpty\.spawn\b",
+            r"\bshell_exec\s*\(",
+            r"\bpassthru\s*\(",
+            r"\bproc_open\s*\(",
+            r"\bchild_process\b",
+            r"\bexecSync\s*\(",
+            r"\bspawn(?:Sync)?\s*\(",
+            r"\bsocket\.socket\b",
+            r"\burllib\b",
+            r"\burlopen\b",
+            r"\brequests\.(?:get|post|put|patch|delete|request|Session)\b",
+            r"\bhttp\.client\b",
+            r"\bhttplib\b",
+            r"\bIO::Socket\b",
+            r"\bNet::",
+            r"\bLWP::",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Inline-interpreter suspicious payload markers (python -c/node -e/... \
+                with exec/subprocess/network) — PR3",
+    },
+    PatternEntry {
         id: "cargo_vet",
         tier1_exec_fragments: &[r"\bcargo\b"],
         tier1_paste_only_fragments: &[],
@@ -910,6 +962,12 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ),
     ("ps_defender_exclusion", "PsDefenderExclusion"),
     ("ps_inline_download_execute", "PsInlineDownloadExecute"),
+    // PR3 — LOTL command rules
+    ("reverse_shell", "ReverseShell"),
+    (
+        "interpreter_suspicious_inline_exec",
+        "InterpreterSuspiciousInlineExec",
+    ),
     // Code file scan
     ("dynamic_code_execution", "DynamicCodeExecution"),
     ("obfuscated_payload", "ObfuscatedPayload"),
