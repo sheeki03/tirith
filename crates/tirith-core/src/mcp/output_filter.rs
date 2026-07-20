@@ -333,6 +333,7 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::ThreatMaliciousIp
         | RuleId::ThreatPackageTyposquat
         | RuleId::ThreatPackageSimilarName
+        | RuleId::ThreatUnresolvedMaliciousPackage
         | RuleId::ThreatMaliciousUrl
         | RuleId::ThreatPhishingUrl
         | RuleId::ThreatTorExitNode

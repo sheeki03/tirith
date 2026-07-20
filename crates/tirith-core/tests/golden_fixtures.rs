@@ -602,6 +602,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "threat_malicious_ip",
     "threat_package_typosquat",
     "threat_package_similar_name",
+    "threat_unresolved_malicious_package",
     // Threat intelligence — supplemental feeds
     "threat_malicious_url",
     "threat_phishing_url",
@@ -1182,6 +1183,7 @@ rule_id_variant_registry! {
     SvgExternalReference,
     // Threat intelligence — local DB
     ThreatMaliciousPackage, ThreatMaliciousIp, ThreatPackageTyposquat, ThreatPackageSimilarName,
+    ThreatUnresolvedMaliciousPackage,
     // Threat intelligence — supplemental feeds
     ThreatMaliciousUrl, ThreatPhishingUrl, ThreatTorExitNode, ThreatThreatFoxIoc,
     // Threat intelligence — real-time lookups
@@ -1340,6 +1342,8 @@ fn test_no_url_rules_have_no_url_fixtures() {
         // M8 ch5 — container-runtime rules fire without a URL in the input.
         "docker_run_privileged",           // docker run --privileged alpine
         "docker_run_sensitive_bind_mount", // docker run -v /var/run/docker.sock:...
+        // A1 — unpinned/constrained malicious package: npm install evil-package
+        "threat_unresolved_malicious_package",
     ]
     .into_iter()
     .collect();

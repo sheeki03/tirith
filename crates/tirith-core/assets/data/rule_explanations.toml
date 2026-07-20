@@ -1334,6 +1334,17 @@ examples_good = ["pip install requests", "npm install lodash"]
 false_positive_guidance = "This is a heuristic check. Legitimate packages may have names similar to popular ones. Review the package on its registry page to confirm it is the intended package."
 remediation = "Double-check the package name. If it is a typo, correct it to the popular package name shown in the evidence. If it is intentional, you can suppress this rule via policy allowlist."
 
+[[rule]]
+id = "threat_unresolved_malicious_package"
+title = "Unresolved malicious package version"
+category = "threatintel"
+severity_rationale = "Medium — the package name is in the malicious-package database but the exact version was not pinned, so the resolver might or might not pull an affected version. A confirmed exact or all-versions hit is reported as the Critical threat_malicious_package instead."
+description = "The package being installed is listed as malicious for specific versions, but the request did not pin an exact version (an unpinned install) or used a version range that overlaps the affected versions. tirith cannot prove the resolver will avoid the malicious version, so it warns. A range that provably excludes every affected version does not trigger this rule."
+examples_bad = ["pip install malicious-pkg-example", "pip install malicious-pkg-example>=1.0,<2.0"]
+examples_good = ["pip install malicious-pkg-example==9.9.9-known-safe", "pip install requests"]
+false_positive_guidance = "This is a precautionary warning, not a confirmed match for the version you will install. If you pin an exact non-affected version, the warning is replaced by a clean result. Consult the reference URL for the affected version list."
+remediation = "Pin the package to a specific version known to be unaffected, or choose a different package. Check the affected versions in the finding evidence before installing."
+
 # ── Threat intelligence rules (Phase B — keyed feeds, stubs) ───────────
 
 [[rule]]

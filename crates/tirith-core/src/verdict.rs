@@ -140,6 +140,16 @@ pub enum RuleId {
     ThreatMaliciousIp,
     ThreatPackageTyposquat,
     ThreatPackageSimilarName,
+    /// A1 — the package name is in the malicious-package DB but the requested
+    /// version could not be resolved to a definite hit: an unpinned install
+    /// (`pip install foo`) of a version-specific malicious record, or a version
+    /// constraint that provably overlaps the affected versions. Distinct from
+    /// `ThreatMaliciousPackage` (a confirmed exact/all-versions hit, which still
+    /// fires and may short-circuit weaker signals); this one is Medium/Warn
+    /// because the resolver MIGHT pick an affected version. A constraint that
+    /// provably excludes every affected version does NOT fire this. Emitted by
+    /// `rules::threatintel` (command path) and `ecosystem_scan` (manifest path).
+    ThreatUnresolvedMaliciousPackage,
     // Supplemental-feed rules are defined now so RuleId stays stable.
     ThreatMaliciousUrl,
     ThreatPhishingUrl,
