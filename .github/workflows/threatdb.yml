@@ -30,7 +30,7 @@ jobs:
       RUN_ID: ${{ github.run_id }}
       RUN_ATTEMPT: ${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           # Need full history so we can rebase on top of any commits that
           # land on main while this build is running.
@@ -130,7 +130,7 @@ jobs:
       # the manifest is overwritten in place. The tag stays pinned where it was
       # first created (we deliberately do NOT set target_commitish).
       - name: Publish release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: threatdb-latest
           prerelease: true
