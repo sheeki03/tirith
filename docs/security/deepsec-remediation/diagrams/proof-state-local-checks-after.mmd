@@ -1,0 +1,6 @@
+flowchart LR
+  R["Read state"] --> L["Local lock and identity check"]
+  L --> C["Transform"]
+  C --> W["Atomic write or append"]
+  W --> B["Expanded local counters"]
+  B --> D["Decision or protection claim"]

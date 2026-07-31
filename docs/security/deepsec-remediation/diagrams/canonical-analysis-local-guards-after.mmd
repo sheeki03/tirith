@@ -1,0 +1,10 @@
+flowchart LR
+  U["Untrusted input"] --> T["Tier-one text gate + parity tests"]
+  U --> P["Dialect tokenizer + local checks"]
+  U --> L["Rule-local parsers + local checks"]
+  T --> R["Rules and extractors"]
+  P --> R
+  L --> R
+  X["Named incomplete states"] --> G["Local finalizer guards"]
+  R --> G
+  G --> F["Policy/action"]

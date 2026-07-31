@@ -1,0 +1,328 @@
+{
+  "documentType": "codex-security.hardening-analysis",
+  "schemaVersion": "1.0",
+  "analysisId": "tirith_deepsec_remediation_20260731",
+  "sourceEvidence": {
+    "kind": "adjudicated_finding_collection",
+    "label": "Tirith DeepSec 2.2.9 disposition audit",
+    "collectionSha256": "78b14d301abfb978492b2451fec26b7f748e52e84c15c9eeb0725a57f062490a",
+    "artifactCount": 551,
+    "targetRevision": "e1ec47ef9f43e32872a550522067a680ff659e6e",
+    "sourceDrift": "none"
+  },
+  "assessment": {
+    "outcome": "opportunities_identified",
+    "summary": "Four repeated control-ownership failures justify incremental shared boundaries, delivered inside a three-PR remediation stack."
+  },
+  "constraints": {
+    "profile": "balanced",
+    "changeHorizons": ["incremental", "medium_term"],
+    "maxImplementationPrs": 3,
+    "nonNegotiables": [
+      "Rust 1.83 MSRV remains supported unless separately approved.",
+      "Incomplete analysis never becomes clean or complete.",
+      "A shared primitive does not close a root until its exact sink is migrated and revalidated.",
+      "Private evidence and payloads remain outside the public repository and CI logs."
+    ],
+    "assumptions": [
+      "No measured latency, memory, or binary-size budget was supplied.",
+      "Performance and resource directions remain source-derived or hypothetical until package benchmarks run.",
+      "Schema changes use additive dual-read and single-write migrations."
+    ]
+  },
+  "opportunities": [
+    {
+      "opportunityId": "canonical-analysis",
+      "title": "Canonical analysis and completeness",
+      "summary": "Preserve raw identity, structured interpretation, and explicit completeness through one owned analysis contract.",
+      "diagnosis": "Performance gates, dialect parsers, rule-local extractors, and finalizers can consume different representations or discard incomplete states.",
+      "evidence": [
+        {
+          "claimType": "observed",
+          "sourceKind": "finding",
+          "findingId": "repo-0042",
+          "path": "crates/tirith-core/src/engine.rs",
+          "claim": "A performance prefilter can prevent a configured precise rule from running."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "finding",
+          "findingId": "repo-0399",
+          "path": "crates/tirith/src/cli/package.rs",
+          "claim": "Artifact coverage gaps can be omitted from the authoritative package result."
+        },
+        {
+          "claimType": "inferred",
+          "sourceKind": "source",
+          "path": "crates/tirith-core/src/scan.rs",
+          "claim": "Existing CoverageGap types are a suitable shared basis, but consumer propagation is not universal."
+        }
+      ],
+      "desiredInvariants": [
+        "The bytes and argv assessed are the bytes and argv executed or forwarded.",
+        "Every security-relevant subject has an explicit complete, incomplete, rejected, or unsupported outcome.",
+        "Tier one is a verified superset prefilter rather than an independent semantic parser."
+      ],
+      "proposalPath": "proposals/canonical-analysis.md",
+      "options": [
+        {
+          "optionId": "local-analysis-guards",
+          "title": "Strengthen local parsers and gap checks",
+          "kind": "baseline",
+          "summary": "Patch named consumers without changing control ownership.",
+          "diagramPaths": {
+            "before": "diagrams/canonical-analysis-before.mmd",
+            "after": "diagrams/canonical-analysis-local-guards-after.mmd"
+          },
+          "findingCoverage": [
+            {
+              "findingId": "repo-0042",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "A local fast-path parity check can close the named path while future callers may still drift."
+            }
+          ],
+          "tradeoffs": [
+            {"dimension": "security", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Named paths close, but control drift remains possible.", "validationPlan": "Rerun each root and search equivalent parsers/finalizers."},
+            {"dimension": "performance", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "Focused checks usually add little hot-path work.", "validationPlan": "Benchmark affected commands and scans before and after each local guard."},
+            {"dimension": "memory", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "No shared retained representation is introduced.", "validationPlan": "Compare peak allocations for adversarial inputs."},
+            {"dimension": "reliability", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Named errors become visible, but behavior remains caller-specific.", "validationPlan": "Exercise parse, cap, and unsupported branches for each consumer."},
+            {"dimension": "operability", "direction": "neutral", "confidence": "low", "basis": "hypothetical", "assessment": "Diagnostics change only at patched sinks.", "validationPlan": "Review human, JSON, and exit outputs for each sink."},
+            {"dimension": "migration", "direction": "neutral", "confidence": "high", "basis": "source-derived", "assessment": "Local changes require little schema migration.", "validationPlan": "Run compatibility controls at the same interfaces."}
+          ],
+          "residualRisks": ["New consumers can omit the local guard.", "Equivalent inputs can still diverge between parsers."],
+          "implementationReadiness": {
+            "affectedComponents": ["crates/tirith-core/src/engine.rs", "crates/tirith-core/src/scan.rs"],
+            "workPackages": ["Use tactical guards for urgent paths inside R1-R3."],
+            "acceptanceCriteria": ["Each named root no longer reproduces and its legitimate control remains."],
+            "migrationNotes": [],
+            "rollback": "Revert the focused consumer change without restoring an incomplete-to-clean conversion."
+          }
+        },
+        {
+          "optionId": "owned-analysis-contract",
+          "title": "Owned command IR and typed outcomes",
+          "kind": "structural",
+          "summary": "Add one raw-plus-structured representation and one explicit completeness contract, then migrate consumers incrementally.",
+          "diagramPaths": {
+            "before": "diagrams/canonical-analysis-before.mmd",
+            "after": "diagrams/canonical-analysis-owned-contract-after.mmd"
+          },
+          "findingCoverage": [
+            {"findingId": "repo-0042", "effect": "addresses", "tacticalFixRequired": true, "rationale": "The fast path must consume the shared contract and keep root-specific parity tests."},
+            {"findingId": "repo-0399", "effect": "addresses", "tacticalFixRequired": true, "rationale": "The package consumer must migrate set/member gaps into finalization."}
+          ],
+          "tradeoffs": [
+            {"dimension": "security", "direction": "improves", "confidence": "high", "basis": "source-derived", "assessment": "Migrated consumers cannot silently discard representation identity or completeness.", "validationPlan": "Run exact-root and cross-consumer parity tests."},
+            {"dimension": "performance", "direction": "unknown", "confidence": "low", "basis": "hypothetical", "assessment": "Parse reuse may help, while retained spans and facts may add work.", "validationPlan": "Benchmark hot short commands, long benign input, and deep wrapper chains against the target revision."},
+            {"dimension": "memory", "direction": "regresses", "confidence": "medium", "basis": "source-derived", "assessment": "The IR and gap records retain bounded metadata.", "validationPlan": "Measure peak allocations and enforce explicit byte/count budgets."},
+            {"dimension": "reliability", "direction": "improves", "confidence": "high", "basis": "source-derived", "assessment": "Errors and caps remain typed across consumers.", "validationPlan": "Exercise complete, incomplete, rejected, unsupported, timeout, and cap states."},
+            {"dimension": "operability", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Coverage diagnostics become consistent and observable.", "validationPlan": "Validate human, JSON, MCP, SARIF, and exit parity."},
+            {"dimension": "migration", "direction": "regresses", "confidence": "high", "basis": "source-derived", "assessment": "Adapters and versioned serialization are required during the three-PR rollout.", "validationPlan": "Run dual-read fixtures and stop migration when legitimate behavior cannot be expressed."}
+          ],
+          "residualRisks": ["Specialized parser grammar can still drift.", "Unmigrated consumers remain locally owned until their PR closes."],
+          "implementationReadiness": {
+            "affectedComponents": ["crates/tirith-core/src/tokenize.rs", "crates/tirith-core/src/scan.rs", "crates/tirith-core/src/engine.rs"],
+            "workPackages": ["R1 foundations and P0/P1 consumers", "R2 remaining P2 consumers", "R3 reliability and convergence"],
+            "acceptanceCriteria": ["Every ledger root assigned to this opportunity reaches an exact-sink verified state."],
+            "migrationNotes": ["Use additive adapters and dual-read serialization."],
+            "rollback": "Stop new migrations and retain adapters; never map typed incomplete states to clean."
+          }
+        }
+      ],
+      "recommendedOptionId": "owned-analysis-contract",
+      "recommendation": "Use the owned contract inside R1-R3, with local guards as urgent tactical protections."
+    },
+    {
+      "opportunityId": "effect-capabilities",
+      "title": "Capability-owned privileged effects",
+      "summary": "Remove ambient PATH, network, and pathname authority from security-sensitive callers.",
+      "diagnosis": "Callers validate strings or paths before invoking process, HTTP, or filesystem APIs that resolve identity again at use time.",
+      "evidence": [
+        {"claimType": "observed", "sourceKind": "finding", "findingId": "repo-0018", "path": "crates/tirith-core/src/util.rs", "claim": "A security-analysis helper can execute a program selected through ambient PATH and environment."},
+        {"claimType": "observed", "sourceKind": "finding", "findingId": "repo-0014", "path": "crates/tirith-core/src/rules/cloaking.rs", "claim": "Destination validation is not bound to the address and redirects used by the actual connection."},
+        {"claimType": "observed", "sourceKind": "finding", "findingId": "repo-0397", "path": "crates/tirith/src/cli/mod.rs", "claim": "A generic atomic writer mixes containment and intentional write-through semantics."}
+      ],
+      "desiredInvariants": [
+        "Security operations spawn only an authenticated absolute executable under a bounded supervisor.",
+        "Every network hop enforces destination policy at connection time.",
+        "Repository and state mutations occur relative to validated directory handles."
+      ],
+      "proposalPath": "proposals/effect-capabilities.md",
+      "options": [
+        {
+          "optionId": "local-effect-validation",
+          "title": "Strengthen validation at each caller",
+          "kind": "baseline",
+          "summary": "Keep dangerous APIs and add local resolve, redirect, or containment checks.",
+          "diagramPaths": {"before": "diagrams/effect-capabilities-before.mmd", "after": "diagrams/effect-capabilities-local-guards-after.mmd"},
+          "findingCoverage": [{"findingId": "repo-0018", "effect": "addresses", "tacticalFixRequired": true, "rationale": "Named callers can resolve trusted absolute programs, but future callers retain ambient APIs."}],
+          "tradeoffs": [
+            {"dimension": "security", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Known effects gain checks while ambient APIs remain callable.", "validationPlan": "Test each caller and search equivalent process/network/file sinks."},
+            {"dimension": "performance", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "Local validation adds little steady-state work.", "validationPlan": "Benchmark affected effects."},
+            {"dimension": "memory", "direction": "neutral", "confidence": "high", "basis": "source-derived", "assessment": "No shared retained state is required.", "validationPlan": "Check output/body/path validation caps."},
+            {"dimension": "reliability", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Named cleanup and validation improve, but remain inconsistent.", "validationPlan": "Exercise timeout, redirect, race, and write failures per caller."},
+            {"dimension": "operability", "direction": "neutral", "confidence": "low", "basis": "hypothetical", "assessment": "Configuration remains caller-specific.", "validationPlan": "Review diagnostics and operator overrides."},
+            {"dimension": "migration", "direction": "neutral", "confidence": "high", "basis": "source-derived", "assessment": "Focused caller changes are easy to stage.", "validationPlan": "Run legitimate tool, proxy, and symlink compatibility controls."}
+          ],
+          "residualRisks": ["Check/use identity can still diverge.", "Future callers can select the unguarded API."],
+          "implementationReadiness": {"affectedComponents": ["crates/tirith-core/src/util.rs", "crates/tirith-core/src/ssrf_guard.rs", "crates/tirith/src/cli/mod.rs"], "workPackages": ["Use only as tactical fixes inside R1-R3."], "acceptanceCriteria": ["Named effects reject ambient identity changes."], "migrationNotes": [], "rollback": "Revert the caller without adding an ambient fallback."}
+        },
+        {
+          "optionId": "owned-effect-capabilities",
+          "title": "Trusted child, guarded client, and contained I/O capabilities",
+          "kind": "structural",
+          "summary": "Require owned effect values and return typed bounded outcomes.",
+          "diagramPaths": {"before": "diagrams/effect-capabilities-before.mmd", "after": "diagrams/effect-capabilities-owned-after.mmd"},
+          "findingCoverage": [
+            {"findingId": "repo-0018", "effect": "addresses", "tacticalFixRequired": true, "rationale": "Every direct spawn still requires migration and a PATH/startup regression."},
+            {"findingId": "repo-0014", "effect": "addresses", "tacticalFixRequired": true, "rationale": "Each HTTP client still requires source-specific redirects and compatibility tests."},
+            {"findingId": "repo-0397", "effect": "addresses", "tacticalFixRequired": true, "rationale": "Callers must select contained or intentional write-through semantics explicitly."}
+          ],
+          "tradeoffs": [
+            {"dimension": "security", "direction": "improves", "confidence": "high", "basis": "source-derived", "assessment": "Migrated callers cannot supply ambient program, network, or path authority directly.", "validationPlan": "Run fake PATH, DNS/redirect/proxy, and symlink/reparse race suites."},
+            {"dimension": "performance", "direction": "regresses", "confidence": "medium", "basis": "source-derived", "assessment": "Resolution, streaming, locks, and fsync add work.", "validationPlan": "Benchmark spawn, common fetch, and state/config writes."},
+            {"dimension": "memory", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "Buffers and caches are explicitly bounded.", "validationPlan": "Measure cap-bound peak RSS during floods and large bodies."},
+            {"dimension": "reliability", "direction": "improves", "confidence": "high", "basis": "source-derived", "assessment": "Cleanup, timeout, cap, redirect, and durability behavior have one owner.", "validationPlan": "Inject process, network, I/O, fsync, and crash failures."},
+            {"dimension": "operability", "direction": "regresses", "confidence": "medium", "basis": "hypothetical", "assessment": "Explicit trusted paths and proxy/host policy require diagnostics and migration guidance.", "validationPlan": "Test supported package-manager, enterprise proxy, and installer configurations."},
+            {"dimension": "migration", "direction": "regresses", "confidence": "high", "basis": "source-derived", "assessment": "Cross-platform consumers migrate throughout R1-R3.", "validationPlan": "Track every effect sink in the ledger and forbid unguarded fallback."}
+          ],
+          "residualRisks": ["Explicit trust policy can be misconfigured.", "Allowed public origins remain trusted if compromised.", "Platform filesystems expose different guarantees."],
+          "implementationReadiness": {"affectedComponents": ["crates/tirith-core/src/util.rs", "crates/tirith-core/src/ssrf_guard.rs", "crates/tirith/src/cli/setup/fs_helpers.rs", "crates/tirith/src/cli/setup/fs_helpers_windows.rs"], "workPackages": ["R1 foundations and high-severity migrations", "R2 remaining security migrations", "R3 reliability and convergence"], "acceptanceCriteria": ["Every owned effect root passes exact-sink and legitimate-control tests."], "migrationNotes": ["Unavailable migrated effects fail explicitly rather than falling back."], "rollback": "Roll back consumers before capabilities; never restore ambient fallback."}
+        }
+      ],
+      "recommendedOptionId": "owned-effect-capabilities",
+      "recommendation": "Use owned effect capabilities throughout the three-PR stack."
+    },
+    {
+      "opportunityId": "safe-output",
+      "title": "Typed safe output and secret lifecycle",
+      "summary": "Separate raw identity, secrets, redacted values, and format-safe output while validating every transformation.",
+      "diagnosis": "Ordinary strings cross terminal, Markdown, structured, persistence, and upload boundaries in inconsistent transformation order.",
+      "evidence": [
+        {"claimType": "observed", "sourceKind": "finding", "findingId": "repo-0029", "path": "crates/tirith-core/src/audit.rs", "claim": "A command can be truncated before complete credential redaction and persistence."},
+        {"claimType": "observed", "sourceKind": "finding", "findingId": "repo-0046", "path": "crates/tirith-core/src/extract.rs", "claim": "Control-sequence overflow can leave analysis in a clean state."},
+        {"claimType": "observed", "sourceKind": "finding", "findingId": "repo-0058", "path": "crates/tirith-core/src/mcp/output_filter.rs", "claim": "A structured key can collide after transformation and before forwarding."}
+      ],
+      "desiredInvariants": [
+        "Secrets are removed before truncation, persistence, upload, or error formatting.",
+        "Every final format uses its own encoder rather than a generic sanitized string.",
+        "The exact transformed structured output is collision-checked, schema-validated, and reanalyzed before forwarding."
+      ],
+      "proposalPath": "proposals/safe-output.md",
+      "options": [
+        {
+          "optionId": "local-output-encoders",
+          "title": "Patch known sinks with local encoders",
+          "kind": "baseline",
+          "summary": "Add the correct terminal or format helper next to each named sink.",
+          "diagramPaths": {"before": "diagrams/safe-output-before.mmd", "after": "diagrams/safe-output-local-encoders-after.mmd"},
+          "findingCoverage": [{"findingId": "repo-0029", "effect": "addresses", "tacticalFixRequired": true, "rationale": "The audit sink can redact complete input before truncation without a type migration."}],
+          "tradeoffs": [
+            {"dimension": "security", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Named sinks close, future transformation order remains caller-owned.", "validationPlan": "Run hostile fields through every patched sink."},
+            {"dimension": "performance", "direction": "neutral", "confidence": "high", "basis": "source-derived", "assessment": "Local encoding is linear and usually already required.", "validationPlan": "Benchmark long output and many fields."},
+            {"dimension": "memory", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "Local strings may allocate but no persistent state is added.", "validationPlan": "Measure peak allocations under output caps."},
+            {"dimension": "reliability", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Named output becomes safe while write/flush and collisions remain local concerns.", "validationPlan": "Inject serialization, collision, write, and flush failures."},
+            {"dimension": "operability", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "Snapshots change at patched surfaces.", "validationPlan": "Review human and machine golden outputs."},
+            {"dimension": "migration", "direction": "neutral", "confidence": "high", "basis": "source-derived", "assessment": "No broad API migration is needed.", "validationPlan": "Version any changed machine envelope."}
+          ],
+          "residualRisks": ["New sinks receive ordinary strings.", "Terminal sanitization may be reused in the wrong format context."],
+          "implementationReadiness": {"affectedComponents": ["crates/tirith-core/src/audit.rs", "crates/tirith-core/src/mcp/output_filter.rs"], "workPackages": ["Urgent sink fixes inside R1-R3."], "acceptanceCriteria": ["Named sink contains no active controls or secret bytes."], "migrationNotes": [], "rollback": "Revert only if a safe format-preserving alternative remains."}
+        },
+        {
+          "optionId": "typed-safe-values",
+          "title": "Typed raw, secret, redacted, and format-safe values",
+          "kind": "structural",
+          "summary": "Make transformation order and final format explicit, with bounded streaming state and post-transform validation.",
+          "diagramPaths": {"before": "diagrams/safe-output-before.mmd", "after": "diagrams/safe-output-typed-values-after.mmd"},
+          "findingCoverage": [
+            {"findingId": "repo-0029", "effect": "addresses", "tacticalFixRequired": true, "rationale": "Audit/spool callers must migrate to redacted-before-persist values."},
+            {"findingId": "repo-0046", "effect": "addresses", "tacticalFixRequired": true, "rationale": "The streaming scanner still requires overflow and split-state regression coverage."},
+            {"findingId": "repo-0058", "effect": "addresses", "tacticalFixRequired": true, "rationale": "The MCP transform must reject collisions and revalidate the exact forwarded object."}
+          ],
+          "tradeoffs": [
+            {"dimension": "security", "direction": "improves", "confidence": "high", "basis": "source-derived", "assessment": "Unsafe transformation order becomes explicit at migrated boundaries.", "validationPlan": "Run terminal, Markdown, CSV, DOT, JSON, MCP, and secret-sink matrices."},
+            {"dimension": "performance", "direction": "regresses", "confidence": "low", "basis": "hypothetical", "assessment": "Streaming state and post-transform analysis add bounded work.", "validationPlan": "Benchmark long terminal output and many structured leaves."},
+            {"dimension": "memory", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "State, ranges, and hits remain explicitly capped.", "validationPlan": "Measure peak retained state at exact caps."},
+            {"dimension": "reliability", "direction": "improves", "confidence": "high", "basis": "source-derived", "assessment": "Collision, truncation, write, and flush outcomes become explicit.", "validationPlan": "Exercise all failure and chunk boundaries."},
+            {"dimension": "operability", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Unsafe or incomplete transforms produce consistent diagnostics.", "validationPlan": "Review human/machine schema and log behavior."},
+            {"dimension": "migration", "direction": "regresses", "confidence": "high", "basis": "source-derived", "assessment": "Many sinks migrate across all three PRs.", "validationPlan": "Use ledger sink ownership and versioned output envelopes."}
+          ],
+          "residualRisks": ["Renderer behavior varies by terminal and Markdown engine.", "New secret formats require pattern maintenance."],
+          "implementationReadiness": {"affectedComponents": ["crates/tirith-core/src/mcp/output_filter.rs", "crates/tirith/src/cli/mod.rs"], "workPackages": ["R1 high-severity output and secret sinks", "R2 remaining security sinks", "R3 output contracts and convergence"], "acceptanceCriteria": ["Every owned sink passes format-specific, secret-absence, and legitimate-output tests."], "migrationNotes": ["Keep machine schemas versioned and values structured."], "rollback": "Preserve raw identity and adapters; do not restore raw human or secret-persistence paths."}
+        }
+      ],
+      "recommendedOptionId": "typed-safe-values",
+      "recommendation": "Use typed values and format-specific encoders, with urgent local fixes as tactical protection."
+    },
+    {
+      "opportunityId": "proof-carrying-state",
+      "title": "Proof-carrying security state",
+      "summary": "Represent success with its generation, completeness, coverage dimensions, and durable transition evidence.",
+      "diagnosis": "Aggregate booleans, replaceable locks, reopened generations, and unlocked read-modify-write can overclaim protection or lose state.",
+      "evidence": [
+        {"claimType": "observed", "sourceKind": "finding", "findingId": "repo-0033", "path": "crates/tirith-core/src/capsule/linux.rs", "claim": "A backend can report filesystem enforcement when an allowed root defeats a deny root."},
+        {"claimType": "observed", "sourceKind": "finding", "findingId": "repo-0196", "path": "crates/tirith-core/src/audit.rs", "claim": "Audit tail, count, and head can describe different file generations."},
+        {"claimType": "observed", "sourceKind": "finding", "findingId": "repo-0343", "path": "crates/tirith-core/src/taint.rs", "claim": "Concurrent or corrupt taint-state transitions can lose protection state."}
+      ],
+      "desiredInvariants": [
+        "A success state names the generation, dimensions, and evidence it represents.",
+        "A stable lock covers the full read, validate, transform, and publish transition.",
+        "Corrupt, stale, incomplete, provisional, unsupported, and degraded are not aliases for absent or successful."
+      ],
+      "proposalPath": "proposals/proof-carrying-state.md",
+      "options": [
+        {
+          "optionId": "local-state-checks",
+          "title": "Add local locks, counters, and validation",
+          "kind": "baseline",
+          "summary": "Repair named state owners without changing their state model.",
+          "diagramPaths": {"before": "diagrams/proof-state-before.mmd", "after": "diagrams/proof-state-local-checks-after.mmd"},
+          "findingCoverage": [{"findingId": "repo-0343", "effect": "addresses", "tacticalFixRequired": true, "rationale": "A stable local lock and corruption check can close the named taint transition."}],
+          "tradeoffs": [
+            {"dimension": "security", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Named races and claims improve while invalid success states remain representable elsewhere.", "validationPlan": "Run deterministic interleavings and inspect every consumer."},
+            {"dimension": "performance", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "Local locking and counters add limited work.", "validationPlan": "Benchmark owner-specific contention and I/O."},
+            {"dimension": "memory", "direction": "neutral", "confidence": "high", "basis": "source-derived", "assessment": "No retained generation metadata is required.", "validationPlan": "Check bounded queues and records."},
+            {"dimension": "reliability", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Known transitions improve, crash recovery remains path-specific.", "validationPlan": "Inject crash, corruption, and replacement failures."},
+            {"dimension": "operability", "direction": "neutral", "confidence": "low", "basis": "hypothetical", "assessment": "Diagnostics remain owner-specific.", "validationPlan": "Review degraded and incomplete outputs."},
+            {"dimension": "migration", "direction": "neutral", "confidence": "high", "basis": "source-derived", "assessment": "Few schema changes are required.", "validationPlan": "Run old-state compatibility fixtures."}
+          ],
+          "residualRisks": ["Aggregate success states remain easy to misuse.", "Other stores can retain unstable lock or generation semantics."],
+          "implementationReadiness": {"affectedComponents": ["crates/tirith-core/src/taint.rs", "crates/tirith-core/src/audit.rs"], "workPackages": ["Use for isolated owners inside R1-R3."], "acceptanceCriteria": ["Named owner transitions are race- and corruption-safe."], "migrationNotes": [], "rollback": "Revert only with preserved last-known-good and explicit degraded behavior."}
+        },
+        {
+          "optionId": "versioned-proof-state",
+          "title": "Versioned state machines with explicit evidence",
+          "kind": "structural",
+          "summary": "Use stable locks, validated transitions, durable generations, and per-dimension coverage.",
+          "diagramPaths": {"before": "diagrams/proof-state-before.mmd", "after": "diagrams/proof-state-versioned-after.mmd"},
+          "findingCoverage": [
+            {"findingId": "repo-0033", "effect": "addresses", "tacticalFixRequired": true, "rationale": "Each backend must validate overlap and report only applied dimensions."},
+            {"findingId": "repo-0196", "effect": "addresses", "tacticalFixRequired": true, "rationale": "Audit operations must use one locked generation and rotation protocol."},
+            {"findingId": "repo-0343", "effect": "addresses", "tacticalFixRequired": true, "rationale": "Taint append, clear, and read must migrate to the stable transition."}
+          ],
+          "tradeoffs": [
+            {"dimension": "security", "direction": "improves", "confidence": "high", "basis": "source-derived", "assessment": "Migrated owners cannot claim success without generation and dimension evidence.", "validationPlan": "Run state transition, coverage, and exact-generation tests."},
+            {"dimension": "performance", "direction": "regresses", "confidence": "medium", "basis": "source-derived", "assessment": "Stable locks, validation, fsync, and rechecks add I/O and contention.", "validationPlan": "Benchmark audit, state mutation, checkpoint, and containment startup."},
+            {"dimension": "memory", "direction": "regresses", "confidence": "low", "basis": "hypothetical", "assessment": "Generation metadata, bounded queues, and last-known-good state retain modest memory/disk.", "validationPlan": "Measure peak queue/state size under configured bounds."},
+            {"dimension": "reliability", "direction": "improves", "confidence": "high", "basis": "source-derived", "assessment": "Crash recovery, stale/corrupt handling, and consistent reads improve.", "validationPlan": "Inject crashes around write, fsync, rename, signing, and publication."},
+            {"dimension": "operability", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Degraded dimensions and truncation become observable.", "validationPlan": "Validate human, JSON, status, health, and alert outputs."},
+            {"dimension": "migration", "direction": "regresses", "confidence": "high", "basis": "source-derived", "assessment": "State schemas and mixed-version writer protocols require coordination.", "validationPlan": "Use dual-read/single-write fixtures and restart gates for stable-lock changes."}
+          ],
+          "residualRisks": ["Distributed exactly-once delivery is not guaranteed.", "Mixed old/new writers require controlled restart.", "Platform durability guarantees differ."],
+          "implementationReadiness": {"affectedComponents": ["crates/tirith-core/src/capsule/mod.rs", "crates/tirith-core/src/audit.rs", "crates/tirith-core/src/taint.rs"], "workPackages": ["R1 state and containment foundations", "R2 remaining security owners", "R3 reliability and convergence"], "acceptanceCriteria": ["Every owned state root has deterministic race, crash, corruption, and legitimate-transition proof."], "migrationNotes": ["Preserve last-known-good and require restart for incompatible writer protocols."], "rollback": "Select a validated prior generation; never rewrite corrupt/incomplete state as empty."}
+        }
+      ],
+      "recommendedOptionId": "versioned-proof-state",
+      "recommendation": "Use proof-carrying state for security and coverage owners across R1-R3."
+    }
+  ],
+  "implementationPlanPath": "implementation/stacked-pr-plan.md",
+  "openQuestions": [
+    "What latency, allocation, and binary-size thresholds apply to the R1 foundations?",
+    "Which Markdown and HTML renderers are officially supported?",
+    "Which state writers require process restart during the compatibility window?",
+    "What is the approval-rule precedence contract for repo-0244?",
+    "What deployed edge controls resolve repo-0446?"
+  ]
+}

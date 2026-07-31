@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "rowCount": 549,
+  "canonicalRootCount": 489,
+  "actionRootCount": 483,
+  "counts": {
+    "sourceDisposition": {
+      "already_fixed": 1,
+      "do_not_fix_design_decision": 1,
+      "do_not_fix_false_positive": 1,
+      "duplicate": 61,
+      "fix_reliability": 99,
+      "fix_security": 383,
+      "needs_more_evidence": 3
+    },
+    "reviewedDisposition": {
+      "already_fixed": 1,
+      "do_not_fix_design_decision": 1,
+      "do_not_fix_false_positive": 1,
+      "duplicate": 60,
+      "fix_reliability": 99,
+      "fix_security": 384,
+      "needs_more_evidence": 3
+    },
+    "priority": {
+      "CLOSED": 1,
+      "HOLD": 3,
+      "NO-FIX": 62,
+      "P0": 15,
+      "P1": 164,
+      "P2": 205,
+      "P3": 99
+    },
+    "status": {
+      "action": 483,
+      "closed": 3,
+      "duplicate": 60,
+      "hold": 3
+    }
+  },
+  "tracks": [
+    {
+      "id": "R1",
+      "label": "critical-foundations-p0-p1",
+      "dependencies": [],
+      "actionRoots": 209,
+      "duplicateRows": 41,
+      "totalRows": 250
+    },
+    {
+      "id": "R2",
+      "label": "remaining-p2-security",
+      "dependencies": [
+        "R1"
+      ],
+      "actionRoots": 186,
+      "duplicateRows": 14,
+      "totalRows": 200
+    },
+    {
+      "id": "R3",
+      "label": "remaining-p3-integration",
+      "dependencies": [
+        "R2"
+      ],
+      "actionRoots": 88,
+      "duplicateRows": 5,
+      "totalRows": 93
+    }
+  ],
+  "packages": [
+    {
+      "code": "R1-FND",
+      "track": "R1",
+      "label": "prerequisite-control-spine",
+      "dependencies": [],
+      "actionRoots": 60,
+      "duplicateRows": 16,
+      "totalRows": 76
+    },
+    {
+      "code": "R1-ART",
+      "track": "R1",
+      "label": "critical-artifact-supply-boundaries",
+      "dependencies": [
+        "R1-FND"
+      ],
+      "actionRoots": 31,
+      "duplicateRows": 8,
+      "totalRows": 39
+    },
+    {
+      "code": "R1-CMD",
+      "track": "R1",
+      "label": "critical-command-policy-boundaries",
+      "dependencies": [
+        "R1-FND"
+      ],
+      "actionRoots": 71,
+      "duplicateRows": 9,
+      "totalRows": 80
+    },
+    {
+      "code": "R1-OUT",
+      "track": "R1",
+      "label": "critical-output-secret-egress-boundaries",
+      "dependencies": [
+        "R1-FND"
+      ],
+      "actionRoots": 19,
+      "duplicateRows": 3,
+      "totalRows": 22
+    },
+    {
+      "code": "R1-PLT",
+      "track": "R1",
+      "label": "critical-platform-state-containment",
+      "dependencies": [
+        "R1-FND",
+        "R1-OUT"
+      ],
+      "actionRoots": 28,
+      "duplicateRows": 5,
+      "totalRows": 33
+    },
+    {
+      "code": "R2-CMP",
+      "track": "R2",
+      "label": "completeness-resource-hardening",
+      "dependencies": [
+        "R1-FND"
+      ],
+      "actionRoots": 47,
+      "duplicateRows": 1,
+      "totalRows": 48
+    },
+    {
+      "code": "R2-CMD",
+      "track": "R2",
+      "label": "command-rule-policy-hardening",
+      "dependencies": [
+        "R1-CMD",
+        "R2-CMP"
+      ],
+      "actionRoots": 31,
+      "duplicateRows": 4,
+      "totalRows": 35
+    },
+    {
+      "code": "R2-IO",
+      "track": "R2",
+      "label": "filesystem-state-hardening",
+      "dependencies": [
+        "R1-PLT",
+        "R2-CMP"
+      ],
+      "actionRoots": 31,
+      "duplicateRows": 1,
+      "totalRows": 32
+    },
+    {
+      "code": "R2-NET",
+      "track": "R2",
+      "label": "network-mcp-output-hardening",
+      "dependencies": [
+        "R1-OUT",
+        "R1-PLT",
+        "R2-CMP"
+      ],
+      "actionRoots": 37,
+      "duplicateRows": 5,
+      "totalRows": 42
+    },
+    {
+      "code": "R2-SUP",
+      "track": "R2",
+      "label": "supply-release-hardening",
+      "dependencies": [
+        "R1-ART",
+        "R2-CMP",
+        "R2-NET"
+      ],
+      "actionRoots": 40,
+      "duplicateRows": 3,
+      "totalRows": 43
+    },
+    {
+      "code": "R3-CORE",
+      "track": "R3",
+      "label": "core-contract-reliability",
+      "dependencies": [
+        "R2-CMP",
+        "R2-CMD",
+        "R2-IO",
+        "R2-NET",
+        "R2-SUP"
+      ],
+      "actionRoots": 26,
+      "duplicateRows": 3,
+      "totalRows": 29
+    },
+    {
+      "code": "R3-PLT",
+      "track": "R3",
+      "label": "cross-platform-launcher-reliability",
+      "dependencies": [
+        "R1-PLT",
+        "R2-IO",
+        "R3-CORE"
+      ],
+      "actionRoots": 12,
+      "duplicateRows": 2,
+      "totalRows": 14
+    },
+    {
+      "code": "R3-CLI",
+      "track": "R3",
+      "label": "cli-output-portability",
+      "dependencies": [
+        "R1-OUT",
+        "R2-IO",
+        "R3-CORE"
+      ],
+      "actionRoots": 45,
+      "duplicateRows": 0,
+      "totalRows": 45
+    },
+    {
+      "code": "R3-CI",
+      "track": "R3",
+      "label": "ci-hermetic-fuzz-benchmark-enforcement",
+      "dependencies": [
+        "R2-SUP",
+        "R3-PLT",
+        "R3-CLI"
+      ],
+      "actionRoots": 3,
+      "duplicateRows": 0,
+      "totalRows": 3
+    },
+    {
+      "code": "R3-INT",
+      "track": "R3",
+      "label": "schema-integration-exact-head-revalidation",
+      "dependencies": [
+        "R3-CI"
+      ],
+      "actionRoots": 2,
+      "duplicateRows": 0,
+      "totalRows": 2
+    }
+  ],
+  "explicitR1PrerequisiteCount": 30,
+  "unassignedNonActionRows": 6
+}

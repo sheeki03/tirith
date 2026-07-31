@@ -1,0 +1,11 @@
+flowchart LR
+  C["Caller with strings and paths"] --> V["Optional local validation"]
+  V --> P["Command with ambient PATH/env"]
+  V --> H["Default HTTP DNS/proxy/redirect"]
+  V --> F["Path-based filesystem API"]
+  A["Ambient authority"] --> P
+  A --> H
+  A --> F
+  P --> E["Privileged effect"]
+  H --> E
+  F --> E

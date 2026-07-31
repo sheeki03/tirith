@@ -1,0 +1,6 @@
+flowchart LR
+  U["Untrusted or secret string"] --> R["Local redaction rules"]
+  R --> T["Terminal sanitizer at named sinks"]
+  R --> M["Local format encoders"]
+  R --> J["Local structured checks"]
+  R --> P["Local persistence redaction"]

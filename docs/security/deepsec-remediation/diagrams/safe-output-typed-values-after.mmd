@@ -1,0 +1,8 @@
+flowchart LR
+  U["Raw or secret value"] --> R["Redaction before truncation"]
+  R --> V["Redacted typed value"]
+  V --> T["Streaming terminal-safe value"]
+  V --> M["Markdown HTML CSV DOT encoder"]
+  U --> J["Structured serializer"]
+  J --> X["Collision schema and post-transform analysis"]
+  V --> P["Persistence and upload"]

@@ -52,6 +52,7 @@ generate_research_charts.py
 data_collect_log*.txt
 
 # Local audit / review artifacts (untracked, not part of the project tree)
+/.deepsec/
 scan/
 SECURITY_AUDIT_2026-04-10.md
 tirith security.rtf

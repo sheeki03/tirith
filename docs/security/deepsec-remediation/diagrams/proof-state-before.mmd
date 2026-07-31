@@ -1,0 +1,7 @@
+flowchart LR
+  R["Read path or state"] --> C["Check or transform"]
+  C --> W["Rewrite rename or append"]
+  X["Concurrent writer or replacement"] --> R
+  X --> W
+  W --> B["Success boolean or counter"]
+  B --> D["Decision or protection claim"]

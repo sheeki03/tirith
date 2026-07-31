@@ -1,0 +1,8 @@
+flowchart LR
+  U["Raw input and structured argv"] --> I["Canonical command/subject IR"]
+  I --> A["Specialized analyzers"]
+  A --> O["Typed AnalysisOutcome and gaps"]
+  I --> O
+  O --> P["Single policy finalization"]
+  P --> S["Bound execution/forward/output"]
+  B["Shared byte, work, and depth budgets"] --> A

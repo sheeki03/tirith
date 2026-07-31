@@ -1,0 +1,10 @@
+flowchart LR
+  U["Untrusted input"] --> T["Tier-one text gate"]
+  U --> P["Dialect tokenizer"]
+  U --> L["Rule-local parsers"]
+  T --> R["Rules and extractors"]
+  P --> R
+  L --> R
+  R --> F["Final policy/action"]
+  X["Cap, parse error, unsupported"] -. "empty or default" .-> F
+  F --> S["Execution, output, or clean result"]

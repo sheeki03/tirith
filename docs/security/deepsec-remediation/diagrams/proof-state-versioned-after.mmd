@@ -1,0 +1,8 @@
+flowchart LR
+  I["Input identity and prior generation"] --> L["Stable owner lock"]
+  L --> T["Validate state transition"]
+  T --> E["Generation plus evidence and dimensions"]
+  E --> P["Durable atomic publish"]
+  P --> R["Same generation reader"]
+  R --> D["Decision or truthful protection claim"]
+  G["Corrupt stale incomplete degraded"] --> T

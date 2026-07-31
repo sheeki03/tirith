@@ -1,0 +1,10 @@
+flowchart LR
+  P["Policy and trusted configuration"] --> T["TrustedExecutable"]
+  P --> H["GuardedHttpClient"]
+  P --> D["ContainedDirectoryHandle"]
+  T --> S["Bounded child supervisor"]
+  H --> N["Connect-time guarded request"]
+  D --> F["No-follow transactional I/O"]
+  S --> O["Typed effect outcome"]
+  N --> O
+  F --> O

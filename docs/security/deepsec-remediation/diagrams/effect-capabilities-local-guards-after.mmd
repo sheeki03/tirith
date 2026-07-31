@@ -1,0 +1,10 @@
+flowchart LR
+  C["Caller"] --> VP["Resolve/check program"]
+  C --> VH["Validate URL and redirects"]
+  C --> VF["Canonicalize/check path"]
+  VP --> P["Process effect"]
+  VH --> H["Network effect"]
+  VF --> F["Filesystem effect"]
+  R["Per-caller recheck and tests"] --> P
+  R --> H
+  R --> F

@@ -1,0 +1,7 @@
+flowchart LR
+  U["Untrusted or secret string"] --> R["Ad hoc redact and truncate"]
+  R --> T["Terminal"]
+  R --> M["Markdown HTML CSV DOT"]
+  R --> J["JSON SARIF MCP"]
+  R --> P["Persist upload log"]
+  X["Post-verdict transform"] --> J

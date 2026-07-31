@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "sourceEvidence": {
+    "targetRevision": "e1ec47ef9f43e32872a550522067a680ff659e6e",
+    "collectionSha256": "78b14d301abfb978492b2451fec26b7f748e52e84c15c9eeb0725a57f062490a",
+    "reportJsonSha256": "a8fb73905e26755c1fff3143723faa2fd4da25df20f98a4405aebd21c20d0dc5",
+    "reportMarkdownSha256": "2b4949f45a0b561b98e1967dad86718060d8a683cc0cf8e33cff585bd4cc9f54"
+  },
+  "artifacts": {
+    "remediation-map.json": {
+      "sha256": "31154dab63c81176cfa8fe8020965985d18eadc610f957b88c30d3e267c4d930",
+      "canonicalJsonSha256": "a719cfeb75b389d953a840ee6862f11c0a8dd45d0a604ef8d887b50eb38d8b1d",
+      "rowCount": 549
+    },
+    "package-catalog.json": {
+      "sha256": "5093c9c51841ba199b8f110e51ef4bc09b5e2928145370e2c1b345c813654be7",
+      "canonicalJsonSha256": "1a6476ba911ea65961c3f0ee47e0b134c1f0bc8639351eddb53bfee413496257",
+      "packageCount": 15
+    }
+  },
+  "reviewedAccounting": {
+    "actionRoots": 483,
+    "duplicates": 60,
+    "holds": 3,
+    "closedNoFixOrAlreadyFixed": 3,
+    "trackActions": {
+      "R1": 209,
+      "R2": 186,
+      "R3": 88
+    }
+  },
+  "bindingMethod": "Source-derived ledger, independent review, raw-byte hashes, and canonical-JSON hashes"
+}
