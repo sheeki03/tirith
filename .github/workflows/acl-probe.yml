@@ -1,0 +1,12 @@
+name: acl-probe
+on: push
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          getfacl -p /home || true
+          getfacl -p /home/runner || true
+          getfacl -p /home/runner/work || true
+          stat -c '%U %a %n' /home /home/runner /home/runner/work || true
+          id
