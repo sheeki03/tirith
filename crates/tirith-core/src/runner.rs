@@ -3417,8 +3417,30 @@ mod tests {
                 called.store(true, Ordering::Release);
                 panic!("pending approval reached the executor")
             }),
-        )
-        .expect("pending approval returns a structured refusal");
+        );
+        // DIAGNOSTIC (scratch branch only): name the policy the runner actually
+        // resolved and the exact verdict it produced, so a CI-only divergence
+        // reports its cause instead of a downstream symptom.
+        {
+            let policy = crate::policy::Policy::discover(None);
+            eprintln!(
+                "DIAG policy: scope={:?} bypass_env={} overrides={:?} approval_rules={} root_env={:?} policy_file_exists={}",
+                policy.scope,
+                policy.allow_bypass_env,
+                policy.severity_overrides,
+                policy.approval_rules.len(),
+                std::env::var("TIRITH_POLICY_ROOT"),
+                isolated.path().join(".tirith/policy.yaml").exists(),
+            );
+            match &result {
+                Ok(run) => eprintln!(
+                    "DIAG result: refused={} executed={} exit={:?} verdict={:#?}",
+                    run.refused, run.executed, run.exit_code, run.verdict
+                ),
+                Err(error) => eprintln!("DIAG result error: {error}"),
+            }
+        }
+        let result = result.expect("pending approval returns a structured refusal");
         stop.store(true, Ordering::Release);
         server.join().expect("join approval test server");
 
