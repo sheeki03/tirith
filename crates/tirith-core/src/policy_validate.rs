@@ -791,6 +791,18 @@ fn validate_unknown_fields(yaml: &str, issues: &mut Vec<PolicyIssue>) {
         "threat_intel",
         "agent_rules",
         "package_policy",
+        "share",
+        "context_guard_enabled",
+        "context_destructive_verbs",
+        "iac_require_plan_before_apply",
+        "sudo_require_reason",
+        "sudo_session_ttl",
+        "env_guard_enabled",
+        "env_guard_sensitive_vars",
+        "exec_guard_enabled",
+        "hooks_guard_enabled",
+        "baseline_enabled",
+        "allowed_install_domains",
     ];
 
     // A typo here is load-bearing — a misspelled `block_newr_than_days` silently
@@ -1288,6 +1300,29 @@ custom_rules:
         let yaml = "not_a_real_field: true\n";
         let issues = validate(yaml);
         assert!(issues.iter().any(|i| i.message.contains("unknown field")));
+    }
+
+    #[test]
+    fn test_operational_guard_fields_are_known() {
+        let yaml = r#"
+share: {}
+context_guard_enabled: true
+context_destructive_verbs: {}
+iac_require_plan_before_apply: true
+sudo_require_reason: false
+sudo_session_ttl: 1800
+env_guard_enabled: true
+env_guard_sensitive_vars: [EXAMPLE_TOKEN]
+exec_guard_enabled: true
+hooks_guard_enabled: true
+baseline_enabled: true
+allowed_install_domains: [example.com]
+"#;
+        let issues = validate(yaml);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("unknown field")),
+            "serialized Policy fields must be accepted by the typo guard: {issues:?}"
+        );
     }
 
     #[test]
