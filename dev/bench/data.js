@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786550190374,
+  "lastUpdate": 1786553911850,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -1637,6 +1637,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 92,
             "range": "± 1",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "168dabbcd4f2b08d75a696e06309a094ae99b782",
+          "message": "Merge pull request #185 from sheeki03/codex/deepsec-r1c-setup-provenance\n\nfix(security): DeepSec R1 3/5: setup transactions, install provenance, and script execution",
+          "timestamp": "2026-08-12T22:23:31+05:30",
+          "tree_id": "6659b8260088ffc420355fe6652be166abfe51ac",
+          "url": "https://github.com/sheeki03/tirith/commit/168dabbcd4f2b08d75a696e06309a094ae99b782"
+        },
+        "date": 1786553910858,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 300,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 105,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 18703,
+            "range": "± 340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 177659,
+            "range": "± 2972",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 153315,
+            "range": "± 674",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 142910,
+            "range": "± 793",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 23503,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 70,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 81,
+            "range": "± 0",
             "unit": "ns/iter"
           }
         ]
