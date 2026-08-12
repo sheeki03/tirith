@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786539719465,
+  "lastUpdate": 1786540719975,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -1013,6 +1013,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 91,
             "range": "± 2",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e5dfec91f1fa1440d026b60681be3738dae11320",
+          "message": "Merge PR #170: sanitize untrusted CLI output with exact approvals\n\nfeat(output): sanitize untrusted fields in human CLI output (terminal control + deceptive Unicode)",
+          "timestamp": "2026-08-12T18:45:29+05:30",
+          "tree_id": "b9eeb4e937e5c88074dfc965fc93ea1038f610bd",
+          "url": "https://github.com/sheeki03/tirith/commit/e5dfec91f1fa1440d026b60681be3738dae11320"
+        },
+        "date": 1786540719443,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 552,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 132,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 34212,
+            "range": "± 173",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 245542,
+            "range": "± 2443",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 214493,
+            "range": "± 1079",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 201371,
+            "range": "± 862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 25604,
+            "range": "± 137",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 78,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 93,
+            "range": "± 1",
             "unit": "ns/iter"
           }
         ]
