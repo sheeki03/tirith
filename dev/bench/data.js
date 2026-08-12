@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786541677143,
+  "lastUpdate": 1786541836375,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -1325,6 +1325,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 79,
             "range": "± 2",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7db3bed6c5d38b4433e37495da1b0af8010aae33",
+          "message": "docs(research): offline-rustsec, web3-phishing, and native-yara spike decisions (#174)\n\ndocs(research): offline-rustsec, web3-phishing, and native-yara spike decision docs",
+          "timestamp": "2026-08-12T19:03:53+05:30",
+          "tree_id": "2b13a72691218e3ecbd07ae64b06925b0fe99abb",
+          "url": "https://github.com/sheeki03/tirith/commit/7db3bed6c5d38b4433e37495da1b0af8010aae33"
+        },
+        "date": 1786541835219,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 478,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 137,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 34806,
+            "range": "± 191",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 248040,
+            "range": "± 2395",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 214226,
+            "range": "± 2893",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 199369,
+            "range": "± 1145",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 24769,
+            "range": "± 122",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 68,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 87,
+            "range": "± 0",
             "unit": "ns/iter"
           }
         ]
