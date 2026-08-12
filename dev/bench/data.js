@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786538032994,
+  "lastUpdate": 1786538072626,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -701,6 +701,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 91,
             "range": "± 1",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bf14ac2404e6712ac24eb08419e7ec14a21f2b0f",
+          "message": "Merge PR #161: DB-C staged rollout and cutover gating\n\nDB-C: v2 staged rollout runbook and non-telemetry cutover gating",
+          "timestamp": "2026-08-12T18:01:25+05:30",
+          "tree_id": "77902699c40d3ff6f19e62667c2f36d48f959db1",
+          "url": "https://github.com/sheeki03/tirith/commit/bf14ac2404e6712ac24eb08419e7ec14a21f2b0f"
+        },
+        "date": 1786538072059,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 476,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 134,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 34626,
+            "range": "± 314",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 248179,
+            "range": "± 4377",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 213608,
+            "range": "± 7873",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 199811,
+            "range": "± 7539",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 24532,
+            "range": "± 873",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 69,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 88,
+            "range": "± 0",
             "unit": "ns/iter"
           }
         ]
