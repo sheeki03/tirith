@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786535697382,
+  "lastUpdate": 1786535776556,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -545,6 +545,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 93,
             "range": "± 1",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "52511f5619f57f06efcdb0f4d1b5d6fa358cf030",
+          "message": "Merge pull request #159 from sheeki03/security/b8-product-wiring-artifact-set\n\nB8: wire artifact inspection into scan and package inspect, with artifact-set cross-distribution correlation",
+          "timestamp": "2026-08-12T17:23:01+05:30",
+          "tree_id": "4986907b986f5376fde20746b7580ab5018782f8",
+          "url": "https://github.com/sheeki03/tirith/commit/52511f5619f57f06efcdb0f4d1b5d6fa358cf030"
+        },
+        "date": 1786535775514,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 249,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 88,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 15029,
+            "range": "± 439",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 149858,
+            "range": "± 6666",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 127778,
+            "range": "± 4495",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 119111,
+            "range": "± 4768",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 18915,
+            "range": "± 753",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 68,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 80,
+            "range": "± 5",
             "unit": "ns/iter"
           }
         ]
