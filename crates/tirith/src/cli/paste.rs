@@ -452,7 +452,7 @@ mod tests {
             &format!("https://mainnet.infura.io/v3/{token}?key=also-secret#fragment"),
             &dlp(&[]),
         );
-        assert_eq!(value, "https://mainnet.infura.io/v3");
+        assert_eq!(value, "https://infura.io/v3");
         assert!(!value.contains(token));
     }
 }

@@ -302,8 +302,8 @@ impl CompiledConfig {
     ) -> Result<Self, String> {
         let mut guarded = Vec::new();
         for tool in config.guarded_tools {
-            let regex = Regex::new(&tool.pattern)
-                .map_err(|e| format!("invalid regex '{}': {e}", tool.pattern))?;
+            let regex =
+                Regex::new(&tool.pattern).map_err(|_| "invalid guarded-tool regex".to_string())?;
             for path in &tool.command_paths {
                 validate_json_pointer(path)?;
             }
@@ -408,27 +408,105 @@ fn resolve_json_pointer<'a>(value: &'a Value, pointer: &str) -> Option<&'a Value
 
 /// Audit log: one JSON line per event, written to stderr.
 #[derive(Serialize)]
-struct AuditEntry<'a> {
+struct AuditEntry {
     ts: String,
-    decision: &'a str,
-    action_taken: &'a str,
-    rule_ids: &'a [String],
+    decision: String,
+    action_taken: String,
+    rule_ids: Vec<String>,
     findings_count: usize,
-    highest_severity: &'a str,
-    tool_name: &'a str,
-    command_hash_prefix: &'a str,
+    highest_severity: String,
+    tool_name: String,
+    command_hash_prefix: String,
     elapsed_ms: f64,
     fail_mode_triggered: bool,
     timeout_triggered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    raw_decision: Option<&'a str>,
+    raw_decision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    raw_rule_ids: Option<&'a [String]>,
+    raw_rule_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<&'a str>,
+    session_id: Option<String>,
     /// M4 item 8 ch3 — every gateway audit line carries `agent_origin: gateway`
     /// (the serialized struct previously lacked the field that the verdict had).
     agent_origin: tirith_core::agent_origin::AgentOrigin,
+}
+
+fn privacy_project_gateway_audit_text(value: &str) -> String {
+    // Gateway audit JSON is a public/stderr durability boundary, not an
+    // authorization identity. Use the same conservative projection as blocked
+    // output so free-form tool/session/rule labels cannot carry secrets or
+    // Tirith canaries into logs.
+    let share_safe = tirith_core::redact::redact_for_audience(
+        value,
+        tirith_core::redact::ShareAudience::PublicPaste,
+    )
+    .redacted_content;
+    tirith_core::redact::redact_blocked_output(&share_safe)
+}
+
+fn privacy_project_gateway_audit_json(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = privacy_project_gateway_audit_text(text),
+        Value::Array(values) => {
+            for value in values {
+                privacy_project_gateway_audit_json(value);
+            }
+        }
+        Value::Object(values) => {
+            // Audit object keys are fixed schema labels at every caller. Project
+            // all values recursively so nested tool/rule/error metadata cannot
+            // bypass the free-form boundary.
+            for value in values.values_mut() {
+                privacy_project_gateway_audit_json(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn write_gateway_audit_json(mut entry: Value) {
+    privacy_project_gateway_audit_json(&mut entry);
+    if let Ok(json) = serde_json::to_string(&entry) {
+        eprintln!("{json}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn projected_gateway_audit_entry(
+    decision: &str,
+    action_taken: &str,
+    rule_ids: &[String],
+    highest_severity: Option<&str>,
+    tool_name: &str,
+    cmd_hash: &str,
+    elapsed_ms: f64,
+    fail_mode_triggered: bool,
+    timeout_triggered: bool,
+    raw_decision: Option<&str>,
+    raw_rule_ids: Option<&[String]>,
+    session_id: Option<&str>,
+) -> AuditEntry {
+    let project = privacy_project_gateway_audit_text;
+    AuditEntry {
+        ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        decision: project(decision),
+        action_taken: project(action_taken),
+        rule_ids: rule_ids.iter().map(|value| project(value)).collect(),
+        findings_count: rule_ids.len(),
+        highest_severity: project(highest_severity.unwrap_or("NONE")),
+        tool_name: project(tool_name),
+        command_hash_prefix: project(cmd_hash),
+        elapsed_ms,
+        fail_mode_triggered,
+        timeout_triggered,
+        raw_decision: raw_decision.map(project),
+        raw_rule_ids: raw_rule_ids
+            .map(|values| values.iter().map(|value| project(value)).collect()),
+        session_id: session_id.map(project),
+        // The gateway is the only call site, so stamping here (vs threading the
+        // verdict's origin) guarantees no gateway line ships without attribution.
+        agent_origin: tirith_core::agent_origin::AgentOrigin::Gateway,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -474,25 +552,20 @@ fn write_audit_with_raw(
     raw_rule_ids: Option<&[String]>,
     session_id: Option<&str>,
 ) {
-    let entry = AuditEntry {
-        ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    let entry = projected_gateway_audit_entry(
         decision,
         action_taken,
         rule_ids,
-        findings_count: rule_ids.len(),
-        highest_severity: highest_severity.unwrap_or("NONE"),
+        highest_severity,
         tool_name,
-        command_hash_prefix: cmd_hash,
+        cmd_hash,
         elapsed_ms,
         fail_mode_triggered,
         timeout_triggered,
         raw_decision,
         raw_rule_ids,
         session_id,
-        // The gateway is the only call site, so stamping here (vs threading the
-        // verdict's origin) guarantees no gateway line ships without attribution.
-        agent_origin: tirith_core::agent_origin::AgentOrigin::Gateway,
-    };
+    );
     match serde_json::to_string(&entry) {
         Ok(json) => eprintln!("{json}"),
         Err(e) => eprintln!(
@@ -504,7 +577,13 @@ fn write_audit_with_raw(
 
 fn cmd_hash_prefix(cmd: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(cmd.as_bytes()))
+    // This prefix is emitted on a durable/stderr audit boundary. Hash the same
+    // conservative mandatory projection used for blocked public output so a
+    // contextual credential or bare valid secp256k1 scalar cannot become a
+    // guessable raw-command hash oracle. Exact execution authorization uses the
+    // separate token-keyed receipt binding, never this observability prefix.
+    let projected = tirith_core::redact::redact_blocked_output(cmd);
+    format!("{:x}", Sha256::digest(projected.as_bytes()))
         .chars()
         .take(8)
         .collect()
@@ -1265,8 +1344,10 @@ impl ToolSchemaCache {
                     content::SchemaValidator::compile(schema).map(|_| ())
                 {
                     tool_suspended = true;
+                    let displayed_name = privacy_project_gateway_audit_text(name);
+                    let why = privacy_project_gateway_audit_text(&why);
                     eprintln!(
-                        "tirith gateway: suspending tool {name:?}: declared schema does not \
+                        "tirith gateway: suspending tool {displayed_name:?}: declared schema does not \
                          compile ({why}); held out of tools/list pending a valid schema"
                     );
                     break;
@@ -1411,6 +1492,8 @@ fn check_request_input_schema(
             // A declared schema that fails to compile at call time: suspend (this
             // mirrors the populate-time suspension; reaching here means the schema
             // was not compile-checked at populate, e.g. an out-of-band cache).
+            let tool_name = privacy_project_gateway_audit_text(tool_name);
+            let why = privacy_project_gateway_audit_text(&why);
             eprintln!("tirith gateway: tool {tool_name:?} inputSchema does not compile: {why}");
             InputSchemaCheck::Suspended
         }
@@ -2272,21 +2355,23 @@ pub fn run_gateway_with_options(
     let descriptor_lock: Arc<Option<tirith_core::mcp_lock::GatewayDescriptorBaseline>> = {
         if let Some(b) = &descriptor_baseline {
             if filter_output {
+                let server_label = privacy_project_gateway_audit_text(&b.server_label);
                 eprintln!(
                     "tirith gateway: descriptor lock active for {:?} ({} tool(s) baselined); \
                      live tools/list drift will suspend new or changed tools pending re-approval",
-                    b.server_label,
+                    server_label,
                     b.descriptors.len()
                 );
             } else {
                 // CR2, do not claim drift is enforced when it is not: the whole
                 // drift path is gated on `filter_output`, so a baseline without it
                 // never suspends anything.
+                let server_label = privacy_project_gateway_audit_text(&b.server_label);
                 eprintln!(
                     "tirith gateway: descriptor lock present for {:?} but --filter-output is \
                      off, so live drift will NOT be enforced (enable it, or use the secure \
                      profile, to suspend changed/new tools)",
-                    b.server_label
+                    server_label
                 );
             }
         }
@@ -2843,15 +2928,16 @@ fn reject_stale_tool_permit_id(
 ) {
     let tool_name = permit.map_or("<unknown>", |permit| permit.tool_name.as_str());
     write_schema_audit("input_schema", "block", tool_name, reason);
+    let displayed_tool_name = privacy_project_gateway_audit_text(tool_name);
     eprintln!(
-        "tirith gateway: refusing tool call for {tool_name:?}: its validated tool contract changed before the upstream write"
+        "tirith gateway: refusing tool call for {displayed_tool_name:?}: its validated tool contract changed before the upstream write"
     );
     if let Some(id @ (Value::String(_) | Value::Number(_) | Value::Null)) = id {
         let _ = output_tx.send(
             build_schema_block(
                 id.clone(),
                 &format!(
-                    "Tirith: tool {tool_name:?} changed after validation; retry against the current tools/list"
+                    "Tirith: tool {displayed_tool_name:?} changed after validation; retry against the current tools/list"
                 ),
                 reason,
             )
@@ -2948,6 +3034,7 @@ fn check_tools_call_input_schema(obj: &Value, schema_cache: &Mutex<ToolSchemaCac
             "tools_call_invalid_name",
         );
     };
+    let displayed_tool_name = privacy_project_gateway_audit_text(tool_name);
 
     match check_request_input_schema(schema_cache, tool_name, params) {
         InputSchemaCheck::Ok(permit) => SchemaGate::Forward(Some(permit)),
@@ -2963,7 +3050,7 @@ fn check_tools_call_input_schema(obj: &Value, schema_cache: &Mutex<ToolSchemaCac
                     build_schema_block(
                         id,
                         &format!(
-                            "Tirith: tool {tool_name:?} is not present in both the approved \
+                            "Tirith: tool {displayed_tool_name:?} is not present in both the approved \
                              descriptor baseline and the current validated tools/list"
                         ),
                         "descriptor_not_approved_and_live",
@@ -2973,7 +3060,7 @@ fn check_tools_call_input_schema(obj: &Value, schema_cache: &Mutex<ToolSchemaCac
                 None => {
                     eprintln!(
                         "tirith gateway: dropping no-id tools/call to unapproved or non-live \
-                         tool {tool_name:?}"
+                         tool {displayed_tool_name:?}"
                     );
                     SchemaGate::Drop
                 }
@@ -2986,7 +3073,7 @@ fn check_tools_call_input_schema(obj: &Value, schema_cache: &Mutex<ToolSchemaCac
                     build_schema_block(
                         id,
                         &format!(
-                            "Tirith: tool {tool_name:?} is suspended (its declared schema does \
+                            "Tirith: tool {displayed_tool_name:?} is suspended (its declared schema does \
                              not compile); re-approve the server after fixing the schema"
                         ),
                         "tool_suspended",
@@ -2997,7 +3084,7 @@ fn check_tools_call_input_schema(obj: &Value, schema_cache: &Mutex<ToolSchemaCac
                 // suspended tool.
                 None => {
                     eprintln!(
-                        "tirith gateway: dropping no-id tools/call to suspended tool {tool_name:?}"
+                        "tirith gateway: dropping no-id tools/call to suspended tool {displayed_tool_name:?}"
                     );
                     SchemaGate::Drop
                 }
@@ -3006,14 +3093,17 @@ fn check_tools_call_input_schema(obj: &Value, schema_cache: &Mutex<ToolSchemaCac
         InputSchemaCheck::Invalid(why) => {
             // The validator's reason is logged (secret-free) but not echoed to the
             // client beyond the generic message.
-            eprintln!("tirith gateway: tool {tool_name:?} inputSchema instance invalid: {why}");
+            let why = privacy_project_gateway_audit_text(&why);
+            eprintln!(
+                "tirith gateway: tool {displayed_tool_name:?} inputSchema instance invalid: {why}"
+            );
             write_schema_audit("input_schema", "block", tool_name, "instance_invalid");
             match id {
                 Some(id) => SchemaGate::Reply(
                     build_schema_block(
                         id,
                         &format!(
-                            "Tirith: tool {tool_name:?} call arguments violate its inputSchema"
+                            "Tirith: tool {displayed_tool_name:?} call arguments violate its inputSchema"
                         ),
                         "input_schema_invalid",
                     )
@@ -3024,7 +3114,7 @@ fn check_tools_call_input_schema(obj: &Value, schema_cache: &Mutex<ToolSchemaCac
                 None => {
                     eprintln!(
                         "tirith gateway: dropping no-id tools/call with invalid args for \
-                         {tool_name:?}"
+                         {displayed_tool_name:?}"
                     );
                     SchemaGate::Drop
                 }
@@ -3663,9 +3753,9 @@ fn build_deny_response(
         .iter()
         .map(|f| {
             serde_json::json!({
-                "rule_id": f.rule_id.to_string(),
+                "rule_id": privacy_project_gateway_audit_text(&f.rule_id.to_string()),
                 "severity": f.severity.to_string(),
-                "title": &f.title,
+                "title": privacy_project_gateway_audit_text(&f.title),
             })
         })
         .collect();
@@ -3679,7 +3769,14 @@ fn build_deny_response(
     let text = verdict
         .findings
         .iter()
-        .map(|f| format!("[{}] {}: {}", f.severity, f.rule_id, f.title))
+        .map(|f| {
+            format!(
+                "[{}] {}: {}",
+                f.severity,
+                privacy_project_gateway_audit_text(&f.rule_id.to_string()),
+                privacy_project_gateway_audit_text(&f.title)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -4048,9 +4145,7 @@ fn write_server_message_audit(decision: &str, kind: &str, rule_ids: &[String], r
         "rule_ids": rule_ids,
         "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
     });
-    if let Ok(json) = serde_json::to_string(&entry) {
-        eprintln!("{json}");
-    }
+    write_gateway_audit_json(entry);
 }
 
 /// C1 — does this client->upstream message look like a *request* (`method` +
@@ -4382,10 +4477,12 @@ fn handle_upstream_response(
                 if filter_output {
                     if let Some(contract) = m.payload.tool_contract.as_ref() {
                         let tool_name = contract.tool_name.as_str();
+                        let displayed_tool_name = privacy_project_gateway_audit_text(tool_name);
                         if let Some(result) = parsed.get("result") {
                             if let Some(why) = check_response_output_schema(contract, result) {
+                                let why = privacy_project_gateway_audit_text(&why);
                                 eprintln!(
-                                    "tirith gateway: tool {tool_name:?} structuredContent violates \
+                                    "tirith gateway: tool {displayed_tool_name:?} structuredContent violates \
                                      outputSchema: {why}"
                                 );
                                 write_schema_audit(
@@ -4398,7 +4495,7 @@ fn handle_upstream_response(
                                     build_schema_block(
                                         resp_id.clone(),
                                         &format!(
-                                            "Tirith: tool {tool_name:?} structured output violates \
+                                            "Tirith: tool {displayed_tool_name:?} structured output violates \
                                              its outputSchema"
                                         ),
                                         "output_schema_invalid",
@@ -4437,12 +4534,13 @@ fn handle_upstream_response(
                         // final transformation gate.
                         if let Some(contract) = m.payload.tool_contract.as_ref() {
                             let tool_name = contract.tool_name.as_str();
+                            let displayed_tool_name = privacy_project_gateway_audit_text(tool_name);
                             let filtered_value: Value = match serde_json::from_slice(&filtered) {
                                 Ok(value) => value,
                                 Err(e) => {
                                     eprintln!(
                                         "tirith gateway: filtered response for tool \
-                                             {tool_name:?} could not be reparsed: {e}"
+                                             {displayed_tool_name:?} could not be reparsed: {e}"
                                     );
                                     write_schema_audit(
                                         "output_schema",
@@ -4455,7 +4553,7 @@ fn handle_upstream_response(
                                             resp_id.clone(),
                                             &format!(
                                                 "Tirith: filtered output for tool \
-                                                     {tool_name:?} could not be validated"
+                                                     {displayed_tool_name:?} could not be validated"
                                             ),
                                             "output_schema_invalid_after_sanitization",
                                         )
@@ -4465,9 +4563,10 @@ fn handle_upstream_response(
                             };
                             if let Some(result) = filtered_value.get("result") {
                                 if let Some(why) = check_response_output_schema(contract, result) {
+                                    let why = privacy_project_gateway_audit_text(&why);
                                     eprintln!(
                                         "tirith gateway: sanitized output for tool \
-                                             {tool_name:?} violates outputSchema: {why}"
+                                             {displayed_tool_name:?} violates outputSchema: {why}"
                                     );
                                     write_schema_audit(
                                         "output_schema",
@@ -4480,7 +4579,7 @@ fn handle_upstream_response(
                                             resp_id.clone(),
                                             &format!(
                                                 "Tirith: sanitized output for tool \
-                                                     {tool_name:?} violates its outputSchema"
+                                                     {displayed_tool_name:?} violates its outputSchema"
                                             ),
                                             "output_schema_invalid_after_sanitization",
                                         )
@@ -4558,9 +4657,7 @@ fn write_pending_lifecycle_audit(event: &str, count: usize) {
         "count": count,
         "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
     });
-    if let Ok(json) = serde_json::to_string(&entry) {
-        eprintln!("{json}");
-    }
+    write_gateway_audit_json(entry);
 }
 
 /// C1 — local error returned to the client when a guarded request reuses an id
@@ -4605,10 +4702,12 @@ fn build_duplicate_request_id_response(
 /// structured output), keyed to the same request id. `reason_code` is a stable,
 /// secret-free code for `structuredContent`.
 fn build_schema_block(id: Value, message: &str, reason_code: &str) -> String {
+    let message = privacy_project_gateway_audit_text(message);
+    let reason_code = privacy_project_gateway_audit_text(reason_code);
     let result = ToolCallResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
-            text: message.to_string(),
+            text: message,
         }],
         is_error: true,
         structured_content: Some(serde_json::json!({
@@ -4636,9 +4735,7 @@ fn write_schema_audit(direction: &str, decision: &str, tool_name: &str, reason: 
         "reason": reason,
         "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
     });
-    if let Ok(json) = serde_json::to_string(&entry) {
-        eprintln!("{json}");
-    }
+    write_gateway_audit_json(entry);
 }
 
 /// Parse `parsed["result"]` as a `ToolCallResult`, filter it, and re-serialize.
@@ -4702,9 +4799,7 @@ fn apply_output_filter_to_response(
                 "fail_mode_triggered": fail_mode_closed,
                 "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
             });
-            if let Ok(json) = serde_json::to_string(&entry) {
-                eprintln!("{json}");
-            }
+            write_gateway_audit_json(entry);
             if fail_mode_closed {
                 let event_id = uuid::Uuid::new_v4().to_string();
                 let new_result = serde_json::json!({
@@ -5185,9 +5280,7 @@ fn write_descriptor_drift_audit(
     rule_ids: &[String],
 ) {
     let entry = build_descriptor_drift_audit(server_label, changes, suspended, rule_ids);
-    if let Ok(json) = serde_json::to_string(&entry) {
-        eprintln!("{json}");
-    }
+    write_gateway_audit_json(entry);
 }
 
 fn persist_descriptor_approval(
@@ -5312,9 +5405,7 @@ fn write_descriptor_approval_audit(decision: &str, descriptor_count: usize) {
         "highest_severity": if decision == "block" { "HIGH" } else { "INFO" },
         "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
     });
-    if let Ok(json) = serde_json::to_string(&entry) {
-        eprintln!("{json}");
-    }
+    write_gateway_audit_json(entry);
 }
 
 /// IM2, one JSONL audit line for a PRESENT-but-unloadable committed MCP lock at
@@ -5350,9 +5441,7 @@ fn write_descriptor_lock_load_error_audit(
         "highest_severity": "HIGH",
         "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
     });
-    if let Ok(json) = serde_json::to_string(&entry) {
-        eprintln!("{json}");
-    }
+    write_gateway_audit_json(entry);
 }
 
 /// TG6, the pure builder behind [`write_descriptor_drift_audit`], split out so a
@@ -5374,7 +5463,7 @@ fn build_descriptor_drift_audit(
             tirith_core::mcp_lock::McpDescriptorChange::ToolChanged { .. } => changed += 1,
         }
     }
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "kind": "gateway_descriptor_drift",
         "surface": "tools/list",
@@ -5387,7 +5476,9 @@ fn build_descriptor_drift_audit(
         "rule_ids": rule_ids,
         "highest_severity": "HIGH",
         "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
-    })
+    });
+    privacy_project_gateway_audit_json(&mut entry);
+    entry
 }
 
 /// C4 — build a JSON-RPC error envelope (keyed to the same id) replacing a blocked
@@ -5398,8 +5489,18 @@ fn build_response_inspect_block(id: Value, kind: ResponseKind, outcome: &Inspect
     let violations: Vec<Value> = outcome
         .violations
         .iter()
-        .map(|v| serde_json::json!({ "code": v.code, "detail": v.detail }))
+        .map(|v| {
+            serde_json::json!({
+                "code": privacy_project_gateway_audit_text(v.code),
+                "detail": privacy_project_gateway_audit_text(&v.detail),
+            })
+        })
         .collect();
+    let rule_ids = outcome
+        .rule_ids()
+        .into_iter()
+        .map(|rule| privacy_project_gateway_audit_text(&rule))
+        .collect::<Vec<_>>();
     let resp = JsonRpcResponse::err(
         id,
         JsonRpcError {
@@ -5412,7 +5513,7 @@ fn build_response_inspect_block(id: Value, kind: ResponseKind, outcome: &Inspect
                 "_tirith_schema": 1,
                 "decision": "block",
                 "surface": kind.label(),
-                "rule_ids": outcome.rule_ids(),
+                "rule_ids": rule_ids,
                 "violations": violations,
             })),
         },
@@ -5436,9 +5537,7 @@ fn write_response_inspect_audit(
         "violations": violation_codes,
         "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
     });
-    if let Ok(json) = serde_json::to_string(&entry) {
-        eprintln!("{json}");
-    }
+    write_gateway_audit_json(entry);
 }
 
 /// Run the output filter over a typed tool result and re-emit a `result` Value
@@ -5861,9 +5960,7 @@ fn write_filter_audit_line(outcome: &FilterOutcome) {
         "fail_mode_triggered": outcome.fail_mode_triggered,
         "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
     });
-    if let Ok(json) = serde_json::to_string(&entry) {
-        eprintln!("{json}");
-    }
+    write_gateway_audit_json(entry);
 }
 
 /// Prepend warn findings to `result.content`. Operates on `serde_json::Value`
@@ -5881,7 +5978,14 @@ fn build_warn_augmented_response(mut parsed: Value, findings: &[Finding]) -> Opt
 
     let warning_lines: Vec<String> = findings
         .iter()
-        .map(|f| format!("  [{}] {}: {}", f.severity, f.rule_id, f.title))
+        .map(|f| {
+            format!(
+                "  [{}] {}: {}",
+                f.severity,
+                privacy_project_gateway_audit_text(&f.rule_id.to_string()),
+                privacy_project_gateway_audit_text(&f.title)
+            )
+        })
         .collect();
     let warning_text = format!(
         "\u{26a0} Tirith warnings (non-blocking):\n{}",
@@ -6967,13 +7071,13 @@ policy:
     fn test_audit_entry_serializes_valid_json() {
         let entry = AuditEntry {
             ts: "2026-02-21T00:00:00.000Z".to_string(),
-            decision: "block",
-            action_taken: "denied",
-            rule_ids: &["CurlPipeShell".to_string()],
+            decision: "block".to_string(),
+            action_taken: "denied".to_string(),
+            rule_ids: vec!["CurlPipeShell".to_string()],
             findings_count: 1,
-            highest_severity: "HIGH",
-            tool_name: "Bash",
-            command_hash_prefix: "a1b2c3d4",
+            highest_severity: "HIGH".to_string(),
+            tool_name: "Bash".to_string(),
+            command_hash_prefix: "a1b2c3d4".to_string(),
             elapsed_ms: 2.3,
             fail_mode_triggered: false,
             timeout_triggered: false,
@@ -6996,13 +7100,13 @@ policy:
         // Verify that crafted tool names can't break JSON
         let entry = AuditEntry {
             ts: "2026-02-21T00:00:00.000Z".to_string(),
-            decision: "allow",
-            action_taken: "forwarded",
-            rule_ids: &[],
+            decision: "allow".to_string(),
+            action_taken: "forwarded".to_string(),
+            rule_ids: vec![],
             findings_count: 0,
-            highest_severity: "NONE",
-            tool_name: r#"Bash","injected":"true"#,
-            command_hash_prefix: "",
+            highest_severity: "NONE".to_string(),
+            tool_name: r#"Bash","injected":"true"#.to_string(),
+            command_hash_prefix: String::new(),
             elapsed_ms: 0.0,
             fail_mode_triggered: false,
             timeout_triggered: false,
@@ -7016,6 +7120,93 @@ policy:
         // The injected content should be inside the tool_name string, not a separate field
         assert!(parsed.get("injected").is_none());
         assert!(parsed["tool_name"].as_str().unwrap().contains("injected"));
+    }
+
+    #[test]
+    fn gateway_audit_projects_every_free_form_field_before_rendering() {
+        let canary = format!("ghp_canary_{}", "C".repeat(30));
+        let scalar = format!("{}1", "0".repeat(63));
+        let values = vec![canary.clone(), scalar.clone()];
+        let entry = projected_gateway_audit_entry(
+            &canary,
+            &scalar,
+            &values,
+            Some(&canary),
+            &canary,
+            &scalar,
+            1.0,
+            false,
+            false,
+            Some(&scalar),
+            Some(&values),
+            Some(&canary),
+        );
+        let json = serde_json::to_string(&entry).expect("projected gateway audit JSON");
+        assert!(!json.contains(&canary), "{json}");
+        assert!(!json.contains(&scalar), "{json}");
+        assert!(json.contains("REDACTED"), "{json}");
+    }
+
+    #[test]
+    fn alternate_gateway_audit_json_recursively_projects_nested_free_form_values() {
+        let canary = format!("ghp_canary_{}", "E".repeat(30));
+        let scalar = format!("{}1", "0".repeat(63));
+        let mut entry = serde_json::json!({
+            "kind": "gateway_test",
+            "server": canary,
+            "nested": [{ "reason": scalar }],
+        });
+        privacy_project_gateway_audit_json(&mut entry);
+        let json = serde_json::to_string(&entry).expect("projected alternate gateway audit JSON");
+        assert!(!json.contains(&canary), "{json}");
+        assert!(!json.contains(&scalar), "{json}");
+        assert!(json.contains("REDACTED"), "{json}");
+    }
+
+    #[test]
+    fn gateway_command_hash_prefix_is_not_a_secret_oracle() {
+        use sha2::{Digest, Sha256};
+
+        let first = format!("0x{}1", "0".repeat(63));
+        let second = format!("0x{}2", "0".repeat(63));
+        let contextual_first = format!("PRIVATE_KEY={first} cast block-number");
+        let contextual_second = format!("PRIVATE_KEY={second} cast block-number");
+        assert_eq!(
+            cmd_hash_prefix(&contextual_first),
+            cmd_hash_prefix(&contextual_second),
+            "changing only a contextual secret must not change the audit hash prefix"
+        );
+
+        let bare_first = format!("mystery-signer --material {first}");
+        let bare_second = format!("mystery-signer --material {second}");
+        assert_eq!(
+            cmd_hash_prefix(&bare_first),
+            cmd_hash_prefix(&bare_second),
+            "an unknown-signer bare scalar must not change the audit hash prefix"
+        );
+        let raw_prefix = format!("{:x}", Sha256::digest(bare_first.as_bytes()))
+            .chars()
+            .take(8)
+            .collect::<String>();
+        assert_ne!(
+            cmd_hash_prefix(&bare_first),
+            raw_prefix,
+            "gateway audit retained the raw-command digest prefix"
+        );
+
+        assert_ne!(
+            cmd_hash_prefix("printf alpha"),
+            cmd_hash_prefix("printf beta"),
+            "benign command differences must remain identity-bearing"
+        );
+
+        let canary_first = format!("run ghp_canary_{}", "A".repeat(30));
+        let canary_second = format!("run ghp_canary_{}", "B".repeat(30));
+        assert_eq!(
+            cmd_hash_prefix(&canary_first),
+            cmd_hash_prefix(&canary_second),
+            "a Tirith canary must not become a durable gateway hash oracle"
+        );
     }
 
     #[test]
@@ -7427,6 +7618,33 @@ policy:
         assert!(!text.contains("CurlPipeShell"));
     }
 
+    #[test]
+    fn deny_response_projects_finding_titles_before_rendering() {
+        use tirith_core::verdict::{Finding, RuleId, Severity, Timings, Verdict};
+
+        let secret = format!("ghp_{}", "D".repeat(36));
+        let mut verdict = Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::CustomRuleMatch,
+                severity: Severity::High,
+                title: format!("blocked {secret} from /Users/alice/private"),
+                description: secret.clone(),
+                evidence: vec![],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: Some(format!("rule-{secret}")),
+            }],
+            3,
+            Timings::default(),
+        );
+        verdict.action = Action::Block;
+        let response = build_deny_response(Value::from(1), &verdict, 1.0);
+        assert!(!response.contains(&secret), "{response}");
+        assert!(!response.contains("/Users/alice"), "{response}");
+        assert!(response.contains("REDACTED"), "{response}");
+    }
+
     fn test_finding(
         rule_id: tirith_core::verdict::RuleId,
         severity: tirith_core::verdict::Severity,
@@ -7494,6 +7712,27 @@ policy:
         assert!(warning_text.contains("Plain HTTP URL"));
 
         assert_eq!(content[1]["text"], "original tool output");
+    }
+
+    #[test]
+    fn warn_augmented_response_projects_untrusted_finding_title() {
+        use tirith_core::verdict::{RuleId, Severity};
+
+        let secret = format!("ghp_{}", "N".repeat(36));
+        let upstream = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "content": [{"type": "text", "text": "original"}] }
+        });
+        let findings = vec![test_finding(
+            RuleId::CustomRuleMatch,
+            Severity::Low,
+            &format!("warning {secret}"),
+        )];
+        let augmented = build_warn_augmented_response(upstream, &findings).unwrap();
+        let rendered = String::from_utf8(augmented).unwrap();
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
     }
 
     #[test]
@@ -8442,6 +8681,23 @@ policy:
             bv["result"]["structuredContent"]["reason"],
             "tool_suspended"
         );
+    }
+
+    #[test]
+    fn response_inspect_block_projects_violation_details() {
+        let secret = format!("ghp_{}", "X".repeat(36));
+        let outcome = InspectOutcome {
+            action: Action::Block,
+            findings: vec![],
+            violations: vec![ResponseViolation {
+                code: "resource_link_ssrf",
+                detail: format!("private target 10.0.0.5/{secret}"),
+            }],
+        };
+        let response =
+            build_response_inspect_block(Value::from(1), ResponseKind::ResourcesRead, &outcome);
+        assert!(!response.contains(&secret), "{response}");
+        assert!(response.contains("REDACTED"), "{response}");
     }
 
     #[test]
@@ -9412,6 +9668,29 @@ policy:
         let v: Value = serde_json::from_slice(&block).unwrap();
         assert_eq!(v["result"]["isError"], true);
         assert_eq!(v["result"]["structuredContent"]["reason"], "tool_suspended");
+    }
+
+    #[test]
+    fn schema_block_projects_attacker_controlled_tool_name() {
+        let secret = format!("ghp_{}", "T".repeat(36));
+        let tool_name = format!("tool-{secret}");
+        let cache = Mutex::new(ToolSchemaCache::new());
+        cache.lock().unwrap().tools.insert(
+            tool_name.clone(),
+            ToolSchemaEntry {
+                input_schema: Some(serde_json::json!({"type": 123})),
+                output_schema: None,
+                suspended: true,
+            },
+        );
+        let call = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": tool_name, "arguments": {} }
+        });
+        let block = gate_reply(check_tools_call_input_schema(&call, &cache));
+        let rendered = String::from_utf8(block).unwrap();
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
     }
 
     #[test]

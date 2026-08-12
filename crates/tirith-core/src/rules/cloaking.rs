@@ -602,7 +602,14 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         match check("http://localhost/") {
             Ok(_) => panic!("expected localhost target to be rejected"),
-            Err(err) => assert!(err.contains("localhost")),
+            Err(err) => assert!(
+                matches!(
+                    err.as_str(),
+                    "refusing to connect to localhost destination"
+                        | "refusing to connect to non-public address"
+                ),
+                "unexpected categorical localhost rejection: {err}"
+            ),
         }
     }
 

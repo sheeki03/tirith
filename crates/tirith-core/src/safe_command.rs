@@ -21,7 +21,6 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
-use std::sync::LazyLock;
 
 use crate::engine::{self, AnalysisContext};
 use crate::extract::ScanContext;
@@ -47,27 +46,10 @@ pub struct SafeSuggestion {
     pub remediation: String,
 }
 
-/// Sensitive env-var names loaded from `sensitive_env.toml` (compiled in via
-/// `include_str!`), used by the env-scrub transform and the env-guard rule.
-static SENSITIVE_ENV_VARS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    #[derive(serde::Deserialize)]
-    struct SensitiveEnvFile {
-        sensitive: Vec<String>,
-    }
-    let toml_str = include_str!("../assets/data/sensitive_env.toml");
-    let parsed: SensitiveEnvFile = toml::from_str(toml_str).expect("invalid sensitive_env.toml");
-    // Leak each string for a `&'static str` — the list is tiny and read once.
-    parsed
-        .sensitive
-        .into_iter()
-        .map(|s| Box::leak(s.into_boxed_str()) as &'static str)
-        .collect()
-});
-
-/// Public accessor for the sensitive env-var list (shared with the env-guard
-/// rule so the asset file stays the single source of truth).
+/// Public compatibility accessor routed directly to the typed sensitive-asset
+/// registry. There is no second parsed/live environment catalog.
 pub fn sensitive_env_vars() -> &'static [&'static str] {
-    &SENSITIVE_ENV_VARS
+    crate::sensitive_assets::secret_env_names()
 }
 
 /// Build guidance-only safe-command suggestions in a default non-interactive

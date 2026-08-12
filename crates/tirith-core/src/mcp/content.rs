@@ -36,6 +36,7 @@
 
 use rust_mcp_schema::ContentBlock;
 use serde_json::Value;
+use std::fmt;
 
 /// One element of a `tools/call` result's `content` array: either a known,
 /// typed MCP content block, or an unknown block kept verbatim.
@@ -46,7 +47,7 @@ use serde_json::Value;
 /// block is re-serialized anyway, so boxing every block to satisfy the heuristic
 /// would add a heap allocation per content element for no real benefit.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum PreservedContent {
     /// A block this build models (text / image / audio / resource-link /
     /// embedded-resource), parsed into the canonical `rust-mcp-schema` type.
@@ -54,6 +55,21 @@ pub enum PreservedContent {
     /// A block this build does NOT model. The raw JSON value is kept verbatim so
     /// it can be forwarded unchanged (compat), never coerced, never dropped.
     Unknown(Value),
+}
+
+impl fmt::Debug for PreservedContent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Known(_) => formatter
+                .debug_struct("Known")
+                .field("payload", &"<inspected-content>")
+                .finish(),
+            Self::Unknown(_) => formatter
+                .debug_struct("Unknown")
+                .field("payload", &"<preserved-unmodeled-content>")
+                .finish(),
+        }
+    }
 }
 
 impl PreservedContent {
@@ -91,7 +107,7 @@ pub enum TypingMode {
 /// untouched `structuredContent`. `extra` keeps every top-level field the MCP
 /// `CallToolResult` shape does not name (e.g. `_meta`), so re-serialization is
 /// lossless for unmodeled siblings too.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TypedToolResult {
     /// The `content` array, each element typed or preserved.
     pub content: Vec<PreservedContent>,
@@ -103,6 +119,29 @@ pub struct TypedToolResult {
     pub extra: serde_json::Map<String, Value>,
 }
 
+impl fmt::Debug for TypedToolResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TypedToolResult")
+            .field("content_count", &self.content.len())
+            .field(
+                "unknown_content_count",
+                &self
+                    .content
+                    .iter()
+                    .filter(|block| block.is_unknown())
+                    .count(),
+            )
+            .field("is_error", &self.is_error)
+            .field(
+                "structured_content_present",
+                &self.structured_content.is_some(),
+            )
+            .field("extra_field_count", &self.extra.len())
+            .finish()
+    }
+}
+
 /// Why [`parse_tool_result`] could not type a `result`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentTypingError {
@@ -112,9 +151,11 @@ pub enum ContentTypingError {
     ContentNotArray,
     /// A `content` element was not a JSON object.
     ElementNotObject,
-    /// Strict mode: a `content` element did not map to a known block. Carries a
-    /// short reason (the serde error) for the audit line.
-    UnknownBlock(String),
+    /// Strict mode: a `content` element did not map to a known block. The raw
+    /// serde error is deliberately not retained because it may echo an
+    /// attacker-controlled discriminator or field value at a public error or
+    /// `Debug` boundary.
+    UnknownBlock,
 }
 
 impl std::fmt::Display for ContentTypingError {
@@ -125,8 +166,8 @@ impl std::fmt::Display for ContentTypingError {
             ContentTypingError::ElementNotObject => {
                 write!(f, "a result.content element is not an object")
             }
-            ContentTypingError::UnknownBlock(why) => {
-                write!(f, "unknown content block under strict mode: {why}")
+            ContentTypingError::UnknownBlock => {
+                write!(f, "unknown content block under strict mode")
             }
         }
     }
@@ -172,9 +213,9 @@ pub fn parse_tool_result(
                 }
                 match serde_json::from_value::<ContentBlock>(item.clone()) {
                     Ok(block) => content.push(PreservedContent::Known(block)),
-                    Err(e) => {
+                    Err(_) => {
                         if mode == TypingMode::Strict {
-                            return Err(ContentTypingError::UnknownBlock(e.to_string()));
+                            return Err(ContentTypingError::UnknownBlock);
                         }
                         content.push(PreservedContent::Unknown(item.clone()));
                     }
@@ -270,7 +311,7 @@ fn collect_block_strings(v: &Value, out: &mut Vec<String>) {
 // ── JSON Schema validation (inputSchema / outputSchema) ──────────────────────
 
 /// Why a JSON-schema validation failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SchemaError {
     /// The SERVER's declared schema did not compile (malformed, or it references
     /// a remote/file `$ref` we refuse to resolve). The caller must SUSPEND the
@@ -285,8 +326,27 @@ pub enum SchemaError {
 impl std::fmt::Display for SchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SchemaError::InvalidSchema(why) => write!(f, "invalid server schema: {why}"),
-            SchemaError::InstanceInvalid(why) => write!(f, "instance failed schema: {why}"),
+            SchemaError::InvalidSchema(why) => {
+                write!(f, "invalid server schema: {}", schema_trait_detail(why))
+            }
+            SchemaError::InstanceInvalid(why) => {
+                write!(f, "instance failed schema: {}", schema_trait_detail(why))
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaError::InvalidSchema(why) => f
+                .debug_tuple("InvalidSchema")
+                .field(&schema_trait_detail(why))
+                .finish(),
+            SchemaError::InstanceInvalid(why) => f
+                .debug_tuple("InstanceInvalid")
+                .field(&schema_trait_detail(why))
+                .finish(),
         }
     }
 }
@@ -332,7 +392,10 @@ impl SchemaValidator {
             // by the engine choice, not a post-hoc check.
             .with_pattern_options(jsonschema::PatternOptions::regex())
             .build(schema)
-            .map_err(|e| SchemaError::InvalidSchema(e.to_string()))?;
+            // jsonschema's Display includes schema values and locations. The
+            // gateway only needs the typed disposition; keep the diagnostic
+            // categorical so a malicious descriptor cannot echo its bytes.
+            .map_err(|_| SchemaError::InvalidSchema("schema compilation failed".to_string()))?;
         Ok(Self { inner })
     }
 
@@ -341,7 +404,7 @@ impl SchemaValidator {
     pub fn validate(&self, instance: &Value) -> Result<(), SchemaError> {
         match self.inner.validate(instance) {
             Ok(()) => Ok(()),
-            Err(e) => Err(SchemaError::InstanceInvalid(e.to_string())),
+            Err(e) => Err(SchemaError::InstanceInvalid(schema_error_summary(&e))),
         }
     }
 
@@ -349,6 +412,39 @@ impl SchemaValidator {
     pub fn is_valid(&self, instance: &Value) -> bool {
         self.inner.is_valid(instance)
     }
+}
+
+const MAX_SCHEMA_DIAGNOSTIC_COMPONENT_BYTES: usize = 256;
+
+/// Return only the validation keyword and a bounded, privacy-projected JSON
+/// pointer. `ValidationError::Display` includes the rejected instance value,
+/// which may be a credential supplied in tool arguments or structured output.
+fn schema_error_summary(error: &jsonschema::ValidationError<'_>) -> String {
+    let keyword = bounded_schema_component(error.kind().keyword(), 64);
+    let pointer = bounded_schema_component(
+        error.instance_path().as_str(),
+        MAX_SCHEMA_DIAGNOSTIC_COMPONENT_BYTES,
+    );
+    let pointer = if pointer.is_empty() { "/" } else { &pointer };
+    format!("keyword={keyword}; instance_path={pointer}")
+}
+
+fn bounded_schema_component(value: &str, max_bytes: usize) -> String {
+    let share_safe =
+        crate::redact::redact_for_audience(value, crate::redact::ShareAudience::PublicPaste)
+            .redacted_content;
+    let projected = crate::redact::redact_blocked_output(&share_safe);
+    let sanitized = crate::mcp::output_filter::sanitize_for_display(&projected);
+    let truncated = crate::util::truncate_bytes(&sanitized, max_bytes);
+    if truncated.len() < sanitized.len() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn schema_trait_detail(value: &str) -> String {
+    bounded_schema_component(value, MAX_SCHEMA_DIAGNOSTIC_COMPONENT_BYTES)
 }
 
 /// Compile a tool's declared schema and validate `instance` against it in one
@@ -424,9 +520,74 @@ mod tests {
         let result = json!({ "content": [ weird ] });
         let err = parse_tool_result(&result, TypingMode::Strict).unwrap_err();
         assert!(
-            matches!(err, ContentTypingError::UnknownBlock(_)),
+            matches!(err, ContentTypingError::UnknownBlock),
             "strict mode must reject an unknown block; got {err:?}"
         );
+    }
+
+    #[test]
+    fn public_debug_never_exposes_known_unknown_structured_or_extra_payloads() {
+        let provider_secret = format!("https://eth-mainnet.g.alchemy.com/v2/{}", "A".repeat(48));
+        let contextual_secret = format!("PRIVATE_KEY=0x{}", "11".repeat(32));
+        let structured_canary = "C04_STRUCTURED_CONTENT_CANARY";
+        let extra_canary = "C04_EXTRA_FIELD_CANARY";
+        let result = json!({
+            "content": [
+                text_block(&contextual_secret),
+                {
+                    "type": "future_provider_block",
+                    "endpoint": provider_secret.clone(),
+                },
+            ],
+            "structuredContent": {
+                "credential": structured_canary,
+            },
+            "_meta": {
+                "authorization": extra_canary,
+            },
+        });
+        let typed = parse_tool_result(&result, TypingMode::Compat).unwrap();
+
+        let mut renderings = vec![format!("{typed:?}")];
+        renderings.extend(typed.content.iter().map(|block| format!("{block:?}")));
+        for rendering in renderings {
+            for canary in [
+                provider_secret.as_str(),
+                contextual_secret.as_str(),
+                structured_canary,
+                extra_canary,
+            ] {
+                assert!(!rendering.contains(canary), "{rendering}");
+            }
+        }
+        let summary = format!("{typed:?}");
+        assert!(summary.contains("content_count: 2"), "{summary}");
+        assert!(summary.contains("unknown_content_count: 1"), "{summary}");
+        assert!(
+            summary.contains("structured_content_present: true"),
+            "{summary}"
+        );
+        assert!(summary.contains("extra_field_count: 1"), "{summary}");
+
+        // Privacy-safe traits do not weaken the compat forwarding contract.
+        assert_eq!(typed.to_value(), result);
+    }
+
+    #[test]
+    fn strict_unknown_error_is_categorical_for_attacker_discriminators() {
+        let canary = format!("future_ghp_{}", "Q".repeat(36));
+        let result = json!({
+            "content": [{
+                "type": canary.clone(),
+                "providerCredential": format!("sk-ant-api03-{}", "R".repeat(32)),
+            }],
+        });
+        let error = parse_tool_result(&result, TypingMode::Strict).unwrap_err();
+        assert_eq!(error, ContentTypingError::UnknownBlock);
+        for rendering in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendering.contains(&canary), "{rendering}");
+            assert!(!rendering.contains("sk-ant-api03-"), "{rendering}");
+        }
     }
 
     #[test]
@@ -503,6 +664,60 @@ mod tests {
             matches!(err, SchemaError::InstanceInvalid(_)),
             "a bad instance is InstanceInvalid, got {err:?}"
         );
+    }
+
+    #[test]
+    fn instance_error_contains_only_keyword_and_projected_pointer() {
+        let secret = format!("ghp_{}", "V".repeat(36));
+        let property = format!("credential-{secret}");
+        let schema = json!({
+            "type": "object",
+            "properties": { (property.clone()): { "type": "number" } },
+        });
+        let bad = json!({ (property): secret.clone() });
+        let SchemaError::InstanceInvalid(detail) =
+            validate_against_schema(Some(&schema), &bad).unwrap_err()
+        else {
+            panic!("expected instance validation error");
+        };
+        assert!(detail.contains("keyword=type"), "{detail}");
+        assert!(detail.contains("instance_path=/"), "{detail}");
+        assert!(!detail.contains(&secret), "{detail}");
+        assert!(
+            !detail.contains('"'),
+            "raw JSON instance value leaked: {detail}"
+        );
+        assert!(detail.len() <= MAX_SCHEMA_DIAGNOSTIC_COMPONENT_BYTES + 96);
+    }
+
+    #[test]
+    fn benign_instance_pointer_remains_actionable() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "count": { "type": "number" } },
+        });
+        let SchemaError::InstanceInvalid(detail) =
+            validate_against_schema(Some(&schema), &json!({"count": "no"})).unwrap_err()
+        else {
+            panic!("expected instance validation error");
+        };
+        assert_eq!(detail, "keyword=type; instance_path=/count");
+    }
+
+    #[test]
+    fn directly_constructed_schema_error_traits_project_payloads() {
+        let secret = format!("ghp_{}", "Y".repeat(36));
+        let error = SchemaError::InstanceInvalid(format!(
+            "raw instance {secret} at /Users/alice/private/{secret}"
+        ));
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        for rendered in [&display, &debug] {
+            assert!(!rendered.contains(&secret), "{rendered}");
+            assert!(!rendered.contains("/Users/alice"), "{rendered}");
+            assert!(rendered.contains("REDACTED"), "{rendered}");
+            assert!(rendered.len() <= MAX_SCHEMA_DIAGNOSTIC_COMPONENT_BYTES + 64);
+        }
     }
 
     #[test]

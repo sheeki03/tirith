@@ -1,7 +1,6 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use crate::rules::shared::SENSITIVE_KEY_VARS;
 use crate::script_analysis::detect_interpreter;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -171,27 +170,22 @@ static PY_HTTP_CALL: Lazy<Regex> = Lazy::new(|| {
 
 /// Sensitive JS references: document.cookie or process.env.SENSITIVE_KEY
 static JS_SENSITIVE: Lazy<Regex> = Lazy::new(|| {
-    let keys: Vec<String> = SENSITIVE_KEY_VARS
-        .iter()
-        .map(|k| regex::escape(k))
-        .collect();
-    Regex::new(&format!(
-        r"(?:document\.cookie|process\.env\.(?:{}))",
-        keys.join("|")
-    ))
-    .unwrap()
+    let keys = crate::sensitive_assets::secret_env_regex_fragment();
+    regex::RegexBuilder::new(&format!(r"(?:document\.cookie|process\.env\.(?:{}))", keys))
+        .case_insensitive(true)
+        .build()
+        .unwrap()
 });
 
 /// Sensitive Python references: os.environ["SENSITIVE_KEY"] or open("/etc/passwd")
 static PY_SENSITIVE: Lazy<Regex> = Lazy::new(|| {
-    let keys: Vec<String> = SENSITIVE_KEY_VARS
-        .iter()
-        .map(|k| regex::escape(k))
-        .collect();
-    Regex::new(&format!(
+    let keys = crate::sensitive_assets::secret_env_regex_fragment();
+    regex::RegexBuilder::new(&format!(
         r#"(?:os\.environ\[["'](?:{})["']\]|open\s*\(\s*["']/etc/(?:passwd|shadow)["'][^)]*\))"#,
-        keys.join("|")
+        keys
     ))
+    .case_insensitive(true)
+    .build()
     .unwrap()
 });
 

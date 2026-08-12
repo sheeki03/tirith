@@ -6,12 +6,87 @@
 use crate::verdict::{RuleId, Severity};
 
 /// A single validation issue found in a policy file.
-#[derive(Debug, Clone, serde::Serialize)]
 pub struct PolicyIssue {
     pub level: IssueLevel,
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
+}
+
+const MAX_POLICY_ISSUE_TEXT_BYTES: usize = 2048;
+
+fn project_policy_issue_text(value: &str) -> String {
+    let share_safe =
+        crate::redact::redact_for_audience(value, crate::redact::ShareAudience::PublicPaste)
+            .redacted_content;
+    let projected = crate::redact::redact_blocked_output(&share_safe);
+    let display = crate::mcp::output_filter::sanitize_for_display(&projected)
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
+    let bounded = crate::util::truncate_bytes(&display, MAX_POLICY_ISSUE_TEXT_BYTES);
+    if bounded.len() < display.len() {
+        format!("{bounded}...")
+    } else {
+        bounded
+    }
+}
+
+impl PolicyIssue {
+    fn into_projected(self) -> Self {
+        Self {
+            level: self.level,
+            message: project_policy_issue_text(&self.message),
+            field: self.field.map(|field| project_policy_issue_text(&field)),
+        }
+    }
+
+    fn projected(&self) -> Self {
+        Self {
+            level: self.level,
+            message: project_policy_issue_text(&self.message),
+            field: self.field.as_deref().map(project_policy_issue_text),
+        }
+    }
+}
+
+impl Clone for PolicyIssue {
+    fn clone(&self) -> Self {
+        self.projected()
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PolicyIssueProjection {
+    level: IssueLevel,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
+}
+
+impl serde::Serialize for PolicyIssue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let safe = self.projected();
+        let projection = PolicyIssueProjection {
+            level: safe.level,
+            message: safe.message,
+            field: safe.field,
+        };
+        serde::Serialize::serialize(&projection, serializer)
+    }
+}
+
+impl std::fmt::Debug for PolicyIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let safe = self.projected();
+        f.debug_struct("PolicyIssue")
+            .field("level", &safe.level)
+            .field("message", &safe.message)
+            .field("field", &safe.field)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -41,8 +116,7 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
         match crate::policy::Policy::parse_document(yaml) {
             Ok(document) => document,
             Err(error) => {
-                issues.push(policy_document_error_issue(error));
-                return issues;
+                return vec![policy_document_error_issue(error).into_projected()];
             }
         };
 
@@ -63,6 +137,9 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     validate_schema_unknown_fields(&migrated, &mut issues);
 
     issues
+        .into_iter()
+        .map(PolicyIssue::into_projected)
+        .collect()
 }
 
 fn policy_document_error_issue(error: crate::policy::PolicyDocumentError) -> PolicyIssue {
@@ -799,6 +876,45 @@ fn validate_agent_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyI
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_projects_issue_messages_and_fields_before_return() {
+        let secret = format!("ghp_{}", "I".repeat(36));
+        let yaml = format!(
+            r#"
+custom_rules:
+  - id: "rule-{secret}"
+    pattern: "x"
+    when:
+      command.uses_sudo: true
+    context: [exec]
+    title: "invalid"
+"#
+        );
+        let issues = validate(&yaml);
+        let rendered = format!("{issues:?}");
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+        assert!(rendered.contains("custom_rules."), "{rendered}");
+        assert!(rendered.contains("has both"), "{rendered}");
+    }
+
+    #[test]
+    fn directly_constructed_policy_issue_traits_project_payloads() {
+        let secret = format!("ghp_{}", "J".repeat(36));
+        let issue = PolicyIssue {
+            level: IssueLevel::Error,
+            message: format!("bad {secret} from /Users/alice/private"),
+            field: Some(format!("custom_rules.{secret}.pattern")),
+        };
+        let debug = format!("{issue:?}");
+        let json = serde_json::to_string(&issue).unwrap();
+        for rendered in [&debug, &json] {
+            assert!(!rendered.contains(&secret), "{rendered}");
+            assert!(!rendered.contains("/Users/alice"), "{rendered}");
+            assert!(rendered.contains("REDACTED"), "{rendered}");
+        }
+    }
 
     #[test]
     fn package_day_zero_block_is_valid_and_meaningful() {

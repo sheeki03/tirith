@@ -1,11 +1,11 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-/// Credential redaction entry: `prefix_len` chars stay visible, rest → [REDACTED].
+/// Credential redaction entry. Public output never retains a secret-derived
+/// prefix; the label is fixed registry metadata.
 struct CredRedactEntry {
     label: String,
     regex: Regex,
-    prefix_len: usize,
 }
 
 /// Target audience for [`redact_for_audience`]. Controls WHAT is redacted on top
@@ -131,7 +131,6 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
     struct CredPat {
         id: String,
         regex: String,
-        redact_prefix_len: Option<usize>,
     }
     #[derive(serde::Deserialize)]
     struct PkPat {
@@ -151,7 +150,6 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
                 entries.push(CredRedactEntry {
                     label: p.id,
                     regex: re,
-                    prefix_len: p.redact_prefix_len.unwrap_or(4),
                 });
             }
         }
@@ -165,7 +163,6 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
                 entries.push(CredRedactEntry {
                     label: pk.id,
                     regex: re,
-                    prefix_len: 0,
                 });
             }
         }
@@ -287,47 +284,17 @@ pub fn looks_secret_shaped(s: &str) -> bool {
     false
 }
 
-#[derive(Default)]
-struct PrivateKeyRedactionCounts {
-    pem: usize,
-    pgp: usize,
-}
-
-/// Structurally redact every recognized PEM/PGP private-key block. Regex
-/// backreferences are unavailable, so a single expression cannot require an
-/// END label to equal its BEGIN label. Parse the label once and search for that
-/// exact footer; if it is absent, consume through end-of-input.
-fn redact_private_key_blocks(input: &str) -> (String, PrivateKeyRedactionCounts) {
-    let (spans, counts) = private_key_block_spans(input);
-    if spans.is_empty() {
-        return (input.to_string(), counts);
-    }
-
-    let mut output = String::with_capacity(input.len());
-    let mut copied_through = 0usize;
-    for span in spans {
-        output.push_str(&input[copied_through..span.start]);
-        output.push_str("[REDACTED]");
-        copied_through = span.end;
-    }
-    output.push_str(&input[copied_through..]);
-    (output, counts)
-}
-
 /// Byte ranges occupied by structurally recognized private-key blocks. This is
 /// crate-visible so consumers that must preserve original line identity can
 /// use the exact same BEGIN/END grammar instead of leaking multiline bodies by
 /// redacting each line independently.
 pub(crate) fn private_key_redaction_spans(input: &str) -> Vec<std::ops::Range<usize>> {
-    private_key_block_spans(input).0
+    private_key_block_spans(input)
 }
 
-fn private_key_block_spans(
-    input: &str,
-) -> (Vec<std::ops::Range<usize>>, PrivateKeyRedactionCounts) {
+fn private_key_block_spans(input: &str) -> Vec<std::ops::Range<usize>> {
     const BEGIN: &str = "-----BEGIN";
     let mut spans = Vec::new();
-    let mut counts = PrivateKeyRedactionCounts::default();
     let mut search_from = 0usize;
 
     while let Some(relative) = input[search_from..].find(BEGIN) {
@@ -362,15 +329,10 @@ fn private_key_block_spans(
         let block_end =
             find_matching_private_key_footer(input, header_end, label).unwrap_or(input.len());
         spans.push(start..block_end);
-        if is_pgp {
-            counts.pgp += 1;
-        } else {
-            counts.pem += 1;
-        }
         search_from = block_end;
     }
 
-    (spans, counts)
+    spans
 }
 
 fn find_matching_private_key_footer(
@@ -401,30 +363,15 @@ fn find_matching_private_key_footer(
 
 /// Redact sensitive content from a string using built-in and credential patterns.
 pub fn redact(input: &str) -> String {
-    let (mut result, _) = redact_private_key_blocks(input);
-    result = AUTHORIZATION_BEARER_PATTERN
-        .replace_all(&result, |captures: &regex::Captures| {
-            format!("{}[REDACTED:Bearer Token]", &captures[1])
-        })
-        .into_owned();
-    // Built-ins first (labeled replacements like `[REDACTED:Foo]`).
-    for (label, regex) in BUILTIN_PATTERNS.iter() {
-        result = regex
-            .replace_all(&result, format!("[REDACTED:{label}]"))
-            .into_owned();
-    }
-    // Credential patterns afterwards, preserving a short prefix.
-    for entry in CREDENTIAL_REDACT_PATTERNS.iter() {
-        result = entry
-            .regex
-            .replace_all(&result, |caps: &regex::Captures| {
-                let matched = &caps[0];
-                let prefix: String = matched.chars().take(entry.prefix_len).collect();
-                format!("{prefix}[REDACTED]")
-            })
-            .into_owned();
-    }
-    result
+    let mut spans = Vec::new();
+    let mut unused_label_order = Vec::new();
+    collect_base_redaction_spans(
+        input,
+        BaseRedactionMode::Generic,
+        &mut spans,
+        &mut unused_label_order,
+    );
+    render_redaction_spans(input, spans).0
 }
 
 /// M11 ch3 — the canary-detection scan driving
@@ -631,14 +578,323 @@ struct MatchInterval {
     end: usize,
 }
 
-/// Apply every regex to the SAME input, merge overlapping byte intervals, then
-/// render exactly once. Replacement text can therefore never become input to a
-/// later policy regex.
-fn apply_custom_patterns_once(
+#[derive(Debug, Clone, Copy)]
+enum BaseRedactionMode {
+    Generic,
+    Audience,
+    /// Mandatory security boundary used by streaming/MCP and public model
+    /// projections. Excludes non-secret privacy patterns such as email addresses.
+    SupportedSecrets,
+}
+
+#[derive(Debug, Clone)]
+struct RedactionSpan {
+    start: usize,
+    end: usize,
+    replacement: String,
+    priority: u16,
+    ordinal: usize,
+    report_label: Option<String>,
+}
+
+const PRIORITY_PRIVATE_KEY: u16 = 1_800;
+const PRIORITY_STRUCTURED_WALLET: u16 = 1_750;
+const PRIORITY_SHELL_ASSIGNMENT: u16 = 1_700;
+const PRIORITY_BEARER: u16 = 1_600;
+const PRIORITY_PRIMARY_PROVIDER: u16 = 1_500;
+const PRIORITY_SECONDARY_PROVIDER: u16 = 1_450;
+const PRIORITY_RPC_VALUE: u16 = 1_300;
+const PRIORITY_REGISTRY_VALUE: u16 = 1_200;
+const PRIORITY_SHARE_PATTERN: u16 = 800;
+const PRIORITY_PRIVATE_IPV4: u16 = 700;
+const PRIORITY_CUSTOM: u16 = 100;
+
+fn register_report_label(order: &mut Vec<String>, label: &str) {
+    if !order.iter().any(|known| known == label) {
+        order.push(label.to_string());
+    }
+}
+
+fn push_redaction_span(
+    spans: &mut Vec<RedactionSpan>,
+    start: usize,
+    end: usize,
+    replacement: String,
+    priority: u16,
+    report_label: Option<&str>,
+) {
+    debug_assert!(start <= end);
+    spans.push(RedactionSpan {
+        start,
+        end,
+        replacement,
+        priority,
+        ordinal: spans.len(),
+        report_label: report_label.map(str::to_string),
+    });
+}
+
+fn collect_base_redaction_spans(
+    input: &str,
+    mode: BaseRedactionMode,
+    spans: &mut Vec<RedactionSpan>,
+    report_order: &mut Vec<String>,
+) {
+    let report_counts = matches!(mode, BaseRedactionMode::Audience);
+    let (credential_priority, builtin_priority) = match mode {
+        BaseRedactionMode::Generic | BaseRedactionMode::SupportedSecrets => {
+            (PRIORITY_SECONDARY_PROVIDER, PRIORITY_PRIMARY_PROVIDER)
+        }
+        BaseRedactionMode::Audience => (PRIORITY_PRIMARY_PROVIDER, PRIORITY_SECONDARY_PROVIDER),
+    };
+
+    let private_key_spans = private_key_redaction_spans(input);
+    let mut saw_pem = false;
+    let mut saw_pgp = false;
+    for range in private_key_spans {
+        let is_pgp = input[range.clone()].starts_with("-----BEGIN PGP PRIVATE KEY BLOCK-----");
+        saw_pgp |= is_pgp;
+        saw_pem |= !is_pgp;
+        let label = if is_pgp {
+            "pgp_private_key"
+        } else {
+            "private_key"
+        };
+        push_redaction_span(
+            spans,
+            range.start,
+            range.end,
+            "[REDACTED]".to_string(),
+            PRIORITY_PRIVATE_KEY,
+            report_counts.then_some(label),
+        );
+    }
+    if report_counts {
+        if saw_pem {
+            register_report_label(report_order, "private_key");
+        }
+        if saw_pgp {
+            register_report_label(report_order, "pgp_private_key");
+        }
+    }
+
+    let mut bearer_matches = 0usize;
+    for captures in AUTHORIZATION_BEARER_PATTERN.captures_iter(input) {
+        let (Some(prefix), Some(whole)) = (captures.get(1), captures.get(0)) else {
+            continue;
+        };
+        push_redaction_span(
+            spans,
+            prefix.end(),
+            whole.end(),
+            "[REDACTED:Bearer Token]".to_string(),
+            PRIORITY_BEARER,
+            report_counts.then_some("bearer_token"),
+        );
+        bearer_matches += 1;
+    }
+    if report_counts && bearer_matches > 0 {
+        register_report_label(report_order, "bearer_token");
+    }
+
+    for entry in CREDENTIAL_REDACT_PATTERNS.iter() {
+        // The structural scanner above is authoritative for private-key blocks:
+        // it stops at an exact matching footer and fails closed to EOF only
+        // when that footer is absent. The registry's fallback regexes consume
+        // to EOF unconditionally and are retained for detection, but must not
+        // widen an already validated complete-block redaction span.
+        if matches!(entry.label.as_str(), "private_key" | "pgp_private_key") {
+            continue;
+        }
+        let mut matches = 0usize;
+        for matched in entry.regex.find_iter(input) {
+            push_redaction_span(
+                spans,
+                matched.start(),
+                matched.end(),
+                format!("[REDACTED:{}]", entry.label),
+                credential_priority,
+                report_counts.then_some(entry.label.as_str()),
+            );
+            matches += 1;
+        }
+        if report_counts && matches > 0 {
+            register_report_label(report_order, &entry.label);
+        }
+    }
+
+    for (idx, (label, regex)) in BUILTIN_PATTERNS.iter().enumerate() {
+        if matches!(mode, BaseRedactionMode::SupportedSecrets) && idx == 6 {
+            // Email is private data for share audiences, but is not credential
+            // material and must not turn ordinary MCP output into a secret hit.
+            continue;
+        }
+        let mut matches = 0usize;
+        for matched in regex.find_iter(input) {
+            push_redaction_span(
+                spans,
+                matched.start(),
+                matched.end(),
+                format!("[REDACTED:{label}]"),
+                builtin_priority,
+                report_counts.then_some(builtin_label_for(idx)),
+            );
+            matches += 1;
+        }
+        if report_counts && matches > 0 {
+            register_report_label(report_order, builtin_label_for(idx));
+        }
+    }
+
+    collect_sensitive_value_redaction_spans(input, spans);
+}
+
+/// Redact only supported credential/secret material. Unlike [`redact`], this
+/// excludes share-only privacy patterns (currently email) so it is safe to use
+/// as a high-confidence streaming DLP predicate without creating an output
+/// blocker for ordinary prose.
+pub fn redact_supported_secrets(input: &str) -> String {
+    let mut spans = Vec::new();
+    let mut unused_label_order = Vec::new();
+    collect_base_redaction_spans(
+        input,
+        BaseRedactionMode::SupportedSecrets,
+        &mut spans,
+        &mut unused_label_order,
+    );
+    render_redaction_spans(input, spans).0
+}
+
+pub fn contains_supported_secret(input: &str) -> bool {
+    redact_supported_secrets(input) != input
+}
+
+/// Mandatory projection for attacker-controlled text that will participate in
+/// a durable identity. Unlike interactive command scanning, a free-form field
+/// has no trustworthy semantic label, so a valid bare secp256k1 scalar is
+/// treated conservatively even without a nearby `PRIVATE_KEY=` cue. This keeps
+/// rule ids, metadata keys, and policy strings from becoming raw-secret or
+/// secret-digest oracles while leaving the ordinary command detector's
+/// transaction-hash false-positive boundary unchanged.
+pub(crate) fn privacy_project_durable_text(input: &str) -> String {
+    static BARE_EVM_SCALAR: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?i)(?:0x)?[0-9a-f]{64}").expect("bare EVM scalar projection regex")
+    });
+    static TIRITH_CANARY_TOKEN: Lazy<Regex> = Lazy::new(|| {
+        // These are Tirith's exact, deliberately synthetic token formats from
+        // `canary::generate_token`. They intentionally do NOT satisfy the real
+        // provider regexes (for example `ghp_canary_` contains an underscore),
+        // but a planted token is still private bait and must never cross a
+        // durable/hash/public-render boundary. Keep this shape-only projection
+        // separate from canary *detection*, which remains an exact store lookup.
+        Regex::new(
+            r"(?:AKIA00CANARY[A-Z2-7]{8}|ghp_canary_[A-Za-z0-9]{30}|AIzaCANARY[A-Za-z0-9_-]{30}|TIRITH_CANARY_TOKEN=canary_[0-9a-f]{24}|TIRITHCANARY[A-Za-z0-9+/]{52})",
+        )
+        .expect("tirith canary projection regex")
+    });
+
+    let projected = redact_supported_secrets(input);
+    let mut spans = Vec::new();
+    for matched in TIRITH_CANARY_TOKEN.find_iter(&projected) {
+        push_redaction_span(
+            &mut spans,
+            matched.start(),
+            matched.end(),
+            "[REDACTED:tirith_canary]".to_string(),
+            PRIORITY_PRIVATE_KEY,
+            None,
+        );
+    }
+    for matched in BARE_EVM_SCALAR.find_iter(&projected) {
+        let before_is_hex = projected[..matched.start()]
+            .bytes()
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_hexdigit());
+        let after_is_hex = projected[matched.end()..]
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_hexdigit());
+        if before_is_hex
+            || after_is_hex
+            || !crate::sensitive_assets::is_valid_evm_private_key(matched.as_str())
+        {
+            continue;
+        }
+        push_redaction_span(
+            &mut spans,
+            matched.start(),
+            matched.end(),
+            "[REDACTED:evm_private_key]".to_string(),
+            PRIORITY_STRUCTURED_WALLET,
+            None,
+        );
+    }
+    render_redaction_spans(&projected, spans).0
+}
+
+/// Fail-safe projection for bytes that crossed a refusal boundary. A blocked
+/// renderer has no reason to preserve a transaction-hash-shaped scalar at the
+/// cost of possibly echoing a private key, so it uses the same conservative
+/// free-text projection as durable identities.
+pub fn redact_blocked_output(input: &str) -> String {
+    privacy_project_durable_text(input)
+}
+
+/// Project a free-form key/value pair while retaining the key as context for
+/// short values such as `PASSWORD=hunter2` that are sensitive only when paired
+/// with a registered name. The output is fixed-label only; it never retains a
+/// prefix or digest of the value.
+pub(crate) fn privacy_project_durable_pair(key: &str, value: &str) -> (String, String) {
+    let projected_key = privacy_project_durable_text(key);
+    let mut projected_value = privacy_project_durable_text(value);
+    let contextual = format!("{key}={value}");
+    if privacy_project_durable_text(&contextual) != contextual && projected_value == value {
+        projected_value = "[REDACTED:supported_secret]".to_string();
+    }
+    (projected_key, projected_value)
+}
+
+fn collect_sensitive_value_redaction_spans(input: &str, spans: &mut Vec<RedactionSpan>) {
+    for span in crate::sensitive_assets::sensitive_value_redaction_spans(input) {
+        let priority = match span.priority {
+            300.. => PRIORITY_STRUCTURED_WALLET,
+            290..=299 => PRIORITY_RPC_VALUE,
+            _ => PRIORITY_REGISTRY_VALUE,
+        };
+        push_redaction_span(
+            spans,
+            span.range.start,
+            span.range.end,
+            span.replacement,
+            priority,
+            None,
+        );
+    }
+}
+
+fn collect_shell_assignment_spans(input: &str, spans: &mut Vec<RedactionSpan>) {
+    for range in shell_assignment_value_ranges(input) {
+        push_redaction_span(
+            spans,
+            range.start,
+            range.end,
+            "[REDACTED]".to_string(),
+            PRIORITY_SHELL_ASSIGNMENT,
+            None,
+        );
+    }
+}
+
+/// Apply every custom regex to the same immutable input, merge only its
+/// overlapping byte intervals, enforce the historical match/output budgets,
+/// and append the resulting spans to the shared render plan.
+fn collect_custom_redaction_spans(
     input: &str,
     patterns: &[Regex],
     replacement: &str,
-) -> Result<(String, usize), RedactionIncomplete> {
+    report_label: Option<&str>,
+    spans: &mut Vec<RedactionSpan>,
+) -> Result<usize, RedactionIncomplete> {
     let mut intervals = Vec::new();
     for (index, regex) in patterns.iter().enumerate() {
         for matched in regex.find_iter(input) {
@@ -662,7 +918,7 @@ fn apply_custom_patterns_once(
     }
 
     if intervals.is_empty() {
-        return Ok((input.to_string(), 0));
+        return Ok(0);
     }
 
     intervals.sort_unstable_by_key(|interval| (interval.start, interval.end));
@@ -691,15 +947,61 @@ fn apply_custom_patterns_once(
         });
     }
 
-    let mut output = String::with_capacity(projected_bytes);
-    let mut cursor = 0;
     for interval in &merged {
-        output.push_str(&input[cursor..interval.start]);
-        output.push_str(replacement);
-        cursor = interval.end;
+        push_redaction_span(
+            spans,
+            interval.start,
+            interval.end,
+            replacement.to_string(),
+            PRIORITY_CUSTOM,
+            report_label,
+        );
+    }
+    Ok(merged.len())
+}
+
+fn render_redaction_spans(
+    input: &str,
+    mut spans: Vec<RedactionSpan>,
+) -> (String, std::collections::HashMap<String, usize>) {
+    if spans.is_empty() {
+        return (input.to_string(), std::collections::HashMap::new());
+    }
+
+    spans.sort_by_key(|span| (span.start, span.end, span.ordinal));
+    let mut output = String::with_capacity(input.len());
+    let mut counts = std::collections::HashMap::new();
+    let mut cursor = 0usize;
+    let mut index = 0usize;
+
+    while index < spans.len() {
+        let start = spans[index].start;
+        let mut end = spans[index].end;
+        let mut winner = index;
+        index += 1;
+
+        while index < spans.len() && spans[index].start < end {
+            end = end.max(spans[index].end);
+            if spans[index].priority > spans[winner].priority
+                || (spans[index].priority == spans[winner].priority
+                    && spans[index].ordinal < spans[winner].ordinal)
+            {
+                winner = index;
+            }
+            index += 1;
+        }
+
+        debug_assert!(start >= cursor);
+        debug_assert!(end <= input.len());
+        output.push_str(&input[cursor..start]);
+        output.push_str(&spans[winner].replacement);
+        cursor = end;
+        if let Some(label) = &spans[winner].report_label {
+            *counts.entry(label.clone()).or_insert(0) += 1;
+        }
     }
     output.push_str(&input[cursor..]);
-    Ok((output, merged.len()))
+    (output, counts)
 }
 
 /// Checked redaction using built-in and policy-provided custom patterns.
@@ -731,10 +1033,22 @@ pub fn try_redact_with_compiled(
     if let Some(error) = &compiled.incomplete {
         return Err(error.clone());
     }
-    let (private_safe, _) = redact_private_key_blocks(input);
-    let (custom_redacted, _) =
-        apply_custom_patterns_once(&private_safe, &compiled.patterns, CUSTOM_REDACTION_MARKER)?;
-    Ok(redact(&custom_redacted))
+    let mut spans = Vec::new();
+    let mut unused_label_order = Vec::new();
+    collect_base_redaction_spans(
+        input,
+        BaseRedactionMode::Generic,
+        &mut spans,
+        &mut unused_label_order,
+    );
+    collect_custom_redaction_spans(
+        input,
+        &compiled.patterns,
+        CUSTOM_REDACTION_MARKER,
+        None,
+        &mut spans,
+    )?;
+    Ok(render_redaction_spans(input, spans).0)
 }
 
 /// Redact using built-in + pre-compiled custom patterns (no per-call recompile).
@@ -756,9 +1070,17 @@ pub fn redact_sanitize_redact_with_compiled(
     input: &str,
     compiled: &CompiledCustomPatterns,
 ) -> String {
-    let redacted = redact_with_compiled(input, compiled);
+    // This helper is the shared public/terminal boundary for Finding,
+    // Evidence, verdict, diagnostic, and receipt strings. Apply the durable
+    // projection on both sides of layout sanitization: the first pass removes
+    // intact canaries/credentials without discarding benign path context, and
+    // the final pass catches a secret reconstituted when deceptive separators
+    // are stripped.
+    let projected = privacy_project_durable_text(input);
+    let redacted = redact_with_compiled(&projected, compiled);
     let sanitized = crate::mcp::output_filter::sanitize_for_display(&redacted);
-    redact_with_compiled(&sanitized, compiled)
+    let redacted = redact_with_compiled(&sanitized, compiled);
+    privacy_project_durable_text(&redacted)
 }
 
 /// Compile policy custom patterns once for a single terminal-boundary value and
@@ -816,7 +1138,7 @@ pub fn sanitize_provenance_url_with_compiled(
             parsed.set_fragment(None);
             let _ = parsed.set_username("");
             let _ = parsed.set_password(None);
-            strip_secret_provider_path(&mut parsed);
+            strip_secret_rpc_path(&mut parsed);
             parsed.to_string()
         }
         Err(_) => {
@@ -830,24 +1152,10 @@ pub fn sanitize_provenance_url_with_compiled(
     sanitize_provenance_text_with_compiled(&structurally_safe, compiled)
 }
 
-fn strip_secret_provider_path(parsed: &mut url::Url) {
-    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    let provider_host = [
-        "alchemy.com",
-        "ankr.com",
-        "blastapi.io",
-        "chainstack.com",
-        "drpc.org",
-        "getblock.io",
-        "infura.io",
-        "llamarpc.com",
-        "moralis.io",
-        "quicknode.com",
-        "quiknode.pro",
-        "tenderly.co",
-    ]
-    .iter()
-    .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")));
+fn strip_secret_rpc_path(parsed: &mut url::Url) {
+    if crate::sensitive_assets::sanitize_hosted_rpc_url_for_display(parsed) {
+        return;
+    }
 
     let segments = parsed
         .path_segments()
@@ -858,14 +1166,6 @@ fn strip_secret_provider_path(parsed: &mut url::Url) {
         })
         .unwrap_or_default();
     if segments.is_empty() {
-        return;
-    }
-    if provider_host {
-        if matches!(segments.first().copied(), Some("v2" | "v3")) {
-            parsed.set_path(&format!("/{}", segments[0]));
-        } else {
-            parsed.set_path("/");
-        }
         return;
     }
     if segments.len() >= 2
@@ -947,136 +1247,75 @@ pub fn try_redact_for_audience_with_custom(
     audience: ShareAudience,
     customer_id_patterns: &[String],
 ) -> Result<RedactReport, RedactionIncomplete> {
-    use std::collections::HashMap;
-
     let customer_id_patterns = CompiledCustomPatterns::try_new(customer_id_patterns)?;
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
-    let bump =
-        |label: &str, n: usize, counts: &mut HashMap<String, usize>, order: &mut Vec<String>| {
-            if n == 0 {
-                return;
-            }
-            if !counts.contains_key(label) {
-                order.push(label.to_string());
-            }
-            *counts.entry(label.to_string()).or_insert(0) += n;
-        };
+    let mut spans = Vec::new();
+    let mut order = Vec::new();
+    collect_base_redaction_spans(input, BaseRedactionMode::Audience, &mut spans, &mut order);
 
-    // 1. Private keys go first because an operator custom pattern must never be
-    // able to rewrite the BEGIN header and expose the remaining key body.
-    // Customer IDs are then planned once over that structurally safe input;
-    // later built-in/static replacements never become operator-regex input.
-    let (private_safe, private_counts) = redact_private_key_blocks(input);
-    let (mut result, customer_id_matches) = apply_custom_patterns_once(
-        &private_safe,
+    let customer_id_matches = collect_custom_redaction_spans(
+        input,
         &customer_id_patterns.patterns,
         CUSTOMER_ID_REDACTION_MARKER,
+        Some("customer_id"),
+        &mut spans,
     )?;
-
-    bump("private_key", private_counts.pem, &mut counts, &mut order);
-    bump(
-        "pgp_private_key",
-        private_counts.pgp,
-        &mut counts,
-        &mut order,
-    );
-
-    // `Authorization: Bearer` values are sensitive by protocol, so they are
-    // redacted here as well as in `redact()` — the narrow provider patterns
-    // below do not recognize JWT or opaque bearer alphabets.
-    let bearer_matches = AUTHORIZATION_BEARER_PATTERN.find_iter(&result).count();
-    if bearer_matches > 0 {
-        result = AUTHORIZATION_BEARER_PATTERN
-            .replace_all(&result, |captures: &regex::Captures| {
-                format!("{}[REDACTED:Bearer Token]", &captures[1])
-            })
-            .into_owned();
-        bump("bearer_token", bearer_matches, &mut counts, &mut order);
+    if customer_id_matches > 0 {
+        register_report_label(&mut order, "customer_id");
     }
 
-    // 2. Credential patterns — ahead of built-ins so a built-in's labeled
-    //    output doesn't shadow a credential match.
-    // `Authorization: Bearer` values are sensitive by protocol, so they are
-    // redacted here as well as in `redact()` — the narrow provider patterns
-    // below do not recognize JWT or opaque bearer alphabets.
-    let bearer_matches = AUTHORIZATION_BEARER_PATTERN.find_iter(&result).count();
-    if bearer_matches > 0 {
-        result = AUTHORIZATION_BEARER_PATTERN
-            .replace_all(&result, |captures: &regex::Captures| {
-                format!("{}[REDACTED:Bearer Token]", &captures[1])
-            })
-            .into_owned();
-        bump("bearer_token", bearer_matches, &mut counts, &mut order);
-    }
-
-    for entry in CREDENTIAL_REDACT_PATTERNS.iter() {
-        let matches = entry.regex.find_iter(&result).count();
-        if matches > 0 {
-            let prefix_len = entry.prefix_len;
-            result = entry
-                .regex
-                .replace_all(&result, |caps: &regex::Captures| {
-                    let matched = &caps[0];
-                    let prefix: String = matched.chars().take(prefix_len).collect();
-                    format!("{prefix}[REDACTED]")
-                })
-                .into_owned();
-            bump(&entry.label, matches, &mut counts, &mut order);
-        }
-    }
-
-    // 3. Built-in patterns (every audience) — long-tail providers not in
-    //    credential_patterns.toml.
-    for (idx, (label, regex)) in BUILTIN_PATTERNS.iter().enumerate() {
-        let matches = regex.find_iter(&result).count();
-        if matches > 0 {
-            result = regex
-                .replace_all(&result, format!("[REDACTED:{label}]"))
-                .into_owned();
-            bump(builtin_label_for(idx), matches, &mut counts, &mut order);
-        }
-    }
-
-    // Preserve the stable report ordering from the prior implementation even
-    // though the one-pass customer replacement itself must run on original
-    // input before any generated marker exists.
-    bump("customer_id", customer_id_matches, &mut counts, &mut order);
-
-    // 4. Share patterns (audience-filtered).
     let token = audience.toml_token();
     for entry in SHARE_PATTERNS.iter() {
         if !entry.audiences.iter().any(|a| a == token) {
             continue;
         }
-        let matches = entry.regex.find_iter(&result).count();
+        let mut matches = 0usize;
+        for matched in entry.regex.find_iter(input) {
+            push_redaction_span(
+                &mut spans,
+                matched.start(),
+                matched.end(),
+                format!("[REDACTED:{}]", entry.label),
+                PRIORITY_SHARE_PATTERN,
+                Some(&entry.label),
+            );
+            matches += 1;
+        }
         if matches > 0 {
-            let label = entry.label.clone();
-            result = entry
-                .regex
-                .replace_all(&result, format!("[REDACTED:{label}]").as_str())
-                .into_owned();
-            bump(&entry.label, matches, &mut counts, &mut order);
+            register_report_label(&mut order, &entry.label);
         }
     }
 
-    // 5. Private-IPv4 redaction (public-paste only) — see `apply_private_ipv4`.
     if matches!(audience, ShareAudience::PublicPaste) {
-        let (new_result, n) = apply_private_ipv4(&result);
-        result = new_result;
-        bump("private_ipv4", n, &mut counts, &mut order);
+        let private_ipv4_spans = private_ipv4_match_ranges(input);
+        if !private_ipv4_spans.is_empty() {
+            register_report_label(&mut order, "private_ipv4");
+        }
+        for range in private_ipv4_spans {
+            push_redaction_span(
+                &mut spans,
+                range.start,
+                range.end,
+                "[REDACTED:private_ipv4]".to_string(),
+                PRIORITY_PRIVATE_IPV4,
+                Some("private_ipv4"),
+            );
+        }
     }
 
+    let (redacted_content, counts) = render_redaction_spans(input, spans);
     let redactions = order
         .into_iter()
-        .map(|label| RedactionCount {
-            count: counts[&label],
-            label,
+        .filter_map(|label| {
+            counts
+                .get(&label)
+                .copied()
+                .filter(|count| *count > 0)
+                .map(|count| RedactionCount { label, count })
         })
         .collect();
 
     Ok(RedactReport {
-        redacted_content: result,
+        redacted_content,
         redactions,
     })
 }
@@ -1088,7 +1327,7 @@ pub fn try_redact_for_audience_with_custom(
 /// chars, OR (2) be on its own line. Public IPs (`1.1.1.1`, `8.8.8.8`) are NOT
 /// touched; even a private IP is left alone without a context signal (readmes
 /// reference private CIDRs as examples).
-fn apply_private_ipv4(input: &str) -> (String, usize) {
+fn private_ipv4_match_ranges(input: &str) -> Vec<std::ops::Range<usize>> {
     static IP_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(concat!(
             r"\b(",
@@ -1101,9 +1340,7 @@ fn apply_private_ipv4(input: &str) -> (String, usize) {
     });
 
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
-    let mut cursor = 0usize;
-    let mut count = 0usize;
+    let mut ranges = Vec::new();
 
     for cap in IP_RE.find_iter(input) {
         let start = cap.start();
@@ -1126,14 +1363,9 @@ fn apply_private_ipv4(input: &str) -> (String, usize) {
             continue;
         }
 
-        out.push_str(&input[cursor..start]);
-        out.push_str("[REDACTED:private_ipv4]");
-        cursor = end;
-        count += 1;
+        ranges.push(start..end);
     }
-    out.push_str(&input[cursor..]);
-
-    (out, count)
+    ranges
 }
 
 /// True when `preceding` ends with a hostname-context keyword + whitespace.
@@ -1175,14 +1407,25 @@ fn is_on_own_line(bytes: &[u8], start: usize, end: usize) -> bool {
 /// Redact shell-style assignment values such as `KEY=value` before user content
 /// is serialized into logs or JSON output.
 pub fn redact_shell_assignments(input: &str) -> String {
+    let mut spans = Vec::new();
+    collect_sensitive_value_redaction_spans(input, &mut spans);
+    collect_shell_assignment_spans(input, &mut spans);
+    render_redaction_spans(input, spans).0
+}
+
+fn shell_assignment_value_ranges(input: &str) -> Vec<std::ops::Range<usize>> {
     let chars: Vec<char> = input.chars().collect();
-    let mut out = String::with_capacity(input.len());
+    let mut byte_offsets = input
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    byte_offsets.push(input.len());
+    let mut ranges = Vec::new();
     let mut i = 0;
 
     while i < chars.len() {
-        if let Some((prefix, next)) = redact_powershell_env_assignment(&chars, i) {
-            out.push_str(&prefix);
-            out.push_str("[REDACTED]");
+        if let Some((value_start, next)) = powershell_env_assignment_value(&chars, i) {
+            ranges.push(byte_offsets[value_start]..byte_offsets[next]);
             i = next;
             continue;
         }
@@ -1194,27 +1437,23 @@ pub fn redact_shell_assignments(input: &str) -> String {
                 i += 1;
             }
             if i < chars.len() && chars[i] == '=' {
-                let name: String = chars[name_start..i].iter().collect();
-                out.push_str(&name);
-                out.push_str("=[REDACTED]");
                 i += 1;
-                i = skip_assignment_value(&chars, i);
+                let value_start = i;
+                i = skip_assignment_value(&chars, value_start);
+                ranges.push(byte_offsets[value_start]..byte_offsets[i]);
                 continue;
             }
-            out.push(chars[name_start]);
             i = name_start + 1;
             continue;
         }
 
-        out.push(chars[i]);
         i += 1;
     }
-
-    out
+    ranges
 }
 
 /// Redact a command-like string for public output by scrubbing assignment values
-/// first, then applying built-in and custom DLP patterns.
+/// while built-in and custom patterns inspect the same immutable input.
 pub fn redact_command_text(input: &str, custom_patterns: &[String]) -> String {
     let compiled = CompiledCustomPatterns::new(custom_patterns);
     redact_command_text_with_compiled(input, &compiled)
@@ -1224,13 +1463,30 @@ pub fn redact_command_text(input: &str, custom_patterns: &[String]) -> String {
 /// Output surfaces which project several sibling fields use this entry point so
 /// every field is governed by the same frozen plan without regex recompilation.
 pub fn redact_command_text_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> String {
-    // Private-key structure must be removed before assignment scrubbing. An
-    // input such as `KEY=-----BEGIN RSA PRIVATE KEY-----\n...` otherwise has
-    // its BEGIN marker split by the assignment pass, leaving the key body for
-    // the later generic redactor to miss.
-    let (private_safe, _) = redact_private_key_blocks(input);
-    let scrubbed = redact_shell_assignments(&private_safe);
-    redact_with_compiled(&scrubbed, compiled)
+    if compiled.incomplete.is_some() {
+        return INCOMPLETE_REDACTION_MARKER.to_string();
+    }
+    let mut spans = Vec::new();
+    let mut unused_label_order = Vec::new();
+    collect_base_redaction_spans(
+        input,
+        BaseRedactionMode::Generic,
+        &mut spans,
+        &mut unused_label_order,
+    );
+    if collect_custom_redaction_spans(
+        input,
+        &compiled.patterns,
+        CUSTOM_REDACTION_MARKER,
+        None,
+        &mut spans,
+    )
+    .is_err()
+    {
+        return INCOMPLETE_REDACTION_MARKER.to_string();
+    }
+    collect_shell_assignment_spans(input, &mut spans);
+    render_redaction_spans(input, spans).0
 }
 
 /// Return a redacted clone of the provided findings for public-facing output.
@@ -1301,7 +1557,14 @@ fn redact_evidence(ev: &mut crate::verdict::Evidence, compiled: &CompiledCustomP
             *value_preview = redact_sanitize_redact_with_compiled(value_preview, compiled);
         }
         Evidence::Text { detail } => {
-            *detail = redact_sanitize_redact_command_with_compiled(detail, compiled);
+            // Tirith's categorical records contain only a versioned prefix,
+            // closed enum tokens, and canonical integers. Preserve a strictly
+            // validated record byte-for-byte so custom DLP cannot corrupt its
+            // schema/index/count. Near-misses and arbitrary public Text still
+            // take the full redaction path.
+            if !crate::verdict::is_internal_categorical_evidence_record(detail) {
+                *detail = redact_sanitize_redact_command_with_compiled(detail, compiled);
+            }
         }
         Evidence::ThreatIntel {
             source,
@@ -1339,6 +1602,33 @@ fn redact_evidence(ev: &mut crate::verdict::Evidence, compiled: &CompiledCustomP
             }
         }
     }
+}
+
+pub(crate) fn mandatory_redacted_evidence(
+    evidence: &crate::verdict::Evidence,
+) -> crate::verdict::Evidence {
+    let mut redacted = evidence.clone();
+    let compiled = CompiledCustomPatterns::new(&[]);
+    redact_evidence(&mut redacted, &compiled);
+    redacted
+}
+
+pub(crate) fn mandatory_redacted_finding(
+    finding: &crate::verdict::Finding,
+) -> crate::verdict::Finding {
+    let mut redacted = finding.clone();
+    let compiled = CompiledCustomPatterns::new(&[]);
+    redact_finding_with_compiled(&mut redacted, &compiled);
+    redacted
+}
+
+pub(crate) fn mandatory_redacted_verdict(
+    verdict: &crate::verdict::Verdict,
+) -> crate::verdict::Verdict {
+    let mut redacted = verdict.clone();
+    let compiled = CompiledCustomPatterns::new(&[]);
+    redact_verdict_with_compiled(&mut redacted, &compiled);
+    redacted
 }
 
 /// Redact all findings in a verdict in-place.
@@ -1482,7 +1772,7 @@ fn skip_assignment_value(chars: &[char], mut idx: usize) -> usize {
     idx
 }
 
-fn redact_powershell_env_assignment(chars: &[char], idx: usize) -> Option<(String, usize)> {
+fn powershell_env_assignment_value(chars: &[char], idx: usize) -> Option<(usize, usize)> {
     if idx > 0 && !is_assignment_boundary(chars[idx - 1]) {
         return None;
     }
@@ -1519,14 +1809,54 @@ fn redact_powershell_env_assignment(chars: &[char], idx: usize) -> Option<(Strin
         value_start += 1;
     }
 
-    let prefix_text: String = chars[idx..value_start].iter().collect();
     let value_end = skip_assignment_value(chars, value_start);
-    Some((prefix_text, value_end))
+    Some((value_start, value_end))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_projection_covers_unlabelled_scalars_and_contextual_pairs() {
+        let scalar = format!("0x{}1", "0".repeat(63));
+        let free_text = format!("rule-{scalar}-suffix");
+        let projected = privacy_project_durable_text(&free_text);
+        assert!(!projected.contains(&scalar), "{projected}");
+        assert!(projected.contains("[REDACTED:evm_private_key]"));
+
+        let (key, value) = privacy_project_durable_pair("WALLET_PASSWORD", "hunter2");
+        assert_eq!(key, "WALLET_PASSWORD");
+        assert_eq!(value, "[REDACTED:supported_secret]");
+
+        let transaction_hash = format!("0x{}", "f".repeat(64));
+        assert_eq!(
+            privacy_project_durable_text(&transaction_hash),
+            transaction_hash,
+            "an out-of-range secp256k1 value is not a valid private scalar"
+        );
+    }
+
+    #[test]
+    fn durable_projection_never_retains_tirith_canary_tokens() {
+        let canaries = [
+            "AKIA00CANARYABCDEFGH".to_string(),
+            format!("ghp_canary_{}", "A".repeat(30)),
+            format!("AIzaCANARY{}", "A".repeat(30)),
+            format!("TIRITH_CANARY_TOKEN=canary_{}", "a".repeat(24)),
+            format!("TIRITHCANARY{}", "A".repeat(52)),
+            format!(
+                "-----BEGIN TIRITH CANARY PRIVATE KEY-----\nTIRITHCANARY{}\n-----END TIRITH CANARY PRIVATE KEY-----",
+                "A".repeat(52)
+            ),
+        ];
+
+        for canary in canaries {
+            let projected = privacy_project_durable_text(&format!("before {canary} after"));
+            assert!(!projected.contains(&canary), "{projected}");
+            assert!(projected.contains("REDACTED"), "{projected}");
+        }
+    }
 
     #[test]
     fn test_redact_openai_key() {
@@ -1550,7 +1880,54 @@ mod tests {
         let key = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
         let redacted = redact(&format!("SENDGRID_API_KEY={key}"));
         assert!(!redacted.contains(&key));
-        assert!(redacted.contains("SG.[REDACTED]"));
+        assert!(redacted.contains("[REDACTED:sendgrid_api_key]"));
+        assert!(!redacted.contains("SG."));
+    }
+
+    #[test]
+    fn registry_redaction_replaces_bare_tokens_with_fixed_labels() {
+        let cases = vec![
+            ("AKIAIOSFODNN7EXAMPLE".to_string(), "AKIA"),
+            (format!("AIzaSy{}", "A".repeat(33)), "AIzaSy"),
+            (format!("ghp_{}", "A".repeat(36)), "ghp_"),
+            (format!("github_pat_{}", "A".repeat(82)), "github_pat_"),
+            (format!("glpat-{}", "A".repeat(20)), "glpat-"),
+            (
+                format!("sk-ant-api03-{}AA", "A".repeat(93)),
+                "sk-ant-api03-",
+            ),
+            (format!("sk-proj-{}", "A".repeat(40)), "sk-proj-"),
+            (format!("hf_{}", "A".repeat(34)), "hf_"),
+            ("xoxb-123-456-Abc".to_string(), "xoxb-"),
+            (format!("SG.{}.{}", "A".repeat(22), "b".repeat(43)), "SG."),
+            (format!("SK{}", "a".repeat(32)), "SK"),
+            (format!("sk_live_{}", "A".repeat(16)), "sk_live_"),
+            (format!("npm_{}", "A".repeat(36)), "npm_"),
+            (
+                format!("pypi-AgEIcHlwaS5vcmc{}", "A".repeat(50)),
+                "pypi-AgEIcHlwaS5vcmc",
+            ),
+            (
+                format!("AGE-SECRET-KEY-1{}", "A".repeat(58)),
+                "AGE-SECRET-KEY-1",
+            ),
+        ];
+        for (secret, prefix) in cases {
+            let redacted = redact_supported_secrets(&secret);
+            assert!(!redacted.contains(&secret), "{redacted}");
+            let secret_derived_suffix = secret
+                .strip_prefix(prefix)
+                .expect("test prefix belongs to secret");
+            assert!(!secret_derived_suffix.is_empty());
+            assert!(!redacted.contains(secret_derived_suffix), "{redacted}");
+            // A registry label such as `npm_token` may intentionally contain
+            // the provider mnemonic `npm_`. It is fixed metadata, not retained
+            // secret bytes; requiring the whole result to be exactly one marker
+            // proves no attacker-controlled prefix survived outside the label.
+            assert!(redacted.starts_with("[REDACTED:"), "{redacted}");
+            assert!(redacted.ends_with(']'), "{redacted}");
+            assert_eq!(redacted.matches("[REDACTED:").count(), 1, "{redacted}");
+        }
     }
 
     #[test]
@@ -1592,6 +1969,107 @@ mod tests {
     }
 
     #[test]
+    fn structural_private_key_complete_blocks_stop_at_exact_footer() {
+        for (label, body) in [
+            ("RSA PRIVATE KEY", "MIIEcomplete-pem-body"),
+            ("PGP PRIVATE KEY BLOCK", "lQdGcomplete-pgp-body"),
+        ] {
+            let input =
+                format!("before\n-----BEGIN {label}-----\n{body}\n-----END {label}-----\nafter");
+            assert_eq!(redact(&input), "before\n[REDACTED]\nafter", "{label}");
+        }
+    }
+
+    #[test]
+    fn structural_private_key_truncated_blocks_fail_closed_to_eof() {
+        for (label, body) in [
+            ("EC PRIVATE KEY", "MIIEtruncated-pem-body"),
+            ("PGP PRIVATE KEY BLOCK", "lQdGtruncated-pgp-body"),
+        ] {
+            let input = format!("before\n-----BEGIN {label}-----\n{body}");
+            assert_eq!(redact(&input), "before\n[REDACTED]", "{label}");
+        }
+    }
+
+    #[test]
+    fn structural_private_key_mismatched_footers_do_not_terminate_blocks() {
+        for (label, wrong_label, first_body, second_body) in [
+            (
+                "RSA PRIVATE KEY",
+                "EC PRIVATE KEY",
+                "FIRST-PEM-SECRET",
+                "SECOND-PEM-SECRET",
+            ),
+            (
+                "PGP PRIVATE KEY BLOCK",
+                "RSA PRIVATE KEY",
+                "FIRST-PGP-SECRET",
+                "SECOND-PGP-SECRET",
+            ),
+        ] {
+            let input = format!(
+                "before\n-----BEGIN {label}-----\n{first_body}\n-----END {wrong_label}-----\n{second_body}\n-----END {label}-----\nafter"
+            );
+            assert_eq!(redact(&input), "before\n[REDACTED]\nafter", "{label}");
+
+            let no_matching_footer = format!(
+                "before\n-----BEGIN {label}-----\n{first_body}\n-----END {wrong_label}-----\npublic-looking-tail"
+            );
+            assert_eq!(
+                redact(&no_matching_footer),
+                "before\n[REDACTED]",
+                "{label} without a matching footer must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_private_key_multiple_blocks_preserve_public_gaps() {
+        let input = concat!(
+            "before\n",
+            "-----BEGIN RSA PRIVATE KEY-----\nPEM-SECRET\n-----END RSA PRIVATE KEY-----\n",
+            "public middle\n",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nPGP-SECRET\n",
+            "-----END PGP PRIVATE KEY BLOCK-----\n",
+            "after"
+        );
+        let expected = "before\n[REDACTED]\npublic middle\n[REDACTED]\nafter";
+        assert_eq!(redact(input), expected);
+
+        let report = redact_for_audience(input, ShareAudience::PublicPaste);
+        assert_eq!(report.redacted_content, expected);
+        assert!(report
+            .redactions
+            .iter()
+            .any(|row| row.label == "private_key" && row.count == 1));
+        assert!(report
+            .redactions
+            .iter()
+            .any(|row| row.label == "pgp_private_key" && row.count == 1));
+    }
+
+    #[test]
+    fn structural_private_key_spans_win_custom_overlaps_without_widening() {
+        for (label, body) in [
+            ("RSA PRIVATE KEY", "PEM-CUSTOM-OVERLAP"),
+            ("PGP PRIVATE KEY BLOCK", "PGP-CUSTOM-OVERLAP"),
+        ] {
+            let input =
+                format!("before\n-----BEGIN {label}-----\n{body}\n-----END {label}-----\nafter");
+            let custom = vec![
+                format!("BEGIN {label}"),
+                body.to_string(),
+                format!("END {label}"),
+            ];
+            assert_eq!(
+                redact_with_custom(&input, &custom),
+                "before\n[REDACTED]\nafter",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     fn custom_patterns_cannot_hide_private_key_headers() {
         let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEprivatebody";
         let patterns = vec!["BEGIN RSA".to_string()];
@@ -1604,6 +2082,162 @@ mod tests {
             .redactions
             .iter()
             .any(|row| row.label == "private_key" && row.count == 1));
+    }
+
+    #[test]
+    fn custom_patterns_cannot_fragment_structural_wallet_secrets() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut keypair = vec![7u8; 32];
+        keypair.extend_from_slice(signing.verifying_key().as_bytes());
+        let keypair = serde_json::to_string(&keypair).unwrap();
+        let input = format!("mnemonic={mnemonic}\nsolana_keypair={keypair}");
+        let patterns = vec!["abandon".to_string(), "7".to_string()];
+
+        let generic = redact_with_custom(&input, &patterns);
+        assert!(!generic.contains(mnemonic), "{generic}");
+        assert!(!generic.contains(&keypair), "{generic}");
+        assert!(generic.contains("[REDACTED:bip39_mnemonic]"), "{generic}");
+        assert!(generic.contains("[REDACTED:solana_keypair]"), "{generic}");
+
+        let audience =
+            redact_for_audience_with_custom(&input, ShareAudience::PublicPaste, &patterns);
+        assert!(!audience.redacted_content.contains(mnemonic));
+        assert!(!audience.redacted_content.contains(&keypair));
+        assert!(audience
+            .redacted_content
+            .contains("[REDACTED:bip39_mnemonic]"));
+        assert!(audience
+            .redacted_content
+            .contains("[REDACTED:solana_keypair]"));
+    }
+
+    #[test]
+    fn custom_patterns_cannot_hide_registry_or_rpc_field_names() {
+        let cases = [
+            ("WALLET_PASSWORD=hunter2", "WALLET_PASSWORD", "hunter2"),
+            (
+                "RPC_URL=https://user:pass@rpc.example/v3/providerToken123456789?api_key=hunter2#fragment",
+                "RPC_URL",
+                "providerToken123456789",
+            ),
+        ];
+        for (input, field_name, canary) in cases {
+            let compiled = CompiledCustomPatterns::new(&[field_name.to_string()]);
+            let generic = redact_with_compiled(input, &compiled);
+            assert!(!generic.contains(canary), "{generic}");
+            assert!(!generic.contains("user:pass"), "{generic}");
+            assert!(!generic.contains("hunter2"), "{generic}");
+            assert!(!generic.contains("api_key="), "{generic}");
+            assert!(!generic.contains("#fragment"), "{generic}");
+
+            let audience = redact_for_audience_with_custom(
+                input,
+                ShareAudience::PublicPaste,
+                &[field_name.to_string()],
+            );
+            assert!(!audience.redacted_content.contains(canary));
+            assert!(!audience.redacted_content.contains("user:pass"));
+            assert!(!audience.redacted_content.contains("hunter2"));
+            assert!(!audience.redacted_content.contains("api_key="));
+            assert!(!audience.redacted_content.contains("#fragment"));
+        }
+    }
+
+    #[test]
+    fn builtins_win_nested_custom_overlaps_while_adjacency_stays_separate() {
+        let aws_key = "AKIAIOSFODNN7EXAMPLE";
+        let input = format!("HEAD-{aws_key}TAIL");
+        let custom = vec![
+            format!("HEAD-{aws_key}"),
+            aws_key.to_string(),
+            "TAIL".to_string(),
+        ];
+
+        assert_eq!(
+            redact_with_custom(&input, &custom),
+            format!("[REDACTED:AWS Access Key]{CUSTOM_REDACTION_MARKER}"),
+            "nested/overlapping custom spans must yield to the built-in span, while an adjacent custom span remains distinct"
+        );
+    }
+
+    #[test]
+    fn exact_secrets_outrank_enclosing_rpc_urls_but_public_urls_stay_visible() {
+        let github_pat = format!("ghp_{}", "a".repeat(36));
+        let openai_key = format!("sk-{}", "a1".repeat(16));
+        let evm_private_key = format!("0x{}1", "0".repeat(63));
+        let cases = [
+            (
+                format!("fetch https://rpc.example/rpc?token={github_pat}"),
+                "fetch [REDACTED:GitHub PAT]",
+            ),
+            (
+                format!("fetch https://rpc.example/rpc?api_key={openai_key}"),
+                "fetch [REDACTED:OpenAI API Key]",
+            ),
+            (
+                format!("fetch https://rpc.example/rpc?private_key={evm_private_key}"),
+                "fetch https://rpc.example/rpc?private_key=[REDACTED:evm_private_key]",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact(&input), expected, "{input}");
+            assert_eq!(redact_command_text(&input, &[]), expected, "{input}");
+        }
+
+        let opaque_provider = "fetch https://mainnet.infura.io/v3/providerToken123456789";
+        assert_eq!(redact(opaque_provider), "fetch https://infura.io");
+
+        let public_rpc = "fetch https://rpc.example/rpc?chain=mainnet";
+        assert_eq!(redact(public_rpc), public_rpc);
+    }
+
+    #[test]
+    fn hosted_rpc_catalog_is_secret_free_across_public_text_boundaries() {
+        let secret = "providerToken123456789";
+        let compiled = CompiledCustomPatterns::new_silent(&[]);
+        for (suffix, url) in crate::sensitive_assets::hosted_rpc_provider_credential_urls(secret) {
+            let error_text = format!("RPC request failed for {url}");
+            let outputs = [
+                redact(&error_text),
+                redact_for_audience(&error_text, ShareAudience::PublicPaste).redacted_content,
+                redact_sanitize_redact(&error_text, &[]),
+                sanitize_provenance_url_with_compiled(&url, &compiled),
+            ];
+            for output in outputs {
+                assert!(!output.contains(secret), "{suffix}: {output}");
+                assert!(!output.contains("api_key="), "{suffix}: {output}");
+                assert!(output.contains(suffix), "{suffix}: {output}");
+            }
+        }
+
+        let public_solana_id = "Vote111111111111111111111111111111111111111";
+        for public in [
+            "https://snowy-white-lake.solana-mainnet.quiknode.pro/mainnet".to_string(),
+            format!("https://rpc.example/v1/{public_solana_id}"),
+            format!("https://example.test/{public_solana_id}"),
+            format!("https://example.test/0x{}", "ab".repeat(20)),
+        ] {
+            assert_eq!(redact(&public), public, "{public}");
+            assert_eq!(redact_sanitize_redact(&public, &[]), public, "{public}");
+        }
+
+        let base58_secret = "123456789ABCDEFGHJKLMNPQRSTUVWXY";
+        for host in [
+            "snowy-white-lake.solana-mainnet.quiknode.pro",
+            "snowy-white-lake.solana-mainnet.quiknode.pro.",
+        ] {
+            let base58_url = format!("https://{host}/{base58_secret}");
+            for output in [
+                redact(&base58_url),
+                redact_for_audience(&base58_url, ShareAudience::PublicPaste).redacted_content,
+                redact_sanitize_redact(&base58_url, &[]),
+                sanitize_provenance_url_with_compiled(&base58_url, &compiled),
+            ] {
+                assert!(!output.contains(base58_secret), "{output}");
+                assert!(output.contains("quiknode.pro"), "{output}");
+            }
+        }
     }
 
     #[test]
@@ -1662,6 +2296,29 @@ mod tests {
         assert!(!safe.contains(&secret));
         assert!(safe.contains("[REDACTED:GitHub PAT]"), "{safe}");
         assert!(!safe.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn public_boundary_projects_canary_path_components_but_keeps_benign_path_context() {
+        let compiled = CompiledCustomPatterns::new_silent(&[]);
+        let benign = "/private/tmp/profile-alice/.zshrc";
+        assert_eq!(
+            redact_sanitize_redact_with_compiled(benign, &compiled),
+            benign
+        );
+
+        let canary = format!("ghp_canary_{}", "B".repeat(30));
+        let split_canary = format!("{}\u{200b}{}", &canary[..20], &canary[20..]);
+        for secret_component in [&canary, &split_canary] {
+            let path = format!("/private/tmp/profile-{secret_component}/.zshrc");
+            let safe = redact_sanitize_redact_with_compiled(&path, &compiled);
+
+            assert!(!safe.contains(&canary), "{safe}");
+            assert!(safe.contains("/private/tmp/profile-"), "{safe}");
+            assert!(safe.ends_with("/.zshrc"), "{safe}");
+            assert!(safe.contains("[REDACTED:tirith_canary]"), "{safe}");
+            assert!(!safe.contains('\u{200b}'), "{safe:?}");
+        }
     }
 
     #[test]
@@ -1801,6 +2458,15 @@ mod tests {
             "[REDACTED:AWS Access Key]",
             "custom patterns must only see original input, not built-in replacement text"
         );
+        let audience = redact_for_audience_with_custom(
+            built_in_secret,
+            ShareAudience::PublicPaste,
+            &inserted_marker_pattern,
+        );
+        assert!(!audience.redacted_content.contains(CUSTOM_REDACTION_MARKER));
+        assert!(!audience
+            .redacted_content
+            .contains(CUSTOMER_ID_REDACTION_MARKER));
 
         let input = "前TOKEN-秘密後";
         let overlaps = vec!["TOKEN-秘密".to_string(), "秘密後".to_string()];
@@ -1948,6 +2614,68 @@ mod tests {
     }
 
     #[test]
+    fn categorical_internal_text_records_are_presentation_stable_under_custom_dlp() {
+        use crate::verdict::{
+            data_flow_evidence, output_data_flow_evidence, web3_address_evidence,
+            web3_endpoint_evidence, DataFlowOperation, DataFlowSink, DataFlowSource, Evidence,
+            Finding, OutputDataOperation, OutputDataSink, OutputDataSource, RuleId, Severity,
+        };
+
+        let endpoint = crate::sensitive_assets::rpc_endpoint_summary("https://rpc.example/rpc")
+            .expect("public RPC endpoint");
+        let evidence = vec![
+            data_flow_evidence(
+                DataFlowSource::SensitiveFile,
+                DataFlowSink::Curl,
+                DataFlowOperation::UploadFile,
+            ),
+            output_data_flow_evidence(
+                OutputDataSource::SecretOrCanarySignal,
+                OutputDataSink::RemoteRenderer,
+                OutputDataOperation::UrlQuery,
+                12,
+                3,
+            ),
+            web3_endpoint_evidence(&endpoint, Some(42)),
+            web3_address_evidence(Some(7)),
+        ];
+        let before = serde_json::to_string(&evidence).unwrap();
+        let mut finding = Finding {
+            rule_id: RuleId::DataExfiltration,
+            severity: Severity::High,
+            title: "categorical evidence".to_string(),
+            description: "presentation stability".to_string(),
+            evidence,
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        redact_finding(
+            &mut finding,
+            &[
+                "source".to_string(),
+                "data_flow".to_string(),
+                "web3_endpoint".to_string(),
+                r"[0-9]+".to_string(),
+            ],
+        );
+        assert_eq!(serde_json::to_string(&finding.evidence).unwrap(), before);
+
+        let mut spoofed = Finding {
+            evidence: vec![Evidence::Text {
+                detail: "tirith:v1:data_flow;source=sensitive_file;sink=curl;operation=upload_file;opaque=source42".to_string(),
+            }],
+            ..finding
+        };
+        redact_finding(&mut spoofed, &["source".to_string(), r"[0-9]+".to_string()]);
+        let Evidence::Text { detail } = &spoofed.evidence[0] else {
+            panic!("text evidence");
+        };
+        assert!(detail.contains("[REDACTED:custom]"), "{detail}");
+    }
+
+    #[test]
     fn redact_finding_covers_every_string_bearing_evidence_variant() {
         use crate::threatdb::Confidence;
         use crate::verdict::{Evidence, Finding, RuleId, Severity, SuspiciousChar};
@@ -2018,6 +2746,7 @@ mod tests {
             8,
             "fixture must cover every variant"
         );
+        assert!(!serialized.contains("command-redacted"));
         match &finding.evidence[7] {
             Evidence::HomoglyphAnalysis {
                 suspicious_chars, ..

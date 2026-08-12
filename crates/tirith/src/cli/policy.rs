@@ -115,6 +115,36 @@ allowlist: []
 blocklist: []
 "#;
 
+/// Mandatory privacy boundary for policy CLI diagnostics. Policy paths and
+/// parser/validation errors may contain local identities, credentials, Tirith
+/// canaries, or bare private-key scalars, so project them before any human or
+/// JSON presenter extracts individual fields.
+fn project_policy_cli_text(value: &str) -> String {
+    let share_safe = tirith_core::redact::redact_for_audience(
+        value,
+        tirith_core::redact::ShareAudience::PublicPaste,
+    )
+    .redacted_content;
+    tirith_core::redact::redact_blocked_output(&share_safe)
+}
+
+fn project_policy_cli_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = project_policy_cli_text(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                project_policy_cli_json(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                project_policy_cli_json(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
 /// `individual` — defaults for a single developer (fail-open, paranoia 1, the
 /// noisiest pipe-to-shell rule escalated, empty allowlist). Body lives in
 /// `assets/policy_templates/individual.yaml`, resolved via `include_str!` so the
@@ -374,10 +404,9 @@ pub fn validate(path: Option<&str>, json: bool) -> i32 {
     let yaml = match std::fs::read_to_string(&policy_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "tirith policy validate: cannot read {}: {e}",
-                policy_path.display()
-            );
+            let display_path = bounded_human_value(&policy_path.display().to_string(), 512);
+            let error = bounded_human_value(&e.to_string(), 512);
+            eprintln!("tirith policy validate: cannot read {display_path}: {error}");
             return 1;
         }
     };
@@ -424,8 +453,19 @@ fn print_validate_json(path: &std::path::Path, issues: &[policy_validate::Policy
         issues,
     };
 
-    if let Err(e) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
-        eprintln!("tirith policy validate: failed to write JSON output: {e}");
+    let mut output = match serde_json::to_value(&output) {
+        Ok(output) => output,
+        Err(error) => {
+            let error = bounded_human_value(&error.to_string(), 512);
+            eprintln!("tirith policy validate: failed to construct JSON output: {error}");
+            return;
+        }
+    };
+    project_policy_cli_json(&mut output);
+
+    if let Err(error) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
+        let error = bounded_human_value(&error.to_string(), 512);
+        eprintln!("tirith policy validate: failed to write JSON output: {error}");
     }
     println!();
 }
@@ -468,9 +508,9 @@ fn print_validate_human(path: &std::path::Path, issues: &[policy_validate::Polic
 }
 
 /// Render a validation issue without ever echoing an attacker-controlled policy
-/// value. Exact diagnostics remain available through `--json`, whose serializer
-/// escapes controls and is a machine-data boundary. Human output exposes only a
-/// fixed category plus its non-secret ordinal in the structured issue list.
+/// value. Projected structured diagnostics remain available through `--json`;
+/// human output exposes only a fixed category plus its non-secret ordinal in the
+/// structured issue list.
 fn human_validation_issue(issue: &policy_validate::PolicyIssue, ordinal: usize) -> String {
     let category = if issue.message.starts_with("YAML parse error") {
         "YAML parse error"
@@ -493,7 +533,8 @@ fn human_validation_issue(issue: &policy_validate::PolicyIssue, ordinal: usize) 
 }
 
 fn bounded_human_value(value: &str, max_chars: usize) -> String {
-    let safe = super::sanitize_for_human_output(value, false);
+    let projected = project_policy_cli_text(value);
+    let safe = super::sanitize_for_human_output(&projected, false);
     if safe.chars().count() <= max_chars {
         return safe;
     }
@@ -563,6 +604,7 @@ fn test_command(command: &str, json: bool) -> i32 {
 fn test_file(file_path: &str, json: bool) -> i32 {
     let path = PathBuf::from(file_path);
     if !path.exists() {
+        let file_path = bounded_human_value(file_path, 512);
         eprintln!("tirith policy test: file not found: {file_path}");
         return 1;
     }
@@ -573,6 +615,7 @@ fn test_file(file_path: &str, json: bool) -> i32 {
     let result = match scan::scan_single_file_guarded(&path) {
         GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(r)) => r,
         GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => {
+            let file_path = bounded_human_value(file_path, 512);
             eprintln!(
                 "tirith policy test: could not analyze {file_path}: coverage gap ({})",
                 gap.kind.as_str()
@@ -580,6 +623,7 @@ fn test_file(file_path: &str, json: bool) -> i32 {
             return 1;
         }
         GuardedScanOutcome::RulePanic(_) => {
+            let file_path = bounded_human_value(file_path, 512);
             eprintln!("tirith policy test: internal error scanning {file_path}: a rule panicked");
             return 1;
         }
@@ -930,8 +974,19 @@ fn print_test_command_json(
         policy_trace: trace,
     };
 
-    if let Err(e) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
-        eprintln!("tirith policy test: failed to write JSON output: {e}");
+    let mut output = match serde_json::to_value(&output) {
+        Ok(output) => output,
+        Err(error) => {
+            let error = bounded_human_value(&error.to_string(), 512);
+            eprintln!("tirith policy test: failed to construct JSON output: {error}");
+            return;
+        }
+    };
+    project_policy_cli_json(&mut output);
+
+    if let Err(error) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
+        let error = bounded_human_value(&error.to_string(), 512);
+        eprintln!("tirith policy test: failed to write JSON output: {error}");
     }
     println!();
 }
@@ -950,8 +1005,19 @@ fn print_test_file_json(file_path: &str, result: &scan::FileScanResult, _policy:
         findings: &result.findings,
     };
 
-    if let Err(e) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
-        eprintln!("tirith policy test: failed to write JSON output: {e}");
+    let mut output = match serde_json::to_value(&output) {
+        Ok(output) => output,
+        Err(error) => {
+            let error = bounded_human_value(&error.to_string(), 512);
+            eprintln!("tirith policy test: failed to construct JSON output: {error}");
+            return;
+        }
+    };
+    project_policy_cli_json(&mut output);
+
+    if let Err(error) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
+        let error = bounded_human_value(&error.to_string(), 512);
+        eprintln!("tirith policy test: failed to write JSON output: {error}");
     }
     println!();
 }
@@ -962,14 +1028,14 @@ fn print_test_command_human(
     _policy: &Policy,
     trace: &PolicyTrace,
 ) {
+    let command = bounded_human_value(command, 2 * 1024);
+    let policy_path = trace
+        .policy_path
+        .as_deref()
+        .map(|path| bounded_human_value(path, 512))
+        .unwrap_or_else(|| "(default — no policy file)".to_string());
     eprintln!("tirith policy test: command = {:?}", command);
-    eprintln!(
-        "  policy: {}",
-        trace
-            .policy_path
-            .as_deref()
-            .unwrap_or("(default — no policy file)")
-    );
+    eprintln!("  policy: {policy_path}");
     eprintln!("  action: {:?}", verdict.action);
     eprintln!("  findings: {}", verdict.findings.len());
 
@@ -978,12 +1044,8 @@ fn print_test_command_human(
             &finding.severity,
             tirith_core::style::Stream::Stderr,
         );
-        eprintln!(
-            "    {} {} — {}",
-            sev,
-            finding.rule_id,
-            super::sanitize_for_human_output(&finding.title, false)
-        );
+        let title = bounded_human_value(&finding.title, 2 * 1024);
+        eprintln!("    {} {} — {}", sev, finding.rule_id, title);
     }
 
     if !trace.allowlist_checked.is_empty() || !trace.blocklist_checked.is_empty() {
@@ -991,11 +1053,13 @@ fn print_test_command_human(
         eprintln!("  policy trace:");
         for entry in &trace.allowlist_checked {
             let mark = if entry.matched { "MATCH" } else { "no match" };
-            eprintln!("    allowlist: {:?} -> {mark}", entry.pattern);
+            let pattern = bounded_human_value(&entry.pattern, 2 * 1024);
+            eprintln!("    allowlist: {pattern:?} -> {mark}");
         }
         for entry in &trace.blocklist_checked {
             let mark = if entry.matched { "MATCH" } else { "no match" };
-            eprintln!("    blocklist: {:?} -> {mark}", entry.pattern);
+            let pattern = bounded_human_value(&entry.pattern, 2 * 1024);
+            eprintln!("    blocklist: {pattern:?} -> {mark}");
         }
     }
 }
@@ -1003,7 +1067,7 @@ fn print_test_command_human(
 fn print_test_file_human(file_path: &str, result: &scan::FileScanResult, _policy: &Policy) {
     // The tested file path is the untrusted scan subject; a crafted name could
     // carry escapes/newlines into this label.
-    let file_path = super::sanitize_for_human_output(file_path, false);
+    let file_path = bounded_human_value(file_path, 512);
     if result.findings.is_empty() {
         eprintln!("tirith policy test: {file_path} — no findings");
         return;
@@ -1019,16 +1083,10 @@ fn print_test_file_human(file_path: &str, result: &scan::FileScanResult, _policy
             &finding.severity,
             tirith_core::style::Stream::Stderr,
         );
-        eprintln!(
-            "  {} {} — {}",
-            sev,
-            finding.rule_id,
-            super::sanitize_for_human_output(&finding.title, false)
-        );
-        eprintln!(
-            "    {}",
-            super::sanitize_for_human_output(&finding.description, true)
-        );
+        let title = bounded_human_value(&finding.title, 2 * 1024);
+        let description = bounded_human_value(&finding.description, 4 * 1024);
+        eprintln!("  {} {} — {}", sev, finding.rule_id, title);
+        eprintln!("    {description}");
     }
 }
 
@@ -1038,7 +1096,8 @@ fn resolve_policy_path(explicit: Option<&str>) -> Option<PathBuf> {
         if path.exists() {
             return Some(path);
         }
-        eprintln!("tirith policy validate: specified path does not exist: {p}");
+        let path = bounded_human_value(p, 512);
+        eprintln!("tirith policy validate: specified path does not exist: {path}");
         return None;
     }
 
@@ -1071,6 +1130,37 @@ mod tests {
         assert!(!rendered.contains('\x1b'), "{rendered:?}");
         assert!(!rendered.contains('\n'), "{rendered:?}");
         assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
+    }
+
+    #[test]
+    fn validation_presenters_project_paths_and_nested_json_before_rendering() {
+        let canary = format!("ghp_canary_{}", "A".repeat(30));
+        let private_scalar = format!("{}1", "0".repeat(63));
+        let local_path = format!("/Users/alice/{canary}/policy.yaml");
+        let projected = bounded_human_value(
+            &format!("{local_path} command-private-key={private_scalar}"),
+            512,
+        );
+        assert!(!projected.contains(&canary), "{projected:?}");
+        assert!(!projected.contains(&private_scalar), "{projected:?}");
+        assert!(!projected.contains("/Users/alice"), "{projected:?}");
+
+        let mut json = serde_json::json!({
+            "path": local_path,
+            "command": private_scalar.clone(),
+            "nested": [{"error": format!("cannot read {canary}")}],
+            "valid": false,
+            "error_count": 1,
+        });
+        project_policy_cli_json(&mut json);
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(!rendered.contains(&canary), "{rendered}");
+        assert!(!rendered.contains(&private_scalar), "{rendered}");
+        assert!(!rendered.contains("/Users/alice"), "{rendered}");
+        assert_eq!(json["valid"], serde_json::Value::Bool(false));
+        assert_eq!(json["error_count"], serde_json::json!(1));
+
+        assert_eq!(bounded_human_value("policy.yaml", 512), "policy.yaml");
     }
 
     /// Every curated template must validate cleanly — no errors AND no warnings

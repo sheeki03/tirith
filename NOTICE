@@ -69,3 +69,13 @@ Tirith Web3 package comparison anchors
            crates/tirith/assets/data/web3_package_anchors.SOURCE.md
   License basis: factual package identifiers (LicenseRef-Package-Name-Facts)
   Used for: Non-authoritative package-name similarity comparison
+
+---
+
+Bitcoin BIPs contributors — BIP-0039 English wordlist
+  Copyright: Bitcoin BIPs contributors
+  Source: https://github.com/bitcoin/bips/blob/ed4ffcb6a48d4dc4fdfc11cdba783c233db8c66e/bip-0039/english.txt
+  Upstream revision: ed4ffcb6a48d4dc4fdfc11cdba783c233db8c66e
+  Local SHA-256: 2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda
+  License: MIT (SPDX-License-Identifier: MIT)
+  Used for: BIP-39 English word membership and checksum validation

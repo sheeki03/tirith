@@ -114,7 +114,12 @@ pub fn drain_captured_policy_diagnostics_for_output(
     let compiled = frozen_compiled.as_ref().unwrap_or(fallback);
     messages
         .into_iter()
-        .map(|message| crate::redact::redact_sanitize_redact_with_compiled(&message, compiled))
+        .map(|message| {
+            let public = policy_diagnostic_text(&message);
+            let configured = crate::redact::redact_sanitize_redact_with_compiled(&public, compiled);
+            let public = policy_diagnostic_text(&configured);
+            crate::redact::redact_sanitize_redact_with_compiled(&public, compiled)
+        })
         .collect()
 }
 
@@ -144,7 +149,9 @@ fn emit_policy_diagnostic(arguments: std::fmt::Arguments<'_>) {
         // Callers that have not established an explicit capture still get a
         // built-in-DLP, terminal-safe single physical line. Custom patterns
         // require a captured, frozen invocation plan and are handled above.
+        let message = policy_diagnostic_text(&message);
         let message = crate::output::sanitize_human_field(&message, &[]);
+        let message = policy_diagnostic_text(&message);
         eprintln!("{message}");
     }
 }
@@ -449,7 +456,7 @@ pub struct Policy {
     pub env_guard_enabled: bool,
 
     /// **M9 ch4** — user extension of the sensitive env-var name list, merged
-    /// with the built-in `assets/data/sensitive_env.toml` (which is always
+    /// with the built-in typed sensitive-asset registry (which is always
     /// included). See [`crate::env_guard::effective_sensitive_vars`].
     #[serde(default)]
     pub env_guard_sensitive_vars: Vec<String>,
@@ -863,13 +870,57 @@ fn default_approval_fallback() -> String {
     "block".to_string()
 }
 
-/// SHA-256 hex digest of one projection value. Binds list CONTENT in the
-/// redacted security projection without placing free-text or identifying
-/// values in it (repo-0311).
+/// Privacy-project one policy string before it can participate in a durable
+/// identity.  The projection deliberately collapses supported credential
+/// values to fixed labels: an unsalted digest of the original string would be
+/// an offline secret oracle even when the string itself never appeared in the
+/// serialized policy projection.
+fn privacy_project_policy_text(value: &str) -> String {
+    crate::redact::privacy_project_durable_text(value)
+}
+
+/// Recursively privacy-project string values and object keys before hashing a
+/// structured rule.  Policy rule identifiers and map keys are operator input
+/// too, so protecting only JSON values would leave a second secret-bearing
+/// identity channel.
+fn privacy_project_policy_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(value) => {
+            serde_json::Value::String(privacy_project_policy_text(&value))
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(privacy_project_policy_json)
+                .collect(),
+        ),
+        serde_json::Value::Object(values) => {
+            let mut projected = serde_json::Map::new();
+            for (key, value) in values {
+                let projected_value = match value {
+                    serde_json::Value::String(value) => {
+                        let (projected_key, projected_value) =
+                            crate::redact::privacy_project_durable_pair(&key, &value);
+                        projected.insert(projected_key, serde_json::Value::String(projected_value));
+                        continue;
+                    }
+                    value => privacy_project_policy_json(value),
+                };
+                projected.insert(privacy_project_policy_text(&key), projected_value);
+            }
+            serde_json::Value::Object(projected)
+        }
+        other => other,
+    }
+}
+
+/// SHA-256 hex digest of one already privacy-projected policy value.  This
+/// binds non-secret posture content without retaining a raw-secret-derived
+/// verifier.
 fn projection_value_digest(value: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(value.as_bytes());
+    h.update(privacy_project_policy_text(value).as_bytes());
     format!("{:x}", h.finalize())
 }
 
@@ -879,7 +930,9 @@ fn projection_rule_digests<T: serde::Serialize>(rules: &[T]) -> Vec<String> {
     let mut out: Vec<String> = rules
         .iter()
         .map(|rule| {
-            let value = serde_json::to_value(rule).unwrap_or(serde_json::Value::Null);
+            let value = privacy_project_policy_json(
+                serde_json::to_value(rule).unwrap_or(serde_json::Value::Null),
+            );
             projection_value_digest(&crate::audit::canonical_json_for_hash(&value))
         })
         .collect();
@@ -893,9 +946,13 @@ fn projection_string_vec_map(map: &HashMap<String, Vec<String>>) -> Vec<String> 
     let mut out: Vec<String> = map
         .iter()
         .map(|(k, vals)| {
-            let mut vals = vals.clone();
+            let projected_key = privacy_project_policy_text(k);
+            let mut vals = vals
+                .iter()
+                .map(|value| crate::redact::privacy_project_durable_pair(k, value).1)
+                .collect::<Vec<_>>();
             vals.sort();
-            format!("{k}={}", vals.join(","))
+            format!("{projected_key}={}", vals.join(","))
         })
         .collect();
     out.sort();
@@ -906,9 +963,34 @@ fn projection_string_vec_map(map: &HashMap<String, Vec<String>>) -> Vec<String> 
 /// value (severity/action overrides: the value changes the verdict, so the
 /// projection must bind it — repo-0311).
 fn projection_override_pairs<V: std::fmt::Display>(map: &HashMap<String, V>) -> Vec<String> {
-    let mut pairs: Vec<String> = map.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut pairs: Vec<String> = map
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                privacy_project_policy_text(k),
+                privacy_project_policy_text(&v.to_string())
+            )
+        })
+        .collect();
     pairs.sort();
     pairs
+}
+
+/// Project untrusted policy paths, identifiers, and parser/compiler messages
+/// before returning or printing them. This keeps validation behavior exact
+/// while preventing an invalid policy from using its own diagnostics as a
+/// secret/path exfiltration channel.
+fn policy_diagnostic_text(value: &str) -> String {
+    let share_safe =
+        crate::redact::redact_for_audience(value, crate::redact::ShareAudience::PublicPaste)
+            .redacted_content;
+    crate::mcp::output_filter::sanitize_for_display(&crate::redact::redact_blocked_output(
+        &share_safe,
+    ))
+    .replace('\r', "\\r")
+    .replace('\n', "\\n")
+    .replace('\t', "\\t")
 }
 
 /// Webhook configuration for event notification.
@@ -2129,14 +2211,12 @@ impl Policy {
     /// scalar thresholds/toggles, and the SORTED values of the host/URL deny &
     /// allow lists (`blocklist`, `network_deny`, `network_allow`,
     /// `additional_known_domains`), the guard toggles, and the sorted
-    /// `key=value` pairs of `severity_overrides` / `action_overrides`. Every
-    /// verdict-affecting LIST is bound by sorted per-value SHA-256 digests
-    /// (repo-0311): two policies that differ in ANY allowlisted destination,
-    /// approval/custom/escalation rule, override VALUE, or guard field now
-    /// fingerprint differently — a policy can no longer be weakened while an
-    /// approval bound to `security_projection_hash` stays valid. The discovery
-    /// `scope` is included so a repo-scoped (sanitized) policy fingerprints
-    /// differently from a user/org one.
+    /// `key=value` pairs of `severity_overrides` / `action_overrides`. Content
+    /// is privacy-projected before it is emitted or hashed: ordinary posture
+    /// changes remain bound, while changing only a supported credential cannot
+    /// create a durable offline verifier. The discovery `scope` is included so
+    /// a repo-scoped (sanitized) policy fingerprints differently from a
+    /// user/org one.
     ///
     /// # What is excluded (secrets + identifying + machine-specific)
     ///
@@ -2145,15 +2225,18 @@ impl Policy {
     /// token), and the loaded `path` (a machine path). Free-text/identifying
     /// list VALUES (`dlp_custom_patterns`, `injection_seeds_custom`,
     /// `package_policy.internal_package_names`, `env_guard_sensitive_vars`,
-    /// `scan.ignore_patterns`, …) appear ONLY as individual SHA-256 digests —
-    /// content-bound without leaking the pattern text.
+    /// `scan.ignore_patterns`, …) appear only after the mandatory supported-
+    /// secret projection and, where appropriate, as individual SHA-256 digests.
     ///
     /// Keys are emitted in a fixed order and any list is sorted, so the value is
     /// canonical input for [`crate::audit::canonical_json_for_hash`]; the same
     /// logical policy always hashes identically.
     pub fn security_projection(&self) -> serde_json::Value {
         let sorted = |v: &[String]| -> Vec<String> {
-            let mut out = v.to_vec();
+            let mut out = v
+                .iter()
+                .map(|value| privacy_project_policy_text(value))
+                .collect::<Vec<_>>();
             out.sort();
             out
         };
@@ -2180,8 +2263,9 @@ impl Policy {
             m.insert(k.to_string(), v);
         };
 
-        // Projection format version: 2 binds content (digests), 1 bound counts.
-        put("projection_version", json!(2));
+        // Projection format version: v3 privacy-projects every string before it
+        // can participate in a durable value or digest. v2 hashed raw free text.
+        put("projection_version", json!(3));
         put("schema_version", json!(self.schema_version));
         put("scope", json!(format!("{:?}", self.scope)));
         put("fail_mode", json!(format!("{:?}", self.fail_mode)));
@@ -2359,46 +2443,15 @@ impl Policy {
         format!("{:x}", h.finalize())
     }
 
-    /// Exact, in-memory identity for an execution decision.
+    /// Durable non-secret identity for an execution decision's policy posture.
     ///
-    /// Unlike [`Self::security_projection_hash`], this deliberately binds the
-    /// VALUES of every serialized policy field, plus the decision-relevant
-    /// fields that serde omits. Only the resulting digest is persisted. That
-    /// lets the execution gate distinguish policies whose redacted receipt
-    /// projection is intentionally identical (for example, two custom-rule
-    /// lists of the same length) without writing rule text, tenant labels, or
-    /// credentials into execution state.
+    /// Command-specific effects are independently bound by the frozen verdict
+    /// identity. Persisting a digest of the full policy (or unsalted hashes of
+    /// omitted API keys) would expose an offline oracle without strengthening
+    /// that decision boundary, so execution state uses the same mandatory
+    /// privacy projection as public receipts.
     pub(crate) fn execution_identity_hash(&self) -> Result<String, String> {
-        use sha2::{Digest, Sha256};
-
-        let secret_hash = |value: Option<&str>| {
-            value.map(|value| {
-                let mut digest = Sha256::new();
-                digest.update(value.as_bytes());
-                format!("{:x}", digest.finalize())
-            })
-        };
-        let serialized = serde_json::to_value(self)
-            .map_err(|error| format!("serialize exact execution policy identity: {error}"))?;
-        let identity = serde_json::json!({
-            "schema": 1,
-            "policy": serialized,
-            "scope": self.scope.as_str(),
-            "context_labels": self.context_labels,
-            "ssh_host_labels": self.ssh_host_labels,
-            // These credentials are skipped by Policy serialization. Their
-            // presence/value can still change live threat-intel behaviour, so
-            // bind a one-way digest without placing the credential in the
-            // canonical JSON even transiently.
-            "google_safe_browsing_key_sha256":
-                secret_hash(self.threat_intel.google_safe_browsing_key.as_deref()),
-            "abusech_auth_key_sha256":
-                secret_hash(self.threat_intel.abusech_auth_key.as_deref()),
-        });
-        let canonical = crate::audit::canonical_json_for_hash(&identity);
-        let mut digest = Sha256::new();
-        digest.update(canonical.as_bytes());
-        Ok(format!("{:x}", digest.finalize()))
+        Ok(self.security_projection_hash())
     }
 
     /// Return a fail-closed policy that blocks everything.
@@ -2494,8 +2547,8 @@ impl Policy {
     /// `Err(message)` rather than printing+falling back, for fail-mode-aware
     /// callers (remote fetch); [`Self::load_from_yaml`] wraps it warn-and-default.
     pub fn try_parse_yaml(content: &str) -> Result<Self, String> {
-        let ParsedPolicyDocument { policy, .. } =
-            Self::parse_document(content).map_err(|error| error.to_string())?;
+        let ParsedPolicyDocument { policy, .. } = Self::parse_document(content)
+            .map_err(|error| policy_diagnostic_text(&error.to_string()))?;
 
         Self::validate_loaded_policy(&policy)?;
         Ok(policy)
@@ -2513,8 +2566,11 @@ impl Policy {
         // policy to PARSE first. Duplicates are reported by the lenient `policy
         // validate` / `rule validate` validators instead.
         for (idx, rule) in policy.custom_rules.iter().enumerate() {
-            rule.validate_shape()
-                .map_err(|e| format!("custom_rules[{idx}] (id '{}'): {e}", rule.id))?;
+            let rule_id = policy_diagnostic_text(&rule.id);
+            rule.validate_shape().map_err(|e| {
+                let error = policy_diagnostic_text(&e.to_string());
+                format!("custom_rules[{idx}] (id '{rule_id}'): {error}")
+            })?;
         }
 
         Ok(())
@@ -3784,6 +3840,18 @@ mod tests {
         assert_eq!(diagnostics[0].matches("[REDACTED:custom]").count(), 2);
     }
 
+    #[test]
+    fn every_policy_diagnostic_uses_the_bounded_public_projection() {
+        let secret = format!("ghp_{}", "P".repeat(36));
+        let raw = format!("policy /Users/alice/private/{secret}.yaml failed: {secret}\nnext");
+        let rendered = policy_diagnostic_text(&raw);
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(!rendered.contains("/Users/alice"), "{rendered}");
+        assert!(!rendered.contains('\n'), "{rendered:?}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+        assert_eq!(policy_diagnostic_text("ordinary-policy"), "ordinary-policy");
+    }
+
     #[cfg(unix)]
     #[test]
     fn context_label_parent_swap_cannot_redirect_write() {
@@ -4064,6 +4132,23 @@ custom_rules:
             err.contains("both-shape") && err.contains("has both"),
             "error must name the rule and its both-shape defect: {err}"
         );
+    }
+
+    #[test]
+    fn invalid_custom_rule_identifier_is_projected_in_load_error() {
+        let secret = format!("ghp_{}", "P".repeat(36));
+        let yaml = format!(
+            r#"
+custom_rules:
+  - id: "rule-{secret}"
+    title: "invalid shape"
+    context: [exec]
+"#
+        );
+        let error = Policy::try_parse_yaml(&yaml).expect_err("invalid custom rule must fail");
+        assert!(!error.contains(&secret), "{error}");
+        assert!(error.contains("REDACTED"), "{error}");
+        assert!(error.contains("has neither"), "{error}");
     }
 
     #[test]
@@ -6095,6 +6180,66 @@ custom_rules:
         assert_ne!(
             base.security_projection_hash(),
             blocked.security_projection_hash(),
+        );
+    }
+
+    #[test]
+    fn security_projection_hashes_only_the_mandatory_secret_projection() {
+        let first_secret = format!("ghp_{}", "A".repeat(40));
+        let second_secret = format!("ghp_{}", "B".repeat(40));
+        let policy_with = |secret: &str| Policy {
+            blocklist: vec![format!("https://example.test/{secret}")],
+            dlp_custom_patterns: vec![format!("prefix-{secret}-suffix")],
+            custom_rules: vec![CustomRule {
+                id: "secret-projection".to_string(),
+                pattern: Some(secret.to_string()),
+                when: None,
+                context: vec!["exec".to_string()],
+                severity: Severity::High,
+                title: format!("credential {secret}"),
+                description: "fixture".to_string(),
+                action: Some(crate::verdict::Action::Block),
+            }],
+            ..Policy::default()
+        };
+        assert_eq!(
+            policy_with(&first_secret).security_projection_hash(),
+            policy_with(&second_secret).security_projection_hash(),
+            "changing only supported secret bytes must not create a durable policy oracle"
+        );
+
+        let contextual_map = |secret: &str| Policy {
+            context_destructive_verbs: HashMap::from([(
+                "WALLET_PASSWORD".to_string(),
+                vec![secret.to_string()],
+            )]),
+            ..Policy::default()
+        };
+        let contextual_first = contextual_map("hunter2");
+        let contextual_second = contextual_map("correct-horse-battery-staple");
+        assert_eq!(
+            contextual_first.security_projection_hash(),
+            contextual_second.security_projection_hash(),
+            "a sensitive map key must supply context before its values are hashed"
+        );
+        assert!(
+            !serde_json::to_string(&contextual_first.security_projection())
+                .expect("contextual projection")
+                .contains("hunter2")
+        );
+
+        let safe_a = Policy {
+            blocklist: vec!["alpha.example".to_string()],
+            ..Policy::default()
+        };
+        let safe_b = Policy {
+            blocklist: vec!["beta.example".to_string()],
+            ..Policy::default()
+        };
+        assert_ne!(
+            safe_a.security_projection_hash(),
+            safe_b.security_projection_hash(),
+            "ordinary non-secret posture content must remain bound"
         );
     }
 

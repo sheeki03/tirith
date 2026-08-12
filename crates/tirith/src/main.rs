@@ -2200,8 +2200,8 @@ Examples:
 Subcommands:
   tirith env guard on|off|status                  — flip the exec-path env-guard
         [--json]                                    rules (off by default).
-  tirith env diff [--reset]                       — show sensitive vars set /
-        [--json]                                    changed since shell start.
+  tirith env diff [--reset]                       — show sensitive vars newly set
+        [--json]                                    since shell start.
                                                     Exit 1 if any newly appeared.
   tirith env explain <VAR>                        — show where a var is set
         [--json]                                    (file:line, value MASKED).
@@ -2214,9 +2214,9 @@ What it protects:
   policy.env_guard_sensitive_vars.
 
 Value safety (load-bearing):
-  tirith NEVER prints, stores, or hashes-recoverably an env value. `explain`
-  masks values as ****; the shell-start snapshot stores variable NAMES plus an
-  8-char SHA-256 prefix for change-detection only — useless for value recovery.
+  tirith NEVER prints, persists, hashes, or baseline-compares an env value.
+  Credential-bearing RPC URLs are classified transiently; every snapshot entry
+  is still stored by NAME and presence only. `explain` masks values as ****.
 
 Examples:
   tirith env guard on
@@ -4540,16 +4540,16 @@ Examples:
         json: bool,
     },
 
-    /// Show sensitive vars set / changed since shell start (values masked)
+    /// Show sensitive vars newly set since shell start (values masked)
     #[command(after_help = "\
 What it shows:
   Compares the sensitive vars set in this process against the shell-start
   snapshot (state-dir/env_snapshot.json, written by the shell hook). Reports
-  which sensitive vars are newly-set or value-changed. VALUES ARE NEVER SHOWN —
-  change-detection uses an 8-char SHA-256 prefix only.
+  which sensitive vars are newly set. Sensitive values are presence-only and
+  are never shown, persisted, hashed, or compared with snapshot values.
 
 --reset:
-  Re-baseline the snapshot from the current environment (names + 8-char hashes).
+  Re-baseline the snapshot from the current environment (all values are presence-only).
 
 Exit codes:
   0  no sensitive var newly appeared (or --reset).

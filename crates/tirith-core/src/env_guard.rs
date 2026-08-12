@@ -1,21 +1,22 @@
 //! Environment-variable lifecycle monitoring (M9 ch4).
 //!
-//! Backs `tirith env guard|diff|explain`. The sensitive-variable list is the
-//! SAME one [`crate::safe_command`] uses for environment-scrubbing guidance
-//! (via [`sensitive_env_vars`]), with an optional user extension from
-//! [`crate::policy::Policy::env_guard_sensitive_vars`] — one source of truth.
+//! Backs `tirith env guard|diff|explain`. The sensitive-variable list comes from
+//! the typed [`crate::sensitive_assets`] registry, with an optional user extension
+//! from [`crate::policy::Policy::env_guard_sensitive_vars`] — one source of truth.
 //!
-//! Provides: [`EnvSnapshot`] (name + 8-char value-hash record, **never a raw
-//! value**), [`diff_sensitive`] (newly-set/changed sensitive vars since shell
-//! start), [`explain_var`] (where a var is `export`ed — file+line, **value
-//! masked**), and rule helpers for the three M9 ch4 [`RuleId`]s. The rules take
+//! Provides: [`EnvSnapshot`] (categorical variable-name presence only),
+//! [`diff_sensitive`] (newly-set, legacy-comparable, or unresolved sensitive
+//! vars since shell start),
+//! [`explain_var`] (where a var is `export`ed — file+line, **value masked**),
+//! and rule helpers for the three M9 ch4 [`RuleId`]s. The rules take
 //! the set of set sensitive var names as a `&[String]` so they are unit-testable
 //! without mutating `std::env` (the libc `setenv` race, PR #125).
 //!
 //! Why a child process writes the snapshot: the shell hook execs
 //! `tirith env _snapshot` rather than piping env values (which would put secrets
 //! on a pipe/tmpfile). The child reads its OWN inherited `std::env` and writes
-//! names + 8-char hashes — no value crosses an argv boundary or temp file.
+//! variable names only — no value-derived hash, prefix, or raw value crosses an
+//! argv boundary or persistence boundary.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,9 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::tokenize::ShellType;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// Re-export of the single source-of-truth sensitive env-var list. M9 ch4
-/// shares the exact list the M6 ch5 environment-scrubbing guidance uses; see
-/// [`crate::safe_command::sensitive_env_vars`].
+/// Compatibility re-export of the stable static slice exposed by the safe
+/// command subsystem. Both accessors derive from the typed central registry.
 pub use crate::safe_command::sensitive_env_vars;
 
 /// Schema version for the on-disk env snapshot. Bump + migrate on layout
@@ -36,73 +36,301 @@ fn default_schema_version() -> u32 {
     1
 }
 
-/// Leading hex chars of `SHA-256(value)` stored per variable. 8 chars = 32 bits:
-/// enough to detect a change, far too short to brute-force a secret back out.
-/// The full digest is never persisted.
+const CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+const MAX_ENV_NAME_BYTES: usize = 256;
+const REDACTED_ENV_NAME: &str = "[REDACTED:env_name]";
+
+fn project_env_text(value: &str) -> String {
+    let share_safe =
+        crate::redact::redact_for_audience(value, crate::redact::ShareAudience::PublicPaste)
+            .redacted_content;
+    crate::redact::redact_blocked_output(&share_safe)
+}
+
+fn privacy_safe_env_name(name: &str) -> Option<&str> {
+    (!name.is_empty() && name.len() <= MAX_ENV_NAME_BYTES && project_env_text(name) == name)
+        .then_some(name)
+}
+
+fn projected_env_name(name: &str) -> String {
+    privacy_safe_env_name(name)
+        .unwrap_or(REDACTED_ENV_NAME)
+        .to_string()
+}
+
+/// Leading hex chars returned by the legacy public [`value_hash8`] helper.
+/// Snapshots no longer persist value-derived identifiers.
 pub const VALUE_HASH_PREFIX_LEN: usize = 8;
 
-/// One recorded variable in the snapshot: its name and an 8-char value-hash
-/// prefix. The raw value is NEVER stored.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One recorded variable in the snapshot. Every production constructor uses
+/// categorical presence only (`value_hash8 = ""`). The field remains a String
+/// for source compatibility, but snapshot serialization never persists a
+/// value-derived identifier for any variable.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SnapshotVar {
     /// The variable name (e.g. `AWS_SECRET_ACCESS_KEY`).
     pub name: String,
-    /// First [`VALUE_HASH_PREFIX_LEN`] hex chars of `SHA-256(value)`. Used
-    /// only for change-detection. Empty string for a recorded-but-empty value.
+    /// Legacy compatibility field. Production construction, deserialization,
+    /// debug formatting, and serialization always normalize it to empty.
     pub value_hash8: String,
 }
 
-/// A point-in-time snapshot of env variable NAMES plus 8-char value-hash
-/// prefixes, taken at shell start and persisted to `state_dir()/env_snapshot.json`.
+impl std::fmt::Debug for SnapshotVar {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotVar")
+            .field("name", &projected_env_name(&self.name))
+            .field("value_hash8", &"")
+            .finish()
+    }
+}
+
+impl Serialize for SnapshotVar {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        let mut state = serializer.serialize_struct("SnapshotVar", 2)?;
+        state.serialize_field("name", &projected_env_name(&self.name))?;
+        state.serialize_field("value_hash8", "")?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SnapshotVar {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            name: String,
+            #[serde(default)]
+            value_hash8: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let _ = wire.value_hash8;
+        Ok(Self {
+            value_hash8: String::new(),
+            name: projected_env_name(&wire.name),
+        })
+    }
+}
+
+/// A point-in-time environment snapshot. Variables persist name presence only.
 ///
-/// Contains NO raw values and NO full hashes. Still written `0600` by
+/// Contains no raw values and no value-derived hashes. Still written `0600` by
 /// [`save_snapshot`] because the *set of names* is itself mildly sensitive (it
 /// reveals which credentials you hold).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EnvSnapshot {
     /// Snapshot schema version (forward-compat migrations).
-    #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     /// Unix epoch seconds the snapshot was taken (informational).
-    #[serde(default)]
     pub taken_at: u64,
     /// Recorded variables keyed by name. A `BTreeMap` keeps the on-disk JSON
     /// deterministic.
-    #[serde(default)]
     pub vars: BTreeMap<String, SnapshotVar>,
 }
 
+fn sanitized_snapshot_vars(vars: &BTreeMap<String, SnapshotVar>) -> BTreeMap<String, SnapshotVar> {
+    vars.iter()
+        .filter(|(name, _)| {
+            privacy_safe_env_name(name).is_some()
+                && crate::sensitive_assets::sensitive_env_kind(name)
+                    != Some(crate::sensitive_assets::SensitiveEnvKind::RpcEndpoint)
+        })
+        .map(|(name, variable)| {
+            let _ = variable;
+            (
+                name.clone(),
+                SnapshotVar {
+                    name: name.clone(),
+                    value_hash8: String::new(),
+                },
+            )
+        })
+        .collect()
+}
+
+impl std::fmt::Debug for EnvSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvSnapshot")
+            .field("schema_version", &self.schema_version)
+            .field("taken_at", &self.taken_at)
+            .field("vars", &sanitized_snapshot_vars(&self.vars))
+            .finish()
+    }
+}
+
+impl Serialize for EnvSnapshot {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        let mut state = serializer.serialize_struct("EnvSnapshot", 3)?;
+        state.serialize_field("schema_version", &self.schema_version)?;
+        state.serialize_field("taken_at", &self.taken_at)?;
+        state.serialize_field("vars", &sanitized_snapshot_vars(&self.vars))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default = "default_schema_version")]
+            schema_version: u32,
+            #[serde(default)]
+            taken_at: u64,
+            #[serde(default)]
+            vars: BTreeMap<String, SnapshotVar>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.schema_version > CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION {
+            return Err(serde::de::Error::custom(
+                "unsupported future env snapshot schema",
+            ));
+        }
+        Ok(Self {
+            schema_version: wire.schema_version,
+            taken_at: wire.taken_at,
+            vars: sanitized_snapshot_vars(&wire.vars),
+        })
+    }
+}
+
+impl Default for EnvSnapshot {
+    fn default() -> Self {
+        Self {
+            schema_version: CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION,
+            taken_at: 0,
+            vars: BTreeMap::new(),
+        }
+    }
+}
+
 impl EnvSnapshot {
-    /// Build a snapshot from `(name, value)` pairs — the production caller
-    /// passes `std::env::vars()`; tests pass a synthetic iterator. Only the
-    /// 8-char value-hash prefix is retained; the value is dropped immediately.
+    fn from_nonempty_env_names<I, K>(names: I, taken_at: u64) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: AsRef<str>,
+    {
+        let mut vars = BTreeMap::new();
+        for name in names {
+            let name = name.as_ref().to_string();
+            if privacy_safe_env_name(&name).is_none() {
+                continue;
+            }
+            if crate::sensitive_assets::sensitive_env_kind(&name)
+                == Some(crate::sensitive_assets::SensitiveEnvKind::RpcEndpoint)
+            {
+                continue;
+            }
+            vars.insert(
+                name.clone(),
+                SnapshotVar {
+                    name,
+                    value_hash8: String::new(),
+                },
+            );
+        }
+        EnvSnapshot {
+            schema_version: CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION,
+            taken_at,
+            vars,
+        }
+    }
+
+    fn migrate_presence_only(&mut self, _extra_sensitive: &[String]) -> bool {
+        let mut changed = self.schema_version < CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION;
+        let previous_len = self.vars.len();
+        // An RPC-named value can move from public to credential-bearing without
+        // changing its name. Never let an untrusted/persisted baseline suppress
+        // that transition; RPC state is therefore intentionally not baselined.
+        self.vars.retain(|name, _| {
+            privacy_safe_env_name(name).is_some()
+                && crate::sensitive_assets::sensitive_env_kind(name)
+                    != Some(crate::sensitive_assets::SensitiveEnvKind::RpcEndpoint)
+        });
+        changed |= self.vars.len() != previous_len;
+        for (name, var) in &mut self.vars {
+            if var.name != name.as_str() {
+                var.name.clone_from(name);
+                changed = true;
+            }
+            if !var.value_hash8.is_empty() {
+                var.value_hash8.clear();
+                changed = true;
+            }
+        }
+        self.schema_version = CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION;
+        changed
+    }
+
+    /// Build a snapshot using the built-in registry privacy boundary.
     pub fn from_env_pairs<I, K, V>(pairs: I, taken_at: u64) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: AsRef<str>,
     {
-        let mut vars = BTreeMap::new();
-        for (k, v) in pairs {
-            let name = k.as_ref().to_string();
-            let value_hash8 = value_hash8(v.as_ref());
-            vars.insert(name.clone(), SnapshotVar { name, value_hash8 });
-        }
-        EnvSnapshot {
-            schema_version: 1,
+        Self::from_env_pairs_with_sensitive(pairs, taken_at, &[])
+    }
+
+    /// Build a snapshot while preserving the stable caller/policy-sensitive
+    /// argument. Every variable persists as name presence only; no value is
+    /// hashed or converted to text.
+    pub fn from_env_pairs_with_sensitive<I, K, V>(
+        pairs: I,
+        taken_at: u64,
+        _extra_sensitive: &[String],
+    ) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        Self::from_nonempty_env_names(
+            pairs
+                .into_iter()
+                .filter_map(|(name, value)| (!value.as_ref().is_empty()).then_some(name)),
             taken_at,
-            vars,
-        }
+        )
     }
 
     /// Build a snapshot from the current process environment. Used by the
     /// hidden `tirith env _snapshot` child the shell hook execs.
     pub fn from_current_process() -> Self {
+        Self::from_current_process_with_sensitive(&[])
+    }
+
+    pub fn from_current_process_with_sensitive(_extra_sensitive: &[String]) -> Self {
         let taken_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        Self::from_env_pairs(std::env::vars(), taken_at)
+        // `vars()` panics when either side of any inherited Unix entry is not
+        // UTF-8 and unnecessarily converts every value into text. Snapshot v3
+        // records non-empty name presence only: iterate OsStrings, inspect only
+        // the value's empty bit (never decode it), and admit only names that are
+        // valid Unicode and pass the same public-name projection used by every
+        // other constructor.
+        let names = std::env::vars_os().filter_map(|(name, value)| {
+            if value.as_os_str().is_empty() {
+                None
+            } else {
+                name.into_string().ok()
+            }
+        });
+        Self::from_nonempty_env_names(names, taken_at)
     }
 }
 
@@ -135,8 +363,14 @@ fn hex_encode(bytes: &[u8]) -> String {
 pub enum EnvDelta {
     /// Set now, absent in the snapshot.
     NewlySet,
-    /// Present in both, but the 8-char value-hash differs.
+    /// Legacy compatibility state supplied directly by a caller carried two
+    /// different non-empty markers.
     ValueChanged,
+    /// The variable was present at both observations, but at least one side has
+    /// crossed the presence-only persistence boundary or belongs to another
+    /// process-local comparison domain. Reporting this state is deliberately
+    /// conservative: claiming "unchanged" would be false confidence.
+    ValueComparisonUnavailable,
 }
 
 impl EnvDelta {
@@ -144,44 +378,125 @@ impl EnvDelta {
         match self {
             EnvDelta::NewlySet => "newly_set",
             EnvDelta::ValueChanged => "value_changed",
+            EnvDelta::ValueComparisonUnavailable => "value_comparison_unavailable",
         }
     }
 }
 
 /// One sensitive-variable difference reported by [`diff_sensitive`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EnvDiffEntry {
     /// The sensitive variable name.
+    #[serde(
+        serialize_with = "serialize_projected_env_name",
+        deserialize_with = "deserialize_projected_env_name"
+    )]
     pub name: String,
     /// What changed.
     pub delta: EnvDelta,
 }
 
-/// Report sensitive vars NEWLY-SET or value-CHANGED since the shell-start
-/// snapshot. `current` is `(name → 8-char value-hash)` for the set sensitive
-/// vars; `sensitive` is the effective name list (built-in ∪ policy extension).
-/// Unchanged or now-unset vars are not reported — the guard surfaces what
-/// *appeared* since shell start.
+impl std::fmt::Debug for EnvDiffEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvDiffEntry")
+            .field("name", &projected_env_name(&self.name))
+            .field("delta", &self.delta)
+            .finish()
+    }
+}
+
+fn serialize_projected_env_name<S>(name: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&projected_env_name(name))
+}
+
+fn deserialize_projected_env_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(|name| projected_env_name(&name))
+}
+
+enum MarkerComparison {
+    Same,
+    Changed,
+    Unavailable,
+}
+
+fn compare_value_markers(previous: &str, current: &str) -> MarkerComparison {
+    if previous.is_empty() || current.is_empty() {
+        return MarkerComparison::Unavailable;
+    }
+
+    if previous == current {
+        MarkerComparison::Same
+    } else {
+        MarkerComparison::Changed
+    }
+}
+
+/// Report sensitive vars newly present, changed, or impossible to compare
+/// safely since the shell-start snapshot. The map retains its legacy `String`
+/// value type. Production snapshots and current maps carry empty presence
+/// markers and therefore produce [`EnvDelta::ValueComparisonUnavailable`]
+/// instead of a false "unchanged" result. Direct legacy callers that provide
+/// two non-empty comparison markers retain their previous behavior.
 pub fn diff_sensitive(
     snapshot: &EnvSnapshot,
     current: &BTreeMap<String, String>,
     sensitive: &[String],
 ) -> Vec<EnvDiffEntry> {
     let mut out = Vec::new();
-    for name in sensitive {
+    let names = sensitive
+        .iter()
+        .cloned()
+        .chain(current.keys().cloned())
+        .chain(
+            snapshot
+                .vars
+                .keys()
+                .filter(|name| {
+                    crate::sensitive_assets::is_sensitive_env_name(name)
+                        || sensitive
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+                })
+                .cloned(),
+        )
+        .filter(|name| privacy_safe_env_name(name).is_some())
+        .collect::<std::collections::BTreeSet<_>>();
+    for name in &names {
         let Some(cur_hash) = current.get(name) else {
             continue; // not set now → nothing appeared
         };
+        if crate::sensitive_assets::sensitive_env_kind(name)
+            == Some(crate::sensitive_assets::SensitiveEnvKind::RpcEndpoint)
+        {
+            out.push(EnvDiffEntry {
+                name: name.clone(),
+                delta: EnvDelta::NewlySet,
+            });
+            continue;
+        }
         match snapshot.vars.get(name) {
             None => out.push(EnvDiffEntry {
                 name: name.clone(),
                 delta: EnvDelta::NewlySet,
             }),
-            Some(prev) if &prev.value_hash8 != cur_hash => out.push(EnvDiffEntry {
-                name: name.clone(),
-                delta: EnvDelta::ValueChanged,
-            }),
-            Some(_) => {} // unchanged
+            Some(prev) => match compare_value_markers(&prev.value_hash8, cur_hash) {
+                MarkerComparison::Same => {}
+                MarkerComparison::Changed => out.push(EnvDiffEntry {
+                    name: name.clone(),
+                    delta: EnvDelta::ValueChanged,
+                }),
+                MarkerComparison::Unavailable => out.push(EnvDiffEntry {
+                    name: name.clone(),
+                    delta: EnvDelta::ValueComparisonUnavailable,
+                }),
+            },
         }
     }
     // Deterministic output regardless of the `sensitive` list ordering.
@@ -189,17 +504,30 @@ pub fn diff_sensitive(
     out
 }
 
-/// The set sensitive vars in *this* process as a `(name → 8-char value-hash)`
-/// map, to feed [`diff_sensitive`]. Empty-valued vars are treated as unset
-/// (no secret), matching the guard's decision not to report empty values.
+/// The set sensitive vars in this process as a presence-only map. Empty-valued
+/// vars are treated as unset. Values are never converted to text or hashed.
 pub fn current_sensitive_in_process(sensitive: &[String]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
-    for name in sensitive {
-        if let Some(val) = std::env::var_os(name) {
-            let val = val.to_string_lossy();
-            if !val.is_empty() {
-                map.insert(name.clone(), value_hash8(&val));
-            }
+    for (name, value) in std::env::vars_os() {
+        let Ok(name) = name.into_string() else {
+            continue;
+        };
+        let policy_sensitive = sensitive
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&name));
+        let registry_sensitive = match crate::sensitive_assets::sensitive_env_kind(&name) {
+            Some(crate::sensitive_assets::SensitiveEnvKind::RpcEndpoint) => value
+                .to_str()
+                .map(|value| crate::sensitive_assets::is_sensitive_env_assignment(&name, value))
+                .unwrap_or(true),
+            Some(kind) => kind.is_secret(),
+            None => false,
+        };
+        if !value.is_empty()
+            && (registry_sensitive || policy_sensitive)
+            && privacy_safe_env_name(&name).is_some()
+        {
+            map.insert(name, String::new());
         }
     }
     map
@@ -210,10 +538,8 @@ pub fn current_sensitive_in_process(sensitive: &[String]) -> BTreeMap<String, St
 /// the engine rules — passing it explicitly (rather than reading `std::env`
 /// inside the rule) keeps the rule unit-testable without an env mutation.
 pub fn sensitive_env_set_in_process(sensitive: &[String]) -> Vec<String> {
-    sensitive
-        .iter()
-        .filter(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
-        .cloned()
+    current_sensitive_in_process(sensitive)
+        .into_keys()
         .collect()
 }
 
@@ -222,10 +548,14 @@ pub fn sensitive_env_set_in_process(sensitive: &[String]) -> Vec<String> {
 /// the extras in their given order. This is the single place the two sources
 /// are combined.
 pub fn effective_sensitive_vars(extra: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = sensitive_env_vars().iter().map(|s| s.to_string()).collect();
+    let mut out: Vec<String> = sensitive_env_vars()
+        .iter()
+        .copied()
+        .map(str::to_string)
+        .collect();
     for e in extra {
         let e = e.trim();
-        if !e.is_empty() && !out.iter().any(|x| x == e) {
+        if privacy_safe_env_name(e).is_some() && !out.iter().any(|x| x == e) {
             out.push(e.to_string());
         }
     }
@@ -235,22 +565,60 @@ pub fn effective_sensitive_vars(extra: &[String]) -> Vec<String> {
 // ─── explain ─────────────────────────────────────────────────────────────────
 
 /// Where a variable is `export`ed: a source file + 1-based line number.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EnvSource {
     /// Display path of the rc/profile file.
+    #[serde(
+        serialize_with = "serialize_projected_text",
+        deserialize_with = "deserialize_projected_text"
+    )]
     pub file: String,
     /// 1-based line number of the `export`/`set` directive.
     pub line: usize,
-    /// The directive line with the VALUE MASKED to `****`. The raw value is
-    /// never read into this string.
+    /// The directive line after value masking and mandatory public projection.
+    /// Sensitive assignment shapes may therefore collapse to a categorical
+    /// `[REDACTED…]` marker. The raw value is never read into this string.
+    #[serde(
+        serialize_with = "serialize_projected_text",
+        deserialize_with = "deserialize_projected_text"
+    )]
     pub masked_line: String,
+}
+
+fn serialize_projected_text<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&project_env_text(value))
+}
+
+fn deserialize_projected_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(|value| project_env_text(&value))
+}
+
+impl std::fmt::Debug for EnvSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvSource")
+            .field("file", &project_env_text(&self.file))
+            .field("line", &self.line)
+            .field("masked_line", &project_env_text(&self.masked_line))
+            .finish()
+    }
 }
 
 /// Result of [`explain_var`]: every rc/profile location that exports `name`,
 /// plus whether it is currently set in the live process environment.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct EnvExplain {
     /// The variable queried.
+    #[serde(
+        serialize_with = "serialize_projected_env_name",
+        deserialize_with = "deserialize_projected_env_name"
+    )]
     pub name: String,
     /// `true` if the variable is set in the current process environment
     /// (regardless of where — could be inherited, set inline, etc.).
@@ -259,12 +627,24 @@ pub struct EnvExplain {
     pub sources: Vec<EnvSource>,
 }
 
+impl std::fmt::Debug for EnvExplain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvExplain")
+            .field("name", &projected_env_name(&self.name))
+            .field("set_in_process", &self.set_in_process)
+            .field("sources", &self.sources)
+            .finish()
+    }
+}
+
 /// Explain where `name` is set: scans the user's rc/profile files for an
 /// `export`/`set -x`/`$env:` directive and reports file + line (value masked),
 /// plus whether it is currently set in this process.
 ///
 /// **The value is never read or printed** — [`mask_assignment`] replaces it
-/// with `****`.
+/// with `****`, after which mandatory public projection may collapse the whole
+/// sensitive assignment to a categorical `[REDACTED…]` marker.
 pub fn explain_var(name: &str) -> EnvExplain {
     let home = home::home_dir();
     explain_var_in(name, home.as_deref())
@@ -272,6 +652,13 @@ pub fn explain_var(name: &str) -> EnvExplain {
 
 /// Testable core of [`explain_var`]: scan rc files under `home`.
 pub fn explain_var_in(name: &str, home: Option<&Path>) -> EnvExplain {
+    let Some(name) = privacy_safe_env_name(name) else {
+        return EnvExplain {
+            name: REDACTED_ENV_NAME.to_string(),
+            set_in_process: false,
+            sources: Vec::new(),
+        };
+    };
     let set_in_process = std::env::var_os(name).is_some();
     let mut sources = Vec::new();
     if let Some(home) = home {
@@ -297,25 +684,47 @@ pub fn scan_rc_for_sensitive_exports(sensitive: &[String], home: Option<&Path>) 
     let Some(home) = home else {
         return findings;
     };
-    for name in sensitive {
-        let mut sources = Vec::new();
-        for rel in RC_FILES {
-            scan_rc_for_export(&home.join(rel), name, &mut sources);
-        }
-        for src in sources {
+    for rel in RC_FILES {
+        let path = home.join(rel);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (index, raw) in contents.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some(name) = exported_var_name(line) else {
+                continue;
+            };
+            let Some(name) = privacy_safe_env_name(name) else {
+                continue;
+            };
+            let registry_sensitive = crate::sensitive_assets::is_sensitive_env_name(name)
+                || exported_var_value(line, name).is_some_and(|value| {
+                    crate::sensitive_assets::is_sensitive_env_assignment(name, value)
+                });
+            if !registry_sensitive
+                && !sensitive
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            let masked_line = mask_assignment(line, name);
+            let line_number = index + 1;
+            let file = path.display().to_string();
             findings.push(Finding {
                 rule_id: RuleId::EnvSensitivePersistedInShellRc,
                 severity: Severity::High,
                 title: format!("Sensitive env var {name} exported in a shell rc/profile"),
                 description: format!(
-                    "{name} is exported in {} (line {}). A credential persisted in shell \
+                    "{name} is exported in {file} (line {line_number}). A credential persisted in shell \
                      config loads into every shell and is a common exfiltration target. \
-                     Load it on demand instead. (value masked: {})",
-                    src.file, src.line, src.masked_line
+                     Load it on demand instead. (value masked: {masked_line})"
                 ),
                 evidence: vec![Evidence::Text {
-                    // The masked_line already has the value replaced with ****.
-                    detail: format!("{}:{} {}", src.file, src.line, src.masked_line),
+                    detail: format!("{file}:{line_number} {masked_line}"),
                 }],
                 human_view: None,
                 agent_view: None,
@@ -353,9 +762,9 @@ fn scan_rc_for_export(path: &Path, name: &str, out: &mut Vec<EnvSource>) {
         }
         if line_exports_var(line, name) {
             out.push(EnvSource {
-                file: path.display().to_string(),
+                file: project_env_text(&path.display().to_string()),
                 line: idx + 1,
-                masked_line: mask_assignment(line, name),
+                masked_line: project_env_text(&mask_assignment(line, name)),
             });
         }
     }
@@ -368,16 +777,18 @@ fn scan_rc_for_export(path: &Path, name: &str, out: &mut Vec<EnvSource>) {
 ///   * `setenv NAME …` (csh/tcsh)
 ///   * `$env:NAME = …` (PowerShell)
 fn line_exports_var(line: &str, name: &str) -> bool {
+    exported_var_name(line).is_some_and(|candidate| candidate == name)
+}
+
+fn exported_var_name(line: &str) -> Option<&str> {
     // PowerShell `$env:NAME = ...`
     if let Some(rest) = line.strip_prefix("$env:") {
         let var = rest.split(['=', ' ', '\t']).next().unwrap_or("");
-        return var == name;
+        return (!var.is_empty()).then_some(var);
     }
 
     let mut toks = line.split_whitespace();
-    let Some(first) = toks.next() else {
-        return false;
-    };
+    let first = toks.next()?;
 
     // fish: `set -x NAME ...` / `set --export NAME ...` / `setenv NAME ...`
     if first == "set" {
@@ -385,12 +796,12 @@ fn line_exports_var(line: &str, name: &str) -> bool {
             if t.starts_with('-') {
                 continue; // flag (-x, --export, -gx, …)
             }
-            return t == name;
+            return Some(t.trim_end_matches('='));
         }
-        return false;
+        return None;
     }
     if first == "setenv" {
-        return toks.next() == Some(name);
+        return toks.next();
     }
 
     // POSIX: optional leading `export` / `declare -x` / `typeset -x`, then
@@ -404,13 +815,23 @@ fn line_exports_var(line: &str, name: &str) -> bool {
         }
         _ => Some(first),
     };
-    match assign_tok {
-        Some(tok) => tok
-            .split_once('=')
-            .map(|(lhs, _)| lhs == name)
-            .unwrap_or(false),
-        None => false,
+    assign_tok.and_then(|token| token.split_once('=').map(|(name, _)| name))
+}
+
+fn exported_var_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    if line.starts_with("$env:") {
+        return line.split_once('=').map(|(_, value)| value.trim());
     }
+    let token = line.split_whitespace().find(|token| {
+        token
+            .trim_end_matches('=')
+            .split_once('=')
+            .map_or(*token, |(candidate, _)| candidate)
+            == name
+    })?;
+    let name_offset = line.find(token)?;
+    let after_name = &line[name_offset + name.len()..];
+    Some(after_name.strip_prefix('=').unwrap_or(after_name).trim())
 }
 
 /// Replace the assigned value of `name` in `line` with `****`. Operates on the
@@ -481,39 +902,155 @@ pub fn snapshot_path() -> Option<PathBuf> {
 /// the file is missing or unparseable — a missing snapshot is the expected
 /// "no shell-start baseline yet" state, not an error.
 pub fn load_snapshot(path: &Path) -> EnvSnapshot {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    load_snapshot_with_sensitive(path, &[])
 }
 
-/// Persist `snapshot` to `path`. On Unix the file is created `0600` AT OPEN TIME
-/// (via `OpenOptions::mode`) so there is no umask-race window where the snapshot
-/// is briefly world-readable. A chmod failure is propagated.
-pub fn save_snapshot(path: &Path, snapshot: &EnvSnapshot) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Load and migrate an environment snapshot. Legacy value-derived markers are
+/// discarded for every variable immediately and never returned. The
+/// caller/policy-sensitive argument is retained for API compatibility.
+pub fn load_snapshot_with_sensitive(path: &Path, extra_sensitive: &[String]) -> EnvSnapshot {
+    load_snapshot_and_migrate(path, extra_sensitive).unwrap_or_default()
+}
+
+/// Checked normal-workflow loader. Legacy value-derived markers are removed for
+/// every variable and the upgraded schema is atomically persisted before it is
+/// returned. A parse, read, or migration-write failure is surfaced so callers
+/// can fail safely instead of continuing from an unpersisted or empty baseline.
+pub fn load_snapshot_and_migrate(
+    path: &Path,
+    extra_sensitive: &[String],
+) -> std::io::Result<EnvSnapshot> {
+    load_snapshot_and_migrate_with(path, extra_sensitive, save_snapshot_with_sensitive)
+}
+
+fn load_snapshot_and_migrate_with<F>(
+    path: &Path,
+    extra_sensitive: &[String],
+    persist: F,
+) -> std::io::Result<EnvSnapshot>
+where
+    F: FnOnce(&Path, &EnvSnapshot, &[String]) -> std::io::Result<()>,
+{
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(EnvSnapshot::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let raw_value = serde_json::from_str::<serde_json::Value>(&raw)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let schema_version = raw_value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| u64::from(default_schema_version()));
+    if schema_version > u64::from(CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION) {
+        // Do not deserialize-and-rewrite a schema owned by a newer binary:
+        // unknown fields must remain byte-for-byte intact.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported future env snapshot schema",
+        ));
     }
-    let json = serde_json::to_string_pretty(snapshot)
+    let raw_requires_presence_migration = raw_value
+        .get("vars")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|variables| {
+            variables.iter().any(|(map_name, variable)| {
+                let declared_name = variable
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(map_name);
+                let has_nonempty_hash = variable
+                    .get("value_hash8")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|hash| !hash.is_empty());
+                privacy_safe_env_name(map_name).is_none()
+                    || privacy_safe_env_name(declared_name).is_none()
+                    || declared_name != map_name
+                    || has_nonempty_hash
+                    || crate::sensitive_assets::sensitive_env_kind(map_name)
+                        == Some(crate::sensitive_assets::SensitiveEnvKind::RpcEndpoint)
+            })
+        });
+    let mut snapshot: EnvSnapshot = serde_json::from_str(&raw)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let migrated = snapshot.migrate_presence_only(extra_sensitive);
+    if raw_requires_presence_migration || migrated {
+        persist(path, &snapshot, extra_sensitive)?;
+    }
+    Ok(snapshot)
+}
+
+/// Persist `snapshot` to `path` via a same-directory temporary file and atomic
+/// replacement. On Unix the temporary file is mode `0600` before any snapshot
+/// bytes are written, so there is no world-readable or truncate-in-place window.
+pub fn save_snapshot(path: &Path, snapshot: &EnvSnapshot) -> std::io::Result<()> {
+    save_snapshot_with_sensitive(path, snapshot, &[])
+}
+
+/// Persist a snapshot after enforcing presence-only storage for every variable.
+/// This sink-side guard also protects callers that constructed or deserialized
+/// an `EnvSnapshot` directly. The extra-name argument remains API-compatible.
+pub fn save_snapshot_with_sensitive(
+    path: &Path,
+    snapshot: &EnvSnapshot,
+    extra_sensitive: &[String],
+) -> std::io::Result<()> {
+    if snapshot.schema_version > CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported future env snapshot schema",
+        ));
+    }
+    match std::fs::read_to_string(path) {
+        Ok(existing) => {
+            if serde_json::from_str::<serde_json::Value>(&existing)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("schema_version")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .is_some_and(|version| version > u64::from(CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "refusing to replace a future env snapshot schema",
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut snapshot = snapshot.clone();
+    snapshot.migrate_presence_only(extra_sensitive);
+    let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    use std::io::Write as _;
-    f.write_all(json.as_bytes())?;
-
-    // `OpenOptions::mode` only applies on file *creation* — if the file
-    // already existed (re-baseline) with looser perms, tighten it now.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    use std::io::Write as _;
+    temporary.write_all(json.as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    {
+        // Durably publish the rename itself. Without a directory fsync, a
+        // reported-success crash can resurrect the pre-migration snapshot.
+        std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
 }
@@ -530,14 +1067,18 @@ pub fn check_sensitive_exposed_to_unknown_script(
     shell: ShellType,
     set_sensitive: &[String],
 ) -> Option<Finding> {
-    if set_sensitive.is_empty() {
+    let safe_names = set_sensitive
+        .iter()
+        .filter_map(|name| privacy_safe_env_name(name))
+        .collect::<Vec<_>>();
+    if safe_names.is_empty() {
         return None;
     }
     if !is_pipe_to_interpreter_shape(cmd, shell) {
         return None;
     }
     // List the exposed var NAMES (never values) in the evidence.
-    let names = set_sensitive.join(", ");
+    let names = safe_names.join(", ");
     Some(Finding {
         rule_id: RuleId::EnvSensitiveExposedToUnknownScript,
         severity: Severity::High,
@@ -546,7 +1087,7 @@ pub fn check_sensitive_exposed_to_unknown_script(
             "{} sensitive environment variable(s) are set and this command pipes \
              remote content into a shell interpreter. A malicious script inherits \
              and can exfiltrate them. Exposed: {names}.",
-            set_sensitive.len()
+            safe_names.len()
         ),
         evidence: vec![Evidence::Text {
             detail: format!("sensitive_env_set={names}"),
@@ -660,7 +1201,7 @@ fn is_pipe_to_interpreter_shape(cmd: &str, shell: ShellType) -> bool {
 /// an unrecognized command may parse, aggregate, or discard its input
 /// (`wc -c`, `sha256sum`), so propagation stops there rather than risk blaming
 /// a downstream sink for data it never received.
-fn is_data_preserving_transform(name: &str) -> bool {
+pub(crate) fn is_data_preserving_transform(name: &str) -> bool {
     matches!(
         name,
         // encoders / encryptors
@@ -785,11 +1326,44 @@ fn strip_quotes(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    struct TestProcessEnv(Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>);
+
+    #[cfg(unix)]
+    impl TestProcessEnv {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+
+        fn set(&mut self, name: std::ffi::OsString, value: std::ffi::OsString) {
+            let previous = std::env::var_os(&name);
+            // SAFETY: the test owns the crate-wide environment lock until this
+            // guard restores every entry.
+            unsafe { std::env::set_var(&name, value) };
+            self.0.push((name, previous));
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestProcessEnv {
+        fn drop(&mut self) {
+            for (name, previous) in self.0.drain(..).rev() {
+                // SAFETY: the owning test still holds the crate-wide lock.
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
     fn s(v: &str) -> String {
         v.to_string()
     }
 
-    // ── snapshot + hashing ────────────────────────────────────────────────
+    // ── snapshot compatibility + presence-only persistence ───────────────
 
     #[test]
     fn value_hash8_is_8_chars_and_value_free() {
@@ -806,29 +1380,426 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_from_pairs_stores_names_and_hashes_only() {
+    fn snapshot_serialization_is_presence_only_and_rpc_names_are_not_baselined() {
         let snap = EnvSnapshot::from_env_pairs(
             [
                 ("AWS_SECRET_ACCESS_KEY", "AKIAsecretvalue"),
+                ("RPC_URL", "https://rpc.example"),
+                (
+                    "ETH_RPC_URL",
+                    "https://rpc.example/v3/providerToken123456789?api_key=hunter2",
+                ),
                 ("PATH", "/usr/bin"),
             ],
             123,
         );
         let v = snap.vars.get("AWS_SECRET_ACCESS_KEY").unwrap();
-        assert_eq!(v.value_hash8.len(), 8);
-        // Serialize the whole snapshot and confirm no raw value leaks.
+        assert_eq!(v.value_hash8, "");
+        assert!(!snap.vars.contains_key("RPC_URL"));
+        assert!(!snap.vars.contains_key("ETH_RPC_URL"));
+        assert_eq!(snap.vars["PATH"].value_hash8, "");
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("AKIAsecretvalue"), "{json}");
+        assert!(!json.contains(&value_hash8("AKIAsecretvalue")), "{json}");
+        assert!(!json.contains("providerToken123456789"), "{json}");
+        assert!(
+            !json.contains(&value_hash8("providerToken123456789")),
+            "{json}"
+        );
         assert!(json.contains("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_process_snapshot_never_text_converts_values_and_skips_non_utf8_names() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut restore = TestProcessEnv::new();
+        let safe_name = std::ffi::OsString::from("TIRITH_C04_NON_UTF8_VALUE");
+        restore.set(
+            safe_name,
+            std::ffi::OsString::from_vec(vec![b'v', b'a', b'l', b'u', b'e', 0xff]),
+        );
+        restore.set(
+            std::ffi::OsString::from("TIRITH_C04_EMPTY_VALUE"),
+            std::ffi::OsString::new(),
+        );
+        let unsafe_name = std::ffi::OsString::from_vec(b"TIRITH_C04_NON_UTF8_NAME_\xff".to_vec());
+        restore.set(unsafe_name, std::ffi::OsString::from("set"));
+
+        let snapshot = EnvSnapshot::from_current_process_with_sensitive(&[]);
+        assert!(snapshot.vars.contains_key("TIRITH_C04_NON_UTF8_VALUE"));
+        assert!(!snapshot.vars.contains_key("TIRITH_C04_EMPTY_VALUE"));
+        assert_eq!(snapshot.vars["TIRITH_C04_NON_UTF8_VALUE"].value_hash8, "");
+        let public = serde_json::to_string(&snapshot).unwrap();
+        assert!(public.contains("TIRITH_C04_NON_UTF8_VALUE"), "{public}");
+        assert!(!public.contains("TIRITH_C04_NON_UTF8_NAME"), "{public}");
+
+        let current = current_sensitive_in_process(&[s("TIRITH_C04_NON_UTF8_VALUE")]);
+        assert_eq!(
+            current.get("TIRITH_C04_NON_UTF8_VALUE").map(String::as_str),
+            Some("")
+        );
+        assert!(!current.contains_key("TIRITH_C04_NON_UTF8_NAME"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_presence_markers_do_not_leak_or_claim_same_and_changed_values_unchanged() {
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut restore = TestProcessEnv::new();
+        let name = "TIRITH_C04_POLICY_SECRET";
+        let first = "wallet-secret-first-value";
+        let replacement = "wallet-secret-replacement-value";
+        restore.set(name.into(), first.into());
+
+        let sensitive = vec![s(name)];
+        let snapshot = EnvSnapshot::from_current_process_with_sensitive(&sensitive);
+        let same = current_sensitive_in_process(&sensitive);
+        assert_eq!(same.get(name).map(String::as_str), Some(""));
+        let same_diff = diff_sensitive(&snapshot, &same, &sensitive);
+        assert_eq!(same_diff.len(), 1, "{same_diff:?}");
+        assert_eq!(same_diff[0].delta, EnvDelta::ValueComparisonUnavailable);
+        for rendered in [format!("{same:?}"), serde_json::to_string(&same).unwrap()] {
+            assert!(!rendered.contains(first), "{rendered}");
+            assert!(!rendered.contains(&value_hash8(first)), "{rendered}");
+        }
+
+        restore.set(name.into(), replacement.into());
+        let changed = current_sensitive_in_process(&sensitive);
+        let diff = diff_sensitive(&snapshot, &changed, &sensitive);
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert_eq!(diff[0].delta, EnvDelta::ValueComparisonUnavailable);
+        for rendered in [
+            format!("{changed:?}"),
+            serde_json::to_string(&changed).unwrap(),
+        ] {
+            assert!(!rendered.contains(replacement), "{rendered}");
+            assert!(!rendered.contains(&value_hash8(replacement)), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn sensitive_snapshot_is_independent_of_secret_value_and_prefix_family() {
+        let left = EnvSnapshot::from_env_pairs(
+            [
+                ("WALLET_PRIVATE_KEY", "first-wallet-secret"),
+                ("AWS_SECRET_CUSTOM", "first-cloud-secret"),
+            ],
+            7,
+        );
+        let right = EnvSnapshot::from_env_pairs(
+            [
+                ("WALLET_PRIVATE_KEY", "different-wallet-secret"),
+                ("AWS_SECRET_CUSTOM", "different-cloud-secret"),
+            ],
+            7,
+        );
+        assert_eq!(
+            serde_json::to_string(&left).unwrap(),
+            serde_json::to_string(&right).unwrap()
+        );
+        assert!(left.vars.values().all(|var| var.value_hash8.is_empty()));
+    }
+
+    #[test]
+    fn policy_sensitive_extension_is_presence_only() {
+        let extra = vec![s("MY_PRIVATE_WALLET")];
+        let snapshot = EnvSnapshot::from_env_pairs_with_sensitive(
+            [("MY_PRIVATE_WALLET", "do-not-hash-me"), ("LANG", "en_US")],
+            1,
+            &extra,
+        );
+        assert_eq!(snapshot.vars["MY_PRIVATE_WALLET"].value_hash8, "");
+        assert_eq!(snapshot.vars["LANG"].value_hash8, "");
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains(&value_hash8("do-not-hash-me")), "{json}");
+    }
+
+    #[test]
+    fn public_snapshot_construction_cannot_serialize_or_debug_unknown_hashes() {
+        let canary = value_hash8("wallet-secret-canary");
+        let variable = SnapshotVar {
+            name: "REMOVED_POLICY_WALLET".to_string(),
+            value_hash8: canary.clone(),
+        };
+        let json = serde_json::to_string(&variable).unwrap();
+        let debug = format!("{variable:?}");
+        assert!(!json.contains(&canary), "{json}");
+        assert!(!debug.contains(&canary), "{debug}");
+        assert!(json.contains(r#""value_hash8":"""#), "{json}");
+
+        let known_secret = SnapshotVar {
+            name: "WALLET_PRIVATE_KEY".to_string(),
+            value_hash8: canary.clone(),
+        };
+        assert!(!serde_json::to_string(&known_secret)
+            .unwrap()
+            .contains(&canary));
+        assert!(!format!("{known_secret:?}").contains(&canary));
+
+        let restored: SnapshotVar = serde_json::from_str(&format!(
+            r#"{{"name":"REMOVED_POLICY_WALLET","value_hash8":"{canary}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(restored.value_hash8, "");
+
+        let public = SnapshotVar {
+            name: "LANG".to_string(),
+            value_hash8: "12345678".to_string(),
+        };
+        assert!(!serde_json::to_string(&public).unwrap().contains("12345678"));
+        assert!(!format!("{public:?}").contains("12345678"));
+        let forged_raw = SnapshotVar {
+            name: "LANG".to_string(),
+            value_hash8: "RAW-WALLET-SECRET".to_string(),
+        };
+        assert!(!serde_json::to_string(&forged_raw)
+            .unwrap()
+            .contains("RAW-WALLET-SECRET"));
+        assert!(!format!("{forged_raw:?}").contains("RAW-WALLET-SECRET"));
+        let restored: SnapshotVar =
+            serde_json::from_str(r#"{"name":"LANG","value_hash8":"RAW-WALLET-SECRET"}"#).unwrap();
+        assert_eq!(restored.value_hash8, "");
+
+        let mismatched = EnvSnapshot {
+            schema_version: 2,
+            taken_at: 1,
+            vars: BTreeMap::from([(
+                "REMOVED_POLICY_WALLET".to_string(),
+                SnapshotVar {
+                    name: "LANG".to_string(),
+                    value_hash8: canary.clone(),
+                },
+            )]),
+        };
+        let json = serde_json::to_string(&mismatched).unwrap();
+        let debug = format!("{mismatched:?}");
+        assert!(!json.contains(&canary), "{json}");
+        assert!(!debug.contains(&canary), "{debug}");
+
+        let secret = "wallet-secret-never-public";
+        let snapshot = EnvSnapshot::from_env_pairs([("WALLET_PRIVATE_KEY", secret)], 1);
+        assert_eq!(snapshot.vars["WALLET_PRIVATE_KEY"].value_hash8, "");
+        for rendered in [
+            serde_json::to_string(&snapshot).unwrap(),
+            format!("{snapshot:?}"),
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+            assert!(!rendered.contains(&value_hash8(secret)), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn secret_bearing_environment_names_are_dropped_or_projected_at_every_boundary() {
+        let canary = format!("ghp_canary_{}", "A".repeat(30));
+        let snapshot = EnvSnapshot::from_env_pairs(
+            [(canary.as_str(), "set"), ("AWS_SECRET_ACCESS_KEY", "set")],
+            7,
+        );
+        assert!(!snapshot.vars.contains_key(&canary));
+        assert!(snapshot.vars.contains_key("AWS_SECRET_ACCESS_KEY"));
+
+        let forged = SnapshotVar {
+            name: canary.clone(),
+            value_hash8: String::new(),
+        };
+        let json = serde_json::to_string(&forged).unwrap();
+        let debug = format!("{forged:?}");
+        assert!(!json.contains(&canary), "{json}");
+        assert!(!debug.contains(&canary), "{debug}");
+
+        let diff = EnvDiffEntry {
+            name: canary.clone(),
+            delta: EnvDelta::NewlySet,
+        };
+        assert!(!serde_json::to_string(&diff).unwrap().contains(&canary));
+        assert!(!format!("{diff:?}").contains(&canary));
+
+        let explained = explain_var_in(&canary, None);
+        assert_eq!(explained.name, REDACTED_ENV_NAME);
+        assert!(!serde_json::to_string(&explained).unwrap().contains(&canary));
+        assert!(!format!("{explained:?}").contains(&canary));
+
+        let source = EnvSource {
+            file: format!("/Users/alice/private/{canary}/.zshrc"),
+            line: 1,
+            masked_line: format!("export {canary}=****"),
+        };
+        for rendered in [
+            serde_json::to_string(&source).unwrap(),
+            format!("{source:?}"),
+        ] {
+            assert!(!rendered.contains(&canary), "{rendered}");
+            assert!(!rendered.contains("/Users/alice"), "{rendered}");
+            assert!(rendered.contains("REDACTED"), "{rendered}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env_snapshot.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":3,"taken_at":7,"vars":{{"{canary}":{{"name":"{canary}","value_hash8":""}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let loaded = load_snapshot_and_migrate(&path, &[]).unwrap();
+        assert!(!loaded.vars.contains_key(&canary));
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains(&canary), "{rewritten}");
+    }
+
+    #[test]
+    fn unknown_and_removed_policy_names_remain_presence_only_on_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env_snapshot.json");
+        let canary = value_hash8("removed-policy-secret");
+        let snapshot = EnvSnapshot {
+            schema_version: 2,
+            taken_at: 7,
+            vars: BTreeMap::from([(
+                "REMOVED_POLICY_WALLET".to_string(),
+                SnapshotVar {
+                    name: "REMOVED_POLICY_WALLET".to_string(),
+                    value_hash8: canary.clone(),
+                },
+            )]),
+        };
+        save_snapshot(&path, &snapshot).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains(&canary), "{persisted}");
+        assert!(persisted.contains("value_hash8"), "{persisted}");
+
+        let legacy_canary = value_hash8("previous-policy-secret");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":2,"taken_at":7,"vars":{{"REMOVED_POLICY_WALLET":{{"name":"REMOVED_POLICY_WALLET","value_hash8":"{legacy_canary}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let loaded = load_snapshot_and_migrate(&path, &[]).unwrap();
+        assert_eq!(loaded.vars["REMOVED_POLICY_WALLET"].value_hash8, "");
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains(&legacy_canary), "{rewritten}");
+        assert!(rewritten.contains("value_hash8"), "{rewritten}");
+
+        let mismatched_canary = value_hash8("mismatched-map-secret");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":2,"taken_at":7,"vars":{{"REMOVED_POLICY_WALLET":{{"name":"LANG","value_hash8":"{mismatched_canary}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let loaded = load_snapshot_and_migrate(&path, &[]).unwrap();
+        assert_eq!(
+            loaded.vars["REMOVED_POLICY_WALLET"].name,
+            "REMOVED_POLICY_WALLET"
+        );
+        assert_eq!(loaded.vars["REMOVED_POLICY_WALLET"].value_hash8, "");
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains(&mismatched_canary), "{rewritten}");
     }
 
     #[test]
     fn snapshot_round_trips_through_json() {
         let snap = EnvSnapshot::from_env_pairs([("GITHUB_TOKEN", "ghp_xxx")], 7);
+        assert_eq!(snap.vars["GITHUB_TOKEN"].value_hash8, "");
         let json = serde_json::to_string(&snap).unwrap();
         let back: EnvSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.vars.len(), 1);
         assert_eq!(back.taken_at, 7);
+        assert_eq!(back.vars["GITHUB_TOKEN"].value_hash8, "");
+    }
+
+    #[test]
+    fn legacy_snapshot_migration_discards_value_markers_for_every_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env_snapshot.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "schema_version": 1,
+                "taken_at": 7,
+                "vars": {
+                    "AWS_SECRET_ACCESS_KEY": {
+                        "name": "AWS_SECRET_ACCESS_KEY",
+                        "value_hash8": "deadbeef"
+                    },
+                    "MY_PRIVATE_WALLET": {
+                        "name": "MY_PRIVATE_WALLET",
+                        "value_hash8": "cafebabe"
+                    },
+                    "LANG": {
+                        "name": "LANG",
+                        "value_hash8": "12345678"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let snapshot =
+            load_snapshot_and_migrate(&path, &["MY_PRIVATE_WALLET".to_string()]).unwrap();
+        assert_eq!(snapshot.schema_version, 3);
+        assert_eq!(snapshot.vars["AWS_SECRET_ACCESS_KEY"].value_hash8, "");
+        assert_eq!(snapshot.vars["MY_PRIVATE_WALLET"].value_hash8, "");
+        assert_eq!(snapshot.vars["LANG"].value_hash8, "");
+
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert!(!persisted.contains("deadbeef"), "{persisted}");
+        assert!(!persisted.contains("cafebabe"), "{persisted}");
+        assert!(!persisted.contains("12345678"), "{persisted}");
+    }
+
+    #[test]
+    fn legacy_migration_persist_failure_returns_error_and_preserves_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env_snapshot.json");
+        let legacy = r#"{
+            "schema_version":1,
+            "vars":{"AWS_SECRET_CUSTOM":{"name":"AWS_SECRET_CUSTOM","value_hash8":"deadbeef"}}
+        }"#;
+        std::fs::write(&path, legacy).unwrap();
+        let result = load_snapshot_and_migrate_with(&path, &[], |_, _, _| {
+            Err(std::io::Error::other("injected atomic persist failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), legacy);
+    }
+
+    #[test]
+    fn future_snapshot_schema_is_rejected_without_rewriting_any_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env_snapshot.json");
+        let future = r#"{
+  "schema_version": 4,
+  "future_guard": {"mode": "must-survive"},
+  "vars": {"RPC_URL": {"name": "RPC_URL", "value_hash8": "legacy"}}
+}"#;
+        std::fs::write(&path, future).unwrap();
+
+        let error = load_snapshot_and_migrate(&path, &[]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), future);
+        assert!(save_snapshot(&path, &EnvSnapshot::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), future);
+
+        let future_snapshot = EnvSnapshot {
+            schema_version: CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION + 1,
+            taken_at: 0,
+            vars: BTreeMap::new(),
+        };
+        let destination = dir.path().join("future-save.json");
+        assert!(save_snapshot(&destination, &future_snapshot).is_err());
+        assert!(!destination.exists());
     }
 
     // ── diff ──────────────────────────────────────────────────────────────
@@ -837,7 +1808,7 @@ mod tests {
     fn diff_reports_newly_set_sensitive_var() {
         let snap = EnvSnapshot::from_env_pairs(Vec::<(&str, &str)>::new(), 0);
         let mut current = BTreeMap::new();
-        current.insert(s("AWS_SECRET_ACCESS_KEY"), value_hash8("v"));
+        current.insert(s("AWS_SECRET_ACCESS_KEY"), String::new());
         let sensitive = vec![s("AWS_SECRET_ACCESS_KEY"), s("GITHUB_TOKEN")];
         let diff = diff_sensitive(&snap, &current, &sensitive);
         assert_eq!(diff.len(), 1);
@@ -846,25 +1817,107 @@ mod tests {
     }
 
     #[test]
-    fn diff_reports_value_change() {
-        let snap = EnvSnapshot::from_env_pairs([("GITHUB_TOKEN", "old")], 0);
-        let mut current = BTreeMap::new();
-        current.insert(s("GITHUB_TOKEN"), value_hash8("new"));
-        let sensitive = vec![s("GITHUB_TOKEN")];
+    fn legacy_nonempty_markers_still_distinguish_same_and_changed_values() {
+        let snap = EnvSnapshot {
+            schema_version: CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION,
+            taken_at: 0,
+            vars: BTreeMap::from([(
+                s("WALLET_PRIVATE_KEY"),
+                SnapshotVar {
+                    name: s("WALLET_PRIVATE_KEY"),
+                    value_hash8: value_hash8("old-secret"),
+                },
+            )]),
+        };
+        let sensitive = vec![s("WALLET_PRIVATE_KEY")];
+
+        let same = BTreeMap::from([(s("WALLET_PRIVATE_KEY"), value_hash8("old-secret"))]);
+        assert!(diff_sensitive(&snap, &same, &sensitive).is_empty());
+
+        let current =
+            BTreeMap::from([(s("WALLET_PRIVATE_KEY"), value_hash8("replacement-secret"))]);
         let diff = diff_sensitive(&snap, &current, &sensitive);
         assert_eq!(diff.len(), 1);
         assert_eq!(diff[0].delta, EnvDelta::ValueChanged);
     }
 
     #[test]
-    fn diff_ignores_unchanged_and_unset() {
-        let snap = EnvSnapshot::from_env_pairs([("GITHUB_TOKEN", "same")], 0);
-        let mut current = BTreeMap::new();
-        current.insert(s("GITHUB_TOKEN"), value_hash8("same"));
-        // NPM_TOKEN is sensitive but unset now → not reported.
-        let sensitive = vec![s("GITHUB_TOKEN"), s("NPM_TOKEN")];
-        let diff = diff_sensitive(&snap, &current, &sensitive);
-        assert!(diff.is_empty(), "{diff:?}");
+    fn persisted_presence_baseline_reports_comparison_unavailable_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env_snapshot.json");
+        let secret = "wallet-secret-never-durable";
+        let snapshot = EnvSnapshot::from_env_pairs([("WALLET_PRIVATE_KEY", secret)], 0);
+        assert_eq!(snapshot.vars["WALLET_PRIVATE_KEY"].value_hash8, "");
+
+        save_snapshot(&path, &snapshot).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains(secret), "{persisted}");
+        assert!(!persisted.contains(&value_hash8(secret)), "{persisted}");
+
+        let reloaded = load_snapshot_and_migrate(&path, &[]).unwrap();
+        assert_eq!(reloaded.vars["WALLET_PRIVATE_KEY"].value_hash8, "");
+        for scenario in ["same value", "changed value"] {
+            let current = BTreeMap::from([(s("WALLET_PRIVATE_KEY"), String::new())]);
+            let diff = diff_sensitive(&reloaded, &current, &[s("WALLET_PRIVATE_KEY")]);
+            assert_eq!(diff.len(), 1, "{scenario}: {diff:?}");
+            assert_eq!(
+                diff[0].delta,
+                EnvDelta::ValueComparisonUnavailable,
+                "a presence-only restart boundary must never claim unchanged"
+            );
+        }
+
+        let json = serde_json::to_string(&diff_sensitive(
+            &reloaded,
+            &BTreeMap::from([(s("WALLET_PRIVATE_KEY"), String::new())]),
+            &[s("WALLET_PRIVATE_KEY")],
+        ))
+        .unwrap();
+        assert!(json.contains("value_comparison_unavailable"), "{json}");
+        assert!(!json.contains(secret), "{json}");
+    }
+
+    #[test]
+    fn public_to_credential_rpc_transition_is_reported_as_newly_sensitive() {
+        let snapshot = EnvSnapshot::from_env_pairs(
+            [("RPC_URL", "https://rpc.example/v3/mainnet?chain=mainnet")],
+            0,
+        );
+        assert!(!snapshot.vars.contains_key("RPC_URL"));
+        let current = BTreeMap::from([("RPC_URL".to_string(), String::new())]);
+        let diff = diff_sensitive(&snapshot, &current, &[]);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].name, "RPC_URL");
+        assert_eq!(diff[0].delta, EnvDelta::NewlySet);
+    }
+
+    #[test]
+    fn diff_ignores_unchanged_and_unset_values() {
+        let snap = EnvSnapshot {
+            schema_version: CURRENT_ENV_SNAPSHOT_SCHEMA_VERSION,
+            taken_at: 0,
+            vars: BTreeMap::from([
+                (
+                    s("WALLET_PRIVATE_KEY"),
+                    SnapshotVar {
+                        name: s("WALLET_PRIVATE_KEY"),
+                        value_hash8: value_hash8("same"),
+                    },
+                ),
+                (
+                    s("NPM_TOKEN"),
+                    SnapshotVar {
+                        name: s("NPM_TOKEN"),
+                        value_hash8: value_hash8("removed"),
+                    },
+                ),
+            ]),
+        };
+        let current = BTreeMap::from([(s("WALLET_PRIVATE_KEY"), value_hash8("same"))]);
+        // NPM_TOKEN was unset after the baseline and is intentionally not a
+        // credential-exposure event.
+        let sensitive = vec![s("WALLET_PRIVATE_KEY"), s("NPM_TOKEN")];
+        assert!(diff_sensitive(&snap, &current, &sensitive).is_empty());
     }
 
     #[test]
@@ -877,6 +1930,8 @@ mod tests {
         assert_eq!(eff.iter().filter(|v| *v == "MY_CUSTOM_TOKEN").count(), 1);
         // Already-built-in GITHUB_TOKEN not duplicated.
         assert_eq!(eff.iter().filter(|v| *v == "GITHUB_TOKEN").count(), 1);
+        assert!(!eff.iter().any(|v| v == "RPC_URL"));
+        assert!(eff.iter().any(|v| v == "RPC_API_KEY"));
         // Blank skipped.
         assert!(!eff.iter().any(|v| v.trim().is_empty()));
     }
@@ -901,7 +1956,11 @@ mod tests {
             "{}",
             ex.sources[0].masked_line
         );
-        assert!(ex.sources[0].masked_line.contains("****"));
+        assert!(
+            ex.sources[0].masked_line.contains("[REDACTED"),
+            "{}",
+            ex.sources[0].masked_line
+        );
     }
 
     #[test]
@@ -919,11 +1978,20 @@ mod tests {
         let fish = explain_var_in("GH_TOKEN", Some(home));
         assert_eq!(fish.sources.len(), 1);
         assert!(!fish.sources[0].masked_line.contains("ghp_fishsecret"));
-        assert!(fish.sources[0].masked_line.contains("****"));
+        assert!(
+            fish.sources[0].masked_line.contains("[REDACTED"),
+            "{}",
+            fish.sources[0].masked_line
+        );
 
         let plain = explain_var_in("NPM_TOKEN", Some(home));
         assert_eq!(plain.sources.len(), 1);
         assert!(!plain.sources[0].masked_line.contains("npm_plainsecret"));
+        assert!(
+            plain.sources[0].masked_line.contains("[REDACTED"),
+            "{}",
+            plain.sources[0].masked_line
+        );
     }
 
     #[test]
@@ -961,9 +2029,11 @@ mod tests {
         let f = f.expect("rule should fire");
         assert_eq!(f.rule_id, RuleId::EnvSensitiveExposedToUnknownScript);
         assert_eq!(f.severity, Severity::High);
-        // Evidence lists the NAME, never a value.
+        // Public evidence is categorical: neither the name nor a value is
+        // exposed through Debug/serialization.
         let ev = format!("{:?}", f.evidence);
-        assert!(ev.contains("AWS_SECRET_ACCESS_KEY"), "{ev}");
+        assert!(!ev.contains("AWS_SECRET_ACCESS_KEY"), "{ev}");
+        assert!(ev.contains("[REDACTED"), "{ev}");
     }
 
     #[test]
@@ -1154,10 +2224,69 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::EnvSensitivePersistedInShellRc);
         assert_eq!(findings[0].severity, Severity::High);
-        // The raw value must never appear in title/description/evidence.
-        let blob = format!("{:?}", findings[0]);
-        assert!(!blob.contains("AKIALEAKEDSECRET"), "{blob}");
-        assert!(blob.contains("****"), "{blob}");
+        // Public Finding serialization may retain a fixed, well-known registry
+        // name such as AWS_SECRET_ACCESS_KEY. It projects the value-bearing
+        // context to a fixed class and retains only a masked directive in
+        // evidence. The benign rc-file path remains useful diagnostic context;
+        // a separate regression below proves secret-bearing path components are
+        // projected. No surface may retain the raw value.
+        let public = serde_json::to_value(&findings[0]).expect("public finding projection");
+        let title = public["title"].as_str().expect("projected title");
+        let description = public["description"]
+            .as_str()
+            .expect("projected description");
+        for summary in [title, description] {
+            assert!(summary.contains("AWS_SECRET_ACCESS_KEY"), "{summary}");
+            assert!(summary.contains("[REDACTED:web3_secret]"), "{summary}");
+        }
+        let serialized = serde_json::to_string(&public).unwrap();
+        assert!(!serialized.contains("AKIALEAKEDSECRET"), "{serialized}");
+        let rc_path = home.join(".zshrc").display().to_string();
+        assert!(serialized.contains(&rc_path), "{serialized}");
+        assert!(
+            serialized.contains("export AWS_SECRET_ACCESS_KEY=[REDACTED]"),
+            "{serialized}"
+        );
+    }
+
+    #[test]
+    fn persisted_secret_scan_drops_secret_bearing_names_before_finding_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let canary = format!("ghp_canary_{}", "A".repeat(30));
+        std::fs::write(
+            dir.path().join(".zshrc"),
+            format!("export {canary}=ordinary-value\n"),
+        )
+        .unwrap();
+
+        let findings =
+            scan_rc_for_sensitive_exports(std::slice::from_ref(&canary), Some(dir.path()));
+        assert!(
+            findings.is_empty(),
+            "a secret-bearing environment name must be dropped before a public Finding exists"
+        );
+        assert!(privacy_safe_env_name(&canary).is_none());
+    }
+
+    #[test]
+    fn persisted_secret_finding_projects_secret_bearing_rc_path_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let canary = format!("ghp_canary_{}", "B".repeat(30));
+        let home = dir.path().join(format!("profile-{canary}"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".zshrc"),
+            "export AWS_SECRET_ACCESS_KEY=AKIALEAKEDSECRET\n",
+        )
+        .unwrap();
+
+        let findings = scan_rc_for_sensitive_exports(&effective_sensitive_vars(&[]), Some(&home));
+        assert_eq!(findings.len(), 1);
+        let public = serde_json::to_string(&findings[0]).unwrap();
+        assert!(!public.contains(&canary), "{public}");
+        assert!(!public.contains("AKIALEAKEDSECRET"), "{public}");
+        assert!(public.contains("AWS_SECRET_ACCESS_KEY"), "{public}");
+        assert!(public.contains("REDACTED"), "{public}");
     }
 
     #[test]
@@ -1183,5 +2312,44 @@ mod tests {
             scan_rc_for_sensitive_exports(&ext, Some(dir.path())).len(),
             1
         );
+    }
+
+    #[test]
+    fn persisted_secret_scan_uses_prefix_kinds_and_ignores_public_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".zshrc"),
+            "export AWS_SECRET_C04=hidden\nexport RPC_URL=https://rpc.example\nexport ETH_RPC_URL=https://rpc.example/v3/providerToken123456789\n",
+        )
+        .unwrap();
+        let findings =
+            scan_rc_for_sensitive_exports(&effective_sensitive_vars(&[]), Some(dir.path()));
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(findings[0].title.contains("AWS_SECRET_C04"));
+        let output = format!("{findings:?}");
+        assert!(!output.contains("https://rpc.example"));
+        assert!(!output.contains("providerToken123456789"));
+    }
+
+    #[test]
+    fn persisted_secret_scan_uses_canonical_alias_spellings_and_fish_form() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".zshrc"),
+            "export walletPrivateKey=hidden\nexport Wallet-Password=hidden\n",
+        )
+        .unwrap();
+        let fish = dir.path().join(".config/fish");
+        std::fs::create_dir_all(&fish).unwrap();
+        std::fs::write(
+            fish.join("config.fish"),
+            "set -gx WalletMnemonic hidden words\n",
+        )
+        .unwrap();
+        let findings =
+            scan_rc_for_sensitive_exports(&effective_sensitive_vars(&[]), Some(dir.path()));
+        assert_eq!(findings.len(), 3, "{findings:?}");
+        let serialized = serde_json::to_string(&findings).unwrap();
+        assert!(!serialized.contains("hidden"), "{serialized}");
     }
 }

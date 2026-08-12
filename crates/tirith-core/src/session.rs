@@ -6,16 +6,25 @@ use std::time::Instant;
 /// Global session ID for the current tirith process lifetime.
 static SESSION_ID: OnceLock<String> = OnceLock::new();
 
-/// The session-ID alphabet shared by the resolver and the state-store path
-/// validation (repo-0339): an env-supplied ID outside this alphabet silently
-/// disabled warning recording (every state path resolved to `None`), so the
-/// resolver rejects it instead of preserving it.
+/// The privacy-safe session-ID contract shared by every resolver and the
+/// state-store path validation (repo-0339). An env/fallback ID outside the
+/// bounded filename alphabet, or one that mandatory durable projection
+/// recognizes as secret material, would either disable warning recording or
+/// become a secret-bearing filename. Reject it at the shared predicate so every
+/// resolved ID remains storable without exposing raw secret bytes.
 pub(crate) fn is_valid_session_id(id: &str) -> bool {
-    !id.is_empty()
+    let has_safe_alphabet = !id.is_empty()
         && id.len() <= 128
         && id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    has_safe_alphabet && crate::redact::privacy_project_durable_text(id) == id
+}
+
+fn select_process_session_id(env_id: Option<String>) -> String {
+    env_id
+        .filter(|id| is_valid_session_id(id))
+        .unwrap_or_else(generate_session_id)
 }
 
 /// Get or generate the session ID: `TIRITH_SESSION_ID` env var, else an
@@ -23,12 +32,10 @@ pub(crate) fn is_valid_session_id(id: &str) -> bool {
 /// for agent hooks should prefer [`resolve_session_id`].
 pub fn session_id() -> &'static str {
     SESSION_ID.get_or_init(|| {
-        // repo-0339: an invalid env ID must not propagate (it would silently
-        // disable every session-state write); fall back to a fresh valid ID.
-        std::env::var("TIRITH_SESSION_ID")
-            .ok()
-            .filter(|s| is_valid_session_id(s))
-            .unwrap_or_else(generate_session_id)
+        // repo-0339: an invalid or privacy-unsafe env ID must not propagate (it
+        // would silently disable every state write or become a secret-bearing
+        // filename); fall back to a fresh valid ID.
+        select_process_session_id(std::env::var("TIRITH_SESSION_ID").ok())
     })
 }
 
@@ -42,8 +49,9 @@ pub fn new_session_id() -> String {
     generate_session_id()
 }
 
-/// `TIRITH_SESSION_ID` if set and non-empty, else `None`. Cached for the process
-/// lifetime.
+/// Privacy-safe `TIRITH_SESSION_ID` if set, else `None`. Values that cannot be
+/// used as non-secret state filenames are treated as absent. Cached for the
+/// process lifetime.
 pub fn env_session_id() -> Option<&'static str> {
     static CACHED: OnceLock<Option<String>> = OnceLock::new();
     CACHED
@@ -81,26 +89,27 @@ const FALLBACK_CACHE_REFRESH_SECS: u64 = 300;
 pub fn fallback_session_id() -> String {
     let scope = compute_scope();
     let cache = FALLBACK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-
-    if let Ok(map) = cache.lock() {
-        if let Some(entry) = map.get(&scope) {
-            if entry.cached_at.elapsed().as_secs() < FALLBACK_CACHE_REFRESH_SECS {
-                return entry.session_id.clone();
-            }
+    // Keep the cache lock across a miss's load/create/insert. Releasing it
+    // between lookup and publication lets concurrent first callers both miss,
+    // generate different UUIDs, and overwrite the same cache entry in turn; a
+    // caller can then observe a different ID on its immediately following call.
+    // This path is non-reentrant (its best-effort diagnostics only project and
+    // print text), so serializing the infrequent fallback I/O is safe.
+    let mut map = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(entry) = map.get(&scope) {
+        if entry.cached_at.elapsed().as_secs() < FALLBACK_CACHE_REFRESH_SECS {
+            return entry.session_id.clone();
         }
     }
 
     let id = load_or_create_fallback_file(&scope);
-
-    if let Ok(mut map) = cache.lock() {
-        map.insert(
-            scope,
-            FallbackEntry {
-                session_id: id.clone(),
-                cached_at: Instant::now(),
-            },
-        );
-    }
+    map.insert(
+        scope,
+        FallbackEntry {
+            session_id: id.clone(),
+            cached_at: Instant::now(),
+        },
+    );
 
     id
 }
@@ -115,35 +124,70 @@ pub fn resolve_session_id() -> String {
     fallback_session_id()
 }
 
-/// Scope key `{integration}-{cwd_hash_8chars}`: integration from
-/// `TIRITH_INTEGRATION` (default "unknown"), cwd_hash the first 8 hex chars of
-/// SHA-256(cwd).
-fn compute_scope() -> String {
-    let integration = std::env::var("TIRITH_INTEGRATION")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+const FALLBACK_SCOPE_UNKNOWN_INTEGRATION: &str = "unknown";
+const FALLBACK_SCOPE_REDACTED_INTEGRATION: &str = "redacted";
+const FALLBACK_SCOPE_REDACTED_CWD: &str = "privacy-redacted-cwd";
+const FALLBACK_SCOPE_UNAVAILABLE_CWD: &str = "cwd-unavailable";
 
-    // Sanitize: only [a-zA-Z0-9_-].
-    let integration: String = integration
+/// Scope key `{integration}-{cwd_hash_8chars}`. Both caller-controlled inputs
+/// cross the mandatory durable-privacy boundary before they can influence a
+/// filename or a stable digest. A secret-bearing integration/cwd collapses to
+/// a fixed category; no raw secret, prefix, or secret-derived digest enters the
+/// fallback path, atomic temp names, diagnostics, or cache key.
+fn compute_scope() -> String {
+    let integration = std::env::var("TIRITH_INTEGRATION").ok();
+    let cwd = std::env::current_dir().ok();
+    compute_scope_from(integration.as_deref(), cwd.as_deref())
+}
+
+fn compute_scope_from(integration: Option<&str>, cwd: Option<&Path>) -> String {
+    let integration = privacy_safe_integration_scope(integration);
+    let cwd_material = privacy_safe_cwd_scope_material(cwd);
+    format!("{integration}-{}", scope_hash_8(&cwd_material))
+}
+
+fn privacy_safe_integration_scope(integration: Option<&str>) -> String {
+    let raw = integration
+        .filter(|value| !value.is_empty())
+        .unwrap_or(FALLBACK_SCOPE_UNKNOWN_INTEGRATION);
+    if crate::redact::privacy_project_durable_text(raw) != raw {
+        return FALLBACK_SCOPE_REDACTED_INTEGRATION.to_string();
+    }
+
+    // Preserve the historical filename alphabet, but project again after
+    // filtering: removing punctuation must not synthesize a credential-shaped
+    // component that bypassed projection in the original representation.
+    let sanitized: String = raw
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(32)
         .collect();
+    if sanitized.is_empty() {
+        return FALLBACK_SCOPE_UNKNOWN_INTEGRATION.to_string();
+    }
+    if crate::redact::privacy_project_durable_text(&sanitized) != sanitized {
+        return FALLBACK_SCOPE_REDACTED_INTEGRATION.to_string();
+    }
 
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
+    sanitized.chars().take(32).collect()
+}
 
-    let cwd_hash = {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(cwd.as_bytes());
-        let digest = hasher.finalize();
-        hex_encode_8(&digest)
+fn privacy_safe_cwd_scope_material(cwd: Option<&Path>) -> String {
+    let Some(cwd) = cwd else {
+        return FALLBACK_SCOPE_UNAVAILABLE_CWD.to_string();
     };
+    let raw = cwd.display().to_string();
+    if crate::redact::privacy_project_durable_text(&raw) == raw {
+        raw
+    } else {
+        FALLBACK_SCOPE_REDACTED_CWD.to_string()
+    }
+}
 
-    format!("{integration}-{cwd_hash}")
+fn scope_hash_8(material: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(material.as_bytes());
+    hex_encode_8(&hasher.finalize())
 }
 
 /// Encode the first 4 bytes (8 hex chars) of a digest.
@@ -154,7 +198,11 @@ fn hex_encode_8(bytes: &[u8]) -> String {
 /// Path for a fallback session file.
 fn fallback_file_path(scope: &str) -> Option<PathBuf> {
     let state = crate::policy::state_dir()?;
-    Some(state.join("sessions").join(format!("fallback-{scope}.id")))
+    Some(fallback_file_path_in(&state, scope))
+}
+
+fn fallback_file_path_in(state: &Path, scope: &str) -> PathBuf {
+    state.join("sessions").join(format!("fallback-{scope}.id"))
 }
 
 /// Load an existing fallback file if fresh, or create a new one.
@@ -163,14 +211,17 @@ fn load_or_create_fallback_file(scope: &str) -> String {
         Some(p) => p,
         None => return generate_session_id(),
     };
+    load_or_create_fallback_path(&path)
+}
 
+fn load_or_create_fallback_path(path: &Path) -> String {
     // Open with O_NOFOLLOW so a symlink planted at the fallback path cannot
     // redirect this read onto another file, and take BOTH the freshness mtime and
     // the content from the SAME open handle: one inode for the stat and the read
     // closes the freshness-vs-read race a separate `symlink_metadata` +
     // `read_to_string` left open (a swap between the two could read a different
     // file than the one whose mtime we checked).
-    if let Ok(file) = crate::util::open_read_no_follow_capped(&path, FALLBACK_FILE_READ_CAP) {
+    if let Ok(file) = crate::util::open_read_no_follow_capped(path, FALLBACK_FILE_READ_CAP) {
         if let Ok(modified) = file.metadata().and_then(|m| m.modified()) {
             if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
                 if age.as_secs() < FALLBACK_FILE_MAX_AGE_SECS {
@@ -200,11 +251,12 @@ fn load_or_create_fallback_file(scope: &str) -> String {
     // through to regenerate: fail-safe, since a stable ID is best-effort.
 
     let new_id = generate_session_id();
-    write_fallback_file(&path, &new_id);
-    // repo-0342: a concurrent process may have won the create race. Re-read the
-    // on-disk winner and return THAT id so every concurrent first invocation
-    // converges on one session, instead of analyzing under divergent UUIDs.
-    if let Ok(file) = crate::util::open_read_no_follow_capped(&path, FALLBACK_FILE_READ_CAP) {
+    write_fallback_file(path, &new_id);
+    // repo-0342: a concurrent process may already have published. Re-read and
+    // adopt the value currently visible on disk, narrowing the cross-process
+    // race window. The cache mutex above is the convergence guarantee for
+    // callers in this process; this reread does not serialize other processes.
+    if let Ok(file) = crate::util::open_read_no_follow_capped(path, FALLBACK_FILE_READ_CAP) {
         use std::io::Read as _;
         let mut buf = Vec::new();
         if (&file)
@@ -280,6 +332,41 @@ mod tests {
     }
 
     #[test]
+    fn privacy_unsafe_env_ids_fall_back_to_storable_uuid() {
+        let canary = format!("ghp_canary_{}", "S".repeat(30));
+        let private_scalar = format!("0x{}1", "0".repeat(63));
+        for unsafe_id in [&canary, &private_scalar] {
+            assert!(unsafe_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')));
+            assert!(!is_valid_session_id(unsafe_id));
+            assert!(crate::session_warnings::session_state_path(unsafe_id).is_none());
+
+            let selected = select_process_session_id(Some(unsafe_id.to_string()));
+            assert_ne!(selected.as_str(), unsafe_id.as_str());
+            assert!(is_valid_session_id(&selected));
+            assert!(uuid::Uuid::parse_str(&selected).is_ok());
+            assert!(crate::session_warnings::session_state_path(&selected).is_some());
+        }
+    }
+
+    #[test]
+    fn resolver_and_state_path_share_one_session_id_predicate() {
+        for valid in [generate_session_id(), "operator-session_1".to_string()] {
+            assert!(is_valid_session_id(&valid));
+            assert!(crate::session_warnings::session_state_path(&valid).is_some());
+        }
+        for invalid in [
+            "../escape".to_string(),
+            format!("ghp_canary_{}", "T".repeat(30)),
+            format!("0x{}1", "0".repeat(63)),
+        ] {
+            assert!(!is_valid_session_id(&invalid));
+            assert!(crate::session_warnings::session_state_path(&invalid).is_none());
+        }
+    }
+
+    #[test]
     fn test_resolve_session_id_returns_non_empty() {
         // Whether env var is set or not, resolve should return something
         let id = resolve_session_id();
@@ -305,6 +392,100 @@ mod tests {
         let parts: Vec<&str> = scope.rsplitn(2, '-').collect();
         assert_eq!(parts[0].len(), 8);
         assert!(parts[0].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn benign_fallback_scope_remains_deterministic_and_partitioned() {
+        let cwd_a = Path::new("/workspace/operator-project-a");
+        let cwd_b = Path::new("/workspace/operator-project-b");
+        let first = compute_scope_from(Some("claude-code"), Some(cwd_a));
+        let repeated = compute_scope_from(Some("claude-code"), Some(cwd_a));
+        let other_cwd = compute_scope_from(Some("claude-code"), Some(cwd_b));
+
+        assert_eq!(first, repeated, "a benign scope must remain deterministic");
+        assert_ne!(first, other_cwd, "benign cwd partitioning must remain");
+        assert!(first.starts_with("claude-code-"));
+        let hash = first.rsplit('-').next().unwrap();
+        assert_eq!(hash.len(), 8);
+        assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        // Projection must also run after filename sanitization: punctuation
+        // removal cannot synthesize a canary-shaped durable component.
+        let split_canary = format!("ghp_!canary_{}", "A".repeat(30));
+        assert_eq!(
+            privacy_safe_integration_scope(Some(&split_canary)),
+            FALLBACK_SCOPE_REDACTED_INTEGRATION
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("tirith");
+        let benign_cwd = dir.path().join("operator-project");
+        std::fs::create_dir_all(&benign_cwd).unwrap();
+        let benign_scope = compute_scope_from(Some("claude-code"), Some(&benign_cwd));
+        let benign_path = fallback_file_path_in(&state_dir, &benign_scope);
+        let first_id = load_or_create_fallback_path(&benign_path);
+        assert_eq!(
+            first_id,
+            load_or_create_fallback_path(&benign_path),
+            "the same benign integration/cwd/state must resolve to one UUID"
+        );
+    }
+
+    #[test]
+    fn fallback_filename_categorizes_secret_bearing_integration_and_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("tirith");
+        let integration_canary = format!("ghp_canary_{}", "I".repeat(30));
+        let cwd_canary = "AKIA00CANARYABCDEFGH";
+        let secret_cwd = dir.path().join(format!("repo-{cwd_canary}"));
+        std::fs::create_dir_all(&secret_cwd).unwrap();
+
+        let raw_cwd = secret_cwd.display().to_string();
+        let legacy_integration_fragment: String = integration_canary.chars().take(32).collect();
+        let raw_integration_digest = scope_hash_8(&integration_canary);
+        let raw_cwd_digest = scope_hash_8(&raw_cwd);
+
+        let scope = compute_scope_from(Some(&integration_canary), Some(&secret_cwd));
+        assert_eq!(
+            scope,
+            compute_scope_from(Some(&integration_canary), Some(&secret_cwd)),
+            "safe categorical scope is stable"
+        );
+        assert!(scope.starts_with("redacted-"), "scope was {scope}");
+        assert_eq!(
+            privacy_safe_cwd_scope_material(Some(&secret_cwd)),
+            FALLBACK_SCOPE_REDACTED_CWD
+        );
+
+        let path = fallback_file_path_in(&state_dir, &scope);
+        let id = load_or_create_fallback_path(&path);
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert_eq!(
+            id,
+            load_or_create_fallback_path(&path),
+            "a secret-categorized path must resolve to one stable UUID"
+        );
+
+        let sessions_dir = state_dir.join("sessions");
+        let names: Vec<String> = std::fs::read_dir(&sessions_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![format!("fallback-{scope}.id")]);
+
+        let rendered_path = format!("{:?}", sessions_dir.join(&names[0]));
+        for forbidden in [
+            integration_canary.as_str(),
+            legacy_integration_fragment.as_str(),
+            raw_integration_digest.as_str(),
+            cwd_canary,
+            raw_cwd_digest.as_str(),
+        ] {
+            assert!(
+                !rendered_path.contains(forbidden),
+                "fallback path retained raw or stable secret material: {rendered_path}"
+            );
+        }
     }
 
     #[test]

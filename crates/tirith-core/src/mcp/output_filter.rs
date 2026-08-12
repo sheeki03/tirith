@@ -27,9 +27,9 @@
 //! `fail_mode_closed=true` callers DENY on analysis error rather than passing
 //! content through.
 
-use std::ops::Range;
+use std::{fmt, ops::Range};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::deobfuscate;
 use crate::engine::{analyze_output_finalize_mut, OutputAnalyzerState};
@@ -64,11 +64,13 @@ pub struct OutputFilterContext {
 }
 
 impl OutputFilterContext {
-    /// Build a context and retain the legacy bad-seed `(pattern, error)` return
-    /// shape for downstream source compatibility. New Tirith-owned output
-    /// boundaries must use [`Self::from_policy_with_diagnostics`] so an invalid
-    /// pattern is never echoed into a log or response.
-    pub fn from_policy(policy: &crate::policy::Policy) -> (Self, Vec<(String, regex::Error)>) {
+    /// Build a context and return only indexed/categorical diagnostics for any
+    /// rejected custom seed. The raw pattern and `regex::Error` are deliberately
+    /// unavailable at this public constructor because either can echo
+    /// attacker-controlled policy bytes into logs, errors, or `Debug` output.
+    pub fn from_policy(
+        policy: &crate::policy::Policy,
+    ) -> (Self, Vec<prompt_injection::InvalidSeedDiagnostic>) {
         let (custom_seeds, bad) = prompt_injection::compile_seeds(&policy.injection_seeds_custom);
         (
             Self {
@@ -79,10 +81,9 @@ impl OutputFilterContext {
         )
     }
 
-    /// Build a context and return safe indexed/categorical diagnostics for any
-    /// rejected custom seed. This additive API lets the server/gateway surface
-    /// each rejection once without exposing the attacker-controlled pattern or
-    /// a `regex::Error` that may echo it.
+    /// Explicitly named alias for [`Self::from_policy`], retained for callers
+    /// that adopted the safe constructor before it became the only public
+    /// constructor contract.
     ///
     /// The caller is expected to have discovered the policy OFFLINE
     /// ([`crate::policy::Policy::discover_local_only`]), which neutralizes a
@@ -90,20 +91,19 @@ impl OutputFilterContext {
     pub fn from_policy_with_diagnostics(
         policy: &crate::policy::Policy,
     ) -> (Self, Vec<prompt_injection::InvalidSeedDiagnostic>) {
-        let (custom_seeds, bad) =
-            prompt_injection::compile_seeds_with_safe_diagnostics(&policy.injection_seeds_custom);
-        (
-            Self {
-                custom_seeds,
-                redact_injection: policy.mcp_redact_injection,
-            },
-            bad,
-        )
+        Self::from_policy(policy)
     }
 }
 
 /// Outcome of one filter pass (the `event_id` is the join key against the audit log).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// All fields remain public for source compatibility, but their contents are
+/// untrusted at public serde and `Debug` boundaries: callers can construct or
+/// mutate this type directly. The custom implementations below preserve valid
+/// UUID correlation and known categorical rule IDs while replacing invalid
+/// values with fixed categoricals. They never derive a stable identifier from
+/// attacker-controlled bytes.
+#[derive(Clone)]
 pub struct FilterOutcome {
     /// Effective action after the filter ran (`WarnAck` is folded into `Warn`).
     pub action: Action,
@@ -124,10 +124,106 @@ pub struct FilterOutcome {
     pub fail_mode_triggered: bool,
 }
 
+/// Fixed UUID-shaped sentinel for a caller-supplied event ID that cannot be
+/// interpreted as a UUID. A constant (rather than a secret-derived digest)
+/// makes invalidity visible without creating a reusable secret verifier.
+const INVALID_FILTER_EVENT_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Private wire mirror for the custom serde boundary. Field names, requiredness,
+/// and ordering deliberately match the formerly derived schema.
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "FilterOutcome")]
+struct FilterOutcomeWire {
+    action: Action,
+    event_id: String,
+    rule_ids: Vec<String>,
+    max_severity: Option<Severity>,
+    elapsed_ms: f64,
+    truncated: bool,
+    fail_mode_triggered: bool,
+}
+
+fn project_filter_event_id(value: &str) -> String {
+    uuid::Uuid::parse_str(value).map_or_else(
+        |_| INVALID_FILTER_EVENT_ID.to_string(),
+        |event_id| event_id.hyphenated().to_string(),
+    )
+}
+
+fn project_filter_rule_id(value: &str) -> String {
+    serde_json::from_value::<RuleId>(serde_json::Value::String(value.to_string())).map_or_else(
+        |_| RuleId::AnalysisIncomplete.to_string(),
+        |rule_id| rule_id.to_string(),
+    )
+}
+
 impl FilterOutcome {
+    fn privacy_projection(&self) -> FilterOutcomeWire {
+        FilterOutcomeWire {
+            action: self.action,
+            event_id: project_filter_event_id(&self.event_id),
+            rule_ids: self
+                .rule_ids
+                .iter()
+                .map(|rule_id| project_filter_rule_id(rule_id))
+                .collect(),
+            max_severity: self.max_severity,
+            elapsed_ms: self.elapsed_ms,
+            truncated: self.truncated,
+            fail_mode_triggered: self.fail_mode_triggered,
+        }
+    }
+
     /// Convenience: was a block forced (either by rule or by fail-mode)?
     pub fn is_block(&self) -> bool {
         matches!(self.action, Action::Block)
+    }
+}
+
+impl Serialize for FilterOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.privacy_projection().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FilterOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FilterOutcomeWire::deserialize(deserializer)?;
+        Ok(Self {
+            action: wire.action,
+            event_id: project_filter_event_id(&wire.event_id),
+            rule_ids: wire
+                .rule_ids
+                .iter()
+                .map(|rule_id| project_filter_rule_id(rule_id))
+                .collect(),
+            max_severity: wire.max_severity,
+            elapsed_ms: wire.elapsed_ms,
+            truncated: wire.truncated,
+            fail_mode_triggered: wire.fail_mode_triggered,
+        })
+    }
+}
+
+impl fmt::Debug for FilterOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let safe = self.privacy_projection();
+        formatter
+            .debug_struct("FilterOutcome")
+            .field("action", &safe.action)
+            .field("event_id", &safe.event_id)
+            .field("rule_ids", &safe.rule_ids)
+            .field("max_severity", &safe.max_severity)
+            .field("elapsed_ms", &safe.elapsed_ms)
+            .field("truncated", &safe.truncated)
+            .field("fail_mode_triggered", &safe.fail_mode_triggered)
+            .finish()
     }
 }
 
@@ -181,8 +277,8 @@ pub fn filter_tool_result(
     // Sanitize the entire candidate through one cross-leaf state machine. A key
     // collision is not recoverable: selecting a winner would forward structured
     // data that never passed validation, so convert it to a policy block.
-    if sanitize_forwarded_result(result).is_err() {
-        findings.push(structured_key_collision_finding());
+    if let Err(error) = sanitize_forwarded_result(result) {
+        findings.push(structured_sanitize_failure_finding(error));
         apply_block(result, &event_id);
         return build_filter_outcome(Action::Block, event_id, &findings, start.elapsed());
     }
@@ -323,14 +419,48 @@ fn scan_tool_result(result: &ToolCallResult, ctx: &OutputFilterContext) -> crate
     if let Some(sc) = &result.structured_content {
         stream_json_string_leaves(sc, &mut state);
     }
-    analyze_output_finalize_mut(&mut state)
+    let mut verdict = analyze_output_finalize_mut(&mut state);
+    // Keep the MCP forwarding boundary self-contained: the streaming engine is
+    // the primary DLP path, while this structural pass proves that a supported
+    // secret in one leaf, a contextual key/value pair, or an ordered cross-leaf
+    // split cannot be forwarded merely because a scanner state changes. The
+    // finding is categorical and retains no attacker bytes.
+    if result_contains_supported_secret(result)
+        && !verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::CredentialInText)
+    {
+        verdict.findings.push(supported_secret_finding());
+        verdict.action =
+            crate::verdict::upgraded_action_from_findings(&verdict.findings, verdict.action);
+    }
+    verdict
 }
 
 fn sanitize_forwarded_result(result: &mut ToolCallResult) -> Result<(), StructuredSanitizeError> {
+    // A deterministic key collision is the most precise structural failure.
+    // Detect it before the cross-leaf DLP check: secret-bearing keys can redact
+    // to the same fixed label, and concatenating their already-redacted forms
+    // must not misclassify that collision as a cross-leaf credential.
+    preflight_result_key_collisions(result)?;
+
+    let mut content_leaves = Vec::new();
+    for item in &result.content {
+        if item.content_type == "text" {
+            content_leaves.push(item.text.as_str());
+        }
+    }
+    reject_cross_leaf_secret(&content_leaves)?;
+    if let Some(sc) = &result.structured_content {
+        reject_cross_leaf_secret_in_value(sc)?;
+    }
+
     let mut sanitizer = TerminalSanitizer::default();
     for item in result.content.iter_mut() {
         if item.content_type == "text" {
-            item.text = sanitizer.sanitize_chunk(&item.text);
+            let redacted = crate::redact::redact_supported_secrets(&item.text);
+            item.text = sanitizer.sanitize_chunk(&redacted);
         }
     }
     if let Some(sc) = result.structured_content.as_mut() {
@@ -340,17 +470,140 @@ fn sanitize_forwarded_result(result: &mut ToolCallResult) -> Result<(), Structur
     Ok(())
 }
 
-fn structured_key_collision_finding() -> Finding {
+fn supported_secret_finding() -> Finding {
+    Finding {
+        rule_id: RuleId::CredentialInText,
+        severity: Severity::High,
+        title: "Supported credential material appeared in output".to_string(),
+        description: "The ordered MCP result contained structurally supported secret material. \
+            Tirith reports only the secret class boundary and never the value, prefix, or a \
+            stable digest."
+            .to_string(),
+        evidence: vec![crate::verdict::Evidence::Text {
+            detail: "supported_secret_material=true;location=mcp_result".to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
+fn structured_value_contains_supported_secret(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => crate::redact::contains_supported_secret(value),
+        serde_json::Value::Array(items) => {
+            let mut leaves = Vec::new();
+            for item in items {
+                collect_json_string_leaves(item, &mut leaves);
+            }
+            leaves_contain_supported_secret(&leaves)
+                || items.iter().any(structured_value_contains_supported_secret)
+        }
+        serde_json::Value::Object(map) => {
+            let mut value_leaves = Vec::new();
+            let entry_secret = map.iter().any(|(key, value)| {
+                collect_json_string_leaves(value, &mut value_leaves);
+                let contextual_secret = if value.is_null()
+                    || !(crate::sensitive_assets::is_registered_env_name(key)
+                        || crate::sensitive_assets::is_sensitive_value_alias(key))
+                {
+                    false
+                } else {
+                    let value = value
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| serde_json::to_string(value).ok())
+                        .unwrap_or_else(|| "[unserializable]".to_string());
+                    crate::redact::contains_supported_secret(&format!("{key}={value}"))
+                };
+                let mut entry_leaves = vec![key.as_str()];
+                collect_json_string_leaves(value, &mut entry_leaves);
+                contextual_secret
+                    || leaves_contain_supported_secret(&entry_leaves)
+                    || structured_value_contains_supported_secret(value)
+            });
+            entry_secret || leaves_contain_supported_secret(&value_leaves)
+        }
+        _ => false,
+    }
+}
+
+fn result_contains_supported_secret(result: &ToolCallResult) -> bool {
+    let mut content_leaves = Vec::new();
+    for item in &result.content {
+        if item.content_type == "text" {
+            content_leaves.push(item.text.as_str());
+        }
+    }
+    if leaves_contain_supported_secret(&content_leaves) {
+        return true;
+    }
+    if let Some(structured) = &result.structured_content {
+        return structured_value_contains_supported_secret(structured);
+    }
+    false
+}
+
+fn leaves_contain_supported_secret(leaves: &[&str]) -> bool {
+    if leaves
+        .iter()
+        .any(|leaf| crate::redact::contains_supported_secret(leaf))
+    {
+        return true;
+    }
+    if leaves.len() < 2 {
+        return false;
+    }
+    let total = leaves
+        .iter()
+        .fold(0usize, |total, leaf| total.saturating_add(leaf.len()));
+    let mut ordered = String::with_capacity(total);
+    for leaf in leaves {
+        ordered.push_str(leaf);
+    }
+    crate::redact::contains_supported_secret(&ordered)
+}
+
+fn preflight_result_key_collisions(result: &ToolCallResult) -> Result<(), StructuredSanitizeError> {
+    let mut sanitizer = TerminalSanitizer::default();
+    for item in &result.content {
+        if item.content_type == "text" {
+            let redacted = crate::redact::redact_supported_secrets(&item.text);
+            let _ = sanitizer.sanitize_chunk(&redacted);
+        }
+    }
+    if let Some(mut structured) = result.structured_content.clone() {
+        sanitize_json_strings(&mut structured, &mut sanitizer)?;
+    }
+    sanitizer.finish();
+    Ok(())
+}
+
+fn structured_sanitize_failure_finding(error: StructuredSanitizeError) -> Finding {
+    let (title, description, detail) = match error {
+        StructuredSanitizeError::KeyCollision => (
+            "Structured output keys collide after sanitization",
+            "Distinct upstream object keys became identical after terminal/control or secret \
+             sanitization. Tirith refused to choose a value because the rewritten object was \
+             never validated or approved.",
+            "sanitized_key_collision=true",
+        ),
+        StructuredSanitizeError::SensitiveMaterialAcrossLeaves => (
+            "Sensitive output crossed a structured leaf boundary",
+            "A supported secret spanned multiple ordered output leaves. Tirith cannot rewrite \
+             that value in place without changing unvalidated structure, so it refused to \
+             forward the result.",
+            "cross_leaf_secret=true",
+        ),
+    };
     Finding {
         rule_id: RuleId::AnalysisIncomplete,
         severity: Severity::High,
-        title: "Structured output keys collide after sanitization".to_string(),
-        description: "Distinct upstream object keys became identical after terminal/control \
-            sanitization. Tirith refused to choose a value because the rewritten object was \
-            never validated or approved."
-            .to_string(),
+        title: title.to_string(),
+        description: description.to_string(),
         evidence: vec![crate::verdict::Evidence::Text {
-            detail: "sanitized_key_collision=true".to_string(),
+            detail: detail.to_string(),
         }],
         human_view: None,
         agent_view: None,
@@ -863,11 +1116,141 @@ fn stream_json_string_leaves(v: &serde_json::Value, state: &mut OutputAnalyzerSt
         }
         serde_json::Value::Object(map) => {
             for (key, val) in map {
+                if !val.is_null()
+                    && (crate::sensitive_assets::is_registered_env_name(key)
+                        || crate::sensitive_assets::is_sensitive_value_alias(key))
+                {
+                    let value = val
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| serde_json::to_string(val).ok())
+                        .unwrap_or_else(|| "[unserializable]".to_string());
+                    feed_chunk(state, &format!("{key}={value}"));
+                }
                 feed_chunk(state, key);
                 stream_json_string_leaves(val, state);
             }
         }
         _ => {}
+    }
+}
+
+fn collect_json_string_leaves<'a>(v: &'a serde_json::Value, leaves: &mut Vec<&'a str>) {
+    match v {
+        serde_json::Value::String(value) => leaves.push(value),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_string_leaves(item, leaves);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                leaves.push(key);
+                collect_json_string_leaves(value, leaves);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Per-leaf redaction cannot safely rewrite one credential whose bytes cross a
+/// leaf/key boundary. The streaming analyzer detects and blocks this in normal
+/// filtering; this additional mutation-time check protects direct sanitizer
+/// callers and turns any such case into an explicit fail-closed outcome.
+fn reject_cross_leaf_secret(leaves: &[&str]) -> Result<(), StructuredSanitizeError> {
+    if leaves.len() < 2 {
+        return Ok(());
+    }
+    let mut clean_run = String::new();
+    let mut clean_leaf_count = 0usize;
+    for leaf in leaves {
+        let redacted = crate::redact::redact_supported_secrets(leaf);
+        if redacted != *leaf {
+            // Check the clean bytes before the first independently rewritable
+            // span against the prior run, then carry only the bytes after the
+            // last span into the next run. Derive those edges by exact common
+            // prefix/suffix, never by searching for the fixed marker: an
+            // attacker may legitimately include marker-shaped text in a leaf.
+            // This preserves real boundary splits at either edge while
+            // preventing a replacement marker from fabricating
+            // `PRIVATE_KEY=[REDACTED:…]ordinary` across two benign leaves.
+            let (prefix, suffix) = unchanged_redaction_edges(leaf, &redacted);
+            if !prefix.is_empty() {
+                clean_run.push_str(prefix);
+                clean_leaf_count += 1;
+            }
+            if clean_leaf_count >= 2 && crate::redact::contains_supported_secret(&clean_run) {
+                return Err(StructuredSanitizeError::SensitiveMaterialAcrossLeaves);
+            }
+            clean_run.clear();
+            clean_run.push_str(suffix);
+            clean_leaf_count = usize::from(!suffix.is_empty());
+            continue;
+        }
+        clean_run.push_str(leaf);
+        clean_leaf_count += 1;
+    }
+    // Every leaf in this run was clean independently. A secret visible only
+    // after their ordered concatenation therefore necessarily crosses at least
+    // one leaf boundary and cannot be rewritten without changing structure.
+    if clean_leaf_count >= 2 && crate::redact::contains_supported_secret(&clean_run) {
+        Err(StructuredSanitizeError::SensitiveMaterialAcrossLeaves)
+    } else {
+        Ok(())
+    }
+}
+
+/// Return the unchanged bytes before the first and after the last redaction.
+/// Both slices borrow the original input, and every boundary is a UTF-8
+/// character boundary even when attacker text and a replacement share bytes.
+fn unchanged_redaction_edges<'a>(input: &'a str, redacted: &str) -> (&'a str, &'a str) {
+    let mut prefix_len = 0usize;
+    for ((offset, input_char), redacted_char) in input.char_indices().zip(redacted.chars()) {
+        if input_char != redacted_char {
+            break;
+        }
+        prefix_len = offset + input_char.len_utf8();
+    }
+
+    let input_tail = &input[prefix_len..];
+    let redacted_tail = &redacted[prefix_len..];
+    let suffix_len = input_tail
+        .chars()
+        .rev()
+        .zip(redacted_tail.chars().rev())
+        .take_while(|(input_char, redacted_char)| input_char == redacted_char)
+        .map(|(input_char, _)| input_char.len_utf8())
+        .sum::<usize>();
+    (
+        &input[..prefix_len],
+        &input[input.len().saturating_sub(suffix_len)..],
+    )
+}
+
+fn reject_cross_leaf_secret_in_value(
+    value: &serde_json::Value,
+) -> Result<(), StructuredSanitizeError> {
+    match value {
+        serde_json::Value::Array(items) => {
+            let mut leaves = Vec::new();
+            for item in items {
+                collect_json_string_leaves(item, &mut leaves);
+                reject_cross_leaf_secret_in_value(item)?;
+            }
+            reject_cross_leaf_secret(&leaves)
+        }
+        serde_json::Value::Object(map) => {
+            let mut value_leaves = Vec::new();
+            for (key, value) in map {
+                let mut entry_leaves = vec![key.as_str()];
+                collect_json_string_leaves(value, &mut entry_leaves);
+                reject_cross_leaf_secret(&entry_leaves)?;
+                collect_json_string_leaves(value, &mut value_leaves);
+                reject_cross_leaf_secret_in_value(value)?;
+            }
+            reject_cross_leaf_secret(&value_leaves)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -877,6 +1260,7 @@ fn stream_json_string_leaves(v: &serde_json::Value, state: &mut OutputAnalyzerSt
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuredSanitizeError {
     KeyCollision,
+    SensitiveMaterialAcrossLeaves,
 }
 
 /// Recursively sanitize every JSON key/value using one streaming terminal state
@@ -888,7 +1272,8 @@ fn sanitize_json_strings(
 ) -> Result<(), StructuredSanitizeError> {
     match v {
         serde_json::Value::String(s) => {
-            *s = sanitizer.sanitize_chunk(s);
+            let redacted = crate::redact::redact_supported_secrets(s);
+            *s = sanitizer.sanitize_chunk(&redacted);
         }
         serde_json::Value::Array(items) => {
             for item in items.iter_mut() {
@@ -898,8 +1283,11 @@ fn sanitize_json_strings(
         serde_json::Value::Object(map) => {
             let mut rebuilt = serde_json::Map::with_capacity(map.len());
             for (key, mut val) in std::mem::take(map) {
-                let sanitized_key = sanitizer.sanitize_chunk(&key);
-                sanitize_json_strings(&mut val, sanitizer)?;
+                let redacted_key = crate::redact::redact_supported_secrets(&key);
+                let sanitized_key = sanitizer.sanitize_chunk(&redacted_key);
+                if !redact_structured_value_for_key(&key, &mut val) {
+                    sanitize_json_strings(&mut val, sanitizer)?;
+                }
                 if rebuilt.contains_key(&sanitized_key) {
                     return Err(StructuredSanitizeError::KeyCollision);
                 }
@@ -912,6 +1300,25 @@ fn sanitize_json_strings(
     Ok(())
 }
 
+fn redact_structured_value_for_key(key: &str, value: &mut serde_json::Value) -> bool {
+    if value.is_null() || value.as_str().is_some_and(|value| value.trim().is_empty()) {
+        return false;
+    }
+    let secret = if crate::sensitive_assets::is_sensitive_value_alias(key) {
+        true
+    } else if crate::sensitive_assets::is_registered_env_name(key) {
+        value
+            .as_str()
+            .is_some_and(|value| crate::sensitive_assets::is_sensitive_env_assignment(key, value))
+    } else {
+        false
+    };
+    if secret {
+        *value = serde_json::Value::String("[REDACTED:web3_secret]".to_string());
+    }
+    secret
+}
+
 /// Public scrub for an MCP `structuredContent` value: strips ANSI/OSC/control/
 /// zero-width bytes from every string leaf (values AND object keys) in place,
 /// identically to the on-every-verdict scrub `filter_tool_result` applies (F10).
@@ -921,9 +1328,30 @@ fn sanitize_json_strings(
 pub fn sanitize_structured_content(
     v: &mut serde_json::Value,
 ) -> Result<(), StructuredSanitizeError> {
+    {
+        let mut collision_probe = v.clone();
+        let mut collision_sanitizer = TerminalSanitizer::default();
+        sanitize_json_strings(&mut collision_probe, &mut collision_sanitizer)?;
+        collision_sanitizer.finish();
+    }
+    {
+        reject_cross_leaf_secret_in_value(v)?;
+    }
     let mut sanitizer = TerminalSanitizer::default();
     sanitize_json_strings(v, &mut sanitizer)?;
     sanitizer.finish();
+
+    // Terminal/control stripping can make previously separated bytes
+    // contiguous inside a leaf. Run the secret-aware pass once more over the
+    // normalized representation, then reject any credential that still spans
+    // multiple leaves. This makes the public direct sanitizer safe even when a
+    // caller does not perform the filter's final policy re-scan.
+    let mut normalized = TerminalSanitizer::default();
+    sanitize_json_strings(v, &mut normalized)?;
+    normalized.finish();
+    let mut normalized_leaves = Vec::new();
+    collect_json_string_leaves(v, &mut normalized_leaves);
+    reject_cross_leaf_secret(&normalized_leaves)?;
     Ok(())
 }
 
@@ -1128,24 +1556,174 @@ fn is_strippable_zero_width(ch: char) -> bool {
 mod tests {
     use super::*;
 
+    fn benign_filter_outcome() -> FilterOutcome {
+        FilterOutcome {
+            action: Action::Warn,
+            event_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            rule_ids: vec![
+                RuleId::CredentialInText.to_string(),
+                RuleId::AnalysisIncomplete.to_string(),
+            ],
+            max_severity: Some(Severity::High),
+            elapsed_ms: 1.25,
+            truncated: true,
+            fail_mode_triggered: false,
+        }
+    }
+
     #[test]
-    fn from_policy_preserves_legacy_error_shape_and_offers_safe_diagnostics() {
-        let raw = "C02_OUTPUT_FILTER_LEGACY_CANARY(";
+    fn filter_outcome_direct_debug_and_serde_are_mandatory_privacy_boundaries() {
+        let secret = format!("0x{}", "11".repeat(32));
+        let canary = format!("ghp_filter_outcome_{}", "A".repeat(30));
+        let tainted = format!("{secret}-{canary}");
+        let outcome = FilterOutcome {
+            action: Action::Block,
+            event_id: tainted.clone(),
+            rule_ids: vec![tainted.clone(), RuleId::CredentialInText.to_string()],
+            max_severity: Some(Severity::Critical),
+            elapsed_ms: 2.5,
+            truncated: false,
+            fail_mode_triggered: false,
+        };
+
+        let json = serde_json::to_string(&outcome).expect("serialize projected outcome");
+        let debug = format!("{outcome:?}");
+        for rendering in [&json, &debug] {
+            assert!(!rendering.contains(&secret), "{rendering}");
+            assert!(!rendering.contains(&secret[..18]), "{rendering}");
+            assert!(!rendering.contains(&canary), "{rendering}");
+            assert!(rendering.contains(INVALID_FILTER_EVENT_ID), "{rendering}");
+            assert!(
+                rendering.contains(&RuleId::AnalysisIncomplete.to_string()),
+                "{rendering}"
+            );
+            assert!(
+                rendering.contains(&RuleId::CredentialInText.to_string()),
+                "{rendering}"
+            );
+        }
+
+        let projected: serde_json::Value = serde_json::from_str(&json).expect("projected JSON");
+        assert_eq!(projected["event_id"], INVALID_FILTER_EVENT_ID);
+        assert_eq!(
+            projected["rule_ids"],
+            serde_json::json!([
+                RuleId::AnalysisIncomplete.to_string(),
+                RuleId::CredentialInText.to_string(),
+            ])
+        );
+
+        // Different attacker bytes collapse to the same fixed categoricals;
+        // neither output is a stable secret-derived verifier.
+        let mut second = outcome.clone();
+        second.event_id = format!("0x{}", "22".repeat(32));
+        second.rule_ids[0] = format!("sk_filter_outcome_{}", "B".repeat(32));
+        assert_eq!(
+            serde_json::to_value(&outcome).expect("first projection"),
+            serde_json::to_value(&second).expect("second projection")
+        );
+    }
+
+    #[test]
+    fn filter_outcome_deserialize_projects_untrusted_public_strings_immediately() {
+        let secret = format!("0x{}", "33".repeat(32));
+        let canary = format!("ghp_filter_input_{}", "C".repeat(30));
+        let tainted = format!("{secret}-{canary}");
+        let input = serde_json::json!({
+            "action": "block",
+            "event_id": tainted,
+            "rule_ids": [
+                format!("rule-{secret}-{canary}"),
+                RuleId::CredentialInText.to_string(),
+            ],
+            "max_severity": "HIGH",
+            "elapsed_ms": 3.5,
+            "truncated": false,
+            "fail_mode_triggered": false,
+        });
+
+        let outcome: FilterOutcome =
+            serde_json::from_value(input).expect("deserialize projected outcome");
+        assert_eq!(outcome.event_id, INVALID_FILTER_EVENT_ID);
+        assert_eq!(
+            outcome.rule_ids,
+            vec![
+                RuleId::AnalysisIncomplete.to_string(),
+                RuleId::CredentialInText.to_string(),
+            ]
+        );
+
+        for rendering in [
+            serde_json::to_string(&outcome).expect("serialize normalized outcome"),
+            format!("{outcome:?}"),
+        ] {
+            assert!(!rendering.contains(&secret), "{rendering}");
+            assert!(!rendering.contains(&secret[..18]), "{rendering}");
+            assert!(!rendering.contains(&canary), "{rendering}");
+        }
+    }
+
+    #[test]
+    fn filter_outcome_benign_wire_round_trip_preserves_schema_and_correlation() {
+        let original = benign_filter_outcome();
+        let wire = serde_json::to_value(&original).expect("serialize benign outcome");
+        assert_eq!(wire["action"], "warn");
+        assert_eq!(wire["event_id"], original.event_id);
+        assert_eq!(
+            wire["rule_ids"],
+            serde_json::to_value(&original.rule_ids).expect("serialize benign rule IDs")
+        );
+        assert_eq!(wire["max_severity"], "HIGH");
+        assert_eq!(wire["elapsed_ms"], 1.25);
+        assert_eq!(wire["truncated"], true);
+        assert_eq!(wire["fail_mode_triggered"], false);
+
+        let round_trip: FilterOutcome =
+            serde_json::from_value(wire.clone()).expect("deserialize benign outcome");
+        assert_eq!(round_trip.action, original.action);
+        assert_eq!(round_trip.event_id, original.event_id);
+        assert_eq!(round_trip.rule_ids, original.rule_ids);
+        assert_eq!(round_trip.max_severity, original.max_severity);
+        assert_eq!(round_trip.elapsed_ms, original.elapsed_ms);
+        assert_eq!(round_trip.truncated, original.truncated);
+        assert_eq!(round_trip.fail_mode_triggered, original.fail_mode_triggered);
+        assert_eq!(
+            serde_json::to_value(round_trip).expect("reserialize benign outcome"),
+            wire
+        );
+    }
+
+    #[test]
+    fn every_from_policy_constructor_returns_only_safe_diagnostics() {
+        let provider = format!("https://eth-mainnet.g.alchemy.com/v2/{}", "A".repeat(48));
+        let contextual = format!("PRIVATE_KEY=0x{}", "11".repeat(32));
+        let raw = format!("C04_OUTPUT_FILTER_CANARY({provider}{contextual}");
         let policy = crate::policy::Policy {
-            injection_seeds_custom: vec![raw.to_string()],
+            injection_seeds_custom: vec![raw.clone()],
             ..Default::default()
         };
 
-        let (_legacy_context, legacy_bad): (_, Vec<(String, regex::Error)>) =
-            OutputFilterContext::from_policy(&policy);
-        assert_eq!(legacy_bad.len(), 1);
-        assert_eq!(legacy_bad[0].0, raw);
+        let (default_named_context, default_named_bad) = OutputFilterContext::from_policy(&policy);
+        let (explicit_context, explicit_bad) =
+            OutputFilterContext::from_policy_with_diagnostics(&policy);
+        assert_eq!(default_named_bad, explicit_bad);
+        assert_eq!(default_named_bad.len(), 1);
+        assert_eq!(default_named_bad[0].index, 0);
+        assert_eq!(
+            default_named_bad[0].category,
+            prompt_injection::InvalidSeedCategory::RegexRejected
+        );
 
-        let (_safe_context, safe_bad) = OutputFilterContext::from_policy_with_diagnostics(&policy);
-        assert_eq!(safe_bad.len(), 1);
-        let safe = format!("{safe_bad:?}");
-        assert!(!safe.contains(raw));
-        assert!(safe.contains("index"));
+        for rendered in [
+            format!("{default_named_context:?}"),
+            format!("{explicit_context:?}"),
+            format!("{default_named_bad:?}"),
+            serde_json::to_string(&default_named_bad).expect("serialize safe diagnostics"),
+        ] {
+            for canary in [raw.as_str(), provider.as_str(), contextual.as_str()] {
+                assert!(!rendered.contains(canary), "{rendered}");
+            }
+        }
     }
 
     fn text_item(s: &str) -> ContentItem {
@@ -1158,6 +1736,163 @@ mod tests {
     fn osc52_text() -> String {
         // A complete OSC 52 (clipboard-write) sequence.
         "before-payload-\x1B]52;c;aGVsbG8=\x07-after-payload".to_string()
+    }
+
+    #[test]
+    fn supported_secrets_in_text_keys_leaves_and_item_splits_never_forward() {
+        let secret = format!("0x{}", "11".repeat(32));
+        let split_secret = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
+        let split_at = 31;
+        let cases = [
+            (
+                "text contextual scalar",
+                ToolCallResult {
+                    content: vec![text_item(&format!("PRIVATE_KEY={secret}"))],
+                    is_error: false,
+                    structured_content: None,
+                },
+                secret.clone(),
+            ),
+            (
+                "structured contextual scalar",
+                ToolCallResult {
+                    content: vec![text_item("benign")],
+                    is_error: false,
+                    structured_content: Some(serde_json::json!({
+                        "private_key": secret.clone(),
+                    })),
+                },
+                secret.clone(),
+            ),
+            (
+                "split content token",
+                ToolCallResult {
+                    content: vec![
+                        text_item(&split_secret[..split_at]),
+                        text_item(&split_secret[split_at..]),
+                    ],
+                    is_error: false,
+                    structured_content: None,
+                },
+                split_secret.clone(),
+            ),
+            (
+                "split structured token",
+                ToolCallResult {
+                    content: vec![text_item("benign")],
+                    is_error: false,
+                    structured_content: Some(serde_json::json!([
+                        &split_secret[..split_at],
+                        &split_secret[split_at..],
+                    ])),
+                },
+                split_secret.clone(),
+            ),
+            (
+                "split nested structured token",
+                ToolCallResult {
+                    content: vec![text_item("benign")],
+                    is_error: false,
+                    structured_content: Some(serde_json::json!({
+                        "rows": [
+                            &split_secret[..split_at],
+                            &split_secret[split_at..],
+                        ]
+                    })),
+                },
+                split_secret,
+            ),
+        ];
+        for (case, mut result, canary) in cases {
+            let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
+            assert_eq!(outcome.action, Action::Block, "{case}: {outcome:?}");
+            assert!(result.is_error, "{case}");
+            assert!(result.structured_content.is_none(), "{case}");
+            let forwarded = serde_json::to_string(&result).expect("forwarded result");
+            assert!(!forwarded.contains(&canary), "{case}: {forwarded}");
+            assert!(!forwarded.contains(&canary[..18]), "{case}: {forwarded}");
+        }
+
+        let mut key_map = serde_json::Map::new();
+        key_map.insert(format!("PRIVATE_KEY={secret}"), serde_json::json!("value"));
+        let mut key_result = ToolCallResult {
+            content: vec![text_item("benign")],
+            is_error: false,
+            structured_content: Some(serde_json::Value::Object(key_map)),
+        };
+        let outcome = filter_tool_result(&mut key_result, false, &OutputFilterContext::default());
+        assert_eq!(outcome.action, Action::Block, "{outcome:?}");
+        assert!(key_result.structured_content.is_none());
+    }
+
+    #[test]
+    fn direct_structured_sanitizer_redacts_supported_secrets_and_fails_on_collisions() {
+        let secret = format!("0x{}", "11".repeat(32));
+        let mut value = serde_json::json!({
+            "private_key": format!("PRIVATE_KEY={secret}"),
+            "safe": "ordinary",
+        });
+        sanitize_structured_content(&mut value).expect("same-leaf secret can be redacted");
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains(&secret), "{serialized}");
+        assert!(!serialized.contains(&secret[..18]), "{serialized}");
+        assert!(serialized.contains("REDACTED"), "{serialized}");
+
+        let mut colliding = serde_json::Map::new();
+        colliding.insert(format!("PRIVATE_KEY={secret}"), serde_json::json!("first"));
+        colliding.insert(
+            format!("PRIVATE_KEY=0x{}", "22".repeat(32)),
+            serde_json::json!("second"),
+        );
+        let mut colliding = serde_json::Value::Object(colliding);
+        assert_eq!(
+            sanitize_structured_content(&mut colliding),
+            Err(StructuredSanitizeError::KeyCollision)
+        );
+
+        let split_secret = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
+        let split_at = 31;
+        let mut mixed = serde_json::json!([
+            format!("PRIVATE_KEY={secret}"),
+            &split_secret[..split_at],
+            &split_secret[split_at..],
+        ]);
+        assert_eq!(
+            sanitize_structured_content(&mut mixed),
+            Err(StructuredSanitizeError::SensitiveMaterialAcrossLeaves)
+        );
+
+        let mut split_after_same_leaf_secret = serde_json::json!([
+            format!("PRIVATE_KEY={secret}; {}", &split_secret[..split_at]),
+            &split_secret[split_at..],
+        ]);
+        assert_eq!(
+            sanitize_structured_content(&mut split_after_same_leaf_secret),
+            Err(StructuredSanitizeError::SensitiveMaterialAcrossLeaves),
+            "redacting one complete leaf-local secret must not hide a second secret split at its suffix"
+        );
+
+        let mut attacker_marker_before_split = serde_json::json!([
+            format!(
+                "[REDACTED:attacker_literal] PRIVATE_KEY={secret}; {}",
+                &split_secret[..split_at]
+            ),
+            &split_secret[split_at..],
+        ]);
+        assert_eq!(
+            sanitize_structured_content(&mut attacker_marker_before_split),
+            Err(StructuredSanitizeError::SensitiveMaterialAcrossLeaves),
+            "attacker marker-shaped text must not confuse unchanged-edge detection"
+        );
+
+        let mut control_joined = serde_json::json!({
+            "value": format!("SG.{}\u{1b}[31m.{}", "A".repeat(22), "b".repeat(43)),
+        });
+        sanitize_structured_content(&mut control_joined)
+            .expect("post-control secret is redacted in the normalized pass");
+        let serialized = serde_json::to_string(&control_joined).unwrap();
+        assert!(!serialized.contains("SG."), "{serialized}");
+        assert!(serialized.contains("REDACTED"), "{serialized}");
     }
 
     #[test]

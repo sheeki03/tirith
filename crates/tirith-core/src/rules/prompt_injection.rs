@@ -44,7 +44,7 @@ const SEEDS_ASSET: &str = include_str!("../../assets/data/prompt_injection_seeds
 ///
 /// `Seed` is deliberately PRIVATE: the public surface is [`CompiledSeeds`], an
 /// opaque wrapper, so callers cannot poke at the regex/rule fields.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Seed {
     regex: Regex,
     rule_id: RuleId,
@@ -58,8 +58,20 @@ struct Seed {
 ///
 /// Wraps a `Vec<Seed>` so the private `Seed` type never leaks across the crate
 /// boundary.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CompiledSeeds(Vec<Seed>);
+
+impl std::fmt::Debug for CompiledSeeds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledSeeds")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
+fn categorical_seed_error(reason: &'static str) -> regex::Error {
+    regex::Error::Syntax(reason.to_string())
+}
 
 impl CompiledSeeds {
     /// An empty seed set — the default for callers with no custom seeds. Used by
@@ -73,13 +85,14 @@ impl CompiledSeeds {
 /// only the source-list index and a categorical reason; the attacker-controlled
 /// regex and `regex::Error` text (which can echo that regex) never need to cross
 /// a CLI or MCP diagnostic boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct InvalidSeedDiagnostic {
     pub index: usize,
     pub category: InvalidSeedCategory,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InvalidSeedCategory {
     BudgetExceeded,
     RegexRejected,
@@ -97,19 +110,15 @@ impl InvalidSeedCategory {
 /// Compile each pattern in `patterns` into a seed using the same
 /// placeholder-substitution + [`classify`] logic as the built-in corpus. Good
 /// seeds go into the returned [`CompiledSeeds`]; each pattern that fails to
-/// compile is collected into the bad-list as `(pattern, error)`.
+/// compile is represented only by its source-list index and a categorical
+/// reason. Neither the pattern nor a `regex::Error` crosses this public
+/// boundary because both can echo attacker-controlled policy bytes.
 ///
 /// Unlike the built-in loader this does NOT `eprintln!` on a bad pattern: the
-/// caller surfaces the bad-list (policy validation is the primary gate, so bad
-/// seeds normally never reach here). A blank/`#`-comment line is skipped silently.
-pub fn compile_seeds(patterns: &[String]) -> (CompiledSeeds, Vec<(String, regex::Error)>) {
-    let (compiled, bad) = compile_seeds_indexed(patterns);
-    (
-        compiled,
-        bad.into_iter()
-            .map(|(_index, pattern, error)| (pattern, error))
-            .collect(),
-    )
+/// caller decides how to handle the safe diagnostics. A blank/`#`-comment line
+/// is skipped silently.
+pub fn compile_seeds(patterns: &[String]) -> (CompiledSeeds, Vec<InvalidSeedDiagnostic>) {
+    compile_seeds_with_safe_diagnostics(patterns)
 }
 
 fn compile_seeds_indexed(
@@ -159,8 +168,8 @@ fn compile_seeds_indexed(
 }
 
 /// Compile custom seeds while projecting failures into safe indexed categories
-/// suitable for public diagnostics. The legacy [`compile_seeds`] return stays
-/// source-compatible for internal consumers and tests that need the raw error.
+/// suitable for public diagnostics. This explicit name remains as an alias for
+/// callers that adopted it before [`compile_seeds`] itself became mandatory-safe.
 pub fn compile_seeds_with_safe_diagnostics(
     patterns: &[String],
 ) -> (CompiledSeeds, Vec<InvalidSeedDiagnostic>) {
@@ -254,7 +263,9 @@ fn compile_seed_regex(seed: &str) -> Result<Regex, regex::Error> {
 /// compile. Returns `Ok(())` for a good seed, `Err(regex::Error)` for a bad one.
 /// Empty/length checks stay in the caller ([`crate::policy_validate`]).
 pub fn validate_seed_pattern(pattern: &str) -> Result<(), regex::Error> {
-    compile_seed_regex(pattern).map(|_| ())
+    compile_seed_regex(pattern)
+        .map(|_| ())
+        .map_err(|_| categorical_seed_error("invalid custom injection seed"))
 }
 
 /// Compile one seed into a case-insensitive regex. Returns `None` + a warning on
@@ -262,8 +273,8 @@ pub fn validate_seed_pattern(pattern: &str) -> Result<(), regex::Error> {
 fn build_regex(seed: &str) -> Option<Regex> {
     match compile_seed_regex(seed) {
         Ok(re) => Some(re),
-        Err(e) => {
-            eprintln!("tirith: warning: invalid prompt-injection seed '{seed}': {e}");
+        Err(_) => {
+            eprintln!("tirith: warning: built-in prompt-injection seed failed to compile");
             None
         }
     }
@@ -1064,10 +1075,11 @@ mod tests {
     }
 
     #[test]
-    fn compile_seeds_collects_bad_patterns() {
+    fn compile_seeds_reports_only_categorical_bad_patterns() {
         let (good, bad) = compile_seeds(&["valid".to_string(), "(unclosed".to_string()]);
         assert_eq!(bad.len(), 1, "one pattern must be reported bad");
-        assert_eq!(bad[0].0, "(unclosed");
+        assert_eq!(bad[0].index, 1);
+        assert_eq!(bad[0].category, InvalidSeedCategory::RegexRejected);
         // The good one still compiled.
         assert!(!check_with("this is valid text", &good).is_empty());
     }
@@ -1096,7 +1108,8 @@ mod tests {
             1,
             "the pathological pattern must land in the bad-list, got {bad:?}"
         );
-        assert_eq!(bad[0].0, pathological);
+        assert_eq!(bad[0].index, 0);
+        assert_eq!(bad[0].category, InvalidSeedCategory::RegexRejected);
 
         // The bound must NOT reject ordinary seeds: the whole built-in corpus still
         // compiles (proves 1 MiB is comfortably above the real corpus's needs).
@@ -1112,6 +1125,63 @@ mod tests {
         }
         // And SEEDS (the lazily-compiled corpus) loaded every entry.
         assert!(!SEEDS.is_empty(), "the built-in corpus must compile");
+    }
+
+    #[test]
+    fn safe_seed_diagnostics_and_debug_never_expose_source_patterns() {
+        let secret = format!("ghp_{}", "Z".repeat(36));
+        let provider = format!("https://eth-mainnet.g.alchemy.com/v2/{}", "A".repeat(48));
+        let contextual = format!("PRIVATE_KEY=0x{}", "11".repeat(32));
+        let invalid = format!("({secret}{provider}{contextual}");
+        let (compiled, diagnostics) = compile_seeds(std::slice::from_ref(&invalid));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].index, 0);
+        assert_eq!(diagnostics[0].category, InvalidSeedCategory::RegexRejected);
+        let debug_diagnostic = format!("{diagnostics:?}");
+        let json_diagnostic =
+            serde_json::to_string(&diagnostics).expect("serialize safe seed diagnostics");
+        for diagnostic in [&debug_diagnostic, &json_diagnostic] {
+            for canary in [
+                secret.as_str(),
+                provider.as_str(),
+                contextual.as_str(),
+                invalid.as_str(),
+            ] {
+                assert!(!diagnostic.contains(canary), "{diagnostic}");
+            }
+        }
+        assert!(
+            debug_diagnostic.contains("RegexRejected"),
+            "{debug_diagnostic}"
+        );
+        assert!(
+            json_diagnostic.contains("regex_rejected"),
+            "{json_diagnostic}"
+        );
+
+        let validation_error =
+            validate_seed_pattern(&invalid).expect_err("invalid policy regex must be rejected");
+        for rendered in [
+            validation_error.to_string(),
+            format!("{validation_error:?}"),
+        ] {
+            for canary in [
+                secret.as_str(),
+                provider.as_str(),
+                contextual.as_str(),
+                invalid.as_str(),
+            ] {
+                assert!(!rendered.contains(canary), "{rendered}");
+            }
+            assert!(
+                rendered.contains("invalid custom injection seed"),
+                "{rendered}"
+            );
+        }
+
+        let debug = format!("{compiled:?}");
+        assert_eq!(debug, "CompiledSeeds { count: 0 }");
+        assert!(!debug.contains(&secret));
     }
 
     #[test]

@@ -381,7 +381,7 @@ pub enum RuleId {
     /// commands run as root with zero tirith visibility. High.
     SudoShellSpawn,
     /// M8 ch4 — `sudo -E` / `--preserve-env[=LIST]` with a sensitive env var
-    /// (`sensitive_env.toml`) set, making credentials readable via
+    /// (central sensitive-asset registry) set, making credentials readable via
     /// `/proc/<pid>/environ`. High.
     SudoEnvPreserveSensitive,
     /// M8 ch4 — `… | sudo tee <system-path>` writing to a privileged file
@@ -493,7 +493,7 @@ pub enum RuleId {
 
     // Environment-variable lifecycle rules (M9 ch4). Two fire from the exec hot
     // path (gated by `policy.env_guard_enabled`); one only from `tirith env guard`.
-    // Sensitive-var list is the same `sensitive_env.toml` M6 ch5 guidance uses.
+    // Sensitive-var list is the same central registry M6 ch5 guidance uses.
     /// M9 ch4 — a sensitive env var is set AND the command pipes remote content
     /// into a shell (`curl … | bash`); the script inherits and can exfiltrate it.
     /// High. This is the dedicated rule for M6 ch5 environment-scrubbing
@@ -950,7 +950,66 @@ impl fmt::Display for Severity {
 }
 
 /// Evidence supporting a finding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DataFlowSource {
+    SensitiveFile,
+    SensitiveEnvironmentReference,
+    SensitiveCommandSubstitution,
+    PipedSensitiveFile,
+    MultipleSensitiveFiles,
+    SensitiveAsset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DataFlowSink {
+    Curl,
+    Wget,
+    RemoteHttp,
+    LocalProcess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DataFlowOperation {
+    UploadFile,
+    MultipartForm,
+    RequestBody,
+    PostFile,
+    PostData,
+    CredentialSweep,
+    UploadAnalysisUnresolved,
+    CredentialSweepAnalysisUnresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OutputDataSource {
+    SecretOrCanarySignal,
+    ClassifiedSensitivePath,
+    OutputText,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OutputDataSink {
+    RemoteRenderer,
+    RemoteHttp,
+    Directive,
+    OperatorSuppression,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OutputDataOperation {
+    AutoFetch,
+    UrlQuery,
+    ReadAndSend,
+    Stealth,
+}
+
+#[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Evidence {
     Url {
@@ -994,6 +1053,537 @@ pub enum Evidence {
     },
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum EvidenceProjection<'a> {
+    Url {
+        raw: &'a str,
+    },
+    HostComparison {
+        raw_host: &'a str,
+        similar_to: &'a str,
+    },
+    CommandPattern {
+        pattern: &'a str,
+        matched: &'a str,
+    },
+    ByteSequence {
+        offset: usize,
+        hex: &'a str,
+        description: &'a str,
+    },
+    EnvVar {
+        name: &'a str,
+        value_preview: &'a str,
+    },
+    Text {
+        detail: &'a str,
+    },
+    ThreatIntel {
+        source: &'a str,
+        threat_type: &'a str,
+        confidence: crate::threatdb::Confidence,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reference: Option<&'a str>,
+    },
+    HomoglyphAnalysis {
+        raw: &'a str,
+        escaped: &'a str,
+        suspicious_chars: &'a [SuspiciousChar],
+    },
+}
+
+impl<'a> From<&'a Evidence> for EvidenceProjection<'a> {
+    fn from(value: &'a Evidence) -> Self {
+        match value {
+            Evidence::Url { raw } => Self::Url { raw },
+            Evidence::HostComparison {
+                raw_host,
+                similar_to,
+            } => Self::HostComparison {
+                raw_host,
+                similar_to,
+            },
+            Evidence::CommandPattern { pattern, matched } => {
+                Self::CommandPattern { pattern, matched }
+            }
+            Evidence::ByteSequence {
+                offset,
+                hex,
+                description,
+            } => Self::ByteSequence {
+                offset: *offset,
+                hex,
+                description,
+            },
+            Evidence::EnvVar {
+                name,
+                value_preview,
+            } => Self::EnvVar {
+                name,
+                value_preview,
+            },
+            Evidence::Text { detail } => Self::Text { detail },
+            Evidence::ThreatIntel {
+                source,
+                threat_type,
+                confidence,
+                reference,
+            } => Self::ThreatIntel {
+                source,
+                threat_type,
+                confidence: *confidence,
+                reference: reference.as_deref(),
+            },
+            Evidence::HomoglyphAnalysis {
+                raw,
+                escaped,
+                suspicious_chars,
+            } => Self::HomoglyphAnalysis {
+                raw,
+                escaped,
+                suspicious_chars,
+            },
+        }
+    }
+}
+
+impl Serialize for Evidence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let safe = crate::redact::mandatory_redacted_evidence(self);
+        EvidenceProjection::from(&safe).serialize(serializer)
+    }
+}
+
+impl fmt::Debug for Evidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let safe = crate::redact::mandatory_redacted_evidence(self);
+        fmt::Debug::fmt(&EvidenceProjection::from(&safe), formatter)
+    }
+}
+
+macro_rules! closed_token {
+    ($value:expr, $($variant:path => $token:literal),+ $(,)?) => {
+        match $value {
+            $($variant => $token,)+
+        }
+    };
+}
+
+pub(crate) fn data_flow_evidence(
+    source: DataFlowSource,
+    sink: DataFlowSink,
+    operation: DataFlowOperation,
+) -> Evidence {
+    let source = closed_token!(source,
+        DataFlowSource::SensitiveFile => "sensitive_file",
+        DataFlowSource::SensitiveEnvironmentReference => "sensitive_environment_reference",
+        DataFlowSource::SensitiveCommandSubstitution => "sensitive_command_substitution",
+        DataFlowSource::PipedSensitiveFile => "piped_sensitive_file",
+        DataFlowSource::MultipleSensitiveFiles => "multiple_sensitive_files",
+        DataFlowSource::SensitiveAsset => "sensitive_asset",
+    );
+    let sink = closed_token!(sink,
+        DataFlowSink::Curl => "curl",
+        DataFlowSink::Wget => "wget",
+        DataFlowSink::RemoteHttp => "remote_http",
+        DataFlowSink::LocalProcess => "local_process",
+    );
+    let operation = closed_token!(operation,
+        DataFlowOperation::UploadFile => "upload_file",
+        DataFlowOperation::MultipartForm => "multipart_form",
+        DataFlowOperation::RequestBody => "request_body",
+        DataFlowOperation::PostFile => "post_file",
+        DataFlowOperation::PostData => "post_data",
+        DataFlowOperation::CredentialSweep => "credential_sweep",
+        DataFlowOperation::UploadAnalysisUnresolved => "upload_analysis_unresolved",
+        DataFlowOperation::CredentialSweepAnalysisUnresolved => "credential_sweep_analysis_unresolved",
+    );
+    Evidence::Text {
+        detail: format!("tirith:v1:data_flow;source={source};sink={sink};operation={operation}"),
+    }
+}
+
+pub(crate) fn output_data_flow_evidence(
+    source: OutputDataSource,
+    sink: OutputDataSink,
+    operation: OutputDataOperation,
+    signal_count: usize,
+    query_key_count: usize,
+) -> Evidence {
+    let source = closed_token!(source,
+        OutputDataSource::SecretOrCanarySignal => "secret_or_canary_signal",
+        OutputDataSource::ClassifiedSensitivePath => "classified_sensitive_path",
+        OutputDataSource::OutputText => "output_text",
+    );
+    let sink = closed_token!(sink,
+        OutputDataSink::RemoteRenderer => "remote_renderer",
+        OutputDataSink::RemoteHttp => "remote_http",
+        OutputDataSink::Directive => "directive",
+        OutputDataSink::OperatorSuppression => "operator_suppression",
+    );
+    let operation = closed_token!(operation,
+        OutputDataOperation::AutoFetch => "auto_fetch",
+        OutputDataOperation::UrlQuery => "url_query",
+        OutputDataOperation::ReadAndSend => "read_and_send",
+        OutputDataOperation::Stealth => "stealth",
+    );
+    Evidence::Text {
+        detail: format!(
+            "tirith:v1:output_data_flow;source={source};sink={sink};operation={operation};signals={signal_count};query_keys={query_key_count}"
+        ),
+    }
+}
+
+fn web3_index_token(extraction_index: Option<usize>) -> String {
+    extraction_index.map_or_else(|| "none".to_string(), |index| index.to_string())
+}
+
+pub(crate) fn web3_endpoint_evidence(
+    endpoint: &crate::sensitive_assets::RpcEndpointSummary,
+    extraction_index: Option<usize>,
+) -> Evidence {
+    use crate::sensitive_assets::{RpcCredentialClass as C, RpcPathClass as P, RpcProvider as R};
+    let provider = closed_token!(endpoint.provider,
+        R::Infura => "infura", R::Alchemy => "alchemy", R::Moralis => "moralis",
+        R::Chainstack => "chainstack", R::GetBlock => "getblock",
+        R::QuickNode => "quicknode", R::Ankr => "ankr", R::Other => "other",
+    );
+    let path = closed_token!(endpoint.path_class,
+        P::Root => "root", P::Rpc => "rpc", P::JsonRpc => "jsonrpc",
+        P::Versioned => "versioned", P::Opaque => "opaque",
+    );
+    let credential = closed_token!(endpoint.credential_class,
+        C::Public => "public", C::UserInfo => "userinfo", C::Query => "query",
+        C::Fragment => "fragment", C::HostToken => "host_token",
+        C::PathToken => "path_token", C::Multiple => "multiple",
+    );
+    Evidence::Text {
+        detail: format!(
+            "tirith:v1:web3_endpoint;index={};provider={provider};path={path};credential={credential}",
+            web3_index_token(extraction_index)
+        ),
+    }
+}
+
+pub(crate) fn web3_address_evidence(extraction_index: Option<usize>) -> Evidence {
+    Evidence::Text {
+        detail: format!(
+            "tirith:v1:web3_address;index={}",
+            web3_index_token(extraction_index)
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PdfTextEvidenceVisibility {
+    Visible,
+    Hidden,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PdfTextEvidenceJoin {
+    Concatenated,
+    Spaced,
+}
+
+fn take_categorical_field<'a>(
+    input: &mut &'a str,
+    field: &str,
+    final_field: bool,
+) -> Option<&'a str> {
+    let value = input.strip_prefix(field)?;
+    if final_field {
+        if value.is_empty() || value.contains(';') {
+            return None;
+        }
+        *input = "";
+        return Some(value);
+    }
+    let (value, remaining) = value.split_once(';')?;
+    if value.is_empty() {
+        return None;
+    }
+    *input = remaining;
+    Some(value)
+}
+
+fn canonical_usize_token(value: &str) -> bool {
+    value
+        .parse::<usize>()
+        .ok()
+        .is_some_and(|parsed| parsed.to_string() == value)
+}
+
+fn canonical_index_token(value: &str) -> bool {
+    value == "none" || canonical_usize_token(value)
+}
+
+const MAX_PDF_TEXT_EVIDENCE_PAGE: u32 = 100_000;
+const MAX_PDF_TEXT_EVIDENCE_OBJECT: u32 = 100_000;
+const MAX_PDF_TEXT_EVIDENCE_FRAGMENTS: u16 = 256;
+
+fn canonical_bounded_u32_token(value: &str, min: u32, max: u32) -> bool {
+    value
+        .parse::<u32>()
+        .ok()
+        .is_some_and(|parsed| parsed >= min && parsed <= max && parsed.to_string() == value)
+}
+
+fn canonical_bounded_u16_token(value: &str, min: u16, max: u16) -> bool {
+    value
+        .parse::<u16>()
+        .ok()
+        .is_some_and(|parsed| parsed >= min && parsed <= max && parsed.to_string() == value)
+}
+
+fn canonical_pdf_object_token(value: &str) -> bool {
+    if value == "unknown" {
+        return true;
+    }
+    let Some(reference) = value.strip_prefix("ref:") else {
+        return false;
+    };
+    let mut fields = reference.split(':');
+    let (Some(number), Some(generation), None) = (fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    canonical_bounded_u32_token(number, 1, MAX_PDF_TEXT_EVIDENCE_OBJECT)
+        && canonical_bounded_u16_token(generation, 0, u16::MAX)
+}
+
+fn pdf_object_evidence_token(object: Option<&str>) -> String {
+    let Some(object) = object else {
+        return "unknown".to_string();
+    };
+    let candidate = format!("ref:{object}");
+    if canonical_pdf_object_token(&candidate) {
+        candidate
+    } else {
+        "unknown".to_string()
+    }
+}
+
+pub(crate) fn pdf_text_fragment_evidence(
+    page: u32,
+    object: Option<&str>,
+    visibility: PdfTextEvidenceVisibility,
+) -> Evidence {
+    let visibility = closed_token!(visibility,
+        PdfTextEvidenceVisibility::Visible => "visible",
+        PdfTextEvidenceVisibility::Hidden => "hidden",
+        PdfTextEvidenceVisibility::Unknown => "unknown",
+    );
+    let object = pdf_object_evidence_token(object);
+    Evidence::Text {
+        detail: format!(
+            "tirith:v1:pdf_text;mode=fragment;page={page};object={object};visibility={visibility}"
+        ),
+    }
+}
+
+pub(crate) fn pdf_text_reassembled_evidence(
+    page: u32,
+    join: PdfTextEvidenceJoin,
+    ordered_fragments: usize,
+) -> Evidence {
+    let join = closed_token!(join,
+        PdfTextEvidenceJoin::Concatenated => "concatenated",
+        PdfTextEvidenceJoin::Spaced => "spaced",
+    );
+    Evidence::Text {
+        detail: format!(
+            "tirith:v1:pdf_text;mode=reassembled;page={page};join={join};fragments={ordered_fragments}"
+        ),
+    }
+}
+
+/// Validate the complete grammar of a Tirith-generated categorical record.
+/// Every string field is a closed token and every numeric field must use its
+/// canonical decimal spelling. Consequently, a public `Evidence::Text` value
+/// cannot append opaque data and masquerade as an internal record to bypass DLP.
+pub(crate) fn is_internal_categorical_evidence_record(detail: &str) -> bool {
+    if let Some(mut tail) = detail.strip_prefix("tirith:v1:data_flow;") {
+        let Some(source) = take_categorical_field(&mut tail, "source=", false) else {
+            return false;
+        };
+        let Some(sink) = take_categorical_field(&mut tail, "sink=", false) else {
+            return false;
+        };
+        let Some(operation) = take_categorical_field(&mut tail, "operation=", true) else {
+            return false;
+        };
+        return tail.is_empty()
+            && matches!(
+                source,
+                "sensitive_file"
+                    | "sensitive_environment_reference"
+                    | "sensitive_command_substitution"
+                    | "piped_sensitive_file"
+                    | "multiple_sensitive_files"
+                    | "sensitive_asset"
+            )
+            && matches!(sink, "curl" | "wget" | "remote_http" | "local_process")
+            && matches!(
+                operation,
+                "upload_file"
+                    | "multipart_form"
+                    | "request_body"
+                    | "post_file"
+                    | "post_data"
+                    | "credential_sweep"
+                    | "upload_analysis_unresolved"
+                    | "credential_sweep_analysis_unresolved"
+            );
+    }
+    if let Some(mut tail) = detail.strip_prefix("tirith:v1:output_data_flow;") {
+        let Some(source) = take_categorical_field(&mut tail, "source=", false) else {
+            return false;
+        };
+        let Some(sink) = take_categorical_field(&mut tail, "sink=", false) else {
+            return false;
+        };
+        let Some(operation) = take_categorical_field(&mut tail, "operation=", false) else {
+            return false;
+        };
+        let Some(signals) = take_categorical_field(&mut tail, "signals=", false) else {
+            return false;
+        };
+        let Some(query_keys) = take_categorical_field(&mut tail, "query_keys=", true) else {
+            return false;
+        };
+        return tail.is_empty()
+            && matches!(
+                source,
+                "secret_or_canary_signal" | "classified_sensitive_path" | "output_text"
+            )
+            && matches!(
+                sink,
+                "remote_renderer" | "remote_http" | "directive" | "operator_suppression"
+            )
+            && matches!(
+                operation,
+                "auto_fetch" | "url_query" | "read_and_send" | "stealth"
+            )
+            && canonical_usize_token(signals)
+            && canonical_usize_token(query_keys);
+    }
+    if let Some(mut tail) = detail.strip_prefix("tirith:v1:web3_endpoint;") {
+        let Some(index) = take_categorical_field(&mut tail, "index=", false) else {
+            return false;
+        };
+        let Some(provider) = take_categorical_field(&mut tail, "provider=", false) else {
+            return false;
+        };
+        let Some(path) = take_categorical_field(&mut tail, "path=", false) else {
+            return false;
+        };
+        let Some(credential) = take_categorical_field(&mut tail, "credential=", true) else {
+            return false;
+        };
+        return tail.is_empty()
+            && canonical_index_token(index)
+            && matches!(
+                provider,
+                "infura"
+                    | "alchemy"
+                    | "moralis"
+                    | "chainstack"
+                    | "getblock"
+                    | "quicknode"
+                    | "ankr"
+                    | "other"
+            )
+            && matches!(path, "root" | "rpc" | "jsonrpc" | "versioned" | "opaque")
+            && matches!(
+                credential,
+                "public"
+                    | "userinfo"
+                    | "query"
+                    | "fragment"
+                    | "host_token"
+                    | "path_token"
+                    | "multiple"
+            );
+    }
+    if let Some(mut tail) = detail.strip_prefix("tirith:v1:web3_address;") {
+        let Some(index) = take_categorical_field(&mut tail, "index=", true) else {
+            return false;
+        };
+        return tail.is_empty() && canonical_index_token(index);
+    }
+    if let Some(mut tail) = detail.strip_prefix("tirith:v1:pdf_text;") {
+        let Some(mode) = take_categorical_field(&mut tail, "mode=", false) else {
+            return false;
+        };
+        let Some(page) = take_categorical_field(&mut tail, "page=", false) else {
+            return false;
+        };
+        if !canonical_bounded_u32_token(page, 1, MAX_PDF_TEXT_EVIDENCE_PAGE) {
+            return false;
+        }
+        return match mode {
+            "fragment" => {
+                let Some(object) = take_categorical_field(&mut tail, "object=", false) else {
+                    return false;
+                };
+                let Some(visibility) = take_categorical_field(&mut tail, "visibility=", true)
+                else {
+                    return false;
+                };
+                tail.is_empty()
+                    && canonical_pdf_object_token(object)
+                    && matches!(visibility, "visible" | "hidden" | "unknown")
+            }
+            "reassembled" => {
+                let Some(join) = take_categorical_field(&mut tail, "join=", false) else {
+                    return false;
+                };
+                let Some(fragments) = take_categorical_field(&mut tail, "fragments=", true) else {
+                    return false;
+                };
+                tail.is_empty()
+                    && matches!(join, "concatenated" | "spaced")
+                    && canonical_bounded_u16_token(fragments, 2, MAX_PDF_TEXT_EVIDENCE_FRAGMENTS)
+            }
+            _ => false,
+        };
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InternalWeb3Evidence {
+    Endpoint { extraction_index: Option<usize> },
+    Address { extraction_index: Option<usize> },
+}
+
+pub(crate) fn internal_web3_evidence(evidence: &Evidence) -> Option<InternalWeb3Evidence> {
+    let Evidence::Text { detail } = evidence else {
+        return None;
+    };
+    if !is_internal_categorical_evidence_record(detail) {
+        return None;
+    }
+    let (kind, tail) = detail.strip_prefix("tirith:v1:")?.split_once(";index=")?;
+    let index_token = tail.split(';').next()?;
+    let extraction_index = if index_token == "none" {
+        None
+    } else {
+        index_token.parse::<usize>().ok()
+    };
+    match kind {
+        "web3_endpoint" => Some(InternalWeb3Evidence::Endpoint { extraction_index }),
+        "web3_address" => Some(InternalWeb3Evidence::Address { extraction_index }),
+        _ => None,
+    }
+}
+
 /// A suspicious character with its position and details
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuspiciousChar {
@@ -1011,7 +1601,7 @@ pub struct SuspiciousChar {
 }
 
 /// A single detection finding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Finding {
     pub rule_id: RuleId,
     pub severity: Severity,
@@ -1030,6 +1620,67 @@ pub struct Finding {
     /// User-defined custom rule ID (populated only for CustomRuleMatch findings).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_rule_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FindingProjection<'a> {
+    rule_id: RuleId,
+    severity: Severity,
+    title: &'a str,
+    description: &'a str,
+    evidence: &'a [Evidence],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    human_view: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_view: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mitre_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    custom_rule_id: Option<&'a str>,
+}
+
+impl<'a> From<&'a Finding> for FindingProjection<'a> {
+    fn from(value: &'a Finding) -> Self {
+        Self {
+            rule_id: value.rule_id,
+            severity: value.severity,
+            title: &value.title,
+            description: &value.description,
+            evidence: &value.evidence,
+            human_view: value.human_view.as_deref(),
+            agent_view: value.agent_view.as_deref(),
+            mitre_id: value.mitre_id.as_deref(),
+            custom_rule_id: value.custom_rule_id.as_deref(),
+        }
+    }
+}
+
+impl Serialize for Finding {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let safe = crate::redact::mandatory_redacted_finding(self);
+        FindingProjection::from(&safe).serialize(serializer)
+    }
+}
+
+impl fmt::Debug for Finding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let safe = crate::redact::mandatory_redacted_finding(self);
+        formatter
+            .debug_struct("Finding")
+            .field("rule_id", &safe.rule_id)
+            .field("severity", &safe.severity)
+            .field("title", &safe.title)
+            .field("description", &safe.description)
+            .field("evidence", &safe.evidence)
+            .field("human_view", &safe.human_view)
+            .field("agent_view", &safe.agent_view)
+            .field("mitre_id", &safe.mitre_id)
+            .field("custom_rule_id", &safe.custom_rule_id)
+            .finish()
+    }
 }
 
 /// The action to take based on analysis.
@@ -1904,7 +2555,7 @@ fn evidence_text_bytes(evidence: &Evidence) -> usize {
 }
 
 /// Complete analysis verdict.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Verdict {
     pub action: Action,
     pub findings: Vec<Finding>,
@@ -1955,6 +2606,99 @@ pub struct Verdict {
     /// parses (serde-default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_allowed_match: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VerdictProjection<'a> {
+    action: Action,
+    findings: &'a [Finding],
+    tier_reached: u8,
+    bypass_requested: bool,
+    bypass_honored: bool,
+    bypass_available: bool,
+    interactive_detected: bool,
+    policy_path_used: Option<&'a str>,
+    timings_ms: &'a Timings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    urls_extracted_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requires_approval: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_fallback: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_rule: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    escalation_reason: Option<&'a str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_origin: Option<&'a crate::agent_origin::AgentOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manifest_allowed_match: Option<&'a str>,
+}
+
+impl<'a> From<&'a Verdict> for VerdictProjection<'a> {
+    fn from(value: &'a Verdict) -> Self {
+        Self {
+            action: value.action,
+            findings: &value.findings,
+            tier_reached: value.tier_reached,
+            bypass_requested: value.bypass_requested,
+            bypass_honored: value.bypass_honored,
+            bypass_available: value.bypass_available,
+            interactive_detected: value.interactive_detected,
+            policy_path_used: value.policy_path_used.as_deref(),
+            timings_ms: &value.timings_ms,
+            urls_extracted_count: value.urls_extracted_count,
+            requires_approval: value.requires_approval,
+            approval_timeout_secs: value.approval_timeout_secs,
+            approval_fallback: value.approval_fallback.as_deref(),
+            approval_rule: value.approval_rule.as_deref(),
+            approval_description: value.approval_description.as_deref(),
+            escalation_reason: value.escalation_reason.as_deref(),
+            agent_origin: value.agent_origin.as_ref(),
+            manifest_allowed_match: value.manifest_allowed_match.as_deref(),
+        }
+    }
+}
+
+impl Serialize for Verdict {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let safe = crate::redact::mandatory_redacted_verdict(self);
+        VerdictProjection::from(&safe).serialize(serializer)
+    }
+}
+
+impl fmt::Debug for Verdict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let safe = crate::redact::mandatory_redacted_verdict(self);
+        formatter
+            .debug_struct("Verdict")
+            .field("action", &safe.action)
+            .field("findings", &safe.findings)
+            .field("tier_reached", &safe.tier_reached)
+            .field("bypass_requested", &safe.bypass_requested)
+            .field("bypass_honored", &safe.bypass_honored)
+            .field("bypass_available", &safe.bypass_available)
+            .field("interactive_detected", &safe.interactive_detected)
+            .field("policy_path_used", &safe.policy_path_used)
+            .field("timings_ms", &safe.timings_ms)
+            .field("urls_extracted_count", &safe.urls_extracted_count)
+            .field("requires_approval", &safe.requires_approval)
+            .field("approval_timeout_secs", &safe.approval_timeout_secs)
+            .field("approval_fallback", &safe.approval_fallback)
+            .field("approval_rule", &safe.approval_rule)
+            .field("approval_description", &safe.approval_description)
+            .field("escalation_reason", &safe.escalation_reason)
+            .field("agent_origin", &safe.agent_origin)
+            .field("manifest_allowed_match", &safe.manifest_allowed_match)
+            .finish()
+    }
 }
 
 /// Per-tier timing information.
@@ -2021,6 +2765,176 @@ impl Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_secret_free_projection(label: &str, projection: &str, secret: &str) {
+        assert!(!projection.contains(secret), "{label}: {projection}");
+        assert!(
+            !projection.contains(&secret[..18]),
+            "{label} retained a stable secret prefix: {projection}"
+        );
+    }
+
+    #[test]
+    fn pdf_text_categorical_evidence_uses_closed_bounded_grammar() {
+        let Evidence::Text { detail: fragment } =
+            pdf_text_fragment_evidence(3, Some("9:0"), PdfTextEvidenceVisibility::Visible)
+        else {
+            panic!("PDF fragment provenance must be text evidence");
+        };
+        assert_eq!(
+            fragment,
+            "tirith:v1:pdf_text;mode=fragment;page=3;object=ref:9:0;visibility=visible"
+        );
+        assert!(is_internal_categorical_evidence_record(&fragment));
+
+        let Evidence::Text {
+            detail: reassembled,
+        } = pdf_text_reassembled_evidence(7, PdfTextEvidenceJoin::Spaced, 2)
+        else {
+            panic!("PDF reassembly provenance must be text evidence");
+        };
+        assert_eq!(
+            reassembled,
+            "tirith:v1:pdf_text;mode=reassembled;page=7;join=spaced;fragments=2"
+        );
+        assert!(is_internal_categorical_evidence_record(&reassembled));
+        assert!(is_internal_categorical_evidence_record(
+            "tirith:v1:pdf_text;mode=reassembled;page=7;join=concatenated;fragments=256"
+        ));
+        assert!(is_internal_categorical_evidence_record(
+            "tirith:v1:pdf_text;mode=fragment;page=100000;object=unknown;visibility=hidden"
+        ));
+
+        let Evidence::Text {
+            detail: malformed_object,
+        } = pdf_text_fragment_evidence(
+            3,
+            Some("9:0;payload=PRIVATE_KEY"),
+            PdfTextEvidenceVisibility::Unknown,
+        )
+        else {
+            panic!("PDF fragment provenance must be text evidence");
+        };
+        assert_eq!(
+            malformed_object,
+            "tirith:v1:pdf_text;mode=fragment;page=3;object=unknown;visibility=unknown"
+        );
+        assert!(is_internal_categorical_evidence_record(&malformed_object));
+
+        for near_miss in [
+            "tirith:v1:pdf_text;mode=fragmented;page=3;object=ref:9:0;visibility=visible",
+            "tirith:v1:pdf_text;mode=fragment;page=03;object=ref:9:0;visibility=visible",
+            "tirith:v1:pdf_text;mode=fragment;page=0;object=ref:9:0;visibility=visible",
+            "tirith:v1:pdf_text;mode=fragment;page=100001;object=ref:9:0;visibility=visible",
+            "tirith:v1:pdf_text;mode=fragment;page=3;object=ref:09:0;visibility=visible",
+            "tirith:v1:pdf_text;mode=fragment;page=3;object=ref:9:00;visibility=visible",
+            "tirith:v1:pdf_text;mode=fragment;page=3;object=ref:0:0;visibility=visible",
+            "tirith:v1:pdf_text;mode=fragment;page=3;object=ref:9:65536;visibility=visible",
+            "tirith:v1:pdf_text;mode=fragment;page=3;object=private_key;visibility=visible",
+            "tirith:v1:pdf_text;mode=fragment;page=3;object=ref:9:0;visibility=Visible",
+            "tirith:v1:pdf_text;mode=fragment;page=3;object=ref:9:0;visibility=visible;payload=secret",
+            "tirith:v1:pdf_text;page=3;mode=fragment;object=ref:9:0;visibility=visible",
+            "tirith:v1:pdf_text;mode=reassembled;page=7;join=mixed;fragments=2",
+            "tirith:v1:pdf_text;mode=reassembled;page=7;join=spaced;fragments=1",
+            "tirith:v1:pdf_text;mode=reassembled;page=7;join=spaced;fragments=02",
+            "tirith:v1:pdf_text;mode=reassembled;page=7;join=spaced;fragments=257",
+            "tirith:v1:pdf_text;mode=reassembled;page=7;join=spaced;fragments=2;visibility=unknown",
+        ] {
+            assert!(
+                !is_internal_categorical_evidence_record(near_miss),
+                "near-miss must use normal evidence redaction: {near_miss}"
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_text_categorical_near_miss_does_not_bypass_mandatory_redaction() {
+        let secret = format!("0x{}", "11".repeat(32));
+        let evidence = Evidence::Text {
+            detail: format!(
+                "tirith:v1:pdf_text;mode=fragment;page=3;object=ref:9:0;visibility=visible;payload=PRIVATE_KEY={secret}"
+            ),
+        };
+        assert!(!is_internal_categorical_evidence_record(match &evidence {
+            Evidence::Text { detail } => detail,
+            _ => unreachable!(),
+        }));
+        assert_secret_free_projection(
+            "PDF categorical near-miss",
+            &serde_json::to_string(&evidence).unwrap(),
+            &secret,
+        );
+    }
+
+    #[test]
+    fn public_evidence_finding_and_verdict_projections_are_mandatorily_secret_safe() {
+        let secret = format!("0x{}", "11".repeat(32));
+        let evidence = Evidence::Text {
+            detail: format!("PRIVATE_KEY={secret}"),
+        };
+        let finding = Finding {
+            rule_id: RuleId::CredentialInText,
+            severity: Severity::High,
+            title: format!("title PRIVATE_KEY={secret}"),
+            description: format!("description PRIVATE_KEY={secret}"),
+            evidence: vec![evidence.clone()],
+            human_view: Some(format!("human PRIVATE_KEY={secret}")),
+            agent_view: Some(format!("agent PRIVATE_KEY={secret}")),
+            mitre_id: Some(format!("PRIVATE_KEY={secret}")),
+            custom_rule_id: Some(format!("PRIVATE_KEY={secret}")),
+        };
+        let mut verdict = Verdict::from_findings(vec![finding.clone()], 3, Timings::default());
+        verdict.policy_path_used = Some(format!("PRIVATE_KEY={secret}"));
+        verdict.approval_description = Some(format!("PRIVATE_KEY={secret}"));
+        verdict.escalation_reason = Some(format!("PRIVATE_KEY={secret}"));
+        verdict.manifest_allowed_match = Some(format!("PRIVATE_KEY={secret}"));
+        verdict.agent_origin = Some(crate::agent_origin::AgentOrigin::Agent {
+            tool: format!("PRIVATE_KEY={secret}"),
+            version: Some(format!("PRIVATE_KEY={secret}")),
+        });
+
+        for (label, projection) in [
+            ("evidence json", serde_json::to_string(&evidence).unwrap()),
+            ("evidence debug", format!("{evidence:?}")),
+            ("finding json", serde_json::to_string(&finding).unwrap()),
+            ("finding debug", format!("{finding:?}")),
+            ("verdict json", serde_json::to_string(&verdict).unwrap()),
+            ("verdict debug", format!("{verdict:?}")),
+        ] {
+            assert_secret_free_projection(label, &projection, &secret);
+        }
+
+        let raw_wire = format!(r#"{{"type":"text","detail":"PRIVATE_KEY={secret}"}}"#);
+        let restored: Evidence = serde_json::from_str(&raw_wire).expect("legacy evidence wire");
+        let reserialized = serde_json::to_string(&restored).expect("safe evidence wire");
+        assert_secret_free_projection("deserialized evidence", &reserialized, &secret);
+        assert!(reserialized.contains(r#""type":"text""#), "{reserialized}");
+
+        let mut raw_finding_wire = serde_json::to_value(&finding).expect("finding wire shape");
+        raw_finding_wire["title"] = serde_json::Value::String(format!("PRIVATE_KEY={secret}"));
+        raw_finding_wire["evidence"][0]["detail"] =
+            serde_json::Value::String(format!("PRIVATE_KEY={secret}"));
+        let restored: Finding =
+            serde_json::from_value(raw_finding_wire).expect("legacy finding wire");
+        assert_secret_free_projection(
+            "deserialized finding",
+            &serde_json::to_string(&restored).expect("safe finding wire"),
+            &secret,
+        );
+
+        let mut raw_verdict_wire = serde_json::to_value(&verdict).expect("verdict wire shape");
+        raw_verdict_wire["policy_path_used"] =
+            serde_json::Value::String(format!("PRIVATE_KEY={secret}"));
+        raw_verdict_wire["agent_origin"]["tool"] =
+            serde_json::Value::String(format!("PRIVATE_KEY={secret}"));
+        let restored: Verdict =
+            serde_json::from_value(raw_verdict_wire).expect("legacy verdict wire");
+        assert_secret_free_projection(
+            "deserialized verdict",
+            &serde_json::to_string(&restored).expect("safe verdict wire"),
+            &secret,
+        );
+    }
 
     #[test]
     fn test_info_severity_maps_to_allow() {

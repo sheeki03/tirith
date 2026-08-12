@@ -5935,7 +5935,26 @@ where
     // The same pure decision the Linux launcher uses (`EnvironmentPolicy`'s own
     // `surviving_vars`): start from the allow-list (or the parent set when
     // `inherit`), then drop every sensitive name.
-    let survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    let mut survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    if policy.deny_sensitive {
+        survivors.retain(|name| {
+            let sensitive = match exact_env {
+                Some(environment) => environment
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .is_some_and(|(_, value)| !policy.assignment_survives(name, value)),
+                None => std::env::var_os(name).is_some_and(|value| {
+                    value
+                        .to_str()
+                        .map(|value| !policy.assignment_survives(name, value))
+                        .unwrap_or_else(|| {
+                            tirith_core::sensitive_assets::is_registered_env_name(name)
+                        })
+                }),
+            };
+            !sensitive
+        });
+    }
     if survivors.iter().any(|name| name.starts_with("DYLD_")) {
         return Err(
             "macOS contained launch refuses every DYLD_* loader-control variable before the trusted capsule re-exec"

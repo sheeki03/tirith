@@ -816,13 +816,14 @@ mod tests {
     }
 
     #[test]
-    fn leader_findings_carry_path_evidence() {
+    fn leader_findings_public_debug_projects_path_evidence() {
         let f = leader_findings(&[LeaderLocation::InTmp], "/tmp/payload");
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].rule_id, RuleId::ExecInTmp);
         assert_eq!(f[0].severity, Severity::Medium);
         let blob = format!("{:?}", f[0].evidence);
-        assert!(blob.contains("/tmp/payload"), "{blob}");
+        assert!(!blob.contains("/tmp/payload"), "{blob}");
+        assert!(blob.contains("[REDACTED]"), "{blob}");
     }
 
     // ── cold: audit_path_str ──────────────────────────────────────────────

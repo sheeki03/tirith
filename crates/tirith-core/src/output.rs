@@ -108,6 +108,41 @@ impl<W: Write> Write for HumanInvocationWriter<W> {
     }
 }
 
+/// Mandatory projection for any free-form string crossing a CLI/public output
+/// boundary. Public-paste redaction removes identifying paths/addresses and the
+/// durable projection additionally catches supported credentials, Tirith
+/// canaries, and otherwise-unlabelled private-key scalars. Projection happens
+/// before layout sanitization or field extraction at every caller.
+fn project_public_text(s: &str) -> String {
+    let share_safe =
+        crate::redact::redact_for_audience(s, crate::redact::ShareAudience::PublicPaste)
+            .redacted_content;
+    crate::redact::redact_blocked_output(&share_safe)
+}
+
+fn project_public_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = project_public_text(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                project_public_json(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                project_public_json(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn project_verdict(verdict: &Verdict) -> std::io::Result<Verdict> {
+    let mut value = serde_json::to_value(verdict).map_err(std::io::Error::other)?;
+    project_public_json(&mut value);
+    serde_json::from_value(value).map_err(std::io::Error::other)
+}
+
 /// A [`Finding`] serialized with its per-rule `remediation` appended. The
 /// remediation text is static and secret-free (no redaction needed); this view
 /// confines it to the `check`/`paste` JSON surface, leaving every other
@@ -170,23 +205,31 @@ fn redact_suggestion(
     compiled: &crate::redact::CompiledCustomPatterns,
 ) -> SafeSuggestion {
     let safe_command = s.safe_command.as_ref().and_then(|command| {
+        let configured = crate::redact::redact_with_compiled(command, compiled);
+        let public = project_public_text(&configured);
         let projected =
-            crate::redact::redact_sanitize_redact_command_with_compiled(command, compiled);
+            crate::redact::redact_sanitize_redact_command_with_compiled(&public, compiled);
         // Executable bytes are an identity contract: sanitizing or redacting
         // even one byte means the analyzed command can no longer be emitted.
         (projected == *command).then(|| command.clone())
     });
-    let mut rationale = crate::redact::redact_sanitize_redact_with_compiled(&s.rationale, compiled);
+    let rationale = crate::redact::redact_with_compiled(&s.rationale, compiled);
+    let rationale = project_public_text(&rationale);
+    let mut rationale = crate::redact::redact_sanitize_redact_with_compiled(&rationale, compiled);
     if s.safe_command.is_some() && safe_command.is_none() {
         rationale.push_str(
-            " Executable command omitted because configured redaction would change the verified bytes.",
+            " Executable command omitted because mandatory output projection would change the verified bytes.",
         );
     }
+    let rule_id = crate::redact::redact_with_compiled(&s.rule_id, compiled);
+    let rule_id = project_public_text(&rule_id);
+    let remediation = crate::redact::redact_with_compiled(&s.remediation, compiled);
+    let remediation = project_public_text(&remediation);
     SafeSuggestion {
-        rule_id: crate::redact::redact_sanitize_redact_with_compiled(&s.rule_id, compiled),
+        rule_id: crate::redact::redact_sanitize_redact_with_compiled(&rule_id, compiled),
         safe_command,
         rationale,
-        remediation: crate::redact::redact_sanitize_redact_with_compiled(&s.remediation, compiled),
+        remediation: crate::redact::redact_sanitize_redact_with_compiled(&remediation, compiled),
     }
 }
 
@@ -210,8 +253,12 @@ pub fn write_json_with_suggestions(
     // Redact before applying presentation bounds: truncating first can split a
     // configured secret and make it fail to match the redactor.
     let compiled = crate::redact::CompiledCustomPatterns::new_silent(custom_patterns);
-    let mut display = verdict.clone();
+    // Run the mandatory projection before any layout sanitizer, then re-run it
+    // afterwards so stripping a deceptive separator cannot reconstitute a
+    // public-path, address, canary, or credential leak.
+    let mut display = project_verdict(verdict)?;
     crate::redact::redact_verdict_with_compiled(&mut display, &compiled);
+    let mut display = project_verdict(&display)?;
     crate::verdict::bound_verdict_for_output(&mut display);
     let findings: Vec<FindingView> = display.findings.iter().map(FindingView::of).collect();
     // A SafeSuggestion's `safe_command` re-embeds the original command/URL/path,
@@ -236,7 +283,7 @@ pub fn write_json_with_suggestions(
         urls_extracted_count: display.urls_extracted_count,
         safe_suggestions,
     };
-    let mut output = serde_json::to_value(&output)?;
+    let mut output = serde_json::to_value(&output).map_err(std::io::Error::other)?;
     let policy_diagnostics = crate::policy::drain_captured_policy_diagnostics_for_output(&compiled);
     if !policy_diagnostics.is_empty() {
         let count = policy_diagnostics.len();
@@ -254,6 +301,9 @@ pub fn write_json_with_suggestions(
         }
     }
     crate::redact::redact_json_strings(&mut output, &compiled);
+    // Diagnostics and suggestion metadata are attached after the verdict
+    // projection, so re-project the complete public response before bounding.
+    project_public_json(&mut output);
     let output = crate::verdict::bound_json_value_for_output(output);
     serde_json::to_writer(&mut w, &output)?;
     writeln!(w)?;
@@ -330,8 +380,9 @@ fn write_human_color_into(
     mut w: impl Write,
 ) -> std::io::Result<()> {
     let original_verdict = verdict;
-    let mut display = verdict.clone();
+    let mut display = project_verdict(verdict)?;
     crate::redact::redact_verdict_with_compiled(&mut display, compiled);
+    let mut display = project_verdict(&display)?;
     crate::verdict::bound_verdict_for_output(&mut display);
     let verdict = &display;
     if verdict.findings.is_empty() {
@@ -728,7 +779,9 @@ pub fn write_safe_suggestions(
 /// cannot introduce controls, and layout bytes are rendered visibly rather
 /// than allowing a field to escape its intended line.
 fn sanitize_suggestion_line(value: &str, custom_patterns: &[String]) -> String {
-    crate::redact::redact_sanitize_redact(value, custom_patterns)
+    let redacted = crate::redact::redact_with_custom(value, custom_patterns);
+    let projected = project_public_text(&redacted);
+    crate::redact::redact_sanitize_redact(&projected, custom_patterns)
         .replace('\r', "\\r")
         .replace('\n', "\\n")
         .replace('\t', "\\t")
@@ -756,8 +809,9 @@ fn write_human_no_color_into(
     mut w: impl Write,
 ) -> std::io::Result<()> {
     let original_verdict = verdict;
-    let mut display = verdict.clone();
+    let mut display = project_verdict(verdict)?;
     crate::redact::redact_verdict_with_compiled(&mut display, compiled);
+    let mut display = project_verdict(&display)?;
     crate::verdict::bound_verdict_for_output(&mut display);
     let verdict = &display;
     if verdict.findings.is_empty() {
@@ -1258,6 +1312,33 @@ mod tests {
         );
         // The static, secret-free fields pass through unchanged.
         assert_eq!(arr[0]["remediation"], "review before running");
+    }
+
+    #[test]
+    fn json_suggestion_withholds_command_changed_only_by_public_projection() {
+        let verdict = block_verdict_with_bypass();
+        let suggestions = vec![SafeSuggestion {
+            rule_id: "plain_http_to_sink".to_string(),
+            safe_command: Some("'/Users/alice/bin/tirith' run checked-input".to_string()),
+            rationale: "use the verified runner".to_string(),
+            remediation: "review before running".to_string(),
+        }];
+
+        let mut buf = Vec::new();
+        write_json_with_suggestions(&verdict, &[], Some(&suggestions), &mut buf).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let suggestion = &value["safe_suggestions"][0];
+        assert!(
+            suggestion.get("safe_command").is_none(),
+            "a projected executable must be withheld: {suggestion}"
+        );
+        assert!(
+            suggestion["rationale"]
+                .as_str()
+                .is_some_and(|text| text.contains("mandatory output projection")),
+            "guidance must explain the omission: {suggestion}"
+        );
+        assert!(!suggestion.to_string().contains("/Users/alice"));
     }
 
     #[test]
@@ -1934,5 +2015,36 @@ mod tests {
         );
         assert!(out.contains("reasonspoof"), "{out:?}");
         assert!(out.contains("fix\\nspoof\\t[REDACTED:custom]"), "{out:?}");
+    }
+
+    #[test]
+    fn json_projects_findings_and_policy_path_before_serialization() {
+        let secret = format!("ghp_{}", "Q".repeat(36));
+        let mut verdict = block_verdict_with_bypass();
+        verdict.findings[0].title = format!("blocked {secret}");
+        verdict.findings[0].description = format!("from /Users/alice/project/{secret}");
+        verdict.policy_path_used = Some(format!("/Users/alice/.tirith/{secret}.yaml"));
+
+        let mut buf = Vec::new();
+        write_json(&verdict, &[], &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.contains(&secret), "{output}");
+        assert!(!output.contains("/Users/alice"), "{output}");
+        assert!(output.contains("REDACTED"), "{output}");
+    }
+
+    #[test]
+    fn human_render_projects_every_dynamic_field_before_formatting() {
+        let scalar = format!("0x{}", "11".repeat(32));
+        let mut verdict = block_verdict_with_bypass();
+        verdict.findings[0].title = format!("blocked {scalar}");
+        verdict.findings[0].description = format!("detail {scalar}");
+        verdict.escalation_reason = Some(format!("origin {scalar}"));
+
+        let mut buf = Vec::new();
+        write_human_no_color(&verdict, false, &[], &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.contains(&scalar), "{output}");
+        assert!(output.contains("[REDACTED:evm_private_key]"), "{output}");
     }
 }

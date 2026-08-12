@@ -3710,7 +3710,7 @@ mod tests {
             );
         }
         assert!(!serialized.contains(&github));
-        assert_eq!(value["url"], "https://mainnet.infura.io/v3");
+        assert_eq!(value["url"], "https://infura.io/v3");
         let error = value["error"].as_str().unwrap();
         assert!(error.contains("[REDACTED:custom]"), "{error}");
         assert!(error.contains("[REDACTED:GitHub PAT]"), "{error}");

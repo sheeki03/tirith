@@ -73,6 +73,7 @@ pub mod scan;
 pub mod scoring;
 pub mod secret_rotation;
 pub mod selfupdate;
+pub mod sensitive_assets;
 pub mod session;
 pub mod session_warnings;
 pub mod ssrf_guard;
