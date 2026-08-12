@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786541836375,
+  "lastUpdate": 1786542897247,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -1403,6 +1403,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 87,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "13f366f03462f81beead84671a8c7b70b3ec98cf",
+          "message": "revert: keep PR #174 research artifacts internal (#192)\n\nrevert: keep PR #174 research artifacts internal",
+          "timestamp": "2026-08-12T19:21:54+05:30",
+          "tree_id": "277e58e5720b7f70ef5e27a697fead70f3394c0f",
+          "url": "https://github.com/sheeki03/tirith/commit/13f366f03462f81beead84671a8c7b70b3ec98cf"
+        },
+        "date": 1786542896518,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 238,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 80,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 14520,
+            "range": "± 454",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 147553,
+            "range": "± 7547",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 127143,
+            "range": "± 6730",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 115084,
+            "range": "± 6667",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 18309,
+            "range": "± 1188",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 58,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 70,
+            "range": "± 3",
             "unit": "ns/iter"
           }
         ]
