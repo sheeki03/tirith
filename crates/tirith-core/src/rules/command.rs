@@ -812,11 +812,12 @@ fn basename_from_normalized(normalized: &str, shell: ShellType) -> String {
     };
     let first_word = after_path.split_whitespace().next().unwrap_or("");
     let lower = first_word.to_lowercase();
-    if lower.ends_with(".exe") {
-        lower[..lower.len() - 4].to_string()
-    } else {
-        lower
+    for suffix in [".exe", ".cmd", ".bat"] {
+        if let Some(base) = lower.strip_suffix(suffix) {
+            return base.to_string();
+        }
     }
+    lower
 }
 
 fn is_interpreter(cmd: &str) -> bool {
@@ -1203,7 +1204,7 @@ enum WrapperDisposition {
 fn is_execution_wrapper(base: &str, shell: ShellType) -> bool {
     matches!(
         base,
-        "sudo" | "doas" | "env" | "command" | "exec" | "nohup" | "time"
+        "sudo" | "doas" | "env" | "command" | "exec" | "nohup" | "time" | "stdbuf"
     ) || (shell == ShellType::PowerShell && base == "&")
 }
 
@@ -1333,6 +1334,11 @@ fn wrapper_disposition(
                         &["--help", "--version"],
                     ),
                     "nohup" => (&[], &[], &["--help", "--version"]),
+                    "stdbuf" => (
+                        &["--input", "--output", "--error"],
+                        &[],
+                        &["--help", "--version"],
+                    ),
                     _ => (&[], &[], &[]),
                 };
             if terminal_options.contains(&name) {
@@ -1409,6 +1415,13 @@ fn wrapper_disposition(
                 idx + 1 < args.len(),
             )?,
             "nohup" => return Err(EffectiveCommandError::MissingOrAmbiguousCommand),
+            "stdbuf" => parse_short_wrapper_option(
+                &normalized,
+                &['i', 'o', 'e'],
+                &[],
+                &[],
+                idx + 1 < args.len(),
+            )?,
             _ => return Err(EffectiveCommandError::MissingOrAmbiguousCommand),
         };
         if terminal {
@@ -1434,7 +1447,7 @@ fn wrapper_first_positional_index(
 
 /// Peel ONE wrapper layer from `seg`, returning the inner command as a synthetic
 /// [`tokenize::Segment`]. Handles generic wrappers (`sudo`/`env`/`command`/
-/// `exec`/`nohup`) by positional slicing and `env -S` via
+/// `exec`/`nohup`/`time`/`stdbuf`) by positional slicing and `env -S` via
 /// [`unwrap_env_split_string_segment`]. `None` when `seg` is not a wrapper.
 ///
 /// Peeling generic wrappers here (not just env-S) lets an `env -S "…"` nested
@@ -1539,6 +1552,7 @@ pub(crate) enum EffectiveEnvironmentValue {
 pub(crate) struct EffectiveEnvironment {
     pub clear_ambient: bool,
     pub values: BTreeMap<String, EffectiveEnvironmentValue>,
+    pub cwd: Option<EffectiveEnvironmentValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -1546,6 +1560,10 @@ pub(crate) struct EffectiveCommand {
     pub segment: tokenize::Segment,
     pub environment: EffectiveEnvironment,
     pub saw_sudo: bool,
+    /// A `sudo` or `doas` boundary was crossed. Unlike a reviewed `env -C`,
+    /// this changes identity and may replace HOME, environment, and cwd in ways
+    /// that cannot be projected from the caller's parse context.
+    pub privileged_context_changed: bool,
     /// The wrapper chain changes the identity, HOME/config surface, cwd, or
     /// filesystem root under which the effective command runs. Consumers that
     /// inspect state relative to the caller's cwd (notably repo hooks) must not
@@ -1576,6 +1594,39 @@ fn record_environment_assignment(
             EffectiveEnvironmentValue::Set(value.to_string())
         },
     );
+}
+
+fn record_environment_cwd(
+    environment: &mut EffectiveEnvironment,
+    value: Option<&str>,
+    shell: ShellType,
+) {
+    let Some(value) = value.filter(|value| command_word_is_statically_bound(value, shell)) else {
+        environment.cwd = Some(EffectiveEnvironmentValue::Unresolved);
+        return;
+    };
+    let value = normalize_shell_token(value, shell);
+    if value.is_empty() {
+        environment.cwd = Some(EffectiveEnvironmentValue::Unresolved);
+        return;
+    }
+    let selected = std::path::PathBuf::from(&value);
+    environment.cwd = Some(if selected.is_absolute() {
+        EffectiveEnvironmentValue::Set(value)
+    } else {
+        match environment.cwd.take() {
+            Some(EffectiveEnvironmentValue::Set(base)) => EffectiveEnvironmentValue::Set(
+                std::path::PathBuf::from(base)
+                    .join(selected)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            Some(EffectiveEnvironmentValue::Unresolved | EffectiveEnvironmentValue::Unset) => {
+                EffectiveEnvironmentValue::Unresolved
+            }
+            None => EffectiveEnvironmentValue::Set(value),
+        }
+    });
 }
 
 fn collect_env_wrapper_environment(
@@ -1648,7 +1699,12 @@ fn collect_env_wrapper_environment_depth(
                     }
                     idx += 1;
                 }
-                "--chdir" | "--argv0" => idx += if attached.is_some() { 1 } else { 2 },
+                "--chdir" => {
+                    let value = attached.or_else(|| args.get(idx + 1).map(String::as_str));
+                    record_environment_cwd(environment, value, shell);
+                    idx += if attached.is_some() { 1 } else { 2 };
+                }
+                "--argv0" => idx += if attached.is_some() { 1 } else { 2 },
                 "--split-string" => {
                     if let Some(payload) = attached {
                         collect_split(payload, &args[idx + 1..], environment);
@@ -1689,7 +1745,18 @@ fn collect_env_wrapper_environment_depth(
                         }
                         break;
                     }
-                    'C' | 'a' => {
+                    'C' => {
+                        let attached = &flags[offset + option.len_utf8()..];
+                        let value = if attached.is_empty() {
+                            consumed_next = true;
+                            args.get(idx + 1).map(String::as_str)
+                        } else {
+                            Some(attached)
+                        };
+                        record_environment_cwd(environment, value, shell);
+                        break;
+                    }
+                    'a' => {
                         consumed_next = offset + option.len_utf8() == flags.len();
                         break;
                     }
@@ -1734,7 +1801,46 @@ fn collect_wrapper_environment(
                 }
             }
         }
+    } else if wrapper == "exec" && exec_wrapper_clears_environment(args, shell) {
+        environment.clear_ambient = true;
+        environment.values.clear();
     }
+}
+
+fn exec_wrapper_clears_environment(args: &[String], shell: ShellType) -> bool {
+    let Ok(WrapperDisposition::Execute(command_index)) = wrapper_disposition("exec", args, shell)
+    else {
+        return false;
+    };
+    let mut index = 0usize;
+    let mut clears = false;
+    while index < command_index {
+        let argument = normalize_shell_token(&args[index], shell);
+        if argument == "--" {
+            break;
+        }
+        let Some(cluster) = argument
+            .strip_prefix('-')
+            .filter(|cluster| !cluster.is_empty() && !cluster.starts_with('-'))
+        else {
+            break;
+        };
+        for (offset, option) in cluster.char_indices() {
+            match option {
+                'c' => clears = true,
+                'l' => {}
+                'a' => {
+                    if offset + option.len_utf8() == cluster.len() {
+                        index += 1;
+                    }
+                    break;
+                }
+                _ => return false,
+            }
+        }
+        index += 1;
+    }
+    clears
 }
 
 fn env_wrapper_changes_cwd(args: &[String], shell: ShellType) -> bool {
@@ -1787,7 +1893,7 @@ fn wrapper_changes_execution_context(wrapper: &str, args: &[String], shell: Shel
 
 /// Resolve a segment to the command and argv the shell wrapper chain executes.
 /// This is the canonical consumer-facing resolver for `sudo`/`doas`/`env`/
-/// `command`/`exec`/`nohup`/`time` and PowerShell's call operator, including
+/// `command`/`exec`/`nohup`/`time`/`stdbuf` and PowerShell's call operator, including
 /// `env -S` payloads. It preserves the effective command token (including its
 /// path) and the corresponding args.
 pub(crate) fn resolve_effective_segment(
@@ -1801,14 +1907,37 @@ pub(crate) fn resolve_effective_command(
     seg: &tokenize::Segment,
     shell: ShellType,
 ) -> Result<EffectiveCommand, EffectiveCommandError> {
+    resolve_effective_command_bounded(seg, shell, MAX_WRAPPER_DEPTH)
+}
+
+/// Resolve the effective command while honoring a caller-selected wrapper
+/// ceiling. Security-sensitive semantic parsers use a deliberately smaller
+/// budget than the general command scanner so adversarial wrapper chains cannot
+/// consume disproportionate work or silently fall back to the outer command.
+pub(crate) fn resolve_effective_command_bounded(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+    max_depth: usize,
+) -> Result<EffectiveCommand, EffectiveCommandError> {
+    // The entry budget belongs to the bounded resolver, so every caller is
+    // covered whether it selects its own wrapper ceiling or takes the default.
     if !command_segment_within_work_budget(seg) {
         return Err(EffectiveCommandError::WorkBudgetExceeded);
     }
     let mut environment = EffectiveEnvironment::default();
-    for (name, value) in tokenize::leading_env_assignments(&seg.raw) {
+    let (assignments, words_truncated, word_bytes_truncated) =
+        tokenize::leading_env_assignments_bounded(
+            &seg.raw,
+            MAX_ENV_SPLIT_ARGV,
+            MAX_ENV_SPLIT_STRING_BYTES,
+        );
+    if words_truncated || word_bytes_truncated {
+        return Err(EffectiveCommandError::MissingOrAmbiguousCommand);
+    }
+    for (name, value) in assignments {
         record_environment_assignment(&mut environment, &format!("{name}={value}"), shell);
     }
-    resolve_effective_command_with_environment(seg, shell, environment)
+    resolve_effective_command_with_environment(seg, shell, environment, max_depth)
 }
 
 fn resolve_effective_segment_tracking(
@@ -1822,11 +1951,15 @@ fn resolve_effective_command_with_environment(
     seg: &tokenize::Segment,
     shell: ShellType,
     mut environment: EffectiveEnvironment,
+    max_depth: usize,
 ) -> Result<EffectiveCommand, EffectiveCommandError> {
     let mut current = seg.clone();
     let mut saw_sudo = false;
+    let mut privileged_context_changed = false;
     let mut execution_context_changed = false;
-    for _ in 0..MAX_WRAPPER_DEPTH {
+    for _ in 0..max_depth {
+        // Re-check per wrapper iteration: unwrapping can expand the segment a
+        // caller-selected depth would otherwise let grow unbounded.
         if !command_segment_within_work_budget(&current) {
             return Err(EffectiveCommandError::WorkBudgetExceeded);
         }
@@ -1842,10 +1975,12 @@ fn resolve_effective_command_with_environment(
                 segment: current,
                 environment,
                 saw_sudo,
+                privileged_context_changed,
                 execution_context_changed,
             });
         }
         saw_sudo |= base == "sudo";
+        privileged_context_changed |= matches!(base.as_str(), "sudo" | "doas");
         execution_context_changed |= wrapper_changes_execution_context(&base, &current.args, shell);
         collect_wrapper_environment(&base, &current.args, shell, &mut environment);
 
@@ -1863,6 +1998,7 @@ fn resolve_effective_command_with_environment(
                     segment: current,
                     environment,
                     saw_sudo,
+                    privileged_context_changed,
                     execution_context_changed,
                 });
             }
@@ -2139,7 +2275,7 @@ fn resolve_interpreter_name_depth_tracking(
 
         if matches!(
             cmd_base.as_str(),
-            "sudo" | "doas" | "env" | "command" | "exec" | "nohup" | "time"
+            "sudo" | "doas" | "env" | "command" | "exec" | "nohup" | "time" | "stdbuf"
         ) && !matches!(
             wrapper_disposition(&cmd_base, &seg.args, shell),
             Ok(WrapperDisposition::Execute(_))
@@ -2152,7 +2288,7 @@ fn resolve_interpreter_name_depth_tracking(
         match cmd_base.as_str() {
             "sudo" => return resolve_sudo_args_depth(&seg.args, shell, budget, exhausted),
             "env" => return resolve_env_args_depth(&seg.args, shell, budget, exhausted),
-            "command" | "exec" | "nohup" => {
+            "command" | "exec" | "nohup" | "stdbuf" => {
                 return resolve_wrapper_args_depth(&seg.args, &cmd_base, shell, budget, exhausted);
             }
             _ => {}
@@ -9529,6 +9665,13 @@ mod tests {
                 "context-changing wrapper was lost: {input}"
             );
         }
+        for input in ["sudo git commit -m test", "doas npm install"] {
+            assert!(
+                resolve(input).privileged_context_changed,
+                "privilege boundary was lost: {input}"
+            );
+        }
+        assert!(!resolve("env -C /tmp git commit -m test").privileged_context_changed);
 
         for input in [
             "git commit -m test",

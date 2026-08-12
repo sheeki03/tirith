@@ -2997,6 +2997,13 @@ fn capture_shell_body(
 struct PosixFunctionDefinition {
     name: String,
     body: String,
+    body_kind: PosixFunctionBodyKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PosixFunctionBodyKind {
+    CurrentShell,
+    Subshell,
 }
 
 #[derive(Clone)]
@@ -3251,6 +3258,11 @@ fn parse_posix_function_definition(raw: &str, start: usize) -> PosixFunctionPars
     if !matches!(bytes.get(i).copied(), Some(b'{' | b'(')) {
         return PosixFunctionParse::Incomplete { body_start: i };
     }
+    let body_kind = if bytes.get(i) == Some(&b'(') {
+        PosixFunctionBodyKind::Subshell
+    } else {
+        PosixFunctionBodyKind::CurrentShell
+    };
     let body_start = i + 1;
     let Some(close) = find_shell_delimiter_close(raw, i, ShellType::Posix) else {
         return PosixFunctionParse::Incomplete { body_start };
@@ -3262,6 +3274,7 @@ fn parse_posix_function_definition(raw: &str, start: usize) -> PosixFunctionPars
         definition: PosixFunctionDefinition {
             name,
             body: body.to_string(),
+            body_kind,
         },
         end: close + 1,
     }
@@ -4120,6 +4133,41 @@ pub(crate) fn is_complete_literal_posix_function_definition(
     )
 }
 
+/// Recover one complete, literal POSIX function definition without executing
+/// its body. The caller owns dispatch state and decides when the body becomes
+/// active. An incomplete or suffix-bearing definition fails closed.
+pub(crate) fn literal_posix_function_definition(
+    segment: &tokenize::Segment,
+) -> Result<Option<(String, String)>, ()> {
+    literal_posix_function_definition_with_body_kind(segment)
+        .map(|definition| definition.map(|(name, body, _)| (name, body)))
+}
+
+/// Like `literal_posix_function_definition`, but preserves whether Bash runs
+/// the function body in the caller (`{ ...; }`) or a subshell (`( ... )`).
+/// Dispatch consumers need this distinction to restore state after invoking a
+/// parenthesized body.
+pub(crate) fn literal_posix_function_definition_with_body_kind(
+    segment: &tokenize::Segment,
+) -> Result<Option<(String, String, PosixFunctionBodyKind)>, ()> {
+    match parse_posix_function_definition(&segment.raw, 0) {
+        PosixFunctionParse::Complete { definition, end }
+            if segment
+                .raw
+                .get(end..)
+                .is_some_and(|suffix| suffix.trim().is_empty()) =>
+        {
+            Ok(Some((
+                definition.name,
+                definition.body,
+                definition.body_kind,
+            )))
+        }
+        PosixFunctionParse::Complete { .. } | PosixFunctionParse::Incomplete { .. } => Err(()),
+        PosixFunctionParse::NotDefinition => Ok(None),
+    }
+}
+
 fn is_complete_literal_posix_brace_group(segment: &tokenize::Segment, shell: ShellType) -> bool {
     if shell != ShellType::Posix || segment.command.as_deref() != Some("{") {
         return false;
@@ -4132,12 +4180,382 @@ fn is_complete_literal_posix_brace_group(segment: &tokenize::Segment, shell: She
         })
 }
 
+/// Recover the body of a complete literal POSIX brace group. Brace groups run
+/// in the current shell, so stateful consumers must not treat this body like a
+/// child-shell substitution.
+pub(crate) fn literal_posix_brace_group_body(
+    segment: &tokenize::Segment,
+) -> Result<Option<String>, ()> {
+    if segment.command.as_deref() != Some("{") {
+        return Ok(None);
+    }
+    let raw = segment.raw.trim();
+    if raw.as_bytes().first() != Some(&b'{') {
+        return Ok(None);
+    }
+    let Some(close) = find_shell_delimiter_close(raw, 0, ShellType::Posix) else {
+        return Err(());
+    };
+    if raw
+        .get(close + 1..)
+        .is_none_or(|suffix| !suffix.trim().is_empty())
+    {
+        return Err(());
+    }
+    raw.get(1..close)
+        .map(|body| Some(body.to_string()))
+        .ok_or(())
+}
+
+/// Recover one complete POSIX subshell group. Unlike a brace group, mutations
+/// made by this body must be discarded by stateful consumers after its facts
+/// have been collected.
+pub(crate) fn literal_posix_subshell_group_body(
+    segment: &tokenize::Segment,
+) -> Result<Option<String>, ()> {
+    let raw = segment.raw.trim();
+    if !raw.starts_with('(') || raw.starts_with("((") {
+        return Ok(None);
+    }
+    let Some(close) = find_shell_delimiter_close(raw, 0, ShellType::Posix) else {
+        return Err(());
+    };
+    if raw
+        .get(close + 1..)
+        .is_none_or(|suffix| !suffix.trim().is_empty())
+    {
+        return Ok(None);
+    }
+    raw.get(1..close)
+        .map(|body| Some(body.to_string()))
+        .ok_or(())
+}
+
 pub(crate) fn executable_substitutions(raw: &str, shell: ShellType) -> Vec<String> {
     executable_substitution_scan(raw, shell)
         .bodies
         .into_iter()
         .map(|body| body.input)
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutableSubstitutionLimitError {
+    CardinalityExceeded,
+}
+
+fn consume_executable_body_unit(units: &mut usize, max_bodies: usize) -> bool {
+    *units = units.saturating_add(1);
+    *units > max_bodies
+}
+
+/// Conservative allocation-free upper bound for the number of executable
+/// bodies the full recovery pass can emit. The streaming state follows each
+/// shell's literal quotes, escapes, and line comments so regexes and inert data
+/// full of delimiter characters do not consume the executable-body budget.
+/// Substitution openers inside interpolating double quotes remain counted.
+fn executable_body_upper_bound_exceeded(raw: &str, shell: ShellType, max_bodies: usize) -> bool {
+    let mut units = usize::from(!raw.trim().is_empty());
+    if units > max_bodies {
+        return true;
+    }
+
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut token_boundary = true;
+    let mut parameter_depth = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let current_char = (shell == ShellType::PowerShell)
+            .then(|| raw.get(index..)?.chars().next())
+            .flatten();
+        let char_len = current_char.map_or(1, char::len_utf8);
+        if line_comment {
+            if matches!(byte, b'\n' | b'\r') {
+                line_comment = false;
+                token_boundary = true;
+                if consume_executable_body_unit(&mut units, max_bodies) {
+                    return true;
+                }
+            }
+            index += char_len;
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            index += char_len;
+            continue;
+        }
+        match quote {
+            Some(b'\'') => {
+                let closes = if shell == ShellType::PowerShell {
+                    current_char.and_then(tokenize::powershell_quote_kind)
+                        == Some(tokenize::PowerShellQuoteKind::Single)
+                } else {
+                    byte == b'\''
+                };
+                if closes {
+                    let next = raw
+                        .get(index + char_len..)
+                        .and_then(|tail| tail.chars().next());
+                    if shell == ShellType::PowerShell
+                        && next.and_then(tokenize::powershell_quote_kind)
+                            == Some(tokenize::PowerShellQuoteKind::Single)
+                    {
+                        index += char_len + next.map_or(0, char::len_utf8);
+                        continue;
+                    }
+                    quote = None;
+                }
+                index += char_len;
+                continue;
+            }
+            Some(b'"') => {
+                if (shell == ShellType::PowerShell && byte == b'`')
+                    || (matches!(shell, ShellType::Posix | ShellType::Fish) && byte == b'\\')
+                {
+                    escaped = true;
+                } else if (shell == ShellType::PowerShell
+                    && current_char.and_then(tokenize::powershell_quote_kind)
+                        == Some(tokenize::PowerShellQuoteKind::Double))
+                    || (shell != ShellType::PowerShell && byte == b'"')
+                {
+                    quote = None;
+                } else if shell != ShellType::Cmd
+                    && byte == b'$'
+                    && bytes.get(index + 1) == Some(&b'(')
+                {
+                    if consume_executable_body_unit(&mut units, max_bodies) {
+                        return true;
+                    }
+                    index += 1;
+                } else if matches!(shell, ShellType::Posix)
+                    && byte == b'`'
+                    && consume_executable_body_unit(&mut units, max_bodies)
+                {
+                    return true;
+                }
+                index += char_len;
+                continue;
+            }
+            _ => {}
+        }
+
+        if matches!(shell, ShellType::Posix | ShellType::Fish) && parameter_depth > 0 {
+            if byte == b'\\' {
+                escaped = true;
+                index += 1;
+                continue;
+            }
+            if byte == b'$' && bytes.get(index + 1) == Some(&b'{') {
+                parameter_depth = parameter_depth.saturating_add(1);
+                index += 2;
+                continue;
+            }
+            if byte == b'}' {
+                parameter_depth -= 1;
+                index += 1;
+                continue;
+            }
+            if byte == b'$' && bytes.get(index + 1) == Some(&b'(') {
+                if consume_executable_body_unit(&mut units, max_bodies) {
+                    return true;
+                }
+                index += 2;
+                continue;
+            }
+            if byte == b'`' && consume_executable_body_unit(&mut units, max_bodies) {
+                return true;
+            }
+            index += char_len;
+            continue;
+        }
+
+        if matches!(shell, ShellType::Posix | ShellType::Fish)
+            && byte == b'$'
+            && bytes.get(index + 1) == Some(&b'{')
+        {
+            parameter_depth = 1;
+            token_boundary = false;
+            index += 2;
+            continue;
+        }
+
+        if shell == ShellType::PowerShell && byte == b'@' {
+            if let Some(here_string) = tokenize::powershell_here_string(raw, index) {
+                if here_string.kind == tokenize::PowerShellQuoteKind::Double {
+                    let content =
+                        &raw.as_bytes()[here_string.content_start..here_string.content_end];
+                    let mut content_index = 0usize;
+                    let mut content_escaped = false;
+                    while content_index < content.len() {
+                        let content_byte = content[content_index];
+                        if content_escaped {
+                            content_escaped = false;
+                        } else if content_byte == b'`' {
+                            content_escaped = true;
+                        } else if content_byte == b'$'
+                            && content.get(content_index + 1) == Some(&b'(')
+                            && consume_executable_body_unit(&mut units, max_bodies)
+                        {
+                            return true;
+                        }
+                        content_index += 1;
+                    }
+                }
+                index = here_string.end;
+                token_boundary = true;
+                continue;
+            }
+        }
+        if shell == ShellType::PowerShell && byte == b'<' && bytes.get(index + 1) == Some(&b'#') {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'#' && bytes[index + 1] == b'>') {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+            token_boundary = true;
+            continue;
+        }
+        if (matches!(shell, ShellType::Posix | ShellType::Fish) && byte == b'\\')
+            || (shell == ShellType::PowerShell && byte == b'`')
+            || (shell == ShellType::Cmd && byte == b'^')
+        {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if shell == ShellType::PowerShell {
+            if let Some(kind) = current_char.and_then(tokenize::powershell_quote_kind) {
+                quote = Some(match kind {
+                    tokenize::PowerShellQuoteKind::Single => b'\'',
+                    tokenize::PowerShellQuoteKind::Double => b'"',
+                });
+                token_boundary = false;
+                index += char_len;
+                continue;
+            }
+        } else if byte == b'\'' && shell != ShellType::Cmd {
+            quote = Some(byte);
+            token_boundary = false;
+            index += char_len;
+            continue;
+        }
+        if byte == b'"' && shell != ShellType::PowerShell {
+            quote = Some(byte);
+            token_boundary = false;
+            index += char_len;
+            continue;
+        }
+        if byte == b'#' && token_boundary && shell != ShellType::Cmd {
+            line_comment = true;
+            index += 1;
+            continue;
+        }
+        let substitution =
+            shell != ShellType::Cmd && byte == b'$' && bytes.get(index + 1) == Some(&b'(');
+        let process_substitution = matches!(shell, ShellType::Posix | ShellType::Fish)
+            && matches!(byte, b'<' | b'>')
+            && bytes.get(index + 1) == Some(&b'(');
+        let group_parenthesis = byte == b'('
+            && (shell == ShellType::Cmd
+                || (token_boundary
+                    && !matches!(bytes.get(index.wrapping_sub(1)), Some(b'$' | b'<' | b'>'))));
+        let group_brace = byte == b'{'
+            && token_boundary
+            && bytes
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_whitespace());
+        let control_separator = b";\n\r&|".contains(&byte);
+        let backtick_substitution = matches!(shell, ShellType::Posix) && byte == b'`';
+        if (substitution
+            || process_substitution
+            || group_parenthesis
+            || group_brace
+            || control_separator
+            || backtick_substitution)
+            && consume_executable_body_unit(&mut units, max_bodies)
+        {
+            return true;
+        }
+        token_boundary = byte.is_ascii_whitespace() || b";&|(){}<>".contains(&byte);
+        index += char_len;
+    }
+    false
+}
+
+/// Cap-aware executable-body recovery for consumers with a strict nested-body
+/// budget. Cardinality is rejected by a streaming preflight before the full
+/// scanner can allocate body strings or its deduplication set.
+pub(crate) fn executable_substitutions_bounded(
+    raw: &str,
+    shell: ShellType,
+    max_bodies: usize,
+) -> Result<Vec<String>, ExecutableSubstitutionLimitError> {
+    executable_bodies_bounded(raw, shell, max_bodies).map(|bodies| {
+        bodies
+            .into_iter()
+            .map(|body| body.input)
+            .collect::<Vec<_>>()
+    })
+}
+
+pub(crate) fn executable_bodies_bounded(
+    raw: &str,
+    shell: ShellType,
+    max_bodies: usize,
+) -> Result<Vec<ExecutableBody>, ExecutableSubstitutionLimitError> {
+    executable_body_scan_bounded(raw, shell, max_bodies).map(|scan| scan.bodies)
+}
+
+pub(crate) fn executable_body_scan_bounded(
+    raw: &str,
+    shell: ShellType,
+    max_bodies: usize,
+) -> Result<ExecutableSubstitutionScan, ExecutableSubstitutionLimitError> {
+    if executable_body_upper_bound_exceeded(raw, shell, max_bodies) {
+        return Err(ExecutableSubstitutionLimitError::CardinalityExceeded);
+    }
+    let scan = executable_substitution_scan(raw, shell);
+    if scan.bodies.len() > max_bodies {
+        // The streaming upper bound is intentionally conservative; retaining
+        // this guard keeps future scanner extensions fail-closed if they add a
+        // body source without updating the preflight invariant.
+        return Err(ExecutableSubstitutionLimitError::CardinalityExceeded);
+    }
+    Ok(scan)
+}
+
+/// Recover only POSIX lexical child-shell bodies: command/process
+/// substitutions and parenthesized subshell groups. Current-shell controls,
+/// `eval`, and external shell wrappers are deliberately left to stateful
+/// callers so they are not executed twice or with the wrong isolation model.
+pub(crate) fn posix_child_shell_scan_bounded(
+    raw: &str,
+    max_bodies: usize,
+) -> Result<ExecutableSubstitutionScan, ExecutableSubstitutionLimitError> {
+    if executable_body_upper_bound_exceeded(raw, ShellType::Posix, max_bodies) {
+        return Err(ExecutableSubstitutionLimitError::CardinalityExceeded);
+    }
+    let (bodies, gap) = lexical_executable_substitutions(raw, ShellType::Posix);
+    if bodies.len() > max_bodies {
+        return Err(ExecutableSubstitutionLimitError::CardinalityExceeded);
+    }
+    let mut seen = std::collections::HashSet::new();
+    Ok(ExecutableSubstitutionScan {
+        bodies: bodies
+            .into_iter()
+            .filter(|body| seen.insert(body.clone()))
+            .map(|input| ExecutableBody {
+                input,
+                shell: ShellType::Posix,
+            })
+            .collect(),
+        gap,
+    })
 }
 
 const MAX_ENCODED_POWERSHELL_BODY_BYTES: usize = 256 * 1024;
@@ -5052,7 +5470,7 @@ fn posix_segment_uses_reserved_time(segment: &tokenize::Segment) -> bool {
         && !matches!(segment.preceding_separator.as_deref(), Some("|" | "|&"))
 }
 
-fn posix_current_scope_dispatch_scan(
+pub(crate) fn posix_current_scope_dispatch_scan(
     segment: &tokenize::Segment,
 ) -> Option<ExecutableSubstitutionScan> {
     let leader_raw = segment.command.as_deref()?;
@@ -5089,7 +5507,16 @@ fn posix_current_scope_dispatch_scan(
     let case_arm = leader.ends_with(')') && !leader.ends_with("()");
     let strict_syntax_leader = matches!(
         leader.as_str(),
-        "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "!" | "case" | "coproc"
+        "if" | "then"
+            | "elif"
+            | "else"
+            | "while"
+            | "until"
+            | "do"
+            | "for"
+            | "!"
+            | "case"
+            | "coproc"
     );
     if strict_syntax_leader && !is_strict_posix_reserved_word(leader_raw, &leader) {
         return None;
@@ -5112,6 +5539,7 @@ fn posix_current_scope_dispatch_scan(
                 | "while"
                 | "until"
                 | "do"
+                | "for"
                 | "!"
                 | "case"
                 | "coproc"
@@ -6057,6 +6485,7 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                     | "while"
                     | "until"
                     | "do"
+                    | "for"
                     | "!"
                     | "case"
                     | "coproc"
@@ -6233,7 +6662,7 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 }
                 None => {}
             },
-            "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "!"
+            "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "for" | "!"
                 if shell == ShellType::Posix && strict_posix_control =>
             {
                 push_control_prefix_body(&args, shell, scan);
@@ -7161,6 +7590,13 @@ fn posix_current_shell_builtin_invocation(
         return Ok(None);
     };
 
+    if command == "!" && is_strict_posix_reserved_word(command_raw, "!") {
+        let Some(target) = segment.args.first() else {
+            return Ok(None);
+        };
+        return posix_current_shell_builtin_from_words(target, &segment.args[1..], 0);
+    }
+
     if command == "time" && posix_segment_uses_reserved_time(segment) {
         let mut index = 0usize;
         if segment
@@ -7184,6 +7620,34 @@ fn posix_current_shell_builtin_invocation(
     }
 
     posix_current_shell_builtin_from_words(command_raw, &segment.args, 0)
+}
+
+/// Resolve a literal command that executes in the current POSIX shell. The
+/// boolean reports whether `command`/`builtin` suppressed function lookup.
+pub(crate) fn literal_posix_current_shell_command(
+    segment: &tokenize::Segment,
+) -> Result<Option<(String, bool)>, ()> {
+    posix_current_shell_builtin_invocation(segment).map(|invocation| {
+        invocation.map(|invocation| (invocation.command, invocation.bypasses_function_lookup))
+    })
+}
+
+/// Recover the literal body evaluated by a current-shell `eval`, including
+/// `command`/`builtin` and reserved `time` wrappers.
+pub(crate) fn literal_posix_current_shell_eval_body(
+    segment: &tokenize::Segment,
+) -> Result<Option<String>, ()> {
+    let Some(invocation) = posix_current_shell_builtin_invocation(segment)? else {
+        return Ok(None);
+    };
+    if invocation.command != "eval" {
+        return Ok(None);
+    }
+    let mut words = Vec::with_capacity(invocation.args.len());
+    for argument in invocation.args {
+        words.push(static_wrapper_word(&argument, ShellType::Posix).ok_or(())?);
+    }
+    Ok(Some(words.join(" ")))
 }
 
 fn posix_reserved_time_word_at(
@@ -12936,6 +13400,59 @@ mod tests {
                 url.in_sink_context && url.parsed.host() == Some("quote-state.example")
             }));
         }
+    }
+
+    #[test]
+    fn executable_body_preflight_ignores_quoted_data_but_caps_real_substitutions() {
+        let delimiter_data = ";;&|(){}<>`".repeat(128);
+        for (input, shell) in [
+            (format!("rg '{delimiter_data}' README.md"), ShellType::Posix),
+            (
+                format!("Write-Output '{delimiter_data}'"),
+                ShellType::PowerShell,
+            ),
+            (
+                format!("Write-Output “{delimiter_data}”"),
+                ShellType::PowerShell,
+            ),
+            (
+                format!("Write-Output @'\n{delimiter_data}\n'@"),
+                ShellType::PowerShell,
+            ),
+            (format!("echo \"{delimiter_data}\""), ShellType::Cmd),
+        ] {
+            assert!(
+                executable_substitutions_bounded(&input, shell, 4).is_ok(),
+                "quoted data exhausted the nested-body budget: {shell:?}"
+            );
+        }
+
+        let parameter_data = (0..32)
+            .map(|index| format!("${{value_{index}}}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let brace_data = (0..32)
+            .map(|index| format!("{{value_{index},fallback}}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for input in [
+            format!("echo {parameter_data}"),
+            format!("echo {brace_data}"),
+        ] {
+            assert!(
+                executable_substitutions_bounded(&input, ShellType::Posix, 4).is_ok(),
+                "ordinary parameter/brace data exhausted the body budget: {input}"
+            );
+        }
+
+        let substitutions = (0..16)
+            .map(|index| format!("echo $(echo {index})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_eq!(
+            executable_substitutions_bounded(&substitutions, ShellType::Posix, 8),
+            Err(ExecutableSubstitutionLimitError::CardinalityExceeded)
+        );
     }
 
     #[test]

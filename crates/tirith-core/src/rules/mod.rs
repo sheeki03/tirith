@@ -27,3 +27,4 @@ pub mod sudo;
 pub mod terminal;
 pub mod threatintel;
 pub mod transport;
+pub mod web3;
