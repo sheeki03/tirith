@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786538072626,
+  "lastUpdate": 1786538103980,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -779,6 +779,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 88,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4c83aec02291af6b021409e7fd5cd4d188f8fd1c",
+          "message": "Merge PR #162: DB-D publish v2 asset and signed index\n\nDB-D: publish the v2 asset and signed v2 index alongside v1 (Phase-4 cutover)",
+          "timestamp": "2026-08-12T18:01:58+05:30",
+          "tree_id": "85c4a63166f7e0e3bdb678f09f89248386eb22a9",
+          "url": "https://github.com/sheeki03/tirith/commit/4c83aec02291af6b021409e7fd5cd4d188f8fd1c"
+        },
+        "date": 1786538103257,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 240,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 86,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 14641,
+            "range": "± 195",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 144409,
+            "range": "± 1785",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 123823,
+            "range": "± 3856",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 114929,
+            "range": "± 2044",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 18165,
+            "range": "± 325",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 56,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 75,
+            "range": "± 4",
             "unit": "ns/iter"
           }
         ]
