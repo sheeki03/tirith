@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786534917819,
+  "lastUpdate": 1786535229513,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -154,6 +154,84 @@ window.BENCHMARK_DATA = {
           {
             "name": "byte_scan_ansi",
             "value": 92,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "52039e6e91de367d5aee9abbe79f0df1f723fc7b",
+          "message": "Merge pull request #152 from sheeki03/security/a2-scan-outcome-coverage-classification\n\nA2: typed scan outcomes, coverage gaps, and file classification",
+          "timestamp": "2026-08-12T17:13:58+05:30",
+          "tree_id": "422399acb10b9fd3cf9db7aa58b775c93ba83a68",
+          "url": "https://github.com/sheeki03/tirith/commit/52039e6e91de367d5aee9abbe79f0df1f723fc7b"
+        },
+        "date": 1786535227685,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 482,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 135,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 34127,
+            "range": "± 1369",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 247333,
+            "range": "± 2343",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 216308,
+            "range": "± 2385",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 201252,
+            "range": "± 1487",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 24865,
+            "range": "± 340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 77,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 93,
             "range": "± 0",
             "unit": "ns/iter"
           }
