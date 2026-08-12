@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786540766279,
+  "lastUpdate": 1786541311110,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -1169,6 +1169,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 88,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6809951c286b74268354a5250f1e2ca299d4dd0b",
+          "message": "Merge PR #172: command and credential hardening\n\nfeat(command): reverse-shell and suspicious inline-interpreter detection, plus OpenAI/HF/PyPI/PGP credentials",
+          "timestamp": "2026-08-12T18:55:09+05:30",
+          "tree_id": "dd140cbf284faaabe2b769a25ddb6d49399fef61",
+          "url": "https://github.com/sheeki03/tirith/commit/6809951c286b74268354a5250f1e2ca299d4dd0b"
+        },
+        "date": 1786541310566,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 480,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 139,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 33583,
+            "range": "± 930",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 247294,
+            "range": "± 1590",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 213095,
+            "range": "± 2611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 198308,
+            "range": "± 2724",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 25052,
+            "range": "± 90",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 69,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 88,
+            "range": "± 5",
             "unit": "ns/iter"
           }
         ]
