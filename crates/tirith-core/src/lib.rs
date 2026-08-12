@@ -93,6 +93,7 @@ pub mod util;
 pub mod util_build_dirs;
 pub mod verdict;
 pub mod version_intent;
+pub mod web3_policy;
 pub mod webhook;
 
 #[cfg(unix)]

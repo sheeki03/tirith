@@ -337,6 +337,19 @@ pub struct Policy {
     #[serde(default)]
     pub injection_seeds_custom: Vec<String>,
 
+    /// Trusted Web3 authorization (C07). MIXED direction, so it is neither
+    /// wholly kept nor wholly reset: [`crate::web3_policy::Web3GuardPolicy::merge_repo_scoped`]
+    /// resets every grant-bearing field (networks, aliases, allowed signers,
+    /// approval key ids) while unioning denials and taking the stricter action.
+    #[serde(default)]
+    pub web3_guard: crate::web3_policy::Web3GuardPolicy,
+
+    /// Trusted untrusted-task gate (C07). Every field is restriction-shaped, so
+    /// [`crate::web3_policy::TaskGatePolicy::merge_repo_scoped`] keeps a repo's
+    /// stricter mode and larger denial sets and refuses a relaxation.
+    #[serde(default)]
+    pub task_gate: crate::web3_policy::TaskGatePolicy,
+
     /// Opt-in: downgrade an injection-ONLY MCP `Block` to a redacted `Warn`
     /// instead of blocking the whole tool result. WEAKENING (it relaxes the
     /// default block), so this is RESET by [`Self::sanitize_repo_scoped`] — only
@@ -1279,6 +1292,8 @@ impl Default for Policy {
             path: None,
             scope: PolicyScope::default(),
             schema_version: default_schema_version(),
+            web3_guard: crate::web3_policy::Web3GuardPolicy::default(),
+            task_gate: crate::web3_policy::TaskGatePolicy::default(),
             fail_mode: FailMode::Open,
             allow_bypass_env: true,
             allow_bypass_env_noninteractive: false,
@@ -1844,8 +1859,30 @@ impl Policy {
             baseline_enabled: _,
             allowed_install_domains: _,
             gateway_profile,
+            web3_guard: repo_web3_guard,
+            task_gate: repo_task_gate,
             neutralized_fields,
         } = repo;
+
+        // Sanitation already stripped every grant the repo tried to introduce,
+        // so what arrives here is a default plus tightenings. Folding it in
+        // with the same tighten-only merge keeps the composition monotonic:
+        // denials union, actions and mode take the stricter value.
+        //
+        // Gated on declaration for the same reason as the scalars below: these
+        // sections are `#[serde(default)]`, and their action defaults are
+        // `Warn`, which is NOT the identity of `max` over a lattice whose
+        // bottom is `Allow`. Without the gate, a repo policy that never
+        // mentions `web3_guard` would still clamp a trusted operator's
+        // deliberate `allow` up to `warn`.
+        if document.top_present("web3_guard") {
+            self.neutralized_fields
+                .extend(self.web3_guard.merge_repo_scoped(repo_web3_guard));
+        }
+        if document.top_present("task_gate") {
+            self.neutralized_fields
+                .extend(self.task_gate.merge_repo_scoped(repo_task_gate));
+        }
 
         let baseline_was_default = self.scope == PolicyScope::Default;
 
@@ -2117,6 +2154,24 @@ impl Policy {
         }
         self.threat_intel = defaults.threat_intel.clone();
         self.allowed_install_domains = defaults.allowed_install_domains.clone();
+
+        // Web3 authorization and the untrusted-task gate (C07). These are the
+        // only sections with a MIXED direction, so they are neither reset nor
+        // kept wholesale: the merge drops every grant the repo tried to
+        // introduce (networks, aliases, signers, approval keys) while keeping
+        // the denials and stricter actions it asked for. Merging against the
+        // DEFAULT rather than the trusted policy is deliberate — at this point
+        // `self` holds the repo document, and a repo may only ever tighten a
+        // default, never a value an operator set elsewhere.
+        let repo_guard = std::mem::take(&mut self.web3_guard);
+        let mut guard = defaults.web3_guard.clone();
+        neutralized.extend(guard.merge_repo_scoped(repo_guard));
+        self.web3_guard = guard;
+
+        let repo_gate = std::mem::take(&mut self.task_gate);
+        let mut gate = defaults.task_gate.clone();
+        neutralized.extend(gate.merge_repo_scoped(repo_gate));
+        self.task_gate = gate;
 
         // These opt-ins are not monotonic repo restrictions. A reasoned sudo
         // session downgrades findings, while baseline learning writes persistent
@@ -3954,6 +4009,100 @@ mod tests {
     }
 
     #[test]
+    fn repo_yaml_cannot_authorize_web3_or_relax_the_task_gate() {
+        // End-to-end through the real parse -> sanitize -> merge pipeline, not
+        // the struct API: a checked-in `.tirith/policy.yaml` is exactly the
+        // attacker-controlled input this stack exists for.
+        let mut trusted = Policy {
+            web3_guard: crate::web3_policy::Web3GuardPolicy {
+                networks: vec![crate::web3_policy::TrustedNetwork {
+                    name: "prod".into(),
+                    family: crate::web3_policy::Web3Family::Evm,
+                    identity: crate::web3_policy::NetworkIdentity::Evm { evm_chain_id: 1 },
+                    endpoints: vec![crate::web3_policy::RpcMatcher {
+                        scheme: "https".into(),
+                        host: "rpc.trusted.test".into(),
+                        port: None,
+                        path_prefix: None,
+                        subdomains: crate::web3_policy::SubdomainPolicy::ExactHost,
+                    }],
+                }],
+                allowed_signers: [crate::web3_policy::TrustedSignerKind::HardwareWallet]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            task_gate: crate::web3_policy::TaskGatePolicy {
+                mode: crate::web3_policy::TaskGateMode::Enforce,
+                effects_requiring_verified_provenance: [
+                    crate::effects::CommandEffectKind::Web3Write,
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..Policy::default()
+        };
+
+        merge_repo_yaml_for_test(
+            &mut trusted,
+            r#"
+web3_guard:
+  networks:
+    - name: prod
+      family: evm
+      identity:
+        evm_chain_id: 1
+      endpoints:
+        - scheme: https
+          host: rpc.attacker.test
+  allowed_signers: [unlocked_node]
+  command_card_key_ids: [attacker-key]
+  action_unclassified_rpc: allow
+  action_incomplete_analysis: block
+  deny_destinations: ["0xdead"]
+task_gate:
+  mode: "off"
+  effects_denied_for_untrusted_sources: [package_install]
+"#,
+        );
+
+        // Nothing the repository named became trusted.
+        assert!(trusted
+            .web3_guard
+            .classify_rpc("https", "rpc.attacker.test", None, None)
+            .is_none());
+        assert!(!trusted
+            .web3_guard
+            .permits_signer(crate::web3_policy::TrustedSignerKind::UnlockedNode));
+        assert!(trusted.web3_guard.command_card_key_ids.is_empty());
+        // The operator's own trusted network is untouched.
+        assert!(trusted
+            .web3_guard
+            .classify_rpc("https", "rpc.trusted.test", None, None)
+            .is_some());
+        // A relaxed action and a downgraded mode are both refused.
+        assert_eq!(
+            trusted.web3_guard.action_unclassified_rpc,
+            crate::web3_policy::Web3GuardAction::Warn
+        );
+        assert_eq!(
+            trusted.task_gate.mode,
+            crate::web3_policy::TaskGateMode::Enforce
+        );
+        // Tightenings the repository asked for are honored.
+        assert_eq!(
+            trusted.web3_guard.action_incomplete_analysis,
+            crate::web3_policy::Web3GuardAction::Block
+        );
+        assert!(trusted.web3_guard.deny_destinations.contains("0xdead"));
+        assert!(trusted
+            .task_gate
+            .effects_denied_for_untrusted_sources
+            .contains(&crate::effects::CommandEffectKind::PackageInstall));
+    }
+
+    #[test]
     fn empty_repo_policy_is_a_true_no_op_for_default_filled_scalars() {
         let mut trusted = Policy {
             allow_bypass_env: true,
@@ -3963,6 +4112,19 @@ mod tests {
                 warn_install_script_network_call: false,
                 block_dependency_confusion: false,
                 ..PackagePolicy::default()
+            },
+            // C07: the action lattice's bottom is `Allow` but its serde default
+            // is `Warn`, so `Warn` is not the identity of the stricter-wins
+            // merge. An undeclared section must still leave a deliberate
+            // operator `allow` alone.
+            web3_guard: crate::web3_policy::Web3GuardPolicy {
+                action_unclassified_rpc: crate::web3_policy::Web3GuardAction::Allow,
+                action_incomplete_analysis: crate::web3_policy::Web3GuardAction::Allow,
+                ..Default::default()
+            },
+            task_gate: crate::web3_policy::TaskGatePolicy {
+                action_incomplete_analysis: crate::web3_policy::Web3GuardAction::Allow,
+                ..Default::default()
             },
             ..Policy::default()
         };
@@ -3974,6 +4136,25 @@ mod tests {
         assert!(!trusted.context_guard_enabled);
         assert!(!trusted.package_policy.warn_install_script_network_call);
         assert!(!trusted.package_policy.block_dependency_confusion);
+        assert_eq!(
+            trusted.web3_guard.action_unclassified_rpc,
+            crate::web3_policy::Web3GuardAction::Allow,
+            "an undeclared web3_guard clamped a trusted action"
+        );
+        assert_eq!(
+            trusted.web3_guard.action_incomplete_analysis,
+            crate::web3_policy::Web3GuardAction::Allow
+        );
+        assert_eq!(
+            trusted.task_gate.action_incomplete_analysis,
+            crate::web3_policy::Web3GuardAction::Allow,
+            "an undeclared task_gate clamped a trusted action"
+        );
+        assert!(
+            trusted.neutralized_fields.is_empty(),
+            "an empty repo policy reported neutralized fields: {:?}",
+            trusted.neutralized_fields
+        );
     }
 
     #[test]
@@ -5597,6 +5778,42 @@ custom_rules:
         // A maximally-hostile policy: every field that COULD weaken is set to a
         // value distinct from the default, so a missing reset is observable.
         let mut p = Policy {
+            // C07: a repo trying to name its own trusted network, allow an
+            // unlocked-node signer, trust its own approval key, and relax the
+            // unclassified-endpoint action, while ALSO adding one legitimate
+            // denial. The grants must vanish and the denial must survive.
+            web3_guard: crate::web3_policy::Web3GuardPolicy {
+                networks: vec![crate::web3_policy::TrustedNetwork {
+                    name: "attacker".into(),
+                    family: crate::web3_policy::Web3Family::Evm,
+                    identity: crate::web3_policy::NetworkIdentity::Evm { evm_chain_id: 1 },
+                    endpoints: vec![crate::web3_policy::RpcMatcher {
+                        scheme: "https".into(),
+                        host: "rpc.attacker.test".into(),
+                        port: None,
+                        path_prefix: None,
+                        subdomains: crate::web3_policy::SubdomainPolicy::ExactHost,
+                    }],
+                }],
+                allowed_signers: [crate::web3_policy::TrustedSignerKind::UnlockedNode]
+                    .into_iter()
+                    .collect(),
+                command_card_key_ids: ["attacker-key".to_string()].into_iter().collect(),
+                action_unclassified_rpc: crate::web3_policy::Web3GuardAction::Allow,
+                deny_destinations: ["0xdead".to_string()].into_iter().collect(),
+                ..Default::default()
+            },
+            task_gate: crate::web3_policy::TaskGatePolicy {
+                // Off is the default, so this cannot weaken; the denial set is
+                // a tightening and must survive.
+                mode: crate::web3_policy::TaskGateMode::Off,
+                effects_denied_for_untrusted_sources: [
+                    crate::effects::CommandEffectKind::Web3Write,
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
             // --- fields the sanitizer RESETS (set hostile here) ---
             allowlist: vec!["evil.example".into()],
             allowlist_rules: vec![AllowlistRule {
@@ -5779,6 +5996,10 @@ custom_rules:
             scope,
             context_labels,
             ssh_host_labels,
+            // C07 — MIXED direction, asserted field-by-field below rather than
+            // as a whole-struct RESET or KEPT.
+            web3_guard,
+            task_gate,
             // Presentation bookkeeping (design C) — NOT a sanitize-classified
             // field (neither RESET nor KEPT). The sanitizer WRITES this with the
             // keys it neutralized; it is `#[serde(skip)]` and a repo cannot set
@@ -5786,6 +6007,38 @@ custom_rules:
             // population is asserted by `sanitize_records_neutralized_fields`.
             neutralized_fields: _,
         } = p;
+
+        // ---- C07 MIXED: grants dropped, denials and stricter actions kept ----
+        assert!(
+            web3_guard.networks.is_empty(),
+            "RESET: web3_guard.networks (a repo cannot name a trusted network)"
+        );
+        assert!(
+            web3_guard.allowed_signers.is_empty(),
+            "RESET: web3_guard.allowed_signers"
+        );
+        assert!(
+            web3_guard.command_card_key_ids.is_empty(),
+            "RESET: web3_guard.command_card_key_ids"
+        );
+        assert_eq!(
+            web3_guard.action_unclassified_rpc, d.web3_guard.action_unclassified_rpc,
+            "RESET: web3_guard.action_unclassified_rpc (a repo cannot relax an action)"
+        );
+        assert!(
+            web3_guard.deny_destinations.contains("0xdead"),
+            "KEPT: web3_guard.deny_destinations (a denial is a tightening)"
+        );
+        assert!(
+            task_gate
+                .effects_denied_for_untrusted_sources
+                .contains(&crate::effects::CommandEffectKind::Web3Write),
+            "KEPT: task_gate.effects_denied_for_untrusted_sources"
+        );
+        assert_eq!(
+            task_gate.mode, d.task_gate.mode,
+            "task_gate.mode may not fall below the trusted mode"
+        );
 
         // ---- RESET: every weakening/suppression/exfil knob back to default ----
         assert_eq!(allowlist, d.allowlist, "RESET: allowlist");

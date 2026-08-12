@@ -133,6 +133,7 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     validate_escalation_rules(&policy, &mut issues);
     validate_agent_rules(&policy, &mut issues);
     validate_package_policy(&policy, &mut issues);
+    validate_web3_sections(&policy, &mut issues);
 
     validate_schema_unknown_fields(&migrated, &mut issues);
 
@@ -392,6 +393,27 @@ fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<Policy
 /// so this lenient `policy validate` path is where the operator is told about them.
 /// A blank/`#`-comment line is a deliberate skip in `compile_seeds`, so it is not
 /// flagged here either.
+/// Surface `web3_guard` / `task_gate` problems (C07) through the same
+/// `tirith policy validate` output as every other section, so an operator finds
+/// out at validation time rather than discovering a network definition was
+/// silently incoherent.
+fn validate_web3_sections(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
+    for issue in crate::web3_policy::validate_web3_guard(&policy.web3_guard) {
+        issues.push(PolicyIssue {
+            level: IssueLevel::Error,
+            message: format!("{}: {}", issue.field, issue.message),
+            field: Some(issue.field),
+        });
+    }
+    for issue in crate::web3_policy::validate_task_gate(&policy.task_gate) {
+        issues.push(PolicyIssue {
+            level: IssueLevel::Error,
+            message: format!("{}: {}", issue.field, issue.message),
+            field: Some(issue.field),
+        });
+    }
+}
+
 fn validate_injection_seeds(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
     for (i, pattern) in policy.injection_seeds_custom.iter().enumerate() {
         let trimmed = pattern.trim();
