@@ -82,6 +82,7 @@ pub mod style;
 pub mod sudo_session;
 pub mod suppression;
 pub mod taint;
+pub mod task;
 pub mod text_confusables;
 pub mod threatdb;
 pub mod threatdb_api;
