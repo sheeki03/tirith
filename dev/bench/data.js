@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786558151216,
+  "lastUpdate": 1786561831851,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -1871,6 +1871,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 92,
             "range": "± 2",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "779e7d969b1a2c512b78791a2f3783355a94304b",
+          "message": "Merge pull request #187 from sheeki03/codex/deepsec-r2a-core-hardening\n\nfix(security): DeepSec R2 1/2: core hardening queue",
+          "timestamp": "2026-08-13T00:36:49+05:30",
+          "tree_id": "4ac95a1378666f1d975c82472205791ea8811c7a",
+          "url": "https://github.com/sheeki03/tirith/commit/779e7d969b1a2c512b78791a2f3783355a94304b"
+        },
+        "date": 1786561831289,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 462,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 125,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 93351,
+            "range": "± 539",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 426179,
+            "range": "± 4334",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 558246,
+            "range": "± 10973",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 288855,
+            "range": "± 1501",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 32596,
+            "range": "± 89",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 80,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 92,
+            "range": "± 0",
             "unit": "ns/iter"
           }
         ]
