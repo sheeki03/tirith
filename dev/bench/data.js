@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786535634080,
+  "lastUpdate": 1786535697382,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -467,6 +467,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 93,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b59213fbb1846ad4f2c70edce14ea3411016f412",
+          "message": "Merge pull request #157 from sheeki03/security/b7-native-triage\n\nB7: native binary triage and import-execution-chain correlation",
+          "timestamp": "2026-08-12T17:21:45+05:30",
+          "tree_id": "7f17b1a6dc649edfc141c98f301cc24f4d91ae4e",
+          "url": "https://github.com/sheeki03/tirith/commit/b59213fbb1846ad4f2c70edce14ea3411016f412"
+        },
+        "date": 1786535696891,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 510,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 134,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 34757,
+            "range": "± 485",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 248994,
+            "range": "± 2253",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 211645,
+            "range": "± 2241",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 201516,
+            "range": "± 1296",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 24415,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 77,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 93,
+            "range": "± 1",
             "unit": "ns/iter"
           }
         ]
