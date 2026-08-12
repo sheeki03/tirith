@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786535433330,
+  "lastUpdate": 1786535634080,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -388,6 +388,84 @@ window.BENCHMARK_DATA = {
           {
             "name": "byte_scan_ansi",
             "value": 39,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0df4fbb258252a8c90deebf91318cb3cb0a55ac7",
+          "message": "Merge pull request #156 from sheeki03/security/b6-python-startup-execution\n\nB6: Python startup-hook execution analyzer (pth / start / sitecustomize)",
+          "timestamp": "2026-08-12T17:20:33+05:30",
+          "tree_id": "c60b9c61bffe9bd62480faf50d88fe7046ecb988",
+          "url": "https://github.com/sheeki03/tirith/commit/0df4fbb258252a8c90deebf91318cb3cb0a55ac7"
+        },
+        "date": 1786535632259,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 472,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 134,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 33607,
+            "range": "± 811",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 245041,
+            "range": "± 5863",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 210073,
+            "range": "± 1539",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 198504,
+            "range": "± 1060",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 25031,
+            "range": "± 148",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 77,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 93,
             "range": "± 0",
             "unit": "ns/iter"
           }
