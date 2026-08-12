@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786556252495,
+  "lastUpdate": 1786558151216,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -1793,6 +1793,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 91,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7a58c55b51e41eb1f5ef50cde75b10cfadd6f24e",
+          "message": "Merge pull request #179 from sheeki03/codex/deepsec-r1-critical-boundaries\n\nfix(security): DeepSec R1 5/5: close parser rules, hooks, threatdb, and release boundaries",
+          "timestamp": "2026-08-12T23:35:37+05:30",
+          "tree_id": "d76069d388f2f5785bc19c42d4336bfaf016e115",
+          "url": "https://github.com/sheeki03/tirith/commit/7a58c55b51e41eb1f5ef50cde75b10cfadd6f24e"
+        },
+        "date": 1786558150054,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 502,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 127,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 82645,
+            "range": "± 740",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 446298,
+            "range": "± 2807",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 580009,
+            "range": "± 4142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 310806,
+            "range": "± 3164",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 24990,
+            "range": "± 367",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 78,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 92,
+            "range": "± 2",
             "unit": "ns/iter"
           }
         ]
