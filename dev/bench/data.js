@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786535776556,
+  "lastUpdate": 1786538032994,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -623,6 +623,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 80,
             "range": "± 5",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a0def1cb36f44a2e253b9d9a5f3100971f109ce5",
+          "message": "Merge PR #160: DB-B v2 binary format and dual-manifest updater\n\nDB-B: v2 binary format with artifact/file-hash indices, dual-format writer, and dual-manifest updater",
+          "timestamp": "2026-08-12T18:00:47+05:30",
+          "tree_id": "e878c75b1c79c19dc1eaecc78a6feee4657decf4",
+          "url": "https://github.com/sheeki03/tirith/commit/a0def1cb36f44a2e253b9d9a5f3100971f109ce5"
+        },
+        "date": 1786538031224,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 495,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 136,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 34439,
+            "range": "± 1350",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 244902,
+            "range": "± 1846",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 211474,
+            "range": "± 1745",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 197506,
+            "range": "± 675",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 24184,
+            "range": "± 1069",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 70,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 91,
+            "range": "± 1",
             "unit": "ns/iter"
           }
         ]
