@@ -18,6 +18,25 @@ No additional remediation PRs are planned. The earlier subsystem packages are
 retained only as internal commit groups, test filters, and ledger workstreams
 inside R1-R3.
 
+## Execution update — 2026-08-12
+
+The three entries above remain the logical ownership and accounting tracks.
+For reviewability, the live implementation was divided into eight ordered merge
+units without changing which track owns a root:
+
+```text
+R1: #183 -> #184 -> #185 -> #186 -> #179
+R2: #187 -> #180
+R3: #181
+```
+
+The documentation/parent chain is `#173 -> #174 -> #177` before those units.
+Each merge unit inherits the validation and closure contract of its logical
+track. A green later unit does not waive a failed earlier unit, and every child
+must be re-authenticated after its parent merges. Current receipts and blockers
+are maintained in [`../MERGE-CHECKPOINT.md`](../MERGE-CHECKPOINT.md); exact
+continuation steps are in [`../HANDOVER.md`](../HANDOVER.md).
+
 This is intentionally a large-PR strategy. To keep it auditable, every PR has an
 ordered commit series, commit-level validation checkpoints, a machine-readable
 root ledger, and a final exact-head revalidation. A root is not closed merely

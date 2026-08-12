@@ -1,7 +1,8 @@
 # DeepSec remediation program
 
-Status: implementation plan only. This document does not claim that any finding
-has been fixed.
+Status: implementation and merge program in progress. See the live
+[merge checkpoint](MERGE-CHECKPOINT.md) and [operator handover](HANDOVER.md)
+before relying on the original planning assumptions below.
 
 This program turns the adjudicated DeepSec inventory at
 `e1ec47ef9f43e32872a550522067a680ff659e6e` into reviewable, dependency-aware
@@ -112,7 +113,7 @@ queued -> reproduced -> control_ready -> migrated -> verified -> closed
 4. The malicious case no longer reproduces and a legitimate control still
    works through the same interface.
 5. Change-aware bypass review covers an alternate input class and sibling sink.
-6. Focused tests, owning-package tests, formatting, clippy, MSRV 1.83, platform
+6. Focused tests, owning-package tests, formatting, clippy, MSRV 1.88, platform
    CI, and applicable dependency checks pass.
 7. Targeted DeepSec revalidation is tied to the exact commit SHA.
 
@@ -159,6 +160,8 @@ The plan does not silently turn uncertainty into code:
 
 ## Plan artifacts
 
+- [Merge checkpoint and receipts](MERGE-CHECKPOINT.md)
+- [Operator handover](HANDOVER.md)
 - [Evidence context](context.md)
 - [Hardening portfolio](hardening.md)
 - [Stacked implementation plan](implementation/stacked-pr-plan.md)
