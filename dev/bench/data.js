@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786538103980,
+  "lastUpdate": 1786538664714,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -857,6 +857,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 75,
             "range": "± 4",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9c72dad8f91b0127f09b53456ddb9c17167eadb5",
+          "message": "Merge PR #164: package firewall, runtime capsule, and MCP gateway hardening\n\nfeat: package firewall + runtime capsule + MCP gateway hardening (executive-verdict follow-on)",
+          "timestamp": "2026-08-12T18:10:53+05:30",
+          "tree_id": "b5e574eea5a17f9b48a0671d7b7f41c260cb78c2",
+          "url": "https://github.com/sheeki03/tirith/commit/9c72dad8f91b0127f09b53456ddb9c17167eadb5"
+        },
+        "date": 1786538663774,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 348,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 102,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 30506,
+            "range": "± 945",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 188863,
+            "range": "± 2769",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 164841,
+            "range": "± 7190",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 150637,
+            "range": "± 686",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 20068,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 63,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 73,
+            "range": "± 0",
             "unit": "ns/iter"
           }
         ]
