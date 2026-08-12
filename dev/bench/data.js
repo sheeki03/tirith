@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786535229513,
+  "lastUpdate": 1786535357309,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -233,6 +233,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 93,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a88c743f8aee8c22336e102dda4d4c244b3ac07b",
+          "message": "Merge pull request #154 from sheeki03/security/a4-hardened-wheel-reader\n\nA4: hardened streaming wheel reader with structural-violation rejection",
+          "timestamp": "2026-08-12T17:16:36+05:30",
+          "tree_id": "77c7bdf254a8b53421b103a69761459dad25f56a",
+          "url": "https://github.com/sheeki03/tirith/commit/a88c743f8aee8c22336e102dda4d4c244b3ac07b"
+        },
+        "date": 1786535355537,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 205,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 66,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 27272,
+            "range": "± 1398",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 156631,
+            "range": "± 4499",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 134550,
+            "range": "± 2464",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 121582,
+            "range": "± 1697",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 13779,
+            "range": "± 546",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 36,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 41,
+            "range": "± 1",
             "unit": "ns/iter"
           }
         ]
