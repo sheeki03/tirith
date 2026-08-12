@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786535357309,
+  "lastUpdate": 1786535433330,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -311,6 +311,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 41,
             "range": "± 1",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "62dc3393eb897986359e01e0588c936ff3b6a052",
+          "message": "Merge pull request #155 from sheeki03/security/b5-wheel-installed-record\n\nB5: wheel and installed RECORD integrity with ownership index",
+          "timestamp": "2026-08-12T17:17:56+05:30",
+          "tree_id": "eccd87821e022e49792cbcf2079420f57bdee101",
+          "url": "https://github.com/sheeki03/tirith/commit/62dc3393eb897986359e01e0588c936ff3b6a052"
+        },
+        "date": 1786535431568,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 204,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 65,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 26099,
+            "range": "± 246",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 151528,
+            "range": "± 2138",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 130839,
+            "range": "± 1615",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 126628,
+            "range": "± 1936",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 13469,
+            "range": "± 125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 37,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 39,
+            "range": "± 0",
             "unit": "ns/iter"
           }
         ]
