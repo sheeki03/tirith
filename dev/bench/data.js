@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786545527756,
+  "lastUpdate": 1786550190374,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -1559,6 +1559,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 93,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "438ea3afc2f36ff5725639ea8802e6aee452db9e",
+          "message": "Merge pull request #184 from sheeki03/codex/deepsec-r1b-network-threatdb\n\nfix(security): DeepSec R1 2/5: network, threatdb, resolver, and output boundaries",
+          "timestamp": "2026-08-12T21:23:19+05:30",
+          "tree_id": "107f8490d4325ecdfc3409c172b787cbacc59b2f",
+          "url": "https://github.com/sheeki03/tirith/commit/438ea3afc2f36ff5725639ea8802e6aee452db9e"
+        },
+        "date": 1786550189821,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 434,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 131,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 40322,
+            "range": "± 371",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 242514,
+            "range": "± 3642",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 221359,
+            "range": "± 3294",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 194749,
+            "range": "± 5908",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 25927,
+            "range": "± 268",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 79,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 92,
+            "range": "± 1",
             "unit": "ns/iter"
           }
         ]
