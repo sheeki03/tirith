@@ -1701,6 +1701,161 @@ pub fn output_sensitive_regex_fragment() -> String {
     fragments.join("|")
 }
 
+/// Byte ranges of reviewed PRIVATE file paths inside free-form command text.
+///
+/// This is the path counterpart to [`sensitive_value_redaction_spans`], which
+/// only covers secret *values*. A wallet or credential path is not a secret
+/// byte string, so no value pattern matches it, yet echoing
+/// `~/.config/Exodus/exodus.wallet` still tells a reader exactly which wallet a
+/// user holds and where it lives. Rules that quote raw command text on a
+/// bounded-analysis path (container/sudo work-budget gaps) would otherwise
+/// carry that path into CLI output and the persistent audit log.
+///
+/// Deliberately excludes [`SensitivePathKind::PrivilegedSystem`]. `/etc`,
+/// container sockets, and the unresolved-`..` catch-all are ordinary system
+/// locations, not private user data; redacting them would blank routine
+/// evidence without protecting anyone. [`OUTPUT_SENSITIVE_TERMS`] is excluded
+/// for the same reason: bare words like `secret` and `credentials` appear in
+/// ordinary prose.
+///
+/// Each match consumes the reviewed root plus its remaining path segments so a
+/// keystore filename (which embeds an account address) cannot survive the root
+/// being blanked. Shell metacharacters terminate a match, keeping a following
+/// sink command visible in the evidence.
+pub(crate) fn private_path_redaction_spans(input: &str) -> Vec<std::ops::Range<usize>> {
+    static PRIVATE_PATH_RE: Lazy<Regex> = Lazy::new(|| {
+        // A literal space survives `regex::escape`, so the ordinary unquoted
+        // macOS spelling (`Application\ Support`) needs the escaped form too.
+        let path_regex = |path: &str| {
+            regex::escape(path)
+                .replace('/', r"[/\\]")
+                .replace(' ', r"(?:\\ | )")
+        };
+        let leading = r#"(?:^|[/\\\s\"'`=:@(\[])"#;
+        // Continue only across a real component boundary, so `.config/gh`
+        // (GitHub CLI credentials) cannot prefix-match `.config/ghostty` and
+        // blank half of an unrelated word. This mirrors the component-root
+        // semantics of `path_definition_matches`. `$`, `(`, and `{` end the
+        // token so an appended `$(curl ...)` substitution cannot ride inside a
+        // path span and disappear from the record.
+        let tail = r#"(?:[/\\][^\s\"'`,;)\]|&><${}()]*)?"#;
+        // The boundary character is consumed but left OUT of the capture, so a
+        // following sink command stays readable. Anything that cannot continue
+        // a filename terminates the path, which keeps `-v ~/.ssh:/keys` (the
+        // canonical Docker credential mount) matching while still rejecting
+        // `.sshrc` and `.config/ghostty`.
+        let trailing = r#"(?:$|[^A-Za-z0-9._\-])"#;
+        let alternatives = SENSITIVE_PATH_DEFINITIONS
+            .iter()
+            .filter(|definition| definition.kind != SensitivePathKind::PrivilegedSystem)
+            .filter(|definition| {
+                // A storage-root directory name alone appears in ordinary
+                // browser profiles; only the wallet extension IDs identify
+                // wallet data. An unpacked extension source tree is not
+                // wallet storage, matching `classify_path_for_flavor`.
+                !matches!(
+                    definition.match_mode,
+                    SensitivePathMatchMode::BrowserStorageRoot
+                        | SensitivePathMatchMode::BrowserSourceRoot
+                )
+            })
+            .flat_map(|definition| match definition.match_mode {
+                SensitivePathMatchMode::BasenameSuffix => {
+                    vec![format!(r"[^/\\\s]*{}", path_regex(definition.match_root))]
+                }
+                _ => {
+                    let mut spellings = vec![path_regex(definition.match_root)];
+                    // `~/.config/Exodus` on its own already discloses which
+                    // wallet the user holds, so the directory that mounting
+                    // would expose is redacted alongside the exact file.
+                    if let Some(bind_root) = definition
+                        .bind_root
+                        .filter(|bind_root| *bind_root != definition.match_root)
+                    {
+                        spellings.push(path_regex(bind_root));
+                    }
+                    // `%APPDATA%` already denotes `AppData\Roaming`, so the
+                    // shell spelling never contains the catalog's literal
+                    // prefix. Mirror `expand_windows_path_aliases` in reverse
+                    // so the environment forms are recognized here too, instead
+                    // of introducing a second alias table.
+                    for (prefix, aliases) in [
+                        (
+                            "AppData/Roaming/",
+                            [r"%APPDATA%", r"\$\{env:APPDATA\}", r"\$env:APPDATA"],
+                        ),
+                        (
+                            "AppData/Local/",
+                            [
+                                r"%LOCALAPPDATA%",
+                                r"\$\{env:LOCALAPPDATA\}",
+                                r"\$env:LOCALAPPDATA",
+                            ],
+                        ),
+                    ] {
+                        if let Some(rest) = definition.match_root.strip_prefix(prefix) {
+                            for alias in aliases {
+                                // Quotes may separate the expansion from the
+                                // rest of the path (`"$env:APPDATA"\Exodus`).
+                                spellings.push(format!(r#"{alias}["']?[/\\]{}"#, path_regex(rest)));
+                            }
+                        }
+                    }
+                    spellings
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !alternatives.is_empty(),
+            "sensitive path catalog has no private definitions"
+        );
+        RegexBuilder::new(&format!(
+            "{leading}(?P<path>(?:{}){tail}){trailing}",
+            alternatives.join("|")
+        ))
+        .case_insensitive(true)
+        .build()
+        // Fail closed like every other production pattern in this module: a
+        // silently missing regex would disable path redaction wholesale.
+        .expect("private path redaction regex")
+    });
+
+    // Resume at the end of the PATH, not the end of the match. Both the
+    // leading and trailing boundaries are consuming groups, so scanning from
+    // the match end would eat the separator that the next path needs as its
+    // own leading boundary and skip every second path in a run such as
+    // `cp .npmrc .netrc /tmp`.
+    // A reviewed root appearing inside a remote URL is a download or exfil
+    // TARGET, not a local private path. Blanking it would delete the very
+    // destination an operator needs from the record, so those ranges are left
+    // intact; this also keeps `Evidence::Url` and `CommandPattern` consistent.
+    let remote_url_ranges = BARE_RPC_URL_RE
+        .find_iter(input)
+        .map(|matched| matched.start()..matched.end())
+        .collect::<Vec<_>>();
+
+    let mut spans = Vec::new();
+    let mut at = 0usize;
+    while at <= input.len() {
+        let Some(captures) = PRIVATE_PATH_RE.captures_at(input, at) else {
+            break;
+        };
+        let Some(matched) = captures.name("path") else {
+            break;
+        };
+        if !remote_url_ranges
+            .iter()
+            .any(|url| matched.start() >= url.start && matched.start() < url.end)
+        {
+            spans.push(matched.start()..matched.end());
+        }
+        // A zero-width capture cannot happen (every alternative is a literal
+        // root), but guard the loop against one regardless.
+        at = matched.end().max(at + 1);
+    }
+    spans
+}
+
 fn path_observation(
     kind: SensitiveAssetKind,
     location_class: SensitiveLocationClass,

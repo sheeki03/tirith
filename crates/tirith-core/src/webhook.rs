@@ -15,7 +15,13 @@ pub fn dispatch(
         return;
     }
 
-    let redacted_preview = crate::redact::redact_with_custom(command_preview, custom_dlp_patterns);
+    // This preview leaves the machine, so it takes the command boundary
+    // (assignment values and reviewed private paths) rather than the plain
+    // value-pattern pass.
+    let redacted_preview = crate::redact::redact_sanitize_redact_command_with_compiled(
+        command_preview,
+        &crate::redact::CompiledCustomPatterns::new(custom_dlp_patterns),
+    );
 
     let max_severity = verdict
         .findings

