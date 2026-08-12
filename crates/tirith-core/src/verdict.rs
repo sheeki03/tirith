@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroUsize;
 
 /// Unique identifier for each detection rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -952,6 +953,31 @@ impl fmt::Display for Severity {
 /// Evidence supporting a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum DataFlowSecretType {
+    /// A wallet, keystore, keypair, mnemonic, or wallet-backed environment
+    /// reference. The category deliberately does not encode the wallet name,
+    /// path, environment-variable name, or secret format.
+    WalletArtifact,
+}
+
+impl DataFlowSecretType {
+    const ALL: &'static [Self] = &[Self::WalletArtifact];
+
+    const fn evidence_token(self) -> &'static str {
+        match self {
+            Self::WalletArtifact => "wallet_artifact",
+        }
+    }
+
+    fn is_evidence_token(value: &str) -> bool {
+        Self::ALL
+            .iter()
+            .any(|candidate| candidate.evidence_token() == value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum DataFlowSource {
     SensitiveFile,
     SensitiveEnvironmentReference,
@@ -961,6 +987,34 @@ pub(crate) enum DataFlowSource {
     SensitiveAsset,
 }
 
+impl DataFlowSource {
+    const ALL: &'static [Self] = &[
+        Self::SensitiveFile,
+        Self::SensitiveEnvironmentReference,
+        Self::SensitiveCommandSubstitution,
+        Self::PipedSensitiveFile,
+        Self::MultipleSensitiveFiles,
+        Self::SensitiveAsset,
+    ];
+
+    const fn evidence_token(self) -> &'static str {
+        match self {
+            Self::SensitiveFile => "sensitive_file",
+            Self::SensitiveEnvironmentReference => "sensitive_environment_reference",
+            Self::SensitiveCommandSubstitution => "sensitive_command_substitution",
+            Self::PipedSensitiveFile => "piped_sensitive_file",
+            Self::MultipleSensitiveFiles => "multiple_sensitive_files",
+            Self::SensitiveAsset => "sensitive_asset",
+        }
+    }
+
+    fn is_evidence_token(value: &str) -> bool {
+        Self::ALL
+            .iter()
+            .any(|candidate| candidate.evidence_token() == value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DataFlowSink {
@@ -968,6 +1022,39 @@ pub(crate) enum DataFlowSink {
     Wget,
     RemoteHttp,
     LocalProcess,
+    RemoteCopy,
+    RawSocket,
+    Dns,
+}
+
+impl DataFlowSink {
+    const ALL: &'static [Self] = &[
+        Self::Curl,
+        Self::Wget,
+        Self::RemoteHttp,
+        Self::LocalProcess,
+        Self::RemoteCopy,
+        Self::RawSocket,
+        Self::Dns,
+    ];
+
+    const fn evidence_token(self) -> &'static str {
+        match self {
+            Self::Curl => "curl",
+            Self::Wget => "wget",
+            Self::RemoteHttp => "remote_http",
+            Self::LocalProcess => "local_process",
+            Self::RemoteCopy => "remote_copy",
+            Self::RawSocket => "raw_socket",
+            Self::Dns => "dns",
+        }
+    }
+
+    fn is_evidence_token(value: &str) -> bool {
+        Self::ALL
+            .iter()
+            .any(|candidate| candidate.evidence_token() == value)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -981,6 +1068,62 @@ pub(crate) enum DataFlowOperation {
     CredentialSweep,
     UploadAnalysisUnresolved,
     CredentialSweepAnalysisUnresolved,
+    Upload,
+    Copy,
+    SocketSend,
+    DnsQuery,
+    TemporaryFile,
+    Archive,
+    Base64Encode,
+    HexEncode,
+}
+
+impl DataFlowOperation {
+    const ALL: &'static [Self] = &[
+        Self::UploadFile,
+        Self::MultipartForm,
+        Self::RequestBody,
+        Self::PostFile,
+        Self::PostData,
+        Self::CredentialSweep,
+        Self::UploadAnalysisUnresolved,
+        Self::CredentialSweepAnalysisUnresolved,
+        Self::Upload,
+        Self::Copy,
+        Self::SocketSend,
+        Self::DnsQuery,
+        Self::TemporaryFile,
+        Self::Archive,
+        Self::Base64Encode,
+        Self::HexEncode,
+    ];
+
+    const fn evidence_token(self) -> &'static str {
+        match self {
+            Self::UploadFile => "upload_file",
+            Self::MultipartForm => "multipart_form",
+            Self::RequestBody => "request_body",
+            Self::PostFile => "post_file",
+            Self::PostData => "post_data",
+            Self::CredentialSweep => "credential_sweep",
+            Self::UploadAnalysisUnresolved => "upload_analysis_unresolved",
+            Self::CredentialSweepAnalysisUnresolved => "credential_sweep_analysis_unresolved",
+            Self::Upload => "upload",
+            Self::Copy => "copy",
+            Self::SocketSend => "socket_send",
+            Self::DnsQuery => "dns_query",
+            Self::TemporaryFile => "temporary_file",
+            Self::Archive => "archive",
+            Self::Base64Encode => "base64_encode",
+            Self::HexEncode => "hex_encode",
+        }
+    }
+
+    fn is_evidence_token(value: &str) -> bool {
+        Self::ALL
+            .iter()
+            .any(|candidate| candidate.evidence_token() == value)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1178,32 +1321,41 @@ pub(crate) fn data_flow_evidence(
     sink: DataFlowSink,
     operation: DataFlowOperation,
 ) -> Evidence {
-    let source = closed_token!(source,
-        DataFlowSource::SensitiveFile => "sensitive_file",
-        DataFlowSource::SensitiveEnvironmentReference => "sensitive_environment_reference",
-        DataFlowSource::SensitiveCommandSubstitution => "sensitive_command_substitution",
-        DataFlowSource::PipedSensitiveFile => "piped_sensitive_file",
-        DataFlowSource::MultipleSensitiveFiles => "multiple_sensitive_files",
-        DataFlowSource::SensitiveAsset => "sensitive_asset",
-    );
-    let sink = closed_token!(sink,
-        DataFlowSink::Curl => "curl",
-        DataFlowSink::Wget => "wget",
-        DataFlowSink::RemoteHttp => "remote_http",
-        DataFlowSink::LocalProcess => "local_process",
-    );
-    let operation = closed_token!(operation,
-        DataFlowOperation::UploadFile => "upload_file",
-        DataFlowOperation::MultipartForm => "multipart_form",
-        DataFlowOperation::RequestBody => "request_body",
-        DataFlowOperation::PostFile => "post_file",
-        DataFlowOperation::PostData => "post_data",
-        DataFlowOperation::CredentialSweep => "credential_sweep",
-        DataFlowOperation::UploadAnalysisUnresolved => "upload_analysis_unresolved",
-        DataFlowOperation::CredentialSweepAnalysisUnresolved => "credential_sweep_analysis_unresolved",
-    );
+    let source = source.evidence_token();
+    let sink = sink.evidence_token();
+    let operation = operation.evidence_token();
     Evidence::Text {
         detail: format!("tirith:v1:data_flow;source={source};sink={sink};operation={operation}"),
+    }
+}
+
+/// Largest exact source-item count retained in one categorical flow record.
+/// The detector works on bounded command structure, so larger caller counts are
+/// capped before presentation rather than allowing attacker-sized integers to
+/// expand the grammar. The non-zero input type makes it impossible for a caller
+/// to manufacture an internally trusted correlation record without at least one
+/// proven source item.
+pub(crate) const MAX_CLASSIFIED_DATA_FLOW_EVIDENCE_COUNT: usize = 256;
+
+/// Build the privacy-safe C05 evidence contract. Every field is categorical;
+/// raw commands, hosts, domains, paths, variable names, and secret material have
+/// no representation in this record.
+pub(crate) fn classified_data_flow_evidence(
+    secret_type: DataFlowSecretType,
+    source: DataFlowSource,
+    sink: DataFlowSink,
+    operation: DataFlowOperation,
+    count: NonZeroUsize,
+) -> Evidence {
+    let secret_type = secret_type.evidence_token();
+    let source = source.evidence_token();
+    let sink = sink.evidence_token();
+    let operation = operation.evidence_token();
+    let count = count.get().min(MAX_CLASSIFIED_DATA_FLOW_EVIDENCE_COUNT);
+    Evidence::Text {
+        detail: format!(
+            "tirith:v1:classified_data_flow;type={secret_type};source={source};sink={sink};operation={operation};count={count}"
+        ),
     }
 }
 
@@ -1319,6 +1471,13 @@ fn canonical_usize_token(value: &str) -> bool {
         .is_some_and(|parsed| parsed.to_string() == value)
 }
 
+fn canonical_bounded_usize_token(value: &str, min: usize, max: usize) -> bool {
+    value
+        .parse::<usize>()
+        .ok()
+        .is_some_and(|parsed| parsed >= min && parsed <= max && parsed.to_string() == value)
+}
+
 fn canonical_index_token(value: &str) -> bool {
     value == "none" || canonical_usize_token(value)
 }
@@ -1419,27 +1578,32 @@ pub(crate) fn is_internal_categorical_evidence_record(detail: &str) -> bool {
             return false;
         };
         return tail.is_empty()
-            && matches!(
-                source,
-                "sensitive_file"
-                    | "sensitive_environment_reference"
-                    | "sensitive_command_substitution"
-                    | "piped_sensitive_file"
-                    | "multiple_sensitive_files"
-                    | "sensitive_asset"
-            )
-            && matches!(sink, "curl" | "wget" | "remote_http" | "local_process")
-            && matches!(
-                operation,
-                "upload_file"
-                    | "multipart_form"
-                    | "request_body"
-                    | "post_file"
-                    | "post_data"
-                    | "credential_sweep"
-                    | "upload_analysis_unresolved"
-                    | "credential_sweep_analysis_unresolved"
-            );
+            && DataFlowSource::is_evidence_token(source)
+            && DataFlowSink::is_evidence_token(sink)
+            && DataFlowOperation::is_evidence_token(operation);
+    }
+    if let Some(mut tail) = detail.strip_prefix("tirith:v1:classified_data_flow;") {
+        let Some(secret_type) = take_categorical_field(&mut tail, "type=", false) else {
+            return false;
+        };
+        let Some(source) = take_categorical_field(&mut tail, "source=", false) else {
+            return false;
+        };
+        let Some(sink) = take_categorical_field(&mut tail, "sink=", false) else {
+            return false;
+        };
+        let Some(operation) = take_categorical_field(&mut tail, "operation=", false) else {
+            return false;
+        };
+        let Some(count) = take_categorical_field(&mut tail, "count=", true) else {
+            return false;
+        };
+        return tail.is_empty()
+            && DataFlowSecretType::is_evidence_token(secret_type)
+            && DataFlowSource::is_evidence_token(source)
+            && DataFlowSink::is_evidence_token(sink)
+            && DataFlowOperation::is_evidence_token(operation)
+            && canonical_bounded_usize_token(count, 1, MAX_CLASSIFIED_DATA_FLOW_EVIDENCE_COUNT);
     }
     if let Some(mut tail) = detail.strip_prefix("tirith:v1:output_data_flow;") {
         let Some(source) = take_categorical_field(&mut tail, "source=", false) else {
@@ -2772,6 +2936,310 @@ mod tests {
             !projection.contains(&secret[..18]),
             "{label} retained a stable secret prefix: {projection}"
         );
+    }
+
+    #[test]
+    fn current_data_flow_wire_tokens_remain_compatible() {
+        let sources = [
+            (DataFlowSource::SensitiveFile, "sensitive_file"),
+            (
+                DataFlowSource::SensitiveEnvironmentReference,
+                "sensitive_environment_reference",
+            ),
+            (
+                DataFlowSource::SensitiveCommandSubstitution,
+                "sensitive_command_substitution",
+            ),
+            (DataFlowSource::PipedSensitiveFile, "piped_sensitive_file"),
+            (
+                DataFlowSource::MultipleSensitiveFiles,
+                "multiple_sensitive_files",
+            ),
+            (DataFlowSource::SensitiveAsset, "sensitive_asset"),
+        ];
+        let sinks = [
+            (DataFlowSink::Curl, "curl"),
+            (DataFlowSink::Wget, "wget"),
+            (DataFlowSink::RemoteHttp, "remote_http"),
+            (DataFlowSink::LocalProcess, "local_process"),
+        ];
+        let operations = [
+            (DataFlowOperation::UploadFile, "upload_file"),
+            (DataFlowOperation::MultipartForm, "multipart_form"),
+            (DataFlowOperation::RequestBody, "request_body"),
+            (DataFlowOperation::PostFile, "post_file"),
+            (DataFlowOperation::PostData, "post_data"),
+            (DataFlowOperation::CredentialSweep, "credential_sweep"),
+            (
+                DataFlowOperation::UploadAnalysisUnresolved,
+                "upload_analysis_unresolved",
+            ),
+            (
+                DataFlowOperation::CredentialSweepAnalysisUnresolved,
+                "credential_sweep_analysis_unresolved",
+            ),
+        ];
+
+        for (source, token) in sources {
+            assert_eq!(
+                serde_json::to_string(&source).unwrap(),
+                format!("\"{token}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<DataFlowSource>(&format!("\"{token}\"")).unwrap(),
+                source
+            );
+        }
+        for (sink, token) in sinks {
+            assert_eq!(
+                serde_json::to_string(&sink).unwrap(),
+                format!("\"{token}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<DataFlowSink>(&format!("\"{token}\"")).unwrap(),
+                sink
+            );
+        }
+        for (operation, token) in operations {
+            assert_eq!(
+                serde_json::to_string(&operation).unwrap(),
+                format!("\"{token}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<DataFlowOperation>(&format!("\"{token}\"")).unwrap(),
+                operation
+            );
+        }
+
+        let Evidence::Text { detail } = data_flow_evidence(
+            DataFlowSource::SensitiveFile,
+            DataFlowSink::Curl,
+            DataFlowOperation::UploadFile,
+        ) else {
+            panic!("data-flow evidence must remain text");
+        };
+        assert_eq!(
+            detail,
+            "tirith:v1:data_flow;source=sensitive_file;sink=curl;operation=upload_file"
+        );
+    }
+
+    #[test]
+    fn classified_data_flow_enum_tokens_are_closed_and_exhaustive() {
+        for secret_type in DataFlowSecretType::ALL {
+            let wire = serde_json::to_string(secret_type).unwrap();
+            assert_eq!(wire, format!("\"{}\"", secret_type.evidence_token()));
+            assert_eq!(
+                serde_json::from_str::<DataFlowSecretType>(&wire).unwrap(),
+                *secret_type
+            );
+            assert_eq!(format!("{secret_type:?}"), "WalletArtifact");
+        }
+        for source in DataFlowSource::ALL {
+            let wire = serde_json::to_string(source).unwrap();
+            assert_eq!(wire, format!("\"{}\"", source.evidence_token()));
+            assert_eq!(
+                serde_json::from_str::<DataFlowSource>(&wire).unwrap(),
+                *source
+            );
+        }
+        for sink in DataFlowSink::ALL {
+            let wire = serde_json::to_string(sink).unwrap();
+            assert_eq!(wire, format!("\"{}\"", sink.evidence_token()));
+            assert_eq!(serde_json::from_str::<DataFlowSink>(&wire).unwrap(), *sink);
+        }
+        for operation in DataFlowOperation::ALL {
+            let wire = serde_json::to_string(operation).unwrap();
+            assert_eq!(wire, format!("\"{}\"", operation.evidence_token()));
+            assert_eq!(
+                serde_json::from_str::<DataFlowOperation>(&wire).unwrap(),
+                *operation
+            );
+        }
+
+        for forged in [
+            "wallet_private_key",
+            "PRIVATE_KEY=0x1111111111111111111111111111111111111111111111111111111111111111",
+            "../wallet.dat",
+        ] {
+            let wire = format!("\"{forged}\"");
+            assert!(serde_json::from_str::<DataFlowSecretType>(&wire).is_err());
+            assert!(serde_json::from_str::<DataFlowSource>(&wire).is_err());
+            assert!(serde_json::from_str::<DataFlowSink>(&wire).is_err());
+            assert!(serde_json::from_str::<DataFlowOperation>(&wire).is_err());
+        }
+    }
+
+    #[test]
+    fn classified_data_flow_records_cover_transports_and_transformations() {
+        let sinks = [
+            DataFlowSink::Curl,
+            DataFlowSink::Wget,
+            DataFlowSink::RemoteHttp,
+            DataFlowSink::RemoteCopy,
+            DataFlowSink::RawSocket,
+            DataFlowSink::Dns,
+        ];
+        let operations = [
+            DataFlowOperation::Upload,
+            DataFlowOperation::Copy,
+            DataFlowOperation::SocketSend,
+            DataFlowOperation::DnsQuery,
+            DataFlowOperation::TemporaryFile,
+            DataFlowOperation::Archive,
+            DataFlowOperation::Base64Encode,
+            DataFlowOperation::HexEncode,
+        ];
+        let sources = [
+            DataFlowSource::SensitiveFile,
+            DataFlowSource::SensitiveEnvironmentReference,
+            DataFlowSource::SensitiveCommandSubstitution,
+            DataFlowSource::PipedSensitiveFile,
+            DataFlowSource::SensitiveAsset,
+        ];
+
+        for source in sources {
+            for sink in sinks {
+                for operation in operations {
+                    let Evidence::Text { detail } = classified_data_flow_evidence(
+                        DataFlowSecretType::WalletArtifact,
+                        source,
+                        sink,
+                        operation,
+                        NonZeroUsize::MIN,
+                    ) else {
+                        panic!("classified data-flow evidence must be text");
+                    };
+                    assert!(
+                        is_internal_categorical_evidence_record(&detail),
+                        "builder emitted a record rejected by its validator: {detail}"
+                    );
+                    assert_eq!(detail.matches(';').count(), 5, "{detail}");
+                    for prohibited in [
+                        "http://",
+                        "https://",
+                        "/home/",
+                        "evil.example",
+                        "PRIVATE_KEY=",
+                    ] {
+                        assert!(!detail.contains(prohibited), "{detail}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classified_data_flow_count_is_canonical_nonzero_and_bounded() {
+        for (input, expected) in [
+            (1, 1),
+            (
+                MAX_CLASSIFIED_DATA_FLOW_EVIDENCE_COUNT,
+                MAX_CLASSIFIED_DATA_FLOW_EVIDENCE_COUNT,
+            ),
+            (usize::MAX, MAX_CLASSIFIED_DATA_FLOW_EVIDENCE_COUNT),
+        ] {
+            let Evidence::Text { detail } = classified_data_flow_evidence(
+                DataFlowSecretType::WalletArtifact,
+                DataFlowSource::SensitiveFile,
+                DataFlowSink::RemoteHttp,
+                DataFlowOperation::Upload,
+                NonZeroUsize::new(input).unwrap(),
+            ) else {
+                panic!("classified data-flow evidence must be text");
+            };
+            assert!(detail.ends_with(&format!(";count={expected}")), "{detail}");
+            assert!(is_internal_categorical_evidence_record(&detail), "{detail}");
+            assert!(
+                serde_json::to_string(&Evidence::Text { detail })
+                    .unwrap()
+                    .len()
+                    < 256
+            );
+        }
+
+        for count in [
+            "",
+            "0",
+            "00",
+            "01",
+            "+1",
+            "-1",
+            "257",
+            "999999999999999999999999",
+        ] {
+            let record = format!(
+                "tirith:v1:classified_data_flow;type=wallet_artifact;source=sensitive_file;sink=remote_http;operation=upload;count={count}"
+            );
+            assert!(
+                !is_internal_categorical_evidence_record(&record),
+                "noncanonical/out-of-range count bypassed redaction: {record}"
+            );
+        }
+    }
+
+    #[test]
+    fn classified_data_flow_forgery_fails_closed_across_debug_and_serde() {
+        let secret = format!("0x{}", "11".repeat(32));
+        let valid = classified_data_flow_evidence(
+            DataFlowSecretType::WalletArtifact,
+            DataFlowSource::SensitiveEnvironmentReference,
+            DataFlowSink::Dns,
+            DataFlowOperation::DnsQuery,
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let Evidence::Text {
+            detail: valid_detail,
+        } = &valid
+        else {
+            panic!("classified data-flow evidence must be text");
+        };
+        assert!(is_internal_categorical_evidence_record(valid_detail));
+        assert_eq!(
+            serde_json::from_str::<Evidence>(&serde_json::to_string(&valid).unwrap())
+                .map(|restored| serde_json::to_string(&restored).unwrap())
+                .unwrap(),
+            serde_json::to_string(&valid).unwrap()
+        );
+        assert_eq!(
+            format!("{valid:?}"),
+            "Text { detail: \"tirith:v1:classified_data_flow;type=wallet_artifact;source=sensitive_environment_reference;sink=dns;operation=dns_query;count=2\" }"
+        );
+
+        let hostile_records = [
+            format!("{valid_detail};secret={secret}"),
+            format!("tirith:v1:classified_data_flow;type={secret};source=sensitive_file;sink=remote_http;operation=upload;count=1"),
+            format!("tirith:v1:classified_data_flow;type=wallet_artifact;source={secret};sink=remote_http;operation=upload;count=1"),
+            format!("tirith:v1:classified_data_flow;type=wallet_artifact;source=sensitive_file;sink={secret};operation=upload;count=1"),
+            format!("tirith:v1:classified_data_flow;type=wallet_artifact;source=sensitive_file;sink=remote_http;operation={secret};count=1"),
+            format!("tirith:v1:classified_data_flow;type=wallet_artifact;source=sensitive_file;sink=remote_http;operation=upload;count=1;secret={secret}"),
+            format!("tirith:v1:classified_data_flow;source=sensitive_file;type=wallet_artifact;sink=remote_http;operation=upload;count=1;secret={secret}"),
+        ];
+        for detail in hostile_records {
+            assert!(
+                !is_internal_categorical_evidence_record(&detail),
+                "{detail}"
+            );
+            let hostile = Evidence::Text { detail };
+            let json = serde_json::to_string(&hostile).unwrap();
+            let debug = format!("{hostile:?}");
+            assert_secret_free_projection("classified data-flow forged serde", &json, &secret);
+            assert_secret_free_projection("classified data-flow forged debug", &debug, &secret);
+
+            let raw_wire = format!(
+                r#"{{"type":"text","detail":"{}"}}"#,
+                match &hostile {
+                    Evidence::Text { detail } => detail,
+                    _ => unreachable!(),
+                }
+            );
+            let restored: Evidence = serde_json::from_str(&raw_wire).unwrap();
+            assert_secret_free_projection(
+                "classified data-flow forged deserialize",
+                &serde_json::to_string(&restored).unwrap(),
+                &secret,
+            );
+        }
     }
 
     #[test]

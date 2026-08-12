@@ -1104,6 +1104,7 @@ fn has_registry_path_candidate_for_platform(
 /// before the normal fast exit so a new registry entry cannot become unreachable.
 pub(crate) fn tier1_sensitive_asset_candidate(input: &str) -> bool {
     TIER1_ENV_ALIAS_RE.is_match(input)
+        || contains_symbolic_env_reference(input)
         || has_registry_path_candidate(input)
         || TIER1_EVM_HEX_RE.is_match(input)
         || SOLANA_ARRAY_RE.is_match(input)
@@ -3439,6 +3440,27 @@ mod tests {
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
         ));
         assert!(tier1_sensitive_asset_candidate(&solana_keypair([9u8; 32])));
+    }
+
+    #[test]
+    fn tier1_registry_gate_covers_embedded_symbolic_environment_references() {
+        for input in [
+            "$PRIVATE_KEY.collector.invalid",
+            "${MNEMONIC}.collector.invalid",
+            "%SOLANA_KEYPAIR%.collector.invalid",
+            "$env:SOLANA_KEYPAIR.collector.invalid",
+        ] {
+            assert!(tier1_sensitive_asset_candidate(input), "{input}");
+        }
+
+        for input in [
+            "$HOME.collector.invalid",
+            "${USER}.collector.invalid",
+            "%TEMP%.collector.invalid",
+            "$env:APPDATA.collector.invalid",
+        ] {
+            assert!(!tier1_sensitive_asset_candidate(input), "{input}");
+        }
     }
 
     #[test]
