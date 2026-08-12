@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786538664714,
+  "lastUpdate": 1786539719465,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -935,6 +935,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_ansi",
             "value": 73,
             "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e5490709946380aab9bce128d80a103ba838bb55",
+          "message": "Merge PR #169: bounded PDF preflight and fail-closed analysis\n\nfix(pdf): preflight nesting-depth guard for lopdf DoS (RUSTSEC-2026-0187)",
+          "timestamp": "2026-08-12T18:28:38+05:30",
+          "tree_id": "431e8e983a0e9cea7cceb6e8c5f8b8da67da4a17",
+          "url": "https://github.com/sheeki03/tirith/commit/e5490709946380aab9bce128d80a103ba838bb55"
+        },
+        "date": 1786539718683,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 427,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 131,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 39760,
+            "range": "± 197",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 248753,
+            "range": "± 1084",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 214049,
+            "range": "± 1017",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 197466,
+            "range": "± 819",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 25983,
+            "range": "± 76",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 69,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 91,
+            "range": "± 2",
             "unit": "ns/iter"
           }
         ]
