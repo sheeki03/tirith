@@ -476,3 +476,82 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["data_exfiltration", "credential_file_sweep"]
+
+# ── C10 — Web3 execution-boundary rules ───────────────────────────────────
+#
+# The shapes C05 deliberately reserved: cast/forge/hardhat/solana/anchor
+# invocations that the bounded parser resolves into on-chain writes and signer
+# exposure. Every destination is a documentation address and every key is a
+# synthetic all-`a` scalar; nothing here is a real address or a funded key.
+#
+# The policy rule is NOT exercised here. It depends on a trusted `web3_guard`
+# that a fixture cannot declare (a repo-scope policy is neutralized by design),
+# so it is covered by unit tests in `rules::web3_gate` instead.
+
+[[fixture]]
+name = "c10_web3_read_only_call_allow"
+min_milestone = 13
+input = "cast call 0x0000000000000000000000000000000000000001 'balanceOf(address)'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["web3_state_changing_command", "web3_signer_risk"]
+
+[[fixture]]
+name = "c10_web3_dry_run_send_allow"
+min_milestone = 13
+input = "cast send 0x0000000000000000000000000000000000000001 --dry-run"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["web3_state_changing_command"]
+
+[[fixture]]
+name = "c10_web3_forge_build_allow"
+min_milestone = 13
+input = "forge build"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["web3_state_changing_command", "web3_signer_risk"]
+
+[[fixture]]
+name = "c10_web3_broadcast_is_state_changing"
+min_milestone = 13
+input = "forge script Deploy.s.sol --broadcast"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["web3_state_changing_command"]
+
+[[fixture]]
+name = "c10_web3_solana_program_deploy_is_state_changing"
+min_milestone = 13
+input = "solana program deploy target/deploy/program.so"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["web3_state_changing_command"]
+
+[[fixture]]
+name = "c10_web3_anchor_deploy_is_state_changing"
+min_milestone = 13
+input = "anchor deploy"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["web3_state_changing_command"]
+
+[[fixture]]
+name = "c10_web3_raw_private_key_is_critical"
+min_milestone = 13
+input = "cast send 0x0000000000000000000000000000000000000001 --private-key 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+context = "exec"
+expected_action = "block"
+expected_rules = ["web3_signer_risk", "web3_state_changing_command"]
+
+[[fixture]]
+name = "c10_web3_hardware_wallet_is_not_a_signer_risk"
+min_milestone = 13
+input = "cast send 0x0000000000000000000000000000000000000001 --ledger"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["web3_state_changing_command"]
+forbidden_rules = ["web3_signer_risk"]

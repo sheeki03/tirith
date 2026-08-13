@@ -324,6 +324,29 @@ pub enum RuleId {
     /// on adversarial content the agent reads. Emitted by `rules::exfil`.
     OutputDataExfiltration,
 
+    // Web3 execution-boundary rules (C10). Exactly three, emitted from
+    // `rules::web3_gate` on facts the bounded parser produced. Parser and
+    // configuration gaps reuse `AnalysisIncomplete` rather than minting a
+    // fourth id, and bare private-key fragments stay out of the global hot
+    // path because the credential and exfiltration contexts already cover
+    // them.
+    /// C10 — the command changes on-chain state (a broadcast send, a contract
+    /// deployment, a program deploy). Medium by default; High when a
+    /// production operation also disables a declared safety control. The
+    /// finding describes the operation, never the destination address.
+    Web3StateChangingCommand,
+    /// C10 — how the command supplies its signer. Critical when literal raw
+    /// signer material appears in argv, High for a password/passphrase or an
+    /// unlocked production node, and lower for a symbolic reference to a
+    /// non-production signer. Evidence names the signer KIND only.
+    Web3SignerRisk,
+    /// C10 — the observed RPC, network, signer, or destination contradicts the
+    /// trusted `web3_guard` policy. High. An endpoint that simply is not
+    /// classified by any trusted network is NOT this rule: that is an
+    /// annotation or an incompleteness, because "unclassified" is not a claim
+    /// that the host is malicious.
+    Web3NetworkPolicyViolation,
+
     // Operational-context rules (M8 ch1) — fire from `rules::context` when the
     // leader is a cloud/k8s CLI (kubectl, helm, aws, gcloud, az, …) and the active
     // provider context is labeled production/critical. Detection in
@@ -1443,6 +1466,25 @@ pub(crate) enum PdfTextEvidenceJoin {
     Spaced,
 }
 
+/// The Web3 tool family, as a closed set. Spelled out rather than derived so a
+/// new tool cannot silently widen what counts as a preservable record.
+fn is_web3_tool_token(value: &str) -> bool {
+    matches!(
+        value,
+        "cast" | "forge" | "hardhat" | "solana" | "anchor" | "unknown"
+    )
+}
+
+/// A lowercase enum name: ASCII letters, digits, and underscores, bounded so a
+/// crafted value cannot ride along inside an otherwise valid record.
+fn is_lower_snake_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 48
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 fn take_categorical_field<'a>(
     input: &mut &'a str,
     field: &str,
@@ -1567,6 +1609,59 @@ pub(crate) fn pdf_text_reassembled_evidence(
 /// canonical decimal spelling. Consequently, a public `Evidence::Text` value
 /// cannot append opaque data and masquerade as an internal record to bypass DLP.
 pub(crate) fn is_internal_categorical_evidence_record(detail: &str) -> bool {
+    // C10 — Web3 boundary records. Every field is a closed vocabulary, so a
+    // validated record is preserved byte-for-byte. Without this, the shared
+    // command-text scrubber sees `tool=cast` as a shell assignment and blanks
+    // the value, which redacts the evidence into uselessness while protecting
+    // nothing: these tokens are enum names, not user input.
+    if let Some(mut tail) = detail.strip_prefix("tirith:v1:web3_operation;") {
+        let Some(tool) = take_categorical_field(&mut tail, "tool=", false) else {
+            return false;
+        };
+        let Some(operation) = take_categorical_field(&mut tail, "operation=", false) else {
+            return false;
+        };
+        let Some(write) = take_categorical_field(&mut tail, "write=", false) else {
+            return false;
+        };
+        let Some(bypass) = take_categorical_field(&mut tail, "safety_bypass=", true) else {
+            return false;
+        };
+        return tail.is_empty()
+            && is_web3_tool_token(tool)
+            && is_lower_snake_token(operation)
+            && write == "state_changing"
+            && matches!(bypass, "yes" | "no");
+    }
+    if let Some(mut tail) = detail.strip_prefix("tirith:v1:web3_signer;") {
+        let Some(tool) = take_categorical_field(&mut tail, "tool=", false) else {
+            return false;
+        };
+        let Some(kind) = take_categorical_field(&mut tail, "kind=", false) else {
+            return false;
+        };
+        let Some(role) = take_categorical_field(&mut tail, "role=", true) else {
+            return false;
+        };
+        return tail.is_empty()
+            && is_web3_tool_token(tool)
+            && is_lower_snake_token(kind)
+            && is_lower_snake_token(role);
+    }
+    if let Some(mut tail) = detail.strip_prefix("tirith:v1:web3_policy;") {
+        let Some(tool) = take_categorical_field(&mut tail, "tool=", false) else {
+            return false;
+        };
+        let Some(status) = take_categorical_field(&mut tail, "status=", true) else {
+            return false;
+        };
+        return tail.is_empty()
+            && is_web3_tool_token(tool)
+            && matches!(
+                status,
+                "denied_endpoint" | "signer_not_permitted" | "unclassified_endpoint"
+            );
+    }
     if let Some(mut tail) = detail.strip_prefix("tirith:v1:data_flow;") {
         let Some(source) = take_categorical_field(&mut tail, "source=", false) else {
             return false;

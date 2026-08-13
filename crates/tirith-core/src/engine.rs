@@ -3053,6 +3053,25 @@ fn analyze_inner_with_policy(
         );
         findings.extend(command_findings);
 
+        // C10 — Web3 execution boundary. The bounded parser from the parser
+        // slice runs here for the first time and its facts become findings.
+        // Static configuration reads are enabled only when the caller gave us a
+        // cwd, so an analysis with no working directory never touches the
+        // filesystem.
+        {
+            let mut web3_context = match ctx.cwd.as_deref() {
+                Some(cwd) => crate::rules::web3::Web3ParseContextV2::for_cwd(cwd),
+                None => crate::rules::web3::Web3ParseContextV2::without_filesystem(),
+            };
+            web3_context.trusted_rpc_path_prefixes = None;
+            let parsed = crate::rules::web3::parse_web3_commands_v2(
+                &analyzed_input,
+                ctx.shell,
+                &web3_context,
+            );
+            findings.extend(crate::rules::web3_gate::check(&parsed, &policy.web3_guard));
+        }
+
         // PowerShell-specific rules (M5 item 16). The checker follows
         // shell-tagged wrapper bodies, so a POSIX/Cmd outer command cannot hide
         // a PowerShell `-Command`/`-EncodedCommand` body.

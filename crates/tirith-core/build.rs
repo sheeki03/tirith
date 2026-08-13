@@ -660,6 +660,17 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Docker/Podman remote daemon with privilege escalation",
     },
     PatternEntry {
+        // C10 — one COARSE gate for the Web3 tool family. Tier-1 only has to
+        // decide whether the precise parser is worth running, so matching the
+        // bare tool token is correct and cheap; `rules::web3` then discards
+        // every benign `cast call` / `forge build` without emitting anything.
+        // Anchored on a word boundary so `forgets` and `castle` do not match.
+        id: "web3_cli",
+        tier1_exec_fragments: &[r"\b(?:cast|forge|hardhat|solana|anchor)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Web3 tool invocations (cast, forge, hardhat, solana, anchor); precise grammar in rules::web3 decides what is actually state-changing",
+    },
+    PatternEntry {
         id: "credential_file_sweep",
         tier1_exec_fragments: &[
             r"(?:^|[\\/])\.ssh(?:[\\/]|\b)",
@@ -1144,6 +1155,14 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("prompt_injection_obfuscated", "PromptInjectionObfuscated"),
     // C7 — output-side data-exfiltration rule.
     ("output_data_exfiltration", "OutputDataExfiltration"),
+    // C10 — Web3 execution-boundary rules. Exactly three; parser and config
+    // gaps reuse `analysis_incomplete`.
+    ("web3_state_changing_command", "Web3StateChangingCommand"),
+    ("web3_signer_risk", "Web3SignerRisk"),
+    (
+        "web3_network_policy_violation",
+        "Web3NetworkPolicyViolation",
+    ),
     // Operational-context rules (M8 ch1).
     (
         "context_prod_destructive_command",

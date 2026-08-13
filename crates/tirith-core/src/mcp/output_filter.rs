@@ -715,6 +715,9 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::CredentialFileSweep
         | RuleId::Base64DecodeExecute
         | RuleId::DataExfiltration
+        | RuleId::Web3StateChangingCommand
+        | RuleId::Web3SignerRisk
+        | RuleId::Web3NetworkPolicyViolation
         | RuleId::ReverseShell
         | RuleId::InterpreterSuspiciousInlineExec
         | RuleId::WrapperChainTooDeep

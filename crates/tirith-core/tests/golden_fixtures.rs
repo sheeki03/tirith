@@ -1014,6 +1014,10 @@ const ALL_RULE_IDS: &[&str] = &[
     "prompt_injection_obfuscated",
     // Output-side data-exfiltration rule (C7)
     "output_data_exfiltration",
+    // C10 — Web3 execution-boundary rules.
+    "web3_state_changing_command",
+    "web3_signer_risk",
+    "web3_network_policy_violation",
     // Output-side bounded-analysis gap (R2)
     "output_analysis_overflow",
     // Operational-context rules (M8 ch1)
@@ -1171,9 +1175,15 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "command_network_deny",
     "license_required",
     "custom_rule_match", // requires custom_rules in policy (Team-only)
-    "server_cloaking",   // requires network fetch (Unix-only)
-    "clipboard_hidden",  // requires --html clipboard input
-    "pdf_hidden_text",   // requires .pdf file input
+    // C10 — requires a trusted `web3_guard` declaring networks, denied
+    // endpoints, or allowed signers. A fixture cannot supply one: a
+    // repository-scope policy has its grants neutralized by design, which is
+    // the whole point of C07. Covered by unit tests in `rules::web3_gate`,
+    // including the boundary that an UNCLASSIFIED endpoint is not a violation.
+    "web3_network_policy_violation",
+    "server_cloaking",  // requires network fetch (Unix-only)
+    "clipboard_hidden", // requires --html clipboard input
+    "pdf_hidden_text",  // requires .pdf file input
     // requires >4096 scanner hits in one output stream (unit-tested in
     // rules/output.rs and extract.rs)
     "output_analysis_overflow",
@@ -1646,6 +1656,8 @@ rule_id_variant_registry! {
     OutputDataExfiltration,
     // Output-side bounded-analysis gap (R2)
     OutputAnalysisOverflow,
+    // Web3 execution-boundary rules (C10)
+    Web3StateChangingCommand, Web3SignerRisk, Web3NetworkPolicyViolation,
     // Operational-context rules (M8 ch1)
     ContextProdDestructiveCommand, ContextProdWriteOperation, ContextProdCredentialChange,
     // SSH operational-context rules (M8 ch2)
