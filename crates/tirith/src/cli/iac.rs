@@ -183,18 +183,32 @@ pub fn check_plan(plan_path: &Path, forced_tool: Option<&str>, json: bool) -> i3
         }
         _ => {}
     }
-    let bytes = match std::fs::read(plan_path) {
+    // repo-0221: a pre-read metadata length check does not stop a FIFO from
+    // blocking forever or /dev/zero from allocating without bound. Read
+    // no-follow, regular-file-only, and capped THROUGH the read.
+    let bytes = match tirith_core::util::read_text_no_follow_capped(
+        plan_path,
+        iac_plan::MAX_PLAN_SIZE_BYTES,
+    ) {
         Ok(b) => b,
+        Err(tirith_core::util::OpenRegularError::TooLarge) => {
+            eprintln!(
+                "tirith iac check-plan: {} exceeds the {} byte cap ({} MiB). Refusing to parse.",
+                plan_path.display(),
+                iac_plan::MAX_PLAN_SIZE_BYTES,
+                iac_plan::MAX_PLAN_SIZE_BYTES / (1024 * 1024),
+            );
+            return 1;
+        }
         Err(e) => {
             eprintln!(
-                "tirith iac check-plan: cannot read {}: {e}",
+                "tirith iac check-plan: cannot read {} safely: {e:?}",
                 plan_path.display()
             );
             return 1;
         }
     };
     if bytes.len() as u64 > iac_plan::MAX_PLAN_SIZE_BYTES {
-        // metadata() may have lied (symlink, /dev/zero, fifo) — re-check post-read.
         eprintln!(
             "tirith iac check-plan: read {} bytes from {}; cap is {} bytes ({} MiB). Refusing to parse.",
             bytes.len(),

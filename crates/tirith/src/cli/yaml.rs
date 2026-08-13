@@ -63,10 +63,45 @@ fn escape_risky_unicode(s: &str) -> String {
 /// and a name with `:` / `#` / a newline / an ANSI escape would otherwise split
 /// the key, comment out the value, break the document, or reach the terminal on
 /// `cat`. The quoted/escaped form is unambiguous.
+/// repo-0234: `true` when a bare emission would be parsed by YAML as
+/// null/bool/number instead of the string it is.
+fn yaml_implicit_nonstring(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "null"
+            | "~"
+            | "true"
+            | "false"
+            | "yes"
+            | "no"
+            | "on"
+            | "off"
+            | ".nan"
+            | ".inf"
+            | "-.inf"
+            | "+.inf"
+    ) {
+        return true;
+    }
+    // Integer / float spellings.
+    if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+        return true;
+    }
+    false
+}
+
 pub(crate) fn safe_scalar(s: &str) -> String {
     // Empty must be quoted — bare empty is invalid YAML.
     if s.is_empty() {
         return "\"\"".to_string();
+    }
+    // repo-0234: a bare scalar that YAML would parse as null/bool/number does
+    // NOT round-trip as a string — quote those spellings.
+    if yaml_implicit_nonstring(s) {
+        return serde_json::to_string(s)
+            .map(|json| escape_risky_unicode(&json))
+            .unwrap_or_else(|_| format!("\"{}\"", s.escape_debug()));
     }
     // Bare-safe iff every byte is printable ASCII non-special. Control bytes are
     // checked separately so a future indicator change can't drop the guards.

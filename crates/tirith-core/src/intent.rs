@@ -118,6 +118,11 @@ impl CommandSignal {
             | RuleId::HelmUntrustedRepo
             | RuleId::RepoAddFromPipe => Some(CommandSignal::PackageInstall),
 
+            // repo-0457: DotfileOverwrite covers `>> ~/.bashrc`-style shell-rc
+            // writes; without this mapping the Configure/Deploy justification
+            // logic never sees the signal and no mismatch is possible.
+            RuleId::DotfileOverwrite => Some(CommandSignal::ShellRcWrite),
+
             _ => None,
         }
     }

@@ -346,6 +346,11 @@ pub struct DaemonResponse {
     /// this is populated from the verdict.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub manifest_allowed_match: Option<String>,
+    /// PID of the daemon process that produced this response. New clients use
+    /// it to bind a live socket response to the PID they are about to signal;
+    /// absent for legacy daemons.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub daemon_pid: Option<u32>,
 }
 
 /// Connect to the daemon and run a check; `None` if unavailable (caller falls
@@ -433,6 +438,7 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         raw_findings: None,
         raw_action: None,
         manifest_allowed_match: None,
+        daemon_pid: Some(std::process::id()),
     };
 
     if req.command == "ping" {
@@ -484,6 +490,7 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
                 raw_findings: None,
                 raw_action: None,
                 manifest_allowed_match: None,
+                daemon_pid: Some(std::process::id()),
             };
         }
     }
@@ -550,6 +557,7 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         raw_findings,
         raw_action: raw_action_str,
         manifest_allowed_match,
+        daemon_pid: Some(std::process::id()),
     }
 }
 
@@ -820,6 +828,7 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                                 urls_extracted_count: None, tier_reached: 0,
                                                 raw_findings: None, raw_action: None,
                                                 manifest_allowed_match: None,
+                                                daemon_pid: Some(std::process::id()),
                                             })
                                     }
                                     Err(e) => DaemonResponse {
@@ -830,6 +839,7 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                         urls_extracted_count: None, tier_reached: 0,
                                         raw_findings: None, raw_action: None,
                                         manifest_allowed_match: None,
+                                        daemon_pid: Some(std::process::id()),
                                     },
                                 };
 
@@ -907,6 +917,50 @@ fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+/// repo-0216: confirm a PID belongs to OUR daemon before signaling it — a
+/// recycled PID must never receive our SIGTERM. A socket connection alone is
+/// insufficient: a different live daemon could answer while a stale PID file
+/// names an unrelated process. Require an actual ping response whose daemon PID
+/// exactly matches the file.
+#[cfg(unix)]
+fn daemon_identity_confirmed(pid: u32, sock: &std::path::Path) -> bool {
+    matches!(daemon_ping(sock), Some(response) if response.exit_code == 0 && response.error.is_none() && response.daemon_pid == Some(pid))
+}
+
+#[cfg(unix)]
+fn daemon_ping(sock: &std::path::Path) -> Option<DaemonResponse> {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let stream = UnixStream::connect(sock).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .ok()?;
+    let request = DaemonRequest {
+        command: "ping".to_string(),
+        input: String::new(),
+        context: "exec".to_string(),
+        cwd: None,
+        shell: None,
+        interactive: false,
+        bypass_requested: false,
+        offline: false,
+    };
+    let mut payload = serde_json::to_string(&request).ok()?;
+    payload.push('\n');
+    let mut writer = stream.try_clone().ok()?;
+    writer.write_all(payload.as_bytes()).ok()?;
+    writer.flush().ok()?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .take(4096)
+        .read_line(&mut line)
+        .ok()?;
+    serde_json::from_str(line.trim()).ok()
+}
+
 #[cfg(not(unix))]
 fn process_alive(_pid: u32) -> bool {
     // Conservatively assume alive (Windows should use OpenProcess).
@@ -916,6 +970,28 @@ fn process_alive(_pid: u32) -> bool {
 #[cfg(unix)]
 fn kill_process(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(pid: u32, attempts: u32, delay: std::time::Duration) -> bool {
+    for attempt in 0..attempts {
+        if !process_alive(pid) {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn remove_stopped_daemon_file(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -1139,12 +1215,44 @@ pub fn stop() -> i32 {
         return 0;
     }
 
+    // repo-0216: a stale PID file can name a RECYCLED pid belonging to an
+    // unrelated process. Only signal it when the daemon socket actually
+    // answers (or, on Linux, /proc confirms the binary), never on a bare
+    // kill(pid, 0).
+    if !daemon_identity_confirmed(pid_num, &sock) {
+        eprintln!(
+            "tirith: PID {pid_num} is not the tirith daemon (socket not answering / identity mismatch); refusing to signal it. Remove {} manually if the daemon is truly gone.",
+            pid.display()
+        );
+        return 1;
+    }
+
     if kill_process(pid_num) {
         eprintln!("tirith: sent SIGTERM to daemon (PID {pid_num})");
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let _ = std::fs::remove_file(&pid);
-        let _ = std::fs::remove_file(&sock);
-        0
+        if !wait_for_process_exit(pid_num, 100, std::time::Duration::from_millis(50)) {
+            eprintln!(
+                "tirith: daemon (PID {pid_num}) did not stop within 5s; preserving {} and {} for a safe retry",
+                pid.display(),
+                sock.display()
+            );
+            return 1;
+        }
+
+        let mut cleanup_failed = false;
+        for path in [&pid, &sock] {
+            if let Err(error) = remove_stopped_daemon_file(path) {
+                eprintln!(
+                    "tirith: daemon stopped, but failed to remove {}: {error}",
+                    path.display()
+                );
+                cleanup_failed = true;
+            }
+        }
+        if cleanup_failed {
+            1
+        } else {
+            0
+        }
     } else {
         eprintln!("tirith: failed to stop daemon (PID {pid_num})");
         1
@@ -1194,53 +1302,26 @@ pub fn status() -> i32 {
     }
 
     let start = Instant::now();
-    let ping_req = DaemonRequest {
-        command: "ping".to_string(),
-        input: String::new(),
-        context: "exec".to_string(),
-        cwd: None,
-        shell: None,
-        interactive: false,
-        bypass_requested: false,
-        offline: false,
-    };
-
-    let ok = (|| -> Option<()> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixStream;
-        use std::time::Duration;
-
-        let stream = UnixStream::connect(&sock).ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(1)))
-            .ok()?;
-
-        let mut payload = serde_json::to_string(&ping_req).ok()?;
-        payload.push('\n');
-
-        let mut sw = stream.try_clone().ok()?;
-        sw.write_all(payload.as_bytes()).ok()?;
-        sw.flush().ok()?;
-
-        let reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.take(4096).read_line(&mut line).ok()?;
-
-        serde_json::from_str::<DaemonResponse>(line.trim()).ok()?;
-        Some(())
-    })();
+    let response = daemon_ping(&sock);
 
     let latency = start.elapsed();
 
-    if ok.is_some() {
+    if matches!(
+        response,
+        Some(ref response)
+            if response.exit_code == 0
+                && response.error.is_none()
+                && response.daemon_pid == Some(pid_num)
+    ) {
         eprintln!(
             "tirith: daemon running (PID {pid_num}), latency {:.1}ms",
             latency.as_secs_f64() * 1000.0
         );
         0
     } else {
-        eprintln!("tirith: daemon running (PID {pid_num}) but not responding on socket");
+        eprintln!(
+            "tirith: daemon PID/socket identity mismatch or daemon not responding (PID {pid_num})"
+        );
         1
     }
 }
@@ -1340,7 +1421,55 @@ mod tests {
             raw_findings: None,
             raw_action: None,
             manifest_allowed_match: None,
+            daemon_pid: Some(std::process::id()),
         }
+    }
+
+    #[cfg(unix)]
+    fn serve_one_ping(
+        sock: &std::path::Path,
+        daemon_pid: Option<u32>,
+    ) -> std::thread::JoinHandle<()> {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let listener = UnixListener::bind(sock).expect("bind fake daemon socket");
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept ping");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone stream"))
+                .read_line(&mut line)
+                .expect("read ping");
+            let request: super::DaemonRequest =
+                serde_json::from_str(line.trim()).expect("valid ping request");
+            assert_eq!(request.command, "ping");
+            let response = DaemonResponse {
+                daemon_pid,
+                ..base_response()
+            };
+            let mut writer = stream;
+            writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_identity_requires_the_exact_pid_from_the_socket_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let matching = dir.path().join("matching.sock");
+        let matching_thread = serve_one_ping(&matching, Some(4242));
+        assert!(super::daemon_identity_confirmed(4242, &matching));
+        matching_thread.join().unwrap();
+
+        let mismatching = dir.path().join("mismatching.sock");
+        let mismatching_thread = serve_one_ping(&mismatching, Some(9898));
+        assert!(!super::daemon_identity_confirmed(4242, &mismatching));
+        mismatching_thread.join().unwrap();
+
+        let legacy = dir.path().join("legacy.sock");
+        let legacy_thread = serve_one_ping(&legacy, None);
+        assert!(!super::daemon_identity_confirmed(4242, &legacy));
+        legacy_thread.join().unwrap();
     }
 
     /// CodeRabbit R3 #4: the matched `allowed[]` entry must survive the

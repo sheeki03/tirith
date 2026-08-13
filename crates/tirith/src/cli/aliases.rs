@@ -70,6 +70,14 @@ fn print_human_scan(scan: &AliasScan, include_runtime: bool) {
             "  (static parse + runtime no-rc introspection; runtime spawns shells with \
              --norc / -f / --no-config so your rc files are NOT sourced.)"
         );
+        // repo-0454: truthfulness — no-rc enumeration sees only built-in or
+        // non-interactive definitions; aliases/functions defined only in the
+        // LIVE parent shell are invisible to a child. Say so instead of
+        // implying full runtime coverage.
+        eprintln!(
+            "  note: runtime introspection cannot see aliases/functions defined only in an \
+             already-running interactive shell; a clean result does not prove their absence."
+        );
         if !scan.runtime_skipped.is_empty() {
             eprintln!(
                 "  runtime-skipped shells (unsupported / not installed): {}",

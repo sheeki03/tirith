@@ -126,25 +126,11 @@ pub fn activate(key: &str) -> i32 {
     }
 
     {
-        use std::io::Write;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        match opts.open(&path) {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(key.trim().as_bytes()) {
-                    eprintln!("tirith: cannot write license key: {e}");
-                    return 1;
-                }
-            }
-            Err(e) => {
-                eprintln!("tirith: cannot write license key: {e}");
-                return 1;
-            }
+        // repo-0222: atomic publish — a crash or full disk mid-write must not
+        // destroy the previously valid license key.
+        if let Err(e) = tirith_core::util::write_file_atomic_0600(&path, key.trim().as_bytes()) {
+            eprintln!("tirith: cannot write license key: {e}");
+            return 1;
         }
     }
 
@@ -237,25 +223,13 @@ pub fn refresh() -> i32 {
                 }
 
                 {
-                    use std::io::Write;
-                    let mut opts = std::fs::OpenOptions::new();
-                    opts.write(true).create(true).truncate(true);
-                    #[cfg(unix)]
+                    // repo-0222: atomic publish — a crash mid-write must not
+                    // destroy the previously valid license key.
+                    if let Err(e) =
+                        tirith_core::util::write_file_atomic_0600(&path, token.trim().as_bytes())
                     {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        opts.mode(0o600);
-                    }
-                    match opts.open(&path) {
-                        Ok(mut f) => {
-                            if let Err(e) = f.write_all(token.trim().as_bytes()) {
-                                eprintln!("tirith: cannot write license key: {e}");
-                                return 1;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("tirith: cannot write license key: {e}");
-                            return 1;
-                        }
+                        eprintln!("tirith: cannot write license key: {e}");
+                        return 1;
                     }
                 }
 

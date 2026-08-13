@@ -182,6 +182,19 @@ pub fn redact_url_userinfo(url: &str) -> String {
     // RFC 3986 splits userinfo at the LAST `@` (a conformant producer
     // percent-encodes any `@` inside the password).
     let Some(at) = authority.rfind('@') else {
+        // Fail closed. A non-conformant userinfo can carry a raw `/`, `?`, or
+        // `#` (`https://deploy:ab/cd@host/repo.git`), which ends the authority
+        // scan above early and hides the `@` — the URL would then be returned
+        // verbatim, credentials and all. The URL parser rejects exactly those
+        // strings, so a parse failure plus a remaining `@` means we cannot
+        // prove the value is credential-free. A URL the parser ACCEPTS has no
+        // userinfo (the scan would have found it), so an `@` in its path or
+        // query is left alone.
+        if ::url::Url::parse(url).is_err() {
+            if let Some(rel) = after_scheme.rfind('@') {
+                return format!("{}://***@{}", &url[..scheme_end], &after_scheme[rel + 1..]);
+            }
+        }
         return url.to_string();
     };
     format!(
@@ -1935,6 +1948,39 @@ mod tests {
             recorded.anchor_warning.is_some(),
             "a failed (non-skipped) anchor must surface an anchor_warning so the caller does not \
              over-claim tamper-evidence"
+        );
+    }
+
+    #[test]
+    fn url_redaction_fails_closed_on_a_non_conformant_userinfo() {
+        // A raw `/`, `?`, or `#` inside the password ends the authority scan
+        // early, so the `@` is never found and the URL used to be returned
+        // verbatim with the credentials intact.
+        for raw in [
+            "https://deploy:ab/cd@github.com/org/repo.git",
+            "https://deploy:ab?cd@github.com/org/repo.git",
+            "https://deploy:ab#cd@github.com/org/repo.git",
+        ] {
+            let redacted = redact_url_userinfo(raw);
+            assert!(
+                !redacted.contains("deploy"),
+                "credentials survived redaction: {redacted}"
+            );
+            assert!(
+                redacted.contains("***@"),
+                "expected a redaction marker: {redacted}"
+            );
+        }
+
+        // The conformant form is unchanged, and a URL the parser accepts keeps
+        // an `@` that belongs to its path or query.
+        assert_eq!(
+            redact_url_userinfo("https://user:tok@example.com/x"),
+            "https://***@example.com/x"
+        );
+        assert_eq!(
+            redact_url_userinfo("https://example.com/a@b"),
+            "https://example.com/a@b"
         );
     }
 }

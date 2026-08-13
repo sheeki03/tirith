@@ -97,7 +97,9 @@ impl InstallMethod {
 /// Detect the install method from the canonicalized path of the running binary.
 /// The caller passes the already-resolved absolute path (symlink/npm-wrapper
 /// resolution is `cli::resolve_effective_tirith_target`'s job), so this is a pure,
-/// unit-testable path-shape classifier.
+/// path-shape classifier — EXCEPT for the `~/.local/bin` ambiguity, where it
+/// probes for Cargo's install metadata (`.crates.toml`) to distinguish
+/// `cargo install --root ~/.local` from a hand-dropped binary (repo-0470).
 pub fn detect_install_method(canonical_path: &Path) -> InstallMethod {
     // Whole-segment checks over the FULL resolved path (each package manager has
     // a recognizable layout). Split on BOTH `/` and `\` regardless of host OS, so
@@ -147,8 +149,15 @@ pub fn detect_install_method(canonical_path: &Path) -> InstallMethod {
     }
 
     // `~/.local/bin` is the install.sh default (user-writable, hand-dropped
-    // binaries too) → self-managed.
+    // binaries too) → self-managed — UNLESS Cargo's install metadata sits in
+    // the same root: `cargo install --root ~/.local tirith` is Cargo-managed
+    // and self-update must not desynchronize Cargo's record (repo-0470).
     if path_lower.contains("/.local/bin/") {
+        if let Some(root) = canonical_path.parent().and_then(Path::parent) {
+            if root.join(".crates.toml").is_file() || root.join(".crates2.json").is_file() {
+                return InstallMethod::Cargo;
+            }
+        }
         return InstallMethod::SelfManaged;
     }
 

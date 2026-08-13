@@ -12,6 +12,11 @@ use crate::state::AppState;
 #[derive(Deserialize)]
 pub struct LookupQuery {
     pub checkout: String,
+    /// `1` when the not-ready page polls via fetch (repo-0235): returns JSON
+    /// instead of a redirect so the one-time receipt is not consumed by the
+    /// poller.
+    #[serde(default)]
+    pub poll: Option<String>,
 }
 
 pub async fn receipt_lookup(
@@ -23,6 +28,29 @@ pub async fn receipt_lookup(
     }
 
     let secret = state.db.receipt_lookup(&query.checkout).await?;
+
+    // repo-0235: the not-ready poller must NOT follow the redirect — fetch()
+    // auto-follows into /receipt/{secret}, consuming the one-time row, and the
+    // discarded body leaves the customer at a perpetual "not ready". Polling
+    // with `poll=1` returns the URL as JSON; the script navigates top-level.
+    if query.poll.as_deref() == Some("1") {
+        let body = match &secret {
+            Some(s) => format!(
+                "{{\"status\":\"ready\",\"url\":\"/receipt/{}\"}}",
+                html_escape(s)
+            ),
+            None => "{\"status\":\"pending\"}".to_string(),
+        };
+        return Ok((
+            StatusCode::OK,
+            [
+                ("content-type", "application/json"),
+                ("cache-control", "no-store"),
+            ],
+            body,
+        )
+            .into_response());
+    }
 
     match secret {
         Some(s) => {
@@ -50,10 +78,12 @@ pub async fn receipt_view(
     State(state): State<AppState>,
     Path(receipt_secret): Path<String>,
 ) -> Result<Response, AppError> {
-    // Atomic consume — exactly one request gets the row.
+    // repo-0237: peek first and decrypt/validate BEFORE the destructive
+    // consume — a key-rotation mismatch or corrupt row must not delete the
+    // only recoverable copy of the customer's API key.
     let row = state
         .db
-        .receipt_consume(&receipt_secret)
+        .receipt_peek(&receipt_secret)
         .await?
         .ok_or_else(|| AppError::NotFound("Receipt expired or already viewed".into()))?;
 
@@ -88,6 +118,19 @@ pub async fn receipt_view(
         error!(sub_id = %row.subscription_id, "decrypted API key is not UTF-8");
         AppError::Internal("License delivery error. Contact support@tirith.dev".into())
     })?;
+
+    // Everything validated — NOW consume atomically. If another request won
+    // the race, the row is gone and we report it as already viewed.
+    let consumed = state
+        .db
+        .receipt_consume(&receipt_secret)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Receipt expired or already viewed".into()))?;
+    if consumed.subscription_id != row.subscription_id {
+        return Err(AppError::NotFound(
+            "Receipt expired or already viewed".into(),
+        ));
+    }
 
     let server_url = state
         .config
@@ -141,9 +184,17 @@ fn receipt_not_ready_page(checkout_id: &str) -> String {
       return;
     }}
     try {{
-      const r = await fetch(location.href);
-      if (r.ok && !(await r.text()).includes('Processing Your License')) {{
-        location.reload();
+      // Poll the JSON endpoint: following the redirect with fetch() would
+      // CONSUME the one-time receipt before the page navigates (repo-0235).
+      const u = new URL(location.href);
+      u.searchParams.set('poll', '1');
+      const r = await fetch(u, {{ redirect: 'manual' }});
+      if (r.ok) {{
+        const body = await r.json();
+        if (body.status === 'ready' && body.url) {{
+          clearInterval(poll);
+          location.href = body.url;
+        }}
       }}
     }} catch(_) {{}}
   }}, 2000);

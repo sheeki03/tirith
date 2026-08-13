@@ -2243,7 +2243,8 @@ pub fn run_gateway_with_options(
     // silently dropped: a seed that passes `policy validate` but fails the real
     // compile would otherwise vanish.
     let filter_ctx: Arc<output_filter::OutputFilterContext> = Arc::new(if filter_output {
-        let (ctx, bad) = output_filter::OutputFilterContext::from_policy(&core_policy);
+        let (ctx, bad) =
+            output_filter::OutputFilterContext::from_policy_with_diagnostics(&core_policy);
         for (pattern, error) in &bad {
             eprintln!(
                 "tirith gateway: warning: invalid injection_seeds_custom regex {pattern:?}: {error}"

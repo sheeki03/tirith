@@ -174,8 +174,15 @@ pub fn run(
         } else {
             None
         };
+        // repo-0489: a missing/truncated JSON document must not pair with a
+        // success exit code — an Allow verdict still reports failure.
         if write_paste_json(&verdict, &policy.dlp_custom_patterns, source_attribution).is_err() {
             eprintln!("tirith: failed to write JSON output");
+            return if verdict.action.exit_code() == 0 {
+                1
+            } else {
+                verdict.action.exit_code()
+            };
         }
     } else {
         if output::write_human_auto(&verdict, false).is_err() {

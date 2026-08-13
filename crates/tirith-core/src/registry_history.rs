@@ -65,6 +65,32 @@ fn write_row(eco: Ecosystem, name: &str, row: &SnapshotRow) -> bool {
     if std::fs::create_dir_all(parent).is_err() {
         return false;
     }
+    // repo-0462: serialize the read-modify-write across processes and publish
+    // atomically — two concurrent writers must not lose each other's snapshot,
+    // and a crash must not leave torn JSONL (read_rows skips malformed lines,
+    // which would erase takeover evidence).
+    let lock_path = parent.join(format!(
+        "{}.lock",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    // The lock file carries no content; keep whatever is already there rather
+    // than truncating a lock another process is holding.
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path);
+    let lock_file = match lock_file {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    {
+        use fs2::FileExt as _;
+        if lock_file.lock_exclusive().is_err() {
+            return false;
+        }
+    }
     let mut rows = read_rows(&path);
     rows.push(row.clone());
     if rows.len() > MAX_SNAPSHOTS_PER_PACKAGE {
@@ -78,7 +104,9 @@ fn write_row(eco: Ecosystem, name: &str, row: &SnapshotRow) -> bool {
             buf.push('\n');
         }
     }
-    std::fs::write(path, buf).is_ok()
+    let result = crate::util::write_file_atomic_0600(&path, buf.as_bytes()).is_ok();
+    let _ = fs2::FileExt::unlock(&lock_file);
+    result
 }
 
 /// Read all rows from `path` oldest-first. Empty on missing file or parse

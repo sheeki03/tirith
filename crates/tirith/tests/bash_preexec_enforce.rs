@@ -728,14 +728,29 @@ fn seed_capability_cache(state_dir: &Path, verdict: &str) {
     let (bash_version, bash_path) = spawned_bash_identity();
     let cache_dir = state_dir.join("tirith");
     fs::create_dir_all(&cache_dir).unwrap();
-    // Schema 1 mirrors cli::bash_capability::CACHE_SCHEMA. Blank tirith_version:
-    // the hook only enforces a version match when a sibling `.hooks-version`
+    // Schema 2 mirrors cli::bash_capability::CACHE_SCHEMA and binds the bash
+    // binary's mtime+size fingerprint (repo-0211). Blank tirith_version: the
+    // hook only enforces a version match when a sibling `.hooks-version`
     // exists, which the assets/ hook lacks.
+    let fingerprint = bash_fingerprint(&bash_path);
     let body = format!(
-        "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
-         bash_path={bash_path}\nenter_capability={verdict}\nreason=seeded by test\n"
+        "schema=2\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+         bash_path={bash_path}\nbash_fingerprint={fingerprint}\n\
+         enter_capability={verdict}\nreason=seeded by test\n"
     );
     fs::write(cache_dir.join("bash-enter-capability"), body).unwrap();
+}
+
+/// mtime-secs:size fingerprint, matching cli::bash_capability (repo-0211).
+fn bash_fingerprint(bash_path: &str) -> String {
+    let meta = std::fs::metadata(bash_path).expect("stat bash");
+    let secs = meta
+        .modified()
+        .expect("mtime")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    format!("{secs}:{}", meta.len())
 }
 
 /// Run the hook in a fresh interactive bash with `XDG_STATE_HOME` at a temp dir,
@@ -979,7 +994,7 @@ fn capability_stale_cache_falls_back_and_installs_debug_trap() {
     fs::write(
         cache_dir.join("bash-enter-capability"),
         format!(
-            "schema=1\ntirith_version=\nshell=bash\nbash_version=0.0.0-stale\n\
+            "schema=2\ntirith_version=\nshell=bash\nbash_version=0.0.0-stale\n\
              bash_path={bash_path}\nenter_capability=works\nreason=stale\n"
         ),
     )

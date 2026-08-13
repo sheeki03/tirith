@@ -42,7 +42,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use tirith_core::artifact::inspect::inspect_artifact_set;
+use tirith_core::artifact::inspect::{inspect_artifact_set, ArtifactSetInspection};
 use tirith_core::artifact::install::discover_installed_distributions;
 use tirith_core::artifact::record::{index_distribution_ownership, OwnershipIndex};
 use tirith_core::artifact::release_diff::{diff_artifact_files, ReleaseDiff, ReleaseDiffError};
@@ -89,6 +89,8 @@ pub enum GraphTarget {
 /// code: `0` on success (a graph was rendered), `2` on a usage error (no wheels and
 /// no `--installed`).
 pub fn run(target: GraphTarget, format: GraphFormat) -> i32 {
+    // repo-0229: an inspection with coverage gaps (unreadable / oversized /
+    // unsupported inputs) must not render as a clean graph with exit 0.
     let graph = match &target {
         GraphTarget::Wheels(paths) => {
             if paths.is_empty() {
@@ -98,7 +100,21 @@ pub fn run(target: GraphTarget, format: GraphFormat) -> i32 {
                 );
                 return 2;
             }
-            build_wheel_graph(paths)
+            let set = inspect_artifact_set(paths);
+            let gap_count = set.gaps.len()
+                + set
+                    .members
+                    .iter()
+                    .map(|m| m.inspected.inspection.coverage.gaps.len())
+                    .sum::<usize>();
+            if gap_count > 0 {
+                eprintln!(
+                    "tirith pkg graph: {gap_count} coverage gap(s) — the graph is incomplete (inspect with `tirith pkg check` for details)"
+                );
+                render(&build_wheel_graph_from_set(&set), format);
+                return 1;
+            }
+            build_wheel_graph_from_set(&set)
         }
         GraphTarget::InstalledEnv(env) => build_installed_graph(env),
     };
@@ -246,8 +262,9 @@ fn render_diff_human_to<W: Write>(
 /// Build the graph for a set of wheel files: inspect the set (B8), fold each
 /// member's inspection in, build the cross-wheel ownership index from the inspected
 /// member files, and add the repo MCP surface.
-fn build_wheel_graph(paths: &[PathBuf]) -> ProvenanceGraph {
-    let set = inspect_artifact_set(paths);
+/// Build the graph from an already-run set inspection (repo-0229 lets the
+/// caller check coverage gaps first).
+fn build_wheel_graph_from_set(set: &ArtifactSetInspection) -> ProvenanceGraph {
     let inspections: Vec<&ArtifactInspection> = set
         .members
         .iter()

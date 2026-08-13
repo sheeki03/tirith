@@ -64,9 +64,14 @@ pub struct OutputFilterContext {
 }
 
 impl OutputFilterContext {
-    /// Build a context from a discovered [`crate::policy::Policy`]: compile the
-    /// operator's `injection_seeds_custom` and read `mcp_redact_injection`. Returns
-    /// the context PLUS the bad-seed list `(pattern, error)` so the long-lived
+    /// Build a context from a discovered [`crate::policy::Policy`]. This keeps
+    /// the historical public return type; long-lived server seams that need
+    /// compile diagnostics use [`Self::from_policy_with_diagnostics`].
+    pub fn from_policy(policy: &crate::policy::Policy) -> Self {
+        Self::from_policy_with_diagnostics(policy).0
+    }
+
+    /// Build a context and return the bad-seed list `(pattern, error)` so the long-lived
     /// server/gateway seams can surface each bad pattern ONCE at init instead of
     /// silently dropping it (a seed that passes `policy validate` but somehow fails
     /// the real compile would otherwise disappear with no signal). This is init,
@@ -75,7 +80,9 @@ impl OutputFilterContext {
     /// The caller is expected to have discovered the policy OFFLINE
     /// ([`crate::policy::Policy::discover_local_only`]), which neutralizes a
     /// repo-scoped `mcp_redact_injection` so a repo cannot weaken a Block.
-    pub fn from_policy(policy: &crate::policy::Policy) -> (Self, Vec<(String, regex::Error)>) {
+    pub fn from_policy_with_diagnostics(
+        policy: &crate::policy::Policy,
+    ) -> (Self, Vec<(String, regex::Error)>) {
         let (custom_seeds, bad) = prompt_injection::compile_seeds(&policy.injection_seeds_custom);
         (
             Self {
@@ -985,39 +992,17 @@ impl TerminalSanitizer {
 /// chars from `chunk` into `out`. This one-shot byte API remains for existing
 /// callers; multi-leaf MCP paths use [`TerminalSanitizer`] directly.
 pub fn sanitize_text_into(chunk: &[u8], out: &mut Vec<u8>) {
-    // Sanitize each valid UTF-8 run and pass invalid bytes through unchanged.
-    // `from_utf8_lossy` would rewrite them as U+FFFD, which silently destroys
-    // byte fidelity for a caller handing this arbitrary output bytes — and the
-    // sanitizer has nothing to say about a byte that is not a character.
+    // Lossy decode is deliberate and is the SAFE direction here: this is a
+    // display sanitizer, and a byte that is not valid UTF-8 can still be a
+    // terminal control in the terminal's own 8-bit encoding — a bare 0x9B is
+    // the C1 CSI introducer. Passing invalid bytes through verbatim to preserve
+    // byte fidelity would forward exactly the sequences this module exists to
+    // neutralize, so undecodable input becomes U+FFFD instead.
+    let decoded = String::from_utf8_lossy(chunk);
     let mut sanitizer = TerminalSanitizer::default();
-    let mut rest = chunk;
-    loop {
-        match std::str::from_utf8(rest) {
-            Ok(text) => {
-                out.extend_from_slice(sanitizer.sanitize_chunk(text).as_bytes());
-                break;
-            }
-            Err(error) => {
-                let (valid, after) = rest.split_at(error.valid_up_to());
-                // SAFETY-adjacent: `valid_up_to` is exactly the valid prefix.
-                let text = std::str::from_utf8(valid).unwrap_or_default();
-                out.extend_from_slice(sanitizer.sanitize_chunk(text).as_bytes());
-                match error.error_len() {
-                    Some(len) => {
-                        out.extend_from_slice(&after[..len]);
-                        rest = &after[len..];
-                    }
-                    // An incomplete sequence at the end of the chunk: keep the
-                    // bytes verbatim rather than guessing at a continuation.
-                    None => {
-                        out.extend_from_slice(after);
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    let sanitized = sanitizer.sanitize_chunk(&decoded);
     sanitizer.finish();
+    out.extend_from_slice(sanitized.as_bytes());
 }
 
 fn is_strippable_zero_width(ch: char) -> bool {
@@ -2041,29 +2026,20 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_text_into_keeps_invalid_utf8_bytes_verbatim() {
-        // The byte API is public, so a caller can hand it arbitrary output.
-        // from_utf8_lossy would rewrite every invalid byte as U+FFFD and
-        // silently change the bytes the caller gets back.
+    fn sanitize_text_into_neutralizes_a_raw_c1_control_byte() {
+        // A bare 0x9B is the 8-bit CSI introducer. It is not valid UTF-8, so
+        // preserving byte fidelity here would hand a terminal the exact control
+        // this module removes when the same control arrives as U+009B.
         let mut out = Vec::new();
-        sanitize_text_into(b"before\xff\xfeafter", &mut out);
-        assert_eq!(out, b"before\xff\xfeafter");
-
-        // Control sequences inside the valid runs are still sanitized.
-        let mut out = Vec::new();
-        sanitize_text_into(b"a\x1b[31mred\xffz", &mut out);
+        sanitize_text_into(b"a\x9b31mb", &mut out);
         assert!(
-            !out.windows(2).any(|pair| pair == b"\x1b["),
-            "a CSI inside a valid run must still be stripped: {out:?}"
-        );
-        assert!(
-            out.contains(&0xff),
-            "the invalid byte must survive: {out:?}"
+            !out.contains(&0x9b),
+            "a raw C1 CSI byte must not reach the terminal: {out:?}"
         );
 
-        // An incomplete sequence at the very end is kept, not guessed at.
+        // Valid text is unaffected, and an escape inside it is still stripped.
         let mut out = Vec::new();
-        sanitize_text_into(b"tail\xe2\x82", &mut out);
-        assert_eq!(out, b"tail\xe2\x82");
+        sanitize_text_into(b"a\x1b[31mred", &mut out);
+        assert_eq!(out, b"ared");
     }
 }

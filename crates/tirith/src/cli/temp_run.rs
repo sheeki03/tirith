@@ -177,7 +177,9 @@ pub fn run(
     };
 
     if json {
-        emit_json(
+        // repo-0499: a failed/truncated JSON write must not pair with a
+        // zero/successful exit status — report 2 when the child succeeded.
+        let wrote = emit_json(
             &command_display,
             command,
             exit_code,
@@ -190,6 +192,9 @@ pub fn run(
             &modified_files,
             kept_path.as_deref(),
         );
+        if !wrote && exit_code == 0 {
+            return 2;
+        }
     } else {
         print_result(exit_code, &new_files, &modified_files, kept_path.as_deref());
     }
@@ -287,7 +292,7 @@ fn emit_json(
     new_files: &[String],
     modified_files: &[String],
     kept_path: Option<&Path>,
-) {
+) -> bool {
     // The honesty marker reflects the actual mode: `capsule_contained` only when
     // --capsule ran AND a backend actually contained it; a degraded --capsule run
     // is still file-only, so it keeps the not-a-sandbox marker. Emitted through the
@@ -325,7 +330,7 @@ fn emit_json(
         "temp_dir_kept": kept_path.is_some(),
         "temp_dir": kept_path.map(|p| p.display().to_string()),
     });
-    write_json_stdout(&json_val, "tirith temp-run: failed to write JSON output");
+    write_json_stdout(&json_val, "tirith temp-run: failed to write JSON output")
 }
 
 /// Build the legacy human/JSON command label from argv. Sanitization and quoting

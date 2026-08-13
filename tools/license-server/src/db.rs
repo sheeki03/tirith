@@ -201,7 +201,10 @@ impl Db {
                 "INSERT INTO subscriptions (id, customer_id, email, tier, status, product_id, last_event_at)
                  VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET
-                   status=CASE WHEN subscriptions.status='revoked' THEN 'revoked' ELSE 'active' END,
+                   -- repo-0444: a reordered `created` must not flip a
+                   -- payment-failed ('past_due') or terminal ('revoked') row
+                   -- back to 'active'; a user-canceled row still reconciles.
+                   status=CASE WHEN subscriptions.status IN ('revoked','past_due') THEN subscriptions.status ELSE 'active' END,
                    email=excluded.email, product_id=excluded.product_id, tier=excluded.tier,
                    last_event_at=MAX(COALESCE(subscriptions.last_event_at,''), excluded.last_event_at),
                    updated_at=datetime('now')",
@@ -705,6 +708,37 @@ impl Db {
 
     /// Atomic consume — DELETE … RETURNING ensures exactly one request
     /// receives the row.
+    /// repo-0237: non-destructive read of a pending receipt. `receipt_view`
+    /// peeks, decrypts/validates, and only then calls [`Self::receipt_consume`]
+    /// — a decryption/validation failure must not destroy the only recoverable
+    /// encrypted API key.
+    pub async fn receipt_peek(&self, receipt_secret: &str) -> Result<Option<ReceiptRow>, AppError> {
+        let conn = self.conn.clone();
+        let secret = receipt_secret.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = acquire_db(&conn);
+            let row: Option<ReceiptRow> = conn
+                .query_row(
+                    "SELECT subscription_id, api_key_enc, api_key_nonce, token, checkout_id FROM pending_receipts WHERE receipt_secret=?1 AND expires_at > datetime('now')",
+                    params![secret],
+                    |row| {
+                        Ok(ReceiptRow {
+                            subscription_id: row.get(0)?,
+                            api_key_enc: row.get(1)?,
+                            api_key_nonce: row.get(2)?,
+                            token: row.get(3)?,
+                            checkout_id: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|e| AppError::Internal(format!("db receipt peek: {e}")))?;
+            Ok(row)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
+    }
+
     pub async fn receipt_consume(
         &self,
         receipt_secret: &str,

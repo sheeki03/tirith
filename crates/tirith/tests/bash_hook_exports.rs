@@ -73,14 +73,26 @@ fn seed_capability_cache(state_dir: &std::path::Path, verdict: &str) {
     };
     let cache_dir = state_dir.join("tirith");
     std::fs::create_dir_all(&cache_dir).unwrap();
-    // Schema 1 mirrors cli::bash_capability::CACHE_SCHEMA; tirith_version blank
+    // Schema 2 mirrors cli::bash_capability::CACHE_SCHEMA; tirith_version blank
     // (version match is only enforced with a sibling `.hooks-version`, which
-    // assets/ lacks).
+    // assets/ lacks). The bash_fingerprint line binds the mtime+size of the
+    // live bash binary (repo-0211).
+    let bash_fingerprint = {
+        let meta = std::fs::metadata(&bash_path).expect("stat bash");
+        let secs = meta
+            .modified()
+            .expect("mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs();
+        format!("{secs}:{}", meta.len())
+    };
     std::fs::write(
         cache_dir.join("bash-enter-capability"),
         format!(
-            "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
-             bash_path={bash_path}\nenter_capability={verdict}\nreason=seeded by test\n"
+            "schema=2\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+             bash_path={bash_path}\nbash_fingerprint={bash_fingerprint}\n\
+             enter_capability={verdict}\nreason=seeded by test\n"
         ),
     )
     .unwrap();

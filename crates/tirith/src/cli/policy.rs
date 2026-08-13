@@ -531,9 +531,18 @@ fn test_command(command: &str, json: bool) -> i32 {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
 
-    let mut verdict = engine::analyze(&ctx);
+    let verdict = engine::analyze(&ctx);
     let policy = Policy::discover(cwd.as_deref());
-    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
+    // repo-0227: apply the same policy finalization the real gate runs
+    // (action_overrides / severity overrides), or `policy test` reports a
+    // different action than enforcement — a Medium-to-Block override would
+    // read as Warn here.
+    let verdict = tirith_core::escalation::finalize_static_verdict(
+        verdict.findings,
+        &policy,
+        verdict.tier_reached,
+        verdict.timings_ms.clone(),
+    );
 
     let trace = build_policy_trace(command, &policy);
 

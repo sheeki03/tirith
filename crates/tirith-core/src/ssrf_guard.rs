@@ -372,6 +372,14 @@ pub(crate) mod test_support {
                             "HTTP fixture received fewer than {expected} requests before deadline"
                         ));
                     };
+                    // On Darwin an accepted socket can inherit the listener's
+                    // nonblocking mode. The fixture needs a bounded BLOCKING
+                    // read: otherwise the first immediate `WouldBlock` records
+                    // an empty request and still publishes a success response,
+                    // making direct-route assertions flaky and misleading.
+                    stream
+                        .set_nonblocking(false)
+                        .map_err(|error| format!("make fixture stream blocking: {error}"))?;
                     stream
                         .set_read_timeout(Some(Duration::from_millis(500)))
                         .map_err(|error| format!("set fixture read timeout: {error}"))?;
@@ -379,9 +387,17 @@ pub(crate) mod test_support {
                     loop {
                         let mut chunk = [0u8; 4096];
                         match stream.read(&mut chunk) {
-                            Ok(0) => break,
+                            Ok(0) => {
+                                return Err("HTTP fixture peer closed before a complete request"
+                                    .to_string());
+                            }
                             Ok(read) => {
                                 request.extend_from_slice(&chunk[..read]);
+                                if request.len() > 1024 * 1024 {
+                                    return Err(
+                                        "HTTP fixture request exceeded the 1 MiB cap".to_string()
+                                    );
+                                }
                                 if request_is_complete(&request) {
                                     break;
                                 }
@@ -392,7 +408,9 @@ pub(crate) mod test_support {
                                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                                 ) =>
                             {
-                                break;
+                                return Err(
+                                    "HTTP fixture timed out before a complete request".to_string()
+                                );
                             }
                             Err(error) => return Err(format!("read HTTP fixture: {error}")),
                         }

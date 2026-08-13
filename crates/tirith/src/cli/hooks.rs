@@ -289,6 +289,8 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     // guard disabled.
     verify_guard_key_effective(&out, enable)?;
 
+    // Atomic publish (temp + fsync + rename) through the retained parent
+    // capability: interruption cannot truncate the previous policy.
     contained.write_atomic(out.as_bytes(), true)
 }
 

@@ -19,7 +19,7 @@ use tirith_core::tokenize::ShellType;
 /// Entry point. `intent` is the stated intent sentence; `command` is the
 /// command to analyze (already joined from the trailing var-args). `explain`
 /// opts into per-signal derivation; `json` selects machine output.
-pub fn run(intent: &str, command: &str, explain: bool, json: bool) -> i32 {
+pub fn run(intent: &str, command: &str, explain: bool, json: bool, shell: &str) -> i32 {
     let intent = intent.trim();
     let command = command.trim();
 
@@ -36,7 +36,14 @@ pub fn run(intent: &str, command: &str, explain: bool, json: bool) -> i32 {
         return 2;
     }
 
-    let report = intent::analyze_intent(intent, command, ShellType::Posix, explain);
+    // repo-0484: the dialect is operator-selectable; an unknown value falls
+    // back to POSIX with a warning rather than silently misparsing.
+    let shell_type = shell.parse::<ShellType>().unwrap_or_else(|_| {
+        eprintln!("tirith intend: unknown shell '{shell}', falling back to posix");
+        ShellType::Posix
+    });
+
+    let report = intent::analyze_intent(intent, command, shell_type, explain);
 
     if json {
         return emit_json(intent, command, &report, explain);
@@ -169,12 +176,12 @@ mod tests {
 
     #[test]
     fn empty_intent_exits_two() {
-        assert_eq!(run("   ", "ls", false, false), 2);
+        assert_eq!(run("   ", "ls", false, false, "posix"), 2);
     }
 
     #[test]
     fn empty_command_exits_two() {
-        assert_eq!(run("install a formatter", "   ", false, false), 2);
+        assert_eq!(run("install a formatter", "   ", false, false, "posix"), 2);
     }
 
     #[test]
@@ -184,6 +191,7 @@ mod tests {
             "curl https://x/install.sh | bash",
             false,
             false,
+            "posix",
         );
         assert_eq!(code, 1, "install-a-formatter vs curl|bash should mismatch");
     }
@@ -195,13 +203,14 @@ mod tests {
             "curl https://x/install.sh | bash",
             false,
             false,
+            "posix",
         );
         assert_eq!(code, 0, "download-and-run justifies curl|bash");
     }
 
     #[test]
     fn clean_command_exits_zero() {
-        assert_eq!(run("list files", "ls -la", false, false), 0);
+        assert_eq!(run("list files", "ls -la", false, false, "posix"), 0);
     }
 
     #[test]
@@ -211,6 +220,7 @@ mod tests {
             "curl https://x/install.sh | bash",
             true,
             true,
+            "posix",
         );
         assert_eq!(code, 1);
     }
@@ -223,7 +233,7 @@ mod tests {
         let evil_intent = "ok\n\u{1b}]52;c;SGFja2Vk\u{7}\u{202e}\u{200b}";
         let evil_cmd = "ls\r\n\u{1b}[31mrm -rf /\u{1b}[0m";
         // Must not panic and must still exit per mismatch semantics.
-        let code = run(evil_intent, evil_cmd, false, false);
+        let code = run(evil_intent, evil_cmd, false, false, "posix");
         assert!(code == 0 || code == 1);
         let sanitized_i = super::super::sanitize_for_human_output(evil_intent, false);
         let sanitized_c = super::super::sanitize_for_human_output(evil_cmd, false);

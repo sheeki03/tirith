@@ -282,6 +282,14 @@ fn cmd_sign(
     eprintln!("\nToken issued:");
     eprintln!("  tier:    {tier_lower}");
     eprintln!("  kid:     {kid}");
+    // repo-0238: `kid` is an independent caller string while the signature is
+    // made by THIS seed's key. Print the signing key's public fingerprint so
+    // the operator can verify it is the key registered under `kid` in the
+    // production keyring — a mismatch means decoders will reject the token.
+    eprintln!(
+        "  signing pubkey (hex): {}",
+        bytes_to_hex(&sk.verifying_key().to_bytes())
+    );
     eprintln!("  expires: {exp_dt} (ts: {exp_ts})");
     if let Some(ref org) = org_id {
         eprintln!("  org_id:  {org}");

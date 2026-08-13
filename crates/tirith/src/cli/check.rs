@@ -24,6 +24,17 @@ use tirith_core::threatdb_api::RuntimeThreatMode;
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::{action_from_findings, upgraded_action_from_findings, Action, Verdict};
 
+/// Once a check dispatches webhooks, every return path waits for their bounded
+/// best-effort delivery. A lexical guard avoids missing protocol/approval/
+/// deferral early returns as new branches are added.
+struct PendingWebhookGuard;
+
+impl Drop for PendingWebhookGuard {
+    fn drop(&mut self) {
+        tirith_core::webhook::wait_for_pending_webhooks(Duration::from_secs(5));
+    }
+}
+
 /// W6: build a DISPLAY-ONLY clone of `effective` whose repeated Warn / WarnAck
 /// findings (already surfaced earlier this session) are collapsed, and return how
 /// many findings were hidden.
@@ -526,21 +537,27 @@ pub fn run(
         && tirith_core::checkpoint::should_auto_checkpoint(cmd)
     {
         if let Some(cwd_val) = &cwd {
-            let cwd_owned = cwd_val.clone();
-            let cmd_owned = cmd.to_string();
-            std::thread::spawn(move || {
-                if let Err(e) =
-                    tirith_core::checkpoint::create(&[cwd_owned.as_str()], Some(&cmd_owned))
-                {
-                    eprintln!("tirith: auto-checkpoint failed (non-fatal): {e}");
-                } else {
+            // repo-0214: checkpoint creation must finish before this process
+            // returns an executable verdict. A detached worker is terminated at
+            // process exit, while a timed wait cannot cancel it safely; either
+            // shape could let the destructive command run without a published
+            // checkpoint. This path is interactive-only, and creation itself is
+            // bounded by the checkpoint entry/file/total-byte budgets.
+            match tirith_core::checkpoint::create(&[cwd_val.as_str()], Some(cmd)) {
+                Err(e) => eprintln!("tirith: auto-checkpoint failed (non-fatal): {e}"),
+                Ok(meta) => {
+                    if meta.incomplete {
+                        eprintln!(
+                            "tirith: auto-checkpoint is incomplete; the destructive command may proceed without a complete snapshot"
+                        );
+                    }
                     // Purge old checkpoints to prevent unbounded disk growth.
                     let config = tirith_core::checkpoint::CheckpointConfig::default();
                     if let Err(e) = tirith_core::checkpoint::purge(&config) {
                         eprintln!("tirith: checkpoint purge failed (non-fatal): {e}");
                     }
                 }
-            });
+            }
         }
     }
 
@@ -556,6 +573,7 @@ pub fn run(
             &policy.dlp_custom_patterns,
         );
     }
+    let _pending_webhook_guard = PendingWebhookGuard;
 
     // Protocol v3 owns every approval / warning-ack interaction in this process.
     // The shell receives only an already-armed receipt token; it never reports a

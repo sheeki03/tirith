@@ -2551,6 +2551,11 @@ Examples:
         /// The command to analyze (everything after `--`)
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         command: Vec<String>,
+
+        /// Shell dialect of the command (posix, bash, zsh, fish, powershell,
+        /// pwsh, cmd). repo-0484: parsing always assumed POSIX before.
+        #[arg(long, default_value = "posix")]
+        shell: String,
     },
 
     /// Opt-in per-user anomaly baseline: learn|status|reset (M10 ch5)
@@ -8698,9 +8703,10 @@ fn run() {
             format,
             json,
             command,
+            shell,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::intent::run(&intent, &command.join(" "), explain, json)
+            cli::intent::run(&intent, &command.join(" "), explain, json, &shell)
         }
         Commands::Baseline { action } => match action {
             BaselineAction::Learn { format, json } => {

@@ -46,6 +46,15 @@ pub struct CheckpointMeta {
     pub paths: Vec<String>,
     pub total_bytes: u64,
     pub file_count: usize,
+    /// repo-0200: true when the capture hit a budget cap (entry count, per-file
+    /// size, total bytes) or skipped unreadable entries, so the checkpoint is
+    /// NOT a complete backup. Surfaced by list/restore consumers; restore of a
+    /// partial checkpoint still works but is flagged.
+    #[serde(default)]
+    pub incomplete: bool,
+    /// Why `incomplete` is set (first reason wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
     /// F6: the working directory at capture time, persisted so a RELATIVE
     /// `original_path` in the manifest is restored against the SAME root it was
     /// captured under, not against whatever cwd the restore happens to run in
@@ -81,6 +90,12 @@ pub struct CheckpointListEntry {
     pub trigger_command: Option<String>,
     pub file_count: usize,
     pub total_bytes: u64,
+    /// The checkpoint omitted one or more requested entries.
+    #[serde(default)]
+    pub incomplete: bool,
+    /// First bounded omission reason, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
 }
 
 /// Checkpoint configuration.
@@ -106,6 +121,9 @@ fn default_max_total_bytes() -> u64 {
 
 /// Checkpoint metadata is tiny; cap hostile files before allocating/parsing.
 const CHECKPOINT_META_MAX_BYTES: u64 = 1024 * 1024;
+/// Manifests may contain thousands of paths, but remain bounded before JSON
+/// allocation/parsing when the checkpoint store is corrupt or attacker-owned.
+const CHECKPOINT_MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 impl Default for CheckpointConfig {
     fn default() -> Self {
@@ -284,26 +302,37 @@ pub fn create_with_config(
     let mut manifest: Vec<ManifestEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
 
+    // repo-0200: every capture gap lands here and is persisted in the meta.
+    let mut capture_gaps: Vec<String> = Vec::new();
     let mut fill = || -> Result<(), BackupError> {
         for path_str in paths {
             let path = Path::new(path_str);
-            if !path.exists() {
+            let root_meta = match path.symlink_metadata() {
+                Ok(meta) => meta,
+                Err(e) => {
+                    capture_gaps.push(format!("cannot inspect requested path {path_str}: {e}"));
+                    continue;
+                }
+            };
+            if root_meta.file_type().is_symlink() {
+                capture_gaps.push(format!("requested symlink omitted: {path_str}"));
                 continue;
             }
 
-            if path.is_file() {
+            if root_meta.is_file() {
                 match backup_file(path, &files_dir, &mut budget) {
                     Ok(entry) => {
                         total_bytes += entry.size;
                         manifest.push(entry);
                     }
                     Err(BackupError::Skip(e)) => {
+                        capture_gaps.push(format!("skipped {path_str}: {e}"));
                         eprintln!("tirith: checkpoint: skip {path_str}: {e}");
                     }
                     Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
                 }
-            } else if path.is_dir() {
-                match backup_dir(path, &files_dir, &mut budget) {
+            } else if root_meta.is_dir() {
+                match backup_dir(path, &files_dir, &mut budget, &mut capture_gaps) {
                     Ok(entries) => {
                         for entry in entries {
                             total_bytes += entry.size;
@@ -311,10 +340,15 @@ pub fn create_with_config(
                         }
                     }
                     Err(BackupError::Skip(e)) => {
+                        capture_gaps.push(format!("skipped dir {path_str}: {e}"));
                         eprintln!("tirith: checkpoint: skip dir {path_str}: {e}");
                     }
                     Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
                 }
+            } else {
+                capture_gaps.push(format!(
+                    "requested path is not a regular file or directory: {path_str}"
+                ));
             }
         }
         Ok(())
@@ -350,6 +384,8 @@ pub fn create_with_config(
         paths: paths.iter().map(|s| s.to_string()).collect(),
         total_bytes,
         file_count: manifest.len(),
+        incomplete: !capture_gaps.is_empty(),
+        incomplete_reason: capture_gaps.first().cloned(),
         // Persist the capture-time cwd so a relative `original_path` restores
         // against this root, independent of the cwd at restore time. Canonicalize
         // it first: on macOS the cwd often contains a symlinked ancestor
@@ -439,6 +475,8 @@ pub fn list() -> Result<Vec<CheckpointListEntry>, String> {
             trigger_command: meta.trigger_command,
             file_count: meta.file_count,
             total_bytes: meta.total_bytes,
+            incomplete: meta.incomplete,
+            incomplete_reason: meta.incomplete_reason,
         });
     }
 
@@ -474,6 +512,22 @@ fn load_bound_checkpoint_meta(
         return Err("metadata id does not match its checkpoint directory".to_string());
     }
     Ok((meta, identity))
+}
+
+fn load_bound_checkpoint_manifest(
+    checkpoint_dir: &Path,
+    identity: Option<(u64, u64)>,
+) -> Result<Vec<ManifestEntry>, String> {
+    verify_checkpoint_dir_identity(checkpoint_dir, identity)?;
+    let manifest_bytes = crate::util::read_text_no_follow_capped(
+        &checkpoint_dir.join("manifest.json"),
+        CHECKPOINT_MANIFEST_MAX_BYTES,
+    )
+    .map_err(|e| format!("cannot safely read manifest.json: {e:?}"))?;
+    verify_checkpoint_dir_identity(checkpoint_dir, identity)?;
+    let manifest_str = String::from_utf8(manifest_bytes)
+        .map_err(|_| "checkpoint manifest.json is not UTF-8".to_string())?;
+    serde_json::from_str(&manifest_str).map_err(|e| format!("corrupt manifest.json: {e}"))
 }
 
 /// Validate that a checkpoint id is the canonical lowercase UUID basename that
@@ -610,7 +664,11 @@ fn reject_symlinked_checkpoint_dir(cp_dir: &Path) -> Result<(), String> {
 fn capture_checkpoint_dir_identity(cp_dir: &Path) -> Result<Option<(u64, u64)>, String> {
     use std::os::unix::fs::MetadataExt;
     match fs::symlink_metadata(cp_dir) {
-        Ok(m) => Ok(Some((m.dev(), m.ino()))),
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(Some((m.dev(), m.ino()))),
+        Ok(_) => Err(format!(
+            "checkpoint path is not a real directory: {}",
+            cp_dir.display()
+        )),
         Err(e) => Err(format!("cannot stat checkpoint directory: {e}")),
     }
 }
@@ -633,7 +691,14 @@ fn verify_checkpoint_dir_identity(
         use std::os::unix::fs::MetadataExt;
         if let Some((dev, ino)) = captured {
             return match fs::symlink_metadata(cp_dir) {
-                Ok(m) if m.dev() == dev && m.ino() == ino => Ok(()),
+                Ok(m)
+                    if m.is_dir()
+                        && !m.file_type().is_symlink()
+                        && m.dev() == dev
+                        && m.ino() == ino =>
+                {
+                    Ok(())
+                }
                 Ok(_) => Err(format!(
                     "checkpoint directory changed identity mid-read (possible swap): {}",
                     cp_dir.display()
@@ -929,6 +994,10 @@ pub struct RestoreReport {
     pub missing: Vec<String>,
     pub corrupt: Vec<String>,
     pub errors: Vec<(String, String)>,
+    /// The source checkpoint was created with omitted entries.
+    pub checkpoint_incomplete: bool,
+    /// First bounded omission reason recorded at capture.
+    pub checkpoint_incomplete_reason: Option<String>,
 }
 
 /// Restore files from a checkpoint, returning a per-bucket report.
@@ -959,33 +1028,11 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
     }
-    // The parent containment check above is LEXICAL: it confirms `cp_dir`'s parent
-    // path equals the store, but does not stop `cp_dir` ITSELF from being a symlink
-    // that redirects outside the store. Reading its manifest / restoring its files
-    // would then follow that link. Reject a symlinked checkpoint directory before
-    // any read. (`symlink_metadata` does not follow the final component.)
-    reject_symlinked_checkpoint_dir(&cp_dir)?;
-    // K3 (TOCTOU): the symlink check above is path-based, so `cp_dir` could be
-    // swapped for a symlink/another directory before the reads below. Pin its
-    // `(dev, ino)` now and re-verify before each subsequent read so a mid-call swap
-    // fails closed instead of feeding an attacker-controlled manifest/meta/blob.
-    let cp_ident = capture_checkpoint_dir_identity(&cp_dir)?;
-
-    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
-    let manifest_str = fs::read_to_string(cp_dir.join("manifest.json"))
-        .map_err(|e| format!("read manifest: {e}"))?;
-    let manifest: Vec<ManifestEntry> =
-        serde_json::from_str(&manifest_str).map_err(|e| format!("parse manifest: {e}"))?;
-
-    // F6: the capture-time root used to anchor RELATIVE manifest paths. Read from
-    // meta.json (best-effort; a missing/corrupt meta or a pre-F6 checkpoint yields
-    // None, which makes relative entries non-anchorable and therefore rejected).
-    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
-    let capture_root: Option<PathBuf> = fs::read_to_string(cp_dir.join("meta.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<CheckpointMeta>(&s).ok())
-        .and_then(|m| m.capture_root)
-        .map(PathBuf::from);
+    // Bind metadata and manifest to one validated physical directory. Both
+    // files are opened no-follow and capped before allocation/deserialization.
+    let (checkpoint_meta, cp_ident) = load_bound_checkpoint_meta(&cp_dir, checkpoint_id)?;
+    let manifest = load_bound_checkpoint_manifest(&cp_dir, cp_ident)?;
+    let capture_root = checkpoint_meta.capture_root.as_deref().map(PathBuf::from);
 
     let files_dir = cp_dir.join("files");
     let mut report = RestoreReport {
@@ -995,6 +1042,8 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
         missing: Vec::new(),
         corrupt: Vec::new(),
         errors: Vec::new(),
+        checkpoint_incomplete: checkpoint_meta.incomplete,
+        checkpoint_incomplete_reason: checkpoint_meta.incomplete_reason,
     };
 
     for entry in &manifest {
@@ -1034,17 +1083,20 @@ pub fn restore_reported(checkpoint_id: &str) -> Result<RestoreReport, String> {
         // slip UNVERIFIED bytes into the destination, breaking the "corrupt blobs
         // are recorded, never written" guarantee. The handle is rewound to 0
         // between the hash and the copy below.
-        let mut blob = match fs::File::open(&src) {
+        let mut blob = match crate::util::open_read_no_follow_capped(&src, u64::MAX) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!(
-                    "tirith: checkpoint restore: cannot open backup for {}: {e}, skipping",
+                    "tirith: checkpoint restore: cannot safely open backup for {}: {e:?}, skipping",
                     entry.original_path
                 );
                 report.corrupt.push(entry.original_path.clone());
                 continue;
             }
         };
+        // The child open above must still belong to the directory identity we
+        // pinned before reading metadata/manifest.
+        verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
 
         // Verify the backup blob's content matches the manifest SHA before
         // restoring. A mismatch means the blob was corrupted or tampered with
@@ -1217,31 +1269,9 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
     if !cp_dir.exists() {
         return Err(format!("checkpoint not found: {checkpoint_id}"));
     }
-    // Same symlink guard as the restore path: a symlinked `cp_dir` could redirect
-    // the manifest/file reads outside the store. Reject it before any read.
-    reject_symlinked_checkpoint_dir(&cp_dir)?;
-    // K3 (TOCTOU): mirror `restore_reported` exactly. Pin the checkpoint dir's
-    // `(dev, ino)` after the path-based symlink check and re-verify before each
-    // read so a mid-call directory swap fails closed instead of reading an
-    // attacker-controlled manifest/meta/blob.
-    let cp_ident = capture_checkpoint_dir_identity(&cp_dir)?;
-
-    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
-    let manifest_str = fs::read_to_string(cp_dir.join("manifest.json"))
-        .map_err(|e| format!("read manifest: {e}"))?;
-    let manifest: Vec<ManifestEntry> =
-        serde_json::from_str(&manifest_str).map_err(|e| format!("parse manifest: {e}"))?;
-
-    // F6: anchor RELATIVE manifest paths to the capture-time root (read from
-    // meta.json) exactly as `restore_reported` does, rather than resolving them
-    // against the caller's cwd. A missing/corrupt meta or a pre-F6 checkpoint yields
-    // None, which makes a relative entry non-anchorable (skipped below).
-    verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
-    let capture_root: Option<PathBuf> = fs::read_to_string(cp_dir.join("meta.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<CheckpointMeta>(&s).ok())
-        .and_then(|m| m.capture_root)
-        .map(PathBuf::from);
+    let (checkpoint_meta, cp_ident) = load_bound_checkpoint_meta(&cp_dir, checkpoint_id)?;
+    let manifest = load_bound_checkpoint_manifest(&cp_dir, cp_ident)?;
+    let capture_root = checkpoint_meta.capture_root.as_deref().map(PathBuf::from);
 
     let files_dir = cp_dir.join("files");
     let mut diffs = Vec::new();
@@ -1253,11 +1283,33 @@ pub fn diff(checkpoint_id: &str) -> Result<Vec<DiffEntry>, String> {
             continue;
         }
 
+        // A manifest is persisted state, not trusted input. Validate both
+        // fields before joining either one into a filesystem path.
+        validate_restore_path(&entry.original_path)?;
+        validate_sha256_filename(&entry.sha256)?;
+
         // K3: re-verify identity before EACH `files/<sha>` read; a swap part-way
         // through aborts the diff (the store is no longer trustworthy).
         verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
-        let backup = files_dir.join(&entry.sha256);
-        if !backup.exists() {
+        let backup_path = files_dir.join(&entry.sha256);
+        let mut backup = match crate::util::open_read_no_follow_capped(&backup_path, u64::MAX) {
+            Ok(file) => file,
+            Err(_) => {
+                diffs.push(DiffEntry {
+                    path: entry.original_path.clone(),
+                    status: DiffStatus::BackupCorrupt,
+                    checkpoint_sha256: entry.sha256.clone(),
+                    current_sha256: None,
+                });
+                classified_paths.insert(entry.original_path.clone());
+                continue;
+            }
+        };
+        verify_checkpoint_dir_identity(&cp_dir, cp_ident)?;
+
+        // repo-0202: an existing blob is not proof of integrity. Hash the
+        // no-follow handle and compare against its content-addressed name.
+        if !matches!(sha256_reader(&mut backup), Ok(actual) if actual == entry.sha256) {
             diffs.push(DiffEntry {
                 path: entry.original_path.clone(),
                 status: DiffStatus::BackupCorrupt,
@@ -1715,55 +1767,97 @@ fn backup_file(
     files_dir: &Path,
     budget: &mut CreationBudget,
 ) -> Result<ManifestEntry, BackupError> {
-    let sha = sha256_file(path).map_err(BackupError::Skip)?;
-    let dst = files_dir.join(&sha);
+    // repo-0201: hash and copy through ONE open handle — hashing first and
+    // reopening for the copy let a concurrent modification desync the
+    // content-addressed blob from the manifest digest (restore would then
+    // reject the only backup as corrupt).
+    let src_file = crate::util::open_read_no_follow_capped(path, u64::MAX)
+        .map_err(|e| BackupError::Skip(format!("open {}: {e:?}", path.display())))?;
+    // Size and mode come from that exact handle, not a path lookup that can be
+    // swapped before open.
+    let meta = src_file
+        .metadata()
+        .map_err(|e| BackupError::Skip(format!("metadata {}: {e}", path.display())))?;
+    let initial_size = meta.len();
 
-    let meta = match path.metadata() {
-        Ok(m) => Some(m),
-        Err(e) => {
-            eprintln!(
-                "tirith: checkpoint: cannot read metadata for {}: {e}",
-                path.display()
-            );
-            None
+    // Refuse to START a large copy the filesystem cannot hold (repo-0262):
+    // failing mid-copy would leave a torn blob and a wasted partial write.
+    #[cfg(unix)]
+    if initial_size >= 1024 * 1024 {
+        if let Some(free) = available_bytes(files_dir) {
+            if free < initial_size {
+                return Err(BackupError::Abort(format!(
+                    "insufficient filesystem space for checkpoint copy of {} ({initial_size} bytes needed, {free} available)",
+                    path.display()
+                )));
+            }
         }
+    }
+
+    // Stream once, hashing and writing to a temp sibling, then rename to the
+    // digest name. The digest always describes the copied bytes.
+    let mut copied: u64 = 0;
+    let (sha, dst) = {
+        let mut hasher = Sha256::new();
+        let mut tmp = tempfile::NamedTempFile::new_in(files_dir)
+            .map_err(|e| BackupError::Skip(format!("tempfile: {e}")))?;
+        let mut reader = std::io::BufReader::new(src_file);
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = std::io::Read::read(&mut reader, &mut buf)
+                .map_err(|e| BackupError::Skip(format!("read {}: {e}", path.display())))?;
+            if n == 0 {
+                break;
+            }
+            if budget.remaining_copy_bytes < n as u64 {
+                return Err(BackupError::Abort(format!(
+                    "checkpoint exceeds the configured total-byte limit of {} bytes while copying {}; aborting",
+                    budget.limit,
+                    path.display()
+                )));
+            }
+            budget.remaining_copy_bytes -= n as u64;
+            copied += n as u64;
+            hasher.update(&buf[..n]);
+            use std::io::Write as _;
+            tmp.write_all(&buf[..n])
+                .map_err(|e| BackupError::Skip(format!("write blob: {e}")))?;
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        let dst = files_dir.join(&digest);
+        (digest, (tmp, dst))
     };
-    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let (tmp, dst) = dst;
 
     // Content-addressed dedup: two checkpointed files with identical contents
     // share a single on-disk copy. Only a REAL copy draws down the cumulative
     // creation budget (repo-0262).
-    if !dst.exists() {
-        if size > budget.remaining_copy_bytes {
-            return Err(BackupError::Abort(format!(
-                "checkpoint exceeds the configured total-byte limit of {} bytes while copying {}; aborting",
-                budget.limit,
-                path.display()
-            )));
-        }
-        // Refuse to START a large copy the filesystem cannot hold (repo-0262):
-        // failing mid-copy would leave a torn blob and a wasted partial write.
-        #[cfg(unix)]
-        if size >= 1024 * 1024 {
-            if let Some(free) = available_bytes(files_dir) {
-                if free < size {
-                    return Err(BackupError::Abort(format!(
-                        "insufficient filesystem space for checkpoint copy of {} ({size} bytes needed, {free} available)",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        fs::copy(path, &dst).map_err(|e| BackupError::Skip(format!("copy: {e}")))?;
-        budget.remaining_copy_bytes = budget.remaining_copy_bytes.saturating_sub(size);
+    let existing_matches = crate::util::open_read_no_follow_capped(&dst, u64::MAX)
+        .ok()
+        .and_then(|mut existing| sha256_reader(&mut existing).ok())
+        .as_deref()
+        == Some(sha.as_str());
+    if existing_matches {
+        // Identical verified content is already stored; drop the duplicate
+        // temp copy. A corrupt, symlinked, or non-regular destination is not
+        // trusted merely because its filename equals the digest.
+        drop(tmp);
+        // repo-0262: a deduplicated copy draws NO budget — refund what the
+        // streaming pass charged.
+        budget.remaining_copy_bytes = budget.remaining_copy_bytes.saturating_add(copied);
+    } else {
+        tmp.persist(&dst)
+            .map_err(|e| BackupError::Skip(format!("publish blob: {e}")))?;
     }
 
     Ok(ManifestEntry {
         original_path: normalize_capture_path(path),
         sha256: sha,
-        size,
+        // The open source can grow or shrink while being streamed. The digest
+        // and manifest size must both describe the bytes actually copied.
+        size: copied,
         is_dir: false,
-        mode: meta.as_ref().and_then(captured_mode),
+        mode: captured_mode(&meta),
     })
 }
 
@@ -1772,10 +1866,14 @@ fn backup_file(
 /// Directory entries are recorded too (repo-0261): restore recreates empty
 /// directories and re-applies each recorded directory mode after the files are
 /// in place, instead of leaving every parent at the umask default.
+/// repo-0200: capturing with a gap channel — every skip/cap is recorded so the
+/// checkpoint metadata can flag the backup as incomplete instead of reporting
+/// silent success.
 fn backup_dir(
     dir: &Path,
     files_dir: &Path,
     budget: &mut CreationBudget,
+    gaps: &mut Vec<String>,
 ) -> Result<Vec<ManifestEntry>, BackupError> {
     let mut entries = Vec::new();
     const MAX_FILES: usize = 10_000;
@@ -1801,6 +1899,7 @@ fn backup_dir(
         MAX_FILES,
         MAX_SINGLE_FILE,
         budget,
+        gaps,
     )?;
     Ok(entries)
 }
@@ -1812,8 +1911,12 @@ fn backup_dir_recursive(
     max_files: usize,
     max_single_file: u64,
     budget: &mut CreationBudget,
+    gaps: &mut Vec<String>,
 ) -> Result<(), BackupError> {
     if entries.len() >= max_files {
+        gaps.push(format!(
+            "entry cap of {max_files} reached before all files were captured"
+        ));
         return Ok(());
     }
 
@@ -1822,11 +1925,15 @@ fn backup_dir_recursive(
 
     for entry in read_dir {
         if entries.len() >= max_files {
+            gaps.push(format!(
+                "entry cap of {max_files} reached before all files were captured"
+            ));
             break;
         }
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
+                gaps.push(format!("unreadable entry in {}: {e}", dir.display()));
                 eprintln!(
                     "tirith: checkpoint: skip unreadable entry in {}: {e}",
                     dir.display()
@@ -1840,18 +1947,25 @@ fn backup_dir_recursive(
         let meta = match path.symlink_metadata() {
             Ok(m) => m,
             Err(e) => {
+                gaps.push(format!("unreadable entry {}: {e}", path.display()));
                 eprintln!("tirith: checkpoint: skip {}: {e}", path.display());
                 continue;
             }
         };
 
         if meta.file_type().is_symlink() {
+            gaps.push(format!("symlink omitted: {}", path.display()));
             continue; // following symlinks could back up files outside the tree
         }
 
         if meta.file_type().is_file() {
             let size = meta.len();
             if size > max_single_file {
+                gaps.push(format!(
+                    "file {} ({} bytes) exceeds the per-file cap",
+                    path.display(),
+                    size
+                ));
                 eprintln!(
                     "tirith: checkpoint: skip large file {} ({} bytes)",
                     path.display(),
@@ -1862,6 +1976,7 @@ fn backup_dir_recursive(
             match backup_file(&path, files_dir, budget) {
                 Ok(e) => entries.push(e),
                 Err(BackupError::Skip(e)) => {
+                    gaps.push(format!("skipped {}: {e}", path.display()));
                     eprintln!("tirith: checkpoint: skip {}: {e}", path.display());
                 }
                 Err(BackupError::Abort(e)) => return Err(BackupError::Abort(e)),
@@ -1874,6 +1989,7 @@ fn backup_dir_recursive(
                 .map(|n| n.starts_with('.'))
                 .unwrap_or(false)
             {
+                gaps.push(format!("dot-directory omitted: {}", path.display()));
                 continue;
             }
             // Record the directory itself so restore recreates empty
@@ -1892,6 +2008,7 @@ fn backup_dir_recursive(
                 max_files,
                 max_single_file,
                 budget,
+                gaps,
             )?;
         }
     }
@@ -1986,6 +2103,8 @@ mod tests {
                 paths: Vec::new(),
                 total_bytes: 123,
                 file_count: 0,
+                incomplete: false,
+                incomplete_reason: None,
                 capture_root: None,
             };
             fs::write(
@@ -2090,6 +2209,44 @@ mod tests {
     }
 
     #[test]
+    fn backup_replaces_a_corrupt_preexisting_digest_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let test_file = tmp.path().join("test.txt");
+        fs::write(&test_file, "hello world").unwrap();
+        let files_dir = tmp.path().join("files");
+        fs::create_dir_all(&files_dir).unwrap();
+        let digest = sha256_file(&test_file).unwrap();
+        fs::write(files_dir.join(&digest), "corrupt").unwrap();
+
+        let entry = backup_file(&test_file, &files_dir, &mut test_budget()).unwrap();
+
+        assert_eq!(entry.sha256, digest);
+        assert_eq!(entry.size, 11);
+        assert_eq!(
+            fs::read(files_dir.join(&entry.sha256)).unwrap(),
+            b"hello world"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_manifest_loader_refuses_a_symlinked_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let checkpoint_dir = tmp.path().join(&id);
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+        let outside = tmp.path().join("outside.json");
+        fs::write(&outside, "[]").unwrap();
+        std::os::unix::fs::symlink(&outside, checkpoint_dir.join("manifest.json")).unwrap();
+        let identity = capture_checkpoint_dir_identity(&checkpoint_dir).unwrap();
+
+        let error = load_bound_checkpoint_manifest(&checkpoint_dir, identity)
+            .expect_err("a manifest symlink must be refused");
+
+        assert!(error.contains("safely read manifest.json"), "{error}");
+    }
+
+    #[test]
     fn test_backup_dir_recursive() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("project");
@@ -2100,7 +2257,7 @@ mod tests {
         let files_dir = tmp.path().join("files");
         fs::create_dir_all(&files_dir).unwrap();
 
-        let entries = backup_dir(&dir, &files_dir, &mut test_budget()).unwrap();
+        let entries = backup_dir(&dir, &files_dir, &mut test_budget(), &mut Vec::new()).unwrap();
         let files = entries.iter().filter(|e| !e.is_dir).count();
         let dirs = entries.iter().filter(|e| e.is_dir).count();
         assert_eq!(files, 2, "should backup 2 files: {entries:?}");

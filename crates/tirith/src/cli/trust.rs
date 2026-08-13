@@ -215,6 +215,30 @@ fn write_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String>
     Ok(())
 }
 
+/// repo-0233: cross-process lock for trust-store mutations. The mutation sites
+/// load → modify → write; without a lock two processes lose each other's
+/// entries. Returns a held lock file guard.
+fn lock_trust_store(path: &std::path::Path) -> Result<std::fs::File, String> {
+    use fs2::FileExt as _;
+    let lock_path = path.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create directory {}: {e}", parent.display()))?;
+    }
+    // The lock file carries no content; keep whatever is already there rather
+    // than truncating a lock another process is holding.
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("cannot open trust-store lock: {e}"))?;
+    file.lock_exclusive()
+        .map_err(|e| format!("cannot lock trust store: {e}"))?;
+    Ok(file)
+}
+
 fn load_store_scoped(scope: &str, path: &std::path::Path) -> Result<TrustStore, String> {
     if scope == "repo" {
         load_repo_store(path)
@@ -1112,6 +1136,14 @@ pub fn add(
         }
     };
 
+    // repo-0233: hold the store lock across load → mutate → write.
+    let _store_lock = match lock_trust_store(&path) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("tirith: trust store lock failed: {e}");
+            return 1;
+        }
+    };
     let mut store = match load_store_scoped(scope, &path) {
         Ok(s) => s,
         Err(e) => {
@@ -1433,6 +1465,14 @@ pub fn remove(pattern: &str, rule_id: Option<&str>, scope: &str) -> i32 {
         }
     };
 
+    // repo-0233: hold the store lock across load → mutate → write.
+    let _store_lock = match lock_trust_store(&path) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("tirith: trust store lock failed: {e}");
+            return 1;
+        }
+    };
     let mut store = match load_store_scoped(scope, &path) {
         Ok(s) => s,
         Err(e) => {
@@ -1878,6 +1918,14 @@ fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) ->
             }
         };
 
+        // repo-0233: hold the store lock across load → mutate → write.
+        let _store_lock = match lock_trust_store(&path) {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("{}", trust_error_line(action_label, &e));
+                return 1;
+            }
+        };
         let mut store = match load_store_scoped(s, &path) {
             Ok(s) => s,
             Err(e) => {
@@ -2630,6 +2678,7 @@ mod tests {
         open_repo_trust_dir(&root.join(".tirith").join("trust.json"), false)
             .expect("an ordinary repository root opens");
 
+        // The component that carries repository content refuses a symlink.
         let hostile = holder.path().join("hostile");
         std::fs::create_dir(&hostile).unwrap();
         let swapped = holder.path().join("swapped");

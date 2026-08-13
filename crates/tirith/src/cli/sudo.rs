@@ -27,6 +27,20 @@ pub fn guard(action: &str, json: bool) -> i32 {
         Err(code) => return code,
     };
 
+    // repo-0498: a repo-scoped policy is sanitized on load — the weakening key
+    // never takes effect there, so refuse instead of reporting a false OFF.
+    if !enable {
+        if let Some((path, scope)) = policy_mod::discover_local_policy_path_scoped(None) {
+            if path == target_path && scope == policy_mod::PolicyScope::Repo {
+                eprintln!(
+                    "tirith sudo guard: cannot disable via a repository policy ({}) — repo policies are sanitized on load and the guard would stay ON. Use your user config: ~/.config/tirith/policy.yaml",
+                    path.display()
+                );
+                return 1;
+            }
+        }
+    }
+
     if let Err(e) = update_policy_key(&target_path, "context_guard_enabled", &enable.to_string()) {
         eprintln!(
             "tirith sudo guard: failed to update {}: {e}",

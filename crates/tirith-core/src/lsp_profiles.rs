@@ -228,6 +228,15 @@ pub fn retains(profile: LspProfile, rule_id: RuleId) -> bool {
             // buffer (see fn doc). Listed so a diff-aware LSP keeps them.
             | RuleId::AiConfigHiddenInstructionAdded
             | RuleId::AiConfigToolUseEscalation
+            // repo-0458: MCP config files are routed to AiConfig, so the
+            // MCP-specific config findings must be retained or a malicious
+            // mcp.json scores clean in the LSP surface.
+            | RuleId::McpInsecureServer
+            | RuleId::McpUntrustedServer
+            | RuleId::McpDuplicateServerName
+            | RuleId::McpOverlyPermissive
+            | RuleId::McpSuspiciousArgs
+            | RuleId::McpServerDrift
         ),
 
         // Markdown install docs: URL/transport + command-shape rules on the

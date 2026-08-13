@@ -42,7 +42,10 @@ pub fn dispatch(
         let url = wh.url.clone();
         let headers = expand_env_headers(&wh.headers);
 
-        std::thread::spawn(move || {
+        // repo-0208: track the handle so a one-shot CLI can wait for delivery
+        // before `process::exit` — detached threads are silently killed at
+        // exit, which made webhook delivery timing-dependent.
+        let handle = std::thread::spawn(move || {
             if let Err(e) = send_with_retry(&url, &payload, &headers, 3) {
                 crate::audit::audit_diagnostic(format!(
                     "tirith: webhook delivery to {} failed: {e}",
@@ -50,6 +53,65 @@ pub fn dispatch(
                 ));
             }
         });
+        pending_webhook_threads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
+    }
+}
+
+/// Handles of in-flight webhook delivery threads (repo-0208).
+fn pending_webhook_threads() -> &'static std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Wait (bounded) for every pending webhook delivery. One-shot commands call
+/// this before exiting so notifications are not silently terminated.
+pub fn wait_for_pending_webhooks(timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let mut handles = {
+            let mut pending = pending_webhook_threads()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *pending)
+        };
+        if handles.is_empty() {
+            return;
+        }
+
+        loop {
+            let mut unfinished = Vec::new();
+            for handle in handles {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                } else {
+                    unfinished.push(handle);
+                }
+            }
+            if unfinished.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Preserve ownership for a later wait in a long-lived caller;
+                // dropping JoinHandle here would detach delivery silently.
+                pending_webhook_threads()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(unfinished);
+                return;
+            }
+            handles = unfinished;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        // A dispatcher racing with this wait may have added new handles while
+        // the local batch was polled. Drain that batch too while time remains.
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
     }
 }
 
@@ -118,7 +180,10 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
         "severity": max_severity.to_string(),
         "rule_ids": rule_ids,
         "finding_count": verdict.findings.len(),
-        "command_preview": sanitize_for_json(command_preview),
+        // repo-0473: serde_json escapes ONCE; pre-escaping here double-escaped
+        // the preview (receivers saw literal `\n`/`\u001b` text). Truncate and
+        // hand the raw string to the serializer.
+        "command_preview": command_preview.chars().take(200).collect::<String>(),
     })
     .to_string()
 }

@@ -373,7 +373,13 @@ const SANDBOX_BASE_EXEC_ALLOW: &str = "\
 (allow file-read* (subpath \"/System/Library\"))
 (allow file-read* (subpath \"/Library/Frameworks\"))
 (allow file-read* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\") (literal \"/dev/urandom\"))
-(allow file-read-metadata)
+(allow file-read-metadata (literal \"/\"))
+(allow file-read-metadata (subpath \"/usr/lib\"))
+(allow file-read-metadata (subpath \"/usr/share\"))
+(allow file-read-metadata (subpath \"/System/Library\"))
+(allow file-read-metadata (subpath \"/Library/Frameworks\"))
+(allow file-read-metadata (subpath \"/private/var/db/dyld\"))
+(allow file-read-metadata (subpath \"/private/var/db/oah\"))
 ";
 
 /// The single network carve-out for an allow-list spec: outbound to the loopback

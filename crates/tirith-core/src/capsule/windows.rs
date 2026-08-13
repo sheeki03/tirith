@@ -71,7 +71,7 @@
 //! egress).
 
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{
     canonicalize_and_validate_filesystem_policy, CapabilityLevel, Capsule, CapsuleCoverage,
@@ -478,6 +478,11 @@ pub struct WindowsLaunchPlan {
     pub profile: AppContainerProfile,
     /// The ACL grants to add (and later revoke) for the container SID.
     pub acl_grants: Vec<AclGrant>,
+    /// The isolated HOME/TEMP directory granted to the container when
+    /// `temporary_home` is set (repo-0199). The executor creates it before
+    /// applying the grant; `build_environment_block` points the HOME family
+    /// here.
+    pub temp_home: Option<PathBuf>,
     /// The Job Object limits to apply.
     pub job_limits: JobObjectLimits,
     /// The target program (the executable path / `lpApplicationName`).
@@ -549,10 +554,32 @@ pub fn windows_launch_plan_os(
 
     let mut normalized_spec = spec.clone();
     normalized_spec.filesystem = filesystem;
-    let grants = acl_grants_from_validated(&normalized_spec.filesystem);
+    let mut grants = acl_grants_from_validated(&normalized_spec.filesystem);
+    // repo-0199: a `temporary_home` spec points HOME/USERPROFILE/TEMP at an
+    // isolated directory — which must EXIST and be granted to the AppContainer
+    // SID, or contained programs get inaccessible profile/temp dirs while
+    // `env_isolated` claims success. Add its Modify grant to the plan.
+    let temp_home = if spec.environment.temporary_home {
+        // A PID-only directory survives multiple launches in one process and
+        // PID reuse across processes. Give every plan an unguessable path so a
+        // later capsule cannot inherit an earlier capsule's HOME/TEMP bytes.
+        let home = std::env::temp_dir().join(format!(
+            "tirith-capsule-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        grants.push(AclGrant {
+            path: home.clone(),
+            access: AclAccess::Modify,
+        });
+        Some(home)
+    } else {
+        None
+    };
     Ok(WindowsLaunchPlan {
         profile: app_container_profile(&normalized_spec)?,
         acl_grants: grants,
+        temp_home,
         job_limits: job_object_limits(&spec.resources),
         program: program.to_os_string(),
         program_args: program_args.to_vec(),
@@ -1068,6 +1095,27 @@ mod tests {
         }));
         // Job kills on close.
         assert!(plan.job_limits.kill_on_close);
+    }
+
+    #[test]
+    fn temporary_home_is_unique_for_every_launch_plan() {
+        let mut spec = CapsuleSpec::locked_down();
+        spec.environment.temporary_home = true;
+
+        let first = windows_launch_plan(&spec, "C:/cmd.exe", &[]).expect("first plan");
+        let second = windows_launch_plan(&spec, "C:/cmd.exe", &[]).expect("second plan");
+        let first_home = first.temp_home.expect("temporary home");
+        let second_home = second.temp_home.expect("temporary home");
+
+        assert_ne!(first_home, second_home, "capsules must not share HOME/TEMP");
+        assert!(first
+            .acl_grants
+            .iter()
+            .any(|grant| { grant.path == first_home && grant.access == AclAccess::Modify }));
+        assert!(second
+            .acl_grants
+            .iter()
+            .any(|grant| { grant.path == second_home && grant.access == AclAccess::Modify }));
     }
 
     #[test]

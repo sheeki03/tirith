@@ -190,7 +190,13 @@ fn check_ssh_config_includes(config_path: &Path, ssh_dir: &Path) -> Option<Hygie
         if target.is_empty() {
             continue;
         }
-        if include_target_is_unsafe(target, ssh_dir) {
+        // repo-0456: ssh_config(5) permits MULTIPLE whitespace-separated
+        // patterns in one Include directive — validate each, not the joined
+        // remainder.
+        if target
+            .split_whitespace()
+            .any(|t| include_target_is_unsafe(t, ssh_dir))
+        {
             return Some(HygieneFinding {
                 rule_id: RuleId::HygieneSshConfigUnsafeInclude,
                 path: config_path.to_path_buf(),
@@ -216,17 +222,41 @@ fn check_ssh_config_includes(config_path: &Path, ssh_dir: &Path) -> Option<Hygie
 fn include_target_is_unsafe(target: &str, ssh_dir: &Path) -> bool {
     let target = target.trim_matches('"').trim_matches('\'');
 
+    // repo-0456: normalize `..` segments BEFORE the confinement checks — both
+    // the `~/` and absolute branches used to return early on a textual prefix,
+    // so `~/.ssh/../tmp/evil` was wrongly considered confined.
+    let mut normalized: Vec<&str> = Vec::new();
+    let mut escapes = false;
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if normalized.pop().is_none() {
+                    escapes = true;
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+    let normalized = normalized.join("/");
+    if escapes && !target.starts_with('/') && !target.starts_with("~/") {
+        return true; // a relative path climbing above its base
+    }
+
     // `~/`-expanded: `~/.ssh/...` is fine, anything else under `~` is outside.
-    if let Some(stripped) = target.strip_prefix("~/") {
-        return !stripped.starts_with(".ssh/") && stripped != ".ssh";
+    if target.strip_prefix("~/").is_some() {
+        return !(normalized == ".ssh"
+            || normalized
+                .strip_prefix(".ssh/")
+                .is_some_and(|rest| !rest.is_empty()));
     }
     // Absolute: unsafe unless confined to ~/.ssh (best-effort prefix check).
     if target.starts_with('/') {
-        let p = Path::new(target);
-        return !p.starts_with(ssh_dir);
+        let normalized_abs = format!("/{normalized}");
+        return !Path::new(&normalized_abs).starts_with(ssh_dir);
     }
     // Relative: unsafe only if it climbs out with `..`.
-    target.split('/').any(|seg| seg == "..")
+    escapes
 }
 
 /// `~/.aws`: `credentials` (and `config`) must be 0600.

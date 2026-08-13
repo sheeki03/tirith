@@ -433,6 +433,14 @@ const READ_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 /// a TOCTOU race (the file can grow between stat and read). Reading at most
 /// `MAX_BYTES + 1` and rejecting over `MAX_BYTES` bounds memory regardless.
 fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_capped_with_metadata(path).map(|(bytes, _)| bytes)
+}
+
+/// Capped read that also returns metadata from the exact open handle whose
+/// bytes were read. The destructive quarantine fallback uses this identity to
+/// avoid comparing a replacement pathname's metadata with an older file's
+/// bytes.
+fn read_capped_with_metadata(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Metadata)> {
     // repo-0356: open no-follow + nonblocking and require a REGULAR file before
     // reading. A project-controlled FIFO (or device/socket) named like a
     // config file must not block `ai diff`/`snapshot`/`quarantine` forever.
@@ -444,7 +452,8 @@ fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -466,7 +475,13 @@ fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
             ),
         ));
     }
-    Ok(bytes)
+    Ok((bytes, metadata))
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 /// Read a file as UTF-8 (lossy) with the [`READ_MAX_BYTES`] cap.
@@ -484,7 +499,7 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
     let src = PathBuf::from(file);
     // Capped read (R15-ai.rs:483) so a huge file can't force a full-file
     // allocation before validation; the sha below is over these capped bytes.
-    let content = match read_capped(&src) {
+    let (content, initial_metadata) = match read_capped_with_metadata(&src) {
         Ok(c) => c,
         Err(e) => {
             if !emit_error(
@@ -627,26 +642,11 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                 // Re-read the source just before the delete and compare hashes; a
                 // mismatch means it was edited after our first read, so keep the
                 // original and fail rather than lose the newer content.
-                match read_capped(&src) {
-                    Ok(current) => {
-                        let current_sha = tirith_core::clipboard::content_sha256_hex(&current);
-                        if current_sha != sha {
-                            if !emit_error(
-                                json,
-                                "tirith ai quarantine",
-                                &format!(
-                                    "{} changed on disk after it was read; refusing to delete the \
-                                     original (the quarantine copy at {} is now stale). Re-run to \
-                                     quarantine the current contents.",
-                                    src.display(),
-                                    dest.display()
-                                ),
-                            ) {
-                                return 2;
-                            }
-                            return 1;
-                        }
-                    }
+                // repo-0209: open ONCE and remember the inode we hashed, so
+                // the pre-delete check compares the live pathname against the
+                // exact file whose bytes we verified.
+                let (current, hashed_metadata) = match read_capped_with_metadata(&src) {
+                    Ok(current) => current,
                     Err(e) => {
                         // Could not re-read to confirm unchanged — do NOT delete
                         // blindly. The copy exists, the original stays, exit non-zero.
@@ -664,7 +664,65 @@ pub fn quarantine(file: &str, do_move: bool, yes: bool, json: bool) -> i32 {
                         }
                         return 1;
                     }
+                };
+                let current_sha = tirith_core::clipboard::content_sha256_hex(&current);
+                if current_sha != sha {
+                    if !emit_error(
+                        json,
+                        "tirith ai quarantine",
+                        &format!(
+                            "{} changed on disk after it was read; refusing to delete the \
+                             original (the quarantine copy at {} is now stale). Re-run to \
+                             quarantine the current contents.",
+                            src.display(),
+                            dest.display()
+                        ),
+                    ) {
+                        return 2;
+                    }
+                    return 1;
                 }
+                // repo-0209: the hash check above verified CONTENT, but a
+                // replace-then-delete race could still remove a DIFFERENT
+                // inode that now sits at `src`. Compare the inode we hashed
+                // against the live pathname immediately before unlinking.
+                #[cfg(unix)]
+                {
+                    if !same_file_identity(&initial_metadata, &hashed_metadata) {
+                        if !emit_error(
+                            json,
+                            "tirith ai quarantine",
+                            &format!(
+                                "{} was replaced after the quarantine bytes were read; the copy at {} is kept and the replacement was NOT removed",
+                                src.display(),
+                                dest.display()
+                            ),
+                        ) {
+                            return 2;
+                        }
+                        return 1;
+                    }
+                    let now_metadata = std::fs::symlink_metadata(&src);
+                    if !matches!(
+                        now_metadata.as_ref(),
+                        Ok(now) if same_file_identity(&hashed_metadata, now)
+                    ) {
+                        if !emit_error(
+                            json,
+                            "tirith ai quarantine",
+                            &format!(
+                                "{} was replaced during quarantine; the copy at {} is kept and the original was NOT removed",
+                                src.display(),
+                                dest.display()
+                            ),
+                        ) {
+                            return 2;
+                        }
+                        return 1;
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = (&initial_metadata, &hashed_metadata);
                 if let Err(e) = std::fs::remove_file(&src) {
                     // Copy succeeded but the original couldn't be removed — report
                     // honestly (a copy exists, the original remains), exit 1.

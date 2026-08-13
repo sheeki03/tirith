@@ -3122,6 +3122,70 @@ fn compute_drift_static(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDr
         j += 1;
     }
 
+    // repo-0459: `content_hash` excludes `source_config` BY DESIGN, so moving
+    // an unchanged server between config files must not drift. The
+    // `(name, source_config)`-keyed merge walk reports such a move as
+    // Removed+Added when unrelated drift forces this slow path — cancel pairs
+    // whose name AND content hash match (a true move), so fast and slow paths
+    // agree.
+    let mut kept: Vec<McpDrift> = Vec::with_capacity(drifts.len());
+    // (name, hash) for Added entries to match Removed against. Resolve each
+    // hash through the exact `(name, source_config)` key: duplicate server
+    // names in different config files are valid and may carry different
+    // transports, so a name-only lookup can cancel the wrong pair.
+    let add_keys: Vec<(String, String)> = drifts
+        .iter()
+        .filter_map(|d| match d {
+            McpDrift::Added {
+                name,
+                source_config,
+                ..
+            } => {
+                let hash = current_lock
+                    .servers
+                    .iter()
+                    .find(|s| &s.name == name && &s.source_config == source_config)
+                    .map(|s| s.hash.clone())
+                    .unwrap_or_default();
+                Some((name.clone(), hash))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut used_adds: Vec<bool> = vec![false; add_keys.len()];
+    for d in drifts {
+        if let McpDrift::Removed {
+            name,
+            source_config,
+        } = &d
+        {
+            let removed_hash = lock
+                .servers
+                .iter()
+                .find(|s| &s.name == name && &s.source_config == source_config)
+                .map(|s| s.hash.clone())
+                .unwrap_or_default();
+            let matched = add_keys
+                .iter()
+                .enumerate()
+                .find(|(idx, (an, ah))| !used_adds[*idx] && an == name && *ah == removed_hash)
+                .map(|(idx, _)| idx);
+            if let Some(idx) = matched {
+                used_adds[idx] = true;
+                continue; // pure move: drop the Removed
+            }
+        }
+        kept.push(d);
+    }
+    // Drop the matched Adds too.
+    let mut drifts: Vec<McpDrift> = Vec::with_capacity(kept.len());
+    let mut add_iter = used_adds.iter();
+    for d in kept {
+        if matches!(d, McpDrift::Added { .. }) && add_iter.next() == Some(&true) {
+            continue;
+        }
+        drifts.push(d);
+    }
     drifts.sort_by_key(McpDrift::sort_key);
     drifts
 }
@@ -5988,10 +6052,10 @@ mod tests {
 
     #[test]
     fn drift_detects_unchanged_server_moving_between_config_principals() {
-        // The transport content is unchanged, but source_config is part of the
-        // policy principal. The inventory fast hash must therefore admit the
-        // merge walk, which reports the old principal removed and the new one
-        // added instead of incorrectly returning clean.
+        // repo-0459: `content_hash` excludes `source_config` BY DESIGN, so a
+        // pure move between config files is NOT drift — on the fast path (equal
+        // inventory) or the slow path (unrelated drift forcing the merge
+        // walk). Both paths must agree.
         let prev = mk_inventory(vec![McpServerEntry {
             tools_declared: true,
             source_config: ".mcp.json".into(),
@@ -6005,20 +6069,81 @@ mod tests {
             ..stdio_server("s", "node")
         }]);
         let drifts = compute_drift(&cur, &lock);
+        // Fast path: pure move, equal inventory — no drift.
+        assert!(drifts.is_empty(), "pure move must stay clean: {drifts:?}");
+        // Slow path consistency: with an unrelated server added, the move must
+        // STILL not surface as Removed+Added.
+        let cur2 = mk_inventory(vec![
+            McpServerEntry {
+                tools_declared: true,
+                source_config: ".vscode/mcp.json".into(),
+                ..stdio_server("s", "node")
+            },
+            stdio_server("other", "node"),
+        ]);
+        let drifts2 = compute_drift(&cur2, &lock);
         assert!(
-            drifts.iter().any(|drift| matches!(
+            !drifts2.iter().any(|drift| matches!(
                 drift,
-                McpDrift::Removed { source_config, .. } if source_config == ".mcp.json"
+                McpDrift::Removed { name, .. } if name == "s"
             )),
-            "old source-qualified principal must be removed: {drifts:?}"
+            "a pure config-file move must not report removal: {drifts2:?}"
         );
         assert!(
-            drifts.iter().any(|drift| matches!(
+            !drifts2.iter().any(|drift| matches!(
                 drift,
-                McpDrift::Added { source_config, .. } if source_config == ".vscode/mcp.json"
+                McpDrift::Added { name, .. } if name == "s"
             )),
-            "new source-qualified principal must be added: {drifts:?}"
+            "a pure config-file move must not report addition: {drifts2:?}"
         );
+        // The genuinely new server IS reported.
+        assert!(
+            drifts2.iter().any(|drift| matches!(
+                drift,
+                McpDrift::Added { name, .. } if name == "other"
+            )),
+            "the new server must be reported: {drifts2:?}"
+        );
+    }
+
+    #[test]
+    fn drift_move_cancellation_uses_the_exact_duplicate_server_hash() {
+        let prev = mk_inventory(vec![
+            McpServerEntry {
+                source_config: "a.json".into(),
+                ..stdio_server("shared", "node")
+            },
+            McpServerEntry {
+                source_config: "b.json".into(),
+                ..stdio_server("shared", "deno")
+            },
+        ]);
+        let lock = McpLockfile::from_inventory(&prev);
+
+        let cur = mk_inventory(vec![
+            // The deno server moved; the node twin stayed put.
+            McpServerEntry {
+                source_config: "a.json".into(),
+                ..stdio_server("shared", "node")
+            },
+            McpServerEntry {
+                source_config: "c.json".into(),
+                ..stdio_server("shared", "deno")
+            },
+            // Force the slow path independently of the move.
+            stdio_server("other", "node"),
+        ]);
+
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(
+            drifts.len(),
+            1,
+            "only the real addition may drift: {drifts:?}"
+        );
+        assert!(matches!(
+            &drifts[0],
+            McpDrift::Added { name, .. } if name == "other"
+        ));
     }
 
     #[test]

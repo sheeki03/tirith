@@ -25,12 +25,17 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run benchmarks
-        run: cargo bench --bench perf -- --output-format bencher | tee bench-output.txt
+        # repo-0452: pipefail so a cargo bench failure cannot be masked by tee;
+        # the downstream result step is gated on this step's success.
+        run: |
+          set -o pipefail
+          cargo bench --bench perf -- --output-format bencher | tee bench-output.txt
 
       - name: Store benchmark result
         uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
-        if: always()
-        continue-on-error: true
+        # repo-0452: only store results when the benchmark step succeeded;
+        # never silently "pass" a job whose benchmarks never ran.
+        if: success()
         with:
           name: tirith benchmarks
           tool: cargo

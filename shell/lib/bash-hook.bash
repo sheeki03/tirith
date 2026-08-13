@@ -455,7 +455,7 @@ _tirith_persist_safe_mode() {
 # cache then fails. Enter-mode delivery itself is a bash-build property — it
 # does not change with the tirith version — so the cache is keyed on bash, not
 # on tirith. (`tirith_version` is still recorded in the file for diagnostics.)
-_TIRITH_ENTER_CAP_SCHEMA=1
+_TIRITH_ENTER_CAP_SCHEMA=2
 _TIRITH_ENTER_CAP_FILE="$_TIRITH_STATE_DIR/bash-enter-capability"
 
 # Read the enter-mode capability cache and decide whether enter mode is proven
@@ -479,12 +479,14 @@ _tirith_enter_capability_proven() {
   (( size > 4096 )) && return 1
 
   local schema="" cache_bash_version="" cache_bash_path="" capability=""
+  local cache_bash_fingerprint=""
   local key value
   while IFS='=' read -r key value; do
     case "$key" in
       schema)           schema="$value" ;;
       bash_version)     cache_bash_version="$value" ;;
       bash_path)        cache_bash_path="$value" ;;
+      bash_fingerprint) cache_bash_fingerprint="$value" ;;
       enter_capability) capability="$value" ;;
     esac
   done < "$_TIRITH_ENTER_CAP_FILE"
@@ -509,6 +511,24 @@ _tirith_enter_capability_proven() {
   # stale and falls back to preexec — fail-safe.
   [[ -n "$cache_bash_path" ]] || return 1
   [[ "$cache_bash_path" == "${BASH:-}" ]] || return 1
+
+  # repo-0211: an in-place rebuild keeps path and version — also require the
+  # recorded mtime:size fingerprint to match the live binary.
+  [[ -n "$cache_bash_fingerprint" ]] || return 1
+  local live_mtime live_size live_fp
+  if live_mtime="$(builtin command stat -Lf %m "${BASH:-/dev/null}" 2>/dev/null)"; then
+    :
+  else
+    live_mtime="$(builtin command stat -Lc %Y "${BASH:-/dev/null}" 2>/dev/null)" || return 1
+  fi
+  if live_size="$(builtin command stat -Lf %z "${BASH:-/dev/null}" 2>/dev/null)"; then
+    :
+  else
+    live_size="$(builtin command stat -Lc %s "${BASH:-/dev/null}" 2>/dev/null)" || return 1
+  fi
+  [[ -n "$live_mtime" && -n "$live_size" ]] || return 1
+  live_fp="${live_mtime}:${live_size}"
+  [[ "$cache_bash_fingerprint" == "$live_fp" ]] || return 1
 
   return 0
 }

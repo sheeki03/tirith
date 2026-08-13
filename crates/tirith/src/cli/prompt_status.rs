@@ -52,10 +52,36 @@ struct CacheEnvelope {
     contexts: BTreeMap<String, String>,
     ssh_remote: bool,
     sudo_active: bool,
+    /// repo-0228: fingerprint of the environment the status was computed from.
+    /// A warm cache from a DIFFERENT shell (other TIRITH_STATUS / AWS_PROFILE /
+    /// KUBECONFIG) must not leak its context into this shell's prompt.
+    #[serde(default)]
+    env_fingerprint: String,
 }
 
 fn default_schema_version() -> u32 {
     1
+}
+
+/// repo-0228: hash the environment inputs the status is derived from.
+fn current_env_fingerprint() -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for name in [
+        "TIRITH_STATUS",
+        "TIRITH_SSH_REMOTE",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "KUBECONFIG",
+    ] {
+        h.update(name.as_bytes());
+        h.update([0]);
+        if let Ok(value) = std::env::var(name) {
+            h.update(value.as_bytes());
+        }
+        h.update([0]);
+    }
+    format!("{:x}", h.finalize())
 }
 
 /// Public JSON envelope written to stdout — like [`CacheEnvelope`] but without
@@ -129,13 +155,22 @@ pub fn run(short: bool, json: bool) -> i32 {
 /// Starts with `[tirith:<mode>]` for downstream parsers; provider segments are
 /// BTreeMap-sorted; ssh/sudo segments appended only when active.
 fn format_short(s: &Status) -> String {
-    let mut out = format!("[tirith:{}]", s.protection_mode);
+    // repo-0411: every interpolated value is env/config-derived and lands in
+    // the prompt unescaped — sanitize terminal controls/bidi/newlines first.
+    let mut out = format!(
+        "[tirith:{}]",
+        super::sanitize_for_human_output(&s.protection_mode, false)
+    );
     for (k, v) in &s.contexts {
         // A malformed cache entry shouldn't render `[kube:]`.
         if v.is_empty() {
             continue;
         }
-        out.push_str(&format!("[{k}:{v}]"));
+        out.push_str(&format!(
+            "[{}:{}]",
+            super::sanitize_for_human_output(k, false),
+            super::sanitize_for_human_output(v, false)
+        ));
     }
     if s.ssh_remote {
         out.push_str("[ssh:remote]");
@@ -148,12 +183,19 @@ fn format_short(s: &Status) -> String {
 
 /// Render the semicolon-separated long form.
 fn format_long(s: &Status) -> String {
-    let mut parts = vec![format!("tirith: {}", s.protection_mode)];
+    let mut parts = vec![format!(
+        "tirith: {}",
+        super::sanitize_for_human_output(&s.protection_mode, false)
+    )];
     for (k, v) in &s.contexts {
         if v.is_empty() {
             continue;
         }
-        parts.push(format!("{k}: {v}"));
+        parts.push(format!(
+            "{}: {}",
+            super::sanitize_for_human_output(k, false),
+            super::sanitize_for_human_output(v, false)
+        ));
     }
     if s.ssh_remote {
         parts.push("ssh: remote".into());
@@ -177,6 +219,7 @@ fn load_or_refresh() -> Result<Status, String> {
                 if env.captured_at <= now
                     && now - env.captured_at < CACHE_TTL_SECS
                     && env.schema_version == 1
+                    && env.env_fingerprint == current_env_fingerprint()
                 {
                     return Ok(Status {
                         protection_mode: env.protection_mode,
@@ -290,7 +333,11 @@ impl ProtectionHealth {
     /// [`Unknown`](Self::Unknown).
     pub(crate) fn classify(protection_mode: &str, hook_configured: bool) -> Self {
         match protection_mode {
-            "guarded" => Self::Guarded,
+            // repo-0436: the env-exported mode string is only meaningful when a
+            // hook actually exists — otherwise a wrapper or project environment
+            // can forge "guarded" and claim protection that is not installed.
+            "guarded" if hook_configured => Self::Guarded,
+            "guarded" => Self::HookMissing,
             "warn-only" => Self::WarnOnly,
             "degraded" => Self::Degraded,
             // No live mode signal. A protected shell's TIRITH_STATUS is
@@ -405,6 +452,7 @@ fn write_cache(path: &std::path::Path, status: &Status) -> std::io::Result<()> {
         contexts: status.contexts.clone(),
         ssh_remote: status.ssh_remote,
         sudo_active: status.sudo_active,
+        env_fingerprint: current_env_fingerprint(),
     };
     let body = serde_json::to_vec(&envelope).map_err(std::io::Error::other)?;
 
@@ -636,6 +684,7 @@ mod tests {
             ]),
             ssh_remote: true,
             sudo_active: false,
+            env_fingerprint: String::new(),
         };
         let bytes = serde_json::to_vec(&env).unwrap();
         let back: CacheEnvelope = serde_json::from_slice(&bytes).unwrap();

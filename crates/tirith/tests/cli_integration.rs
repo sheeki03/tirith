@@ -3980,9 +3980,20 @@ fn capability_cache_body(verdict: &str) -> String {
     let mut lines = text.lines();
     let bash_version = lines.next().unwrap_or_default().trim();
     let bash_path = lines.next().unwrap_or_default().trim();
+    let fingerprint = std::fs::metadata(bash_path)
+        .ok()
+        .and_then(|m| {
+            let secs = m
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            Some(format!("{}:{}", secs.as_secs(), m.len()))
+        })
+        .unwrap_or_default();
     format!(
-        "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
-         bash_path={bash_path}\nenter_capability={verdict}\nreason=seeded by test\n"
+        "schema=2\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+         bash_path={bash_path}\nbash_fingerprint={fingerprint}\nenter_capability={verdict}\nreason=seeded by test\n"
     )
 }
 
@@ -4285,6 +4296,28 @@ fn auto_checkpoint_cli_wiring_compiles_and_runs() {
         !stderr.contains("auto-checkpoint failed"),
         "auto-checkpoint should not report errors, got: {stderr}"
     );
+
+    // The check process must not return until a complete checkpoint has been
+    // published. A detached worker could make this directory absent or leave a
+    // half-written snapshot that is killed at process exit.
+    let checkpoint_store = state_dir.join("tirith").join("checkpoints");
+    let checkpoint_dirs: Vec<_> = fs::read_dir(&checkpoint_store)
+        .unwrap_or_else(|error| {
+            panic!(
+                "auto-checkpoint store {} was not published before check returned: {error}",
+                checkpoint_store.display()
+            )
+        })
+        .map(|entry| entry.expect("read checkpoint entry").path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert_eq!(
+        checkpoint_dirs.len(),
+        1,
+        "exactly one auto-checkpoint should be published: {checkpoint_dirs:?}"
+    );
+    assert!(checkpoint_dirs[0].join("meta.json").is_file());
+    assert!(checkpoint_dirs[0].join("manifest.json").is_file());
 }
 
 #[cfg(unix)]
@@ -19492,14 +19525,27 @@ fn lsp_stdio_initialize_didopen_didchange_lifecycle() {
 // UX / transparency pass (feat/ux-transparency-pass)
 // ---------------------------------------------------------------------------
 
+// Unix-only: the contract under test is the BASH exported-protection signal
+// (`TIRITH_BASH_EFFECTIVE_PROTECTION`) combined with bash/zsh profile hook
+// detection. Windows protection runs through the PowerShell hook, a separate
+// surface with its own coverage, so seeding `.bashrc`/`.zshrc` cannot satisfy
+// hook detection there and `status` correctly reports NOT FULLY PROTECTED.
+#[cfg(unix)]
 #[test]
 fn status_guarded_via_exported_signal_exits_zero() {
-    // The REAL hook contract: a protected shell's `TIRITH_STATUS` is NON-exported,
-    // so an external `tirith status` must read the EXPORTED
-    // `TIRITH_BASH_EFFECTIVE_PROTECTION` (which the bash hook re-exports precisely
-    // so an external check sees the truth). Prove it by setting ONLY the exported
-    // signal and clearing TIRITH_STATUS — a real protected shell never exports it.
+    // repo-0436: the exported signal only proves protection when a hook is
+    // actually configured (otherwise any environment can forge it). Seed a
+    // shell profile with the hook line so hook detection succeeds, set ONLY
+    // the exported signal, and clear TIRITH_STATUS.
+    let root = fresh_command_environment();
+    let profile_dir = root.join("home");
+    std::fs::create_dir_all(&profile_dir).expect("home dir");
+    for name in [".zshrc", ".bashrc"] {
+        std::fs::write(profile_dir.join(name), "eval \"$(tirith init)\"\n")
+            .expect("seed shell profile");
+    }
     let out = tirith()
+        .env("HOME", &profile_dir)
         .env_remove("TIRITH_STATUS")
         .env("TIRITH_BASH_EFFECTIVE_PROTECTION", "blocks")
         .args(["status"])

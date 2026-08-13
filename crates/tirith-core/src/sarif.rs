@@ -10,7 +10,15 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
     let mut rules = Vec::new();
 
     for f in findings {
-        let rule_str = f.finding.rule_id.to_string();
+        // repo-0467: custom rules share RuleId::CustomRuleMatch; their real
+        // identity lives in `custom_rule_id`. Key the SARIF rule descriptor
+        // by the EFFECTIVE id so distinct custom rules get distinct
+        // descriptors and fingerprints.
+        let rule_str = f
+            .finding
+            .custom_rule_id
+            .clone()
+            .unwrap_or_else(|| f.finding.rule_id.to_string());
         if !rule_map.contains_key(&rule_str) {
             let idx = rules.len();
             rule_map.insert(rule_str.clone(), idx);
@@ -49,7 +57,11 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
     let results: Vec<serde_json::Value> = findings
         .iter()
         .map(|f| {
-            let rule_str = f.finding.rule_id.to_string();
+            let rule_str = f
+                .finding
+                .custom_rule_id
+                .clone()
+                .unwrap_or_else(|| f.finding.rule_id.to_string());
             let rule_index = rule_map[&rule_str];
             let level = severity_to_level(f.finding.severity);
 

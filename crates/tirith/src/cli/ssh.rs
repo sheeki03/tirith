@@ -77,6 +77,21 @@ pub fn guard(action: &str, json: bool) -> i32 {
         Err(code) => return code,
     };
 
+    // repo-0497: a repo-scoped policy is sanitized on load — a weakening key
+    // written there never takes effect. Refuse instead of reporting OFF while
+    // enforcement stays ON; point the operator at the user config.
+    if !enable {
+        if let Some((path, scope)) = policy_mod::discover_local_policy_path_scoped(None) {
+            if path == target_path && scope == policy_mod::PolicyScope::Repo {
+                eprintln!(
+                    "tirith ssh guard: cannot disable via a repository policy ({}) — repo policies are sanitized on load and the guard would stay ON. Use your user config: ~/.config/tirith/policy.yaml",
+                    path.display()
+                );
+                return 1;
+            }
+        }
+    }
+
     if let Err(e) = update_policy_guard_key(&target_path, enable) {
         eprintln!(
             "tirith ssh guard: failed to update {}: {e}",

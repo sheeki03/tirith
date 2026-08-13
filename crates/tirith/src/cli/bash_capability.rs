@@ -27,7 +27,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 /// Cache-file schema version. Bump when the cache format changes so an old
 /// hook reading a new file (or vice versa) treats the mismatch as stale.
-pub const CACHE_SCHEMA: u32 = 1;
+pub const CACHE_SCHEMA: u32 = 2;
 
 /// Name of the capability cache file inside `state_dir()`.
 pub const CACHE_FILENAME: &str = "bash-enter-capability";
@@ -111,6 +111,9 @@ pub struct CachedDecision {
     /// property of the bash *build*, not just the version string, so a
     /// different binary at the same version is treated as a different bash.
     pub bash_path: String,
+    /// repo-0211: mtime+size fingerprint of the probed bash binary — catches
+    /// an in-place rebuild that keeps the same path and version string.
+    pub bash_fingerprint: String,
     pub reason: String,
 }
 
@@ -630,6 +633,20 @@ fn render_cache(outcome: &ProbeOutcome) -> String {
     body.push_str("shell=bash\n");
     body.push_str(&format!("bash_version={bash_version}\n"));
     body.push_str(&format!("bash_path={bash_path}\n"));
+    let bash_fingerprint = outcome
+        .bash_path
+        .as_deref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| {
+            let mtime = m
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            Some(format!("{}:{}", mtime.as_secs(), m.len()))
+        })
+        .unwrap_or_default();
+    body.push_str(&format!("bash_fingerprint={bash_fingerprint}\n"));
     body.push_str(&format!(
         "enter_capability={}\n",
         outcome.capability.as_token()
@@ -697,6 +714,7 @@ pub fn read_cache() -> Option<CachedDecision> {
     let mut tirith_version: Option<String> = None;
     let mut bash_version: Option<String> = None;
     let mut bash_path: Option<String> = None;
+    let mut bash_fingerprint: Option<String> = None;
     let mut capability: Option<EnterCapability> = None;
     let mut reason = String::new();
 
@@ -709,6 +727,7 @@ pub fn read_cache() -> Option<CachedDecision> {
             "tirith_version" => tirith_version = Some(value.trim().to_string()),
             "bash_version" => bash_version = Some(value.trim().to_string()),
             "bash_path" => bash_path = Some(value.trim().to_string()),
+            "bash_fingerprint" => bash_fingerprint = Some(value.trim().to_string()),
             "enter_capability" => capability = parse_capability(value),
             "reason" => reason = value.trim().to_string(),
             _ => {}
@@ -725,6 +744,7 @@ pub fn read_cache() -> Option<CachedDecision> {
         tirith_version: tirith_version?,
         bash_version: bash_version?,
         bash_path: bash_path?,
+        bash_fingerprint: bash_fingerprint?,
         reason,
     })
 }
@@ -739,6 +759,25 @@ pub fn decision_is_fresh(decision: &CachedDecision) -> bool {
         return false;
     };
     if bash.display().to_string() != decision.bash_path {
+        return false;
+    }
+    // repo-0211: an in-place rebuild/replacement keeps the same path and can
+    // keep the same $BASH_VERSION — bind the decision to the binary's mtime
+    // (and size) too, so a changed build re-probes instead of trusting a
+    // stale `Works`.
+    let fingerprint_matches = std::fs::metadata(&bash)
+        .ok()
+        .and_then(|m| {
+            let mtime = m
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            Some(format!("{}:{}", mtime.as_secs(), m.len()))
+        })
+        .map(|fp| fp == decision.bash_fingerprint)
+        .unwrap_or(false);
+    if !fingerprint_matches {
         return false;
     }
     match bash_version_of(&bash) {

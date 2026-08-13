@@ -310,6 +310,8 @@ fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
     // `--out .` flow writes ./dashboard.html). Bind its parent once and publish
     // relative to that retained capability. This refuses both a symlinked final
     // component and a symlinked intermediate directory without a check/use gap.
+    // With `create_parent = true`, the same capability traversal also creates a
+    // missing default `~/Documents` parent without an unsafe pathname pre-pass.
     let root = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

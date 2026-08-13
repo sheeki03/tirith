@@ -150,7 +150,15 @@ fn has_executable_tirith_init(content: &str) -> bool {
         if trimmed.is_empty() {
             return false;
         }
-        trimmed.contains("tirith init")
+        // repo-0495: a substring match counts `echo "tirith init"` or
+        // `false && eval "$(tirith init)"` as installed. Require a real
+        // activation shape: a leading eval/source/direct invocation of
+        // `tirith init`.
+        trimmed.starts_with("tirith init")
+            || ((trimmed.starts_with("eval") || trimmed.starts_with("source"))
+                && (trimmed.contains("$(tirith init")
+                    || trimmed.contains("`tirith init")
+                    || trimmed.contains("<(tirith init")))
     })
 }
 

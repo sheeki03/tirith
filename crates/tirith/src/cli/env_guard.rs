@@ -198,6 +198,8 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         out.push('\n');
     }
 
+    // Atomic publish (temp + fsync + rename) through the retained parent
+    // capability: a crash or full disk leaves the previous policy intact.
     contained.write_atomic(out.as_bytes(), true)
 }
 

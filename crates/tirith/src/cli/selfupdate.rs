@@ -739,6 +739,14 @@ fn run_update(
     }
 
     if !crate::cli::confirm(&format!("Update tirith from v{current} to v{latest}?"), yes) {
+        // repo-0492: in --json mode a cancelled update must still emit exactly
+        // one document (a machine consumer cannot distinguish empty stdout).
+        if json {
+            let _ = super::write_json_stdout(
+                &serde_json::json!({"schema_version": 1, "kind": "update", "status": "cancelled"}),
+                "tirith update: failed to write JSON output",
+            );
+        }
         eprintln!("tirith: update cancelled");
         return 0;
     }
@@ -754,7 +762,9 @@ fn run_update(
         }
     };
 
-    println!("tirith: downloading {tag} for {target}...");
+    // repo-0492: progress goes to stderr — in --json mode stdout must carry
+    // exactly one JSON document.
+    eprintln!("tirith: downloading {tag} for {target}...");
     let release = match download_release_set(&tag, &archive_name, workdir.path()) {
         Ok(r) => r,
         Err(e) => {
@@ -1004,6 +1014,12 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
     }
 
     if !crate::cli::confirm("Roll tirith back to the previously-installed binary?", yes) {
+        if json {
+            let _ = super::write_json_stdout(
+                &serde_json::json!({"schema_version": 1, "kind": "rollback", "status": "cancelled"}),
+                "tirith rollback: failed to write JSON output",
+            );
+        }
         eprintln!("tirith: rollback cancelled");
         return 0;
     }

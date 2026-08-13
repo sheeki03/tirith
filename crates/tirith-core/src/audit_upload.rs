@@ -1,9 +1,12 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead as _, Read as _, Seek as _, Write as _};
 use std::path::PathBuf;
 
 const DEFAULT_MAX_EVENTS: usize = 1000;
 const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB
+/// Absolute allocation/read ceiling even when a caller supplies a larger
+/// retention value.
+const ABSOLUTE_MAX_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Dedicated cross-process lock guarding every spool read/append/rewrite
 /// (repo-0250): without it, two drainers snapshot-then-rewrite from stale
@@ -51,6 +54,12 @@ fn spool_path() -> PathBuf {
 ///
 /// DLP redaction must be applied **before** calling this function.
 pub fn spool_event(event_json: &str) -> std::io::Result<()> {
+    if event_json.len() as u64 + 1 > ABSOLUTE_MAX_SPOOL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit event exceeds the per-event spool limit",
+        ));
+    }
     with_spool_lock(|| spool_event_locked(event_json))
 }
 
@@ -65,9 +74,32 @@ fn spool_event_locked(event_json: &str) -> std::io::Result<()> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    {
+        if fs::symlink_metadata(&path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(std::io::Error::other(
+                "refusing to append through a symlinked audit spool",
+            ));
+        }
     }
     let mut file = opts.open(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "refusing to append to a non-regular audit spool",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     writeln!(file, "{event_json}")?;
+    file.sync_data()?;
     Ok(())
 }
 
@@ -91,7 +123,10 @@ fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> V
         // Walk newest→oldest so the drop list favors the most stale events.
         for line in result.into_iter().rev() {
             let line_bytes = line.len() as u64 + 1;
-            if running_bytes + line_bytes > max_bytes && !kept.is_empty() {
+            if line_bytes > max_bytes {
+                continue;
+            }
+            if running_bytes + line_bytes > max_bytes {
                 break;
             }
             running_bytes += line_bytes;
@@ -106,6 +141,40 @@ fn enforce_retention(lines: Vec<String>, max_events: usize, max_bytes: u64) -> V
     }
 
     result
+}
+
+/// Read only the newest bounded suffix of the spool. The returned boolean says
+/// older bytes (or a partial boundary record) were omitted.
+fn read_spool_lines_bounded(
+    path: &std::path::Path,
+    requested_max_bytes: u64,
+) -> std::io::Result<(Vec<String>, bool)> {
+    let max_bytes = requested_max_bytes.min(ABSOLUTE_MAX_SPOOL_BYTES);
+    let mut file = crate::util::open_read_no_follow_capped(path, u64::MAX)
+        .map_err(|e| std::io::Error::other(format!("cannot safely open audit spool: {e:?}")))?;
+    let length = file.metadata()?.len();
+    if max_bytes == 0 {
+        return Ok((Vec::new(), length > 0));
+    }
+    let start = length.saturating_sub(max_bytes);
+    let mut discard_partial = false;
+    if start > 0 {
+        file.seek(std::io::SeekFrom::Start(start - 1))?;
+        let mut previous = [0u8; 1];
+        file.read_exact(&mut previous)?;
+        discard_partial = previous[0] != b'\n';
+    }
+    file.seek(std::io::SeekFrom::Start(start))?;
+    let mut reader = std::io::BufReader::new(file.take(length.saturating_sub(start)));
+    if discard_partial {
+        let mut ignored = String::new();
+        reader.read_line(&mut ignored)?;
+    }
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        lines.push(line?);
+    }
+    Ok((lines, start > 0))
 }
 
 /// Drain the spool by uploading events to the server (background, non-blocking).
@@ -126,22 +195,18 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
     // Snapshot under the spool lock (repo-0250); the network phase runs
     // unlocked so appends are not blocked behind slow sends, and the final
     // rewrite re-locks and removes only the prefix this drainer actually sent.
-    let content = match with_spool_lock(|| fs::read_to_string(&path)) {
-        Ok(c) => c,
+    let lines = match with_spool_lock(|| -> std::io::Result<Vec<String>> {
+        let (current, tail_truncated) = read_spool_lines_bounded(&path, max_bytes)?;
+        let retained = enforce_retention(current.clone(), max_events, max_bytes);
+        if tail_truncated || retained != current {
+            write_spool_atomic(&path, &retained)?;
+        }
+        Ok(retained)
+    }) {
+        Ok(lines) => lines,
         Err(_) => return,
     };
-    let lines: Vec<String> = content.lines().map(String::from).collect();
     if lines.is_empty() {
-        return;
-    }
-
-    let lines = enforce_retention(lines, max_events, max_bytes);
-    if lines.is_empty() {
-        if let Err(e) = fs::write(&path, "") {
-            crate::audit::audit_diagnostic(format!(
-                "tirith: audit-spool: failed to clear spool: {e}"
-            ));
-        }
         return;
     }
 
@@ -178,7 +243,7 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
                     crate::audit::audit_diagnostic(
                         "tirith: audit-upload: auth failed, stopping upload",
                     );
-                    rewrite_spool(&path, &lines[sent_count..]);
+                    rewrite_spool(&path, &lines, sent_count, max_bytes);
                     return;
                 }
                 _ => {
@@ -194,32 +259,89 @@ pub fn drain_spool(server_url: &str, api_key: &str, max_events: usize, max_bytes
         }
     }
 
-    rewrite_spool(&path, &lines[sent_count..]);
+    rewrite_spool(&path, &lines, sent_count, max_bytes);
 }
 
-/// Rewrite the spool file with the remaining unsent lines.
-fn rewrite_spool(path: &std::path::Path, remaining: &[String]) {
-    let _ = with_spool_lock(|| {
+fn write_spool_atomic(path: &std::path::Path, lines: &[String]) -> std::io::Result<()> {
+    let mut content = lines.join("\n");
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    crate::util::write_file_atomic_0600(path, content.as_bytes())
+}
+
+/// Remove exactly the sent prefix of `snapshot`, preserving its unsent suffix
+/// and every line appended after that snapshot. If another drainer or retention
+/// pass changed the prefix, leave the file untouched: at-least-once delivery is
+/// safer than guessing and deleting an event.
+fn rewrite_spool(path: &std::path::Path, snapshot: &[String], sent_count: usize, max_bytes: u64) {
+    let result = with_spool_lock(|| {
         // repo-0250: under the lock, re-read the CURRENT file and remove only
         // the prefix this drainer sent. Events appended by another process
-        // while we were sending land at the end and must survive. On any
-        // suffix mismatch (another drainer intervened), keep the file as-is —
-        // at-least-once delivery beats silent loss.
-        let current = fs::read_to_string(path).unwrap_or_default();
-        let current_lines: Vec<String> = current.lines().map(String::from).collect();
-        if current_lines.len() < remaining.len()
-            || current_lines[current_lines.len() - remaining.len()..] != *remaining
+        // while we were sending land at the end and must survive.
+        let (current_lines, tail_truncated) = read_spool_lines_bounded(path, max_bytes)?;
+        if tail_truncated {
+            return Ok(());
+        }
+        if sent_count > snapshot.len()
+            || current_lines.len() < snapshot.len()
+            || current_lines[..snapshot.len()] != *snapshot
         {
             return Ok(());
         }
-        let keep = &current_lines[..current_lines.len() - remaining.len()];
-        let _ = keep; // the sent prefix we are dropping
-        let mut content = remaining.join("\n");
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        fs::write(path, content)
+        let mut keep = snapshot[sent_count..].to_vec();
+        keep.extend_from_slice(&current_lines[snapshot.len()..]);
+        write_spool_atomic(path, &keep)
     });
+    if let Err(error) = result {
+        crate::audit::audit_diagnostic(format!(
+            "tirith: audit-spool: failed to publish rewritten spool: {error}"
+        ));
+    }
+}
+
+/// repo-0194: coalesce bursts into ONE drainer. A thread per event lets a burst
+/// create unbounded concurrent workers in a long-lived process.
+static DRAIN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The running drainer snapshots the spool once, so an event appended after that
+/// snapshot is not covered by it. Record that the spool changed and let the
+/// drainer take another pass; without this the event waits for an unrelated
+/// later append and retention can drop it undelivered.
+static DRAIN_RESCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Releases the drainer claim even if the worker panics or never starts.
+/// Without it a failed spawn or a panic inside `drain_spool` would leave
+/// `DRAIN_ACTIVE` set forever and every later event would only flag a rescan
+/// nobody performs, stranding the durable queue until the process restarts.
+struct DrainOwnership {
+    held: bool,
+}
+
+impl DrainOwnership {
+    fn release(&mut self) {
+        if self.held {
+            self.held = false;
+            DRAIN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn retake(&mut self) -> bool {
+        self.held = DRAIN_ACTIVE
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        self.held
+    }
+}
+
+impl Drop for DrainOwnership {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// Primary entry point: append the event to the durable spool, then spawn a
@@ -231,18 +353,87 @@ pub fn spool_and_upload(
     max_events: Option<usize>,
     max_bytes: Option<u64>,
 ) {
+    let max_ev = max_events.unwrap_or(DEFAULT_MAX_EVENTS);
+    let max_b = max_bytes
+        .unwrap_or(DEFAULT_MAX_BYTES)
+        .min(ABSOLUTE_MAX_SPOOL_BYTES);
+    if event_json.len() as u64 + 1 > max_b {
+        crate::audit::audit_diagnostic(
+            "tirith: audit-spool: event exceeds the configured spool byte limit; event not queued",
+        );
+        return;
+    }
     if let Err(e) = spool_event(event_json) {
         crate::audit::audit_diagnostic(format!("tirith: audit-spool: failed to write event: {e}"));
         return;
     }
 
+    // repo-0195: enforce retention AT APPEND TIME, before any destination
+    // validation or network state can skip it — a prolonged outage must not
+    // grow the queue past the configured bounds.
+    trim_spool_to_retention(max_ev, max_b);
+
+    if DRAIN_ACTIVE
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        DRAIN_RESCAN.store(true, std::sync::atomic::Ordering::Release);
+        return; // a drainer is already running; the flag makes it rescan
+    }
+
     // Drain runs on a background thread — the CLI path must never block on network I/O.
     let url = server_url.to_string();
     let key = api_key.to_string();
-    let max_ev = max_events.unwrap_or(DEFAULT_MAX_EVENTS);
-    let max_b = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
-    std::thread::spawn(move || {
-        drain_spool(&url, &key, max_ev, max_b);
+    let spawned = std::thread::Builder::new()
+        .name("tirith-audit-drain".to_string())
+        .spawn(move || {
+            let mut ownership = DrainOwnership { held: true };
+            loop {
+                // Clear before draining: an append during this pass sets the
+                // flag again and earns another one.
+                DRAIN_RESCAN.store(false, std::sync::atomic::Ordering::Release);
+                drain_spool(&url, &key, max_ev, max_b);
+                if DRAIN_RESCAN.load(std::sync::atomic::Ordering::Acquire) {
+                    continue;
+                }
+                ownership.release();
+                // An append between the load above and that release saw an
+                // active drainer and only set the flag, so re-take ownership for
+                // it. If another caller already became the drainer, it owns the
+                // work.
+                if !DRAIN_RESCAN.load(std::sync::atomic::Ordering::Acquire) || !ownership.retake() {
+                    break;
+                }
+            }
+        });
+    if spawned.is_err() {
+        // Never leave the claim set for a worker that does not exist.
+        DRAIN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        crate::audit::audit_diagnostic(
+            "tirith: audit-upload: could not start the drain worker; the spool is retained",
+        );
+    }
+}
+
+/// Trim the spool file to the retention bounds (event count and total bytes),
+/// dropping the oldest lines. Runs under the spool lock.
+fn trim_spool_to_retention(max_events: usize, max_bytes: u64) {
+    let path = spool_path();
+    let _ = with_spool_lock(|| -> std::io::Result<()> {
+        let (lines, tail_truncated) = match read_spool_lines_bounded(&path, max_bytes) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        let trimmed = enforce_retention(lines.clone(), max_events, max_bytes);
+        if tail_truncated || trimmed != lines {
+            write_spool_atomic(&path, &trimmed)?;
+        }
+        Ok(())
     });
 }
 
@@ -307,7 +498,8 @@ mod tests {
         let path = dir.path().join("spool.jsonl");
         fs::write(&path, "line1\nline2\n").unwrap();
 
-        rewrite_spool(&path, &[]);
+        let snapshot = vec!["line1".to_string(), "line2".to_string()];
+        rewrite_spool(&path, &snapshot, snapshot.len(), u64::MAX);
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.is_empty());
     }
@@ -319,8 +511,13 @@ mod tests {
         // The on-disk spool holds the drainer's snapshot (sent + unsent lines).
         fs::write(&path, "line1\nline2\nline3\nline4\n").unwrap();
 
-        let remaining = vec!["line3".to_string(), "line4".to_string()];
-        rewrite_spool(&path, &remaining);
+        let snapshot = vec![
+            "line1".to_string(),
+            "line2".to_string(),
+            "line3".to_string(),
+            "line4".to_string(),
+        ];
+        rewrite_spool(&path, &snapshot, 2, u64::MAX);
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "line3\nline4\n");
     }
@@ -334,12 +531,43 @@ mod tests {
         let path = dir.path().join("spool.jsonl");
         fs::write(&path, "line1\nline3\nline4\nline5-new\n").unwrap();
 
-        let remaining = vec!["line3".to_string(), "line4".to_string()];
-        rewrite_spool(&path, &remaining);
+        let snapshot = vec![
+            "line1".to_string(),
+            "line3".to_string(),
+            "line4".to_string(),
+        ];
+        rewrite_spool(&path, &snapshot, 1, u64::MAX);
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(
-            content, "line1\nline3\nline4\nline5-new\n",
-            "a suffix mismatch must leave the spool untouched"
+            content, "line3\nline4\nline5-new\n",
+            "the sent prefix is removed while a concurrent append survives"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_spool_preserves_append_after_fully_sent_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        fs::write(&path, "line1\nline2\nline3-new\n").unwrap();
+        let snapshot = vec!["line1".to_string(), "line2".to_string()];
+
+        rewrite_spool(&path, &snapshot, snapshot.len(), u64::MAX);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "line3-new\n");
+    }
+
+    #[test]
+    fn test_rewrite_spool_refuses_changed_snapshot_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        fs::write(&path, "other\nline2\nline3-new\n").unwrap();
+        let snapshot = vec!["line1".to_string(), "line2".to_string()];
+
+        rewrite_spool(&path, &snapshot, 1, u64::MAX);
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "other\nline2\nline3-new\n"
         );
     }
 }

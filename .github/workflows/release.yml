@@ -1064,8 +1064,12 @@ jobs:
           sed -i "s/^pkgrel=.*/pkgrel=1/" packaging/aur/PKGBUILD
 
           # Compute source checksum without keeping the tarball (AUR has a blob size limit)
+          # repo-0453: --fail so an HTTP error page is never hashed as the
+          # "source archive"; validate the payload is a gzip stream.
           URL="https://github.com/sheeki03/tirith/archive/refs/tags/${VERSION}.tar.gz"
-          SHA=$(curl -sSL "$URL" | sha256sum | cut -d' ' -f1)
+          set -o pipefail
+          SHA=$(curl -fsSL "$URL" | tee /tmp/aur-src.tar.gz | sha256sum | cut -d' ' -f1)
+          file /tmp/aur-src.tar.gz | grep -q "gzip compressed data"
           sed -i "s/^sha256sums=.*/sha256sums=('${SHA}')/" packaging/aur/PKGBUILD
 
       - name: Publish to AUR

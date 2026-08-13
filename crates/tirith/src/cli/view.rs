@@ -116,9 +116,15 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
 
     // Human path: write the sanitized content to stdout (so callers can
     // `tirith view foo | less`), and the findings/banner to stderr.
-    let _ = std::io::stdout().lock().write_all(&sanitized);
+    // repo-0502: a broken pipe or full filesystem must not return the
+    // verdict's clean exit code with truncated/absent output.
+    let mut out_ok = std::io::stdout().lock().write_all(&sanitized).is_ok();
     if !sanitized.is_empty() && !sanitized.ends_with(b"\n") {
-        let _ = writeln!(std::io::stdout().lock());
+        out_ok = writeln!(std::io::stdout().lock()).is_ok() && out_ok;
+    }
+    if !out_ok {
+        eprintln!("tirith view: failed to write output");
+        return 1;
     }
 
     print_findings_human(&verdict, path, total_bytes, truncated);

@@ -257,14 +257,27 @@ impl IsolatedEnv {
         let path = self.bash_enter_capability_file();
         std::fs::create_dir_all(path.parent().expect("capability cache parent"))
             .expect("pty harness: create state dir");
-        // Schema 1 mirrors `CACHE_SCHEMA`. tirith_version is blank: the hook only
-        // enforces it when a sibling `.hooks-version` exists, which the harness
-        // (sourcing the hook directly) does not create.
+        // Schema 2 mirrors `CACHE_SCHEMA` (repo-0211 binds mtime+size).
+        // tirith_version is blank: the hook only enforces it when a sibling
+        // `.hooks-version` exists, which the harness (sourcing the hook
+        // directly) does not create.
+        let fingerprint = std::fs::metadata(bash_path)
+            .ok()
+            .and_then(|m| {
+                let secs = m
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?;
+                Some(format!("{}:{}", secs.as_secs(), m.len()))
+            })
+            .unwrap_or_default();
         let body = format!(
-            "schema=1\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
-             bash_path={}\nenter_capability={verdict}\n\
+            "schema=2\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+             bash_path={}\nbash_fingerprint={}\nenter_capability={verdict}\n\
              reason=seeded by pty conformance harness\n",
-            bash_path.display()
+            bash_path.display(),
+            fingerprint
         );
         std::fs::write(&path, body).expect("pty harness: write capability cache");
     }

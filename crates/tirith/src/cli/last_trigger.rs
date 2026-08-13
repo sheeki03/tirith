@@ -65,6 +65,29 @@ pub fn write_last_trigger(
         }
         let path = dir.join("last_trigger.json");
 
+        // A failed replacement must not leave an older event available to
+        // `trust --from-last-trigger`. Invalidate the previous record before
+        // constructing the new one; losing this convenience record is safer
+        // than applying trust to a stale finding after any serialization or
+        // publication failure below.
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tirith_core::audit::audit_diagnostic(format!(
+                        "tirith: warning: cannot invalidate stale last-trigger record: {e}"
+                    ));
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tirith_core::audit::audit_diagnostic(format!(
+                    "tirith: warning: cannot inspect prior last-trigger record: {e}"
+                ));
+                return;
+            }
+        }
+
         let redacted_findings =
             tirith_core::redact::redacted_findings(&verdict.findings, custom_patterns);
 
@@ -122,7 +145,15 @@ pub fn write_last_trigger(
 
             let mut tmp_file = match NamedTempFile::new_in(&dir) {
                 Ok(f) => f,
-                Err(_) => return,
+                Err(e) => {
+                    // repo-0486: a stale last_trigger.json is a WRONG-TRUST
+                    // hazard (`trust --from-last-trigger` would act on an old
+                    // event) — never fail silently.
+                    tirith_core::audit::audit_diagnostic(format!(
+                        "tirith: warning: last-trigger temp file failed: {e}"
+                    ));
+                    return;
+                }
             };
             #[cfg(unix)]
             {
@@ -132,9 +163,15 @@ pub fn write_last_trigger(
                     .set_permissions(std::fs::Permissions::from_mode(0o600));
             }
             if tmp_file.write_all(json.as_bytes()).is_err() {
+                tirith_core::audit::audit_diagnostic("tirith: warning: last-trigger write failed");
                 return;
             }
-            let _ = tmp_file.persist(&path);
+            if let Err(e) = tmp_file.persist(&path) {
+                tirith_core::audit::audit_diagnostic(format!(
+                    "tirith: warning: last-trigger publish failed: {}",
+                    e.error
+                ));
+            }
         }
     }
 }

@@ -43,6 +43,7 @@ const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_SECRET_BLOCK_BYTES: usize = 1024 * 1024;
 const REDACTED_BLOCK_MARKER: &str = "[REDACTED]";
 const INCOMPLETE_REDACTION_MARKER: &str = "[REDACTED:incomplete]";
+const OVERSIZED_LOG_LINE_MARKER: &str = "[... oversized line omitted ...]";
 
 // ─── scan ───────────────────────────────────────────────────────────────────
 
@@ -551,6 +552,70 @@ where
     Ok(())
 }
 
+/// Stream plain logical lines without allowing one newline-free record to make
+/// `BufRead::read_line` allocate the entire remainder of an attacker-controlled
+/// file. Oversized records are discarded through the next newline and replaced
+/// by one categorical marker.
+fn read_plain_records_bounded<R, F>(
+    reader: &mut R,
+    line_limit: usize,
+    mut consume: F,
+) -> std::io::Result<()>
+where
+    R: BufRead,
+    F: FnMut(String),
+{
+    let mut line = Vec::with_capacity(STREAM_CHUNK_BYTES.min(line_limit));
+    let mut oversized = false;
+    let mut pending = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if pending || oversized {
+                if oversized {
+                    consume(OVERSIZED_LOG_LINE_MARKER.to_string());
+                } else {
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    consume(String::from_utf8_lossy(&line).into_owned());
+                }
+            }
+            return Ok(());
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let payload_len = newline.unwrap_or(available.len());
+        if !oversized {
+            let remaining = line_limit.saturating_sub(line.len());
+            if payload_len > remaining {
+                oversized = true;
+                line.clear();
+            } else {
+                line.extend_from_slice(&available[..payload_len]);
+            }
+        }
+        pending |= payload_len > 0;
+
+        let consumed = payload_len + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            if oversized {
+                consume(OVERSIZED_LOG_LINE_MARKER.to_string());
+            } else {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                consume(String::from_utf8_lossy(&line).into_owned());
+            }
+            line.clear();
+            oversized = false;
+            pending = false;
+        }
+    }
+}
+
 // ─── summarize ──────────────────────────────────────────────────────────────
 
 /// `tirith logs summarize` — a compressed, optionally-sanitized view of a log.
@@ -580,9 +645,29 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
         Vec::new()
     };
 
-    // Stream-collapse duplicates and (optionally) redact + strip ANSI; holds at
-    // most `max_lines * 2` collapsed entries, far smaller than the input.
-    let mut collected: Vec<String> = Vec::new();
+    // repo-0223: the old "bounded" claim was false — every UNIQUE line was
+    // retained and truncated only after EOF. Keep only the head and a rolling
+    // tail window, so memory is O(max_lines) regardless of input size.
+    let mut lines_head: Vec<String> = Vec::new();
+    let mut lines_tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    // Reserve one line for the elision marker. With max_lines == 1 the
+    // bounded buffers intentionally retain no content lines, so the marker is
+    // the sole output instead of exceeding the caller's requested limit.
+    let budget = max_lines.saturating_sub(1);
+    let head_cap = budget.div_ceil(2);
+    let tail_cap = budget - head_cap;
+    let mut total_lines: usize = 0;
+    let mut push_bounded = |line: String| {
+        total_lines += 1;
+        if lines_head.len() < head_cap {
+            lines_head.push(line);
+        } else {
+            lines_tail.push_back(line);
+            while lines_tail.len() > tail_cap {
+                lines_tail.pop_front();
+            }
+        }
+    };
     let mut collapsed_runs: usize = 0;
     let mut secret_count: usize = 0;
     let mut redaction_breakdown: Vec<RedactionCount> = Vec::new();
@@ -591,11 +676,11 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
     let mut last_line: Option<String> = None;
     let mut last_count: usize = 0;
 
-    let push_collapsed = |collected: &mut Vec<String>, line: &str, count: usize| {
+    let push_collapsed = |push_bounded: &mut dyn FnMut(String), line: &str, count: usize| {
         if count > 1 {
-            collected.push(format!("{line} [×{count}]"));
+            push_bounded(format!("{line} [×{count}]"));
         } else {
-            collected.push(line.to_string());
+            push_bounded(line.to_string());
         }
     };
 
@@ -608,7 +693,7 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
                 if last_count > 1 {
                     collapsed_runs += last_count - 1;
                 }
-                push_collapsed(&mut collected, &prev, last_count);
+                push_collapsed(&mut push_bounded, prev.as_str(), last_count);
             }
             last_line = Some(processed);
             last_count = 1;
@@ -638,36 +723,32 @@ pub fn summarize(path: &Path, safe_for_agent: bool, max_lines: usize, json: bool
     } else {
         // Preserve the unredacted command's historical behavior. The protected
         // path above uses fixed-size reads and a bounded logical-record cap.
-        let mut buf: Vec<u8> = Vec::with_capacity(4096);
-        loop {
-            buf.clear();
-            let n = match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("tirith logs summarize: read error: {e}");
-                    return 1;
-                }
-            };
-            let mut end = n;
-            if end > 0 && buf[end - 1] == b'\n' {
-                end -= 1;
-            }
-            if end > 0 && buf[end - 1] == b'\r' {
-                end -= 1;
-            }
-            accept_processed(String::from_utf8_lossy(&buf[..end]).into_owned());
+        if let Err(e) =
+            read_plain_records_bounded(&mut reader, MAX_STREAM_LINE_BYTES, accept_processed)
+        {
+            eprintln!("tirith logs summarize: read error: {e}");
+            return 1;
         }
     }
     if let Some(prev) = last_line.take() {
         if last_count > 1 {
             collapsed_runs += last_count - 1;
         }
-        push_collapsed(&mut collected, &prev, last_count);
+        push_collapsed(&mut push_bounded, prev.as_str(), last_count);
     }
 
-    // Head+tail truncation to `max_lines`.
-    let (final_lines, elided) = head_tail_truncate(&collected, max_lines);
+    // Head+tail truncation to `max_lines` from the bounded buffers.
+    let (final_lines, elided) = if total_lines <= max_lines {
+        let mut all = lines_head.clone();
+        all.extend(lines_tail.iter().cloned());
+        (all, 0)
+    } else {
+        let elided = total_lines.saturating_sub(lines_head.len() + lines_tail.len());
+        let mut out = lines_head.clone();
+        out.push(format!("[... {elided} lines collapsed ...]"));
+        out.extend(lines_tail.iter().cloned());
+        (out, elided)
+    };
 
     if json {
         return emit_summarize_json(
@@ -764,6 +845,7 @@ fn emit_summarize_json(
 /// remaining count plus the elision marker fits in `max_lines`. Returns
 /// `(final_lines, elided_count)`. When the input already fits, the
 /// original lines are returned unchanged with `elided = 0`.
+#[cfg(test)]
 fn head_tail_truncate(lines: &[String], max_lines: usize) -> (Vec<String>, usize) {
     if lines.len() <= max_lines {
         return (lines.to_vec(), 0);
@@ -1245,6 +1327,21 @@ mod tests {
         }
         let code = summarize(f.path(), false, 30, false);
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn plain_record_reader_bounds_a_newline_free_record_and_resumes() {
+        let input = format!("{}\nnext\r\n", "x".repeat(33));
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut records = Vec::new();
+
+        read_plain_records_bounded(&mut reader, 32, |line| records.push(line))
+            .expect("bounded read");
+
+        assert_eq!(
+            records,
+            vec![OVERSIZED_LOG_LINE_MARKER.to_string(), "next".to_string()]
+        );
     }
 
     #[test]

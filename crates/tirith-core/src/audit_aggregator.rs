@@ -1,7 +1,7 @@
 //! Audit log aggregation, analytics, and compliance reporting over JSONL logs:
 //! export (JSON/CSV), stats, and a structured compliance report.
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::io::{BufRead, Read as _, Seek as _};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -116,7 +116,15 @@ pub struct HookStats {
 pub struct ReadLogResult {
     pub records: Vec<AuditRecord>,
     pub skipped_lines: usize,
+    /// True when a bounded tail read omitted older bytes or records. Full-log
+    /// readers leave this false.
+    pub truncated_records: bool,
 }
+
+/// Maximum audit bytes diagnostic consumers inspect. The record cap limits
+/// retained objects; this independent byte cap limits CPU and the largest
+/// possible line allocation when a hostile log contains no newlines.
+const MAX_LOG_TAIL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Read and parse all records from a JSONL audit log, STREAMING line-by-line via
 /// [`BufReader`] so a large append-only log is never fully buffered. Result and
@@ -128,6 +136,98 @@ pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
         std::fs::File::open(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     let reader = std::io::BufReader::new(file);
     parse_log_from_reader(reader, Some(path))
+}
+
+/// repo-0479/0480/0481: bounded variant for diagnostic consumers — keeps only
+/// the NEWEST `max_records` parsed records, so a huge or attacker-inflated
+/// audit log cannot hang or OOM `doctor`, `explain`, or `incident`.
+pub fn read_log_tail(path: &Path, max_records: usize) -> Result<ReadLogResult, String> {
+    read_log_tail_with_byte_cap(path, max_records, MAX_LOG_TAIL_BYTES)
+}
+
+fn read_log_tail_with_byte_cap(
+    path: &Path,
+    max_records: usize,
+    max_bytes: u64,
+) -> Result<ReadLogResult, String> {
+    let mut file = crate::util::open_read_no_follow_capped(path, u64::MAX)
+        .map_err(|e| format!("Failed to safely open {}: {e:?}", path.display()))?;
+    let initial_metadata = file
+        .metadata()
+        .map_err(|e| format!("Failed to stat {}: {e}", path.display()))?;
+    let length = initial_metadata.len();
+    if max_records == 0 || max_bytes == 0 {
+        return Ok(ReadLogResult {
+            records: Vec::new(),
+            skipped_lines: 0,
+            truncated_records: length > 0,
+        });
+    }
+
+    let start = length.saturating_sub(max_bytes);
+    let mut discard_partial = false;
+    if start > 0 {
+        file.seek(std::io::SeekFrom::Start(start - 1))
+            .map_err(|e| format!("Failed to seek {}: {e}", path.display()))?;
+        let mut previous = [0u8; 1];
+        file.read_exact(&mut previous)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        discard_partial = previous[0] != b'\n';
+    }
+    file.seek(std::io::SeekFrom::Start(start))
+        .map_err(|e| format!("Failed to seek {}: {e}", path.display()))?;
+    // Read only the bytes that belonged to the open handle's metadata snapshot;
+    // concurrent appends cannot extend this invocation past the cap.
+    let snapshot_bytes = length.saturating_sub(start);
+    let metadata_probe = file
+        .try_clone()
+        .map_err(|e| format!("Failed to clone {}: {e}", path.display()))?;
+    let reader = std::io::BufReader::new(file.take(snapshot_bytes));
+    let mut reader = reader;
+    let mut truncated_records = start > 0;
+    if discard_partial {
+        // `start` can land in the middle of a JSONL record. Drop that bounded
+        // fragment so it cannot be misreported as malformed input. If it was
+        // exactly at a boundary we conservatively omit one additional record.
+        let mut partial = Vec::new();
+        reader
+            .read_until(b'\n', &mut partial)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    }
+    let mut records: std::collections::VecDeque<AuditRecord> =
+        std::collections::VecDeque::with_capacity(max_records.min(1024));
+    let mut skipped_lines = 0usize;
+    for (idx, line) in reader.lines().enumerate() {
+        let line_num = idx + 1;
+        match line {
+            Ok(line) => {
+                let mut one = Vec::new();
+                parse_log_line(&line, line_num, Some(path), &mut one, &mut skipped_lines);
+                if let Some(record) = one.into_iter().next() {
+                    if records.len() >= max_records {
+                        records.pop_front();
+                        truncated_records = true;
+                    }
+                    records.push_back(record);
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to read {}: {e}", path.display()));
+            }
+        }
+    }
+    if let Ok(final_metadata) = metadata_probe.metadata() {
+        if final_metadata.len() != initial_metadata.len()
+            || final_metadata.modified().ok() != initial_metadata.modified().ok()
+        {
+            truncated_records = true;
+        }
+    }
+    Ok(ReadLogResult {
+        records: records.into_iter().collect(),
+        skipped_lines,
+        truncated_records,
+    })
 }
 
 /// Streaming counterpart of [`parse_log`]: pulls one line at a time from
@@ -159,6 +259,7 @@ pub fn parse_log_from_reader(
     Ok(ReadLogResult {
         records,
         skipped_lines,
+        truncated_records: false,
     })
 }
 
@@ -174,6 +275,7 @@ pub fn parse_log(content: &str, source: Option<&Path>) -> ReadLogResult {
     ReadLogResult {
         records,
         skipped_lines,
+        truncated_records: false,
     }
 }
 
@@ -1198,6 +1300,56 @@ mod tests {
             read_log(dir.path()).is_err(),
             "read_log on a directory must return Err (not hang, not Ok)"
         );
+    }
+
+    #[test]
+    fn bounded_tail_keeps_newest_records_and_reports_omission() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let rows = sample_records();
+        let content = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).expect("serialize row"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, content).expect("write audit log");
+
+        let tail = read_log_tail_with_byte_cap(&path, 2, u64::MAX).expect("read tail");
+        assert_eq!(tail.records.len(), 2);
+        assert_eq!(tail.records[0].action, rows[1].action);
+        assert_eq!(tail.records[1].action, rows[2].action);
+        assert!(tail.truncated_records);
+    }
+
+    #[test]
+    fn bounded_tail_limits_bytes_and_never_keeps_a_partial_first_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let row = serde_json::to_string(&sample_records()[0]).expect("serialize row");
+        let content = format!("{}\n{row}\n", "x".repeat(4096));
+        std::fs::write(&path, content).expect("write audit log");
+
+        let cap = (row.len() + 32) as u64;
+        let tail = read_log_tail_with_byte_cap(&path, 10, cap).expect("read bounded tail");
+        assert_eq!(tail.records.len(), 1);
+        assert_eq!(tail.records[0].event_id.as_deref(), Some("evt-1"));
+        assert_eq!(
+            tail.skipped_lines, 0,
+            "partial prefix is not malformed JSON"
+        );
+        assert!(tail.truncated_records);
+    }
+
+    #[test]
+    fn zero_record_tail_is_empty_and_reports_nonempty_input() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "{}\n").expect("write audit log");
+
+        let tail = read_log_tail(&path, 0).expect("zero-sized tail");
+        assert!(tail.records.is_empty());
+        assert!(tail.truncated_records);
     }
 
     // PR #121 CR follow-up — caller-influenced CSV columns must be neutralized

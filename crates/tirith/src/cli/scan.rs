@@ -309,6 +309,16 @@ pub fn run(
     } else if ci_coverage_fail {
         // Fail closed in CI: an incomplete scan must not report success.
         1
+    } else if ci {
+        // repo-0230: under --ci, findings BELOW --fail-on must not fail the
+        // build — every non-zero code is a failure in CI systems, so the
+        // legacy "2 = findings below threshold" makes `--fail-on high` fail on
+        // Low/Medium noise.
+        if !output_ok {
+            1
+        } else {
+            0
+        }
     } else if result.total_findings() > 0 {
         2
     } else if !output_ok {

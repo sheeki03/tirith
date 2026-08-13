@@ -57,7 +57,7 @@ pub fn run_with_options(
                 .and_then(|p| p.to_str().map(String::from))
                 .as_deref(),
         );
-        let (ctx, bad) = output_filter::OutputFilterContext::from_policy(&policy);
+        let (ctx, bad) = output_filter::OutputFilterContext::from_policy_with_diagnostics(&policy);
         for (pattern, error) in &bad {
             let _ = writeln!(
                 log,
