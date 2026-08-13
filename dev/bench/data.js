@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786561831851,
+  "lastUpdate": 1786611433306,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -1948,6 +1948,84 @@ window.BENCHMARK_DATA = {
           {
             "name": "byte_scan_ansi",
             "value": 92,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7264d760ddd3e2dfccc5d3a941082cef897491a8",
+          "message": "fix(security): DeepSec R2 2/2: CLI, license server, and CI hardening (#180)\n\nfix(security): DeepSec R2 2/2: CLI, license server, and CI hardening",
+          "timestamp": "2026-08-13T14:23:20+05:30",
+          "tree_id": "3790ec39e8ed43e1e41002a0820af09220f727d1",
+          "url": "https://github.com/sheeki03/tirith/commit/7264d760ddd3e2dfccc5d3a941082cef897491a8"
+        },
+        "date": 1786611432183,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 494,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 123,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 82206,
+            "range": "± 415",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 448819,
+            "range": "± 9193",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 578349,
+            "range": "± 13294",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 305337,
+            "range": "± 2748",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 31482,
+            "range": "± 369",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 78,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 93,
             "range": "± 0",
             "unit": "ns/iter"
           }
