@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786611433306,
+  "lastUpdate": 1786618316709,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -2021,6 +2021,84 @@ window.BENCHMARK_DATA = {
             "name": "byte_scan_clean",
             "value": 78,
             "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 93,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3e7c62d46a724f8a05e0b8cddea7005babd677e5",
+          "message": "fix(security): remediate DeepSec R3 reliability and convergence queue (#181)",
+          "timestamp": "2026-08-13T16:18:16+05:30",
+          "tree_id": "26f51f7a4e42866fbb959860149c2ca1d567458c",
+          "url": "https://github.com/sheeki03/tirith/commit/3e7c62d46a724f8a05e0b8cddea7005babd677e5"
+        },
+        "date": 1786618315635,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 457,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 125,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 91942,
+            "range": "± 1725",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 427020,
+            "range": "± 5009",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 547912,
+            "range": "± 3637",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 291052,
+            "range": "± 3346",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 31531,
+            "range": "± 124",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 80,
+            "range": "± 1",
             "unit": "ns/iter"
           },
           {
