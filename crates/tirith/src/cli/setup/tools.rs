@@ -1003,6 +1003,77 @@ pub fn setup_pi_cli(opts: &SetupOpts) -> Result<(), String> {
     Ok(())
 }
 
+// Prime Agent extensions live in:
+//   - User scope: `~/.prime/agent/extensions/`
+//   - Project scope: `.prime/agent/extensions/`
+// With `--with-mcp`, also registers the tirith MCP gateway server in the
+// Prime Agent MCP settings file (`~/.prime/agent/settings.json` or `.prime/agent/settings.json`).
+pub fn setup_prime_agent(opts: &SetupOpts) -> Result<(), String> {
+    let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
+
+    let (target, scope_root) = match opts.scope {
+        Scope::Project => {
+            let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
+            (cwd.join(".prime").join("agent"), Some(cwd))
+        }
+        Scope::User => (home.join(".prime").join("agent"), Some(home.clone())),
+    };
+
+    fs_helpers::validate_target_dir(&target, scope_root.as_deref())?;
+
+    // Install the extension
+    let extensions_dir = target.join("extensions");
+    if !opts.dry_run {
+        std::fs::create_dir_all(&extensions_dir)
+            .map_err(|e| format!("create {}: {e}", extensions_dir.display()))?;
+    }
+
+    let guard_path = extensions_dir.join("tirith-guard.ts");
+    let guard_content = crate::assets::PRIME_AGENT_GUARD_TS;
+    fs_helpers::write_hook_script(&guard_path, guard_content, opts.force, opts.dry_run)?;
+
+    if opts.update_configs {
+        eprintln!();
+        eprintln!("tirith: Prime Agent hook scripts refreshed");
+        return Ok(());
+    }
+
+    // --with-mcp: register tirith gateway as MCP server in settings.json
+    if opts.with_mcp {
+        let settings_path = target.join("settings.json");
+        merge::merge_mcp_json(
+            &settings_path,
+            "tirith",
+            serde_json::json!({
+                "type": "stdio",
+                "command": opts.tirith_bin,
+                "args": ["mcp-server"],
+                "env": {}
+            }),
+            opts.force,
+            opts.dry_run,
+        )?;
+    }
+
+    if let Err(e) =
+        super::shell_profile::install_shell_hook(&opts.tirith_bin, opts.force, opts.dry_run)
+    {
+        eprintln!("tirith: WARNING: {e}");
+    }
+
+    eprintln!();
+    eprintln!("tirith: Prime Agent setup complete");
+    eprintln!("  Extension installed to: {}", guard_path.display());
+    if opts.with_mcp {
+        eprintln!(
+            "  MCP server registered in: {}",
+            target.join("settings.json").display()
+        );
+    }
+    eprintln!("  Run `tirith doctor` to verify your configuration.");
+    Ok(())
+}
+
 pub fn setup_openclaw(opts: &SetupOpts) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
 
@@ -2721,6 +2792,127 @@ mod tests {
             assert!(
                 cwd.join(".kiro/agents/tirith-security.json").exists(),
                 "creates new .kiro/ at cwd when no ancestor exists"
+            );
+        });
+    }
+
+    // ── setup_prime_agent tests ──────────────────────────────────────────
+
+    /// Project scope: guard written at .prime/agent/extensions/tirith-guard.ts
+    #[test]
+    fn setup_prime_agent_project_scope_writes_guard() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            setup_prime_agent(&opts_for(Scope::Project)).unwrap();
+
+            let guard = cwd.join(".prime/agent/extensions/tirith-guard.ts");
+            assert!(
+                guard.exists(),
+                "guard at .prime/agent/extensions/tirith-guard.ts"
+            );
+
+            let content = std::fs::read_to_string(&guard).unwrap();
+            assert!(
+                content.contains("extractBashCommand"),
+                "guard content is the prime-agent guard script"
+            );
+        });
+    }
+
+    /// User scope: guard written at ~/.prime/agent/extensions/tirith-guard.ts
+    #[test]
+    fn setup_prime_agent_user_scope_writes_guard() {
+        with_fake_env(false, |home, _cwd| {
+            setup_prime_agent(&opts_for(Scope::User)).unwrap();
+
+            let guard = home.join(".prime/agent/extensions/tirith-guard.ts");
+            assert!(
+                guard.exists(),
+                "guard at ~/.prime/agent/extensions/tirith-guard.ts"
+            );
+        });
+    }
+
+    /// --with-mcp writes settings.json with MCP server config
+    #[test]
+    fn setup_prime_agent_with_mcp_writes_settings_json() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let mut opts = opts_for(Scope::Project);
+            opts.with_mcp = true;
+            opts.tirith_bin = "/usr/local/bin/tirith".to_string();
+            setup_prime_agent(&opts).unwrap();
+
+            let settings_path = cwd.join(".prime/agent/settings.json");
+            assert!(settings_path.exists(), "settings.json created");
+
+            let raw = std::fs::read_to_string(&settings_path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let server = &v["mcpServers"]["tirith"];
+            assert_eq!(server["type"], "stdio");
+            assert_eq!(server["command"], "/usr/local/bin/tirith");
+            assert_eq!(server["args"], serde_json::json!(["mcp-server"]));
+        });
+    }
+
+    /// --with-mcp user scope: settings.json at ~/.prime/agent/settings.json
+    #[test]
+    fn setup_prime_agent_user_scope_with_mcp_writes_settings() {
+        with_fake_env(false, |home, _cwd| {
+            let mut opts = opts_for(Scope::User);
+            opts.with_mcp = true;
+            setup_prime_agent(&opts).unwrap();
+
+            let settings_path = home.join(".prime/agent/settings.json");
+            assert!(
+                settings_path.exists(),
+                "settings.json at ~/.prime/agent/"
+            );
+
+            let raw = std::fs::read_to_string(&settings_path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                v["mcpServers"]["tirith"].is_object(),
+                "tirith MCP server registered"
+            );
+        });
+    }
+
+    /// --update-configs refreshes hooks without writing settings.json
+    #[test]
+    fn setup_prime_agent_update_configs_refreshes_hooks_only() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let mut opts = opts_for(Scope::Project);
+            opts.with_mcp = true;
+            opts.update_configs = true;
+            setup_prime_agent(&opts).unwrap();
+
+            let guard = cwd.join(".prime/agent/extensions/tirith-guard.ts");
+            assert!(guard.exists(), "guard refreshed");
+
+            let settings_path = cwd.join(".prime/agent/settings.json");
+            assert!(
+                !settings_path.exists(),
+                "settings.json NOT written in update-configs mode"
+            );
+        });
+    }
+
+    /// dry-run: nothing is written to disk
+    #[test]
+    fn setup_prime_agent_dry_run_writes_nothing() {
+        with_fake_env(true, |_home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let mut opts = opts_for(Scope::Project);
+            opts.dry_run = true;
+            opts.with_mcp = true;
+            setup_prime_agent(&opts).unwrap();
+
+            let prime_dir = cwd.join(".prime");
+            assert!(
+                !prime_dir.exists(),
+                "dry-run must not create any directories"
             );
         });
     }

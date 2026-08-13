@@ -71,3 +71,8 @@ pub const NUSHELL_HOOK: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/shell/lib/nushell-hook.nu"
 ));
+
+pub const PRIME_AGENT_GUARD_TS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/tirith-guard-prime-agent.ts"
+));

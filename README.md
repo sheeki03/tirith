@@ -678,6 +678,7 @@ tirith setup kiro                     # Kiro CLI (formerly Amazon Q)
 tirith setup pi-cli                   # Pi CLI
 tirith setup vscode                   # VS Code
 tirith setup windsurf                 # Windsurf
+tirith setup prime-agent --with-mcp   # Prime Agent + MCP server
 ```
 
 For manual configuration, see `mcp/clients/` for per-tool guides.
