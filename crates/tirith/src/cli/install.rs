@@ -1966,12 +1966,26 @@ fn run_package_manager(
         }
         signals
     };
+    // C13: the name-existence seam. The exact resolver above cannot answer for
+    // an unpinned spec, because there is no version to bind provenance to. This
+    // one answers only whether the registry claims the name exists, so a
+    // plausible-looking but nonexistent package is rejected even when the
+    // install is unpinned. It returns `PackageExistence` and nothing else, so
+    // it structurally cannot leak latest-version provenance onto an unpinned
+    // install.
+    let name_existence = |eco: Ecosystem, name: &str| {
+        let (_signals, existence) = registry_api::gather_api_signals(&http_client, eco, name);
+        existence
+    };
     let online_mode = if let Some(reason) = registry_configuration_issue.as_deref() {
         OnlineMode::UnverifiedSource(reason)
     } else if !use_online {
         OnlineMode::Off
     } else {
-        OnlineMode::Resolver(&resolver)
+        OnlineMode::Resolver {
+            exact: &resolver,
+            name_only: &name_existence,
+        }
     };
 
     let db = ThreatDb::cached();
@@ -2863,6 +2877,25 @@ struct OutcomeRecord<'a> {
 /// Emit the single `{"analysis":..,"outcome":..}` JSON envelope (PR #121
 /// fix-list item 3). Returns `false` on a write failure. `outcome` is `None`
 /// when the install never ran (the field is still present as `null` for a
+/// The caveat every npm identity/provenance rendering carries, stated once so
+/// the human and JSON paths cannot drift into implying different things.
+const NPM_BYTES_NOT_BOUND_CAVEAT: &str =
+    "tirith has not downloaded, inspected, or bound the tarball bytes npm will install";
+
+/// The C13 npm `dist` facts for one planned package, when the online resolver
+/// attached registry provenance. `None` offline, for a non-npm ecosystem, or
+/// for a packument with no `dist` object.
+fn npm_dist_facts_of(
+    risk: &tirith_core::package_risk::RiskBreakdown,
+) -> Option<&tirith_core::provenance::npm_facts::NpmDistFacts> {
+    match &risk.api_signals {
+        tirith_core::package_risk::ApiSignals::Available { provenance } => {
+            provenance.npm_dist.as_ref()
+        }
+        _ => None,
+    }
+}
+
 /// stable shape).
 fn emit_combined_json(
     plan: &InstallPlan,
@@ -2883,6 +2916,14 @@ fn emit_combined_json(
         version: Option<&'a str>,
         risk_score: u32,
         risk_level: &'a str,
+        /// C13: npm registry identity/provenance FACTS, when the registry
+        /// supplied any. Parsed, never verified.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        npm_dist: Option<&'a tirith_core::provenance::npm_facts::NpmDistFacts>,
+        /// Present exactly when `npm_dist` is, so no consumer can read an
+        /// integrity or signature value as a claim about the installed bytes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        npm_identity_caveat: Option<&'static str>,
     }
     #[derive(serde::Serialize)]
     struct AnalysisEnvelope<'a> {
@@ -2940,12 +2981,17 @@ fn emit_combined_json(
     let packages = plan
         .packages
         .iter()
-        .map(|p| PackageOut {
-            ecosystem: p.reference.ecosystem.to_string(),
-            name: &p.reference.name,
-            version: p.reference.version.as_version_str(),
-            risk_score: p.risk.score,
-            risk_level: p.risk.risk_level,
+        .map(|p| {
+            let npm_dist = npm_dist_facts_of(&p.risk);
+            PackageOut {
+                ecosystem: p.reference.ecosystem.to_string(),
+                name: &p.reference.name,
+                version: p.reference.version.as_version_str(),
+                risk_score: p.risk.score,
+                risk_level: p.risk.risk_level,
+                npm_dist,
+                npm_identity_caveat: npm_dist.map(|_| NPM_BYTES_NOT_BOUND_CAVEAT),
+            }
         })
         .collect();
 
@@ -3457,6 +3503,26 @@ fn print_plan_human(
                 pkg.risk.score,
                 pkg.risk.risk_level,
             );
+            // C13: the registry identity/provenance FACTS, with the caveat that
+            // makes them readable as facts. Strict npm installs may require
+            // this metadata; none of it says Tirith saw the bytes.
+            if let Some(dist) = npm_dist_facts_of(&pkg.risk) {
+                eprintln!(
+                    "      registry identity: {}",
+                    install_value_for_human_with_compiled(&dist.summary(), compiled),
+                );
+                if dist.tarball_url_rejected {
+                    eprintln!(
+                        "      registry identity: tarball URL REJECTED: {}",
+                        install_value_for_human_with_compiled(
+                            dist.tarball_rejection_reason
+                                .as_deref()
+                                .unwrap_or("not bound to the registry origin"),
+                            compiled,
+                        ),
+                    );
+                }
+            }
         }
     }
     eprintln!();

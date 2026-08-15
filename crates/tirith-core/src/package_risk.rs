@@ -444,6 +444,17 @@ pub struct ApiProvenance {
     /// API has no repository field or the value is empty / not a URL shape.
     #[serde(default)]
     pub repository_url: Option<String>,
+    /// C13: npm `dist` provenance FACTS for the selected version (integrity
+    /// SRI, legacy shasum status, signature/attestation state, origin-validated
+    /// tarball URL).
+    ///
+    /// Deliberately NOT scored. `api_factors` stays monotone-non-decreasing
+    /// with respect to provenance, so no amount of valid-looking provenance can
+    /// subtract from a package's risk. A signed package is still a package:
+    /// behavioral, ThreatDB, typosquat and lifecycle findings are unaffected by
+    /// anything in here.
+    #[serde(default)]
+    pub npm_dist: Option<crate::provenance::npm_facts::NpmDistFacts>,
 }
 
 impl ApiProvenance {

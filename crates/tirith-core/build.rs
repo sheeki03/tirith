@@ -553,8 +553,26 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         id: "package_install",
         tier1_exec_fragments: &[
             r"(?i:\b(?:pip3?|uv)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+install\b)",
-            r"(?i:\b(?:npm|npx|yarn|pnpm|bun)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:install|i|add)\b)",
+            // `(?:[^\s;|&]+\s+){0,3}` mirrors `npm_command::MAX_SUBCOMMAND_PREFIX_WORDS`:
+            // the subcommand is not always the first word after the launcher
+            // (`yarn global add`, `yarn workspace <name> add`, `yarn
+            // --network-timeout 100000 add`), and a fragment that demands
+            // adjacency gates those forms out of exec context entirely.
+            r"(?i:\b(?:npm|npx|yarn|pnpm|bun)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}(?:install|i|add|ci|clean-install)\b)",
+            // npm's historical install misspellings and the install-test
+            // family. They install exactly as `install` does, so without them
+            // one extra keystroke buys an unanalyzed install.
+            r"(?i:\bnpm(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}(?:in|ins|inst|insta|instal|isnt|isnta|isntal|isntall|ic|install-clean|isntall-clean|install-test|it|install-ci-test|cit|clean-install-test|sit)\b)",
             r"(?i:\bnpx(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s)",
+            // The fetch-and-run half of the npm family (`crate::npm_command`).
+            // Every form the shared grammar recognizes needs a fragment here or
+            // it is gated out of exec context and never reaches tier 3.
+            r"(?i:\bnpm(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}(?:exec|x)\b)",
+            r"(?i:\bpnpm(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}dlx\b)",
+            r"(?i:\byarn(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}dlx\b)",
+            r"(?i:\bbun(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}x\b)",
+            r"(?i:\bbunx(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s)",
+            r"(?i:\bpnpx(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s)",
             r"(?i:\bgem(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+install\b)",
             r"(?i:\bgo(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:get|install)\b)",
             r"(?i:\bcomposer(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+require\b)",

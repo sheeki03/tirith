@@ -428,8 +428,13 @@ fn is_web3_tool_name(value: &str) -> bool {
     matches!(value, "cast" | "forge" | "hardhat" | "solana" | "anchor")
 }
 
+/// Launcher identity is a purely lexical question, so it comes from the shared
+/// npm grammar rather than a table private to the Web3 parser. The resolution
+/// semantics below (config-layer trust, project-local bin proof, cwd binding)
+/// stay here; only the "is this word an npm-family launcher" answer is shared.
+/// Sharing widens the set by `pnpx`, which tightens the nested-runner guard.
 fn is_package_runner_name(value: &str) -> bool {
-    matches!(value, "npx" | "npm" | "pnpm" | "yarn" | "bun" | "bunx")
+    crate::npm_command::is_package_runner_name(value)
 }
 
 fn is_project_local_bin_command(value: &str) -> bool {

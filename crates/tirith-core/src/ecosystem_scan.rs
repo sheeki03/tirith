@@ -639,6 +639,92 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
     Some(out)
 }
 
+/// Most lockfile entries retained by [`npm_lock_integrity_index`]. A lockfile
+/// is attacker-influenced input, so the index it produces is bounded.
+const MAX_LOCK_INTEGRITY_ENTRIES: usize = 8192;
+
+/// Index a `package-lock.json` by resolved `(registry name, version)` to its
+/// recorded `integrity` string (C13).
+///
+/// Separate from [`parse_package_lock`] on purpose: that function answers "what
+/// does this project depend on", which every ecosystem scan needs, while this
+/// one answers "what bytes did the lockfile pin for that exact version", which
+/// only the provenance comparison needs. Entries with no `integrity` are simply
+/// absent from the index; absence is "not recorded", never "mismatch".
+///
+/// The name comes from `meta.name` when the lockfile supplies it and from the
+/// install path otherwise, matching the identity rules the dependency parser
+/// already uses, so an aliased entry indexes under the TARGET package rather
+/// than the alias.
+pub fn npm_lock_integrity_index(text: &str) -> BTreeMap<(String, String), String> {
+    let mut index = BTreeMap::new();
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+        return index;
+    };
+
+    if let Some(packages) = json.get("packages").and_then(|value| value.as_object()) {
+        for (path_key, meta) in packages {
+            let Some(installed_name) = package_lock_name_from_path(path_key) else {
+                continue;
+            };
+            let name = meta
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or(installed_name);
+            insert_lock_integrity(&mut index, &name, meta);
+        }
+    }
+
+    if let Some(dependencies) = json.get("dependencies").and_then(|value| value.as_object()) {
+        collect_lock_v1_integrity(dependencies, &mut index);
+    }
+
+    index
+}
+
+fn collect_lock_v1_integrity(
+    dependencies: &serde_json::Map<String, serde_json::Value>,
+    index: &mut BTreeMap<(String, String), String>,
+) {
+    for (declared_name, meta) in dependencies {
+        let (name, _alias, _version) = npm_lock_identity(declared_name.trim(), meta);
+        insert_lock_integrity(index, &name, meta);
+        if let Some(nested) = meta.get("dependencies").and_then(|value| value.as_object()) {
+            collect_lock_v1_integrity(nested, index);
+        }
+    }
+}
+
+fn insert_lock_integrity(
+    index: &mut BTreeMap<(String, String), String>,
+    name: &str,
+    meta: &serde_json::Value,
+) {
+    if index.len() >= MAX_LOCK_INTEGRITY_ENTRIES {
+        return;
+    }
+    let Some(version) = meta.get("version").and_then(|value| value.as_str()) else {
+        return;
+    };
+    // An alias records `npm:target@version`; the resolved version is the tail.
+    let version = version
+        .strip_prefix("npm:")
+        .and_then(split_npm_name_version)
+        .and_then(|(_, version)| version)
+        .unwrap_or(version);
+    let Some(integrity) = meta.get("integrity").and_then(|value| value.as_str()) else {
+        return;
+    };
+    if name.is_empty() || version.is_empty() || integrity.trim().is_empty() {
+        return;
+    }
+    index.insert(
+        (name.to_string(), version.to_string()),
+        integrity.trim().to_string(),
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NpmLockAliasClaim {
     target_name: String,

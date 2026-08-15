@@ -847,7 +847,19 @@ fn print_json(breakdown: &RiskBreakdown, explain: bool) -> bool {
         /// Full factor breakdown — present only with `explain`.
         #[serde(skip_serializing_if = "Option::is_none")]
         risk_breakdown: Option<&'a RiskBreakdown>,
+        /// C13: present whenever npm `dist` facts are reported, so a JSON
+        /// consumer cannot read an integrity/signature field as a claim that
+        /// Tirith checked the artifact.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        npm_identity_caveat: Option<&'static str>,
     }
+
+    let npm_identity_caveat = match &breakdown.api_signals {
+        ApiSignals::Available { provenance } if provenance.npm_dist.is_some() => {
+            Some(NPM_BYTES_NOT_BOUND_CAVEAT)
+        }
+        _ => None,
+    };
 
     let out = PackageRiskOutput {
         ecosystem: &breakdown.ecosystem,
@@ -860,6 +872,7 @@ fn print_json(breakdown: &RiskBreakdown, explain: bool) -> bool {
         content_signals: &breakdown.content_signals,
         api_signals: &breakdown.api_signals,
         risk_breakdown: if explain { Some(breakdown) } else { None },
+        npm_identity_caveat,
     };
     super::write_json_stdout(&out, "tirith package: failed to write JSON output")
 }
@@ -1086,6 +1099,85 @@ fn write_api_provenance_human(
     } else {
         writeln!(w, "               - status: latest version current")?;
     }
+    if let Some(dist) = p.npm_dist.as_ref() {
+        write_npm_dist_facts_human(dist, w)?;
+    }
+    Ok(())
+}
+
+/// The caveat every npm identity/provenance rendering must carry. Stated once
+/// so the human and JSON paths cannot drift into implying different things.
+pub(crate) const NPM_BYTES_NOT_BOUND_CAVEAT: &str =
+    "tirith has not downloaded, inspected, or bound the tarball bytes npm will install";
+
+/// Render the C13 npm `dist` provenance FACTS.
+///
+/// Every line here reports what the registry PUBLISHED, and the closing caveat
+/// is mandatory rather than decoration: without it the integrity and signature
+/// lines read as verification claims. Tirith does not download the tarball, so
+/// there is nothing local for the SRI to cover, and there is no ECDSA P-256
+/// backend to check the signature with.
+fn write_npm_dist_facts_human(
+    dist: &tirith_core::provenance::npm_facts::NpmDistFacts,
+    w: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    if dist.is_empty() {
+        return Ok(());
+    }
+    if let Some(origin) = dist.registry_origin.as_deref() {
+        writeln!(
+            w,
+            "               - registry origin: {}",
+            super::sanitize_for_human_output(origin, false)
+        )?;
+    }
+    match (dist.tarball_url.as_deref(), dist.tarball_url_rejected) {
+        (Some(url), _) => writeln!(
+            w,
+            "               - tarball: {} (registry-bound URL; not downloaded)",
+            super::sanitize_for_human_output(url, false)
+        )?,
+        (None, true) => writeln!(
+            w,
+            "               - tarball: REJECTED, {}",
+            super::sanitize_for_human_output(
+                dist.tarball_rejection_reason
+                    .as_deref()
+                    .unwrap_or("not bound to the registry origin"),
+                false
+            )
+        )?,
+        (None, false) => writeln!(w, "               - tarball: none published")?,
+    }
+    match dist.integrity_sri.as_ref() {
+        Some(sri) => writeln!(
+            w,
+            "               - integrity: {} (parsed from dist.integrity; not checked)",
+            super::sanitize_for_human_output(&sri.canonical(), false)
+        )?,
+        // Ahead of both fallbacks: a value Tirith declined to parse must not be
+        // reported as a value the publisher never shipped.
+        None if dist.integrity_unparsed => writeln!(
+            w,
+            "               - integrity: PUBLISHED BUT UNREADABLE (dist.integrity did not parse)"
+        )?,
+        None if dist.legacy_shasum_present => writeln!(
+            w,
+            "               - integrity: none; legacy dist.shasum present (SHA-1, display only)"
+        )?,
+        None => writeln!(w, "               - integrity: not published")?,
+    }
+    writeln!(
+        w,
+        "               - registry signature: {}",
+        dist.signature_state.label()
+    )?;
+    writeln!(
+        w,
+        "               - provenance attestation: {}",
+        dist.attestation_state.label()
+    )?;
+    writeln!(w, "               - NOTE: {}", NPM_BYTES_NOT_BOUND_CAVEAT)?;
     Ok(())
 }
 

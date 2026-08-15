@@ -53,7 +53,7 @@ Inspected:
 | `tirith init` | None | Prints the shell hook for the active profile. Configuration surface. | Yes |
 | `tirith onboard` | None | Guided first-run wizard: detects the environment and recommends a policy template. Configuration surface. | Yes |
 | `tirith setup` | None | One-command AI-tool setup. Writes integration config; does not inspect content. | Yes |
-| `tirith install` | Partial | Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run. | Partial |
+| `tirith install` | Partial | Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run. For npm, --online also reports registry identity facts (origin, registry-bound tarball URL, parsed dist.integrity SRI, legacy shasum status, signature and provenance-attestation state) and, on an unpinned spec, a name-existence probe; those facts are parsed, never verified, and tirith does not download, inspect, or bind the tarball bytes npm installs. | Partial |
 | `tirith verify-self` | Full | Verifies the running binary and its build/install provenance against signed checksums. | Yes |
 | `tirith update` | Full | Signature-verified self-update: inspects the downloaded binary before replacing the running one. | Yes |
 | `tirith version` | None | Prints version and, with --provenance, build/install provenance. Reporting surface. | Yes |
@@ -92,7 +92,7 @@ Inspected:
 
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
-| `tirith package` | Partial | Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise. | Partial |
+| `tirith package` | Partial | Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise. For npm, --online reports dist identity facts and their verification state; no state can be verified here, and tirith does not download, inspect, or bind npm tarball bytes. | Partial |
 | `tirith ecosystem` | Partial | Scores every declared dependency in a project, slopsquat-aware. Inspects manifests and installed trees; registry depth needs --online. | Partial |
 | `tirith threat-db` | None | Manages the signed local threat database. Data management surface consumed by the inspecting commands. | Yes |
 | `tirith iac` | Full | Terraform / Pulumi / OpenTofu apply gates: inspects the saved-plan hash and blocks no-plan applies. | Yes |

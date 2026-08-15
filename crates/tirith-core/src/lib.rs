@@ -47,6 +47,7 @@ pub mod mcp;
 pub mod mcp_lock;
 pub mod network;
 pub mod normalize;
+pub mod npm_command;
 pub mod osv_correlation;
 pub mod output;
 pub mod package_risk;

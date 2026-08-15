@@ -246,7 +246,7 @@ policy_complete = true
 name = "install"
 group = "Setup & onboarding"
 inspected = "partial"
-coverage = "Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run."
+coverage = "Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run. For npm, --online also reports registry identity facts (origin, registry-bound tarball URL, parsed dist.integrity SRI, legacy shasum status, signature and provenance-attestation state) and, on an unpinned spec, a name-existence probe; those facts are parsed, never verified, and tirith does not download, inspect, or bind the tarball bytes npm installs."
 policy_complete = false
 
 [[command]]
@@ -426,7 +426,7 @@ policy_complete = true
 name = "package"
 group = "Supply-chain"
 inspected = "partial"
-coverage = "Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise."
+coverage = "Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise. For npm, --online reports dist identity facts and their verification state; no state can be verified here, and tirith does not download, inspect, or bind npm tarball bytes."
 policy_complete = false
 
 [[command]]
