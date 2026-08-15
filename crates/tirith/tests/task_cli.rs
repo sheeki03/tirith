@@ -98,6 +98,26 @@ fn the_response_declares_itself_diagnostic() {
     assert_eq!(json["schema_version"], 1);
 }
 
+/// C12 lands real enforcement at five tirith-owned transitions. This CLI is not
+/// one of them, and its honesty claim must not drift now that enforcement
+/// exists elsewhere: an operator who sees `enforceability: enforceable` here
+/// would reasonably believe `tirith task check` can stop something.
+#[test]
+fn enforcement_elsewhere_does_not_upgrade_this_diagnostic_surface() {
+    let envelope = r#"{
+        "sources": [{"claimed_source": "issue_body", "content": "from an issue"}],
+        "actions": [{"shell": {"command": "forge script Deploy.s.sol --broadcast"}}]
+    }"#;
+    let (_, stdout, _) = run_stdin(envelope, &["--format", "json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json output");
+    assert_eq!(json["diagnostic"], true);
+    assert_eq!(json["enforceability"], "observe_only");
+    // The diagnostic projection carries no boundary or outcome: those belong to
+    // an owned transition that can actually refuse.
+    assert!(json.get("boundary").is_none());
+    assert!(json.get("outcome").is_none());
+}
+
 #[test]
 fn a_malformed_or_unknown_field_envelope_is_an_input_error() {
     for envelope in [

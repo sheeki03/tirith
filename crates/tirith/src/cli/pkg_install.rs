@@ -1374,7 +1374,22 @@ pub fn run_contained_install(
     installed_distributions: &[ExpectedInstalledDistribution],
     policy: &Policy,
     suppress_child_output: bool,
+    task_denied_effects: &std::collections::BTreeSet<tirith_core::effects::CommandEffectKind>,
 ) -> Result<ContainedInstallOutcome, ContainedInstallError> {
+    // C12: the last hop before the capsule launch re-asserts the decision the
+    // caller already made, rather than re-deriving one. Re-deriving here would
+    // let this site and `pkg.rs` disagree about the same install; asserting
+    // catches a future caller that forgets the gate entirely. Under any mode
+    // that is not enforcing, `denied_effects` is reported but never handed down
+    // as a refusal, so this can only trip on a real enforcing denial that leaked
+    // past the gate.
+    if task_denied_effects.contains(&tirith_core::effects::CommandEffectKind::PackageInstall) {
+        return Err(ContainedInstallError::ToolBinding(
+            "task gate denied the package-install effect; refusing before the contained launch"
+                .to_string(),
+        ));
+    }
+
     // 0. Revalidate the exact sealed uv/Python identities and bounded root-managed
     // pip tree before any launch preparation. A path-only interpreter check would
     // reopen the verify-to-exec race this enforcing surface exists to close.

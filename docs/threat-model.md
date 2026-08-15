@@ -48,6 +48,39 @@
 - **Strict PowerShell execution proof**: the PowerShell hook can block during
   PSReadLine preflight, but mutable history is not treated as trusted evidence
   that an accepted command executed
+- **Task-gate enforcement outside tirith-owned transitions**: `tirith task
+  check` and the `tirith_check_task` MCP tool are diagnostic preflight. They
+  report what a task envelope would be allowed to do; they execute nothing and
+  they stop nothing, and both declare `enforceability: observe_only` so the
+  limit is visible in their own output rather than only in this document. An
+  arbitrary shell, or an MCP client that does not route through `tirith gateway
+  run`, can ignore them entirely. The task gate ENFORCES at exactly five
+  tirith-owned irreversible transitions, and nowhere else:
+  - the MCP gateway's upstream forward, before pending registration;
+  - `tirith pkg approve` / `tirith pkg install`, before resolver network and
+    again before install preparation;
+  - `tirith install <manager>`, before registry network and before the manager
+    is spawned;
+  - `tirith run <url>` and `tirith install url <URL>`, before download and
+    launch. Both spellings reach the same runner, so both are gated;
+  - a tirith-owned configuration write, before the final atomic rename. This
+    covers every `.tirith/` file tirith publishes: the policy, the commands
+    manifest, the MCP lock (from `tirith mcp lock` and from the gateway's
+    descriptor approval alike), and the MCP policy scaffold.
+
+  Two consequences are stated rather than papered over. First, the `tirith run`
+  download itself lives in `tirith-core`'s runner, so the gate sits in the CLI:
+  a program that links `tirith-core` and calls `runner::run` directly is not
+  gated. Second, only writes tirith itself performs are covered; a shell
+  redirection into an agent config, or any other host write that does not pass
+  through tirith, is not intercepted.
+- **Task-gate coverage of general shell**: task effect inference models the
+  Web3 command grammar and reports every other shell segment as INCOMPLETE.
+  That is honest about coverage, but it means `task_gate.mode: enforce` combined
+  with `action_incomplete_analysis: block` refuses nearly every guarded command,
+  because nearly every guarded command is incompletely modelled. Leave
+  `action_incomplete_analysis` at its `warn` default and express enforcement
+  through `effects_denied_for_untrusted_sources` instead.
 
 ### `tirith temp-run` is file isolation, NOT a sandbox
 

@@ -379,6 +379,7 @@ fn prepare_plan(
     artifact_origin: &[String],
     policy: &Policy,
     expiry: String,
+    task_gate_binding: String,
 ) -> Result<PreparedPlan, PrepareError> {
     // Resolve uv + python by executable provenance (never a bare PATH name in the
     // child), with the locked-down default allowances (no sdist/VCS/editable/...).
@@ -444,6 +445,7 @@ fn prepare_plan(
         policy,
         backend.backend_id,
         expiry,
+        task_gate_binding,
     );
 
     Ok(PreparedPlan {
@@ -461,6 +463,7 @@ fn prepare_plan(
 /// the plan carries (artifact hashes, normalised packages, interpreter, target env,
 /// platform tags, install-command semantics, redacted policy hash, DB sequence,
 /// capsule backend, required coverage, expiry).
+#[allow(clippy::too_many_arguments)]
 fn build_plan_digest(
     plan: &DigestInstallPlan,
     resolved: &ResolvedSet,
@@ -469,6 +472,7 @@ fn build_plan_digest(
     policy: &Policy,
     capsule_backend: &str,
     expiry: String,
+    task_gate_binding: String,
 ) -> InstallPlanDigest {
     let artifact_sha256: Vec<String> = resolved
         .artifacts
@@ -512,6 +516,7 @@ fn build_plan_digest(
         threat_db_sequence: plan.bound_db_sequence,
         capsule_backend: capsule_backend.to_string(),
         required_coverage: plan.spec.required_coverage(),
+        task_gate_binding,
         expiry,
     })
 }
@@ -622,6 +627,57 @@ fn run_trust_tool(path: &Path, json: bool) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// C12: the owned package transitions
+// ---------------------------------------------------------------------------
+
+/// Evaluate one owned package boundary.
+///
+/// The effects come from [`tirith_core::task::ProposedAction::PackageInstall`],
+/// which already derives package install, network egress, and filesystem write;
+/// there is no second deriver here. The policy is the offline operator-only one
+/// the caller already discovered, so a repository cannot weaken its own install.
+fn evaluate_package_boundary(
+    boundary: tirith_core::task_boundary::OwnedBoundary,
+    ecosystem: Ecosystem,
+    requirements: &[String],
+    policy: &Policy,
+) -> tirith_core::task_boundary::BoundaryAssessment {
+    let envelope = tirith_core::task_boundary::package_envelope(ecosystem.label(), requirements);
+    let operation = tirith_core::task_boundary::BoundaryOperation {
+        boundary,
+        envelope: &envelope,
+        // An argv identifies no origin. Claiming one would be a lie the
+        // provenance model exists to prevent.
+        adapter: tirith_core::task::IngressAdapter::Unattributed,
+        boundary_effects: Default::default(),
+    };
+    tirith_core::task_boundary::evaluate(&operation, &policy.task_gate)
+}
+
+/// Report a task-gate refusal on a `pkg` subcommand.
+fn report_task_gate_refusal(
+    command: &str,
+    assessment: &tirith_core::task_boundary::BoundaryAssessment,
+    reason: &str,
+    json: bool,
+) -> i32 {
+    if json {
+        let out = serde_json::json!({
+            "refused": true,
+            "stage": "task_gate",
+            "boundary": assessment.boundary.token(),
+            "reason": reason,
+            "task_decision": assessment.projection(),
+        });
+        let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
+        println!();
+    } else {
+        eprintln!("tirith pkg {command}: refused before any network or install step: {reason}");
+    }
+    1
+}
+
+// ---------------------------------------------------------------------------
 // pkg approve
 // ---------------------------------------------------------------------------
 
@@ -643,6 +699,21 @@ fn run_approve(
     // weaken the approval; the resolver never reads repo-local pip/uv config.
     let policy = Policy::discover_local_only(cwd.as_deref());
 
+    // C12: the owned network-egress transition. `prepare_plan` does PATH
+    // lookup, quarantine creation, broker binding, DNS, and resolver child
+    // execution, so the gate has to sit here: one line later and packages have
+    // already been fetched. `approve` has no separate human gate of its own to
+    // satisfy a required approval, so it passes `false`.
+    let task_assessment = evaluate_package_boundary(
+        tirith_core::task_boundary::OwnedBoundary::PackageApproval,
+        ecosystem,
+        requirements,
+        &policy,
+    );
+    if let Some(reason) = task_assessment.refusal(false) {
+        return report_task_gate_refusal("approve", &task_assessment, reason, json);
+    }
+
     let expiry =
         (chrono::Utc::now() + chrono::Duration::seconds(DEFAULT_APPROVAL_TTL_SECS)).to_rfc3339();
     let prepared = match prepare_plan(
@@ -652,6 +723,7 @@ fn run_approve(
         artifact_origin,
         &policy,
         expiry,
+        tirith_core::task_boundary::ceiling_binding(&task_assessment.decision),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -736,6 +808,17 @@ fn run_install(
     // digest with no expiry and looks for a matching approval (whose own expiry is
     // checked). This keeps "the bytes/situation I am about to install" stable while
     // the approval governs the time window.
+    // C12: same owned network-egress transition, before the resolver runs.
+    let network_assessment = evaluate_package_boundary(
+        tirith_core::task_boundary::OwnedBoundary::PackageResolve,
+        ecosystem,
+        requirements,
+        &policy,
+    );
+    if let Some(reason) = network_assessment.refusal(false) {
+        return report_task_gate_refusal("install", &network_assessment, reason, json);
+    }
+
     let prepared = match prepare_plan(
         requirements,
         target,
@@ -743,6 +826,7 @@ fn run_install(
         artifact_origin,
         &policy,
         String::new(),
+        tirith_core::task_boundary::ceiling_binding(&network_assessment.decision),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -792,6 +876,23 @@ fn run_install(
                 );
             }
         }
+    }
+
+    // C12: the owned install-preparation transition. Everything irreversible
+    // about the install starts at `EnvironmentCheckpoint::begin` below, which
+    // creates and retains the target environment before pip gets write access,
+    // so the second gate sits above it. Unlike the resolve gate this site HAS
+    // crossed a human gate already: either a matching un-expired approval record
+    // was just validated, or the operator passed `--yes` for the unattended
+    // path, so a required approval is satisfied rather than refused.
+    let preparation_assessment = evaluate_package_boundary(
+        tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+        ecosystem,
+        requirements,
+        &policy,
+    );
+    if let Some(reason) = preparation_assessment.refusal(true) {
+        return report_task_gate_refusal("install", &preparation_assessment, reason, json);
     }
 
     // The contained install (D4) always fails closed. `--allow-degraded` remains a
@@ -852,6 +953,7 @@ fn run_install(
         &policy,
         json,
         degraded_policy,
+        &preparation_assessment.enforced_denied_effects(),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -1046,6 +1148,7 @@ fn run_contained_install_with_policy(
     policy: &Policy,
     json: bool,
     degraded_policy: DegradedPolicy,
+    task_denied_effects: &std::collections::BTreeSet<tirith_core::effects::CommandEffectKind>,
 ) -> Result<crate::cli::pkg_install::ContainedInstallOutcome, ContainedInstallError> {
     let _ = degraded_policy;
     run_contained_install(
@@ -1058,6 +1161,7 @@ fn run_contained_install_with_policy(
         installed_distributions,
         policy,
         json,
+        task_denied_effects,
     )
 }
 
@@ -1800,33 +1904,25 @@ fn approval_status(digest: &InstallPlanDigest) -> ApprovalStatus {
 /// field. The install builds its digest with no expiry; the approval record carries
 /// one; everything else must match exactly for the approval to authorise the
 /// install.
+///
+/// Compared by blanking the two excluded fields and leaning on the derived
+/// `PartialEq`, NOT by enumerating the binding fields here. A hand-written list
+/// silently stops covering a field the moment [`InstallPlanDigest`] grows one,
+/// and that is exactly how `task_gate_binding` came to be written into the
+/// digest and never checked when an approval was redeemed. A field added in
+/// future is therefore bound by default; the failure direction if it should not
+/// have been is a re-approval, not an unbound install.
 fn same_plan_modulo_expiry(a: &InstallPlanDigest, b: &InstallPlanDigest) -> bool {
-    a.artifact_sha256 == b.artifact_sha256
-        && a.normalized_packages == b.normalized_packages
-        && a.interpreter == b.interpreter
-        && a.interpreter_sha256 == b.interpreter_sha256
-        && a.resolver == b.resolver
-        && a.resolver_sha256 == b.resolver_sha256
-        && a.resolver_version == b.resolver_version
-        && a.package_manager_version == b.package_manager_version
-        && a.pip_tree_root == b.pip_tree_root
-        && a.pip_tree_sha256 == b.pip_tree_sha256
-        && a.pip_tree_binding_version == b.pip_tree_binding_version
-        && a.pip_tree_max_files == b.pip_tree_max_files
-        && a.pip_tree_max_bytes == b.pip_tree_max_bytes
-        && a.pip_tree_max_file_bytes == b.pip_tree_max_file_bytes
-        && a.pip_tree_max_path_bytes == b.pip_tree_max_path_bytes
-        && a.pip_tree_files == b.pip_tree_files
-        && a.pip_tree_bytes == b.pip_tree_bytes
-        && a.target_environment == b.target_environment
-        && a.target_parent_identity == b.target_parent_identity
-        && a.target_component == b.target_component
-        && a.platform_tags == b.platform_tags
-        && a.install_command_semantics == b.install_command_semantics
-        && a.policy_projection_hash == b.policy_projection_hash
-        && a.threat_db_sequence == b.threat_db_sequence
-        && a.capsule_backend == b.capsule_backend
-        && a.required_coverage == b.required_coverage
+    // `plan_digest` is derived from every other field, so comparing it would be
+    // circular; `expiry` is the one binding input the install deliberately does
+    // not carry.
+    let situation = |digest: &InstallPlanDigest| {
+        let mut copy = digest.clone();
+        copy.plan_digest.clear();
+        copy.expiry.clear();
+        copy
+    };
+    situation(a) == situation(b)
 }
 
 #[cfg(test)]
@@ -1869,6 +1965,7 @@ mod tests {
             threat_db_sequence: 3,
             capsule_backend: "landlock-seccomp".to_string(),
             required_coverage: CapsuleSpec::locked_down().required_coverage(),
+            task_gate_binding: "task_gate:v1:mode=off;denied=".to_string(),
             expiry: expiry.to_string(),
         }
     }
@@ -2025,6 +2122,80 @@ mod tests {
         assert!(!same_plan_modulo_expiry(&approved, &other));
         // No matching approval for the changed situation.
         assert_eq!(approval_status(&other), ApprovalStatus::Missing);
+    }
+
+    /// The task-gate ceiling is part of the binding, not decoration.
+    ///
+    /// `approve` records the ceiling that was in force when the human said yes
+    /// (`run_approve` -> `ceiling_binding`); `install` re-derives it from the
+    /// policy in force at install time (`run_install`). If the operator relaxes
+    /// the gate in between, the approval must die. The two strings are built the
+    /// way the two commands build them, through a real boundary evaluation, so a
+    /// change to what the ceiling means breaks this test rather than sliding past
+    /// it.
+    #[test]
+    fn a_relaxed_task_gate_invalidates_an_approval_taken_under_a_stricter_one() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _g = isolate(root.path());
+
+        let requirements = ["requests==2.31.0".to_string()];
+        let enforcing = Policy {
+            task_gate: tirith_core::web3_policy::TaskGatePolicy {
+                mode: tirith_core::web3_policy::TaskGateMode::Enforce,
+                ..Default::default()
+            },
+            ..Policy::default()
+        };
+        let ceiling = |policy: &Policy, boundary| {
+            tirith_core::task_boundary::ceiling_binding(
+                &evaluate_package_boundary(boundary, Ecosystem::Pip, &requirements, policy)
+                    .decision,
+            )
+        };
+        let approved_under = ceiling(
+            &enforcing,
+            tirith_core::task_boundary::OwnedBoundary::PackageApproval,
+        );
+        let installed_under = ceiling(
+            &Policy::default(),
+            tirith_core::task_boundary::OwnedBoundary::PackageResolve,
+        );
+        assert_ne!(
+            approved_under, installed_under,
+            "the ceiling must differ, or this test proves nothing"
+        );
+
+        let mut approved_inputs = plan_inputs_with_expiry("2099-01-01T00:00:00+00:00");
+        approved_inputs.task_gate_binding = approved_under;
+        let approved = InstallPlanDigest::new(approved_inputs);
+        ApprovalRecord::from_digest(&approved).save().unwrap();
+
+        let mut install_inputs = plan_inputs_with_expiry("");
+        install_inputs.task_gate_binding = installed_under;
+        let install_digest = InstallPlanDigest::new(install_inputs);
+
+        assert!(
+            !same_plan_modulo_expiry(&approved, &install_digest),
+            "an approval taken under an enforcing gate matched an install under a relaxed one"
+        );
+        assert_eq!(approval_status(&install_digest), ApprovalStatus::Missing);
+    }
+
+    /// The same ceiling still authorises: the check above must not have made
+    /// every approval unredeemable.
+    #[test]
+    fn an_unchanged_task_gate_still_authorises_the_install() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _g = isolate(root.path());
+
+        let approved = digest_with_expiry("2099-01-01T00:00:00+00:00");
+        ApprovalRecord::from_digest(&approved).save().unwrap();
+        assert_eq!(
+            approval_status(&digest_with_expiry("")),
+            ApprovalStatus::Valid
+        );
     }
 
     #[test]

@@ -181,6 +181,16 @@ impl DegradedPolicy {
 /// asserts the same contract, so a future enforcing surface that mis-wires its
 /// policy is caught in tests rather than silently running an attacker's code
 /// uncontained.
+///
+/// C12 extends the same contract to the task gate: a surface holding an
+/// enforcing task decision must never reach a degraded run, or a decision that
+/// TIGHTENED the capsule (`task_boundary::tighten_capsule_spec`) would be
+/// satisfied by no capsule at all. That holds structurally today, because
+/// `pkg install` launches through `run_to_completion_bound_inputs` (whose API
+/// has no degraded mode) and `tirith run` passes `FailClosed`; the source scan
+/// `only_the_declared_best_effort_surfaces_name_the_degraded_policy` in
+/// `crates/tirith/tests/owned_boundary_enforcement.rs` keeps a future surface
+/// from quietly joining the list.
 fn assert_degraded_run_is_permitted(policy: DegradedPolicy) {
     debug_assert!(
         !policy.is_enforcing(),

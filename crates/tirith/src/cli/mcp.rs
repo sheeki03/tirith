@@ -77,7 +77,12 @@ pub(crate) fn lock_for_root(repo_root: &Path, json: bool, allow_incomplete_confi
         // safe to carry into the replacement.
         Err(_) => 0,
     };
-    if let Err(e) = write_lockfile(&lock_path, &lockfile) {
+    // C12: the operator policy, discovered offline. The repository whose MCP
+    // servers are being baselined must not get to authorise the write that
+    // baselines them, so a repo-scoped `.tirith/policy.yaml` is out of scope here
+    // for the same reason it is in `tirith policy init`.
+    let operator_policy = policy::Policy::discover_local_only(repo_root.to_str());
+    if let Err(e) = write_lockfile(&lock_path, &lockfile, &operator_policy) {
         report_error(
             json,
             &format!("failed to write {}: {e}", lock_path.display()),
@@ -206,7 +211,21 @@ fn resolve_repo_root() -> Option<PathBuf> {
 
 /// Write the rendered lockfile to `<repo_root>/.tirith/mcp.lock`, creating the
 /// `.tirith/` directory if needed.
-fn write_lockfile(lock_path: &Path, lockfile: &McpLockfile) -> std::io::Result<()> {
+///
+/// C12: `mcp.lock` is a Tirith-owned configuration file. It records which MCP
+/// servers and tools are approved, which is what `tirith mcp verify` gates drift
+/// against and what the gateway reads for descriptor approval, so re-baselining
+/// it is the same class of act as rewriting the policy. It publishes through the
+/// gated permit rather than the raw contained writer for that reason; `policy` is
+/// passed in so the caller owns the discovery and this stays a pure write.
+///
+/// The write is not flagged as a `policy_change`: it governs which servers are
+/// approved, not Tirith's own policy document, matching the commands manifest.
+fn write_lockfile(
+    lock_path: &Path,
+    lockfile: &McpLockfile,
+    policy: &policy::Policy,
+) -> std::io::Result<()> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -217,7 +236,14 @@ fn write_lockfile(lock_path: &Path, lockfile: &McpLockfile) -> std::io::Result<(
     let rendered = lockfile
         .render()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    super::write_file_atomic_contained(repo_root, lock_path, rendered.as_bytes(), true)
+    super::write_config_file_permitted(
+        repo_root,
+        lock_path,
+        rendered.as_bytes(),
+        true,
+        policy,
+        false,
+    )
 }
 
 /// Emit the machine-readable result.
@@ -1058,13 +1084,23 @@ pub(crate) fn policy_init_for_root(repo_root: &Path, json: bool, force: bool) ->
     // repo-0395: the scaffold lives under the repo's `.tirith/`, which a
     // malicious checkout can make a symlink. Write through the contained,
     // no-follow atomic helper so the write can never land outside the repo.
+    //
+    // C12: and through the gated permit, because it is a file Tirith owns under
+    // `.tirith/`. It is a scaffold the operator copies, not the live policy, so
+    // it is not flagged as a policy change.
     let repo_root = example_path
         .parent()
         .and_then(Path::parent)
         .unwrap_or_else(|| Path::new("."));
-    if let Err(e) =
-        super::write_file_atomic_contained(repo_root, &example_path, yaml_body.as_bytes(), true)
-    {
+    let operator_policy = policy::Policy::discover_local_only(repo_root.to_str());
+    if let Err(e) = super::write_config_file_permitted(
+        repo_root,
+        &example_path,
+        yaml_body.as_bytes(),
+        true,
+        &operator_policy,
+        false,
+    ) {
         report_error_for(
             json,
             "tirith mcp policy init",
@@ -2033,6 +2069,12 @@ mod tests {
         }
     }
 
+    /// The C12 task gate ships off, so these lockfile tests state that plainly
+    /// rather than depending on whatever policy the host running them has.
+    fn inert_policy() -> policy::Policy {
+        policy::Policy::default()
+    }
+
     #[test]
     fn write_lockfile_creates_tirith_dir_and_file() {
         let repo = tempdir().unwrap();
@@ -2040,7 +2082,7 @@ mod tests {
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
 
-        write_lockfile(&lock_path, &lockfile).expect("write should succeed");
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).expect("write should succeed");
         assert!(lock_path.is_file(), ".tirith/mcp.lock must exist");
 
         let contents = fs::read_to_string(&lock_path).unwrap();
@@ -2060,9 +2102,9 @@ mod tests {
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
 
-        write_lockfile(&lock_path, &lockfile).unwrap();
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).unwrap();
         let first = fs::read_to_string(&lock_path).unwrap();
-        write_lockfile(&lock_path, &lockfile).unwrap();
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).unwrap();
         let second = fs::read_to_string(&lock_path).unwrap();
         assert_eq!(first, second, "re-writing an unchanged lockfile is stable");
     }
@@ -2078,7 +2120,8 @@ mod tests {
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
         let inventory = mcp_lock::build_inventory(repo.path());
         let mut lockfile = McpLockfile::from_inventory(&inventory);
-        write_lockfile(&lock_path, &lockfile).expect("write initial safe baseline");
+        write_lockfile(&lock_path, &lockfile, &inert_policy())
+            .expect("write initial safe baseline");
         let before = fs::read(&lock_path).expect("read initial baseline");
 
         let probe = "ghp_DIRECT_WRITE_SECRET_NEVER_PERSIST_123456";
@@ -2087,7 +2130,7 @@ mod tests {
             args: vec![format!("--token={probe}")],
             env: vec![],
         };
-        let error = write_lockfile(&lock_path, &lockfile)
+        let error = write_lockfile(&lock_path, &lockfile, &inert_policy())
             .expect_err("unsafe direct transport must fail before publication");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(!error.to_string().contains(probe));
@@ -2122,7 +2165,7 @@ mod tests {
         )
         .unwrap();
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
-        write_lockfile(&lock_path, &approved).unwrap();
+        write_lockfile(&lock_path, &approved, &inert_policy()).unwrap();
 
         assert_eq!(lock_for_root(repo.path(), false, false), 0);
         let refreshed = mcp_lock::load_lockfile(&lock_path).unwrap();
@@ -2158,7 +2201,7 @@ mod tests {
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
-        write_lockfile(&lock_path, &lockfile).expect("write");
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).expect("write");
         repo
     }
 
@@ -2253,6 +2296,7 @@ mod tests {
         write_lockfile(
             &repo.path().join(".tirith").join(MCP_LOCK_FILENAME),
             &McpLockfile::from_inventory(&inventory),
+            &inert_policy(),
         )
         .unwrap();
 
@@ -2348,7 +2392,7 @@ mod tests {
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
-        write_lockfile(&lock_path, &lockfile).expect("write");
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).expect("write");
         repo
     }
 
@@ -2469,7 +2513,7 @@ mod tests {
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
-        write_lockfile(&lock_path, &lockfile).unwrap();
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).unwrap();
         let code = policy_init_for_root(repo.path(), false, false);
         assert_eq!(code, 0);
         let body = fs::read_to_string(repo.path().join(".tirith").join("mcp-policy.yaml.example"))
@@ -2505,7 +2549,7 @@ mod tests {
         };
         let lockfile = McpLockfile::from_inventory(&inv);
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
-        write_lockfile(&lock_path, &lockfile).unwrap();
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).unwrap();
 
         let code = policy_init_for_root(repo.path(), false, false);
         assert_eq!(code, 0);

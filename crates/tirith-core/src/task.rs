@@ -673,10 +673,29 @@ pub fn decide(
     gate: &TaskGatePolicy,
     boundary: BoundaryCapability,
 ) -> TaskDecision {
+    decide_with_boundary_effects(envelope, provenance, gate, boundary, &BTreeSet::new())
+}
+
+/// [`decide`], plus effects the BOUNDARY itself knows the operation will have.
+///
+/// An owned transition often knows more than the envelope's grammar does: the
+/// `tirith run` download is network egress whatever the URL text parses to, and
+/// a package manager always installs. Those facts are folded into the inferred
+/// set here rather than in a second effect deriver, so there stays exactly one
+/// implementation of the intersection. `boundary_effects` can only ADD to what
+/// is inferred; it never grants, because the policy filter runs afterwards over
+/// the union.
+pub fn decide_with_boundary_effects(
+    envelope: &TaskEnvelopeInput,
+    provenance: Vec<AssignedProvenance>,
+    gate: &TaskGatePolicy,
+    boundary: BoundaryCapability,
+    boundary_effects: &BTreeSet<CommandEffectKind>,
+) -> TaskDecision {
     let rejections = validate_envelope(envelope);
     let mut complete = rejections.is_empty();
 
-    let mut inferred = BTreeSet::new();
+    let mut inferred = boundary_effects.clone();
     for action in &envelope.actions {
         let derived = infer_effects_detailed(action);
         // A partially-modelled action leaves the picture incomplete even when

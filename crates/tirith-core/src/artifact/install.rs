@@ -1272,6 +1272,22 @@ pub struct InstallPlanDigest {
     /// [`crate::capsule::CapsuleSpec::required_coverage`]). Bound so an approval that
     /// demanded raw-network-deny cannot be redeemed against a spec that does not.
     pub required_coverage: crate::capsule::CapsuleCoverage,
+    /// The task-gate ceiling in force when the plan was built
+    /// ([`crate::task_boundary::ceiling_binding`]): the gate mode plus the
+    /// effects it denied. Bound so an approval taken while the gate refused
+    /// network egress cannot be redeemed once the operator has relaxed it, the
+    /// same way `policy_projection_hash` binds the rest of the posture.
+    ///
+    /// It is a field of its own precisely because
+    /// [`crate::policy::Policy::security_projection`] emits no `task_gate` key:
+    /// the gate is the one posture dimension `policy_projection_hash` does not
+    /// carry, so without this the digest would say nothing about it.
+    ///
+    /// `serde(default)` keeps an approval record written before this field
+    /// existed loadable; its digest will simply no longer match, which is the
+    /// fail-closed outcome (the operator re-approves).
+    #[serde(default)]
+    pub task_gate_binding: String,
     /// RFC 3339 UTC expiry. After this instant the approval is stale and
     /// [`Self::is_expired_at`] refuses it. An empty string means "no expiry"
     /// (the caller chose not to time-box it).
@@ -1335,6 +1351,8 @@ pub struct InstallPlanInputs {
     pub capsule_backend: String,
     /// The required per-capability coverage.
     pub required_coverage: crate::capsule::CapsuleCoverage,
+    /// The task-gate ceiling this plan was built under.
+    pub task_gate_binding: String,
     /// RFC 3339 UTC expiry, or empty for none.
     pub expiry: String,
 }
@@ -1388,6 +1406,7 @@ impl InstallPlanDigest {
             threat_db_sequence: inputs.threat_db_sequence,
             capsule_backend: inputs.capsule_backend,
             required_coverage: inputs.required_coverage,
+            task_gate_binding: inputs.task_gate_binding,
             expiry: inputs.expiry,
         };
         digest.plan_digest = digest.compute_plan_digest();
@@ -2467,6 +2486,7 @@ mod tests {
             threat_db_sequence: 7,
             capsule_backend: "landlock-seccomp".to_string(),
             required_coverage: crate::capsule::CapsuleSpec::locked_down().required_coverage(),
+            task_gate_binding: "task_gate:v1:mode=off;denied=".to_string(),
             expiry: "2026-06-22T12:00:00+00:00".to_string(),
         }
     }

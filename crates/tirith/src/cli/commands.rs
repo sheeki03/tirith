@@ -151,11 +151,19 @@ pub fn init(force: bool, json: bool) -> i32 {
     // Write ATOMICALLY (temp → fsync → rename → parent fsync), not truncate-in-
     // place, so a crash can't lose or half-write the manifest. No-clobber unless
     // `--force` so a manifest created in the post-`exists()` race window survives.
-    if let Err(e) = super::write_file_atomic_contained(
+    //
+    // C12: the commands manifest is a Tirith-owned configuration file, so its
+    // publication goes through the gated single-use permit. It governs which
+    // commands are allowed, not Tirith's policy document itself, so it is not
+    // flagged as a policy change.
+    let operator_policy = tirith_core::policy::Policy::discover_local_only(Some(&invocation.cwd));
+    if let Err(e) = super::write_config_file_permitted(
         repo_root,
         &path,
         tirith_core::commands_manifest::STARTER_MANIFEST.as_bytes(),
         force,
+        &operator_policy,
+        false,
     ) {
         if !emit_commands_error(
             json,

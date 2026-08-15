@@ -419,6 +419,14 @@ mod write_json_tests {
         assert_eq!(entries.len(), 1, "no temp file left behind: {entries:?}");
     }
 
+    /// The containment properties below are asserted on
+    /// [`super::write_config_file_permitted`], the only contained publisher the
+    /// CLI has left, with an inert default policy so the subject is the write
+    /// and not the gate.
+    fn inert() -> tirith_core::policy::Policy {
+        tirith_core::policy::Policy::default()
+    }
+
     #[test]
     fn contained_atomic_write_stays_beneath_root() {
         let root = tempfile::tempdir().unwrap();
@@ -426,7 +434,15 @@ mod write_json_tests {
         std::fs::create_dir(&config).unwrap();
         let path = config.join("policy.yaml");
 
-        super::write_file_atomic_contained(root.path(), &path, b"safe: true\n", true).unwrap();
+        super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"safe: true\n",
+            true,
+            &inert(),
+            true,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"safe: true\n");
 
         let outside = tempfile::tempdir().unwrap();
@@ -436,8 +452,15 @@ mod write_json_tests {
                 .file_name()
                 .expect("temp directory has a name"),
         );
-        let err = super::write_file_atomic_contained(root.path(), &escaped, b"escape", true)
-            .expect_err("a destination outside the anchored root must be rejected");
+        let err = super::write_config_file_permitted(
+            root.path(),
+            &escaped,
+            b"escape",
+            true,
+            &inert(),
+            true,
+        )
+        .expect_err("a destination outside the anchored root must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
@@ -448,15 +471,36 @@ mod write_json_tests {
         std::fs::create_dir(&config).unwrap();
         let path = config.join("commands.yaml");
 
-        super::write_file_atomic_contained(root.path(), &path, b"original\n", false)
-            .expect("no-clobber create must succeed when absent");
-        let error = super::write_file_atomic_contained(root.path(), &path, b"replacement\n", false)
-            .expect_err("no-clobber publish must refuse an existing destination");
+        super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"original\n",
+            false,
+            &inert(),
+            false,
+        )
+        .expect("no-clobber create must succeed when absent");
+        let error = super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"replacement\n",
+            false,
+            &inert(),
+            false,
+        )
+        .expect_err("no-clobber publish must refuse an existing destination");
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&path).unwrap(), b"original\n");
 
-        super::write_file_atomic_contained(root.path(), &path, b"replacement\n", true)
-            .expect("overwrite still atomically replaces the destination");
+        super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"replacement\n",
+            true,
+            &inert(),
+            false,
+        )
+        .expect("overwrite still atomically replaces the destination");
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement\n");
         assert_eq!(
             std::fs::read_dir(&config).unwrap().count(),
@@ -478,7 +522,7 @@ mod write_json_tests {
         let path = config.join("policy.yaml");
         symlink(outside.path(), &path).unwrap();
 
-        super::write_file_atomic_contained(root.path(), &path, b"attacker", true)
+        super::write_config_file_permitted(root.path(), &path, b"attacker", true, &inert(), true)
             .expect_err("a repo-contained writer must refuse a final symlink");
         assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
         assert!(std::fs::symlink_metadata(path)
@@ -498,8 +542,15 @@ mod write_json_tests {
         symlink(outside.path(), &config).unwrap();
         let path = config.join("policy.yaml");
 
-        let err = super::write_file_atomic_contained(root.path(), &path, b"attacker", true)
-            .expect_err("a repo-contained writer must refuse an escaping parent link");
+        let err = super::write_config_file_permitted(
+            root.path(),
+            &path,
+            b"attacker",
+            true,
+            &inert(),
+            true,
+        )
+        .expect_err("a repo-contained writer must refuse an escaping parent link");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(!outside.path().join("policy.yaml").exists());
     }
@@ -576,19 +627,71 @@ pub(crate) fn write_file_atomic(
     write_file_atomic_to_dest(&dest, contents, overwrite)
 }
 
-/// Atomically write a repository-owned file while proving the effective parent
-/// remains beneath `root`. Unlike [`write_file_atomic`], this variant never
-/// follows a final-component symlink: profile compatibility and repository
-/// containment are distinct policies.
-pub(crate) fn write_file_atomic_contained(
+/// C12: publish a TIRITH-OWNED configuration file through the task gate and a
+/// single-use [`tirith_core::config_write::ConfigWritePermit`].
+///
+/// The irreversible step is the final rename inside `commit`, so the gate runs
+/// before the permit is even issued and the permit re-checks its bindings again
+/// immediately before that rename. `policy_change` is the caller's own statement
+/// that the file it owns is Tirith's policy; only the caller knows that, so it
+/// is passed as a boundary effect rather than guessed from the path.
+///
+/// Honest scope: this covers files Tirith itself writes. A shell redirection
+/// into an agent config, or any other host write that does not go through
+/// Tirith, is not intercepted here.
+///
+/// This is the ONLY contained publisher the CLI has. There used to be an
+/// ungated `write_file_atomic_contained` beside it, and every site that still
+/// called it (the MCP lock, the MCP policy scaffold, the gateway's descriptor
+/// re-baseline) was a Tirith-owned config write the gate silently did not cover.
+/// Deleting it, rather than documenting it, is what makes that class of omission
+/// a compile error instead of an audit finding.
+pub(crate) fn write_config_file_permitted(
     root: &std::path::Path,
     path: &std::path::Path,
     contents: &[u8],
     overwrite: bool,
+    policy: &tirith_core::policy::Policy,
+    policy_change: bool,
 ) -> std::io::Result<()> {
-    write_file_atomic_contained_with_hook(root, path, contents, overwrite, || Ok(()))
+    let mut boundary_effects = std::collections::BTreeSet::new();
+    if policy_change {
+        boundary_effects.insert(tirith_core::effects::CommandEffectKind::PolicyChange);
+    }
+    let envelope = tirith_core::task_boundary::config_write_envelope(&path.to_string_lossy());
+    let operation = tirith_core::task_boundary::BoundaryOperation {
+        boundary: tirith_core::task_boundary::OwnedBoundary::ConfigWrite,
+        envelope: &envelope,
+        adapter: tirith_core::task::IngressAdapter::Unattributed,
+        boundary_effects,
+    };
+    let assessment = tirith_core::task_boundary::evaluate(&operation, &policy.task_gate);
+    if let Some(reason) = assessment.refusal(false) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("task gate refused this configuration write: {reason}"),
+        ));
+    }
+
+    let permit = tirith_core::config_write::ConfigWritePermit::prepare(
+        root,
+        path,
+        contents,
+        overwrite,
+        &policy.security_projection_hash(),
+    )?;
+    permit.commit(contents).map_err(std::io::Error::from)
 }
 
+/// The contained publication [`write_config_file_permitted`] performs, with a
+/// hook between binding the parent and publishing through it.
+///
+/// Test-only, and deliberately so: the hook exists to open the check/use gap on
+/// purpose, and a production caller reaching this would be reaching a contained
+/// write that no task gate saw. It calls the same
+/// [`tirith_core::util::ContainedAtomicFile`] pair the permit calls, so the
+/// containment properties it pins are the permit's own.
+#[cfg(test)]
 fn write_file_atomic_contained_with_hook(
     root: &std::path::Path,
     path: &std::path::Path,

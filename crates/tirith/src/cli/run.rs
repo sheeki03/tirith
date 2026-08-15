@@ -50,13 +50,61 @@ pub fn run(
 
     let interactive = is_terminal::is_terminal(std::io::stderr());
 
+    // C12: the owned download-and-launch transition. The download itself lives
+    // in the core runner (`runner::run_impl` -> `download_bounded`), so gating
+    // from the CLI keeps that heavily frozen code untouched while still sitting
+    // upstream of every byte: nothing below this point has resolved DNS, opened
+    // a socket, written a temporary file, or launched an interpreter.
+    //
+    // Stated honestly: this gate covers the `tirith run` COMMAND. A program that
+    // links tirith-core and calls `runner::run` directly is not routed through
+    // it, exactly as `docs/threat-model.md` says.
+    //
+    // Network egress is a boundary effect because it is true of the URL whatever
+    // its text parses to. The effects a downloaded script would have once it
+    // runs are not guessed here; the runner's existing post-download review
+    // already gates those against the ordinary verdict.
+    let run_assessment = {
+        let envelope = tirith_core::task_boundary::shell_envelope(url);
+        let operation = tirith_core::task_boundary::BoundaryOperation {
+            boundary: tirith_core::task_boundary::OwnedBoundary::RemoteScriptRun,
+            envelope: &envelope,
+            adapter: tirith_core::task::IngressAdapter::Unattributed,
+            boundary_effects: [tirith_core::effects::CommandEffectKind::NetworkEgress]
+                .into_iter()
+                .collect(),
+        };
+        tirith_core::task_boundary::evaluate(&operation, &output_policy.task_gate)
+    };
+    if let Some(reason) = run_assessment.refusal(false) {
+        let message = format!("task gate refused before any download: {reason}");
+        if json {
+            let error = build_run_error_json(&message, &output_dlp);
+            let _ = write_run_json(&error);
+        } else {
+            eprintln!(
+                "tirith run: {}",
+                tirith_core::output::sanitize_human_field_with_compiled(&message, &output_dlp),
+            );
+        }
+        return 1;
+    }
+    // The effects the gate refused tighten the capsule the script would run in,
+    // so a decision that survives to launch still narrows what launch means.
+    // `enforced_denied_effects` is empty unless the gate is enforcing, so an
+    // operator who filled in the effect sets without choosing a mode does not
+    // get a silently narrower capsule.
+    let denied_effects = run_assessment.enforced_denied_effects();
+
     // Every live path now uses the same stopped-target capsule controller. The
     // legacy `--capsule` spelling remains accepted, but omitting it no longer
     // falls back to an ordinary spawn that could run before durable execution
     // state is committed.
     let _capsule_requested = capsule;
     let verified_executor: Option<tirith_core::runner::VerifiedScriptExecutor> =
-        Some(Box::new(capsuled_exec));
+        Some(Box::new(move |invocation, reviewed, authorizer| {
+            capsuled_exec_tightened(invocation, reviewed, authorizer, &denied_effects)
+        }));
 
     let opts = RunOptions {
         url: url.to_string(),
@@ -293,16 +341,30 @@ fn apply_test_capsule_override(
     spec
 }
 
-/// The contained executor for every live `tirith run` (E5). `--capsule` is a
-/// legacy compatibility spelling, not an opt-in boundary. Runs the exact typed
-/// interpreter invocation through the locked-down OS capsule. File mode receives
-/// only the inherited sealed reviewed-script descriptor; no downloaded-script
-/// pathname enters argv. Enforcing surface: fail closed when the backend cannot
-/// provide the spec's required coverage.
-pub(crate) fn capsuled_exec(
+/// The contained executor for every live `tirith run` and `tirith install url`
+/// (E5). `--capsule` is a legacy compatibility spelling, not an opt-in boundary.
+/// Runs the exact typed interpreter invocation through the locked-down OS
+/// capsule. File mode receives only the inherited sealed reviewed-script
+/// descriptor; no downloaded-script pathname enters argv. Enforcing surface:
+/// fail closed when the backend cannot provide the spec's required coverage.
+///
+/// `task_denied_effects` carries the C12 decision into the spec: a denied effect
+/// becomes a removed capability
+/// ([`tirith_core::task_boundary::tighten_capsule_spec`]). Because
+/// `CapsuleSpec::required_coverage` is derived from the spec, tightening it
+/// raises what the backend must deliver, and the existing shortfall check
+/// refuses a backend that cannot deliver it. Nothing here loosens a spec.
+///
+/// There is deliberately no untightened sibling that takes three arguments. A
+/// convenience wrapper that passes an empty denial set is the easy wrong call
+/// for a new download-and-launch surface to make, and that is precisely the
+/// mistake `tirith install url` made before this slice was finished; a caller
+/// with no decision must now write the empty set out and mean it.
+pub(crate) fn capsuled_exec_tightened(
     invocation: &ScriptInvocation,
     reviewed_script: tirith_core::runner::ReviewedScript<'_>,
     authorizer: &mut tirith_core::runner::ExecutionAuthorizer,
+    task_denied_effects: &std::collections::BTreeSet<tirith_core::effects::CommandEffectKind>,
 ) -> Result<i32, String> {
     let outcome = match invocation.input_mode {
         ScriptInputMode::File => {
@@ -311,6 +373,7 @@ pub(crate) fn capsuled_exec(
                     .to_string()
             })?;
             let mut spec = reviewed_file_capsule_spec();
+            tirith_core::task_boundary::tighten_capsule_spec(&mut spec, task_denied_effects);
             let (read_roots, runtime_path) = validated_stdin_runtime(program)?;
             spec.filesystem.read_roots = read_roots;
             spec.environment.allow = ["PATH", "LANG", "TERM"]
@@ -340,6 +403,7 @@ pub(crate) fn capsuled_exec(
                     format!("forced stdin execution lost its closed interpreter identity: {error}")
                 })?;
             let mut spec = forced_stdin_capsule_spec();
+            tirith_core::task_boundary::tighten_capsule_spec(&mut spec, task_denied_effects);
             let (read_roots, runtime_path) = validated_stdin_runtime(program)?;
             spec.filesystem.read_roots = read_roots;
             // PATH is supplied as explicit, validated child data. It is not
@@ -1006,7 +1070,14 @@ mod tests {
                 interpreter: tirith_core::runner::PipeInterpreter::Bash,
                 args: Vec::new(),
             },
-            Box::new(super::capsuled_exec),
+            Box::new(|invocation, reviewed, authorizer| {
+                super::capsuled_exec_tightened(
+                    invocation,
+                    reviewed,
+                    authorizer,
+                    &std::collections::BTreeSet::new(),
+                )
+            }),
         );
         drop(server);
         result.expect("live `tirith run` regression transaction")

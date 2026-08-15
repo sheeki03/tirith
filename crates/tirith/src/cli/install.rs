@@ -1740,6 +1740,61 @@ pub fn run(
 
 // package-manager form: npm / pip / cargo
 
+/// C12: evaluate an owned `tirith install` transition.
+///
+/// The envelope carries the manager argv as a shell action so the Web3 grammar
+/// still contributes what it can derive; `boundary_effects` states what the
+/// TRANSITION itself does, which the argv grammar cannot tell you. Both feed one
+/// [`tirith_core::task::decide`]; nothing here re-implements effect inference.
+///
+/// The two transitions deliberately carry DIFFERENT effects. Analysis reaches a
+/// registry and nothing else: it installs nothing and writes nothing, so
+/// claiming an install effect there would refuse a read-only operation. The
+/// spawn is where the package is actually installed onto the disk. An operator
+/// who denies only `package_install` therefore keeps their analysis and loses
+/// the execution, which is the useful posture and would be unreachable if both
+/// gates asked the same question.
+fn evaluate_install_boundary(
+    boundary: tirith_core::task_boundary::OwnedBoundary,
+    manager: PackageManager,
+    args: &[String],
+    policy: &tirith_core::policy::Policy,
+    boundary_effects: &[tirith_core::effects::CommandEffectKind],
+) -> tirith_core::task_boundary::BoundaryAssessment {
+    let command = format!("{} {}", manager.program(), args.join(" "));
+    let envelope = tirith_core::task_boundary::shell_envelope(&command);
+    let operation = tirith_core::task_boundary::BoundaryOperation {
+        boundary,
+        envelope: &envelope,
+        adapter: tirith_core::task::IngressAdapter::Unattributed,
+        boundary_effects: boundary_effects.iter().copied().collect(),
+    };
+    tirith_core::task_boundary::evaluate(&operation, &policy.task_gate)
+}
+
+/// Report a pre-analysis task-gate refusal. `before` names the irreversible step
+/// that did not happen, in the caller's own words, because the two forms of
+/// `tirith install` reach different ones.
+///
+/// Written to stderr even under `--json`, matching every other refusal that
+/// happens before a plan exists (an empty argv, an unresolvable executable): the
+/// stdout envelope is `{"analysis":..,"outcome":..}` and there is no analysis to
+/// put in it yet.
+fn report_install_task_refusal(
+    assessment: &tirith_core::task_boundary::BoundaryAssessment,
+    before: &str,
+    reason: &str,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> i32 {
+    eprintln!(
+        "tirith install: task gate refused at the {} boundary before {}: {}",
+        assessment.boundary.token(),
+        before,
+        tirith_core::output::sanitize_human_field_with_compiled(reason, compiled),
+    );
+    1
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_package_manager(
     manager: PackageManager,
@@ -1840,6 +1895,30 @@ fn run_package_manager(
             return 2;
         }
     };
+
+    // C12: the owned network-egress transition for the analysis path. Every
+    // registry lookup below flows from `use_online` / `HttpRegistryClient` /
+    // `gather_api_signals_exact`, so the gate sits above all three: a refusal
+    // here means no host was contacted.
+    //
+    // The only effect analysis has is network egress: it resolves registry
+    // metadata, installs nothing, and writes nothing. The install and write
+    // effects belong to the spawn gate further down, not here.
+    let network_assessment = evaluate_install_boundary(
+        tirith_core::task_boundary::OwnedBoundary::PackageManagerNetwork,
+        manager,
+        args,
+        &policy,
+        &[tirith_core::effects::CommandEffectKind::NetworkEgress],
+    );
+    if let Some(reason) = network_assessment.refusal(false) {
+        return report_install_task_refusal(
+            &network_assessment,
+            "any registry request",
+            reason,
+            &output_dlp,
+        );
+    }
 
     // --- ANALYZE ---
     // Offline by default; `--online` opts in, `--offline` / `TIRITH_OFFLINE`
@@ -1966,7 +2045,39 @@ fn run_package_manager(
             Action::Warn | Action::WarnAck => ProceedDecision::Stop(2),
         }
     } else {
-        decide_proceed(&plan.verdict, &policy, interactive, yes, json)
+        // C12: the owned execution transition. Combined with `decide_proceed`
+        // so a task denial can only ever force a stop: it is folded in BEFORE
+        // the proceed decision is consulted, upstream of `ProceedDecision::Go`
+        // and therefore upstream of `run_and_record`, which is what creates the
+        // checkpoint and spawns the manager.
+        //
+        // `--no-exec` never reaches this branch, so a check-only run cannot be
+        // recorded as executed by the gate.
+        let execution_assessment = evaluate_install_boundary(
+            tirith_core::task_boundary::OwnedBoundary::PackageManagerExecution,
+            manager,
+            args,
+            &policy,
+            &[
+                tirith_core::effects::CommandEffectKind::PackageInstall,
+                tirith_core::effects::CommandEffectKind::NetworkEgress,
+                tirith_core::effects::CommandEffectKind::FilesystemWrite,
+            ],
+        );
+        match execution_assessment.refusal(false) {
+            Some(reason) => {
+                // Printed in JSON mode too. The envelope on stdout stays a
+                // clean `{"analysis":..,"outcome":null}`, and a refusal with no
+                // stated reason anywhere is worse than a line on stderr.
+                eprintln!(
+                    "tirith install: task gate refused before '{}' ran: {}",
+                    install_command_for_human_with_compiled(&plan.argv, &output_dlp),
+                    install_value_for_human(reason),
+                );
+                ProceedDecision::Stop(1)
+            }
+            None => decide_proceed(&plan.verdict, &policy, interactive, yes, json),
+        }
     };
 
     // If the gate bypassed a BLOCK via `TIRITH=0`, stamp the verdict so the audit
@@ -2979,6 +3090,38 @@ fn run_url(
         emit_install_policy_diagnostics_human(&output_dlp);
     }
 
+    // C12: the SAME owned download-and-launch transition `tirith run` guards.
+    // Both spellings end in `runner::run_with_verified_executor`, which is where
+    // `download_bounded` lives, so gating one and not the other would leave the
+    // second as a way to walk around an enforcing gate by swapping two words.
+    // The boundary token stays `remote_script_run` because the transition is the
+    // same one, not an `install`-flavoured cousin of it.
+    //
+    // Placed above the preflight print, the agent-rules pass, and the audit
+    // write: everything below has already resolved the policy but not yet
+    // contacted a host, so a refusal here costs nothing and reveals nothing. The
+    // policy is the snapshot `preflight_url` returned, so this shares the one
+    // discovery the rest of the function was built around instead of opening a
+    // second TOCTOU window.
+    let run_assessment = {
+        let envelope = tirith_core::task_boundary::shell_envelope(url);
+        let operation = tirith_core::task_boundary::BoundaryOperation {
+            boundary: tirith_core::task_boundary::OwnedBoundary::RemoteScriptRun,
+            envelope: &envelope,
+            adapter: tirith_core::task::IngressAdapter::Unattributed,
+            boundary_effects: [tirith_core::effects::CommandEffectKind::NetworkEgress]
+                .into_iter()
+                .collect(),
+        };
+        tirith_core::task_boundary::evaluate(&operation, &policy.task_gate)
+    };
+    if let Some(reason) = run_assessment.refusal(false) {
+        return report_install_task_refusal(&run_assessment, "any download", reason, &output_dlp);
+    }
+    // What the gate refused tightens the capsule the downloaded script would run
+    // in, exactly as in `tirith run`. Empty unless the gate is enforcing.
+    let task_denied_effects = run_assessment.enforced_denied_effects();
+
     // M4 item 8 chunk 3 — stamp the caller origin before the audit write, else
     // audit lines land in the "unknown" bucket.
     preflight.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
@@ -3082,7 +3225,16 @@ fn run_url(
         // executor as `tirith run`; there is no uncontained fallback.
         exec_fn: None,
     };
-    match runner::run_with_verified_executor(opts, Box::new(crate::cli::run::capsuled_exec)) {
+    let verified_executor: tirith_core::runner::VerifiedScriptExecutor =
+        Box::new(move |invocation, reviewed, authorizer| {
+            crate::cli::run::capsuled_exec_tightened(
+                invocation,
+                reviewed,
+                authorizer,
+                &task_denied_effects,
+            )
+        });
+    match runner::run_with_verified_executor(opts, verified_executor) {
         Ok(result) => {
             let presentation_patterns =
                 tirith_core::policy::captured_policy_dlp_patterns_or(&policy.dlp_custom_patterns);

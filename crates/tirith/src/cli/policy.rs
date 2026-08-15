@@ -360,11 +360,19 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
     // crash mid-write never loses the prior policy. Without `--force`,
     // `overwrite=false` makes it no-clobber, so a policy created in the race window
     // after the `exists()` check surfaces as a write error instead of being lost.
-    if let Err(e) = super::write_file_atomic_contained(
+    //
+    // C12: writing Tirith's own policy is a policy change at a Tirith-owned
+    // boundary, so it goes through the gated, single-use permit. The operator
+    // policy is discovered offline: a repository being initialised must not get
+    // to authorise the write that creates its own policy.
+    let operator_policy = tirith_core::policy::Policy::discover_local_only(cwd.as_deref());
+    if let Err(e) = super::write_config_file_permitted(
         &repo_root,
         &policy_path,
         template_body.as_bytes(),
         force,
+        &operator_policy,
+        true,
     ) {
         eprintln!(
             "tirith policy init: cannot write {}: {e}",

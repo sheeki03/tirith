@@ -3189,6 +3189,55 @@ fn handle_guarded_call(
                     .collect()
             };
             let session_id = tirith_core::session::resolve_session_id();
+
+            // C12: the owned gateway transition. This sits upstream of
+            // `prepare_execution` (which drafts durable execution state), of
+            // `acquire_current_tool_permit`, of `register_request`, and of the
+            // `forward` write, so a refusal here costs the upstream server
+            // nothing: no pending entry, no draft, no byte.
+            //
+            // `engine_policy` is the fully-merged policy the analysis already
+            // loaded, so the gate does not re-discover one and cannot disagree
+            // with the verdict about which policy was in force.
+            let task_envelope = tirith_core::task_boundary::shell_envelope(command);
+            let task_operation = tirith_core::task_boundary::BoundaryOperation {
+                boundary: tirith_core::task_boundary::OwnedBoundary::GatewayForward,
+                envelope: &task_envelope,
+                // Nothing on an MCP stdio pipe identified itself.
+                adapter: tirith_core::task::IngressAdapter::Unattributed,
+                boundary_effects: Default::default(),
+            };
+            let task_assessment =
+                tirith_core::task_boundary::evaluate(&task_operation, &engine_policy.task_gate);
+            // An off gate writes nothing: a per-call audit line an operator
+            // never asked for is not an inert default.
+            if task_assessment.is_recordable() {
+                write_task_boundary_audit(&task_assessment, tool_name, &hash, &session_id);
+            }
+            // The gateway has no channel to ask a human about a task decision,
+            // so a required approval is a refusal here. Observe and off modes
+            // never reach this branch: `refusal` returns `None` in both, which
+            // is what keeps `warn_action: deny` from turning observation into
+            // enforcement.
+            if let Some(reason) = task_assessment.refusal(false) {
+                write_audit_with_raw(
+                    "block",
+                    "task_boundary_denied",
+                    &raw_rule_ids_vec,
+                    None,
+                    tool_name,
+                    &hash,
+                    elapsed,
+                    false,
+                    false,
+                    Some(&raw_decision_str),
+                    Some(&raw_rule_ids_vec),
+                    Some(&session_id),
+                );
+                let _ = output_tx.send(build_task_gate_deny(id, reason, elapsed).into_bytes());
+                return Ok(());
+            }
+
             let completion_window = match Duration::from_millis(config.policy.pending_timeout_ms)
                 .checked_add(Duration::from_millis(config.policy.tombstone_retention_ms))
             {
@@ -3541,6 +3590,12 @@ fn handle_extraction_failed(
     Ok(())
 }
 
+/// A guarded `tools/call` sent as a NOTIFICATION has no id, so there is no
+/// channel on which a refusal could be answered. It is therefore dropped
+/// unconditionally, which is already at least as strict as anything the C12 task
+/// gate could decide: no envelope, no mode, and no policy can make an
+/// unconditional drop weaker. Evaluating the gate here would only cost a policy
+/// load per notification and could never change the outcome.
 fn handle_guarded_notification(command: &str, tool_name: &str) -> io::Result<()> {
     let hash = cmd_hash_prefix(command);
     write_audit(
@@ -3825,6 +3880,33 @@ fn build_fail_mode_deny(
             "elapsed_ms": elapsed_ms,
             "fail_mode_triggered": fail_mode_triggered,
             "timeout_triggered": timeout_triggered,
+        })),
+    };
+    let resp = JsonRpcResponse::ok(id, serde_json::to_value(&result).unwrap());
+    serde_json::to_string(&resp).unwrap_or_default()
+}
+
+/// C12: the response for a guarded call refused by the task gate.
+///
+/// Distinct from [`build_fail_mode_deny`]: nothing failed and nothing timed out,
+/// so the response must not claim `fail_mode=closed`. The client is told an
+/// enforcing policy refused the call, which is the truth it can act on.
+fn build_task_gate_deny(id: Value, reason: &str, elapsed_ms: f64) -> String {
+    let result = ToolCallResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: format!("Tirith task gate refused this call: {reason}"),
+        }],
+        is_error: true,
+        structured_content: Some(serde_json::json!({
+            "_tirith_schema": 1,
+            "decision": "deny",
+            "verdict_action": "block",
+            "findings": [],
+            "elapsed_ms": elapsed_ms,
+            "fail_mode_triggered": false,
+            "timeout_triggered": false,
+            "task_gate_denied": true,
         })),
     };
     let resp = JsonRpcResponse::ok(id, serde_json::to_value(&result).unwrap());
@@ -4133,6 +4215,31 @@ fn handle_server_initiated_message(
     };
     write_server_message_audit(decision, "notification", &rule_ids, "inspected");
     serde_json::to_vec(&parsed).ok()
+}
+
+/// C12: record one owned-boundary task decision.
+///
+/// Written in EVERY mode, including `off` and `observe`, because recording is
+/// the only thing observe mode is allowed to do. It is a separate line from the
+/// verdict audit on purpose: folding a task decision into the verdict's own
+/// `decision` field would make an observation indistinguishable from a rule
+/// finding, and `warn_action: deny` would then enforce it.
+fn write_task_boundary_audit(
+    assessment: &tirith_core::task_boundary::BoundaryAssessment,
+    tool_name: &str,
+    cmd_hash: &str,
+    session_id: &str,
+) {
+    let entry = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "kind": "gateway_task_boundary",
+        "tool_name": tool_name,
+        "command_hash_prefix": cmd_hash,
+        "session_id": session_id,
+        "task_decision": assessment.projection(),
+        "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
+    });
+    write_gateway_audit_json(entry);
 }
 
 fn write_server_message_audit(decision: &str, kind: &str, rule_ids: &[String], reason: &str) {
@@ -5354,8 +5461,21 @@ fn persist_descriptor_approval(
     let rendered = lock
         .render()
         .map_err(|_| "MCP lockfile contains data that is unsafe to persist")?;
-    super::write_file_atomic_contained(&approval.repo_root, &lock_path, rendered.as_bytes(), true)
-        .map_err(|_| "atomic contained MCP lock write failed")?;
+    // C12: the same Tirith-owned configuration write `tirith mcp lock` performs,
+    // reached from the gateway instead of the CLI, so it goes through the same
+    // gated permit. The operator policy is discovered offline: the repository
+    // whose descriptors are being approved does not authorise its own approval.
+    let operator_policy =
+        tirith_core::policy::Policy::discover_local_only(approval.repo_root.to_str());
+    super::write_config_file_permitted(
+        &approval.repo_root,
+        &lock_path,
+        rendered.as_bytes(),
+        true,
+        &operator_policy,
+        false,
+    )
+    .map_err(|_| "atomic contained MCP lock write failed")?;
 
     let written_bytes = tirith_core::util::read_text_no_follow_capped(
         &lock_path,
