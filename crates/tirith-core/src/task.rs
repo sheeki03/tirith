@@ -604,6 +604,63 @@ pub struct TaskDecision {
     pub mode: TaskGateMode,
 }
 
+/// A stable wire token for an envelope rejection.
+///
+/// The detail on `Malformed` is a serde message about SHAPE, not content, so it
+/// is safe to surface; it never echoes a field value.
+pub fn rejection_token(rejection: &EnvelopeRejection) -> String {
+    match rejection {
+        EnvelopeRejection::TooManySources { max } => format!("too_many_sources(max={max})"),
+        EnvelopeRejection::TooManyActions { max } => format!("too_many_actions(max={max})"),
+        EnvelopeRejection::SourceTooLarge { max } => format!("source_too_large(max={max})"),
+        EnvelopeRejection::InlineContentTooLarge { max } => {
+            format!("inline_content_too_large(max={max})")
+        }
+        EnvelopeRejection::StringTooLong { max } => format!("string_too_long(max={max})"),
+        EnvelopeRejection::PathTooLong { max } => format!("path_too_long(max={max})"),
+        EnvelopeRejection::Malformed { detail } => format!("malformed({detail})"),
+    }
+}
+
+/// The normalized security projection of a decision.
+///
+/// C11 requires the core, CLI, and MCP views of the same assessment to be
+/// equal. Rendering every surface from this one function makes that structural
+/// rather than a property a test has to keep re-proving: a field added for one
+/// caller cannot silently be missing from another, and the two cannot disagree
+/// about what was denied.
+///
+/// Effects serialize through serde, which yields the enums' declared
+/// `snake_case` wire tokens. `{:?}` would emit different spellings and would
+/// change silently under a variant rename.
+pub fn decision_projection(
+    decision: &TaskDecision,
+    rejections: &[EnvelopeRejection],
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "mode": decision.mode,
+        "complete": decision.complete,
+        "enforceability": decision.enforceability,
+        "inferred_effects": decision.inferred_effects,
+        "allowed_effects": decision.allowed_effects,
+        "denied_effects": decision.denied_effects,
+        // The CLAIM is reported next to the assignment on purpose: an operator
+        // debugging a refusal needs to see that the two differ.
+        "provenance": decision.provenance.iter().map(|provenance| serde_json::json!({
+            "claimed_source": provenance.claimed_source,
+            "effective_source": provenance.effective_source,
+            "adapter": provenance.adapter,
+            "receipt_status": provenance.receipt_status,
+        })).collect::<Vec<_>>(),
+        "envelope_rejections": rejections.iter().map(rejection_token).collect::<Vec<_>>(),
+        // Every surface that renders this is advisory. None of them executed
+        // anything, and the response says so rather than leaving the reader to
+        // assume an assessment was an enforcement.
+        "diagnostic": true,
+    })
+}
+
 /// Decide what a task may do.
 ///
 /// Intersects three independent restrictions and never unions them:

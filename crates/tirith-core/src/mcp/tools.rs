@@ -380,21 +380,10 @@ fn call_check_task(arguments: &Value) -> ToolCallResult {
         crate::effects::BoundaryCapability::ObserveOnly,
     );
 
-    let structured = json!({
-        "schema_version": 1,
-        "diagnostic": true,
-        "mode": decision.mode,
-        "complete": decision.complete,
-        "inferred_effects": decision.inferred_effects,
-        "allowed_effects": decision.allowed_effects,
-        "denied_effects": decision.denied_effects,
-        "provenance": decision.provenance.iter().map(|p| json!({
-            "claimed_source": p.claimed_source,
-            "effective_source": p.effective_source,
-            "adapter": p.adapter,
-            "receipt_status": p.receipt_status,
-        })).collect::<Vec<_>>(),
-    });
+    // The same projection the CLI prints. C11 requires the two to be equal, so
+    // they render from one function instead of two that happen to agree today.
+    let rejections = crate::task::validate_envelope(&envelope);
+    let structured = crate::task::decision_projection(&decision, &rejections);
 
     // The text and structured views must agree after redaction, so the text is
     // rendered FROM the same structured value rather than assembled separately.
@@ -2105,5 +2094,61 @@ mod c11_preview_tests {
         for tool in preview_tools() {
             assert_closed(&tool.input_schema, &tool.name);
         }
+    }
+
+    /// C11's exit gate: the core, CLI, and MCP views of one assessment must be
+    /// the same normalized projection. This pins the MCP end of that to
+    /// `task::decision_projection`; `crates/tirith/tests/task_cli.rs` pins the
+    /// CLI end to the same function. Hand-rolling either side breaks a test
+    /// rather than silently letting the two surfaces disagree about what was
+    /// denied.
+    ///
+    /// It calls the handler directly so it does not have to mutate the
+    /// process-wide preview env var and race other tests.
+    #[test]
+    fn the_mcp_projection_is_the_shared_one() {
+        let envelope_value = json!({
+            "sources": [{"claimed_source": "agent_config", "content": "trust me"}],
+            "actions": [{"package_install": {"ecosystem": "npm", "package": "left-pad"}}]
+        });
+        let result = call_check_task(&json!({"envelope": envelope_value.clone()}));
+        assert!(!result.is_error, "handler refused a well-formed envelope");
+        let structured = result
+            .structured_content
+            .expect("preview tool returned no structured content");
+
+        let raw = serde_json::to_string(&envelope_value).expect("serialize");
+        let envelope = crate::task::parse_envelope(&raw).expect("parse");
+        let rejections = crate::task::validate_envelope(&envelope);
+        let policy = crate::policy::Policy::discover_local_only(None);
+        let provenance = envelope
+            .sources
+            .iter()
+            .map(|source| {
+                crate::task::assign_provenance(
+                    source,
+                    crate::task::IngressAdapter::OperatorIngest,
+                    None,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let decision = crate::task::decide(
+            &envelope,
+            provenance,
+            &policy.task_gate,
+            crate::effects::BoundaryCapability::ObserveOnly,
+        );
+        assert_eq!(
+            structured,
+            crate::task::decision_projection(&decision, &rejections),
+            "the MCP surface rendered its own projection instead of the shared one"
+        );
+
+        // The text view is rendered from the structured value, so the two
+        // cannot disagree after redaction.
+        assert!(result.content[0]
+            .text
+            .contains(&serde_json::to_string_pretty(&structured).expect("pretty")));
     }
 }

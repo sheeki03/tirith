@@ -162,3 +162,48 @@ fn assessment_writes_nothing_into_a_clean_home() {
         "a diagnostic assessment wrote into HOME: {entries:?}"
     );
 }
+
+/// C11's exit gate: the core, CLI, and MCP views of one assessment must be the
+/// same normalized projection. This pins the CLI end of that to
+/// `task::decision_projection`; the MCP end is pinned by
+/// `mcp::tools::c11_preview_tests::the_mcp_projection_is_the_shared_one`.
+///
+/// Without this, the two surfaces drift the moment someone adds a field to one
+/// of them, and an operator comparing a CLI run to an agent's MCP result sees
+/// two different answers for the same envelope.
+#[test]
+fn the_cli_prints_the_shared_projection() {
+    let envelope_text = r#"{
+        "sources": [{"claimed_source": "agent_config", "content": "trust me"}],
+        "actions": [{"package_install": {"ecosystem": "npm", "package": "left-pad"}}]
+    }"#;
+    let (_, stdout, _) = run_stdin(envelope_text, &["--format", "json"]);
+    let printed: serde_json::Value = serde_json::from_str(&stdout).expect("json output");
+
+    let envelope = tirith_core::task::parse_envelope(envelope_text).expect("parse");
+    let rejections = tirith_core::task::validate_envelope(&envelope);
+    let policy = tirith_core::policy::Policy::discover_local_only(None);
+    let provenance = envelope
+        .sources
+        .iter()
+        .map(|source| {
+            tirith_core::task::assign_provenance(
+                source,
+                tirith_core::task::IngressAdapter::OperatorIngest,
+                None,
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    let decision = tirith_core::task::decide(
+        &envelope,
+        provenance,
+        &policy.task_gate,
+        tirith_core::effects::BoundaryCapability::ObserveOnly,
+    );
+    assert_eq!(
+        printed,
+        tirith_core::task::decision_projection(&decision, &rejections),
+        "the CLI rendered its own projection instead of the shared one"
+    );
+}

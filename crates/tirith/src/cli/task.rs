@@ -20,8 +20,9 @@ use std::path::Path;
 use tirith_core::effects::{BoundaryCapability, CommandEffectKind};
 use tirith_core::policy::Policy;
 use tirith_core::task::{
-    assign_provenance, decide, parse_envelope, validate_envelope, EnvelopeRejection,
-    IngressAdapter, TaskDecision, TaskEnvelopeInput, MAX_INLINE_BYTES,
+    assign_provenance, decide, decision_projection, parse_envelope, rejection_token,
+    validate_envelope, EnvelopeRejection, IngressAdapter, TaskDecision, TaskEnvelopeInput,
+    MAX_INLINE_BYTES,
 };
 
 /// Exit codes, matching the repository's existing convention: 0 clean, 1 a
@@ -96,58 +97,11 @@ fn effect_token(effect: CommandEffectKind) -> &'static str {
     }
 }
 
-fn effects_json(effects: &BTreeSet<CommandEffectKind>) -> Vec<String> {
-    effects
-        .iter()
-        .map(|effect| effect_token(*effect).to_string())
-        .collect()
-}
-
-fn rejection_token(rejection: &EnvelopeRejection) -> String {
-    match rejection {
-        EnvelopeRejection::TooManySources { max } => format!("too_many_sources(max={max})"),
-        EnvelopeRejection::TooManyActions { max } => format!("too_many_actions(max={max})"),
-        EnvelopeRejection::SourceTooLarge { max } => format!("source_too_large(max={max})"),
-        EnvelopeRejection::InlineContentTooLarge { max } => {
-            format!("inline_content_too_large(max={max})")
-        }
-        EnvelopeRejection::StringTooLong { max } => format!("string_too_long(max={max})"),
-        EnvelopeRejection::PathTooLong { max } => format!("path_too_long(max={max})"),
-        // The detail is a serde message about SHAPE, not content, so it is safe
-        // to surface; it never echoes a field value.
-        EnvelopeRejection::Malformed { detail } => format!("malformed({detail})"),
-    }
-}
-
-fn decision_json(decision: &TaskDecision, rejections: &[EnvelopeRejection]) -> serde_json::Value {
-    serde_json::json!({
-        "schema_version": 1,
-        "mode": decision.mode,
-        "complete": decision.complete,
-        "enforceability": match decision.enforceability {
-            BoundaryCapability::ObserveOnly => "observe_only",
-            BoundaryCapability::BoundaryDependent => "boundary_dependent",
-            BoundaryCapability::Enforceable => "enforceable",
-        },
-        "inferred_effects": effects_json(&decision.inferred_effects),
-        "allowed_effects": effects_json(&decision.allowed_effects),
-        "denied_effects": effects_json(&decision.denied_effects),
-        // Serialized through serde, NOT `{:?}`. These enums already declare
-        // `rename_all = "snake_case"`, so serde yields the stable wire tokens
-        // (`github_issue`, `agent_config`); Debug formatting would emit
-        // `githubissue` and would silently change if a variant were renamed.
-        "provenance": decision.provenance.iter().map(|p| serde_json::json!({
-            // The CLAIM is reported next to the assignment on purpose: an
-            // operator debugging a refusal needs to see that the two differ.
-            "claimed_source": p.claimed_source,
-            "effective_source": p.effective_source,
-            "adapter": p.adapter,
-            "receipt_status": p.receipt_status,
-        })).collect::<Vec<_>>(),
-        "envelope_rejections": rejections.iter().map(rejection_token).collect::<Vec<_>>(),
-        "diagnostic": true,
-    })
-}
+// The JSON projection deliberately lives in core (`task::decision_projection`)
+// rather than here, so this CLI and the MCP preview tool cannot drift apart.
+// C11's exit gate requires their normalized security output to be equal, and a
+// single renderer makes that structural instead of something a test has to keep
+// re-proving. The human rendering below is presentation only.
 
 fn print_human(decision: &TaskDecision, rejections: &[EnvelopeRejection]) {
     println!("tirith task check (diagnostic — nothing was executed)");
@@ -261,7 +215,7 @@ pub fn run(path: Option<&Path>, adapter: Option<&str>, json: bool) -> i32 {
     );
 
     if json {
-        println!("{}", decision_json(&decision, &rejections));
+        println!("{}", decision_projection(&decision, &rejections));
     } else {
         print_human(&decision, &rejections);
     }
