@@ -843,6 +843,7 @@ pub mod ssh;
 pub mod status;
 pub mod sudo;
 pub mod taint;
+pub mod task;
 pub mod temp_run;
 pub mod threatdb_cmd;
 pub mod trust;

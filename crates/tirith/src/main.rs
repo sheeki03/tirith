@@ -581,6 +581,16 @@ Examples:
   tirith score https://get.example-tool.sh
   tirith score --explain https://example.com
   tirith score --format json https://example.com")]
+    /// Diagnostically assess an untrusted task envelope (preview).
+    ///
+    /// Reports what the envelope WOULD be allowed to do under the current
+    /// policy. Executes nothing, fetches nothing, resolves no package, and
+    /// writes nothing.
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+
     Score {
         /// URL to score
         url: String,
@@ -2965,6 +2975,28 @@ Examples:
     Browser {
         #[command(subcommand)]
         action: BrowserAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// Assess a bounded task envelope from a file or stdin.
+    Check {
+        /// Envelope JSON file. Reads stdin when omitted.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+
+        /// Which Tirith-owned ingress adapter obtained the content. This is an
+        /// OPERATOR assertion; the envelope can never claim it for itself.
+        #[arg(long)]
+        adapter: Option<String>,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
     },
 }
 
@@ -7458,6 +7490,18 @@ fn run() {
                 && is_terminal::is_terminal(std::io::stdin());
             cli::lab::run(interactive, filter.as_deref(), want_json, score)
         }
+
+        Commands::Task { action } => match action {
+            TaskAction::Check {
+                file,
+                adapter,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::task::run(file.as_deref(), adapter.as_deref(), json)
+            }
+        },
 
         Commands::Score {
             url,
