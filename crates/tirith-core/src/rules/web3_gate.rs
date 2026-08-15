@@ -126,6 +126,52 @@ fn is_state_changing(facts: &Web3CommandFactsV2) -> bool {
     )
 }
 
+/// Cluster monikers that name a development or test network.
+///
+/// Deliberately a SHORT exact list, not a substring test: `devnet` must match
+/// while `my-devnet-proxy.example` must not, because an attacker-supplied host
+/// containing "devnet" is not a development network.
+const DEVELOPMENT_NETWORK_ALIASES: &[&str] = &[
+    "devnet",
+    "testnet",
+    "localhost",
+    "localnet",
+    "local",
+    "l",
+    "d",
+    "t",
+];
+
+/// Is this operation explicitly aimed at a development or test network?
+///
+/// Deploying to devnet is routine developer activity that happens many times a
+/// day, and the C00 benign corpus lists local and devnet operations as
+/// negatives precisely so a new rule cannot start warning on them. Warning here
+/// would be the alert-fatigue failure that makes operators stop reading the
+/// output.
+///
+/// Only an EXPLICIT selector counts. A command with no endpoint at all falls
+/// through to the tool's configured default, which may well be mainnet, so
+/// silence there would be under-detection.
+fn targets_development_network(facts: &Web3CommandFactsV2) -> bool {
+    let Some(rpc) = facts.rpc.as_ref() else {
+        return false;
+    };
+    if let Some(alias) = rpc.alias.as_deref() {
+        if DEVELOPMENT_NETWORK_ALIASES
+            .iter()
+            .any(|known| alias.eq_ignore_ascii_case(known))
+        {
+            return true;
+        }
+    }
+    // A loopback endpoint is a local node by definition.
+    matches!(
+        rpc.host.as_deref(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1")
+    )
+}
+
 /// A safety control the operator would have to switch off deliberately.
 fn disables_declared_safety(facts: &Web3CommandFactsV2) -> bool {
     facts.safety_flags.iter().any(|flag| {
@@ -138,6 +184,12 @@ fn disables_declared_safety(facts: &Web3CommandFactsV2) -> bool {
 
 fn push_state_change(findings: &mut Vec<Finding>, facts: &Web3CommandFactsV2) {
     if !is_state_changing(facts) {
+        return;
+    }
+    // A deploy explicitly aimed at devnet, testnet, or a local validator is
+    // normal development, not an event worth interrupting. The signer rules
+    // still apply: a raw key is just as exposed on devnet as on mainnet.
+    if targets_development_network(facts) {
         return;
     }
     // High only when a write ALSO disables a declared check. A plain deploy is
@@ -473,9 +525,72 @@ mod tests {
     }
 
     #[test]
+    fn a_development_network_deploy_is_not_worth_interrupting() {
+        // The C00 benign corpus lists local and devnet operations as negatives
+        // precisely so a new rule cannot start warning on routine development.
+        let guard = Web3GuardPolicy::default();
+        for command in [
+            "solana program deploy --url devnet target/deploy/example.so",
+            "solana program deploy --url testnet x.so",
+            "solana program deploy --url localhost x.so",
+            "solana program deploy --url localnet x.so",
+        ] {
+            let findings = findings_for(command, &guard);
+            assert!(
+                !has(&findings, RuleId::Web3StateChangingCommand),
+                "a development-network deploy warned: {command}"
+            );
+        }
+
+        // Production is unaffected, including the no-selector case, which falls
+        // through to the tool's configured default and may well be mainnet.
+        for command in [
+            "solana program deploy --url mainnet-beta x.so",
+            "solana program deploy x.so",
+        ] {
+            assert!(
+                has(
+                    &findings_for(command, &guard),
+                    RuleId::Web3StateChangingCommand
+                ),
+                "a production deploy went unreported: {command}"
+            );
+        }
+
+        // The carve-out is an EXACT moniker match, so a hostile host that merely
+        // contains the word does not inherit the exemption.
+        assert!(
+            has(
+                &findings_for(
+                    "cast send 0xabc --rpc-url https://my-devnet-proxy.example",
+                    &guard
+                ),
+                RuleId::Web3StateChangingCommand
+            ),
+            "a host containing 'devnet' must not be treated as a development network"
+        );
+
+        // A raw key is just as exposed on devnet, so the signer rule still fires.
+        let devnet_key = findings_for(
+            "solana program deploy --url devnet --keypair 5MaiiCavjCmn9Hs1o3eznqDEhRwxo7pXiAYez7keQUviUkauRiTMD8DrESdrNjN8zd9mTmVhRvBJeg9LhaTLDBK9 x.so",
+            &guard,
+        );
+        assert!(
+            has(&devnet_key, RuleId::Web3SignerRisk),
+            "the signer rule must not inherit the development-network exemption"
+        );
+    }
+
+    #[test]
     fn a_hardware_wallet_is_not_a_signer_risk() {
         let guard = Web3GuardPolicy::default();
-        let findings = findings_for("cast send 0xabc --ledger", &guard);
+        // An explicit remote endpoint, because `cast send` with no `--rpc-url`
+        // resolves to the localhost tool default, which is a local node and is
+        // covered by the development-network carve-out.
+        let findings = findings_for(
+            "cast send 0xabc --rpc-url https://mainnet.example --ledger",
+            &guard,
+        );
         assert!(!has(&findings, RuleId::Web3SignerRisk));
         // ...but it is still an on-chain write.
         assert!(has(&findings, RuleId::Web3StateChangingCommand));

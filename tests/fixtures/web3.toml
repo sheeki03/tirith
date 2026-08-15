@@ -542,7 +542,7 @@ expected_rules = ["web3_state_changing_command"]
 [[fixture]]
 name = "c10_web3_raw_private_key_is_critical"
 min_milestone = 13
-input = "cast send 0x0000000000000000000000000000000000000001 --private-key 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+input = "cast send 0x0000000000000000000000000000000000000001 --rpc-url https://rpc.example.invalid --private-key 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 context = "exec"
 expected_action = "block"
 expected_rules = ["web3_signer_risk", "web3_state_changing_command"]
@@ -550,8 +550,38 @@ expected_rules = ["web3_signer_risk", "web3_state_changing_command"]
 [[fixture]]
 name = "c10_web3_hardware_wallet_is_not_a_signer_risk"
 min_milestone = 13
-input = "cast send 0x0000000000000000000000000000000000000001 --ledger"
+input = "cast send 0x0000000000000000000000000000000000000001 --rpc-url https://rpc.example.invalid --ledger"
 context = "exec"
 expected_action = "warn"
 expected_rules = ["web3_state_changing_command"]
 forbidden_rules = ["web3_signer_risk"]
+
+# The development-network carve-out. C00's benign corpus lists local and devnet
+# operations as negatives, so a deploy explicitly aimed at one must not warn.
+# The signer rules still apply: a key is just as exposed on devnet.
+
+[[fixture]]
+name = "c10_web3_devnet_deploy_is_not_interrupted"
+min_milestone = 13
+input = "solana program deploy --url devnet target/deploy/example.so"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["web3_state_changing_command"]
+
+[[fixture]]
+name = "c10_web3_localhost_deploy_is_not_interrupted"
+min_milestone = 13
+input = "solana program deploy --url localhost target/deploy/example.so"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["web3_state_changing_command"]
+
+[[fixture]]
+name = "c10_web3_devnet_lookalike_host_is_not_exempt"
+min_milestone = 13
+input = "cast send 0x0000000000000000000000000000000000000001 --rpc-url https://my-devnet-proxy.example.invalid"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["web3_state_changing_command"]

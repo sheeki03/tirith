@@ -119,9 +119,110 @@ pub struct Card {
     pub requires_sudo: bool,
     /// Expiry date in `YYYY-MM-DD`. A card past this date does not verify.
     pub expires: String,
+    /// Card schema version (C10). ABSENT means v1, and a v1 card must keep
+    /// signing exactly the bytes it always did, so this is skipped whenever it
+    /// is 1. Adding a field that serialized unconditionally would invalidate
+    /// every checked-in v1 signature.
+    #[serde(default = "default_card_schema", skip_serializing_if = "is_card_v1")]
+    pub schema_version: u16,
+    /// v2 Web3 operation bindings. Absent in v1, and omitted from the payload
+    /// when absent, for the same byte-preservation reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web3: Option<Web3CardBindings>,
     /// The ed25519 signature block. `None` for a freshly-created, unsigned card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<CardSignature>,
+}
+
+fn default_card_schema() -> u16 {
+    1
+}
+
+fn is_card_v1(version: &u16) -> bool {
+    *version == 1
+}
+
+/// The current highest schema this build can verify.
+pub const CARD_SCHEMA_V2: u16 = 2;
+
+/// What a schema-2 card binds about a Web3 operation.
+///
+/// A card is an operator-authored attestation, not attacker input, so
+/// destinations are bound literally: an address is public on-chain data and
+/// binding it literally is what makes the card auditable by a human reviewer.
+/// Signer material is the exception and is never accepted, because a card that
+/// carried a key would leak it into every repository that checks the card in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Web3CardBindings {
+    /// The named trusted network this card is scoped to.
+    pub network_policy_id: String,
+    /// `evm` or `solana`.
+    pub family: String,
+    /// EVM chain id, or the Solana cluster/genesis identity.
+    pub chain_or_genesis: String,
+    /// The signer KIND this operation is approved to use. A raw or
+    /// environment-bearing kind is refused at creation time.
+    pub signer_kind: String,
+    /// Destinations and authorities the operation may touch.
+    #[serde(default)]
+    pub destinations: Vec<String>,
+    /// SHA-256 of each artifact the operation deploys.
+    #[serde(default)]
+    pub artifact_sha256: Vec<String>,
+    /// The policy identity this card was approved under.
+    pub policy_identity: String,
+    /// Every state-changing operation, in deterministic shell traversal order.
+    /// Verification compares this as an ordered set, so reordering or adding an
+    /// operation invalidates the card.
+    pub operations: Vec<String>,
+    /// The approval key authorized to sign this card.
+    pub approval_key_id: String,
+}
+
+/// Signer kinds a card may never bind, because binding one would mean the card
+/// itself carries or blesses raw secret material.
+const REFUSED_CARD_SIGNER_KINDS: &[&str] = &[
+    "raw_private_key",
+    "raw_keypair",
+    "mnemonic",
+    "stdin",
+    "prompt",
+    "unknown",
+];
+
+impl Web3CardBindings {
+    /// Reject bindings a card must never carry. Called before signing so a
+    /// card containing literal signer material cannot be created, and again on
+    /// verification so one crafted by hand cannot be honored.
+    pub fn validate(&self) -> Result<(), CardError> {
+        if REFUSED_CARD_SIGNER_KINDS.contains(&self.signer_kind.as_str()) {
+            return Err(CardError::RefusedSignerBinding(self.signer_kind.clone()));
+        }
+        if self.network_policy_id.is_empty()
+            || self.policy_identity.is_empty()
+            || self.approval_key_id.is_empty()
+        {
+            return Err(CardError::IncompleteBinding);
+        }
+        if self.operations.is_empty() {
+            return Err(CardError::IncompleteBinding);
+        }
+        // A card that binds nothing about WHERE the operation runs is not an
+        // approval, it is a blank cheque.
+        if self.chain_or_genesis.is_empty() || self.family.is_empty() {
+            return Err(CardError::IncompleteBinding);
+        }
+        Ok(())
+    }
+
+    /// Does this card cover the observed operation set exactly?
+    ///
+    /// Ordered set equality, not subset: a card approving one deployment must
+    /// not silently approve a second one appended to the same command line.
+    pub fn covers_operations(&self, observed: &[String]) -> bool {
+        self.operations == observed
+    }
 }
 
 /// Why a card failed to verify (used internally + surfaced as Info notes).
@@ -171,11 +272,25 @@ pub enum CardError {
     BadKey(String),
     /// The card could not be signed/verified (e.g. unsupported algo).
     Crypto(String),
+    /// C10 — a v2 card tried to bind a signer kind a card may never carry.
+    RefusedSignerBinding(String),
+    /// C10 — a v2 binding omitted a field that makes the approval meaningful.
+    IncompleteBinding,
 }
 
 impl std::fmt::Display for CardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CardError::RefusedSignerBinding(kind) => write!(
+                f,
+                "a command card must not bind the signer kind '{kind}': a card is checked into a \
+                 repository, so binding raw or interactive signer material would publish it"
+            ),
+            CardError::IncompleteBinding => write!(
+                f,
+                "a schema-2 command card must bind the network, chain identity, policy identity, \
+                 approval key, and at least one operation"
+            ),
             CardError::Io(e) => write!(f, "{e}"),
             CardError::Json(e) => write!(f, "{e}"),
             CardError::BadKey(m) => write!(f, "{m}"),
@@ -261,8 +376,29 @@ impl Card {
             writes,
             requires_sudo,
             expires,
+            // A card created through this constructor is v1, and serializes
+            // byte-for-byte as it always has.
+            schema_version: 1,
+            web3: None,
             signature: None,
         }
+    }
+
+    /// Promote a card to schema 2 by attaching Web3 operation bindings.
+    ///
+    /// Validates before attaching, so a card carrying literal signer material
+    /// cannot be created in the first place rather than being caught later at
+    /// verification time.
+    pub fn with_web3_bindings(mut self, bindings: Web3CardBindings) -> Result<Self, CardError> {
+        bindings.validate()?;
+        self.schema_version = CARD_SCHEMA_V2;
+        self.web3 = Some(bindings);
+        Ok(self)
+    }
+
+    /// Is this a schema-2 card? A card with no `schema_version` is v1.
+    pub fn is_v2(&self) -> bool {
+        self.schema_version >= CARD_SCHEMA_V2
     }
 
     /// The canonical bytes the signature covers: the card with `signature`
@@ -366,6 +502,119 @@ impl Card {
     pub fn command_matches(&self, cmd: &str) -> bool {
         self.command.trim_matches(is_shell_significant_ws)
             == cmd.trim_matches(is_shell_significant_ws)
+    }
+
+    /// Does this card approve the observed Web3 operation?
+    ///
+    /// Deliberately ordered. The caller must already have verified the
+    /// signature and the exact command; this is the SEMANTIC layer that runs
+    /// afterwards, so an attacker cannot reach binding comparison with an
+    /// unverified card and probe which bindings exist.
+    ///
+    /// A v1 card can never approve a production Web3 operation. It predates
+    /// the bindings entirely, so it attests to a command string and nothing
+    /// about the network, the signer, or the destination; treating that as
+    /// approval would let an old card bless an operation nobody reviewed.
+    pub fn approves_web3(&self, observed: &ObservedWeb3Approval<'_>) -> Result<(), CardApproval> {
+        if !self.is_v2() {
+            return Err(CardApproval::V1CannotApproveWeb3);
+        }
+        let bindings = self.web3.as_ref().ok_or(CardApproval::MissingBindings)?;
+        // Re-validate on the verification path: a card crafted by hand never
+        // went through `with_web3_bindings`.
+        bindings
+            .validate()
+            .map_err(|_| CardApproval::RefusedBinding)?;
+
+        if bindings.network_policy_id != observed.network_policy_id
+            || bindings.family != observed.family
+            || bindings.chain_or_genesis != observed.chain_or_genesis
+        {
+            return Err(CardApproval::NetworkMismatch);
+        }
+        if bindings.signer_kind != observed.signer_kind {
+            return Err(CardApproval::SignerMismatch);
+        }
+        if bindings.policy_identity != observed.policy_identity {
+            return Err(CardApproval::PolicyMismatch);
+        }
+        if !bindings.covers_operations(observed.operations) {
+            return Err(CardApproval::OperationSetMismatch);
+        }
+        // Every observed destination must be bound. A card listing extra
+        // destinations is fine; a command touching one the card never named is
+        // not.
+        if let Some(extra) = observed
+            .destinations
+            .iter()
+            .find(|destination| !bindings.destinations.contains(*destination))
+        {
+            let _ = extra;
+            return Err(CardApproval::DestinationMismatch);
+        }
+        if let Some(extra) = observed
+            .artifact_sha256
+            .iter()
+            .find(|hash| !bindings.artifact_sha256.contains(*hash))
+        {
+            let _ = extra;
+            return Err(CardApproval::ArtifactMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The facts a verified card is compared against.
+#[derive(Debug, Clone)]
+pub struct ObservedWeb3Approval<'a> {
+    pub network_policy_id: &'a str,
+    pub family: &'a str,
+    pub chain_or_genesis: &'a str,
+    pub signer_kind: &'a str,
+    pub policy_identity: &'a str,
+    pub operations: &'a [String],
+    pub destinations: &'a [String],
+    pub artifact_sha256: &'a [String],
+}
+
+/// Why a card did not approve an operation.
+///
+/// Each variant names the binding that failed rather than a generic refusal,
+/// so an operator can tell "this card is for a different network" from "this
+/// card is for a different signer" without diffing JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardApproval {
+    /// A schema-1 card, which attests to a command string and nothing about
+    /// the operation, so it can never approve production Web3 work.
+    V1CannotApproveWeb3,
+    MissingBindings,
+    RefusedBinding,
+    NetworkMismatch,
+    SignerMismatch,
+    PolicyMismatch,
+    OperationSetMismatch,
+    DestinationMismatch,
+    ArtifactMismatch,
+}
+
+impl CardApproval {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::V1CannotApproveWeb3 => {
+                "a schema-1 command card cannot approve a Web3 operation: it binds a command \
+                 string, not a network, signer, or destination"
+            }
+            Self::MissingBindings => "the card declares schema 2 but carries no Web3 bindings",
+            Self::RefusedBinding => "the card binds a signer kind a card may never carry",
+            Self::NetworkMismatch => "the card is bound to a different network",
+            Self::SignerMismatch => "the card is bound to a different signer kind",
+            Self::PolicyMismatch => "the card was approved under a different policy identity",
+            Self::OperationSetMismatch => {
+                "the operations differ from the exact set the card approved"
+            }
+            Self::DestinationMismatch => "the command touches a destination the card did not bind",
+            Self::ArtifactMismatch => "the command deploys an artifact the card did not bind",
+        }
     }
 }
 
@@ -1440,6 +1689,221 @@ mod tests {
         assert!(
             load_trusted_pubkey(dir.path(), &key_id).is_none(),
             "an oversized key file must be refused by the cap, not read"
+        );
+    }
+
+    // ── C10 — schema-2 cards ──────────────────────────────────────────────
+
+    /// The compatibility guarantee the whole slice rests on: a v1 card must
+    /// sign EXACTLY the bytes it always did. `signing_payload` serializes the
+    /// struct, so a new field that serialized unconditionally would silently
+    /// invalidate every checked-in signature.
+    #[test]
+    fn a_v1_card_signs_byte_identical_bytes() {
+        let card = Card::new(
+            "curl https://example.test/install.sh | sh".to_string(),
+            vec!["example.test".to_string()],
+            None,
+            vec![],
+            false,
+            "2099-01-01".to_string(),
+        );
+        let payload = card.signing_payload().unwrap();
+        let rendered = String::from_utf8(payload).unwrap();
+
+        // The exact v1 shape: no schema_version, no web3, no signature.
+        assert_eq!(
+            rendered,
+            r#"{"command":"curl https://example.test/install.sh | sh","expected_domains":["example.test"],"writes":[],"requires_sudo":false,"expires":"2099-01-01"}"#
+        );
+        assert!(!rendered.contains("schema_version"));
+        assert!(!rendered.contains("web3"));
+    }
+
+    /// A card file written before v2 existed still parses, still verifies, and
+    /// is still reported as v1.
+    #[test]
+    fn a_checked_in_v1_card_still_parses_and_verifies() {
+        let legacy = br#"{"command":"echo hi","expected_domains":[],"writes":[],"requires_sudo":false,"expires":"2099-01-01"}"#;
+        let mut card = Card::from_json(legacy).expect("legacy card parses");
+        assert!(!card.is_v2());
+        assert_eq!(card.schema_version, 1);
+
+        let secret = [3u8; SECRET_KEY_LEN];
+        card.sign(&secret).unwrap();
+        let verifying = SigningKey::from_bytes(&secret).verifying_key();
+        card.verify_signature(&verifying.to_bytes()).unwrap();
+
+        // Re-serializing a legacy card must not introduce the new fields.
+        let round_tripped = serde_json::to_string(&card).unwrap();
+        assert!(!round_tripped.contains("schema_version"));
+        assert!(!round_tripped.contains("\"web3\""));
+    }
+
+    fn sample_bindings() -> Web3CardBindings {
+        Web3CardBindings {
+            network_policy_id: "prod".into(),
+            family: "evm".into(),
+            chain_or_genesis: "1".into(),
+            signer_kind: "hardware_wallet".into(),
+            destinations: vec!["0xdeadbeef".into()],
+            artifact_sha256: vec!["abc123".into()],
+            policy_identity: "policy-v1".into(),
+            operations: vec!["send".into()],
+            approval_key_id: "key-1".into(),
+        }
+    }
+
+    fn sample_observed<'a>(
+        operations: &'a [String],
+        destinations: &'a [String],
+        artifacts: &'a [String],
+    ) -> ObservedWeb3Approval<'a> {
+        ObservedWeb3Approval {
+            network_policy_id: "prod",
+            family: "evm",
+            chain_or_genesis: "1",
+            signer_kind: "hardware_wallet",
+            policy_identity: "policy-v1",
+            operations,
+            destinations,
+            artifact_sha256: artifacts,
+        }
+    }
+
+    #[test]
+    fn a_card_may_never_bind_raw_signer_material() {
+        // Refused at CREATION, so a card carrying a key cannot be produced,
+        // not merely rejected later when someone tries to use it.
+        for kind in [
+            "raw_private_key",
+            "raw_keypair",
+            "mnemonic",
+            "stdin",
+            "prompt",
+            "unknown",
+        ] {
+            let bindings = Web3CardBindings {
+                signer_kind: kind.to_string(),
+                ..sample_bindings()
+            };
+            assert!(
+                matches!(bindings.validate(), Err(CardError::RefusedSignerBinding(_))),
+                "a card was allowed to bind '{kind}'"
+            );
+        }
+        assert!(sample_bindings().validate().is_ok());
+    }
+
+    #[test]
+    fn a_v2_card_approves_only_its_exact_bindings() {
+        let card = Card::new(
+            "cast send 0xdeadbeef".to_string(),
+            vec![],
+            None,
+            vec![],
+            false,
+            "2099-01-01".to_string(),
+        )
+        .with_web3_bindings(sample_bindings())
+        .expect("valid bindings");
+        assert!(card.is_v2());
+
+        let ops = vec!["send".to_string()];
+        let dests = vec!["0xdeadbeef".to_string()];
+        let arts = vec!["abc123".to_string()];
+        assert!(card
+            .approves_web3(&sample_observed(&ops, &dests, &arts))
+            .is_ok());
+
+        // Every binding is load-bearing.
+        let mut wrong_network = sample_observed(&ops, &dests, &arts);
+        wrong_network.chain_or_genesis = "137";
+        assert_eq!(
+            card.approves_web3(&wrong_network),
+            Err(CardApproval::NetworkMismatch)
+        );
+
+        let mut wrong_signer = sample_observed(&ops, &dests, &arts);
+        wrong_signer.signer_kind = "unlocked_node";
+        assert_eq!(
+            card.approves_web3(&wrong_signer),
+            Err(CardApproval::SignerMismatch)
+        );
+
+        let mut wrong_policy = sample_observed(&ops, &dests, &arts);
+        wrong_policy.policy_identity = "policy-v2";
+        assert_eq!(
+            card.approves_web3(&wrong_policy),
+            Err(CardApproval::PolicyMismatch)
+        );
+
+        // A SECOND operation appended to the approved one must not ride along.
+        let two_ops = vec!["send".to_string(), "deploy".to_string()];
+        assert_eq!(
+            card.approves_web3(&sample_observed(&two_ops, &dests, &arts)),
+            Err(CardApproval::OperationSetMismatch)
+        );
+
+        // An unbound destination or artifact is refused.
+        let other_dest = vec!["0xcafe".to_string()];
+        assert_eq!(
+            card.approves_web3(&sample_observed(&ops, &other_dest, &arts)),
+            Err(CardApproval::DestinationMismatch)
+        );
+        let other_art = vec!["def456".to_string()];
+        assert_eq!(
+            card.approves_web3(&sample_observed(&ops, &dests, &other_art)),
+            Err(CardApproval::ArtifactMismatch)
+        );
+    }
+
+    #[test]
+    fn a_v1_card_can_never_approve_a_web3_operation() {
+        let card = Card::new(
+            "cast send 0xdeadbeef".to_string(),
+            vec![],
+            None,
+            vec![],
+            false,
+            "2099-01-01".to_string(),
+        );
+        let ops = vec!["send".to_string()];
+        let dests = vec!["0xdeadbeef".to_string()];
+        let arts = vec![];
+        assert_eq!(
+            card.approves_web3(&sample_observed(&ops, &dests, &arts)),
+            Err(CardApproval::V1CannotApproveWeb3),
+            "a pre-v2 card must not bless an operation it knows nothing about"
+        );
+    }
+
+    #[test]
+    fn a_v2_card_signature_covers_its_bindings() {
+        // Tampering with a binding after signing must invalidate the card,
+        // otherwise the bindings would be decorative.
+        let mut card = Card::new(
+            "cast send 0xdeadbeef".to_string(),
+            vec![],
+            None,
+            vec![],
+            false,
+            "2099-01-01".to_string(),
+        )
+        .with_web3_bindings(sample_bindings())
+        .unwrap();
+        let secret = [5u8; SECRET_KEY_LEN];
+        card.sign(&secret).unwrap();
+        let verifying = SigningKey::from_bytes(&secret).verifying_key().to_bytes();
+        card.verify_signature(&verifying)
+            .expect("freshly signed card verifies");
+
+        if let Some(bindings) = card.web3.as_mut() {
+            bindings.destinations = vec!["0xattacker".to_string()];
+        }
+        assert!(
+            card.verify_signature(&verifying).is_err(),
+            "a re-pointed destination must break the signature"
         );
     }
 }
