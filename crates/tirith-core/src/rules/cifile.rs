@@ -124,7 +124,7 @@ pub fn check(input: &str, file_path: Option<&Path>) -> Vec<Finding> {
 
 /// Truncate `s` to at most `max` chars (char-boundary safe), appending `…`
 /// when truncation happened. Keeps evidence lines short.
-fn truncate(s: &str, max: usize) -> String {
+pub(super) fn truncate(s: &str, max: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= max {
         return s.to_string();
@@ -134,7 +134,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Strip a single matching layer of surrounding quotes (single or double).
-fn strip_quotes(s: &str) -> &str {
+pub(super) fn strip_quotes(s: &str) -> &str {
     let t = s.trim();
     if t.len() >= 2
         && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
@@ -148,7 +148,7 @@ fn strip_quotes(s: &str) -> &str {
 /// `true` when `r` is an immutable 40-character lowercase-hex commit SHA — the
 /// only form of action pin that cannot change under you. A short SHA, a tag,
 /// or a branch name is *not* immutable.
-fn is_commit_sha(r: &str) -> bool {
+pub(super) fn is_commit_sha(r: &str) -> bool {
     r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -165,19 +165,19 @@ fn check_workflow(input: &str, findings: &mut Vec<Finding>) {
 /// A GitHub Actions `uses:` reference. Only the third-party-action form
 /// (`owner/repo[/path]@ref`) is a pin target — a local action (`./.github/…`)
 /// and a Docker action (`docker://…`) are handled separately.
-struct UsesRef<'a> {
+pub(super) struct UsesRef<'a> {
     /// The whole reference value as written (`owner/repo@ref`).
-    raw: &'a str,
+    pub(super) raw: &'a str,
     /// The `owner/repo[/path]` portion.
-    repo: &'a str,
+    pub(super) repo: &'a str,
     /// The `@`-suffixed ref (branch / tag / SHA), without the `@`.
-    git_ref: &'a str,
+    pub(super) git_ref: &'a str,
 }
 
 /// Parse a `uses:` value into a [`UsesRef`] when it is a pinnable third-party
 /// action reference. Returns `None` for a local (`./…`) action, a
 /// `docker://` action, or a value with no `@ref`.
-fn parse_uses(value: &str) -> Option<UsesRef<'_>> {
+pub(super) fn parse_uses(value: &str) -> Option<UsesRef<'_>> {
     let v = strip_quotes(value).trim();
     if v.is_empty() {
         return None;
@@ -389,7 +389,7 @@ fn expression_is_untrusted(expr_body: &str) -> bool {
 }
 
 /// Extract every `${{ … }}` expression body from a line.
-fn github_expressions(line: &str) -> Vec<&str> {
+pub(super) fn github_expressions(line: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut rest = line;
     while let Some(start) = rest.find("${{") {
@@ -745,7 +745,11 @@ fn check_workflow_run_steps(input: &str, findings: &mut Vec<Finding>) {
 /// `defaults.run.shell`. With no declaration, statically-known hosted runner
 /// labels select the platform default (`pwsh` on Windows, POSIX elsewhere).
 /// Dynamic/unknown metadata preserves the analyzer's fail-closed third state.
-fn workflow_step_shell(doc: &Value, job: &Value, step: &Value) -> Result<ShellType, String> {
+pub(super) fn workflow_step_shell(
+    doc: &Value,
+    job: &Value,
+    step: &Value,
+) -> Result<ShellType, String> {
     if let Some(value) = get_field(step, "shell") {
         return workflow_shell_value(value, "step shell");
     }
@@ -1175,34 +1179,33 @@ fn check_workflow_structural(input: &str, findings: &mut Vec<Finding>) {
 /// (`jobs`, `permissions`, `steps`, `with`, and similar) are ordinary strings, unlike
 /// the top-level `on:` key, which needs [`workflow_triggers`]' special
 /// handling.
-fn get_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+pub(super) fn get_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value
         .as_mapping()?
         .iter()
         .find_map(|(k, v)| k.as_str().filter(|s| *s == key).map(|_| v))
 }
 
-/// The set of trigger names declared under the workflow's `on:` key,
-/// lowercased.
+/// The value of the workflow's `on:` key.
 ///
-/// Two shapes are normalised here:
-///  * The value may be a single scalar (`on: push`), a sequence
-///    (`on: [push, pull_request]`), or a mapping (`on:\n  push:\n  ...`).
-///  * The `on:` KEY itself: `serde_yaml` 0.9 keeps it as the string `"on"`, but
-///    YAML 1.1 parsers resolve the bare plain scalar `on` to the boolean
-///    `true`. Both key forms are accepted so trigger detection is robust to the
-///    parser's scalar resolution.
-fn workflow_triggers(doc: &Value) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let Some(map) = doc.as_mapping() else {
-        return out;
-    };
-    let on = map.iter().find_map(|(k, v)| match k {
+/// The `on:` KEY itself needs normalising: `serde_yaml` 0.9 keeps it as the
+/// string `"on"`, but YAML 1.1 parsers resolve the bare plain scalar `on` to the
+/// boolean `true`. Both key forms are accepted so trigger detection is robust to
+/// the parser's scalar resolution.
+pub(super) fn workflow_on_value(doc: &Value) -> Option<&Value> {
+    doc.as_mapping()?.iter().find_map(|(k, v)| match k {
         Value::String(s) if s == "on" => Some(v),
         Value::Bool(true) => Some(v),
         _ => None,
-    });
-    let Some(on) = on else {
+    })
+}
+
+/// The set of trigger names declared under the workflow's `on:` key,
+/// lowercased. The value may be a single scalar (`on: push`), a sequence
+/// (`on: [push, pull_request]`), or a mapping (`on:\n  push:\n  ...`).
+pub(super) fn workflow_triggers(doc: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(on) = workflow_on_value(doc) else {
         return out;
     };
     match on {

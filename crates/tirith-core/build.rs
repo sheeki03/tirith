@@ -1069,6 +1069,7 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
         "WorkflowCheckoutUntrustedRef",
     ),
     ("workflow_cache_poisoning", "WorkflowCachePoisoning"),
+    ("workflow_artifact_poisoning", "WorkflowArtifactPoisoning"),
     ("dockerfile_unpinned_image", "DockerfileUnpinnedImage"),
     ("package_script_dangerous", "PackageScriptDangerous"),
     // AI-relevant file hidden-content scan rules

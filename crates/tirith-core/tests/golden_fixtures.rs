@@ -939,6 +939,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "workflow_run_trigger",
     "workflow_checkout_untrusted_ref",
     "workflow_cache_poisoning",
+    "workflow_artifact_poisoning",
     "dockerfile_unpinned_image",
     "package_script_dangerous",
     // AI-relevant file hidden-content scan rules
@@ -1386,6 +1387,14 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // and gets no `tests/fixtures` entry. Covered by unit tests in `scan.rs` +
     // the `scan --ci` / `policy` CLI integration tests.
     "analysis_incomplete",
+    // C15: `workflow_artifact_poisoning` is proven by a REPOSITORY post-pass in
+    // `crate::scan::scan` that correlates a fork-reachable producer workflow with
+    // a privileged `workflow_run` consumer workflow. `struct Fixture` carries
+    // exactly one `input` and one `file_path`, so no fixture can express a
+    // two-workflow chain, and a per-file rule structurally cannot emit it.
+    // Covered by unit tests in `rules::workflow_artifacts` plus the
+    // `tests/workflow_artifact_flow.rs` repository-scan integration tests.
+    "workflow_artifact_poisoning",
     // B5: `python_installed_integrity_violation` is correlated by the
     // installed-tree scan from `crate::artifact::ArtifactSignalKind`s recorded
     // while walking a `site-packages` tree on the filesystem (a RECORD mismatch,
@@ -1621,7 +1630,7 @@ rule_id_variant_registry! {
     // CI / repo supply-chain scan rules
     WorkflowUnpinnedAction, WorkflowDangerousTrigger, WorkflowCurlPipeShell, WorkflowUntrustedInput,
     WorkflowExcessivePermissions, WorkflowRunTrigger, WorkflowCheckoutUntrustedRef,
-    WorkflowCachePoisoning,
+    WorkflowCachePoisoning, WorkflowArtifactPoisoning,
     DockerfileUnpinnedImage, PackageScriptDangerous,
     // AI-relevant file hidden-content scan rules
     NotebookHiddenContent, NotebookSuspiciousOutput, AgentInstructionHidden, SvgScriptEmbedded,

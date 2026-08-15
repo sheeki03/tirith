@@ -82,6 +82,12 @@ struct CandidateScanResult {
     file_results: Vec<FileScanResult>,
     coverage_gaps: Vec<CoverageGap>,
     intentionally_ignored: bool,
+    /// C15: the bounded cross-workflow model for a `.github/workflows/*.yml`
+    /// candidate, built from the SAME decoded bytes this scan already read.
+    /// Returned by value rather than written through a captured `&mut` because
+    /// `catch_panic_scanning` asserts unwind safety on this call and its contract
+    /// requires the closure to capture no mutable state used after a panic.
+    workflow: Option<crate::rules::workflow_artifacts::WorkflowModel>,
 }
 
 enum GuardedCandidateOutcome {
@@ -258,6 +264,7 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     let candidate_total = collected.candidate_total;
     let collection_work_exhausted = collected.collection_work_exhausted;
     let collection_unclassified_entries = collected.collection_unclassified_entries;
+    let workflow_pattern_filtered = collected.workflow_pattern_filtered;
     let mut candidates = Vec::with_capacity(
         collected.text_candidates.len()
             + collected.linked_text_candidates.len()
@@ -329,45 +336,111 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     // hash-lookup seam returns None until the DB-B methods land), but this is the
     // correct wiring so the artifact path consults the same DB the engine does.
     let artifact_threat_db = crate::threatdb::ThreatDb::cached();
+    // C15: the cross-workflow artifact-flow post-pass needs every workflow at
+    // once, so each candidate's bounded model rides back out of the per-file
+    // scan that already decoded its bytes. Only the MODEL is retained; the YAML
+    // is dropped with the candidate, and `WorkflowBudget` caps how much of it a
+    // repository can make this pass carry.
+    let mut workflow_budget = WorkflowBudget::default();
+    let mut workflow_models = Vec::new();
     for candidate in candidates {
         match candidate {
             ScanCandidate::Text {
                 read_path,
                 logical_path,
                 expected_identity,
-            } => match scan_candidate_guarded_at(
-                &read_path,
-                &logical_path,
-                expected_identity,
-                artifact_threat_db.as_deref(),
-            ) {
-                GuardedCandidateOutcome::Completed(mut result) => {
-                    if result.intentionally_ignored {
-                        continue;
+            } => {
+                // Path-only classification, so the budget decision costs no I/O
+                // and an exhausted budget stops the model being BUILT rather
+                // than merely dropped afterwards.
+                let is_workflow = crate::rules::cifile::classify(Some(logical_path.as_path()))
+                    == Some(crate::rules::cifile::CiFileKind::GithubWorkflow);
+                let step_budget = if is_workflow {
+                    workflow_budget.remaining_steps()
+                } else {
+                    0
+                };
+                if is_workflow && step_budget == 0 {
+                    workflow_budget.record_truncation(&logical_path, &mut coverage_gaps);
+                }
+                match scan_candidate_guarded_at(
+                    &read_path,
+                    &logical_path,
+                    expected_identity,
+                    artifact_threat_db.as_deref(),
+                    step_budget,
+                ) {
+                    GuardedCandidateOutcome::Completed(mut result) => {
+                        if result.intentionally_ignored {
+                            continue;
+                        }
+                        match result.workflow.take() {
+                            Some(model) => {
+                                workflow_budget.admit(
+                                    model,
+                                    &mut workflow_models,
+                                    &mut coverage_gaps,
+                                );
+                            }
+                            // A workflow that was skipped for size or a read fault
+                            // is a workflow the flow analysis never saw. Its gap is
+                            // already recorded below; what matters here is that the
+                            // post-pass loses the right to claim no chain exists.
+                            None if is_workflow && step_budget > 0 => {
+                                workflow_budget.complete = false;
+                            }
+                            None => {}
+                        }
+                        if result.coverage_gaps.is_empty() {
+                            scanned_count += 1;
+                        } else {
+                            // Candidate-level counter: one partially/uninspected
+                            // subject counts once, while the typed list retains every
+                            // member-level reason.
+                            skipped_count += 1;
+                            coverage_gaps.append(&mut result.coverage_gaps);
+                        }
+                        file_results.append(&mut result.file_results);
                     }
-                    if result.coverage_gaps.is_empty() {
-                        scanned_count += 1;
-                    } else {
-                        // Candidate-level counter: one partially/uninspected
-                        // subject counts once, while the typed list retains every
-                        // member-level reason.
+                    GuardedCandidateOutcome::RulePanic(gap) => {
                         skipped_count += 1;
-                        coverage_gaps.append(&mut result.coverage_gaps);
+                        if is_workflow {
+                            // A workflow that panicked mid-scan is a workflow the
+                            // flow analysis never saw.
+                            workflow_budget.complete = false;
+                        }
+                        panic_files.push(logical_path);
+                        coverage_gaps.push(gap);
                     }
-                    file_results.append(&mut result.file_results);
                 }
-                GuardedCandidateOutcome::RulePanic(gap) => {
-                    skipped_count += 1;
-                    panic_files.push(logical_path);
-                    coverage_gaps.push(gap);
-                }
-            },
+            }
         }
         // Policy discovery occurs inside each candidate analysis. Drain its
         // captured raw diagnostics immediately so an unbounded file set cannot
         // accumulate an unbounded pre-redaction diagnostic vector.
         diagnostics.drain_policy_diagnostics();
     }
+
+    // Anything that dropped a candidate WHOLESALE could have dropped a workflow,
+    // so it costs the post-pass the right to claim that no chain exists: the
+    // caller's `max_files` cap, an exhausted collection work budget, a directory
+    // that could not be enumerated, and a pattern filter that removed a workflow
+    // all hide unknown paths.
+    let workflow_coverage_complete = workflow_budget.complete
+        && budget_skipped == 0
+        && !collection_work_exhausted
+        && !workflow_pattern_filtered
+        && !coverage_gaps
+            .iter()
+            .any(|gap| gap.kind == CoverageGapKind::EnumerationFailed);
+    run_workflow_artifact_post_pass(
+        config,
+        &workflow_models,
+        workflow_coverage_complete,
+        &mut file_results,
+        &mut coverage_gaps,
+    );
+    diagnostics.drain_policy_diagnostics();
 
     let truncated = budget_skipped > 0 || collection_work_exhausted;
     let truncation_reason = config.max_files.and_then(|max| {
@@ -390,6 +463,182 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         panic_files,
         coverage_gaps,
         file_results,
+    }
+}
+
+/// The repository-wide bound on the C15 cross-workflow artifact-flow post-pass:
+/// at most [`workflow_artifacts::MAX_WORKFLOWS`] workflows,
+/// [`workflow_artifacts::MAX_TOTAL_WORKFLOW_BYTES`] of aggregate YAML source, and
+/// [`workflow_artifacts::MAX_TOTAL_STEPS`] modelled steps.
+///
+/// `complete` is the only thing that lets the post-pass claim the ABSENCE of a
+/// chain. Any exhausted bound, any workflow that panicked, and any workflow that
+/// did not parse clears it, so a bounded scan degrades to "not proven either
+/// way" instead of to "clean".
+struct WorkflowBudget {
+    workflows: usize,
+    bytes: usize,
+    steps: usize,
+    complete: bool,
+    /// The stderr note is emitted once. Every dropped workflow still gets its own
+    /// typed `CoverageGap`, so a monorepo cannot turn the bound into thousands of
+    /// diagnostic lines while losing nothing machine-readable.
+    announced: bool,
+}
+
+impl Default for WorkflowBudget {
+    fn default() -> Self {
+        Self {
+            workflows: 0,
+            bytes: 0,
+            steps: 0,
+            complete: true,
+            announced: false,
+        }
+    }
+}
+
+impl WorkflowBudget {
+    /// The step allowance a further workflow may spend, or 0 when any bound is
+    /// already exhausted (which also stops the model being built at all).
+    fn remaining_steps(&self) -> usize {
+        use crate::rules::workflow_artifacts as wf;
+        if self.workflows >= wf::MAX_WORKFLOWS || self.bytes >= wf::MAX_TOTAL_WORKFLOW_BYTES {
+            return 0;
+        }
+        wf::MAX_TOTAL_STEPS.saturating_sub(self.steps)
+    }
+
+    /// Charge a built model against the budget and retain it, or drop it and
+    /// record the gap. `Truncated` is the existing gap kind for "read only
+    /// partially before being abandoned", and a `.github/workflows/*.yml`
+    /// location is already security-relevant, so the gap becomes an
+    /// `AnalysisIncomplete` finding through the normal driver path.
+    fn admit(
+        &mut self,
+        model: crate::rules::workflow_artifacts::WorkflowModel,
+        models: &mut Vec<crate::rules::workflow_artifacts::WorkflowModel>,
+        gaps: &mut Vec<CoverageGap>,
+    ) {
+        use crate::rules::workflow_artifacts as wf;
+        let next_bytes = self.bytes.saturating_add(model.source_bytes());
+        if next_bytes > wf::MAX_TOTAL_WORKFLOW_BYTES {
+            let path = model.path().to_path_buf();
+            self.record_truncation(&path, gaps);
+            return;
+        }
+        if model.steps_truncated() {
+            let path = model.path().to_path_buf();
+            self.record_truncation(&path, gaps);
+        }
+        self.bytes = next_bytes;
+        self.workflows += 1;
+        self.steps = self.steps.saturating_add(model.step_count());
+        models.push(model);
+    }
+
+    fn record_truncation(&mut self, path: &Path, gaps: &mut Vec<CoverageGap>) {
+        self.complete = false;
+        if !self.announced {
+            self.announced = true;
+            emit_scan_diagnostic(format_args!(
+                "tirith: scan: cross-workflow artifact analysis bound reached at {}; \
+                 remaining workflows are recorded as coverage gaps",
+                path.display()
+            ));
+        }
+        gaps.push(CoverageGap {
+            location: SubjectLocation::from_path(path.to_path_buf()),
+            kind: CoverageGapKind::Truncated,
+            sha256: None,
+        });
+    }
+}
+
+/// Run the C15 cross-workflow artifact-flow analysis over every modelled
+/// workflow and fold its output into the scan result.
+///
+/// Two outputs. (1) A proven producer-to-consumer chain becomes a
+/// `WorkflowArtifactPoisoning` finding on a synthetic [`FileScanResult`] located
+/// at the CONSUMER workflow, exactly as the `AnalysisIncomplete` driver attaches
+/// its findings. (2) A `workflow_run` consumer this pass had FULL visibility into
+/// and proved no chain for has its already-emitted presence-level
+/// `WorkflowRunTrigger` finding lowered from High to Medium. The lowering happens
+/// only here, never in `rules::cifile`, because `tirith check` on one workflow
+/// file, `scan_single_file_guarded`, the MCP scan tool, and the LSP never run
+/// this post-pass and must keep the original severity.
+fn run_workflow_artifact_post_pass(
+    config: &ScanConfig,
+    models: &[crate::rules::workflow_artifacts::WorkflowModel],
+    coverage_complete: bool,
+    file_results: &mut Vec<FileScanResult>,
+    coverage_gaps: &mut Vec<CoverageGap>,
+) {
+    if models.is_empty() {
+        return;
+    }
+
+    // The post-pass runs OUTSIDE the per-candidate panic guard, so it carries its
+    // own: a bug here must degrade to a coverage gap, not abort the whole scan.
+    let anchor = models[0].path().to_path_buf();
+    let Some(flow) = catch_panic_scanning(&anchor, || {
+        crate::rules::workflow_artifacts::analyze_repository(models, coverage_complete)
+    }) else {
+        coverage_gaps.push(CoverageGap {
+            location: SubjectLocation::from_path(anchor),
+            kind: CoverageGapKind::Panicked,
+            sha256: None,
+        });
+        return;
+    };
+
+    // Discover policy from the SCAN TARGET (not the caller's cwd) so scanning
+    // another tree applies THAT tree's repo policy, matching the driver's own
+    // `AnalysisIncomplete` synthesis. Only a chain finding needs it, so a tree
+    // with workflows but no chain pays nothing.
+    let policy = (!flow.findings.is_empty())
+        .then(|| crate::policy::Policy::discover(Some(&config.path.display().to_string())));
+
+    for (path, finding) in flow.findings {
+        let Some(policy) = policy.as_ref() else {
+            continue;
+        };
+        let verdict = crate::escalation::finalize_static_verdict(
+            vec![finding],
+            policy,
+            3,
+            crate::verdict::Timings::default(),
+        );
+        if verdict.findings.is_empty() {
+            continue;
+        }
+        file_results.push(FileScanResult {
+            path,
+            findings: verdict.findings,
+            is_config_file: false,
+        });
+    }
+
+    for path in flow.unproven_consumers {
+        for file_result in file_results.iter_mut().filter(|r| r.path == path) {
+            for finding in &mut file_result.findings {
+                // Only the rule's OWN default severity is lowered. An operator who
+                // set `severity_overrides` on this rule has already made the call,
+                // and the post-pass must not quietly overrule it.
+                if finding.rule_id != crate::verdict::RuleId::WorkflowRunTrigger
+                    || finding.severity != Severity::High
+                {
+                    continue;
+                }
+                finding.severity = Severity::Medium;
+                finding.description.push_str(
+                    " This repository scan modelled every workflow in the tree and found no \
+                     workflow that both feeds this one an artifact from an untrusted run and \
+                     reaches a dangerous sink with it, so the trigger is reported as a \
+                     present-but-unproven risk rather than a proven chain.",
+                );
+            }
+        }
     }
 }
 
@@ -716,7 +965,11 @@ fn scan_single_file_at(
     logical_path: &Path,
     expected_identity: Option<FileIdentity>,
 ) -> ScanFileOutcome {
-    let mut candidate = scan_candidate_at(read_path, logical_path, expected_identity, None, false);
+    // Step budget 0: a single-file scan has no repository post-pass, so no
+    // cross-workflow model is built and `WorkflowArtifactPoisoning` can never be
+    // emitted here. One workflow file cannot prove a producer-to-consumer chain.
+    let mut candidate =
+        scan_candidate_at(read_path, logical_path, expected_identity, None, false, 0);
     if let Some(gap) = candidate.coverage_gaps.into_iter().next() {
         return ScanFileOutcome::Skipped(gap);
     }
@@ -739,6 +992,7 @@ impl CandidateScanResult {
             file_results: vec![result],
             coverage_gaps: Vec::new(),
             intentionally_ignored: false,
+            workflow: None,
         }
     }
 
@@ -747,6 +1001,7 @@ impl CandidateScanResult {
             file_results: Vec::new(),
             coverage_gaps: vec![gap],
             intentionally_ignored: false,
+            workflow: None,
         }
     }
 
@@ -755,6 +1010,7 @@ impl CandidateScanResult {
             file_results: Vec::new(),
             coverage_gaps: Vec::new(),
             intentionally_ignored: true,
+            workflow: None,
         }
     }
 }
@@ -775,6 +1031,7 @@ fn scan_candidate_at(
     expected_identity: Option<FileIdentity>,
     threat_db: Option<&crate::threatdb::ThreatDb>,
     inspect_artifacts: bool,
+    workflow_step_budget: usize,
 ) -> CandidateScanResult {
     let location = SubjectLocation::from_path(logical_path.to_path_buf());
 
@@ -893,6 +1150,7 @@ fn scan_candidate_at(
                 file_results,
                 coverage_gaps,
                 intentionally_ignored: false,
+                workflow: None,
             };
         }
 
@@ -1036,6 +1294,7 @@ fn scan_candidate_at(
                     file_results,
                     coverage_gaps,
                     intentionally_ignored: false,
+                    workflow: None,
                 };
             }
             return CandidateScanResult::skipped(CoverageGap {
@@ -1077,11 +1336,27 @@ fn scan_candidate_at(
     let mut findings = verdict.findings;
     engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
 
-    CandidateScanResult::scanned(FileScanResult {
+    // C15: build the cross-workflow model from the content already decoded
+    // above. Re-opening the path here would be a TOCTOU window onto a different
+    // inode, and this scan has already paid for the read.
+    let workflow = (workflow_step_budget > 0
+        && crate::rules::cifile::classify(Some(logical_path))
+            == Some(crate::rules::cifile::CiFileKind::GithubWorkflow))
+    .then(|| {
+        crate::rules::workflow_artifacts::build_model(
+            logical_path,
+            &ctx.input,
+            workflow_step_budget,
+        )
+    });
+
+    let mut outcome = CandidateScanResult::scanned(FileScanResult {
         path: logical_path.to_path_buf(),
         findings,
         is_config_file: is_config,
-    })
+    });
+    outcome.workflow = workflow;
+    outcome
 }
 
 /// Wrap `f` in `catch_unwind` for the directory walk: on panic, log a skip and
@@ -1132,9 +1407,17 @@ fn scan_candidate_guarded_at(
     logical_path: &Path,
     expected_identity: Option<FileIdentity>,
     threat_db: Option<&crate::threatdb::ThreatDb>,
+    workflow_step_budget: usize,
 ) -> GuardedCandidateOutcome {
     match catch_panic_scanning(logical_path, || {
-        scan_candidate_at(read_path, logical_path, expected_identity, threat_db, true)
+        scan_candidate_at(
+            read_path,
+            logical_path,
+            expected_identity,
+            threat_db,
+            true,
+            workflow_step_budget,
+        )
     }) {
         Some(outcome) => GuardedCandidateOutcome::Completed(outcome),
         None => GuardedCandidateOutcome::RulePanic(CoverageGap {
@@ -1247,6 +1530,12 @@ struct CollectedFiles {
     collection_enumeration_remaining: Option<usize>,
     collection_work_exhausted: bool,
     collection_unclassified_entries: usize,
+    /// A `.github/workflows/*` file the caller's `--ignore` / `--include` /
+    /// `--exclude` patterns dropped before analysis. Pattern filters are an
+    /// intentional exclusion, so they record no coverage gap, but a dropped
+    /// workflow is still a workflow the cross-workflow post-pass never saw and
+    /// therefore cannot claim the absence of a chain across.
+    workflow_pattern_filtered: bool,
 }
 
 #[derive(Debug)]
@@ -1342,6 +1631,7 @@ impl CollectedFiles {
                 .map(|_| COLLECTION_ENUMERATION_CEILING),
             collection_work_exhausted: false,
             collection_unclassified_entries: 0,
+            workflow_pattern_filtered: false,
         }
     }
 
@@ -1390,6 +1680,18 @@ impl CollectedFiles {
         let candidates = std::mem::take(&mut self.bounded_candidates).into_sorted_vec();
         for candidate in candidates {
             self.distribute_candidate(candidate);
+        }
+    }
+
+    /// Record that a pattern filter dropped a candidate. Only a GitHub workflow
+    /// matters here: the cross-workflow post-pass is the only analysis whose
+    /// conclusions depend on having seen the WHOLE set of a repository's
+    /// workflows, so filtering out anything else costs it nothing.
+    fn note_pattern_filtered(&mut self, path: &Path) {
+        if crate::rules::cifile::classify(Some(path))
+            == Some(crate::rules::cifile::CiFileKind::GithubWorkflow)
+        {
+            self.workflow_pattern_filtered = true;
         }
     }
 
@@ -1883,6 +2185,7 @@ fn collect_one_entry(
         include_patterns,
         exclude_patterns,
     ) {
+        collected.note_pattern_filtered(&path);
         return;
     }
 
@@ -1953,15 +2256,17 @@ fn collect_config_symlink(
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(is_known_config_dir);
-    if !is_config_link
-        || !candidate_matches_patterns(
-            root,
-            logical_path,
-            ignore_patterns,
-            include_patterns,
-            exclude_patterns,
-        )
-    {
+    if !is_config_link {
+        return;
+    }
+    if !candidate_matches_patterns(
+        root,
+        logical_path,
+        ignore_patterns,
+        include_patterns,
+        exclude_patterns,
+    ) {
+        collected.note_pattern_filtered(logical_path);
         return;
     }
 
@@ -2455,6 +2760,73 @@ mod tests {
         let envelope = envelope.finish();
         assert!(envelope.len() <= crate::verdict::MAX_PRESENTATION_BYTES);
         assert!(envelope.contains("presentation truncated"));
+    }
+
+    /// The 32 MiB aggregate-source ceiling of the C15 cross-workflow post-pass.
+    /// Charged as pure arithmetic here rather than through a real directory scan:
+    /// reaching 32 MiB on disk would push every one of those bytes through
+    /// `engine::analyze` as well, which proves nothing extra about the budget.
+    #[test]
+    fn workflow_budget_stops_at_the_aggregate_byte_ceiling() {
+        use crate::rules::workflow_artifacts as wf;
+
+        // Sized to EXACTLY 8 MiB so the ceiling is reached on a boundary and the
+        // "no further model is even built" guard is observable.
+        let header = "name: Bulk\non: [push]\n# ";
+        let target = 8 * 1024 * 1024;
+        let mut bulk = String::with_capacity(target);
+        bulk.push_str(header);
+        bulk.push_str(&"x".repeat(target - header.len() - 1));
+        bulk.push('\n');
+        assert_eq!(bulk.len(), target);
+        let model = wf::build_model(
+            Path::new(".github/workflows/bulk.yml"),
+            &bulk,
+            wf::MAX_TOTAL_STEPS,
+        );
+        let per_file = model.source_bytes();
+        assert!(per_file > 0 && per_file <= MAX_FILE_SIZE as usize);
+        let capacity = wf::MAX_TOTAL_WORKFLOW_BYTES / per_file;
+
+        let mut budget = WorkflowBudget::default();
+        let mut models = Vec::new();
+        let mut gaps = Vec::new();
+        for _ in 0..capacity {
+            budget.admit(model.clone(), &mut models, &mut gaps);
+        }
+        assert_eq!(
+            models.len(),
+            capacity,
+            "everything within the ceiling is kept"
+        );
+        assert!(gaps.is_empty(), "{gaps:?}");
+        assert!(
+            budget.complete,
+            "coverage is complete while inside the ceiling"
+        );
+
+        budget.admit(model.clone(), &mut models, &mut gaps);
+        assert_eq!(
+            models.len(),
+            capacity,
+            "the overflowing workflow is dropped"
+        );
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].kind, CoverageGapKind::Truncated);
+        assert_eq!(
+            gaps[0].primary_path(),
+            Some(Path::new(".github/workflows/bulk.yml")),
+            "the gap points at the workflow that was dropped"
+        );
+        assert!(
+            !budget.complete,
+            "an exhausted ceiling must never be read as proof that no chain exists"
+        );
+        assert_eq!(
+            budget.remaining_steps(),
+            0,
+            "once the byte ceiling is reached no further model is even built"
+        );
     }
 
     fn scan_tree(path: &Path, max_files: Option<usize>) -> ScanResult {

@@ -1090,6 +1090,18 @@ remediation = "Build cache keys only from trusted, content-derived values such a
 mitre_id = "T1195.001"
 
 [[rule]]
+id = "workflow_artifact_poisoning"
+title = "Privileged workflow consumes a build artifact produced by an untrusted run"
+category = "ecosystem"
+severity_rationale = "High: the full chain is proven, not inferred. A fork/PR-reachable workflow uploads an artifact, a `workflow_run` workflow running on the default branch with a read/write GITHUB_TOKEN and secrets downloads that same artifact from the run that triggered it, and a later step in the same job executes, sources, PATH-mutates, publishes, or deploys it with no trusted digest or attestation compared in between. An untrusted contributor therefore decides the bytes a privileged job runs or ships without ever editing the privileged workflow."
+description = "This is the build-output trust break. The attacker never touches the privileged workflow's text; they change only the artifact it consumes. Tirith proves the chain across workflow files during a repository scan: an untrusted producer, an upload under a statically resolved artifact name, a cross-run download bound to `github.event.workflow_run.id` in this repository, a matching artifact identity, and a dangerous sink after the download."
+examples_bad = ["ci.yml: on: pull_request + actions/upload-artifact (name: build)\ndeploy.yml: on: workflow_run + actions/download-artifact@v4 (name: build, run-id: ${{ github.event.workflow_run.id }}) then `bash ./dist/install.sh`"]
+examples_good = ["deploy.yml: download the artifact, then `gh attestation verify` (or compare it against a checksum file that lives OUTSIDE the download directory) before any execute/publish/deploy step"]
+false_positive_guidance = "Only a fully proven chain fires. A producer whose only triggers are push/schedule/workflow_dispatch is not fork-reachable and never participates. actions/download-artifact v3 and earlier cannot fetch across runs and are ignored. A download with no dangerous sink (a report or coverage file that is only read) is not flagged. An execute, source, or PATH-mutation sink must additionally name an operand inside the download directory; a publish or deploy sink is matched on step order within the same job instead, because those ship the workspace as a whole. Anything statically unresolvable - an expression or glob in an artifact name, a wildcard or missing `on.workflow_run.workflows` list, a reusable workflow, a local composite action, a matrix job, an unresolvable step shell, or an exhausted scan bound - is treated as incomplete coverage and blocks the finding rather than producing a guess. Because this finding is assembled by the repository scan driver rather than by `engine::analyze`, the policy allowlist does not apply to it; use `severity_overrides` or `action_overrides` on `workflow_artifact_poisoning` instead."
+remediation = "Do not treat the triggering run's artifact as trusted input. Verify it against a digest or attestation that the producer run cannot supply (a checksum file committed outside the download directory, `gh attestation verify`, or a signature) BEFORE executing, sourcing, PATH-adding, publishing, or deploying it. Better still, do the privileged work in a run that builds from a trusted ref rather than consuming a fork-influenced build output."
+mitre_id = "T1195.001"
+
+[[rule]]
 id = "dockerfile_unpinned_image"
 title = "Dockerfile base image is not digest-pinned"
 category = "ecosystem"
