@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 /// `every_command_is_categorized` test guards this against drift.
 const COMMANDS_BY_CATEGORY: &str = "\
 COMMANDS BY CATEGORY:
-  Scan & Analyze:   check paste run score diff fetch fix scan view preview watch temp-run taint intend lab explain why visual-audit
+  Scan & Analyze:   check paste run score diff fetch fix scan view preview watch temp-run taint intend task lab explain why visual-audit
   Status & Health:  status doctor prompt-status dashboard warnings receipt logs baseline
   Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
   Policy & Trust:   policy trust rule output
@@ -575,12 +575,6 @@ Examples:
         json: bool,
     },
 
-    /// Score a URL for security risk
-    #[command(after_help = "\
-Examples:
-  tirith score https://get.example-tool.sh
-  tirith score --explain https://example.com
-  tirith score --format json https://example.com")]
     /// Diagnostically assess an untrusted task envelope (preview).
     ///
     /// Reports what the envelope WOULD be allowed to do under the current
@@ -591,6 +585,12 @@ Examples:
         action: TaskAction,
     },
 
+    /// Score a URL for security risk
+    #[command(after_help = "\
+Examples:
+  tirith score https://get.example-tool.sh
+  tirith score --explain https://example.com
+  tirith score --format json https://example.com")]
     Score {
         /// URL to score
         url: String,
