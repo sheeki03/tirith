@@ -275,7 +275,9 @@ pub fn run_with_options(
                 }
                 "ping" => JsonRpcResponse::ok(id, json!({})),
                 "tools/list" => {
-                    let tools = tools::list();
+                    // Preview tools appear ONLY when the operator opted in; the
+                    // default list is a frozen compatibility contract.
+                    let tools = tools::list_with_preview();
                     JsonRpcResponse::ok(id, json!({ "tools": tools }))
                 }
                 "tools/call" => {

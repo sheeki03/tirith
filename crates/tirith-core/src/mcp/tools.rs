@@ -166,6 +166,154 @@ pub fn list() -> Vec<ToolDefinition> {
     tools
 }
 
+/// Environment variable an operator sets to opt into preview MCP tools.
+///
+/// The default `tools/list` is a frozen compatibility contract (C00), and
+/// clients cache it, so a new tool cannot simply appear there. It is advertised
+/// only when the operator explicitly asks for preview surface.
+pub const PREVIEW_CAPABILITY_ENV: &str = "TIRITH_MCP_PREVIEW";
+
+/// Is the preview surface enabled for this process?
+pub fn preview_enabled() -> bool {
+    std::env::var(PREVIEW_CAPABILITY_ENV)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Tools advertised ONLY under the preview capability.
+///
+/// `tirith_check_task` is diagnostic: it reports what an untrusted task
+/// envelope would be allowed to do, and executes, fetches, resolves, and writes
+/// nothing. Every object is `additionalProperties: false` so a client cannot
+/// smuggle an unmodelled field past the bounded envelope parser.
+pub fn preview_tools() -> Vec<ToolDefinition> {
+    vec![ToolDefinition {
+        name: "tirith_check_task".into(),
+        description: "PREVIEW, DIAGNOSTIC. Assess an untrusted task envelope (issue body, PDF,                       web page, and similar) and report which effects it would be allowed.                       Executes nothing, fetches nothing, resolves no package, and writes                       nothing. The response is advisory and is not an enforcement decision."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "envelope": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "The bounded task envelope to assess.",
+                    "properties": {
+                        "task_id": {"type": "string", "maxLength": 4096},
+                        "sources": {
+                            "type": "array",
+                            "maxItems": 32,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "claimed_source": {
+                                        "type": "string",
+                                        "description": "What the document CLAIMS this is. Recorded as a claim; never trusted.",
+                                        "enum": [
+                                            "issue_body", "issue_comment", "pull_request_body",
+                                            "pdf", "web_page", "source_comment",
+                                            "image_alt_text", "repository_config",
+                                            "agent_config", "unknown"
+                                        ]
+                                    },
+                                    "content": {"type": "string", "maxLength": 16384},
+                                    "locator": {"type": "string", "maxLength": 4096},
+                                    "receipt": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "receipt_id": {"type": "string", "maxLength": 4096},
+                                            "issuer_key_id": {"type": "string", "maxLength": 4096},
+                                            "source_kind": {"type": "string"},
+                                            "content_sha256": {"type": "string", "maxLength": 128},
+                                            "adapter": {"type": "string"},
+                                            "acquisition_path": {"type": "string", "maxLength": 4096},
+                                            "task_id": {"type": "string", "maxLength": 4096},
+                                            "policy_identity": {"type": "string", "maxLength": 4096},
+                                            "issued_at": {"type": "string", "maxLength": 64},
+                                            "expires_at": {"type": "string", "maxLength": 64},
+                                            "nonce": {"type": "string", "maxLength": 256},
+                                            "signature": {"type": "string", "maxLength": 512}
+                                        },
+                                        "required": [
+                                            "receipt_id", "issuer_key_id", "source_kind",
+                                            "content_sha256", "adapter", "issued_at",
+                                            "expires_at", "nonce"
+                                        ]
+                                    }
+                                },
+                                "required": ["claimed_source"]
+                            }
+                        },
+                        // One closed object per proposed-action variant, so an
+                        // unmodelled shape is refused at the schema rather than
+                        // reaching the parser as a surprise.
+                        "actions": {
+                            "type": "array",
+                            "maxItems": 32,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "shell": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {"command": {"type": "string", "maxLength": 4096}},
+                                        "required": ["command"]
+                                    },
+                                    "package_install": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "ecosystem": {"type": "string", "maxLength": 4096},
+                                            "package": {"type": "string", "maxLength": 4096}
+                                        },
+                                        "required": ["ecosystem", "package"]
+                                    },
+                                    "config_write": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {"path": {"type": "string", "maxLength": 4096}},
+                                        "required": ["path"]
+                                    },
+                                    "narrative": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {"text": {"type": "string", "maxLength": 4096}},
+                                        "required": ["text"]
+                                    }
+                                }
+                            }
+                        },
+                        "requested_effects": {"type": "array", "maxItems": 32, "items": {"type": "string"}}
+                    }
+                },
+                "adapter": {
+                    "type": "string",
+                    "description": "Which Tirith-owned ingress adapter obtained the content. Caller-asserted; it selects which claimed kind is believable and confers no trust.",
+                    "enum": [
+                        "operator_ingest", "github_issue", "github_pull_request",
+                        "file_read", "http_fetch", "unattributed"
+                    ]
+                }
+            },
+            "required": ["envelope"]
+        }),
+    }]
+}
+
+/// The tool list for this process: the frozen default set, plus preview tools
+/// when the operator opted in.
+pub fn list_with_preview() -> Vec<ToolDefinition> {
+    let mut tools = list();
+    if preview_enabled() {
+        tools.extend(preview_tools());
+    }
+    tools
+}
+
 /// Dispatch a tool call by name.
 pub fn call(name: &str, arguments: &Value) -> ToolCallResult {
     match name {
@@ -179,7 +327,88 @@ pub fn call(name: &str, arguments: &Value) -> ToolCallResult {
         "tirith_fetch_cloaking" => call_fetch_cloaking(arguments),
         #[cfg(not(unix))]
         "tirith_fetch_cloaking" => tool_error("Not available on this platform"),
+        // Preview surface. Refused unless the operator opted in, so a client
+        // that learned the name elsewhere cannot reach it on a default server.
+        "tirith_check_task" if preview_enabled() => call_check_task(arguments),
+        "tirith_check_task" => {
+            tool_error("tirith_check_task is a preview tool; set TIRITH_MCP_PREVIEW=1 to enable it")
+        }
         _ => tool_error(&format!("Unknown tool: {name}")),
+    }
+}
+
+/// Assess a bounded task envelope. DIAGNOSTIC: executes nothing, fetches
+/// nothing, resolves no package, writes nothing.
+fn call_check_task(arguments: &Value) -> ToolCallResult {
+    let Some(envelope_value) = arguments.get("envelope") else {
+        return tool_error("Missing required parameter: envelope");
+    };
+    // Route through the same bounded parser the CLI uses, rather than
+    // deserializing directly: the depth and size checks live there, and a
+    // second path would drift.
+    let raw = match serde_json::to_string(envelope_value) {
+        Ok(raw) => raw,
+        Err(error) => return tool_error(&format!("Invalid envelope: {error}")),
+    };
+    let envelope = match crate::task::parse_envelope(&raw) {
+        Ok(envelope) => envelope,
+        Err(rejection) => return tool_error(&format!("Envelope rejected: {rejection:?}")),
+    };
+
+    // The adapter is caller-asserted and selects only which claimed kind is
+    // believable. No source kind is trusted, so this can never grant.
+    let adapter = match arguments.get("adapter").and_then(Value::as_str) {
+        None | Some("operator_ingest") => crate::task::IngressAdapter::OperatorIngest,
+        Some("github_issue") => crate::task::IngressAdapter::GithubIssue,
+        Some("github_pull_request") => crate::task::IngressAdapter::GithubPullRequest,
+        Some("file_read") => crate::task::IngressAdapter::FileRead,
+        Some("http_fetch") => crate::task::IngressAdapter::HttpFetch,
+        Some("unattributed") => crate::task::IngressAdapter::Unattributed,
+        Some(other) => return tool_error(&format!("Unknown adapter: {other}")),
+    };
+
+    let policy = crate::policy::Policy::discover_local_only(None);
+    let provenance = envelope
+        .sources
+        .iter()
+        .map(|source| crate::task::assign_provenance(source, adapter, None, None))
+        .collect::<Vec<_>>();
+    let decision = crate::task::decide(
+        &envelope,
+        provenance,
+        &policy.task_gate,
+        crate::effects::BoundaryCapability::ObserveOnly,
+    );
+
+    let structured = json!({
+        "schema_version": 1,
+        "diagnostic": true,
+        "mode": decision.mode,
+        "complete": decision.complete,
+        "inferred_effects": decision.inferred_effects,
+        "allowed_effects": decision.allowed_effects,
+        "denied_effects": decision.denied_effects,
+        "provenance": decision.provenance.iter().map(|p| json!({
+            "claimed_source": p.claimed_source,
+            "effective_source": p.effective_source,
+            "adapter": p.adapter,
+            "receipt_status": p.receipt_status,
+        })).collect::<Vec<_>>(),
+    });
+
+    // The text and structured views must agree after redaction, so the text is
+    // rendered FROM the same structured value rather than assembled separately.
+    let text = format!(
+        "tirith_check_task (diagnostic; nothing was executed)\n{}",
+        serde_json::to_string_pretty(&structured).unwrap_or_default()
+    );
+    ToolCallResult {
+        content: vec![ContentItem {
+            content_type: "text".into(),
+            text,
+        }],
+        is_error: false,
+        structured_content: Some(structured),
     }
 }
 
@@ -1815,5 +2044,66 @@ mod tests {
             "paste audit rule_ids MUST NOT carry agent_denied_by_policy under honored bypass: \
              {entry}"
         );
+    }
+}
+
+#[cfg(test)]
+mod c11_preview_tests {
+    use super::*;
+
+    /// The default list is a frozen compatibility contract (C00) and clients
+    /// cache it, so a preview tool must never appear in it.
+    #[test]
+    fn the_default_tool_list_never_contains_the_preview_tool() {
+        assert!(
+            !list().iter().any(|tool| tool.name == "tirith_check_task"),
+            "a preview tool leaked into the frozen default list"
+        );
+        assert!(preview_tools()
+            .iter()
+            .any(|tool| tool.name == "tirith_check_task"));
+    }
+
+    /// Knowing the name is not enough: a client that learned it elsewhere must
+    /// still be refused on a server without the capability.
+    #[test]
+    fn calling_the_preview_tool_without_the_capability_is_refused() {
+        // The env var is process-wide, so assert the refusal path directly
+        // rather than mutating it and racing other tests.
+        if !preview_enabled() {
+            let result = call("tirith_check_task", &json!({"envelope": {}}));
+            assert!(result.is_error, "preview tool answered without opt-in");
+            let text = &result.content[0].text;
+            assert!(
+                text.contains("preview tool"),
+                "refusal did not name the reason: {text}"
+            );
+        }
+    }
+
+    /// Every object in the schema is closed, so a client cannot smuggle an
+    /// unmodelled field past the bounded envelope parser.
+    #[test]
+    fn the_preview_schema_is_closed_at_every_object() {
+        fn assert_closed(value: &Value, path: &str) {
+            if value.get("type").and_then(Value::as_str) == Some("object") {
+                assert_eq!(
+                    value.get("additionalProperties"),
+                    Some(&Value::Bool(false)),
+                    "object at {path} is not closed"
+                );
+            }
+            if let Some(properties) = value.get("properties").and_then(Value::as_object) {
+                for (key, child) in properties {
+                    assert_closed(child, &format!("{path}.{key}"));
+                }
+            }
+            if let Some(items) = value.get("items") {
+                assert_closed(items, &format!("{path}[]"));
+            }
+        }
+        for tool in preview_tools() {
+            assert_closed(&tool.input_schema, &tool.name);
+        }
     }
 }
