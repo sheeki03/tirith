@@ -116,6 +116,13 @@ coverage = "Runs a command in a throwaway directory and diffs file impact. File 
 policy_complete = false
 
 [[command]]
+name = "capsule run"
+group = "Scan & analyze"
+inspected = "full"
+coverage = "Copies the project with symlink-safe same-inode traversal (refusing symlinks, escapes, and case/Unicode collisions), digests every copied file, runs the exact argv in a fail-closed capsule, and diffs the tree afterwards. Enforceable only on x86_64 Linux; every other host refuses before any copy or spawn."
+policy_complete = true
+
+[[command]]
 name = "taint"
 group = "Scan & analyze"
 inspected = "none"

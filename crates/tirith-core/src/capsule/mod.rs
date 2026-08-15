@@ -761,6 +761,15 @@ pub(crate) struct ResourceLimitSupport {
     pub(crate) wall_clock_seconds: bool,
 }
 
+/// Environment names the `untrusted-project` preset lets through by NAME. The
+/// values are supplied explicitly by the launching parent, never inherited, and
+/// each still passes the value-aware sensitive gate.
+///
+/// `HOME`, `TMPDIR`, and the `XDG_*` bases are absent on purpose: the launcher
+/// sets them to the temporary HOME after the survivor set is computed, so
+/// listing them here would only invite a caller to point them somewhere else.
+pub const UNTRUSTED_PROJECT_ENV_ALLOW: &[&str] = &["PATH", "LANG", "LC_ALL", "TERM", "TZ"];
+
 /// Everything a backend needs to contain one child process. Constructed by the
 /// caller (install, MCP spawn, `tirith run`) and handed to a [`Capsule`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,6 +805,50 @@ impl CapsuleSpec {
             handles: HandlePolicy::default(),
             resources: ResourceLimits::conservative(),
         }
+    }
+
+    /// The `untrusted-project` preset (C14): [`Self::locked_down`] plus write
+    /// authority over exactly one held project copy and read authority over the
+    /// interpreter roots the child needs to `exec` at all.
+    ///
+    /// Everything else is inherited on purpose. `locked_down` already gives
+    /// deny-all network, a non-inheriting environment with the sensitive set
+    /// stripped, a temporary HOME, [`ResourceLimits::conservative`] (which is
+    /// already exactly the preset's CPU 120 / memory 2 GiB / processes 256 /
+    /// open files 256 / output 16 MiB / wall 300 s ceiling), and
+    /// [`deny_default_paths`] seeded from
+    /// [`crate::sensitive_assets::capsule_deny_relative_paths`] (credential
+    /// stores, `.ethereum/keystore`, `.config/solana`, the Electrum / Exodus /
+    /// Atomic / Ledger Live wallet roots, and every browser user-data root).
+    /// Re-declaring any of that here would silently drift from the shared
+    /// catalogue the first time a wallet root is added to it.
+    ///
+    /// `project_root` MUST already be the canonical path of the held ephemeral
+    /// COPY, never the operator's own tree: the preset's entire point is that
+    /// the untrusted project cannot write to the real working directory.
+    ///
+    /// The network policy is [`NetworkPolicy::DenyAll`] and there is no
+    /// allow-listed-domain variant, because no backend in this tree can claim
+    /// `domain_proxy_enforced` (it is hard-coded `false` in all three), so an
+    /// allow-list preset would fail closed on every host while implying a
+    /// capability the product does not have.
+    pub fn untrusted_project(project_root: &Path, interpreter_read_roots: &[PathBuf]) -> Self {
+        let mut spec = Self::locked_down();
+        spec.filesystem.write_roots.push(project_root.to_path_buf());
+        for root in interpreter_read_roots {
+            if !spec.filesystem.read_roots.contains(root) {
+                spec.filesystem.read_roots.push(root.clone());
+            }
+        }
+        // A contained child still needs to find its interpreter and speak the
+        // host's locale. Every name here is checked against the sensitive
+        // registry by `surviving_vars`, so an allow entry can never re-expose a
+        // credential.
+        spec.environment.allow = UNTRUSTED_PROJECT_ENV_ALLOW
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        spec
     }
 
     /// The coverage an enforcing surface should *require* given this spec: every
@@ -1189,6 +1242,92 @@ mod tests {
             allow.capability_level(),
             CapabilityLevel::AllowListedDomains
         );
+    }
+
+    #[test]
+    fn the_untrusted_project_preset_inherits_the_locked_down_baseline() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let project = base.path().join("held-copy");
+        std::fs::create_dir(&project).expect("create held copy");
+
+        let preset = CapsuleSpec::untrusted_project(&project, &[]);
+        assert!(preset.network.is_deny_all());
+        assert!(!preset.environment.inherit);
+        assert!(preset.environment.deny_sensitive);
+        assert!(preset.environment.temporary_home);
+        // Reused verbatim, never restated: a drift here would mean the preset
+        // stopped tracking the shared conservative ceiling.
+        assert_eq!(preset.resources, ResourceLimits::conservative());
+        assert_eq!(preset.filesystem.write_roots, vec![project.clone()]);
+        assert!(preset.required_coverage().network_raw_denied);
+        assert!(!preset.required_coverage().domain_proxy_enforced);
+    }
+
+    #[test]
+    fn the_untrusted_project_preset_denies_every_shared_sensitive_root() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let project = base.path().join("held-copy");
+        std::fs::create_dir(&project).expect("create held copy");
+        let preset = CapsuleSpec::untrusted_project(&project, &[]);
+
+        // The deny set is seeded from the shared catalogue, so it can never be
+        // empty on a host whose authenticated home resolved; when it did not,
+        // `deny_default_paths` emits the empty poison root and the validator
+        // below fails closed instead.
+        assert!(!preset.filesystem.deny_roots.is_empty());
+        let poisoned = preset
+            .filesystem
+            .deny_roots
+            .iter()
+            .any(|root| root.as_os_str().is_empty());
+        if !poisoned {
+            let names: Vec<String> = preset
+                .filesystem
+                .deny_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect();
+            for expected in [".ssh", ".aws", ".gnupg"] {
+                assert!(
+                    names.iter().any(|root| root.ends_with(expected)),
+                    "preset deny roots lost {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_untrusted_project_preset_refuses_a_project_over_a_denied_root() {
+        // The negative half of the deny contract, and the reason `--project ~`
+        // and `--project ~/.ssh` must never be accepted: the validator rejects
+        // an allow root that overlaps a deny root in either direction.
+        let Ok(home) = authenticated_home_dir() else {
+            return;
+        };
+        let preset = CapsuleSpec::untrusted_project(&home.join(".ssh"), &[]);
+        assert!(canonicalize_and_validate_filesystem_policy(&preset.filesystem).is_err());
+
+        let whole_home = CapsuleSpec::untrusted_project(&home, &[]);
+        assert!(canonicalize_and_validate_filesystem_policy(&whole_home.filesystem).is_err());
+    }
+
+    #[test]
+    fn the_untrusted_project_env_allowlist_cannot_re_expose_a_credential() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let project = base.path().join("held-copy");
+        std::fs::create_dir(&project).expect("create held copy");
+        let mut preset = CapsuleSpec::untrusted_project(&project, &[]);
+        preset.environment.allow.push("GITHUB_TOKEN".to_string());
+        preset
+            .environment
+            .allow
+            .push("AWS_SECRET_ACCESS_KEY".to_string());
+
+        let survivors = preset.environment.surviving_vars(std::iter::empty());
+        assert!(survivors.contains("PATH"));
+        assert!(survivors.contains("TERM"));
+        assert!(!survivors.contains("GITHUB_TOKEN"));
+        assert!(!survivors.contains("AWS_SECRET_ACCESS_KEY"));
     }
 
     #[test]

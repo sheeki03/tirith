@@ -10,6 +10,8 @@ pub mod baseline;
 pub mod blast_radius;
 pub mod canary;
 pub mod capsule;
+pub mod capsule_project;
+pub mod capsule_receipt;
 pub mod checkpoint;
 pub mod clipboard;
 pub mod command_card;

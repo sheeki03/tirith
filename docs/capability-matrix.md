@@ -26,6 +26,7 @@ Inspected:
 | `tirith preview` | Partial | Simulates the filesystem blast radius of destructive commands; models the impact rather than inspecting content. | Yes |
 | `tirith watch` | Partial | Runs a command, then diffs filesystem, PATH, and shell-rc impact; observes effects, not the command bytes. | Yes |
 | `tirith temp-run` | Partial | Runs a command in a throwaway directory and diffs file impact. File isolation, not full containment, unless --capsule is set. | Partial |
+| `tirith capsule run` | Full | Copies the project with symlink-safe same-inode traversal (refusing symlinks, escapes, and case/Unicode collisions), digests every copied file, runs the exact argv in a fail-closed capsule, and diffs the tree afterwards. Enforceable only on x86_64 Linux; every other host refuses before any copy or spawn. | Yes |
 | `tirith taint` | None | Tracks provenance of files downloaded from risky sources; flags execution of a tainted file. Bookkeeping, not content inspection. | Yes |
 | `tirith intend` | Full | Inspects the command and flags high-impact behavior the stated intent does not justify (advisory). | Yes |
 | `tirith lab` | Full | Runs the detection engine against a curated, inert adversarial corpus to show what it catches. Offline. | Yes |

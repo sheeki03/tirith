@@ -108,6 +108,14 @@ pub struct ParsedArgs {
     /// replaces it with the held directory's observed canonical location before
     /// building the OS sandbox policy.
     pub cwd_root: Option<OsString>,
+    /// Optional inherited directory descriptor that is BOTH the target's working
+    /// directory and its single writable grant. The launcher enters it with
+    /// `fchdir` and sources the Landlock write rule from this descriptor, so no
+    /// pathname is resolved a second time after the parent proved its identity.
+    pub work_fd: Option<i32>,
+    /// The write-root pathname paired with `work_fd`, used to locate the exact
+    /// policy grant and as a diagnostic. Authority is the descriptor's.
+    pub work_root: Option<OsString>,
     /// Parent-owned mountpoint used for the private sealed-input view.
     pub staging_root: Option<OsString>,
     /// Exact inherited mountpoint capability paired with `staging_root`.
@@ -162,6 +170,8 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     let mut temp_home_fd = None;
     let mut cwd_fd = None;
     let mut cwd_root = None;
+    let mut work_fd = None;
+    let mut work_root = None;
     let mut staging_root = None;
     let mut staging_fd = None;
     let mut input_fds = Vec::new();
@@ -287,6 +297,24 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
             if cwd_root.replace(value).is_some() {
                 return Err("duplicate `--cwd-root` launcher option".to_string());
             }
+        } else if option == "--work-fd" {
+            if work_fd.is_some() {
+                return Err("duplicate `--work-fd` launcher option".to_string());
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| "`--work-fd` is not valid UTF-8".to_string())?;
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| "`--work-fd` must be a decimal descriptor".to_string())?;
+            if parsed < 3 {
+                return Err("`--work-fd` must not overlap standard I/O".to_string());
+            }
+            work_fd = Some(parsed);
+        } else if option == "--work-root" {
+            if work_root.replace(value).is_some() {
+                return Err("duplicate `--work-root` launcher option".to_string());
+            }
         } else if option == "--staging-root" {
             if staging_root.replace(value).is_some() {
                 return Err("duplicate `--staging-root` launcher option".to_string());
@@ -357,6 +385,7 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         coverage_status_fd,
         temp_home_fd,
         cwd_fd,
+        work_fd,
         staging_fd,
         target_dir_fd,
     ];
@@ -373,6 +402,15 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     }
     if cwd_fd.is_some() != cwd_root.is_some() {
         return Err("`--cwd-fd` and `--cwd-root` must be supplied together".to_string());
+    }
+    if work_fd.is_some() != work_root.is_some() {
+        return Err("`--work-fd` and `--work-root` must be supplied together".to_string());
+    }
+    // The two working-directory protocols are mutually exclusive: one binds a
+    // read-only grant to the descriptor, the other a writable one, and accepting
+    // both would leave the target's cwd ambiguous.
+    if work_fd.is_some() && cwd_fd.is_some() {
+        return Err("`--work-fd` and `--cwd-fd` are mutually exclusive".to_string());
     }
     if temp_home_fd.is_some() != temp_home.is_some() {
         return Err("`--temp-home-fd` and `--temp-home` must be supplied together".to_string());
@@ -399,6 +437,9 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     if bound_input_mode && cwd_fd.is_some() {
         return Err("sealed-input launch cannot also select a bound cwd".to_string());
     }
+    if bound_input_mode && work_fd.is_some() {
+        return Err("sealed-input launch cannot also select a bound work directory".to_string());
+    }
     let rest = &args[sep + 1..];
     let program = rest
         .first()
@@ -418,6 +459,8 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         temp_home_fd,
         cwd_fd,
         cwd_root,
+        work_fd,
+        work_root,
         staging_root,
         staging_fd,
         inputs,
@@ -671,6 +714,80 @@ fn rebase_bound_cwd_root(
     }
     spec.filesystem.read_roots[matching[0]] = observed_root.to_path_buf();
     Ok(())
+}
+
+/// Enter a parent-held directory capability that is also the target's single
+/// writable grant, and return it so the Landlock rule is built from the
+/// DESCRIPTOR rather than from the pathname.
+///
+/// This is the shape the untrusted-project preset needs and the bound-cwd
+/// protocol cannot express: there the held directory is a READ grant, and a
+/// writable grant overlapping it would be a second, pathname-derived authority.
+/// Here the writable grant IS the descriptor, so there is no second authority to
+/// disagree with it. The pathname is still proved to identify the descriptor,
+/// because a visible root that was swapped out from under the parent is a
+/// refusal rather than a run.
+#[cfg(target_os = "linux")]
+fn prepare_bound_work_directory(
+    spec: &tirith_core::capsule::CapsuleSpec,
+    parsed: &ParsedArgs,
+) -> Result<Option<(std::path::PathBuf, i32)>, String> {
+    let (fd, raw_root) = match (parsed.work_fd, parsed.work_root.as_deref()) {
+        (None, None) => return Ok(None),
+        (Some(fd), Some(root)) => (fd, root),
+        _ => {
+            return Err("bound work descriptor and root must be supplied together".to_string());
+        }
+    };
+    if !spec.handles.extra_unix_fds.contains(&fd) {
+        return Err(format!(
+            "bound work descriptor {fd} is absent from the handle allow-list"
+        ));
+    }
+    let canonical = validate_held_ephemeral_directory(raw_root, fd, "bound work directory")?;
+    if spec
+        .filesystem
+        .write_roots
+        .iter()
+        .filter(|root| root.as_path() == canonical)
+        .count()
+        != 1
+    {
+        return Err(
+            "bound work directory must be one exact filesystem-policy write root".to_string(),
+        );
+    }
+    if spec.filesystem.write_roots.iter().any(|root| {
+        root.as_path() != canonical && (root.starts_with(&canonical) || canonical.starts_with(root))
+    }) {
+        return Err("bound work directory must not overlap another writable grant".to_string());
+    }
+    if spec
+        .filesystem
+        .read_roots
+        .iter()
+        .any(|root| root.starts_with(&canonical) || canonical.starts_with(root))
+    {
+        return Err("bound work directory must not overlap a readable grant".to_string());
+    }
+
+    // SAFETY: `fd` is an inherited directory descriptor named by the handle policy.
+    if unsafe { libc::fchdir(fd) } != 0 {
+        return Err(format!(
+            "enter bound work descriptor {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let observed = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| format!("resolve bound work directory after fchdir: {error}"))?;
+    if observed != canonical {
+        return Err(
+            "the entered work directory no longer answers to the pathname the policy grants"
+                .to_string(),
+        );
+    }
+    Ok(Some((canonical, fd)))
 }
 
 #[cfg(target_os = "linux")]
@@ -1110,6 +1227,15 @@ fn macos_launch(parsed: &ParsedArgs) -> ! {
         eprintln!("tirith __capsule-child: invalid bound working directory: {error}");
         std::process::exit(2);
     }
+    // Seatbelt cannot bind a filesystem grant to a held vnode, so a descriptor
+    // bound working directory has no meaning here and must not be silently
+    // downgraded to a pathname grant.
+    if parsed.work_fd.is_some() {
+        eprintln!(
+            "tirith __capsule-child: a descriptor-bound work directory is unsupported on macOS"
+        );
+        std::process::exit(2);
+    }
 
     // Build and validate every CString before descriptor closure so no fallible
     // string conversion or allocation is needed after the isolation boundary is
@@ -1212,6 +1338,13 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         Ok(bound) => bound,
         Err(error) => {
             eprintln!("tirith __capsule-child: invalid bound working directory: {error}");
+            std::process::exit(2);
+        }
+    };
+    let bound_work = match prepare_bound_work_directory(&spec, parsed) {
+        Ok(bound) => bound,
+        Err(error) => {
+            eprintln!("tirith __capsule-child: invalid bound work directory: {error}");
             std::process::exit(2);
         }
     };
@@ -1378,6 +1511,9 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
     if let Some((root, fd)) = bound_cwd.as_ref() {
         bound_read_roots.push((root.as_path(), *fd));
     }
+    if let Some((root, fd)) = bound_work.as_ref() {
+        bound_write_roots.push((root.as_path(), *fd));
+    }
     if let Some(bound) = bound_inputs.as_ref() {
         bound_read_roots.push((bound.staging_root.as_path(), bound.staging_fd));
         bound_write_roots.push((bound.target_root.as_path(), bound.target_fd));
@@ -1409,6 +1545,17 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         if unsafe { libc::close(fd) } != 0 {
             eprintln!(
                 "tirith __capsule-child: close bound working-directory descriptor failed: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(2);
+        }
+    }
+    if let Some((_, fd)) = bound_work {
+        // The Landlock rule has consumed the descriptor's identity; the target
+        // must not inherit the capability itself.
+        if unsafe { libc::close(fd) } != 0 {
+            eprintln!(
+                "tirith __capsule-child: close bound work-directory descriptor failed: {}",
                 std::io::Error::last_os_error()
             );
             std::process::exit(2);
@@ -2460,6 +2607,71 @@ mod tests {
         );
         assert_eq!(parsed.program, "/tmp/bound/busybox");
         assert_eq!(parsed.program_args, vec![OsString::from("-s")]);
+    }
+
+    #[test]
+    fn parse_args_carries_a_bound_work_directory_and_keeps_it_apart_from_a_bound_cwd() {
+        let base = [
+            "tirith",
+            "__capsule-child",
+            "{}",
+            "--work-fd",
+            "57",
+            "--work-root",
+            "/tmp/tirith-capsule-project-ab12ef",
+        ];
+        let parsed = parse_args(&argv(
+            &[&base[..], &["--", "/bin/sh", "-c", "npm test"]].concat(),
+        ))
+        .expect("parse a bound work directory");
+        assert_eq!(parsed.work_fd, Some(57));
+        assert_eq!(
+            parsed.work_root.as_deref(),
+            Some(OsStr::new("/tmp/tirith-capsule-project-ab12ef"))
+        );
+
+        // Paired, exclusive with the read-only bound cwd, and never a duplicate
+        // of another internal descriptor.
+        assert!(parse_args(&argv(&[
+            "tirith",
+            "__capsule-child",
+            "{}",
+            "--work-fd",
+            "57",
+            "--",
+            "/bin/sh"
+        ]))
+        .is_err());
+        assert!(parse_args(&argv(
+            &[
+                &base[..],
+                &[
+                    "--cwd-fd",
+                    "58",
+                    "--cwd-root",
+                    "/tmp/other",
+                    "--",
+                    "/bin/sh"
+                ]
+            ]
+            .concat()
+        ))
+        .is_err());
+        assert!(parse_args(&argv(
+            &[
+                &base[..],
+                &[
+                    "--temp-home-fd",
+                    "57",
+                    "--temp-home",
+                    "/tmp/h",
+                    "--",
+                    "/bin/sh"
+                ]
+            ]
+            .concat()
+        ))
+        .is_err());
     }
 
     #[test]

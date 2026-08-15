@@ -28,13 +28,22 @@ projection_bytes_sha256 = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1
 security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
 
 [capability_manifest]
-# C13 compatibility note: the `install` and `package` coverage prose changed to
-# state the new npm registry-identity facts AND, explicitly, that tirith does
-# not download, inspect, or bind the tarball bytes npm installs. No command was
-# added, removed, renamed, or regrouped, and no `inspected` or `policy_complete`
-# value changed; this is a documentation-truth edit only, so the hash is
-# re-pinned rather than the contract relaxed.
-sha256 = "7e91c17190c1d6b42218689cfc7d7cc052e12caa8f9f0be8ad06f269b6943a25"
+# C14 compatibility note: one NEW `[[command]]` entry, `capsule run`, was added
+# to the existing "Scan & analyze" group. This is a declared ADDITION, not a
+# content regression: verified before updating, rather than assumed, by diffing
+# the manifest entry-by-entry against the previous freeze. No existing command
+# was removed, renamed, or regrouped, and no existing `inspected`, `coverage`,
+# or `policy_complete` value changed. The freeze exists to catch a silent
+# weakening of a recorded capability claim; adding a command that did not exist
+# before cannot weaken one. Bisect: passes at ad08ac6b (C13) with the previous
+# value; this value is required from the C14 commit onward.
+#
+# C13 compatibility note (retained): the `install` and `package` coverage prose
+# changed to state the new npm registry-identity facts AND, explicitly, that
+# tirith does not download, inspect, or bind the tarball bytes npm installs. No
+# command was added, removed, renamed, or regrouped, and no `inspected` or
+# `policy_complete` value changed; that was a documentation-truth edit only.
+sha256 = "833185d2c8efc423a7fb3c866a31ec2a3040c7b48da000da7db7265cf2d5f6c0"
 
 [mcp]
 default_tools = [

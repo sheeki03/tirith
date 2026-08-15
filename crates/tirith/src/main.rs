@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 /// `every_command_is_categorized` test guards this against drift.
 const COMMANDS_BY_CATEGORY: &str = "\
 COMMANDS BY CATEGORY:
-  Scan & Analyze:   check paste run score diff fetch fix scan view preview watch temp-run taint intend task lab explain why visual-audit
+  Scan & Analyze:   check paste run score diff fetch fix scan view preview watch temp-run capsule taint intend task lab explain why visual-audit
   Status & Health:  status doctor prompt-status dashboard warnings receipt logs baseline
   Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
   Policy & Trust:   policy trust rule output
@@ -583,6 +583,12 @@ Examples:
     Task {
         #[command(subcommand)]
         action: TaskAction,
+    },
+
+    /// Run an untrusted project inside a fail-closed OS containment capsule
+    Capsule {
+        #[command(subcommand)]
+        action: CapsuleAction,
     },
 
     /// Score a URL for security risk
@@ -2997,6 +3003,92 @@ enum TaskAction {
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
+    },
+}
+
+/// Honesty block for `tirith capsule run`. The wording here is the SAME
+/// contract the command's refusal message, the JSON envelope, and
+/// `docs/capsule.md` carry.
+const CAPSULE_RUN_AFTER_HELP: &str = "\
+FAIL-CLOSED CONTAINMENT. NO DEGRADED FALLBACK.
+  This is the recruiter-task preset: you were sent a repository and asked to
+  run it. The project is COPIED into a held ephemeral directory and the command
+  runs there, with write access to the copy and a private temporary HOME and
+  nothing else.
+
+PLATFORM LIMIT (not a bug, a refusal):
+  Enforceable only on x86_64 Linux with a usable Landlock ABI. Raw-network
+  denial needs seccomp, which this build supports on x86_64 Linux only; macOS
+  cannot enforce a memory or process-count ceiling at all; and the parent-owned
+  wall-clock and combined-output supervisor is Linux-only. Every other host
+  REFUSES before anything is copied or spawned, naming the exact control it
+  could not deliver. It never falls back to a degraded or uncontained run.
+
+WHAT THE PRESET DOES:
+  - copies the project with symlink-safe, same-inode traversal, REFUSING (never
+    silently skipping) symlinks, hardlinks, cross-filesystem entries, path
+    escapes, case/Unicode collisions, and non-regular files; excludes .git;
+    caps at 100,000 files, 200,000 entries, 256 levels, and 2 GiB
+  - denies all network. Domain allow-listing is NOT offered: no backend here
+    can enforce it, so claiming it would be a lie. Dependencies must be
+    vendored or preinstalled by a separate trusted transaction
+  - denies credential stores, wallet roots, browser profiles, and inherited
+    secret environment; the child gets a fixed PATH and a temporary HOME
+  - applies CPU 120s, wall 300s, memory 2 GiB, 256 processes, 256 open files,
+    and 16 MiB combined output, tightened further by any task_gate policy
+
+RECEIPT:
+  Every invocation writes one signed, content-addressed receipt, including a
+  refusal. It records the argv DIGEST (never the argv), the project input and
+  output tree digests, the backend, requested versus achieved coverage, the
+  effective limits, the child's exit status SEPARATELY from Tirith's decision,
+  the termination reason, a bounded file diff, whether a copy was materialized
+  at all, and cleanup confirmation for the copy, the process tree, and the
+  temporary HOME. Host paths are redacted from the recorded reason. A run that
+  was not fully contained is recorded as `partial` or `refused`, never as a
+  contained result.
+
+EXIT CODES:
+  0 contained and the child exited 0; 1 a Tirith decision (refused before
+  launch, terminated after it, or a run whose receipt could not be recorded or
+  could not be anchored in the audit chain);
+  2 usage or input error; 3 contained but the child itself exited non-zero.
+
+Examples:
+  tirith capsule run --preset untrusted-project --project . -- npm test
+  tirith capsule run --preset untrusted-project --project ./take-home \\
+    --receipt ./run.json -- ./scripts/build.sh";
+
+#[derive(Subcommand)]
+enum CapsuleAction {
+    /// Copy an untrusted project into a held ephemeral directory and run an
+    /// exact argv inside a fail-closed capsule
+    #[command(after_help = CAPSULE_RUN_AFTER_HELP)]
+    Run {
+        /// Containment preset. The only value is `untrusted-project`.
+        #[arg(long, default_value = cli::capsule_run::PRESET_UNTRUSTED_PROJECT)]
+        preset: String,
+
+        /// Project directory to copy and run. Never written to itself.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+
+        /// Write the run receipt to this path (0600). A content-addressed copy
+        /// is stored under the tirith data directory regardless.
+        #[arg(long)]
+        receipt: Option<PathBuf>,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+
+        /// The exact argv to run inside the capsule, after `--`. Never joined
+        /// or reparsed by a shell.
+        #[arg(last = true, required = true)]
+        argv: Vec<std::ffi::OsString>,
     },
 }
 
@@ -7500,6 +7592,20 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::task::run(file.as_deref(), adapter.as_deref(), json)
+            }
+        },
+
+        Commands::Capsule { action } => match action {
+            CapsuleAction::Run {
+                preset,
+                project,
+                receipt,
+                format,
+                json,
+                argv,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::capsule_run::run(&preset, &project, receipt.as_deref(), &argv, json)
             }
         },
 

@@ -21,6 +21,7 @@ everyday subset; this is the complete reference.
 | `tirith preview -- <cmd>` | Simulate the filesystem blast radius of `rm` / `mv` / `chmod -R` / `rsync --delete` without running it |
 | `tirith watch -- <cmd>` | Run a command, then diff its filesystem, `$PATH`, and shell-rc impact |
 | `tirith temp-run -- <cmd>` | Run a command in a throwaway temp directory and diff its file impact (file isolation, not a sandbox) |
+| `tirith capsule run --preset untrusted-project --project <dir> -- <cmd>` | Copy an untrusted project into a held ephemeral directory and run an exact argv inside a fail-closed OS capsule, emitting a signed receipt. Enforceable on x86_64 Linux only; every other host refuses before anything is copied or spawned, and there is no degraded fallback |
 | `tirith taint {list,explain,clear}` | Track files downloaded from risky sources; executing or sourcing a tainted file fires a finding |
 | `tirith intend "<intent>" -- <cmd>` | Flag high-impact behavior the stated intent does not justify (advisory) |
 | `tirith lab` | Run the detection engine against a curated adversarial corpus to see what it catches (`--filter`, `--score`) |

@@ -106,6 +106,12 @@ pub enum OwnedBoundary {
     RemoteScriptRun,
     /// A Tirith-owned configuration file is about to be published by rename.
     ConfigWrite,
+    /// `tirith capsule run --preset untrusted-project` is about to copy an
+    /// untrusted project into a held ephemeral directory and launch the
+    /// operator's argv inside it. Evaluated before the copy, so a refusal costs
+    /// the operator nothing and leaves no copy of an attacker's repository on
+    /// disk.
+    CapsulePresetRun,
 }
 
 impl OwnedBoundary {
@@ -119,6 +125,7 @@ impl OwnedBoundary {
             Self::PackageManagerExecution => "package_manager_execution",
             Self::RemoteScriptRun => "remote_script_run",
             Self::ConfigWrite => "config_write",
+            Self::CapsulePresetRun => "capsule_preset_run",
         }
     }
 }
@@ -604,6 +611,89 @@ mod tests {
             spec.resources.memory_bytes,
             crate::capsule::ResourceLimits::conservative().memory_bytes
         );
+    }
+
+    /// C14 launches through `tighten_capsule_spec` and must be able to state
+    /// that the merge is monotone, not just believe it: applying any denial set
+    /// twice equals applying it once, and no dimension is ever raised.
+    #[test]
+    fn tightening_is_monotone_and_idempotent_over_every_effect() {
+        let every_effect: BTreeSet<CommandEffectKind> = [
+            CommandEffectKind::PackageInstall,
+            CommandEffectKind::PersistenceChange,
+            CommandEffectKind::PolicyChange,
+            CommandEffectKind::SecretRead,
+            CommandEffectKind::NetworkEgress,
+            CommandEffectKind::FilesystemWrite,
+            CommandEffectKind::ResourceEscalation,
+            CommandEffectKind::Web3Write,
+            CommandEffectKind::Web3SignerUse,
+        ]
+        .into_iter()
+        .collect();
+
+        let mut spec = crate::capsule::CapsuleSpec::locked_down();
+        spec.resources.cpu_seconds = Some(5);
+        spec.resources.memory_bytes = None;
+        spec.resources.max_output_bytes = Some(1);
+        spec.filesystem.write_roots.push("/tmp/held".into());
+        let before = spec.clone();
+
+        tighten_capsule_spec(&mut spec, &every_effect);
+        let once = spec.clone();
+        tighten_capsule_spec(&mut spec, &every_effect);
+        assert_eq!(once, spec, "tightening must be idempotent");
+
+        // Never raises a populated ceiling, and only ever ADDS a ceiling where
+        // there was none.
+        fn never_raised<T: Ord + Copy>(before: Option<T>, after: Option<T>) -> bool {
+            match (before, after) {
+                (Some(before), Some(after)) => after <= before,
+                (Some(_), None) => false,
+                (None, _) => true,
+            }
+        }
+        assert!(never_raised(
+            before.resources.cpu_seconds,
+            once.resources.cpu_seconds
+        ));
+        assert!(never_raised(
+            before.resources.max_output_bytes,
+            once.resources.max_output_bytes
+        ));
+        assert!(never_raised(
+            before.resources.wall_clock_seconds,
+            once.resources.wall_clock_seconds
+        ));
+        assert!(once.resources.memory_bytes.is_some());
+        // Capabilities only ever shrink.
+        assert!(once.network.is_deny_all());
+        assert!(once.filesystem.write_roots.len() <= before.filesystem.write_roots.len());
+    }
+
+    /// The C14 preset is already the tightest spec the product builds, so the
+    /// gate can never widen it. Pinned, because "it happens to be a no-op today"
+    /// is exactly the property a future preset change could silently break.
+    #[test]
+    fn tightening_the_untrusted_project_preset_never_widens_it() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let project = base.path().join("held-copy");
+        std::fs::create_dir(&project).expect("create held copy");
+        let preset = crate::capsule::CapsuleSpec::untrusted_project(&project, &[]);
+
+        let mut tightened = preset.clone();
+        tighten_capsule_spec(
+            &mut tightened,
+            &[
+                CommandEffectKind::ResourceEscalation,
+                CommandEffectKind::NetworkEgress,
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(tightened.resources, preset.resources);
+        assert_eq!(tightened.network, preset.network);
+        assert_eq!(tightened.filesystem, preset.filesystem);
     }
 
     #[test]
