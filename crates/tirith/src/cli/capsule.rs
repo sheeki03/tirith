@@ -6417,6 +6417,11 @@ fn windows_run_to_completion_os(
         coverage: sel.coverage,
         degraded: false,
         termination: None,
+        // `None` means "not observed", not "confirmed gone". This launcher owns
+        // no ephemeral HOME, so it has nothing to observe, and a caller that
+        // requires proof of cleanup must treat the absence as unproven rather
+        // than as success.
+        ephemeral_home_cleanup_confirmed: None,
     })
 }
 
