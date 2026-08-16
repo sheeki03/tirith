@@ -848,6 +848,10 @@ pub fn confirm(prompt: &str, yes: bool) -> bool {
 pub mod agent;
 pub mod ai;
 pub mod aliases;
+/// The `tirith attest` namespace (C18): point-in-time build and deployment
+/// receipts. Distinct from the nested `tirith pkg attest`, which binds PyPI
+/// publish attestations and is untouched by this surface.
+pub mod attest;
 pub mod audit;
 pub mod baseline;
 #[cfg(unix)]

@@ -16,7 +16,7 @@ COMMANDS BY CATEGORY:
   Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
   Policy & Trust:   policy trust rule output
   Shell & System:   daemon hooks exec env path sudo ssh context persistence hygiene aliases
-  Supply-chain:     package pkg ecosystem threat-db iac canary secret command-card commands
+  Supply-chain:     package pkg ecosystem threat-db iac canary secret command-card commands attest
   Integrations:     mcp mcp-server gateway agent ai lsp license
   Forensics:        audit incident checkpoint pending share redact clipboard
 
@@ -543,6 +543,47 @@ does not install, `pkg verify-env` only verifies an existing tree, and
     Pkg {
         #[command(subcommand)]
         action: PkgAction,
+    },
+
+    /// Bind one source tree, one output tree, and one set of deployed routes
+    /// into content-addressed, point-in-time receipts, signed when this
+    /// installation has an audit key.
+    #[command(after_help = "\
+What it is:
+  `attest build` hashes a source tree and an output tree into one deterministic
+  digest each, plus the commit, dirty state, lockfile digests, policy hash, a
+  REDACTED argv digest, and the per-file output manifest. `attest deployment`
+  fetches manifest-listed routes from ONE https origin and binds the bytes that
+  came back. The two verify- commands re-check what was bound.
+
+What it is NOT:
+  - not a reproducible-build claim: tirith does not run your build and cannot
+    say the output came from the source;
+  - not continuous monitoring: a deployment receipt describes the routes it
+    fetched, at the moment it fetched them, and nothing else;
+  - `attest verify-deployment` re-checks the DOCUMENT and does not re-fetch.
+    Run `attest deployment` again to measure the site again.
+
+This is a different command from `tirith pkg attest`, which binds PyPI publish
+attestations for a wheel and is unaffected by anything here.
+
+Exit codes (deliberately distinct from `tirith check`, which uses 3 for a warn
+acknowledgement; per-command codes in tirith are not shared):
+  0  clean     everything asked for was bound, or still matches
+  1  mismatch  a bound tree or a fetched route no longer matches, a document
+               failed its own integrity rules, or a target left the origin
+  2  usage     a bad path, an unreadable receipt, or an invalid route map
+  3  partial   something could not be measured: a cap, an unreadable tree, an
+               unreachable, authenticated, or CDN-transformed route
+
+Examples:
+  tirith attest build --source . --output dist --out build.receipt.json
+  tirith attest verify-build build.receipt.json --source . --output dist
+  tirith attest deployment --build-receipt build.receipt.json --base-url https://app.example
+  tirith attest verify-deployment deployment.receipt.json")]
+    Attest {
+        #[command(subcommand)]
+        action: AttestAction,
     },
 
     /// Run adversarial training scenarios (experimental)
@@ -3006,6 +3047,228 @@ enum TaskAction {
         #[arg(long)]
         adapter: Option<String>,
 
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttestAction {
+    /// Bind a source tree and an output tree into one point-in-time receipt.
+    #[command(after_help = "\
+What it binds:
+  A deterministic sha256 over each tree (sorted relative paths, mode, size, and
+  file bytes), the HEAD commit and dirty state when the source is a repository,
+  the lockfile digests, the policy projection hash, a digest of the REDACTED
+  argv, the per-file output manifest, and the identity of the one external tool
+  tirith itself ran.
+
+What it refuses:
+  A symlink anywhere in either tree, a non-regular entry, a non-UTF-8 path, two
+  paths that collide under case folding or Unicode normalization, a file that
+  was rebound, grew, or was truncated while it was being hashed, and anything
+  past 100,000 entries, 2 GiB, or 256 directories deep. Every refusal is a
+  refusal, never a silently skipped entry.
+
+Removed from the SOURCE digest, explicitly and on the record:
+  .git at every depth (every path it pruned is listed in the receipt and folded
+  into the digest), the --output root when it is nested under --source, and the
+  --out receipt destination, so a receipt can never hash itself into existence.
+
+Removed from the OUTPUT digest:
+  only the --out receipt destination when it lands inside --output. Nothing is
+  pruned by name there: a directory called .git under build output is shipped
+  content, and dropping it would leave bytes inside a tree the receipt calls
+  bound.
+
+--execution-receipt:
+  Links a `tirith capsule run` receipt. The link is labelled verified ONLY when
+  that receipt's SIGNATURE verifies against this installation's audit key, it is
+  self-consistent, it records a fully contained run whose child reached exit 0,
+  and its input tree digest is THIS source tree. It says nothing about --output:
+  a capsule builds inside an ephemeral copy that is deleted before the run ends,
+  so the bytes it produced are not on this disk. Anything else is recorded as an
+  observation with the reasons named, and the receipt is partial.
+
+Exit codes:
+  0  clean     both trees were bound in full
+  1  mismatch  the assembled receipt failed its own integrity rules
+  2  usage     a bad --source, --output, --execution-receipt, or --out
+  3  partial   a tree could not be bound in full (a cap, a symlink, a race), or
+               a linked execution receipt did not prove a contained run
+
+Examples:
+  tirith attest build --source . --output dist
+  tirith attest build --source . --output dist --out build.receipt.json
+  tirith attest build --source . --output dist --execution-receipt capsule.receipt.json
+  tirith attest build --source . --output dist --format json")]
+    Build {
+        /// The source tree to bind.
+        #[arg(long, default_value = ".")]
+        source: std::path::PathBuf,
+        /// The build output tree to bind.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// A `tirith capsule run` receipt to link this build to.
+        #[arg(long)]
+        execution_receipt: Option<std::path::PathBuf>,
+        /// Also write the receipt to this path (atomic, mode 0600).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Re-hash both trees and compare them with a build receipt.
+    #[command(after_help = "\
+What it does:
+  Checks the receipt's SIGNATURE against this installation's audit key, then
+  re-scans --source and --output under the caps, exclusion set, and permission
+  model the receipt itself records and compares the two digests. It proves the
+  trees are unchanged since the receipt was taken; it proves nothing about where
+  either tree came from.
+
+  The signature is the load-bearing check. receipt_id and both tree digests are
+  keyless sha256s that anyone who can write the file can recompute, so on an
+  installation that signs, an unsigned or non-verifying receipt is a mismatch
+  rather than a warning. Both exclusion sets and both covered file counts are
+  printed on every answer, so an exclusion set wide enough to swallow a tree is
+  visible instead of hiding behind the word clean.
+
+Exit codes:
+  0  clean     both trees still hash to what the receipt bound
+  1  mismatch  a tree changed, the receipt failed its own integrity rules
+               (including a stripped signature, which the content address binds),
+               or its signature does not verify
+  2  usage     the file is not a build receipt, or a bad --source / --output
+  3  partial   a tree could not be re-scanned, the receipt was itself partial, or
+               it is signed and no verifying key is installed to check it
+
+Examples:
+  tirith attest verify-build build.receipt.json --source . --output dist
+  tirith attest verify-build build.receipt.json --source . --output dist --format json")]
+    VerifyBuild {
+        /// The build receipt to verify against.
+        #[arg(value_name = "RECEIPT")]
+        receipt: std::path::PathBuf,
+        /// The source tree to re-hash.
+        #[arg(long, default_value = ".")]
+        source: std::path::PathBuf,
+        /// The output tree to re-hash.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Fetch manifest-listed routes from one https origin and bind the bytes.
+    #[command(after_help = "\
+What it does:
+  Verifies the build receipt FIRST (a receipt that fails its own integrity rules
+  or whose signature this installation rejects produces a mismatch and ZERO
+  requests), then fetches only the routes the build's output manifest names, from
+  ONE origin, through tirith's connect-time DNS guard. It sends
+  Accept-Encoding: identity and hashes the exact returned body bytes.
+
+Route mapping:
+  By default index.html serves its containing directory and every other file
+  serves its exact relative path. A --route-map JSON file
+  ({\"routes\": {\"index.html\": \"/\", \"app.js\": \"/static/app.js\"}}) replaces
+  that convention with your own; every key must name a file in the build
+  receipt's output manifest, and every value must be an absolute same-origin
+  path.
+
+  BOTH mappings go through the same gate, the default one included: it is
+  derived from filenames in a build tree nothing character-checked, and a file
+  named so that its route resolves to another authority would otherwise send the
+  request there. Every resolved URL is re-checked against the base origin before
+  the request leaves, and a route that resolves elsewhere is a mismatch that
+  reaches no network.
+
+Bounds:
+  8 concurrent fetches, 5 redirect hops, 32 MiB per response, 2 GiB in total,
+  30 second request and 10 second connect budgets.
+
+What this receipt proves:
+  ONLY that the routes it lists returned these bytes at the timestamp it
+  records. It is not continuous monitoring, it says nothing about routes it did
+  not fetch, and it is not proof that the deployed site is the build. CSP and
+  trusted-types headers are recorded as observations, never as byte proof.
+
+Exit codes:
+  0  clean     every built file was fetched and served exactly the built bytes
+  1  mismatch  a route served different bytes, did not serve the file at all,
+               redirected or resolved off the origin, resolved to a private or
+               loopback address, or the build receipt failed verification
+  2  usage     the file is not a build receipt, or the route map is invalid
+  3  partial   a route was unreachable, authenticated, challenged, transformed
+               in transit, or over a cap; the build receipt was itself partial;
+               or built files were never fetched
+
+Examples:
+  tirith attest deployment --build-receipt build.receipt.json --base-url https://app.example
+  tirith attest deployment --build-receipt build.receipt.json --base-url https://app.example --route-map routes.json
+  tirith attest deployment --build-receipt build.receipt.json --base-url https://app.example --out deployment.receipt.json")]
+    Deployment {
+        /// The build receipt whose output manifest names what to fetch.
+        #[arg(long)]
+        build_receipt: std::path::PathBuf,
+        /// The single https origin to fetch from.
+        #[arg(long)]
+        base_url: String,
+        /// JSON file mapping built files to URL paths.
+        #[arg(long)]
+        route_map: Option<std::path::PathBuf>,
+        /// Also write the receipt to this path (atomic, mode 0600).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+
+    /// Re-check a deployment receipt document. Makes no network request.
+    #[command(after_help = "\
+What it does:
+  Checks the receipt's SIGNATURE against this installation's audit key,
+  re-computes the content address, re-counts the route ledger, and reports what
+  the receipt did not cover, what origin it is about, and when it was measured.
+
+  It deliberately does NOT re-fetch. A second measurement presented as
+  verification of the first would be exactly the continuous-monitoring claim
+  this command refuses to make. To measure the site again, run
+  `tirith attest deployment` again and compare the two receipts.
+
+Exit codes:
+  0  clean     the document stands up and every recorded route matched
+  1  mismatch  the document failed its integrity rules, its signature does not
+               verify, or a route mismatched
+  2  usage     the file is not a deployment receipt
+  3  partial   a route was unmeasured, built files were never fetched, the build
+               receipt behind it was partial, or the signature cannot be checked
+
+Examples:
+  tirith attest verify-deployment deployment.receipt.json
+  tirith attest verify-deployment deployment.receipt.json --format json")]
+    VerifyDeployment {
+        /// The deployment receipt to re-check.
+        #[arg(value_name = "RECEIPT")]
+        receipt: std::path::PathBuf,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -7794,6 +8057,66 @@ fn run() {
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::task::run(file.as_deref(), adapter.as_deref(), json)
+            }
+        },
+
+        Commands::Attest { action } => match action {
+            AttestAction::Build {
+                source,
+                output,
+                execution_receipt,
+                out,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::attest::build(cli::attest::BuildArgs {
+                    source,
+                    output,
+                    execution_receipt,
+                    out,
+                    json,
+                })
+            }
+            AttestAction::VerifyBuild {
+                receipt,
+                source,
+                output,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::attest::verify_build(cli::attest::VerifyBuildArgs {
+                    receipt,
+                    source,
+                    output,
+                    json,
+                })
+            }
+            AttestAction::Deployment {
+                build_receipt,
+                base_url,
+                route_map,
+                out,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::attest::deployment(cli::attest::DeploymentArgs {
+                    build_receipt,
+                    base_url,
+                    route_map,
+                    out,
+                    json,
+                })
+            }
+            AttestAction::VerifyDeployment {
+                receipt,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::attest::verify_deployment(cli::attest::VerifyDeploymentArgs { receipt, json })
             }
         },
 

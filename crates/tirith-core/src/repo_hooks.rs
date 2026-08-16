@@ -1380,6 +1380,45 @@ fn run_trusted_git(
     run_trusted_git_inner(repo_root, args, stdout_cap, true)
 }
 
+/// What one bounded, hardened Git invocation produced, for callers outside this
+/// module.
+///
+/// A separate type from [`TrustedGitOutput`] so the hook inspector's internal
+/// record stays private and can change shape without becoming a cross-module
+/// contract.
+pub(crate) struct BoundedGitOutput {
+    pub(crate) success: bool,
+    pub(crate) stdout: Vec<u8>,
+}
+
+/// Run one read-only Git command through the SAME hardened envelope the hook
+/// inspector uses, for callers in other modules.
+///
+/// Exposed rather than replicated because rebuilding this envelope inline (the
+/// null hooks path, the disabled system config, the disabled terminal prompt and
+/// credential helper, the fsmonitor and untracked-cache suppression, the time
+/// and output bounds) is a known failure mode in this repository: a caller that
+/// forgets one line runs repository-controlled code from a hook.
+pub(crate) fn run_trusted_git_bounded(
+    repo_root: &Path,
+    args: &[String],
+    stdout_cap: usize,
+) -> Result<BoundedGitOutput, &'static str> {
+    run_trusted_git(repo_root, args, stdout_cap).map(|output| BoundedGitOutput {
+        success: output.success,
+        stdout: output.stdout,
+    })
+}
+
+/// The resolved path of the trusted system Git, when one is available. `None`
+/// means no candidate passed the trusted-executable validator, which callers
+/// must record as an absent identity rather than fabricating one.
+pub(crate) fn trusted_git_path() -> Option<std::path::PathBuf> {
+    trusted_git_executable()
+        .ok()
+        .map(|executable| executable.path().to_path_buf())
+}
+
 /// Resolve Git's own hook path while retaining the repository-local
 /// `core.hooksPath`. The explicit `rev-parse` callers are read-only and cannot
 /// execute hooks; every other trusted Git call keeps hooks redirected to null.
