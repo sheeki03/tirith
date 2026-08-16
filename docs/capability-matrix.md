@@ -58,7 +58,7 @@ Inspected:
 | `tirith verify-self` | Full | Verifies the running binary and its build/install provenance against signed checksums. | Yes |
 | `tirith update` | Full | Signature-verified self-update: inspects the downloaded binary before replacing the running one. | Yes |
 | `tirith version` | None | Prints version and, with --provenance, build/install provenance. Reporting surface. | Yes |
-| `tirith browser` | None | Installs the Chrome native-messaging host that records clipboard provenance. Configuration surface. | Yes |
+| `tirith browser` | Partial | Installs the Chrome native-messaging host that records clipboard provenance (configuration surface). `browser audit` additionally reads bytes: it hashes every file under a profile's Extensions/<id>/<version> source tree, parses each manifest.json, and reads exactly three install-class fields (location, from_webstore, was_installed_by_default) from Preferences. It never reads cookies, history, saved passwords, Local Storage, IndexedDB, extension storage, wallet databases, or Local State, so it cannot see browsing data or the signed-in account, and profile identity is the profile directory name only. | Yes |
 | `tirith devcontainer` | Partial | Guards container operations and injects tirith into devcontainer.json. Inspects the guarded operation, not container contents. | Yes |
 | `tirith codespaces` | None | Sets up and injects tirith into Codespaces. Configuration surface. | Yes |
 | `tirith activate` | None | Activates a commercial license key. Licensing surface. | Yes |

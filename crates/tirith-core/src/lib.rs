@@ -8,6 +8,7 @@ pub mod audit_tune;
 pub mod audit_upload;
 pub mod baseline;
 pub mod blast_radius;
+pub mod browser_extensions;
 pub mod canary;
 pub mod capsule;
 pub mod capsule_project;

@@ -280,8 +280,8 @@ policy_complete = true
 [[command]]
 name = "browser"
 group = "Setup & onboarding"
-inspected = "none"
-coverage = "Installs the Chrome native-messaging host that records clipboard provenance. Configuration surface."
+inspected = "partial"
+coverage = "Installs the Chrome native-messaging host that records clipboard provenance (configuration surface). `browser audit` additionally reads bytes: it hashes every file under a profile's Extensions/<id>/<version> source tree, parses each manifest.json, and reads exactly three install-class fields (location, from_webstore, was_installed_by_default) from Preferences. It never reads cookies, history, saved passwords, Local Storage, IndexedDB, extension storage, wallet databases, or Local State, so it cannot see browsing data or the signed-in account, and profile identity is the profile directory name only."
 policy_complete = true
 
 [[command]]

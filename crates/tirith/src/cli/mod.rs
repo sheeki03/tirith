@@ -853,6 +853,7 @@ pub mod baseline;
 #[cfg(unix)]
 pub mod bash_capability;
 pub mod browser;
+pub mod browser_audit;
 pub mod browser_host;
 pub mod canary;
 /// Consumer-facing capsule launch surface (Stack E, unit E5): the single seam

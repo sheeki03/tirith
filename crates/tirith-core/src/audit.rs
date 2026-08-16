@@ -1483,6 +1483,37 @@ pub fn sign_canonical_bytes(canonical: &[u8]) -> Option<String> {
     sign_canonical(canonical)
 }
 
+/// The raw ed25519 VERIFYING key this installation trusts, or `None` when there
+/// is no usable one.
+///
+/// Exposed so a detached signature produced by [`sign_canonical_bytes`] can
+/// actually be CHECKED by the commands that consume one. A receipt whose
+/// signature is never verified is a receipt whose signature is decoration: both
+/// the content hash and the inventory hash inside it are recomputable by anyone
+/// who edits the file, so the signature is the only part a local attacker with
+/// write access cannot forge, and it has to be consulted for that to matter.
+///
+/// Same gate as the chain verifier: a non-regular file, a group/other-WRITABLE
+/// file, or one not owned by the effective uid is refused with a diagnostic, so
+/// an attacker cannot install their own public key alongside a re-signed
+/// document.
+pub fn audit_verifying_key_bytes() -> Option<[u8; 32]> {
+    audit_verify_key().map(|key| key.to_bytes())
+}
+
+/// Whether this installation is in SIGNED mode: a signing key or a verifying key
+/// is present in `config_dir()`.
+///
+/// A consumer that trusts a signed document has to treat an UNSIGNED one as a
+/// downgrade rather than as a document that simply happens to carry no
+/// signature; stripping the signature is otherwise the cheapest forgery there
+/// is. This is the same presence test the chain uses, and it is deliberately
+/// independent of key validity: an unreadable key must not make a signed
+/// installation look unsigned.
+pub fn audit_signing_expected() -> bool {
+    audit_signing_configured()
+}
+
 /// Result of verifying the audit chain over a log file.
 #[derive(Debug, Clone)]
 pub struct AuditVerifyReport {

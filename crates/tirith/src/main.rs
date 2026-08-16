@@ -2969,6 +2969,13 @@ Subcommands:
                       host. Dry-run by default (prints the manifest + path);
                       --apply writes it. Windows uses a registry key — guidance
                       is printed there rather than writing the registry.
+  audit               read-only integrity audit of the extensions installed in a
+                      Chromium-family profile: sorted-tree digests, declared
+                      permissions and execution surfaces, install class,
+                      provenance, and drift against a baseline receipt. Reads the
+                      extension source trees and three install-class fields from
+                      Preferences; never cookies, history, passwords, wallet
+                      storage, or Local State.
 
 Because the extension is not yet published its Chrome id is unknown; pass
 --extension-id <id> or a clearly-marked placeholder is used.
@@ -2977,7 +2984,9 @@ Examples:
   tirith browser install-extension
   tirith browser install-extension --apply
   tirith browser install-extension --extension-id abcdefghijklmnopabcdefghijklmnop --apply
-  tirith browser install-extension --json")]
+  tirith browser install-extension --json
+  tirith browser audit --browser all
+  tirith browser audit --baseline ./browser-baseline.json --format json")]
     Browser {
         #[command(subcommand)]
         action: BrowserAction,
@@ -3195,6 +3204,101 @@ Examples:
         apply: bool,
         /// Emit a JSON envelope instead of human text.
         #[arg(long)]
+        json: bool,
+    },
+
+    /// Read-only integrity audit of the installed Chromium-family extensions
+    #[command(after_help = "\
+Hashes the extension SOURCE trees a Chromium-family browser has installed and
+reports what each one declares, then compares that against a baseline receipt.
+Explicit, one-shot, read-only: it never removes, quarantines, or watches
+anything.
+
+WHAT IT READS:
+  <user-data>/<profile>/Extensions/<id>/<version>/**   every file, for the digest
+  <profile>/Preferences and Secure Preferences         THREE fields per extension
+                                                       id (location, from_webstore,
+                                                       was_installed_by_default),
+                                                       which is where the browser
+                                                       records install class
+
+WHAT IT NEVER READS:
+  cookies, history, saved passwords, Local Storage, IndexedDB, Local/Sync
+  Extension Settings, wallet databases, seed material, or Preferences as a
+  document. It also never reads <user-data>/Local State, because that file holds
+  the human profile names alongside the signed-in account email. Profile
+  identity here is the profile DIRECTORY NAME and nothing else.
+
+WHAT IT REPORTS:
+  browser and profile identity, extension id, version, install class, a
+  deterministic sorted-tree digest, manifest version, permissions and host
+  scopes, execution surfaces, provenance class, coverage, and (against a
+  baseline) new / removed / version change / version directory REUSED (a
+  declared version that moved while its directory did not, which no real browser
+  update produces) / version-directory set change / same-version BYTE change /
+  permission, host, and OPTIONAL permission and host expansion /
+  manifest-version change / execution-surface change / provenance change.
+
+  Permission RISK and integrity DRIFT are reported separately and never folded
+  together. A wallet extension legitimately holding broad permissions is not the
+  same event as one whose bytes changed without its version changing. Wallet
+  extension ids are labels, never trust anchors, and enterprise or developer
+  installs are classified, not condemned.
+
+COVERAGE:
+  Any symlink, name collision, unreadable or locked directory, hard link,
+  oversize file, or exhausted budget makes the result `partial`. A partial digest
+  is never emitted as if it were complete, and it is never compared against a
+  baseline as if it were: an extension whose tree could not be fully hashed, or
+  whose own directory could not be fully enumerated, is reported as
+  `integrity_not_comparable` rather than as tamper or as clean.
+
+BASELINE TRUST:
+  A baseline's `receipt_id` and `inventory_hash` are hashes the document computes
+  over ITSELF, so anyone who can edit the file can recompute them. They prove the
+  document is internally consistent and nothing more. When this installation has
+  an audit key, `--baseline` therefore REQUIRES an ed25519 signature that
+  verifies against it: a signature that does not verify, and a signature that was
+  stripped, are both usage errors rather than a clean comparison.
+
+EXIT CODES:
+  0 audited with no drift; 1 drift against the supplied baseline, including an
+  extension that could not be compared and any `--baseline` run whose coverage
+  was partial (a verify run that could not verify never reports no drift);
+  2 usage error, unreadable / unverifiable baseline, failed baseline write, or a
+  broken JSON write with no drift.
+
+Examples:
+  tirith browser audit
+  tirith browser audit --browser all
+  tirith browser audit --browser brave --write-baseline ./browser-baseline.json
+  tirith browser audit --baseline ./browser-baseline.json --format json")]
+    Audit {
+        /// Which browser to audit: chrome (default), chromium, brave, edge, or
+        /// all. Firefox and XPI are out of scope and are refused by name.
+        #[arg(long, default_value = "chrome")]
+        browser: String,
+
+        /// Audit exactly this profile directory instead of discovering profiles
+        /// under the browser's user-data directory. Not combinable with
+        /// `--browser all`.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+
+        /// Compare against this baseline receipt and report drift.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+
+        /// Write the current inventory as a content-addressed baseline receipt
+        /// at this path (0600), ed25519-signed when the audit chain has a key.
+        #[arg(long)]
+        write_baseline: Option<PathBuf>,
+
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
 }
@@ -9089,6 +9193,23 @@ fn run() {
                     2
                 }
             },
+            BrowserAction::Audit {
+                browser,
+                profile,
+                baseline,
+                write_baseline,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::browser_audit::run(cli::browser_audit::AuditArgs {
+                    browser,
+                    profile,
+                    baseline,
+                    write_baseline,
+                    json,
+                })
+            }
         },
 
         // `temp-run` and its hidden `sandbox-dir` alias share one impl.

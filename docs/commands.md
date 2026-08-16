@@ -52,6 +52,7 @@ everyday subset; this is the complete reference.
 | `tirith install <backend> <args>` | Recorded, risk-analyzed install across npm / pip / cargo / apt / brew / dnf / yum / pacman / scoop / docker / go / url (`--online`, `--no-exec`, `--yes`, `--sha256`) |
 | `tirith verify-self` / `update` / `version --provenance` | Verify the running binary, signature-verified self-update, and build / install provenance |
 | `tirith browser {host,install-extension}` | Install the Chrome native-messaging host that records clipboard provenance |
+| `tirith browser audit` | Read-only integrity audit of installed Chromium-family extensions: tree digests, permissions, execution surfaces, install class, provenance, and drift against a baseline receipt (`--browser`, `--profile`, `--baseline`, `--write-baseline`) |
 | `tirith devcontainer {guard,inject}` / `codespaces {setup,inject}` | Guard container operations and inject tirith into `devcontainer.json` |
 | `tirith activate <key>` / `tirith license` | Activate a commercial license key, or show and manage license status |
 

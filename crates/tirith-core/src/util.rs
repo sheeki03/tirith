@@ -7,6 +7,7 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 mod contained_fs;
+pub(crate) mod dirfd;
 
 #[doc(hidden)]
 pub use contained_fs::ContainedAtomicFile;

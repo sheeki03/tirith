@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Synthetic Managed",
+  "version": "3.1.0",
+  "description": "Synthetic fixture. Not a real extension.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://intranet.example.invalid/*"],
+  "background": { "service_worker": "sw.js" }
+}

@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Synthetic Wallet",
+  "version": "10.0.0",
+  "description": "Synthetic fixture. Not a real extension.",
+  "permissions": ["storage", "notifications", "scripting"],
+  "host_permissions": ["https://rpc.example.invalid/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    { "matches": ["https://dapp.example.invalid/*"], "js": ["inpage.js"] }
+  ],
+  "externally_connectable": { "ids": ["abcdefghijklmnopabcdefghijklmnop"] }
+}
