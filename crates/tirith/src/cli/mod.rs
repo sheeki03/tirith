@@ -914,6 +914,15 @@ pub mod lsp;
 pub mod manpage;
 pub mod mcp;
 pub mod mcp_server;
+/// `tirith pkg attest-npm` (C17): resolve the operator's own npm through the
+/// trusted-child mechanism, discover its exact version, and run ONLY the argv a
+/// closed, fixture-backed contract table authorizes for that version, binding
+/// the answer to the project's `package-lock.json` digest, its installed
+/// `node_modules` inventory, and its registry hosts. Attestation evidence only:
+/// a clean receipt means npm's signature check passed, never that the package
+/// code is benign. The spawn / rendering half of
+/// [`tirith_core::provenance::npm`].
+pub mod npm_integrity;
 pub mod onboard;
 pub mod output_guard;
 pub mod package;

@@ -32,6 +32,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The caveat every npm identity / provenance rendering must carry, stated
+/// once so the human, JSON, and receipt paths cannot drift into implying
+/// different things. Lives here, in the module that established the wording,
+/// so the CLI renderings and [`crate::provenance::npm`]'s receipt all quote the
+/// same sentence.
+pub const NPM_BYTES_NOT_BOUND_CAVEAT: &str =
+    "tirith has not downloaded, inspected, or bound the tarball bytes npm will install";
+
 /// Longest `dist.integrity` string accepted. A real SRI for one tarball is well
 /// under 200 bytes even with several algorithms; the cap keeps a hostile
 /// packument from turning a display field into a memory cost.

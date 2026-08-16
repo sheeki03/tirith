@@ -5747,6 +5747,82 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Ask the project's OWN npm to verify its installed packages' registry
+    /// signatures and provenance attestations, and bind the answer to the exact
+    /// package-lock.json, the installed node_modules inventory, and both the
+    /// lockfile's registry hosts and the ones npm itself reported. Emits a
+    /// content-addressed, signed receipt.
+    #[command(
+        name = "attest-npm",
+        after_help = "\
+What it does:
+  Resolves npm through tirith's trusted-executable mechanism (no shell, so an
+  alias cannot hijack the name), discovers npm's exact version, and only then
+  looks that version up in a CLOSED, fixture-backed contract table. The table
+  maps a supported npm version range to one exact argv, its expected JSON
+  schema, and how to read the result. An npm outside the table returns partial
+  with an unsupported-version reason and runs NO audit command: tirith never
+  hands a speculative flag to an npm whose output shape it has not
+  characterized.
+
+  The audit runs without a shell, with a 120 second timeout and 8 MiB stdout /
+  stderr caps, and its stderr is redacted before it reaches the receipt. Offline
+  mode returns partial without resolving or spawning anything. On Windows npm is
+  a batch launcher (npm.cmd) that the trusted-executable validator refuses, so
+  Windows returns partial rather than pretending.
+
+  The audit child runs in the project directory, where npm reads the project's
+  own .npmrc above the user and global config. A project .npmrc that sets a key
+  deciding what npm verifies or where it verifies it from (registry, ca, cafile,
+  strict-ssl, _keys, omit, userconfig, globalconfig) returns partial and runs NO
+  audit command: the audited project does not get to configure its own audit.
+
+What a clean receipt means:
+  npm's own registry signature check passed. It is NOT a statement that the
+  package code is benign, and tirith has not downloaded, inspected, or bound the
+  tarball bytes npm will install. npm performs its own registry network I/O,
+  outside tirith's fetch validator and capsule broker.
+
+  npm's JSON enumerates only the invalid, missing, and attested packages, so a
+  package with a plain registry signature is derived by subtraction. Tirith
+  makes that derivation only where npm's own eligibility rules say the package
+  was audited at all: it must be installed on disk and resolve from the public
+  npm registry. Everything else is reported as not-audited, which is partial.
+
+Exit codes (deliberately distinct from `tirith check`, which uses 3 for a warn
+acknowledgement; per-command codes in tirith are not shared):
+  0  clean     every eligible package carried a verified registry signature
+  1  mismatch  a signature, attestation, or attested subject digest FAILED
+  2  usage     bad --project, an unwritable --out, or a broken JSON write
+  3  partial   old npm, offline, unsupported platform, a project .npmrc that
+               reconfigures the audit, network or parse failure, missing install
+               tree, an unsupported dependency source, an installed package with
+               no lockfile entry, or a package npm's report does not cover
+
+Examples:
+  tirith pkg attest-npm --project .
+  tirith pkg attest-npm --project . --require-provenance
+  tirith pkg attest-npm --out npm-provenance.receipt.json --format json"
+    )]
+    AttestNpm {
+        /// The project directory holding package-lock.json and node_modules
+        /// (default: the repository root, else the working directory).
+        #[arg(long)]
+        project: Option<std::path::PathBuf>,
+        /// Also write the receipt to this path (atomic, mode 0600).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Require a verified provenance attestation for every eligible
+        /// package, not merely a registry signature.
+        #[arg(long)]
+        require_provenance: bool,
+        /// Output format (default: human)
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
     /// List or show the package-firewall tamper-evident receipts.
     #[command(after_help = "\
 Examples:
@@ -7571,6 +7647,24 @@ fn run() {
             let (_, json) = HumanJsonFormat::resolve(format, json);
             cli::pypi_integrity::run(&wheel, json)
         }
+        Commands::Pkg {
+            action:
+                PkgAction::AttestNpm {
+                    project,
+                    out,
+                    require_provenance,
+                    format,
+                    json,
+                },
+        } => {
+            let (_, json) = HumanJsonFormat::resolve(format, json);
+            cli::npm_integrity::run(cli::npm_integrity::AttestNpmArgs {
+                project,
+                out,
+                require_provenance,
+                json,
+            })
+        }
         Commands::Pkg { action } => {
             let pkg_action = match action {
                 PkgAction::Approve {
@@ -7666,6 +7760,10 @@ fn run() {
                 // exit code through `cli::pypi_integrity::run`), so it never reaches
                 // here.
                 PkgAction::Attest { .. } => unreachable!("pkg attest handled above"),
+                // `AttestNpm` likewise returns its own exit code through
+                // `cli::npm_integrity::run` in an earlier arm, so it never
+                // reaches here.
+                PkgAction::AttestNpm { .. } => unreachable!("pkg attest-npm handled above"),
             };
             cli::pkg::run(pkg_action)
         }

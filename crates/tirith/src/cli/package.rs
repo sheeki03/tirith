@@ -1105,10 +1105,11 @@ fn write_api_provenance_human(
     Ok(())
 }
 
-/// The caveat every npm identity/provenance rendering must carry. Stated once
-/// so the human and JSON paths cannot drift into implying different things.
+/// The caveat every npm identity/provenance rendering must carry. Aliased to
+/// the core constant so this surface, `cli::install`, and C17's npm provenance
+/// receipt cannot drift into implying different things.
 pub(crate) const NPM_BYTES_NOT_BOUND_CAVEAT: &str =
-    "tirith has not downloaded, inspected, or bound the tarball bytes npm will install";
+    tirith_core::provenance::npm_facts::NPM_BYTES_NOT_BOUND_CAVEAT;
 
 /// Render the C13 npm `dist` provenance FACTS.
 ///

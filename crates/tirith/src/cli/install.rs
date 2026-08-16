@@ -2877,10 +2877,11 @@ struct OutcomeRecord<'a> {
 /// Emit the single `{"analysis":..,"outcome":..}` JSON envelope (PR #121
 /// fix-list item 3). Returns `false` on a write failure. `outcome` is `None`
 /// when the install never ran (the field is still present as `null` for a
-/// The caveat every npm identity/provenance rendering carries, stated once so
-/// the human and JSON paths cannot drift into implying different things.
+/// The caveat every npm identity/provenance rendering carries, aliased to the
+/// core constant so this surface, `cli::package`, and C17's npm provenance
+/// receipt cannot drift into implying different things.
 const NPM_BYTES_NOT_BOUND_CAVEAT: &str =
-    "tirith has not downloaded, inspected, or bound the tarball bytes npm will install";
+    tirith_core::provenance::npm_facts::NPM_BYTES_NOT_BOUND_CAVEAT;
 
 /// The C13 npm `dist` facts for one planned package, when the online resolver
 /// attached registry provenance. `None` offline, for a non-npm ecosystem, or
