@@ -253,9 +253,12 @@ fn push_signer_risk(findings: &mut Vec<Finding>, facts: &Web3CommandFactsV2) {
                 "Signer exposure risk".to_string()
             },
             description: if kind.is_raw_secret() {
-                "A private key, keypair, or mnemonic appears literally in this command. It is \
-                 readable from the process table, the shell history, and any log that captured \
-                 the command. Treat the key as compromised."
+                // Prose discipline: an alias word followed by a plain-space word
+                // ("mnemonic appears") trips the mandatory value redactor and
+                // mangles the sentence, so the parenthesized form is deliberate.
+                "Raw signer material appears literally in this command (a private key, \
+                 keypair, or mnemonic). It is readable from the process table, the shell \
+                 history, and any log that captured the command. Treat the key as compromised."
                     .to_string()
             } else {
                 "This command signs using an unlocked node or an interactive prompt rather than a \
@@ -416,6 +419,30 @@ mod tests {
 
     fn has(findings: &[Finding], rule: RuleId) -> bool {
         findings.iter().any(|finding| finding.rule_id == rule)
+    }
+
+    #[test]
+    fn authored_finding_prose_survives_mandatory_redaction() {
+        // "…or mnemonic appears literally…" taught the value redactor to eat
+        // the word after the alias; the parenthesized wording must not
+        // regress, or the CLI shows `[REDACTED:web3_secret]` mid-sentence.
+        let guard = Web3GuardPolicy::default();
+        let findings = findings_for(
+            "cast send 0xabc --private-key 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &guard,
+        );
+        for finding in &findings {
+            let mut clone = finding.clone();
+            crate::redact::redact_finding(&mut clone, &[]);
+            assert_eq!(
+                clone.description, finding.description,
+                "description mangled by mandatory redaction"
+            );
+            assert_eq!(
+                clone.title, finding.title,
+                "title mangled by mandatory redaction"
+            );
+        }
     }
 
     #[test]

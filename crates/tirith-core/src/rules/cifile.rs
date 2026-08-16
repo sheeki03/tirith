@@ -1405,7 +1405,10 @@ fn check_workflow_excessive_permissions(
     findings.push(Finding {
         rule_id: RuleId::WorkflowExcessivePermissions,
         severity: Severity::Medium,
-        title: "Workflow grants an excessive GITHUB_TOKEN for a risky trigger".to_string(),
+        // Backticked like every other prose mention of the variable: a bare
+        // `GITHUB_TOKEN for` trips the mandatory value redactor and mangles
+        // the rendered title.
+        title: "Workflow grants an excessive `GITHUB_TOKEN` for a risky trigger".to_string(),
         description: format!(
             "This workflow is triggered by an event an untrusted actor can influence (a fork \
              `pull_request_target`, a `workflow_run`, or an issue/comment event) and {reason}. A \
@@ -3364,6 +3367,32 @@ mod tests {
             ".github/workflows/ci.yml",
             RuleId::WorkflowExcessivePermissions
         ));
+    }
+
+    #[test]
+    fn workflow_excessive_permissions_title_survives_mandatory_redaction() {
+        // The bare `GITHUB_TOKEN for` shape taught the mandatory value
+        // redactor to eat the word after the alias mid-title; the backticked
+        // form must not regress.
+        let wf = "on:\n  issue_comment:\n    types: [created]\npermissions: write-all\n\
+                  jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        let findings = run(wf, ".github/workflows/ci.yml");
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::WorkflowExcessivePermissions)
+            .expect("rule must fire");
+        let mut redacted = finding.clone();
+        crate::redact::redact_finding(&mut redacted, &[]);
+        assert_eq!(
+            redacted.title, finding.title,
+            "title mangled: {:?}",
+            redacted.title
+        );
+        assert_eq!(
+            redacted.description, finding.description,
+            "description mangled: {:?}",
+            redacted.description
+        );
     }
 
     #[test]
