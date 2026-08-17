@@ -1,0 +1,1 @@
+PR #201 npm regression harness cannot stage a fake npm under a temporary target path because trusted-child validation rejects it; fix tests through a test-only NpmInvoker/resolved-executable seam and bind the exact Node shebang interpreter, without weakening production trust or overriding HOME globally.

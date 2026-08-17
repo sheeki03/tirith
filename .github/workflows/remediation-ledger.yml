@@ -1,0 +1,37 @@
+name: Security remediation ledger
+
+on:
+  pull_request:
+    paths:
+      - "main.md"
+      - "docs/security/remediation/**"
+      - ".github/workflows/remediation-ledger.yml"
+  push:
+    branches: [main]
+    paths:
+      - "main.md"
+      - "docs/security/remediation/**"
+      - ".github/workflows/remediation-ledger.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remediation-ledger-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  structural:
+    name: Immutable source and ledger structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable sources, mappings, ownership, and lifecycle
+        run: python3 docs/security/remediation/validate_ledger.py --structural
+      - name: Verify generated human tracker
+        run: python3 docs/security/remediation/render_main.py --check
+      - name: Reject generated drift
+        run: git diff --exit-code -- main.md docs/security/remediation

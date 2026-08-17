@@ -1,0 +1,241 @@
+{
+  "$id": "https://tirith.dev/schemas/security-remediation-source-index-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "expected_counts": {
+      "additionalProperties": false,
+      "properties": {
+        "by_report": {
+          "const": {
+            "additional": 41,
+            "addendum": 1,
+            "original": 67,
+            "stack": 26
+          }
+        },
+        "total": {
+          "const": 135
+        }
+      },
+      "required": [
+        "by_report",
+        "total"
+      ],
+      "type": "object"
+    },
+    "normalization": {
+      "const": "UTF-8; CRLF and CR converted to LF; exactly one terminal LF"
+    },
+    "report_order": {
+      "const": [
+        "stack",
+        "addendum",
+        "additional",
+        "original"
+      ]
+    },
+    "reports": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "byte_count": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "expected_rows": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "line_count": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "normalized_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "origin_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "path": {
+            "pattern": "^sources/[a-z0-9-]+\\.md$",
+            "type": "string"
+          },
+          "report_id": {
+            "enum": [
+              "stack",
+              "addendum",
+              "additional",
+              "original"
+            ]
+          },
+          "vulnerable_commit": {
+            "pattern": "^[0-9a-f]{40}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "byte_count",
+          "expected_rows",
+          "line_count",
+          "normalized_sha256",
+          "origin_sha256",
+          "path",
+          "report_id",
+          "vulnerable_commit"
+        ],
+        "type": "object"
+      },
+      "maxItems": 4,
+      "minItems": 4,
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "sources": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "block_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "evidence": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "commit": {
+                  "pattern": "^[0-9a-f]{40}$",
+                  "type": "string"
+                },
+                "line_end": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "line_start": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "path": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "commit",
+                "line_end",
+                "line_start",
+                "path"
+              ],
+              "type": "object"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "ledger_ordinal": {
+            "maximum": 135,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "normalized_severity": {
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low",
+              null
+            ]
+          },
+          "report_id": {
+            "enum": [
+              "stack",
+              "addendum",
+              "additional",
+              "original"
+            ]
+          },
+          "report_ordinal": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "reported_severity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "section": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source_id": {
+            "pattern": "^(STACK|ADDENDUM|ADDITIONAL|ORIGINAL)-[0-9]{3}$",
+            "type": "string"
+          },
+          "source_locator": {
+            "additionalProperties": false,
+            "properties": {
+              "line_end": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "line_start": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "path": {
+                "pattern": "^sources/[a-z0-9-]+\\.md$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "line_end",
+              "line_start",
+              "path"
+            ],
+            "type": "object"
+          },
+          "title": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "vulnerable_commit": {
+            "pattern": "^[0-9a-f]{40}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "block_sha256",
+          "evidence",
+          "ledger_ordinal",
+          "normalized_severity",
+          "report_id",
+          "report_ordinal",
+          "reported_severity",
+          "section",
+          "source_id",
+          "source_locator",
+          "title",
+          "vulnerable_commit"
+        ],
+        "type": "object"
+      },
+      "maxItems": 135,
+      "minItems": 135,
+      "type": "array"
+    }
+  },
+  "required": [
+    "expected_counts",
+    "normalization",
+    "report_order",
+    "reports",
+    "schema_version",
+    "sources"
+  ],
+  "title": "Tirith security remediation source index",
+  "type": "object"
+}
