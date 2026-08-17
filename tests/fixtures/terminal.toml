@@ -481,6 +481,28 @@ context = "paste"
 expected_action = "allow"
 expected_rules = []
 
+# Regression for #196: the reverse of `confusable_text_benign_cjk_ascii_word` —
+# U+3002 closes a Japanese sentence and the next one opens with an ASCII word,
+# so U+3002 must terminate the word forwards too, not splice "Rust" onto it.
+[[fixture]]
+name = "confusable_text_benign_cjk_ascii_word_forward"
+min_milestone = 4
+input = "\u4F7F\u3046\u3002Rust"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+
+# Guard for #196: U+3002 standing in for the "." of a hostname is a real
+# homoglyph, and making it a word boundary must not suppress it — the backward
+# pass still collects the ASCII "github" it was spliced into.
+[[fixture]]
+name = "confusable_text_ideographic_period_in_host"
+min_milestone = 4
+input = "curl github\u3002com"
+context = "paste"
+expected_action = "block"
+expected_rules = ["confusable_text"]
+
 # Regression for #126: fullwidth Latin (U+FF21 A / U+FF30 P / U+FF29 I) inside
 # Japanese text ("Rust no API wo yobu"). The fullwidth letters are confusables,
 # but bounded by Hiragana they form their own non-ASCII word with no ASCII letter.

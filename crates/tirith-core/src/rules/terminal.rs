@@ -683,13 +683,18 @@ fn is_ascii_nearby(input: &[u8], offset: usize) -> bool {
 ///   confusable is isolated from `Rust`). Fixes #126.
 /// - `…/filename_Отсканированный_документ.pdf` → false (path/`_` separators
 ///   isolate the pure-Cyrillic segments). Fixes #134.
+/// - `あ。abc` → false (`。` is punctuation, so it ends the word instead of
+///   joining the following ASCII sentence to it). Fixes #196.
+/// - `curl github。com` → still true (`。` is a boundary, but the backward pass
+///   has already collected the ASCII `github` it was spliced into).
 ///
 /// Boundaries are script-aware: any non-alphanumeric ASCII byte (whitespace,
-/// punctuation, and identifier/path separators like `/ _ . -`), plus any
-/// character whose Unicode script is outside the confusable-bearing set
-/// {Latin, Cyrillic, Greek, Common, Inherited} — so Han/Hiragana/Katakana/
-/// Hangul/Thai/Arabic/… terminate a word. The word is suspicious only if, after
-/// trimming at those boundaries, it still contains an ASCII letter.
+/// punctuation, and identifier/path separators like `/ _ . -`), any non-ASCII
+/// punctuation, and any character whose Unicode script is outside the
+/// confusable-bearing set {Latin, Cyrillic, Greek, Common} — so Han/Hiragana/
+/// Katakana/Hangul/Thai/Arabic/… terminate a word, while combining marks stay
+/// word-internal. The word is suspicious only if, after trimming at those
+/// boundaries, it still contains an ASCII letter.
 fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
     use unicode_script::{Script, UnicodeScript};
 
@@ -699,10 +704,18 @@ fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
         if ch.is_ascii() {
             return ch.is_ascii_alphanumeric();
         }
-        matches!(
-            ch.script(),
-            Script::Latin | Script::Cyrillic | Script::Greek | Script::Common | Script::Inherited
-        )
+        // Combining marks attach to the preceding letter, so they never split it.
+        if ch.script() == Script::Inherited {
+            return true;
+        }
+        // Non-ASCII punctuation never sits inside a word even when its script is
+        // Common — U+3002 IDEOGRAPHIC FULL STOP would otherwise let the forward
+        // pass walk into the next sentence's ASCII word. Fixes #196.
+        ch.is_alphanumeric()
+            && matches!(
+                ch.script(),
+                Script::Latin | Script::Cyrillic | Script::Greek | Script::Common
+            )
     }
 
     let Ok(text) = std::str::from_utf8(input) else {
