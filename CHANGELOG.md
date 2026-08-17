@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **#196:** `confusable_text` no longer fires on ordinary Japanese prose where U+3002 (ideographic full stop) is immediately followed by an ASCII word (`。oEmbed`). The #126 fix only covered the trailing form (`Rustを使う。`); the word expansion still walked *forwards* through U+3002 because its Unicode script is `Common`. Non-ASCII punctuation is now a word boundary in both directions, so a `tirith scan --ci` gate no longer fails on Japanese docs. Genuine homoglyphs are unaffected: `curl gіthub.com` (Cyrillic `і`) and `curl github。com` (U+3002 standing in for the hostname dot) still block.
 - **Private checkpoint storage:** checkpoint operations no longer fall back to the shared legacy `/tmp/tirith/checkpoints` path; they require a user-owned private state directory and validate its identity and permissions. `checkpoints_dir()` keeps its public `PathBuf` return type for source compatibility, while new code can use `try_checkpoints_dir()` for an explicit unavailable state. Existing legacy files are not migrated automatically: inspect and remove `/tmp/tirith/checkpoints` manually if an older release created it.
 
 ## [0.3.3] - 2026-06-19
