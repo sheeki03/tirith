@@ -284,13 +284,25 @@ impl PreparedCapsuleReceipt {
         let requested = requested_path
             .map(|path| {
                 let reported_path = path.to_path_buf();
-                let path = absolute_path(path).map_err(CapsuleReceiptError::Io)?;
-                let anchor = filesystem_anchor(&path).ok_or_else(|| {
-                    CapsuleReceiptError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "receipt path has no filesystem root",
-                    ))
-                })?;
+                let path = crate::capsule_project::trusted_platform_root_alias(
+                    &absolute_path(path).map_err(CapsuleReceiptError::Io)?,
+                );
+                let project_root = project_root
+                    .map(absolute_path)
+                    .transpose()
+                    .map_err(CapsuleReceiptError::Io)?
+                    .map(|root| crate::capsule_project::trusted_platform_root_alias(&root));
+                let anchor = project_root
+                    .as_ref()
+                    .filter(|root| path.strip_prefix(root).is_ok())
+                    .cloned()
+                    .or_else(|| filesystem_anchor(&path))
+                    .ok_or_else(|| {
+                        CapsuleReceiptError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "receipt path has no filesystem root",
+                        ))
+                    })?;
                 let destination = crate::util::ContainedAtomicFile::prepare(&anchor, &path, true)
                     .map_err(CapsuleReceiptError::Io)?;
                 match destination.read_capped(0) {
@@ -307,6 +319,7 @@ impl PreparedCapsuleReceipt {
                     }
                 }
                 let project_exclusion = project_root
+                    .as_deref()
                     .and_then(|root| path.strip_prefix(root).ok())
                     .filter(|relative| {
                         !relative.as_os_str().is_empty()
@@ -893,6 +906,53 @@ mod tests {
             b"receipt-two"
         );
         assert!(!requested.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retained_receipt_accepts_the_approved_macos_var_alias() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let canonical_base = std::fs::canonicalize(base.path()).expect("canonical tempdir");
+        let suffix = canonical_base
+            .strip_prefix("/private/var")
+            .expect("macOS tempdir lives beneath /private/var");
+        let aliased_base = Path::new("/var").join(suffix);
+        let project = canonical_base.join("project");
+        std::fs::create_dir(&project).expect("project");
+        let aliased_project = aliased_base.join("project");
+        let requested = aliased_project.join("receipts/run.json");
+
+        let prepared = PreparedCapsuleReceipt::prepare(Some(&requested), Some(&aliased_project))
+            .expect("the fixed system alias is accepted");
+
+        assert_eq!(
+            prepared.project_exclusion(),
+            Some(Path::new("receipts/run.json"))
+        );
+        assert!(project.join("receipts").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_receipt_rejects_a_symlink_below_the_project_root() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let project = base.path().join("project");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&project).expect("project");
+        std::fs::create_dir(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, project.join("receipts")).expect("symlink");
+        let requested = project.join("receipts/run.json");
+
+        let error = match PreparedCapsuleReceipt::prepare(Some(&requested), Some(&project)) {
+            Err(error) => error,
+            Ok(_) => panic!("a symlink below the trusted project root must be refused"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("symlinked contained directory component receipts"),
+            "{error}"
+        );
     }
 
     #[test]

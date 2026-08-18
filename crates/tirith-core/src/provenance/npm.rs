@@ -3123,7 +3123,14 @@ mod tests {
         };
         let mut inventory = installed(&["node_modules/a"]);
         inventory.capped = true;
-        let assessment = reconcile(&lockfile, &inventory, Some(&NpmAuditReport::default()));
+        // Isolate the inventory-level gap: the package itself has explicit
+        // positive audit membership, so omission/NotAudited is not a separate
+        // and correctly higher-priority reason for Partial.
+        let report = NpmAuditReport {
+            verified: vec![audit_entry("a", "node_modules/a", "1.0.0", None)],
+            ..NpmAuditReport::default()
+        };
+        let assessment = reconcile(&lockfile, &inventory, Some(&report));
         assert!(assessment.coverage_gap().is_some());
         let outcome = apply_coverage_gap(
             overall_outcome(&assessment.statuses(), false),

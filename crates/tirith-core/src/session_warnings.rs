@@ -3336,7 +3336,12 @@ mod tests {
             // so this exercises the production rule while remaining deterministic
             // when a contended full-suite run makes 260 fsync-backed mutations take
             // longer than the 20-second mass-deletion window.
-            let base = chrono::Utc::now() + chrono::Duration::minutes(5);
+            // Keep the synthetic events well ahead of even a heavily contended
+            // full-suite run. This fixture performs hundreds of durable writes
+            // and can take several minutes under load; a five-minute margin made
+            // later events age out for wall-clock reasons unrelated to the
+            // de-duplication invariant under test.
+            let base = chrono::Utc::now() + chrono::Duration::days(1);
             let stamp =
                 |ms_before: i64| (base - chrono::Duration::milliseconds(ms_before)).to_rfc3339();
 

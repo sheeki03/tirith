@@ -1448,8 +1448,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn production_presence_markers_do_not_leak_or_claim_same_and_changed_values_unchanged() {
-        let _global = tirith_test_support::GlobalStateGuard::new()
+        let mut global = tirith_test_support::GlobalStateGuard::new()
             .expect("isolate process-global environment-guard state");
+        // The shared guard deliberately installs a KUBECONFIG fixture, which is
+        // itself a production-sensitive environment variable. This test is
+        // scoped to the policy extension below, so remove that unrelated fixture
+        // while retaining the guard's serialization and panic-safe restoration.
+        global.remove_env("KUBECONFIG");
         let mut restore = TestProcessEnv::new();
         let name = "TIRITH_C04_POLICY_SECRET";
         let first = "wallet-secret-first-value";

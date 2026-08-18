@@ -85,12 +85,13 @@ pub(crate) fn with_fake_env<F, R>(set_cwd: bool, f: F) -> R
 where
     F: panic::UnwindSafe + FnOnce(&Path, Option<&Path>) -> R,
 {
+    let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // GlobalStateGuard always installs a fresh cwd. Preserve the compatibility
     // contract for `set_cwd == false` by temporarily returning to the caller's
-    // cwd inside the shared guard's lifetime; CwdGuard restores the isolated
-    // cwd before GlobalStateGuard restores the original process state.
-    let original_cwd = (!set_cwd).then(|| std::env::current_dir().expect("current_dir"));
-    let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // cwd inside the shared guard's lifetime. Crucially, sample that cwd from
+    // the guard after acquiring the shared lock: reading it before acquisition
+    // can capture another test's soon-to-be-deleted isolated cwd.
+    let original_cwd = (!set_cwd).then(|| lock.previous_cwd().to_path_buf());
     let _cwd_guard = original_cwd.as_deref().map(CwdGuard::set);
 
     let home_path = lock.roots().home.clone();

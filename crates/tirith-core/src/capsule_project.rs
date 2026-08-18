@@ -411,15 +411,21 @@ fn trusted_project_root(source: &Path) -> Result<PathBuf, ProjectCopyError> {
             .map_err(|error| ProjectCopyError::Io(format!("resolve current directory: {error}")))?
             .join(source)
     };
+    Ok(trusted_platform_root_alias(&absolute))
+}
+
+/// Resolve only the platform-owned root alias Tirith explicitly trusts before
+/// beginning descriptor-relative, no-follow traversal at that trusted root.
+pub(crate) fn trusted_platform_root_alias(absolute: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         let var = Path::new("/var");
         if absolute == var || absolute.starts_with(var) {
             let suffix = absolute.strip_prefix(var).unwrap_or(Path::new(""));
-            return Ok(Path::new("/private/var").join(suffix));
+            return Path::new("/private/var").join(suffix);
         }
     }
-    Ok(absolute)
+    absolute.to_path_buf()
 }
 
 /// The fd-relative copy. Every traversal step is `openat`/`fstatat`/`mkdirat`

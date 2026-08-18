@@ -578,12 +578,16 @@ mod tests {
         };
         use std::time::Duration;
 
+        // Acquire process-global environment ownership before starting either
+        // deadline-bound listener. Under a parallel full-suite run, waiting for
+        // this lock after binding could let the fixture's accept deadline expire
+        // and turn the intended direct connection into a spurious refusal.
+        let mut restore = EnvironmentRestore::new();
         let fixture = ScriptedHttpServer::start(vec![
             http_response("200 OK", &[], b"server-direct"),
             http_response("200 OK", &[], b"fetch-direct"),
         ]);
         let proxy = ProxyTrap::start();
-        let mut restore = EnvironmentRestore::new();
         restore.install_ambient_proxy(&proxy.url());
 
         let address = fixture.address();

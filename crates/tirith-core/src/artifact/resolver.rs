@@ -4350,9 +4350,13 @@ certifi==2024.2.2 \\
     #[test]
     fn resolver_tool_enrollment_pin_binds_canonical_path_and_digest() {
         let mut environment = GlobalStateGuard::new().expect("isolate resolver enrollment");
+        let host_home = environment
+            .previous_env("HOME")
+            .expect("resolver enrollment test requires the pre-guard HOME")
+            .to_os_string();
         let root = tempfile::Builder::new()
             .prefix("tirith-resolver-enrollment-")
-            .tempdir_in(home::home_dir().expect("test home"))
+            .tempdir_in(PathBuf::from(host_home))
             .unwrap();
         environment.set_env("XDG_CONFIG_HOME", root.path());
 
@@ -4444,9 +4448,14 @@ certifi==2024.2.2 \\
     #[cfg(target_vendor = "apple")]
     #[test]
     fn resolver_trust_directory_rejects_mutating_macos_acl() {
+        let environment = GlobalStateGuard::new().expect("isolate resolver ACL environment");
+        let host_home = environment
+            .previous_env("HOME")
+            .expect("resolver ACL test requires the pre-guard HOME")
+            .to_os_string();
         let directory = tempfile::Builder::new()
             .prefix("tirith-resolver-acl-")
-            .tempdir_in(home::home_dir().expect("test home"))
+            .tempdir_in(PathBuf::from(host_home))
             .unwrap();
         let status = std::process::Command::new("/bin/chmod")
             .args(["+a", "everyone allow write"])
@@ -4509,9 +4518,13 @@ certifi==2024.2.2 \\
         fn new() -> Self {
             let mut environment =
                 GlobalStateGuard::new().expect("isolate resolver public API environment");
+            let host_home = environment
+                .previous_env("HOME")
+                .expect("resolver public API test requires the pre-guard HOME")
+                .to_os_string();
             let root = tempfile::Builder::new()
                 .prefix("tirith-resolver-public-api-")
-                .tempdir_in(home::home_dir().expect("test home"))
+                .tempdir_in(PathBuf::from(host_home))
                 .unwrap();
             environment.set_env("XDG_CONFIG_HOME", root.path().join("config"));
             Self {

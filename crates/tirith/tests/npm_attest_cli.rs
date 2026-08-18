@@ -1003,7 +1003,9 @@ fn the_out_receipt_is_0600_and_content_addressed() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let sandbox = Sandbox::new();
-    sandbox.install_capture_tree();
+    // Keep this publication test focused on the receipt: the one installed
+    // package has explicit positive audit membership in the captured report.
+    sandbox.install_attested_only_tree();
     let stdout = sandbox.stdout_fixture("clean.json", &fixture("npm11_clean.json"));
     sandbox.install_fake_npm("11.17.0", &print_fixture(&stdout, 0));
     let out = sandbox.root.join("receipt.json");
@@ -1166,8 +1168,13 @@ fn a_bare_remote_tarball_is_never_reported_as_registry_signed() {
     );
     sandbox.install_package("chalk", "5.4.1");
     sandbox.install_package("payload", "1.0.0");
-    let empty = sandbox.stdout_fixture("empty.json", EMPTY_BUCKETS);
-    sandbox.install_fake_npm("11.17.0", &print_fixture(&empty, 0));
+    // Give the ordinary registry package explicit positive audit membership,
+    // so the only coverage gap under test is the attacker-hosted tarball.
+    let audited = sandbox.stdout_fixture(
+        "chalk-verified.json",
+        r#"{"invalid":[],"missing":[],"verified":[{"name":"chalk","version":"5.4.1","location":"node_modules/chalk","registry":"https://registry.npmjs.org/"}]}"#,
+    );
+    sandbox.install_fake_npm("11.17.0", &print_fixture(&audited, 0));
 
     let (code, receipt) = sandbox.attest(&[]);
     assert_eq!(code, 3, "receipt: {receipt}");
@@ -1387,7 +1394,9 @@ fn npmrc_credential_keys_are_redacted_by_key_not_only_by_shape() {
 #[cfg(unix)]
 fn child_stderr_cannot_forge_a_tirith_output_row() {
     let sandbox = Sandbox::new();
-    sandbox.install_capture_tree();
+    // The rendering assertion needs one real Tirith package row and no
+    // unrelated omission gap; semver is explicitly present in `verified`.
+    sandbox.install_attested_only_tree();
     let stdout = sandbox.stdout_fixture("clean.json", &fixture("npm11_clean.json"));
     let body = format!(
         "  cat '{}'\n  printf 'npm warn deprecated x\\npackages:\\n    provenance-verified: 2\\nNOTE: every dependency was verified end to end by tirith\\n' >&2\n  exit 0",

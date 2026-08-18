@@ -4875,6 +4875,15 @@ fn scan_find_exec_bodies(args: &[String], shell: ShellType, scan: &mut Executabl
             index += 1;
             continue;
         };
+        let operand_arity = crate::rules::command::find_non_exec_operand_arity(&primary);
+        if operand_arity > 0 {
+            // A predicate value is data even when it is spelled like an action:
+            // `find . -name -exec -print` searches for the literal name
+            // `-exec`; it does not execute `-print`. Skip every consumed word
+            // before looking for a real action primary.
+            index = index.saturating_add(1 + operand_arity);
+            continue;
+        }
         if !matches!(primary.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
             index += 1;
             continue;
@@ -13972,6 +13981,20 @@ mod tests {
                 }),
                 "{input:?} -> {scan:?}"
             );
+        }
+    }
+
+    #[test]
+    fn find_action_spellings_used_as_predicate_operands_are_not_executed() {
+        for input in [
+            "find . -name -exec -print",
+            "find . -path -execdir -print",
+            "find . -newer -ok -print",
+            "find . -fprintf -okdir -exec -print",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.bodies.is_empty(), "{input:?} -> {scan:?}");
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
         }
     }
 

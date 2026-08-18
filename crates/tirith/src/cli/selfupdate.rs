@@ -1768,6 +1768,72 @@ fn describe_status(status: &VerificationStatus) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn write_test_targz(path: &Path, members: &[(&str, &[u8])]) {
+        fn write_octal(field: &mut [u8], value: usize) {
+            field.fill(b'0');
+            let encoded = format!("{value:o}");
+            assert!(encoded.len() < field.len(), "tar field overflow");
+            let start = field.len() - encoded.len() - 1;
+            field[start..start + encoded.len()].copy_from_slice(encoded.as_bytes());
+            field[field.len() - 1] = 0;
+        }
+
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = u32::MAX;
+            for &byte in bytes {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            !crc
+        }
+
+        let mut tar = Vec::new();
+        for &(name, contents) in members {
+            let name = name.as_bytes();
+            assert!(name.len() <= 100, "test tar member name is too long");
+            let mut header = [0u8; 512];
+            header[..name.len()].copy_from_slice(name);
+            write_octal(&mut header[100..108], 0o755);
+            write_octal(&mut header[108..116], 0);
+            write_octal(&mut header[116..124], 0);
+            write_octal(&mut header[124..136], contents.len());
+            write_octal(&mut header[136..148], 0);
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum: usize = header.iter().map(|byte| usize::from(*byte)).sum();
+            let encoded = format!("{checksum:06o}\0 ");
+            header[148..156].copy_from_slice(encoded.as_bytes());
+            tar.extend_from_slice(&header);
+            tar.extend_from_slice(contents);
+            tar.resize(tar.len().next_multiple_of(512), 0);
+        }
+        tar.resize(tar.len() + 1024, 0);
+
+        // A gzip stream containing DEFLATE stored blocks. Keeping this tiny
+        // fixture encoder in-process avoids depending on GNU or BSD tar syntax
+        // merely to build bytes that production then extracts with the host tar.
+        let mut gzip = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+        let mut remaining = tar.as_slice();
+        while !remaining.is_empty() {
+            let take = remaining.len().min(u16::MAX as usize);
+            let final_block = take == remaining.len();
+            gzip.push(u8::from(final_block));
+            let length = take as u16;
+            gzip.extend_from_slice(&length.to_le_bytes());
+            gzip.extend_from_slice(&(!length).to_le_bytes());
+            gzip.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+        }
+        gzip.extend_from_slice(&crc32(&tar).to_le_bytes());
+        gzip.extend_from_slice(&(tar.len() as u32).to_le_bytes());
+        std::fs::write(path, gzip).expect("write hermetic tar.gz fixture");
+    }
+
     #[test]
     fn selfupdate_rejects_unsafe_initial_destinations() {
         for url in [
@@ -2204,23 +2270,13 @@ mod tests {
     #[test]
     fn extract_tirith_binary_finds_member_in_targz() {
         let dir = tempfile::tempdir().unwrap();
-        // tar.gz with a `tirith` file plus a decoy.
-        let stage = dir.path().join("stage");
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::write(stage.join("tirith"), b"BINARY-CONTENT").unwrap();
-        std::fs::write(stage.join("README"), b"decoy").unwrap();
+        // tar.gz with a `tirith` file plus a decoy, built without relying on
+        // host-specific tar fixture-creation flags.
         let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
-        let ok = std::process::Command::new("tar")
-            .arg("czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&stage)
-            .arg("tirith")
-            .arg("README")
-            .status()
-            .expect("tar should run")
-            .success();
-        assert!(ok, "tar czf should succeed");
+        write_test_targz(
+            &archive,
+            &[("tirith", b"BINARY-CONTENT"), ("README", b"decoy")],
+        );
 
         let extracted =
             extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", dir.path()).unwrap();
@@ -2305,35 +2361,20 @@ mod tests {
     #[test]
     fn extract_tirith_binary_dotdot_member_writes_nothing_outside() {
         let dir = tempfile::tempdir().unwrap();
-        let stage = dir.path().join("stage");
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::write(stage.join("tirith"), b"PAYLOAD").unwrap();
         // Archive the member under a `../escaped-tirith` name.
         let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
-        let ok = std::process::Command::new("tar")
-            .arg("czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&stage)
-            .arg("--transform")
-            .arg("s,^tirith,../escaped-tirith,")
-            .arg("tirith")
-            .status();
-        // GNU tar has --transform; bsdtar may not, so tolerate failure.
-        let renamed = ok.map(|s| s.success()).unwrap_or(false);
+        write_test_targz(&archive, &[("../escaped-tirith", b"PAYLOAD")]);
 
         let workdir = dir.path().join("work");
         std::fs::create_dir_all(&workdir).unwrap();
         let leak = workdir.join("escaped-tirith");
         let _ = extract_tirith_binary(&archive, "x86_64-unknown-linux-gnu", &workdir);
 
-        if renamed {
-            // The `../`-prefixed member must not have escaped into `work/`.
-            assert!(
-                !leak.exists(),
-                "a `../`-prefixed archive member must not be written outside the extract dir"
-            );
-        }
+        // The `../`-prefixed member must not have escaped into `work/`.
+        assert!(
+            !leak.exists(),
+            "a `../`-prefixed archive member must not be written outside the extract dir"
+        );
     }
 
     /// F21 / F1: the containment check rejects ESCAPES, not in-bounds files — a

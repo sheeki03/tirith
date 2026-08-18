@@ -24,6 +24,12 @@ const CHILD_PASSTHROUGH_ENV: &[&str] = &[
     "PATHEXT",
 ];
 
+/// Temp-directory selectors are installed on env-cleared child commands, but
+/// not process-globally. `tempfile` consults these variables in otherwise
+/// unrelated tests; repointing them at this guard's owned root lets those tests
+/// create files that disappear when the guard drops.
+const CHILD_ONLY_ISOLATED_ENV: &[&str] = &["TMPDIR", "TMP", "TEMP"];
+
 /// Every fresh filesystem location installed by [`GlobalStateGuard`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolatedRoots {
@@ -150,13 +156,17 @@ impl GlobalStateGuard {
         let assignments = roots.assignments();
         let previous_env: Vec<(&'static str, Option<OsString>)> = assignments
             .iter()
+            .filter(|(key, _)| !CHILD_ONLY_ISOLATED_ENV.contains(key))
             .map(|(key, _)| (*key, std::env::var_os(key)))
             .collect();
 
         // SAFETY: the guard owns GLOBAL_STATE_LOCK from the first mutation until
         // Drop has restored every key and the original cwd.
         unsafe {
-            for (key, value) in &assignments {
+            for (key, value) in assignments
+                .iter()
+                .filter(|(key, _)| !CHILD_ONLY_ISOLATED_ENV.contains(key))
+            {
                 std::env::set_var(key, value);
             }
         }
@@ -196,6 +206,25 @@ impl GlobalStateGuard {
     /// All isolated roots for fixtures and assertions.
     pub fn roots(&self) -> &IsolatedRoots {
         &self.roots
+    }
+
+    /// Process cwd observed after acquiring the global-state lock and before
+    /// installing the isolated cwd. Compatibility harnesses that deliberately
+    /// need the caller cwd must use this value rather than sampling cwd before
+    /// lock acquisition, when another test may still own a temporary cwd.
+    pub fn previous_cwd(&self) -> &Path {
+        &self.previous_cwd
+    }
+
+    /// Value of one standard isolated variable before this guard installed its
+    /// replacement. Test fixtures that must exercise a trust boundary outside
+    /// the isolated temporary roots can use this snapshot without racing a
+    /// different guard's process-global mutation.
+    pub fn previous_env(&self, key: &str) -> Option<&OsStr> {
+        self.previous_env
+            .iter()
+            .find(|(present, _)| *present == key)
+            .and_then(|(_, value)| value.as_deref())
     }
 
     /// Set an additional process variable for the guard's lifetime. The exact
@@ -352,6 +381,7 @@ mod tests {
         }
         {
             let mut guard = GlobalStateGuard::new().expect("create guard");
+            assert_eq!(guard.previous_env("HOME"), Some(sentinel.as_os_str()));
             guard.set_env(CHILD_CUSTOM, "temporary");
             guard.remove_env("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
             assert_ne!(std::env::var_os("HOME"), Some(sentinel.clone()));
@@ -447,6 +477,28 @@ mod tests {
             .clone();
         assert_ne!(first, second);
         assert!(!first.exists());
+    }
+
+    #[test]
+    fn parent_temp_selectors_are_stable_while_children_receive_isolated_ones() {
+        let _serial = test_lock();
+        let before = ["TMPDIR", "TMP", "TEMP"].map(std::env::var_os);
+        let guard = GlobalStateGuard::new().expect("create guard");
+
+        assert_eq!(
+            ["TMPDIR", "TMP", "TEMP"].map(std::env::var_os),
+            before,
+            "a guard must not redirect unrelated parent-process tempfile users"
+        );
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            let child_value = guard
+                .child_env
+                .iter()
+                .find(|(present, _)| present == OsStr::new(key))
+                .map(|(_, value)| value)
+                .expect("child receives isolated temp selector");
+            assert_eq!(child_value, guard.roots().temp.as_os_str());
+        }
     }
 
     #[test]

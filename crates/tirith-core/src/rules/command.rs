@@ -5944,6 +5944,22 @@ fn find_promotion_newer_predicate(token: &str) -> bool {
     })
 }
 
+/// Number of following words consumed by a non-exec `find` primary or global
+/// option. The executable-body scanner uses this to distinguish an action from
+/// a literal predicate operand named `-exec`/`-execdir`/`-ok`/`-okdir`.
+pub(crate) fn find_non_exec_operand_arity(token: &str) -> usize {
+    match token {
+        // Global options/root forms.
+        "-D" | "-f" => 1,
+        // State-changing output actions consume a destination, and `-fprintf`
+        // additionally consumes its format string.
+        "-fprintf" => 2,
+        "-fprint" | "-fprint0" | "-fls" => 1,
+        _ if FIND_PROMOTION_UNARY.contains(&token) || find_promotion_newer_predicate(token) => 1,
+        _ => 0,
+    }
+}
+
 fn find_promoted_exec_flow(
     args: &[String],
     action_index: usize,

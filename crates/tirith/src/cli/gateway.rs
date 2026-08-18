@@ -10544,6 +10544,30 @@ policy:
     fn test_handle_guarded_call_duplicate_active_id_denies() {
         // End to end: a guarded forward whose id is already pending is denied with
         // a `duplicate_active_id` envelope and is NOT written upstream.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let session_id = format!("gateway-duplicate-{}-{nonce}", std::process::id());
+        let ambient_state_path = tirith_core::session_warnings::session_state_path(&session_id);
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate duplicate-id gateway state");
+        global.set_env("TIRITH_SESSION_ID", &session_id);
+
+        let isolated_state_root = global.roots().xdg_state.join("tirith");
+        assert_eq!(
+            tirith_core::policy::state_dir().as_deref(),
+            Some(isolated_state_root.as_path()),
+            "gateway state must resolve beneath the fresh shared-guard root"
+        );
+        assert_eq!(tirith_core::session::resolve_session_id(), session_id);
+        let isolated_state_path = tirith_core::session_warnings::session_state_path(&session_id)
+            .expect("isolated gateway session path");
+        assert!(isolated_state_path.starts_with(&isolated_state_root));
+        let isolated_sessions = isolated_state_path
+            .parent()
+            .expect("gateway session path has a parent");
+
         let config = test_config();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let pending = Mutex::new(PendingRequests::new());
@@ -10585,6 +10609,31 @@ policy:
             v["result"]["structuredContent"]["reason"],
             "duplicate_active_id"
         );
+
+        assert!(
+            isolated_sessions
+                .join(format!("{session_id}.execution"))
+                .exists(),
+            "strict execution preparation must stay inside the isolated state root"
+        );
+        if let Some(ambient_state_path) = ambient_state_path {
+            assert_ne!(ambient_state_path, isolated_state_path);
+            let ambient_sessions = ambient_state_path
+                .parent()
+                .expect("ambient gateway session path has a parent");
+            for path in [
+                ambient_state_path.clone(),
+                ambient_sessions.join(format!("{session_id}.json.lock")),
+                ambient_sessions.join(format!("{session_id}.execution")),
+                ambient_sessions.join(format!("{session_id}.execution.anchor")),
+            ] {
+                assert!(
+                    !path.exists(),
+                    "duplicate-id test touched ambient gateway execution/replay state: {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]

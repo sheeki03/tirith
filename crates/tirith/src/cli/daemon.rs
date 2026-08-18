@@ -45,7 +45,12 @@ use tirith_core::verdict::{upgraded_action_from_findings, Evidence, RuleId, Seve
 /// rejected rather than reused or chmod-coerced.
 #[cfg(unix)]
 fn runtime_dir() -> PathBuf {
-    if let Some(state) = tirith_core::policy::state_dir() {
+    runtime_dir_with_state(tirith_core::policy::state_dir())
+}
+
+#[cfg(unix)]
+fn runtime_dir_with_state(state_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(state) = state_dir {
         return state;
     }
 
@@ -1697,11 +1702,11 @@ mod tests {
     fn runtime_dir_prefers_xdg_runtime_dir_when_no_state_dir() {
         let mut tmp = TmpDir::new("xdgrt");
         std::fs::create_dir_all(&tmp.path).expect("create");
-        // Clear state-dir inputs so resolution falls past option (1).
-        tmp.global.remove_env("XDG_STATE_HOME");
-        tmp.global.remove_env("HOME");
         tmp.global.set_env("XDG_RUNTIME_DIR", &tmp.path);
-        let dir = super::runtime_dir();
+        // Inject the unavailable higher-priority state-dir result directly.
+        // On macOS `home::home_dir()` can resolve the account home even after
+        // HOME is removed, so environment removal does not prove this branch.
+        let dir = super::runtime_dir_with_state(None);
         assert_eq!(
             dir,
             tmp.path.join("tirith"),
