@@ -1517,6 +1517,23 @@ fn collect_ossf(
         if osv.id.trim().is_empty() || !osv.id.starts_with("MAL-") {
             return Err(format!("{} is not an OpenSSF MAL record", path.display()));
         }
+        let file_id = path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} does not have a UTF-8 OpenSSF record filename",
+                    path.display()
+                )
+            })?;
+        if file_id != osv.id {
+            return Err(format!(
+                "{} claims OpenSSF record id {:?}, which does not match filename {:?}",
+                path.display(),
+                osv.id,
+                file_id
+            ));
+        }
         stats.total_entries += 1;
         if let Some(withdrawn) = osv.withdrawn.as_deref() {
             if withdrawn.trim().is_empty() {
@@ -5242,6 +5259,16 @@ mod tests {
         assert_eq!(stats.bounded_intervals_materialized, 0);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].all_versions_malicious);
+    }
+
+    #[test]
+    fn ossf_record_id_must_match_its_source_filename() {
+        let directory = tempfile::tempdir().unwrap();
+        write_mal(directory.path(), "MAL-2099-0099.json", C01_WHOLE_PACKAGE);
+
+        let error = parse_ossf(directory.path())
+            .expect_err("an aliased OpenSSF record must not enter the signed database");
+        assert!(error.contains("does not match filename"), "{error}");
     }
 
     #[test]
