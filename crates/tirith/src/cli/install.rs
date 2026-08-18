@@ -1946,6 +1946,40 @@ impl InstallBoundaryBinding {
         binding
     }
 
+    /// Bind a registry name-existence request without pretending that an
+    /// unpinned install selected any particular version. This is deliberately a
+    /// different domain from [`Self::from_registry_request`], so an exact-version
+    /// authorization cannot be relabelled as a name-only lookup (or vice versa).
+    fn from_registry_name_request(argv: &InstallArgv, ecosystem: Ecosystem, name: &str) -> Self {
+        let mut binding = Self::from_argv(
+            tirith_core::task_boundary::OwnedBoundary::PackageManagerNetwork,
+            argv,
+            PACKAGE_MANAGER_NETWORK_EFFECTS,
+        );
+        let projection = serde_json::json!({
+            "binding_version": 1,
+            "manager_argv": {
+                "program": &argv.program,
+                "args": &argv.args,
+            },
+            "registry_request": {
+                "kind": "name_only",
+                "ecosystem": ecosystem.to_string(),
+                "name": name,
+            },
+        });
+        let digest =
+            Sha256::digest(tirith_core::audit::canonical_json_for_hash(&projection).as_bytes());
+        binding.envelope.sources[0].content = format!(
+            "tirith-package-manager-registry-name-request:v1:sha256:{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        binding
+    }
+
     fn operation(&self) -> tirith_core::task_boundary::BoundaryOperation<'_> {
         tirith_core::task_boundary::BoundaryOperation {
             boundary: self.boundary,
@@ -2080,18 +2114,34 @@ fn authorize_package_manager_spawn(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum RegistryRequestKind {
+    Exact { version: String },
+    NameOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RegistryRequestIdentity {
     ecosystem: Ecosystem,
     name: String,
-    version: String,
+    kind: RegistryRequestKind,
 }
 
 impl RegistryRequestIdentity {
-    fn new(ecosystem: Ecosystem, name: &str, version: &str) -> Self {
+    fn exact(ecosystem: Ecosystem, name: &str, version: &str) -> Self {
         Self {
             ecosystem,
             name: name.to_string(),
-            version: version.to_string(),
+            kind: RegistryRequestKind::Exact {
+                version: version.to_string(),
+            },
+        }
+    }
+
+    fn name_only(ecosystem: Ecosystem, name: &str) -> Self {
+        Self {
+            ecosystem,
+            name: name.to_string(),
+            kind: RegistryRequestKind::NameOnly,
         }
     }
 }
@@ -2127,7 +2177,7 @@ impl<'a> AuthorizedRegistrySession<'a> {
             request,
             permit,
         } = self;
-        let actual = RegistryRequestIdentity::new(ecosystem, name, version);
+        let actual = RegistryRequestIdentity::exact(ecosystem, name, version);
         let operation = binding.operation();
         if actual != request {
             return Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch);
@@ -2136,6 +2186,30 @@ impl<'a> AuthorizedRegistrySession<'a> {
         Ok(registry_api::gather_api_signals_exact(
             client, ecosystem, name, version,
         ))
+    }
+
+    fn gather_name_existence(
+        self,
+        ecosystem: Ecosystem,
+        name: &str,
+    ) -> Result<
+        tirith_core::package_risk::PackageExistence,
+        tirith_core::task_boundary::BoundaryAuthorizationError,
+    > {
+        let Self {
+            client,
+            binding,
+            request,
+            permit,
+        } = self;
+        let actual = RegistryRequestIdentity::name_only(ecosystem, name);
+        let operation = binding.operation();
+        if actual != request {
+            return Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch);
+        }
+        permit.authorize_effect_at(&operation, chrono::Utc::now())?;
+        let (_signals, existence) = registry_api::gather_api_signals(client, ecosystem, name);
+        Ok(existence)
     }
 }
 
@@ -2188,7 +2262,35 @@ impl<'a> AuthorizedRegistryResolver<'a> {
         Ok(AuthorizedRegistrySession {
             client: self.client,
             binding,
-            request: RegistryRequestIdentity::new(ecosystem, name, version),
+            request: RegistryRequestIdentity::exact(ecosystem, name, version),
+            permit,
+        })
+    }
+
+    fn authorize_name_request(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+    ) -> Result<AuthorizedRegistrySession<'a>, tirith_core::task_boundary::BoundaryAuthorizationError>
+    {
+        #[cfg(test)]
+        self.authorization_attempts
+            .set(self.authorization_attempts.get().saturating_add(1));
+        let binding =
+            InstallBoundaryBinding::from_registry_name_request(&self.argv, ecosystem, name);
+        let operation = binding.operation();
+        let permit = prepare_local_install_authorization::<
+            tirith_core::task_boundary::PackageManagerNetworkBoundary,
+        >(&binding, self.policy)
+        .and_then(|authorization| {
+            consume_exact_authorization(authorization, &operation, |authorization| {
+                authorization.consume_default(chrono::Utc::now())
+            })
+        })?;
+        Ok(AuthorizedRegistrySession {
+            client: self.client,
+            binding,
+            request: RegistryRequestIdentity::name_only(ecosystem, name),
             permit,
         })
     }
@@ -2250,6 +2352,31 @@ impl<'a> AuthorizedRegistryResolver<'a> {
             _ => {}
         }
         signals
+    }
+
+    fn resolve_name(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+    ) -> tirith_core::package_risk::PackageExistence {
+        use tirith_core::package_risk::PackageExistence;
+        if self.refusal.borrow().is_some() {
+            return PackageExistence::Unknown;
+        }
+        let transaction = match self.authorize_name_request(ecosystem, name) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                *self.refusal.borrow_mut() = Some(error);
+                return PackageExistence::Unknown;
+            }
+        };
+        match transaction.gather_name_existence(ecosystem, name) {
+            Ok(existence) => existence,
+            Err(error) => {
+                *self.refusal.borrow_mut() = Some(error);
+                PackageExistence::Unknown
+            }
+        }
     }
 }
 
@@ -2401,8 +2528,10 @@ fn run_package_manager(
     // it structurally cannot leak latest-version provenance onto an unpinned
     // install.
     let name_existence = |eco: Ecosystem, name: &str| {
-        let (_signals, existence) = registry_api::gather_api_signals(&http_client, eco, name);
-        existence
+        registry_resolver
+            .as_ref()
+            .expect("online resolver mode requires an authorized resolver session")
+            .resolve_name(eco, name)
     };
     let online_mode = if let Some(reason) = registry_configuration_issue.as_deref() {
         OnlineMode::UnverifiedSource(reason)
@@ -6433,14 +6562,16 @@ mod tests {
     }
 
     #[test]
-    fn unpinned_online_plan_never_starts_or_consumes_registry_authorization() {
-        let client = HttpRegistryClient::new();
+    fn unpinned_online_plan_uses_one_authorized_name_only_transaction() {
+        let client = CountingRegistryClient {
+            calls: std::cell::Cell::new(0),
+        };
         let policy = Policy::default();
         let args = vec!["my-pkg".to_string()];
         let argv = install_txn::build_argv(PackageManager::Npm, &args);
         let session = AuthorizedRegistryResolver::new(&client, &policy, &argv);
-        let resolver =
-            |eco: Ecosystem, name: &str, version: &str| session.resolve(eco, name, version);
+        let exact = |eco: Ecosystem, name: &str, version: &str| session.resolve(eco, name, version);
+        let name_only = |eco: Ecosystem, name: &str| session.resolve_name(eco, name);
         let request = PlanRequest {
             manager: PackageManager::Npm,
             user_args: &args,
@@ -6448,12 +6579,16 @@ mod tests {
             policy: &policy,
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &exact,
+                name_only: &name_only,
+            },
         };
 
         let _plan = install_txn::plan_install(&request);
 
-        assert_eq!(session.authorization_attempts.get(), 0);
+        assert_eq!(session.authorization_attempts.get(), 1);
+        assert_eq!(client.calls.get(), 1);
         assert!(session.refusal.borrow().is_none());
     }
 
@@ -6465,12 +6600,18 @@ mod tests {
         fn fetch(
             &self,
             _ecosystem: Ecosystem,
-            _name: &str,
+            name: &str,
         ) -> Result<
             tirith_core::registry_api::RegistryMetadata,
             tirith_core::registry_api::FetchError,
         > {
-            unreachable!("the authorized install adapter always uses fetch_exact")
+            self.calls.set(self.calls.get().saturating_add(1));
+            Ok(tirith_core::registry_api::RegistryMetadata {
+                source: "npm".to_string(),
+                package_name: Some(name.to_string()),
+                latest_version: Some("1.0.0".to_string()),
+                ..Default::default()
+            })
         }
 
         fn fetch_exact(
@@ -6518,7 +6659,7 @@ mod tests {
         let session = AuthorizedRegistrySession {
             client: &client,
             binding,
-            request: RegistryRequestIdentity::new(Ecosystem::Npm, "demo", "1.0.0"),
+            request: RegistryRequestIdentity::exact(Ecosystem::Npm, "demo", "1.0.0"),
             permit,
         };
 
@@ -6527,6 +6668,66 @@ mod tests {
             Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch)
         ));
         assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn registry_name_session_rejects_changed_name_before_client_fetch() {
+        let client = CountingRegistryClient {
+            calls: std::cell::Cell::new(0),
+        };
+        let argv = InstallArgv {
+            program: "npm".to_string(),
+            args: vec!["install".to_string(), "demo".to_string()],
+        };
+        let binding =
+            InstallBoundaryBinding::from_registry_name_request(&argv, Ecosystem::Npm, "demo");
+        let operation = binding.operation();
+        let permit = prepare_local_install_authorization::<
+            tirith_core::task_boundary::PackageManagerNetworkBoundary,
+        >(&binding, &Policy::default())
+        .unwrap()
+        .consume_default_for_operation(&operation, chrono::Utc::now())
+        .unwrap();
+        let session = AuthorizedRegistrySession {
+            client: &client,
+            binding,
+            request: RegistryRequestIdentity::name_only(Ecosystem::Npm, "demo"),
+            permit,
+        };
+
+        assert!(matches!(
+            session.gather_name_existence(Ecosystem::Npm, "replacement"),
+            Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch)
+        ));
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn denied_name_only_registry_request_has_zero_client_effects() {
+        let client = CountingRegistryClient {
+            calls: std::cell::Cell::new(0),
+        };
+        let mut policy = Policy::default();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_requiring_verified_provenance
+            .insert(tirith_core::effects::CommandEffectKind::NetworkEgress);
+        let argv = InstallArgv {
+            program: "npm".to_string(),
+            args: vec!["install".to_string(), "demo".to_string()],
+        };
+        let resolver = AuthorizedRegistryResolver::new(&client, &policy, &argv);
+
+        assert_eq!(
+            resolver.resolve_name(Ecosystem::Npm, "demo"),
+            tirith_core::package_risk::PackageExistence::Unknown
+        );
+        assert_eq!(client.calls.get(), 0);
+        assert!(matches!(
+            resolver.refusal.borrow().as_ref(),
+            Some(tirith_core::task_boundary::BoundaryAuthorizationError::SchemaV2Required)
+        ));
     }
 
     #[test]
@@ -6565,6 +6766,11 @@ mod tests {
             "demo",
             "2.0.0",
         );
+        let name_only = InstallBoundaryBinding::from_registry_name_request(
+            &approved_argv,
+            Ecosystem::Npm,
+            "demo",
+        );
         let pending = prepare_local_install_authorization::<
             tirith_core::task_boundary::PackageManagerNetworkBoundary,
         >(&approved, &Policy::default())
@@ -6573,6 +6779,7 @@ mod tests {
         assert!(pending.binds_operation(&approved.operation()));
         assert!(!pending.binds_operation(&changed_set.operation()));
         assert!(!pending.binds_operation(&changed_request.operation()));
+        assert!(!pending.binds_operation(&name_only.operation()));
     }
 
     #[test]

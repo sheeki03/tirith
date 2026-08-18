@@ -13,6 +13,23 @@ PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 COSIGN_BIN=""
 
+# Paired-publication rollback state. These are globals because an EXIT trap can
+# run after `main`'s local scope has unwound. Rollback is armed only after both
+# preimages have been captured and verified, and is disarmed only after both
+# installed binaries have passed exact readback verification.
+PAIRED_ROLLBACK_ARMED=0
+PAIRED_TMPDIR=""
+PAIRED_MAIN_DEST=""
+PAIRED_MAIN_BACKUP=""
+PAIRED_MAIN_HAD_PREVIOUS=0
+PAIRED_MAIN_PREVIOUS_SHA256=""
+PAIRED_MAIN_NEW_SHA256=""
+PAIRED_HELPER_DEST="/usr/local/libexec/tirith-package-approval-authority"
+PAIRED_HELPER_BACKUP=""
+PAIRED_HELPER_HAD_PREVIOUS=0
+PAIRED_HELPER_PREVIOUS_SHA256=""
+PAIRED_HELPER_NEW_SHA256=""
+
 err() {
   printf 'error: %s\n' "$1" >&2
   exit 1
@@ -24,6 +41,105 @@ info() {
 
 warn() {
   printf 'warning: %s\n' "$1" >&2
+}
+
+sha256_file() {
+  if [ -x /usr/bin/sha256sum ]; then
+    /usr/bin/sha256sum "$1" | /usr/bin/awk '{print $1}'
+  elif [ -x /usr/bin/shasum ]; then
+    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+restore_main_install() {
+  if [ "$PAIRED_MAIN_HAD_PREVIOUS" = "1" ]; then
+    if command -v install >/dev/null 2>&1; then
+      install -m 755 "$PAIRED_MAIN_BACKUP" "$PAIRED_MAIN_DEST" || return 1
+    else
+      cp "$PAIRED_MAIN_BACKUP" "$PAIRED_MAIN_DEST" || return 1
+      chmod 755 "$PAIRED_MAIN_DEST" || return 1
+    fi
+    restored_sum="$(sha256_file "$PAIRED_MAIN_DEST")" || return 1
+    [ "$restored_sum" = "$PAIRED_MAIN_PREVIOUS_SHA256" ] || return 1
+  else
+    rm -f "$PAIRED_MAIN_DEST" || return 1
+    [ ! -e "$PAIRED_MAIN_DEST" ] && [ ! -L "$PAIRED_MAIN_DEST" ] || return 1
+  fi
+}
+
+restore_package_approval_helper() {
+  if [ "$PAIRED_HELPER_HAD_PREVIOUS" = "1" ]; then
+    run_root /usr/bin/install -m 755 "$PAIRED_HELPER_BACKUP" "$PAIRED_HELPER_DEST" \
+      || return 1
+    restored_sum="$(sha256_file "$PAIRED_HELPER_DEST")" || return 1
+    [ "$restored_sum" = "$PAIRED_HELPER_PREVIOUS_SHA256" ] || return 1
+  else
+    run_root /bin/rm -f "$PAIRED_HELPER_DEST" || return 1
+    run_root /usr/bin/test ! -e "$PAIRED_HELPER_DEST" || return 1
+    run_root /usr/bin/test ! -L "$PAIRED_HELPER_DEST" || return 1
+  fi
+}
+
+cleanup_paired_backups() {
+  if [ -n "$PAIRED_HELPER_BACKUP" ]; then
+    run_root /bin/rm -f "$PAIRED_HELPER_BACKUP" || return 1
+    PAIRED_HELPER_BACKUP=""
+  fi
+  return 0
+}
+
+paired_exit_handler() {
+  exit_status="$1"
+  trap - EXIT HUP INT TERM
+  rollback_ok=1
+  if [ "$PAIRED_ROLLBACK_ARMED" = "1" ]; then
+    main_restore_ok=0
+    helper_restore_ok=0
+    if restore_main_install; then
+      main_restore_ok=1
+    fi
+    # Always attempt the helper restoration even if the main restoration
+    # failed. The two results are combined only after both attempts finish.
+    if [ "${TARGET:-}" = "x86_64-unknown-linux-gnu" ]; then
+      if restore_package_approval_helper; then
+        helper_restore_ok=1
+      fi
+    else
+      helper_restore_ok=1
+    fi
+    if [ "$main_restore_ok" != "1" ] || [ "$helper_restore_ok" != "1" ]; then
+      rollback_ok=0
+      warn "paired install rollback could not verify both restored states; inspect the install paths before retrying"
+      exit_status=1
+    fi
+    PAIRED_ROLLBACK_ARMED=0
+  fi
+
+  # A failed restoration keeps the privileged backup for manual recovery.
+  if [ "$rollback_ok" = "1" ]; then
+    cleanup_paired_backups || {
+      warn "could not remove the verified helper backup"
+      exit_status=1
+    }
+  fi
+  if [ -n "$PAIRED_TMPDIR" ]; then
+    rm -rf "$PAIRED_TMPDIR" || exit_status=1
+    PAIRED_TMPDIR=""
+  fi
+  exit "$exit_status"
+}
+
+install_paired_traps() {
+  trap 'paired_exit_handler $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 }
 
 detect_platform() {
@@ -182,7 +298,7 @@ install_package_approval_helper() {
   helper_archive="$1"
   helper_archive_sha256="$2"
   helper_dir="/usr/local/libexec"
-  helper_dest="${helper_dir}/tirith-package-approval-authority"
+  helper_dest="$PAIRED_HELPER_DEST"
   if [ ! -x /usr/bin/install ]; then
     err "x86_64 Linux install requires the fixed /usr/bin/install utility"
   fi
@@ -243,23 +359,28 @@ install_package_approval_helper() {
     run_root /bin/rm -rf "$helper_stage" || true
     return 1
   fi
+  helper_payload_sum="$(run_root /usr/bin/sha256sum \
+    "${helper_stage}/tirith-package-approval-authority")" \
+    || {
+      run_root /bin/rm -rf "$helper_stage" || true
+      return 1
+    }
   if ! run_root /usr/bin/install -m 755 \
       "${helper_stage}/tirith-package-approval-authority" "$helper_dest"; then
     run_root /bin/rm -rf "$helper_stage" || true
     return 1
   fi
-  run_root /bin/rm -rf "$helper_stage" || return 1
-}
-
-restore_package_approval_helper() {
-  helper_backup="$1"
-  helper_had_previous="$2"
-  helper_dest="/usr/local/libexec/tirith-package-approval-authority"
-  if [ "$helper_had_previous" = "1" ]; then
-    run_root /usr/bin/install -m 755 "$helper_backup" "$helper_dest"
-  else
-    run_root /bin/rm -f "$helper_dest"
+  helper_installed_sum="$(run_root /usr/bin/sha256sum "$helper_dest")" \
+    || {
+      run_root /bin/rm -rf "$helper_stage" || true
+      return 1
+    }
+  if [ "${helper_installed_sum%% *}" != "${helper_payload_sum%% *}" ]; then
+    run_root /bin/rm -rf "$helper_stage" || true
+    return 1
   fi
+  PAIRED_HELPER_NEW_SHA256="${helper_payload_sum%% *}"
+  run_root /bin/rm -rf "$helper_stage" || return 1
 }
 
 main() {
@@ -270,7 +391,8 @@ main() {
 
   local tmpdir
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
+  PAIRED_TMPDIR="$tmpdir"
+  install_paired_traps
 
   # Download archive and checksums
   info "Downloading ${ARCHIVE}..."
@@ -299,60 +421,70 @@ main() {
   info "Extracting..."
   tar xzf "${tmpdir}/${ARCHIVE}" -C "$tmpdir"
   mkdir -p "$INSTALL_DIR"
-  main_had_previous=0
-  if [ -f "${INSTALL_DIR}/tirith" ]; then
-    main_had_previous=1
-    cp "${INSTALL_DIR}/tirith" "${tmpdir}/tirith.previous"
+  PAIRED_MAIN_DEST="${INSTALL_DIR}/tirith"
+  PAIRED_MAIN_NEW_SHA256="$(sha256_file "${tmpdir}/tirith")" \
+    || err "could not hash the extracted Tirith binary"
+  if [ -f "$PAIRED_MAIN_DEST" ]; then
+    PAIRED_MAIN_HAD_PREVIOUS=1
+    PAIRED_MAIN_PREVIOUS_SHA256="$(sha256_file "$PAIRED_MAIN_DEST")" \
+      || err "could not hash the existing Tirith binary"
+    PAIRED_MAIN_BACKUP="${tmpdir}/tirith.previous"
+    cp "$PAIRED_MAIN_DEST" "$PAIRED_MAIN_BACKUP" \
+      || err "could not back up the existing Tirith binary"
+    main_backup_sum="$(sha256_file "$PAIRED_MAIN_BACKUP")" \
+      || err "could not verify the Tirith backup"
+    [ "$main_backup_sum" = "$PAIRED_MAIN_PREVIOUS_SHA256" ] \
+      || err "the Tirith backup did not match the installed binary"
   fi
-  helper_had_previous=0
-  helper_backup=""
   if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
-    if [ -f /usr/local/libexec/tirith-package-approval-authority ]; then
-      helper_had_previous=1
-      helper_backup="$(run_root /usr/bin/mktemp \
+    if [ -f "$PAIRED_HELPER_DEST" ]; then
+      PAIRED_HELPER_HAD_PREVIOUS=1
+      helper_previous_sum="$(run_root /usr/bin/sha256sum "$PAIRED_HELPER_DEST")" \
+        || err "could not hash the existing package-approval helper"
+      PAIRED_HELPER_PREVIOUS_SHA256="${helper_previous_sum%% *}"
+      PAIRED_HELPER_BACKUP="$(run_root /usr/bin/mktemp \
         /usr/local/libexec/.tirith-helper-backup.XXXXXX)"
       run_root /usr/bin/install -m 755 \
-        /usr/local/libexec/tirith-package-approval-authority "$helper_backup"
+        "$PAIRED_HELPER_DEST" "$PAIRED_HELPER_BACKUP" \
+        || err "could not back up the existing package-approval helper"
+      helper_backup_sum="$(run_root /usr/bin/sha256sum "$PAIRED_HELPER_BACKUP")" \
+        || err "could not verify the package-approval helper backup"
+      [ "${helper_backup_sum%% *}" = "$PAIRED_HELPER_PREVIOUS_SHA256" ] \
+        || err "the helper backup did not match the installed helper"
     fi
+  fi
+
+  # From this point through both exact readbacks, EXIT and signal paths restore
+  # and verify both preimages. Arm before the helper is the first published.
+  PAIRED_ROLLBACK_ARMED=1
+  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
     archive_sha256="${CHECKSUM_LINE%% *}"
     if ! install_package_approval_helper "${tmpdir}/${ARCHIVE}" "$archive_sha256"; then
-      restore_package_approval_helper "$helper_backup" "$helper_had_previous" || true
-      [ -z "$helper_backup" ] || run_root /bin/rm -f "$helper_backup" || true
       err "could not install the root-owned package-approval helper"
     fi
   fi
   if command -v install >/dev/null 2>&1; then
-    if ! install -m 755 "${tmpdir}/tirith" "${INSTALL_DIR}/tirith"; then
-      if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
-        restore_package_approval_helper "$helper_backup" "$helper_had_previous"
-        [ -z "$helper_backup" ] || run_root /bin/rm -f "$helper_backup" || true
-      fi
-      if [ "$main_had_previous" = "1" ]; then
-        install -m 755 "${tmpdir}/tirith.previous" "${INSTALL_DIR}/tirith" || true
-      else
-        rm -f "${INSTALL_DIR}/tirith"
-      fi
-      err "could not install the paired Tirith binaries"
-    fi
+    install -m 755 "${tmpdir}/tirith" "$PAIRED_MAIN_DEST" \
+      || err "could not install the paired Tirith binaries"
   else
-    if ! cp "${tmpdir}/tirith" "${INSTALL_DIR}/tirith" || \
-       ! chmod 755 "${INSTALL_DIR}/tirith"; then
-      if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
-        restore_package_approval_helper "$helper_backup" "$helper_had_previous"
-        [ -z "$helper_backup" ] || run_root /bin/rm -f "$helper_backup" || true
-      fi
-      if [ "$main_had_previous" = "1" ]; then
-        cp "${tmpdir}/tirith.previous" "${INSTALL_DIR}/tirith" || true
-        chmod 755 "${INSTALL_DIR}/tirith" || true
-      else
-        rm -f "${INSTALL_DIR}/tirith"
-      fi
-      err "could not install the paired Tirith binaries"
-    fi
+    cp "${tmpdir}/tirith" "$PAIRED_MAIN_DEST" \
+      || err "could not install the paired Tirith binaries"
+    chmod 755 "$PAIRED_MAIN_DEST" \
+      || err "could not install the paired Tirith binaries"
   fi
-  if [ -n "$helper_backup" ]; then
-    run_root /bin/rm -f "$helper_backup" || true
+  main_installed_sum="$(sha256_file "$PAIRED_MAIN_DEST")" \
+    || err "could not read back the installed Tirith binary"
+  [ "$main_installed_sum" = "$PAIRED_MAIN_NEW_SHA256" ] \
+    || err "installed Tirith binary failed exact readback verification"
+  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+    [ -n "$PAIRED_HELPER_NEW_SHA256" ] \
+      || err "installed package-approval helper was not read back and verified"
   fi
+
+  # Both publications and both readbacks succeeded. Only now may EXIT stop
+  # restoring the paired preimages.
+  PAIRED_ROLLBACK_ARMED=0
+  cleanup_paired_backups || err "could not remove the verified helper backup"
 
   info ""
   info "tirith installed to ${INSTALL_DIR}/tirith"

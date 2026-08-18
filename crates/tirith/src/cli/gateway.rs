@@ -3999,6 +3999,7 @@ fn handle_unmatched_tool_call(
     ) {
         Ok(()) => Ok(()),
         Err(GuardedForwardError::Authorization(error)) => {
+            let error = complete_known_zero_replay_rollback(error);
             if let Ok(mut table) = pending.lock() {
                 table.discard_before_forward(direction, &registered.proxy_id);
             }
@@ -4828,6 +4829,7 @@ fn handle_guarded_call(
                         Ok(())
                     }
                     Err(GuardedForwardError::Authorization(error)) => {
+                        let error = complete_known_zero_replay_rollback(error);
                         if let Err(abort_error) = abort_pending_execution_known_zero(
                             pending,
                             direction,
@@ -7654,7 +7656,7 @@ fn forward(writer: &mut impl Write, line: &[u8]) -> io::Result<()> {
 
 #[derive(Debug)]
 enum GuardedForwardError {
-    Authorization(tirith_core::task_boundary::BoundaryAuthorizationError),
+    Authorization(tirith_core::task_boundary::BoundaryEffectCommitError),
     Transport(io::Error),
 }
 
@@ -7696,6 +7698,32 @@ fn complete_known_zero_execution_rollback(
             }
         }
     }
+}
+
+fn complete_known_zero_replay_rollback(
+    error: tirith_core::task_boundary::BoundaryEffectCommitError,
+) -> tirith_core::task_boundary::BoundaryAuthorizationError {
+    let (error, rollback) = error.into_parts();
+    let Some(mut rollback) = rollback else {
+        return error;
+    };
+    let mut attempts = 0_u64;
+    while !rollback.is_complete() {
+        match rollback.retry() {
+            Ok(()) => break,
+            Err(rollback_error) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts.is_multiple_of(20) {
+                    eprintln!(
+                        "tirith gateway: known-zero replay rollback is still pending after \
+                         {attempts} attempt(s): {rollback_error}; forwarding remains stopped"
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    error
 }
 
 fn forward_guarded(

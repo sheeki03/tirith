@@ -223,11 +223,11 @@ pub use task_receipt::{
     DurableReplayStore, EnforcementProjectionV1, GatewayEnforcementProjectionV1,
     McpToolIdentityProjectionV1, ProvenanceReceiptV2, ReceiptEffectiveShell,
     ReceiptGatewayFailMode, ReceiptGatewayWarnAction, ReceiptServerRequestPolicy, ReceiptV2Error,
-    ReplayOutcome, ReplayReservation, ReplayReservationOutcome, ReplayStore, ReplayStoreError,
-    ResourceCeilingsProjectionV1, SecureProfileFloorProjectionV1, TaskAuthorizationProjectionV1,
-    TaskGateAuthorizationProjectionV1, ToolIdentityProjectionV1, ValidatedReceiptV2,
-    PROVENANCE_RECEIPT_V2, RECEIPT_V2_CLOCK_SKEW_SECONDS, RECEIPT_V2_MAX_TTL_SECONDS,
-    TASK_AUTHORIZATION_PROJECTION_V1,
+    ReplayKnownZeroRollback, ReplayOutcome, ReplayReservation, ReplayReservationOutcome,
+    ReplayStore, ReplayStoreError, ResourceCeilingsProjectionV1, SecureProfileFloorProjectionV1,
+    TaskAuthorizationProjectionV1, TaskGateAuthorizationProjectionV1, ToolIdentityProjectionV1,
+    ValidatedReceiptV2, PROVENANCE_RECEIPT_V2, RECEIPT_V2_CLOCK_SKEW_SECONDS,
+    RECEIPT_V2_MAX_TTL_SECONDS, TASK_AUTHORIZATION_PROJECTION_V1,
 };
 pub(crate) use task_receipt::{
     validate_canonical_acquisition_identity, validate_receipt_context_identifier,

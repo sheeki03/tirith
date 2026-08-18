@@ -269,6 +269,37 @@ impl ContainedAtomicFile {
         self.inner.remove_if_contents(expected)
     }
 
+    /// Remove the prepared regular file only when it still has the exact
+    /// identity and digest recorded by the most recent [`Self::read_capped`].
+    ///
+    /// The platform implementation opens the candidate first, runs the
+    /// recorded-preimage check while that identity is held, and then either
+    /// deletes that exact identity (Windows) or proves the quarantined rename
+    /// moved the same identity (Unix).
+    /// `before_remove` runs after the candidate identity is held and its
+    /// recorded preimage has been revalidated, at the last safe seam before
+    /// deletion.
+    pub(crate) fn remove_if_observed_checked<F>(
+        &self,
+        expected: &[u8],
+        before_remove: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        let observed = self.observed_preimage()?;
+        if observed.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no contained preimage was observed before deletion",
+            ));
+        }
+        self.inner.remove_if_contents_checked(expected, || {
+            self.verify_observed_preimage(&observed)?;
+            before_remove()
+        })
+    }
+
     /// Confirm that resolving `path` beneath `root` still reaches this exact
     /// retained root/parent/final-name identity.
     pub fn matches_visible(&self, root: &Path, path: &Path) -> io::Result<bool> {
@@ -889,6 +920,17 @@ mod platform {
         }
 
         pub(super) fn remove_if_contents(&self, expected: &[u8]) -> io::Result<()> {
+            self.remove_if_contents_checked(expected, || Ok(()))
+        }
+
+        pub(super) fn remove_if_contents_checked<F>(
+            &self,
+            expected: &[u8],
+            before_remove: F,
+        ) -> io::Result<()>
+        where
+            F: FnOnce() -> io::Result<()>,
+        {
             require_nonsymlink_final(&self.parent, &self.name, &self.display)?;
             let fd = unsafe {
                 libc::openat(
@@ -905,6 +947,7 @@ mod platform {
             if !original.is_file() {
                 return Err(invalid_input("rollback destination is not a regular file"));
             }
+            before_remove()?;
 
             let rollback_name = CString::new(format!(
                 ".tirith-rollback-{}.tmp",
@@ -2116,6 +2159,17 @@ mod platform {
         }
 
         pub(super) fn remove_if_contents(&self, expected: &[u8]) -> io::Result<()> {
+            self.remove_if_contents_checked(expected, || Ok(()))
+        }
+
+        pub(super) fn remove_if_contents_checked<F>(
+            &self,
+            expected: &[u8],
+            before_remove: F,
+        ) -> io::Result<()>
+        where
+            F: FnOnce() -> io::Result<()>,
+        {
             let handle = open_named_file(
                 &self.parent,
                 &self.name,
@@ -2125,6 +2179,7 @@ mod platform {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "rollback file is absent"))?;
             inspect_regular(handle.0, &self.display)?;
             let mut file = handle.into_file();
+            before_remove()?;
             let mut bytes = Vec::new();
             file.by_ref()
                 .take(expected.len().saturating_add(1) as u64)
@@ -2539,6 +2594,20 @@ mod platform {
         }
 
         pub(super) fn remove_if_contents(&self, _expected: &[u8]) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "contained rollback removal is unsupported on this platform",
+            ))
+        }
+
+        pub(super) fn remove_if_contents_checked<F>(
+            &self,
+            _expected: &[u8],
+            _before_remove: F,
+        ) -> io::Result<()>
+        where
+            F: FnOnce() -> io::Result<()>,
+        {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "contained rollback removal is unsupported on this platform",
