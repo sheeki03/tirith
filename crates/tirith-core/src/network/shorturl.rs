@@ -216,6 +216,21 @@ fn cache_put(url: &str, resolved: &str) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    const AMBIENT_PROXY_PROBE_HOSTS: [&str; 3] = [
+        "http-proxy-bypass.example.test",
+        "https-proxy-bypass.example.test",
+        "all-proxy-bypass.example.test",
+    ];
+
+    #[cfg(unix)]
+    fn is_owned_ambient_proxy_probe(request: &[u8]) -> bool {
+        let request = String::from_utf8_lossy(request);
+        AMBIENT_PROXY_PROBE_HOSTS
+            .iter()
+            .any(|host| request.contains(host))
+    }
+
     #[test]
     fn test_is_shortened_url_known() {
         assert!(is_shortened_url("https://bit.ly/abc123"));
@@ -354,10 +369,13 @@ mod tests {
             while !worker_stop.load(Ordering::Acquire) && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        worker_hit.store(true, Ordering::Release);
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
                         let mut request = [0u8; 1024];
-                        let _ = stream.read(&mut request);
+                        if let Ok(read) = stream.read(&mut request) {
+                            if is_owned_ambient_proxy_probe(&request[..read]) {
+                                worker_hit.store(true, Ordering::Release);
+                            }
+                        }
                         let _ = stream.write_all(
                             b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         );
@@ -435,6 +453,23 @@ mod tests {
                 "{proxy_key} must not bypass the guarded resolver: {messages:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambient_proxy_fixture_attributes_only_owned_shorturl_requests() {
+        assert!(is_owned_ambient_proxy_probe(
+            b"GET http://http-proxy-bypass.example.test/landing HTTP/1.1\r\n"
+        ));
+        assert!(is_owned_ambient_proxy_probe(
+            b"CONNECT https-proxy-bypass.example.test:443 HTTP/1.1\r\n"
+        ));
+        assert!(is_owned_ambient_proxy_probe(
+            b"GET http://all-proxy-bypass.example.test/landing HTTP/1.1\r\n"
+        ));
+        assert!(!is_owned_ambient_proxy_probe(
+            b"GET http://unrelated-full-suite-fixture.example.test/ HTTP/1.1\r\n"
+        ));
     }
 
     // Redirect control flow remains hermetic via injected closures below.

