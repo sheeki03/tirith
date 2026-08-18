@@ -129,17 +129,45 @@ fn assert_raw_private_key_privacy(data: &str, shell: ShellType, context: &Web3Pa
         "the privacy probe must exercise a recognized raw private key"
     );
 
-    let debug = format!("{parsed:?}");
-    let json = serde_json::to_string(&parsed).expect("private-key parse result must serialize");
+    let encoded = serde_json::to_vec(&parsed).expect("private-key parse result must serialize");
+    let decoded = Web3ParseResultV2::from_json_slice_bounded(&encoded)
+        .expect("private-key parse result must fit the bounded public reader");
+    assert!(
+        decoded.commands.iter().any(|facts| {
+            facts
+                .signers
+                .iter()
+                .any(|tagged| tagged.signer.kind() == SignerKindV2::RawPrivateKey)
+        }),
+        "bounded decoding must preserve raw-private-key classification"
+    );
+
+    let findings = web3_gate::check(&decoded, &trusted());
+    let parsed_debug = format!("{parsed:?}");
+    let parsed_json =
+        serde_json::to_string(&parsed).expect("private-key parse result must serialize");
+    let decoded_debug = format!("{decoded:?}");
+    let decoded_json =
+        serde_json::to_string(&decoded).expect("bounded private-key result must serialize");
+    let findings_debug = format!("{findings:?}");
+    let findings_json =
+        serde_json::to_string(&findings).expect("private-key findings must serialize");
     let bare_canary = canary.trim_start_matches("0x");
-    for rendered in [&debug, &json] {
+    for rendered in [
+        &parsed_debug,
+        &parsed_json,
+        &decoded_debug,
+        &decoded_json,
+        &findings_debug,
+        &findings_json,
+    ] {
         assert!(
             !rendered.contains(&canary),
-            "raw private key leaked from parser surface"
+            "raw private key leaked from a bounded Web3 surface"
         );
         assert!(
             !rendered.contains(bare_canary),
-            "raw private-key payload leaked from parser surface"
+            "raw private-key payload leaked from a bounded Web3 surface"
         );
     }
     assert_bounded_wire_contract(&parsed);

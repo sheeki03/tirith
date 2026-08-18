@@ -1,9 +1,11 @@
 name: Fuzz
 
 on:
+  pull_request:
   schedule:
     - cron: "0 3 * * 1" # Monday 3am UTC
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -23,8 +25,10 @@ jobs:
           - extractor
           - normalizer
           - byte_scanner
+          - artifact_wheel
           - lexical_path
           - npm_command
+          - task_envelope
           - web3_command
           - workflow_artifact
     steps:
@@ -34,7 +38,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-06-01
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked

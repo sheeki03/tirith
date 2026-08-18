@@ -3,6 +3,7 @@ name = "tirith-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
+license = "AGPL-3.0-only"
 
 [package.metadata]
 cargo-fuzz = true
@@ -68,6 +69,11 @@ doc = false
 [[bin]]
 name = "web3_command"
 path = "fuzz_targets/web3_command.rs"
+doc = false
+
+[[bin]]
+name = "task_envelope"
+path = "fuzz_targets/task_envelope.rs"
 doc = false
 
 [[bin]]

@@ -8,17 +8,6 @@ ignore = [
     # MSRV 1.83), and tirith never parses user-controlled RFC 2822 dates (the only
     # trigger). Transitive dep via lopdf/rust-s3. See the time pin note in Cargo.toml.
     "RUSTSEC-2026-0009",
-    # rustls-pemfile unmaintained — transitive dep of rust-s3 (license server).
-    # No replacement available; rust-s3 hasn't migrated yet.
-    "RUSTSEC-2025-0134",
-    # rustls-webpki CRL / name-constraint advisories — affect 0.101.7 via
-    # rust-s3 → aws-creds → attohttpc → rustls → rustls-webpki. Transitive
-    # chain pinned until rust-s3 moves forward. tirith does not use CRL
-    # revocation checking or name-constraint validation on this path. The
-    # current 0.103.x copy is kept up to date separately.
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
     # lopdf 0.34 stack-overflow DoS: a crafted PDF with deeply nested arrays/dicts
     # aborts the process (uncatchable SIGABRT) during parse. The fix (lopdf >=0.42)
     # requires Rust 1.85, above tirith's MSRV 1.83, so we cannot bump lopdf. The
@@ -29,16 +18,6 @@ ignore = [
     # preflight was bypassable via /ObjStm). Remove this ignore
     # (and the .cargo/audit.toml twin) once MSRV/lopdf can move.
     "RUSTSEC-2026-0187",
-    # quick-xml 0.32.0 DoS advisories: quadratic run time when checking a start
-    # tag for duplicate attribute names, and unbounded namespace-declaration
-    # allocation in NsReader (memory exhaustion). Reached only via
-    # aws-creds -> rust-s3 -> tirith-license-server, the same transitive chain as
-    # the rustls-pemfile / rustls-webpki / time ignores above. rust-s3 0.35.1 pins
-    # quick-xml 0.32.0 and the fix is a major-version jump it has not taken; tirith
-    # never parses untrusted XML on this path (S3 credential and response handling
-    # only). Remove once rust-s3 moves to a fixed quick-xml.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
@@ -48,6 +27,9 @@ allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # NCSA is the permissive University of Illinois license used by the
+    # libfuzzer-sys/LLVM libFuzzer component in the standalone fuzz workspace.
+    "NCSA",
     "ISC",
     "Unicode-3.0",
     "MPL-2.0",
