@@ -1600,30 +1600,6 @@ mod tests {
         assert!(error_text.contains("[REDACTED:custom]"));
     }
 
-    /// Snapshot an env var and restore on `Drop` (same shape as the one in
-    /// `policy.rs::tests`, which is not importable across `mod tests`).
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     /// Seed a `.tirith/policy.yaml` whose `agent_rules.deny` matches MCP client
     /// `client`. Returns the temp dir for the caller to hold.
     fn seed_mcp_deny_policy(client: &str) -> tempfile::TempDir {
@@ -1640,9 +1616,8 @@ mod tests {
     /// enforce on `tirith_check_command` but silently fail here.
     #[test]
     fn mcp_check_url_with_agent_rules_deny_forces_block() {
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global MCP tool state");
         let _origin_guard = super::super::origin::reset_for_test();
 
         // Seed the MCP origin to a name our deny matcher will catch.
@@ -1654,7 +1629,7 @@ mod tests {
         // Seed a policy that denies this client. Discovery walks
         // `TIRITH_POLICY_ROOT/.tirith` first.
         let policy_dir = seed_mcp_deny_policy("hostile-mcp-client");
-        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
+        global.set_env("TIRITH_POLICY_ROOT", policy_dir.path());
 
         // A clean URL — would otherwise be Allow.
         let resp = call_check_url(&json!({"url": "https://example.com/"}));
@@ -1705,9 +1680,8 @@ mod tests {
     /// else a denied client gets conflicting `block` + `approval_*` instructions.
     #[test]
     fn mcp_check_url_deny_does_not_emit_approval_metadata() {
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global MCP tool state");
         let _origin_guard = super::super::origin::reset_for_test();
 
         super::super::origin::set_from_initialize(Some(&super::super::types::ClientInfo {
@@ -1716,7 +1690,7 @@ mod tests {
         }));
 
         let policy_dir = seed_mcp_deny_plus_approval_policy("hostile-mcp-client");
-        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
+        global.set_env("TIRITH_POLICY_ROOT", policy_dir.path());
 
         // Plain-HTTP sink URL: would match the approval rule, but with deny in
         // play the verdict is Block and approval must NOT be derived.
@@ -1757,9 +1731,8 @@ mod tests {
     /// paste handler had the same reorder bug.
     #[test]
     fn mcp_check_paste_deny_does_not_emit_approval_metadata() {
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global MCP tool state");
         let _origin_guard = super::super::origin::reset_for_test();
 
         super::super::origin::set_from_initialize(Some(&super::super::types::ClientInfo {
@@ -1768,7 +1741,7 @@ mod tests {
         }));
 
         let policy_dir = seed_mcp_deny_plus_approval_policy("hostile-mcp-client");
-        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
+        global.set_env("TIRITH_POLICY_ROOT", policy_dir.path());
 
         // Plain-HTTP paste: matches the approval rule, but under deny the verdict
         // must be Block with no approval_* metadata.
@@ -1806,9 +1779,8 @@ mod tests {
     /// `tirith_check_url`; this pins the paste-handler fix.
     #[test]
     fn mcp_check_paste_with_agent_rules_deny_forces_block() {
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global MCP tool state");
         let _origin_guard = super::super::origin::reset_for_test();
 
         super::super::origin::set_from_initialize(Some(&super::super::types::ClientInfo {
@@ -1817,7 +1789,7 @@ mod tests {
         }));
 
         let policy_dir = seed_mcp_deny_policy("hostile-mcp-client");
-        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
+        global.set_env("TIRITH_POLICY_ROOT", policy_dir.path());
 
         // Clean paste content — would otherwise be Allow.
         let resp = call_check_paste(&json!({"content": "hello world"}));
@@ -1871,9 +1843,8 @@ mod tests {
     /// bypass-honored path. See the module comment above for the test plan.
     #[test]
     fn mcp_check_url_bypass_writes_audit_entry() {
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global MCP tool state");
         let _origin_guard = super::super::origin::reset_for_test();
 
         super::super::origin::set_from_initialize(Some(&super::super::types::ClientInfo {
@@ -1882,15 +1853,15 @@ mod tests {
         }));
 
         let policy_dir = seed_mcp_bypass_plus_deny_policy("hostile-mcp-client");
-        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
+        global.set_env("TIRITH_POLICY_ROOT", policy_dir.path());
 
         // Point the audit log at a tempdir (`data_dir()` honors `XDG_DATA_HOME`
         // on macOS & Linux via etcetera 0.8).
         let data_tmp = tempfile::tempdir().expect("data tempdir");
-        let _data = EnvVarGuard::set("XDG_DATA_HOME", data_tmp.path());
+        global.set_env("XDG_DATA_HOME", data_tmp.path());
         // Explicit: TIRITH_LOG defaults on, but the env may carry a stale "0".
-        let _log = EnvVarGuard::set("TIRITH_LOG", "1");
-        let _bypass = EnvVarGuard::set("TIRITH", "0");
+        global.set_env("TIRITH_LOG", "1");
+        global.set_env("TIRITH", "0");
 
         // URL that fires tier-1 once wrapped in `curl '...'` (http:// + .sh).
         // Tier-1 MUST trigger or the engine fast-exits without `bypass_honored`.
@@ -1958,9 +1929,8 @@ mod tests {
     /// the paste handler.
     #[test]
     fn mcp_check_paste_bypass_writes_audit_entry() {
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global MCP tool state");
         let _origin_guard = super::super::origin::reset_for_test();
 
         super::super::origin::set_from_initialize(Some(&super::super::types::ClientInfo {
@@ -1969,12 +1939,12 @@ mod tests {
         }));
 
         let policy_dir = seed_mcp_bypass_plus_deny_policy("hostile-mcp-client");
-        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", policy_dir.path());
+        global.set_env("TIRITH_POLICY_ROOT", policy_dir.path());
 
         let data_tmp = tempfile::tempdir().expect("data tempdir");
-        let _data = EnvVarGuard::set("XDG_DATA_HOME", data_tmp.path());
-        let _log = EnvVarGuard::set("TIRITH_LOG", "1");
-        let _bypass = EnvVarGuard::set("TIRITH", "0");
+        global.set_env("XDG_DATA_HOME", data_tmp.path());
+        global.set_env("TIRITH_LOG", "1");
+        global.set_env("TIRITH", "0");
 
         // Paste that fires tier-1 (pipe-to-shell) so the engine reaches bypass.
         let resp =

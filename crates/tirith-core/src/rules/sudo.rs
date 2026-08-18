@@ -1158,25 +1158,20 @@ fn normalize_lexical_path(path: &str) -> Result<Option<String>, ()> {
         return Ok(None);
     };
 
-    let mut components: Vec<&str> = Vec::new();
-    for component in tail.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                if components.pop().is_none() {
-                    return Err(());
-                }
-            }
-            other => components.push(other),
-        }
+    let normalized =
+        crate::lexical_path::LexicalPath::parse(tail, crate::lexical_path::PathDialect::Posix)
+            .map_err(|_| ())?;
+    if !normalized.parent_state().is_clean() {
+        return Err(());
     }
-    if components.is_empty() {
+    if normalized.components().is_empty() {
         return Ok(Some(root.to_string()));
     }
+    let tail = normalized.components().join("/");
     let normalized = if root == "/" {
-        format!("/{}", components.join("/"))
+        format!("/{tail}")
     } else {
-        format!("~/{}", components.join("/"))
+        format!("~/{tail}")
     };
     Ok(Some(normalized))
 }
@@ -1978,6 +1973,22 @@ mod tests {
         }
         assert!(!is_protected_system_path("/var/tmp/../tmp/file"));
         assert!(is_protected_system_path("/../../etc/passwd"));
+    }
+
+    #[test]
+    fn sudo_path_normalization_preserves_alias_and_escape_contracts() {
+        assert_eq!(
+            normalize_lexical_path("${HOME}/.config/../.bashrc"),
+            Ok(Some("~/.bashrc".to_string()))
+        );
+        assert_eq!(
+            normalize_lexical_path("/usr//local/./bin/../sbin"),
+            Ok(Some("/usr/local/sbin".to_string()))
+        );
+        assert_eq!(normalize_lexical_path("/../../etc/passwd"), Err(()));
+        assert_eq!(normalize_lexical_path("~/../../root/.ssh"), Err(()));
+        assert_eq!(normalize_lexical_path(r"C:\Windows\System32"), Ok(None));
+        assert!(!is_protected_system_path(r"C:\etc\cron.d\payload"));
     }
 
     #[test]

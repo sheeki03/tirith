@@ -597,9 +597,8 @@ mod tests {
         // Serialize with the empty-baseline test below: that test sets
         // `TIRITH_PRIVATE_FETCH_ALLOW` process-wide, which (if it overlapped)
         // would relax the very localhost rejection this test asserts.
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global cloaking state");
         match check("http://localhost/") {
             Ok(_) => panic!("expected localhost target to be rejected"),
             Err(err) => assert!(
@@ -753,28 +752,6 @@ mod tests {
     }
 
     /// Snapshot an env var and restore it on `Drop`.
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     /// When the BASELINE (chrome, USER_AGENTS[0]) returns an empty body but other
     /// user-agents succeed, there is no reference to diff against and the check
     /// could not actually run. It MUST come back inconclusive (`Err`), never
@@ -795,10 +772,9 @@ mod tests {
 
         // Loopback fetches are SSRF-blocked by default; the carve-out opt-in is
         // process-wide, so serialize with other env-sensitive cloaking tests.
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _allow_private = EnvVarGuard::set("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global cloaking state");
+        global.set_env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");

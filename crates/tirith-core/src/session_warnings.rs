@@ -1807,61 +1807,7 @@ pub fn clear_session(session_id: &str) {
 mod tests {
     use super::*;
     use crate::verdict::{Evidence, Finding, RuleId, Severity};
-
-    #[cfg(unix)]
-    struct TestStateHome(Option<std::ffi::OsString>);
-
-    #[cfg(unix)]
-    impl TestStateHome {
-        fn install(path: &std::path::Path) -> Self {
-            let previous = std::env::var_os("XDG_STATE_HOME");
-            // SAFETY: every caller holds the crate-wide environment lock.
-            unsafe { std::env::set_var("XDG_STATE_HOME", path) };
-            Self(previous)
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for TestStateHome {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds the crate-wide environment lock.
-            unsafe {
-                match self.0.take() {
-                    Some(previous) => std::env::set_var("XDG_STATE_HOME", previous),
-                    None => std::env::remove_var("XDG_STATE_HOME"),
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    struct TestEnvVar {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl TestEnvVar {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: every caller holds the crate-wide environment lock.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for TestEnvVar {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds the crate-wide environment lock.
-            unsafe {
-                match self.previous.take() {
-                    Some(previous) => std::env::set_var(self.key, previous),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
+    use tirith_test_support::GlobalStateGuard;
 
     fn make_finding(rule_id: RuleId, severity: Severity) -> Finding {
         Finding {
@@ -2124,12 +2070,10 @@ mod tests {
     fn locked_writer_projects_fresh_mutation_before_persistence() {
         use crate::event_buffer::{EventKind, TypedEvent, MANIFEST_FLAG_KEY};
 
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let temporary = tempfile::tempdir().expect("isolated session privacy state");
-        let _state = TestStateHome::install(temporary.path());
-        let _audit = TestEnvVar::set("TIRITH_LOG", "0");
+        global_state.set_env("XDG_STATE_HOME", temporary.path());
+        global_state.set_env("TIRITH_LOG", "0");
         let canary = format!("ghp_canary_{}", "E".repeat(30));
         let session_id = "privacy-writer-session";
 
@@ -2212,12 +2156,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn locked_writer_refuses_privacy_changed_session_identity() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let temporary = tempfile::tempdir().expect("isolated session identity state");
-        let _state = TestStateHome::install(temporary.path());
-        let _audit = TestEnvVar::set("TIRITH_LOG", "0");
+        global_state.set_env("XDG_STATE_HOME", temporary.path());
+        global_state.set_env("TIRITH_LOG", "0");
         let session_id = "privacy-writer-identity";
         let canary = format!("ghp_canary_{}", "F".repeat(30));
 
@@ -2268,11 +2210,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         use std::time::{Duration, SystemTime};
 
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let temporary = tempfile::tempdir().expect("isolated GC state");
-        let _state = TestStateHome::install(temporary.path());
+        global_state.set_env("XDG_STATE_HOME", temporary.path());
 
         let prepare = |session_id: &str,
                        verdict: &crate::verdict::Verdict,
@@ -2474,13 +2414,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_record_and_load_cycle() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let dir = tempfile::tempdir().unwrap();
         let state_home = dir.path().join("state");
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        global_state.set_env("XDG_STATE_HOME", &state_home);
 
         let session_id = "test-session-rec-001";
 
@@ -2514,7 +2452,7 @@ mod tests {
         let session = load(session_id);
         assert_eq!(session.total_warnings, 0);
 
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        global_state.remove_env("XDG_STATE_HOME");
     }
 
     #[test]
@@ -2669,14 +2607,11 @@ mod tests {
 
     #[test]
     fn suppress_check_is_session_backed() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
+
         let sid = "test-suppress-1";
         // First sighting starts the cooldown and is NOT suppressed.
         assert!(!suppress_check(sid, "curl_pipe_shell", None, 3600));
@@ -2688,10 +2623,8 @@ mod tests {
         // The cooldown is persisted on the session record.
         let sw = load(sid);
         assert!(sw.cooldowns.contains_key("curl_pipe_shell"));
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("TIRITH_LOG");
-        }
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("TIRITH_LOG");
     }
 
     #[test]
@@ -2700,14 +2633,11 @@ mod tests {
         // place the expiry in the past and instantly expire the cooldown). After
         // clamping, the first sighting starts a far-future cooldown and the second
         // sighting (same key) is suppressed.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
+
         let sid = "test-suppress-overflow";
         // u64::MAX would overflow i64; the clamp keeps the expiry in the future.
         assert!(!suppress_check(sid, "curl_pipe_shell", None, u64::MAX));
@@ -2726,10 +2656,8 @@ mod tests {
             parsed > chrono::Utc::now(),
             "clamped expiry must be in the future, got {expiry}"
         );
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("TIRITH_LOG");
-        }
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("TIRITH_LOG");
     }
 
     /// W6 safety contract: a SUPPRESSED hit must emit a compact
@@ -2739,18 +2667,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn suppress_check_emits_finding_suppressed_rollup() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         // Isolate BOTH state (session record) and data (audit log) into the temp
         // dir, and ENABLE logging so the rollup is actually written.
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
-            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
-            std::env::set_var("TIRITH_LOG", "1");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path().join("state"));
+        global_state.set_env("XDG_DATA_HOME", dir.path().join("data"));
+        global_state.set_env("TIRITH_LOG", "1");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "test-suppress-rollup";
@@ -2777,12 +2701,11 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("TIRITH_LOG");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("XDG_DATA_HOME");
+        global_state.remove_env("TIRITH_LOG");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -2797,17 +2720,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn with_session_locked_write_is_atomic_and_leaves_no_temp() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "h12-atomic-session";
@@ -2854,15 +2773,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -2880,17 +2799,13 @@ mod tests {
     fn with_session_locked_refuses_symlinked_lock() {
         use crate::event_buffer::{EventKind, TypedEvent};
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "symlinked-lock-session";
@@ -2925,15 +2840,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -2947,17 +2862,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn suppress_check_prunes_expired_cooldowns_globally() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "prune-cooldowns-session";
@@ -2983,15 +2894,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -3007,17 +2918,13 @@ mod tests {
     fn with_session_locked_refuses_symlinked_session_file() {
         use crate::event_buffer::{EventKind, TypedEvent};
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "symlinked-session-file";
@@ -3054,15 +2961,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -3077,15 +2984,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn load_refuses_symlinked_session_file() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
 
         let result = std::panic::catch_unwind(|| {
             let sid = "symlink-read";
@@ -3110,11 +3013,11 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
         if let Err(e) = result {
@@ -3130,15 +3033,11 @@ mod tests {
     #[test]
     fn load_refuses_fifo_session_file() {
         use std::os::unix::ffi::OsStrExt;
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
 
         let result = std::panic::catch_unwind(|| {
             let sid = "fifo-read";
@@ -3161,11 +3060,11 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
         if let Err(e) = result {
@@ -3183,17 +3082,13 @@ mod tests {
         use crate::event_buffer::{EventKind, TypedEvent};
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::FileTypeExt;
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "fifo-write";
@@ -3226,15 +3121,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -3251,17 +3146,13 @@ mod tests {
     #[test]
     fn reader_degrades_but_writer_preserves_invalid_utf8_session() {
         use crate::event_buffer::{EventKind, TypedEvent};
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let sid = "invalid-utf8";
@@ -3307,15 +3198,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -3334,12 +3225,10 @@ mod tests {
     fn correlate_session_persists_marker_and_warning_atomically() {
         use crate::event_buffer::{EventKind, TypedEvent};
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
-        let _state_home = TestStateHome::install(dir.path());
-        let _audit_log = TestEnvVar::set("TIRITH_LOG", "0");
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let session_id = "w7-atomic-correlation";
@@ -3434,12 +3323,10 @@ mod tests {
     fn surfaced_correlation_not_re_emitted_while_source_events_live() {
         use crate::event_buffer::{EventKind, TypedEvent};
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
-        let _state_home = TestStateHome::install(dir.path());
-        let _audit_log = TestEnvVar::set("TIRITH_LOG", "0");
+        global_state.set_env("XDG_STATE_HOME", dir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             let session_id = "w7-surfaced-retention-e3";

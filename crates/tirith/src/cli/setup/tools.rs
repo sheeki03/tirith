@@ -1359,7 +1359,7 @@ fn write_owned_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_harness::{with_fake_env, EnvGuard};
+    use crate::cli::test_harness::{with_fake_env, CwdGuard, EnvGuard};
 
     #[cfg(unix)]
     #[test]
@@ -2576,7 +2576,7 @@ mod tests {
             // Descend into a subdirectory — setup must still write at repo root.
             let subdir = cwd.join("sub").join("dir");
             std::fs::create_dir_all(&subdir).unwrap();
-            std::env::set_current_dir(&subdir).unwrap();
+            let _cwd = CwdGuard::set(&subdir);
 
             setup_copilot_cli(&opts_for(Scope::Project)).unwrap();
 
@@ -2699,7 +2699,7 @@ mod tests {
             std::fs::create_dir_all(cwd.join(".kiro")).unwrap();
             let subdir = cwd.join("sub").join("dir");
             std::fs::create_dir_all(&subdir).unwrap();
-            std::env::set_current_dir(&subdir).unwrap();
+            let _cwd = CwdGuard::set(&subdir);
 
             setup_kiro(&opts_for(Scope::Project)).unwrap();
 

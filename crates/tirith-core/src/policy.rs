@@ -4248,11 +4248,10 @@ task_gate:
 
     #[test]
     fn remote_policy_cache_is_bound_to_endpoint_and_credential() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
         let cache = tempfile::tempdir().unwrap();
-        let _cache = EnvVarGuard::set("XDG_CACHE_HOME", cache.path());
+        global.set_env("XDG_CACHE_HOME", cache.path());
         let yaml = "paranoia: 4\n";
 
         cache_remote_policy("https://a.example/policy", "tenant-a-key", yaml).unwrap();
@@ -4509,9 +4508,8 @@ custom_rules:
 
     #[test]
     fn test_discover_applies_remote_fetch_fail_mode_when_configured() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
 
         let dir = tempfile::tempdir().unwrap();
         let policy_dir = dir.path().join(".tirith");
@@ -4526,25 +4524,20 @@ custom_rules:
         // be loaded via the ORG branch (TIRITH_POLICY_ROOT) for its `closed`
         // fetch-fail-mode to be honored. (A repo `.tirith/policy.yaml` could not
         // steer remote-fetch failure.)
-        unsafe { std::env::set_var("TIRITH_POLICY_ROOT", dir.path()) };
-        unsafe { std::env::set_var("TIRITH_SERVER_URL", "http://127.0.0.1") };
-        unsafe { std::env::set_var("TIRITH_API_KEY", "dummy") };
+        global.set_env("TIRITH_POLICY_ROOT", dir.path());
+        global.set_env("TIRITH_SERVER_URL", "http://127.0.0.1");
+        global.set_env("TIRITH_API_KEY", "dummy");
 
         let policy = Policy::discover(Some(dir.path().to_str().unwrap()));
         assert_eq!(policy.path.as_deref(), Some("fail-closed"));
         assert_eq!(policy.fail_mode, FailMode::Closed);
         assert!(!policy.allow_bypass_env_noninteractive);
-
-        unsafe { std::env::remove_var("TIRITH_API_KEY") };
-        unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
-        unsafe { std::env::remove_var("TIRITH_POLICY_ROOT") };
     }
 
     #[test]
     fn environment_url_never_reuses_stored_policy_key() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
         let dir = tempfile::tempdir().unwrap();
         let policy_dir = dir.path().join(".tirith");
         std::fs::create_dir_all(&policy_dir).unwrap();
@@ -4557,9 +4550,9 @@ custom_rules:
         )
         .unwrap();
 
-        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", dir.path());
-        let _url = EnvVarGuard::set("TIRITH_SERVER_URL", "http://127.0.0.1:1");
-        let _key = EnvVarGuard::unset("TIRITH_API_KEY");
+        global.set_env("TIRITH_POLICY_ROOT", dir.path());
+        global.set_env("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+        global.remove_env("TIRITH_API_KEY");
 
         let policy = Policy::discover(Some(dir.path().to_str().unwrap()));
         assert_eq!(
@@ -4588,17 +4581,16 @@ custom_rules:
         // `discover` fails closed (path `"fail-closed"`, fail_mode `Closed`,
         // bypass disabled). So observing the LOCAL values here proves no fetch
         // branch ran — `discover_local_only` never touched the network.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
 
         // Isolate from ambient runtime state: unset TIRITH_POLICY_ROOT (could
         // redirect discovery) and point XDG_STATE_HOME at an empty tempdir (no
         // incident flag → overrides are a no-op), so the assertions stay hermetic.
-        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        global.remove_env("TIRITH_POLICY_ROOT");
         let state = tempfile::tempdir().unwrap();
-        let _xdg_state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
-        let _xdg_config = EnvVarGuard::set("XDG_CONFIG_HOME", state.path().join("config"));
+        global.set_env("XDG_STATE_HOME", state.path());
+        global.set_env("XDG_CONFIG_HOME", state.path().join("config"));
         // Drop any incident-flag cache loaded by an earlier test so the lookup
         // re-reads against our isolated (empty) state dir.
         crate::incident::invalidate_cache();
@@ -4621,8 +4613,8 @@ custom_rules:
 
         // Env-configured server too — the other source `discover_resolved`
         // would honor. Both must be ignored by the offline path.
-        let _url = EnvVarGuard::set("TIRITH_SERVER_URL", "http://127.0.0.1:1");
-        let _key = EnvVarGuard::set("TIRITH_API_KEY", "env-key");
+        global.set_env("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+        global.set_env("TIRITH_API_KEY", "env-key");
 
         let policy = Policy::discover_local_only(Some(dir.path().to_str().unwrap()));
 
@@ -4669,13 +4661,12 @@ custom_rules:
     /// policy is KEPT.
     #[test]
     fn discover_local_only_neutralizes_repo_mcp_redact_injection() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
+        global.remove_env("TIRITH_POLICY_ROOT");
         let state = tempfile::tempdir().unwrap();
-        let _xdg_state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
-        let _xdg_config = EnvVarGuard::set("XDG_CONFIG_HOME", state.path().join("config"));
+        global.set_env("XDG_STATE_HOME", state.path());
+        global.set_env("XDG_CONFIG_HOME", state.path().join("config"));
         crate::incident::invalidate_cache();
 
         let dir = tempfile::tempdir().unwrap();
@@ -4714,13 +4705,12 @@ custom_rules:
     /// this (a repo can tighten the gateway, never weaken it).
     #[test]
     fn discover_local_only_keeps_repo_gateway_profile_secure() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
+        global.remove_env("TIRITH_POLICY_ROOT");
         let state = tempfile::tempdir().unwrap();
-        let _xdg_state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
-        let _xdg_config = EnvVarGuard::set("XDG_CONFIG_HOME", state.path().join("config"));
+        global.set_env("XDG_STATE_HOME", state.path());
+        global.set_env("XDG_CONFIG_HOME", state.path().join("config"));
         crate::incident::invalidate_cache();
 
         let dir = tempfile::tempdir().unwrap();
@@ -4740,36 +4730,6 @@ custom_rules:
         crate::incident::invalidate_cache();
     }
 
-    /// Snapshot an env var on construction and restore it on `Drop` (the
-    /// `TEST_ENV_LOCK` serializes env-mutating tests but does not restore).
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::remove_var(key) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     fn discovery_test_rule(id: &str, pattern: &str) -> CustomRule {
         CustomRule {
             id: id.to_string(),
@@ -4785,21 +4745,20 @@ custom_rules:
 
     #[test]
     fn empty_repo_policy_cannot_shadow_trusted_user_baseline() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
         let isolated = tempfile::tempdir().unwrap();
         let config_home = isolated.path().join("config");
-        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        global.set_env("XDG_CONFIG_HOME", &config_home);
         // `config_dir()` resolves through etcetera, which reads APPDATA on
         // Windows and ignores XDG_CONFIG_HOME entirely. Without these the user
         // baseline is never found there, discovery falls through to the repo,
         // and the scope assertion below sees `Repo` instead of `User`.
-        let _appdata = EnvVarGuard::set("APPDATA", &config_home);
-        let _local_appdata = EnvVarGuard::set("LOCALAPPDATA", &config_home);
-        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
-        let _url = EnvVarGuard::unset("TIRITH_SERVER_URL");
-        let _key = EnvVarGuard::unset("TIRITH_API_KEY");
+        global.set_env("APPDATA", &config_home);
+        global.set_env("LOCALAPPDATA", &config_home);
+        global.remove_env("TIRITH_POLICY_ROOT");
+        global.remove_env("TIRITH_SERVER_URL");
+        global.remove_env("TIRITH_API_KEY");
 
         let user_dir = config_home.join("tirith");
         std::fs::create_dir_all(&user_dir).unwrap();
@@ -4856,14 +4815,13 @@ custom_rules:
 
     #[test]
     fn hostile_repo_policy_only_adds_restrictions_to_trusted_org_baseline() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
         let isolated = tempfile::tempdir().unwrap();
         let config_home = isolated.path().join("config");
-        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
-        let _url = EnvVarGuard::unset("TIRITH_SERVER_URL");
-        let _key = EnvVarGuard::unset("TIRITH_API_KEY");
+        global.set_env("XDG_CONFIG_HOME", &config_home);
+        global.remove_env("TIRITH_SERVER_URL");
+        global.remove_env("TIRITH_API_KEY");
 
         let org = isolated.path().join("org");
         std::fs::create_dir_all(org.join(".tirith")).unwrap();
@@ -4893,7 +4851,7 @@ custom_rules:
             serde_yaml::to_string(&trusted).unwrap(),
         )
         .unwrap();
-        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", &org);
+        global.set_env("TIRITH_POLICY_ROOT", &org);
 
         let repo = isolated.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -4980,11 +4938,10 @@ custom_rules:
 
     #[test]
     fn discover_local_policy_path_prefers_policy_root_over_walkup() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
         let isolated_config = tempfile::tempdir().unwrap();
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", isolated_config.path());
+        global.set_env("XDG_CONFIG_HOME", isolated_config.path());
 
         // Both the TIRITH_POLICY_ROOT repo and the cwd carry their own policy.
         let root_repo = tempfile::tempdir().unwrap();
@@ -4993,7 +4950,7 @@ custom_rules:
             std::fs::create_dir_all(base.join(".tirith")).unwrap();
             std::fs::write(base.join(".tirith/policy.yaml"), "fail_mode: open\n").unwrap();
         }
-        let _root = EnvVarGuard::set("TIRITH_POLICY_ROOT", root_repo.path());
+        global.set_env("TIRITH_POLICY_ROOT", root_repo.path());
 
         assert_eq!(
             discover_local_policy_path(Some(cwd_repo.path().to_str().unwrap())),
@@ -5004,12 +4961,11 @@ custom_rules:
 
     #[test]
     fn discover_local_policy_path_walks_up_to_repo_root() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
         let isolated_config = tempfile::tempdir().unwrap();
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", isolated_config.path());
-        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        global.set_env("XDG_CONFIG_HOME", isolated_config.path());
+        global.remove_env("TIRITH_POLICY_ROOT");
 
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join(".git")).unwrap();
@@ -5027,12 +4983,11 @@ custom_rules:
 
     #[test]
     fn discover_local_policy_path_finds_cwd_policy_without_git() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
         let isolated_config = tempfile::tempdir().unwrap();
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", isolated_config.path());
-        let _root = EnvVarGuard::unset("TIRITH_POLICY_ROOT");
+        global.set_env("XDG_CONFIG_HOME", isolated_config.path());
+        global.remove_env("TIRITH_POLICY_ROOT");
 
         // Mimics `tirith policy init` run outside a git repo (e.g. in $HOME):
         // it writes cwd/.tirith/policy.yaml with no .git boundary anywhere.
@@ -5449,21 +5404,18 @@ custom_rules:
         use crate::extract::ScanContext;
         use crate::tokenize::ShellType;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
         // Pin policy discovery off so a stray .tirith/policy.yaml in cwd
         // can't bleed in. APPDATA covers the Windows path.
-        unsafe {
-            std::env::set_var("TIRITH_POLICY_ROOT", "/nonexistent-tirith-test-root");
-            std::env::set_var("XDG_CONFIG_HOME", "/nonexistent-tirith-test-config");
-            std::env::set_var("XDG_DATA_HOME", "/nonexistent-tirith-test-data");
-            std::env::set_var("XDG_STATE_HOME", "/nonexistent-tirith-test-state");
-            std::env::set_var("APPDATA", "/nonexistent-tirith-test-appdata");
-            std::env::remove_var("TIRITH_SERVER_URL");
-            std::env::remove_var("TIRITH_API_KEY");
-            std::env::remove_var("TIRITH_LOG");
-        }
+        global.set_env("TIRITH_POLICY_ROOT", "/nonexistent-tirith-test-root");
+        global.set_env("XDG_CONFIG_HOME", "/nonexistent-tirith-test-config");
+        global.set_env("XDG_DATA_HOME", "/nonexistent-tirith-test-data");
+        global.set_env("XDG_STATE_HOME", "/nonexistent-tirith-test-state");
+        global.set_env("APPDATA", "/nonexistent-tirith-test-appdata");
+        global.remove_env("TIRITH_SERVER_URL");
+        global.remove_env("TIRITH_API_KEY");
+        global.remove_env("TIRITH_LOG");
 
         // The engine itself produces the raw verdict; chunk-3 enforcement
         // happens in `post_process_verdict`. So a call to `analyze` must
@@ -5492,14 +5444,6 @@ custom_rules:
                     .any(|f| f.rule_id == crate::verdict::RuleId::AgentDeniedByPolicy),
                 "engine::analyze must never produce AgentDeniedByPolicy — that rule fires only in post_process_verdict"
             );
-        }
-
-        unsafe {
-            std::env::remove_var("TIRITH_POLICY_ROOT");
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("APPDATA");
         }
     }
 
@@ -5568,15 +5512,14 @@ custom_rules:
         // MUST raise an override that sits below it. We pin one
         // INCIDENT_ELEVATED_RULES entry ABOVE its incident level and another
         // BELOW, activate an incident, and assert the merge respects both.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
 
         // Point state_dir() (hence incident::flag_path()) at a tempdir so the
         // active-incident check reads our flag, never the real machine state.
         // state_dir() reads XDG_STATE_HOME on every platform (Windows included).
         let state = tempfile::tempdir().unwrap();
-        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", state.path());
+        global.set_env("XDG_STATE_HOME", state.path());
 
         // ExecRecentlyModified's incident level is High; pin it at Critical
         // (ABOVE) — must be preserved. CredentialFileSweep's incident level is

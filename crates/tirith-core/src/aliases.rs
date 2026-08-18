@@ -1551,36 +1551,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(name);
-            // SAFETY: every caller holds the crate-wide TEST_ENV_LOCK until this
-            // guard restores the previous value in Drop.
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds TEST_ENV_LOCK.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.name, value),
-                    None => std::env::remove_var(self.name),
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
     }
@@ -1612,12 +1582,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn runtime_alias_probes_reject_path_shadows_and_ignore_bash_env() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global alias test state");
         let temporary = tempfile::Builder::new()
             .prefix("tirith-alias-shadow-")
-            .tempdir_in(home::home_dir().expect("test account home"))
+            .tempdir_in(&global.roots().home)
             .unwrap();
         let shadow_bin = temporary.path().join("shadow-bin");
         std::fs::create_dir(&shadow_bin).unwrap();
@@ -1626,22 +1595,20 @@ mod tests {
         for shell in ["bash", "zsh", "fish"] {
             write_marker_executable(&shadow_bin.join(shell), &shadow_marker);
         }
-        {
-            let inherited = std::env::var_os("PATH").unwrap_or_default();
-            let mut path_entries = vec![shadow_bin.clone()];
-            path_entries.extend(std::env::split_paths(&inherited));
-            let shadow_path = std::env::join_paths(path_entries).unwrap();
-            let _path = EnvVarGuard::set("PATH", shadow_path);
-            for (shell, args) in [
-                ("bash", &["--norc", "--noprofile", "-c", "alias"][..]),
-                ("zsh", &["-f", "-c", "alias"][..]),
-                ("fish", &["--no-config", "-c", "functions --names"][..]),
-            ] {
-                assert!(
-                    matches!(run_no_rc(shell, args), RuntimeOutcome::Unsupported),
-                    "PATH-shadowed {shell} must be refused before execution"
-                );
-            }
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_entries = vec![shadow_bin.clone()];
+        path_entries.extend(std::env::split_paths(&inherited));
+        let shadow_path = std::env::join_paths(path_entries).unwrap();
+        global.set_env("PATH", shadow_path);
+        for (shell, args) in [
+            ("bash", &["--norc", "--noprofile", "-c", "alias"][..]),
+            ("zsh", &["-f", "-c", "alias"][..]),
+            ("fish", &["--no-config", "-c", "functions --names"][..]),
+        ] {
+            assert!(
+                matches!(run_no_rc(shell, args), RuntimeOutcome::Unsupported),
+                "PATH-shadowed {shell} must be refused before execution"
+            );
         }
         assert!(
             !shadow_marker.exists(),
@@ -1660,8 +1627,8 @@ mod tests {
         .unwrap();
         let trusted_path = std::env::join_paths([Path::new("/bin"), Path::new("/usr/bin")])
             .expect("construct fixed system PATH");
-        let _path = EnvVarGuard::set("PATH", trusted_path);
-        let _bash_env = EnvVarGuard::set("BASH_ENV", &bash_env);
+        global.set_env("PATH", trusted_path);
+        global.set_env("BASH_ENV", &bash_env);
         assert!(
             matches!(
                 run_no_rc("bash", &["--norc", "--noprofile", "-c", "alias"]),

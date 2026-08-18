@@ -12,6 +12,8 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use unicode_normalization::UnicodeNormalization as _;
 
+use crate::lexical_path::{LexicalPath, PathDialect};
+
 /// The upstream snapshot used for the vendored BIP-39 English wordlist.
 pub const BIP39_ENGLISH_SOURCE_REVISION: &str =
     "bitcoin/bips@ed4ffcb6a48d4dc4fdfc11cdba783c233db8c66e";
@@ -1535,25 +1537,20 @@ fn normalize_path_for_explicit_flavor(path: &str, flavor: SensitivePathFlavor) -
             raw.truncate(component_start + stream_offset);
         }
     }
-    let absolute = raw.starts_with('/');
-    let mut components: Vec<&str> = Vec::new();
-    for component in raw.split('/') {
-        match component {
-            "" | "." => {}
-            // Lexically cancelling a parent can cross a symlink trust boundary
-            // (`link/..`). Preserve it so earlier sensitive roots remain
-            // visible and classification fails conservatively.
-            ".." => components.push(component),
-            _ => components.push(component),
-        }
-    }
-    let joined = components.join("/");
-    let normalized = if absolute {
-        format!("/{joined}")
+    // Lexically cancelling a parent can cross a symlink trust boundary
+    // (`link/..`). Retain every parent token so earlier sensitive roots remain
+    // visible and classification fails conservatively. Alias expansion, ADS
+    // stripping, and the explicit macOS case policy remain classifier-owned.
+    let dialect = if flavor == SensitivePathFlavor::Windows {
+        PathDialect::Windows
     } else {
-        joined
+        PathDialect::Posix
     };
-    normalized
+    LexicalPath::parse_preserving_parents(&raw, dialect)
+        .map(|path| path.to_slash_string())
+        // Preserve the previous conservative surface for malformed strings;
+        // this classifier is not a filesystem-authorization boundary.
+        .unwrap_or(raw)
 }
 
 fn padded_path(path: &str) -> String {
@@ -3346,6 +3343,43 @@ mod tests {
                 "Linux Tier 1 became case-insensitive: {command}"
             );
         }
+    }
+
+    #[test]
+    fn shared_lexical_normalizer_preserves_path_flavor_contracts() {
+        assert_eq!(
+            normalize_path_for_explicit_flavor(
+                r#""$env:APPDATA"\Exodus\.\exodus.wallet:private"#,
+                SensitivePathFlavor::Windows,
+            ),
+            "appdata/roaming/exodus/exodus.wallet"
+        );
+        assert_eq!(
+            normalize_path_for_explicit_flavor(
+                "/Users/Alice/Library//Application Support/./Exodus/exodus.wallet",
+                SensitivePathFlavor::MacOs,
+            ),
+            "/users/alice/library/application support/exodus/exodus.wallet"
+        );
+        assert_eq!(
+            normalize_path_for_explicit_flavor(
+                "/Users/Alice/Library/Application Support/Exodus/exodus.wallet",
+                SensitivePathFlavor::Posix,
+            ),
+            "/Users/Alice/Library/Application Support/Exodus/exodus.wallet"
+        );
+        assert_eq!(
+            normalize_path_for_explicit_flavor(
+                r"C:\Users\Alice\Wallet\..\Electrum\wallets\default",
+                SensitivePathFlavor::Windows,
+            ),
+            "c:/users/alice/wallet/../electrum/wallets/default"
+        );
+        assert!(classify_path_for_flavor(
+            r"C:\Users\Alice\Wallet\..\documentation\readme.txt",
+            SensitivePathFlavor::Windows,
+        )
+        .is_some());
     }
 
     #[test]

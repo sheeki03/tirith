@@ -3353,6 +3353,7 @@ dependencies = [
  "tempfile",
  "tiny_http",
  "tirith-core",
+ "tirith-test-support",
  "tokio",
  "toml",
  "tower-lsp",
@@ -3402,6 +3403,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "tirith-test-support",
  "toml",
  "unicode-normalization",
  "unicode-script",
@@ -3449,6 +3451,13 @@ dependencies = [
  "rand_core 0.6.4",
  "serde_json",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tirith-test-support"
+version = "0.3.3"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

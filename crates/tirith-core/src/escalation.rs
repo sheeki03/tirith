@@ -4029,36 +4029,6 @@ mod tests {
         );
     }
 
-    /// RAII guard that snapshots an env var on construction and restores it (to its
-    /// prior value, or absent) on Drop, so a unix E2E test that sets
-    /// `XDG_STATE_HOME`/`TIRITH_LOG` does not leak that mutation into later tests.
-    /// Mirrors the `EnvVarGuard` used in `policy.rs`/`url_validate.rs`. Restoration
-    /// runs on unwind too, so the previous `catch_unwind` + unconditional
-    /// `remove_var` dance is no longer needed. Serialized by `TEST_ENV_LOCK`.
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let prev = std::env::var_os(key);
-            // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: serialized by TEST_ENV_LOCK; restore the prior value or remove.
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     /// W7 end-to-end: a SINGLE `rm a b c d` (four non-artifact paths) trips the
     /// MassFileDeletion correlation through the real `post_process_verdict` path,
     /// while `rm dist/x dist/y dist/z` (build artifacts) does not. This is the
@@ -4067,13 +4037,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn correlation_single_multipath_rm_trips_mass_deletion() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global escalation state");
         let dir = tempfile::tempdir().unwrap();
-        // Snapshot-and-restore the prior env so later tests are not mutated.
-        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", dir.path());
-        let _log = EnvVarGuard::set("TIRITH_LOG", "0");
+        global.set_env("XDG_STATE_HOME", dir.path());
+        global.set_env("TIRITH_LOG", "0");
 
         let policy = crate::policy::Policy::default();
 
@@ -4154,13 +4122,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn correlation_secret_write_then_network_reaches_verdict() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global escalation state");
         let dir = tempfile::tempdir().unwrap();
-        // Snapshot-and-restore the prior env so later tests are not mutated.
-        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", dir.path());
-        let _log = EnvVarGuard::set("TIRITH_LOG", "0");
+        global.set_env("XDG_STATE_HOME", dir.path());
+        global.set_env("TIRITH_LOG", "0");
 
         let policy = crate::policy::Policy::default();
         let session_id = "w7-secret-then-network";
@@ -4273,12 +4239,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn correlation_presentation_dedup_does_not_suppress_block() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global escalation state");
         let dir = tempfile::tempdir().unwrap();
-        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", dir.path());
-        let _log = EnvVarGuard::set("TIRITH_LOG", "0");
+        global.set_env("XDG_STATE_HOME", dir.path());
+        global.set_env("TIRITH_LOG", "0");
 
         let policy = crate::policy::Policy::default();
         let session_id = "w7-dedup-enforcement";

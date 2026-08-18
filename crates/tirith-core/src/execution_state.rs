@@ -4638,40 +4638,12 @@ fn validate_stable_id(kind: &str, value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::verdict::{Evidence, Finding, RuleId, Severity, Timings, Verdict};
-    use std::path::Path;
-
-    struct StateEnv {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl StateEnv {
-        fn install(path: &Path) -> Self {
-            let previous = std::env::var_os("XDG_STATE_HOME");
-            // SAFETY: every test using this helper holds TEST_ENV_LOCK until the
-            // guard restores the process environment.
-            unsafe { std::env::set_var("XDG_STATE_HOME", path) };
-            Self { previous }
-        }
-    }
-
-    impl Drop for StateEnv {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds TEST_ENV_LOCK.
-            unsafe {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-                    None => std::env::remove_var("XDG_STATE_HOME"),
-                }
-            }
-        }
-    }
+    use tirith_test_support::GlobalStateGuard;
 
     fn isolated_state(test: impl FnOnce(&tempfile::TempDir)) {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut environment = GlobalStateGuard::new().expect("isolate execution state");
         let temporary = tempfile::tempdir().expect("isolated state home");
-        let _environment = StateEnv::install(temporary.path());
+        environment.set_env("XDG_STATE_HOME", temporary.path());
         test(&temporary);
     }
 

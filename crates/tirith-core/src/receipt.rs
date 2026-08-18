@@ -1071,6 +1071,7 @@ fn sha2_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tirith_test_support::GlobalStateGuard;
 
     #[test]
     fn test_validate_sha256_valid() {
@@ -1215,11 +1216,8 @@ mod tests {
         // requested filename is a substituted receipt — verifying it would
         // check a DIFFERENT cached script while reporting success for the
         // requested one.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
+        let _environment = isolate_dirs(root.path());
         let dir = root.path().join("tirith").join("receipts");
         std::fs::create_dir_all(&dir).unwrap();
         let requested = "a".repeat(64);
@@ -1316,42 +1314,24 @@ mod tests {
 
     use crate::capsule::CapsuleCoverage;
 
-    /// A scoped env-var override that restores the prior value on drop. Local to
-    /// these tests so they do not depend on policy.rs's private guard.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, val: &std::path::Path) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::set_var(key, val);
-            EnvGuard { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     /// Point every directory env var [`crate::policy::data_dir`] /
     /// [`crate::policy::config_dir`] consult at `root`, on whichever platform the
     /// test runs (XDG on unix, APPDATA/LOCALAPPDATA on Windows), plus HOME so a
-    /// stray home lookup cannot escape. The guards restore on drop.
-    fn isolate_dirs(root: &std::path::Path) -> Vec<EnvGuard> {
-        vec![
-            EnvGuard::set("XDG_DATA_HOME", root),
-            EnvGuard::set("XDG_CONFIG_HOME", root),
-            EnvGuard::set("XDG_STATE_HOME", root),
-            EnvGuard::set("APPDATA", root),
-            EnvGuard::set("LOCALAPPDATA", root),
-            EnvGuard::set("HOME", root),
-            EnvGuard::set("USERPROFILE", root),
-        ]
+    /// stray home lookup cannot escape. The shared guard restores on drop.
+    fn isolate_dirs(root: &std::path::Path) -> GlobalStateGuard {
+        let mut environment = GlobalStateGuard::new().expect("isolate receipt directories");
+        for key in [
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "HOME",
+            "USERPROFILE",
+        ] {
+            environment.set_env(key, root);
+        }
+        environment
     }
 
     /// A sample capsule receipt with full deny-all coverage (what a clean
@@ -1645,17 +1625,10 @@ mod tests {
     // by the pkg_install receipt tests.
     #[cfg(unix)]
     fn record_saves_file_and_anchors_in_audit_chain() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
+        let mut environment = isolate_dirs(root.path());
         // Make sure logging is on for this test even if the ambient env set it off.
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        environment.set_env("TIRITH_LOG", "1");
 
         let r = sample_receipt();
         // require_signature=false: an unsigned (tamper-evident) anchor is fine here.
@@ -1698,16 +1671,9 @@ mod tests {
 
     #[test]
     fn record_lists_alongside_script_receipts_without_cross_parse() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        let mut environment = isolate_dirs(root.path());
+        environment.set_env("TIRITH_LOG", "1");
 
         // Save one artifact-scan receipt.
         let r = sample_receipt();
@@ -1750,13 +1716,10 @@ mod tests {
 
     #[test]
     fn record_fails_closed_when_signature_required_but_unavailable() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         // Isolate config so no real audit-signing.key is present -> signing
         // unavailable.
-        let _guards = isolate_dirs(root.path());
+        let _environment = isolate_dirs(root.path());
 
         let r = sample_receipt();
         // require_signature=true with no signing key must fail closed and write
@@ -1790,16 +1753,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn forged_committed_receipt_is_rejected_before_write_or_anchor() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        let mut environment = isolate_dirs(root.path());
+        environment.set_env("TIRITH_LOG", "1");
 
         let private = sample_receipt();
         let mut forged = private.clone();
@@ -1825,16 +1781,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unsafe_or_stale_receipt_id_is_rejected_before_write_or_anchor() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        let mut environment = isolate_dirs(root.path());
+        environment.set_env("TIRITH_LOG", "1");
 
         let mut forged = sample_receipt();
         forged.receipt_id = "../../escape".to_string();
@@ -1857,18 +1806,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn signed_private_capability_is_required_for_committed_recording() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
+        let mut environment = isolate_dirs(root.path());
         let tirith_dir = root.path().join("tirith");
         plant_signing_key(&tirith_dir);
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        environment.set_env("TIRITH_LOG", "1");
 
         let private = sample_receipt();
         let private_id = private.receipt_id.clone();
@@ -1918,20 +1860,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn record_fails_closed_when_signature_required_but_logging_off() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
+        let mut environment = isolate_dirs(root.path());
         // config_dir() == data_dir() == <root>/tirith under the isolated XDG vars.
         let tirith_dir = root.path().join("tirith");
         plant_signing_key(&tirith_dir);
         // Logging OFF -> the receipt anchor is Skipped.
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "0");
+        environment.set_env("TIRITH_LOG", "0");
 
         // Sanity: the signing key IS available (so this is NOT the key-absent path).
         assert!(
@@ -1958,16 +1893,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn record_skipped_is_ok_unsigned_when_signature_not_required() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "0");
+        let mut environment = isolate_dirs(root.path());
+        environment.set_env("TIRITH_LOG", "0");
 
         let r = sample_receipt();
         let recorded = r
@@ -1992,17 +1920,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn record_degrades_to_anchor_warning_when_chain_append_fails() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let _guards = isolate_dirs(root.path());
+        let mut environment = isolate_dirs(root.path());
         // Keep logging ON so the anchor is attempted (not Skipped).
-        let _log = EnvGuard {
-            key: "TIRITH_LOG",
-            prev: std::env::var_os("TIRITH_LOG"),
-        };
-        std::env::set_var("TIRITH_LOG", "1");
+        environment.set_env("TIRITH_LOG", "1");
 
         // Put a DIRECTORY at the audit log path so the append open() fails (EISDIR)
         // -> AuditWrite::Failed -> ReceiptAnchor::Failed.

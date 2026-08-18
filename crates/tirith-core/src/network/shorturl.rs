@@ -316,7 +316,6 @@ mod tests {
     #[test]
     fn production_client_ignores_ambient_proxy_environment() {
         use std::error::Error as _;
-        use std::ffi::OsString;
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -335,32 +334,8 @@ mod tests {
             "no_proxy",
         ];
 
-        struct RestoreEnvironment(Vec<(&'static str, Option<OsString>)>);
-
-        impl Drop for RestoreEnvironment {
-            fn drop(&mut self) {
-                // SAFETY: the test holds the crate-wide TEST_ENV_LOCK until this
-                // guard restores every proxy variable.
-                unsafe {
-                    for (name, value) in self.0.drain(..) {
-                        match value {
-                            Some(value) => std::env::set_var(name, value),
-                            None => std::env::remove_var(name),
-                        }
-                    }
-                }
-            }
-        }
-
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = RestoreEnvironment(
-            PROXY_KEYS
-                .iter()
-                .map(|&name| (name, std::env::var_os(name)))
-                .collect(),
-        );
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global short-URL state");
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local proxy trap");
         listener
@@ -413,14 +388,10 @@ mod tests {
                 "all-proxy-bypass.example.test",
             ),
         ] {
-            // SAFETY: process-environment mutation is serialized by
-            // TEST_ENV_LOCK and restored by RestoreEnvironment on every exit.
-            unsafe {
-                for name in PROXY_KEYS {
-                    std::env::remove_var(name);
-                }
-                std::env::set_var(proxy_key, &proxy_url);
+            for name in PROXY_KEYS {
+                global.remove_env(name);
             }
+            global.set_env(proxy_key, &proxy_url);
 
             let resolver = crate::ssrf_guard::fetch_resolver_with_lookup_for_test(move |host| {
                 if host != expected_host {

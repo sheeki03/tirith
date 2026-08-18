@@ -1,0 +1,1 @@
+npx --yes hardhat@2.22.0 run deploy.js && pnpm add left-pad@1.3.0

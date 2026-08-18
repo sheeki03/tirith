@@ -2015,6 +2015,7 @@ fn sha256_reader<R: Read>(reader: &mut R) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tirith_test_support::GlobalStateGuard;
 
     /// Unlimited creation budget for backup-helper unit tests.
     fn test_budget() -> CreationBudget {
@@ -2050,13 +2051,11 @@ mod tests {
     fn list_and_purge_bind_metadata_to_private_directory_identity() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let tmp = tempfile::tempdir().unwrap();
         let previous_state = std::env::var_os("XDG_STATE_HOME");
         // SAFETY: serialized by the crate-wide test environment lock.
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        global_state.set_env("XDG_STATE_HOME", tmp.path());
 
         let outcome = (|| -> Result<(Vec<CheckpointListEntry>, PurgeResult, bool, u32), String> {
             let base = try_checkpoints_dir().ok_or("checkpoint dir unavailable")?;
@@ -2099,11 +2098,11 @@ mod tests {
             Ok((listed, purged, checkpoint_dir.exists(), mode))
         })();
 
-        // SAFETY: restore the process environment before making assertions.
-        unsafe {
+        // Restore the isolated environment before making assertions.
+        {
             match previous_state {
-                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(value) => global_state.set_env("XDG_STATE_HOME", value),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
 
@@ -2120,13 +2119,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn purge_ignores_symlinked_checkpoint_entries() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let tmp = tempfile::tempdir().unwrap();
         let previous_state = std::env::var_os("XDG_STATE_HOME");
         // SAFETY: serialized by the crate-wide test environment lock.
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        global_state.set_env("XDG_STATE_HOME", tmp.path());
 
         let outcome = (|| -> Result<(PurgeResult, bool), String> {
             let base = secure_checkpoints_dir()?;
@@ -2144,11 +2141,11 @@ mod tests {
             Ok((result, outside.join("sentinel").exists()))
         })();
 
-        // SAFETY: restore the process environment before making assertions.
-        unsafe {
+        // Restore the isolated environment before making assertions.
+        {
             match previous_state {
-                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(value) => global_state.set_env("XDG_STATE_HOME", value),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
 
@@ -2265,11 +2262,9 @@ mod tests {
         //
         // `validate_restore_path` rejects absolute original paths, so the
         // checkpointed paths must be relative. We chdir into a temp workdir
-        // (serialized by TEST_ENV_LOCK, the same boundary the env mutation
+        // (serialized by GlobalStateGuard, the same boundary the env mutation
         // below relies on) and checkpoint by bare filename.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -2278,15 +2273,17 @@ mod tests {
         let state_dir = tmpdir.path().join("state");
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         // Relative names that pass validate_restore_path; resolved against `workdir`.
         let name_a = "a.txt";
         let name_b = "b.txt";
 
-        let run = || -> Result<RestoreReport, String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+        let mut run = || -> Result<RestoreReport, String> {
+            global_state
+                .set_cwd(&workdir)
+                .map_err(|e| format!("chdir: {e}"))?;
 
             fs::write(name_a, "alpha contents").map_err(|e| format!("write a: {e}"))?;
             fs::write(name_b, "bravo contents").map_err(|e| format!("write b: {e}"))?;
@@ -2333,11 +2330,11 @@ mod tests {
 
         // Restore cwd and env before assertions so cleanup runs even on failure.
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
         match prev_state {
-            Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            Some(val) => global_state.set_env("XDG_STATE_HOME", val),
+            None => global_state.remove_env("XDG_STATE_HOME"),
         }
 
         let report = result.expect("restore_reported should succeed");
@@ -2375,9 +2372,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_reported_happy_path() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -2389,20 +2384,20 @@ mod tests {
         let prev_data = std::env::var("XDG_DATA_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules. Point the
+        // GlobalStateGuard restores the exact prior process state.
         // audit log at the temp data dir and ENABLE logging so the restore
         // emission is observable.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("XDG_DATA_HOME", &data_dir);
-            std::env::set_var("TIRITH_LOG", "1");
-        }
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("XDG_DATA_HOME", &data_dir);
+        global_state.set_env("TIRITH_LOG", "1");
 
         let name_a = "a.txt";
         let name_b = "b.txt";
 
-        let run = || -> Result<RestoreReport, String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+        let mut run = || -> Result<RestoreReport, String> {
+            global_state
+                .set_cwd(&workdir)
+                .map_err(|e| format!("chdir: {e}"))?;
             fs::write(name_a, "original alpha").map_err(|e| format!("write a: {e}"))?;
             fs::write(name_b, "original bravo").map_err(|e| format!("write b: {e}"))?;
             let meta = create(&[name_a, name_b], Some("rm -rf project"))?;
@@ -2421,20 +2416,20 @@ mod tests {
 
         // Restore cwd + env before assertions so cleanup runs even on failure.
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_data {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
+                Some(v) => global_state.set_env("XDG_DATA_HOME", v),
+                None => global_state.remove_env("XDG_DATA_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -2486,9 +2481,7 @@ mod tests {
     fn test_restore_preserves_file_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -2498,15 +2491,15 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "secret.txt";
-        let run = || -> Result<RestoreReport, String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+        let mut run = || -> Result<RestoreReport, String> {
+            global_state
+                .set_cwd(&workdir)
+                .map_err(|e| format!("chdir: {e}"))?;
             fs::write(name, "top secret").map_err(|e| format!("write: {e}"))?;
             // Lock the original file down to owner-read/write only.
             fs::set_permissions(name, fs::Permissions::from_mode(0o600))
@@ -2525,16 +2518,16 @@ mod tests {
             .map(|m| m.permissions().mode() & 0o777);
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -2562,15 +2555,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_refuses_symlinked_checkpoint_dir() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         // A tempdir-scoped absolute target the manifest would restore to if the
         // symlink guard regressed. Scoping it under `tmpdir` (instead of a fixed
@@ -2624,11 +2615,11 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by crate::TEST_ENV_LOCK; restore regardless.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
         if let Err(e) = outcome {
@@ -2701,9 +2692,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_refuses_symlinked_destination() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -2716,16 +2705,16 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "victim.txt";
         let outside_for_run = outside.clone();
-        let run = || -> Result<RestoreReport, String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+        let mut run = || -> Result<RestoreReport, String> {
+            global_state
+                .set_cwd(&workdir)
+                .map_err(|e| format!("chdir: {e}"))?;
             fs::write(name, "checkpointed bytes").map_err(|e| format!("write: {e}"))?;
             let meta = create(&[name], Some("rm -rf project"))?;
             // Remove the live file and replace it with a symlink that escapes the
@@ -2741,16 +2730,16 @@ mod tests {
 
         // Restore cwd + env before assertions so cleanup runs even on failure.
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -2779,19 +2768,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_reported_absolute_path_restores() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         // An ABSOLUTE path under the tempdir (not a symlink) — exactly the shape
         // create() records for an auto-checkpoint of an absolute target. Canonicalize
@@ -2815,14 +2800,14 @@ mod tests {
         let result = run();
         let live = fs::read_to_string(&abs_file).ok();
 
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -2915,9 +2900,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_reported_relative_path_anchors_to_capture_root() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         // Canonicalize so the macOS /var -> /private/var symlink does not trip the
@@ -2932,22 +2915,24 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "note.txt";
-        let run = || -> Result<RestoreReport, String> {
+        let mut run = || -> Result<RestoreReport, String> {
             // Capture in dir A with a RELATIVE name (capture_root := dir A).
-            std::env::set_current_dir(&dir_a).map_err(|e| format!("chdir A: {e}"))?;
+            global_state
+                .set_cwd(&dir_a)
+                .map_err(|e| format!("chdir A: {e}"))?;
             fs::write(name, "captured bytes").map_err(|e| format!("write: {e}"))?;
             let meta = create(&[name], Some("rm -rf ."))?;
             // Mutate the live file in A so a successful restore is observable.
             fs::write(name, "MUTATED").map_err(|e| format!("rewrite: {e}"))?;
             // Restore from a DIFFERENT cwd (dir B).
-            std::env::set_current_dir(&dir_b).map_err(|e| format!("chdir B: {e}"))?;
+            global_state
+                .set_cwd(&dir_b)
+                .map_err(|e| format!("chdir B: {e}"))?;
             restore_reported(&meta.id)
         };
 
@@ -2956,16 +2941,16 @@ mod tests {
         let leaked_b = dir_b.join(name).exists();
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -2992,17 +2977,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_diff_rejects_traversal_ids() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let tmpdir = tempfile::tempdir().unwrap();
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", tmpdir.path());
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", tmpdir.path());
+        global_state.set_env("TIRITH_LOG", "0");
 
         let result = std::panic::catch_unwind(|| {
             assert!(
@@ -3019,15 +3000,15 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by crate::TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
         if let Err(e) = result {
@@ -3044,9 +3025,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_diff_relative_path_anchors_to_capture_root() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         // Canonicalize so the macOS /var -> /private/var symlink does not trip the
@@ -3061,39 +3040,41 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "note.txt";
-        let run = || -> Result<Vec<DiffEntry>, String> {
+        let mut run = || -> Result<Vec<DiffEntry>, String> {
             // Capture in dir A with a RELATIVE name (capture_root := dir A).
-            std::env::set_current_dir(&dir_a).map_err(|e| format!("chdir A: {e}"))?;
+            global_state
+                .set_cwd(&dir_a)
+                .map_err(|e| format!("chdir A: {e}"))?;
             fs::write(name, "captured bytes").map_err(|e| format!("write: {e}"))?;
             let meta = create(&[name], Some("rm -rf ."))?;
             // Mutate the live file in A so a correctly-anchored diff sees Modified.
             fs::write(name, "MUTATED").map_err(|e| format!("rewrite: {e}"))?;
             // Diff from a DIFFERENT cwd (dir B), where no `note.txt` exists.
-            std::env::set_current_dir(&dir_b).map_err(|e| format!("chdir B: {e}"))?;
+            global_state
+                .set_cwd(&dir_b)
+                .map_err(|e| format!("chdir B: {e}"))?;
             diff(&meta.id)
         };
 
         let result = run();
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        // SAFETY: serialized by crate::TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
+        // GlobalStateGuard restores the exact prior process state.
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -3121,9 +3102,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_diff_regular_file_replaced_by_symlink_is_modified() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         // Canonicalize so the macOS /var -> /private/var symlink does not trip the
@@ -3136,15 +3115,15 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "note.txt";
-        let run = || -> Result<Vec<DiffEntry>, String> {
-            std::env::set_current_dir(&dir_a).map_err(|e| format!("chdir A: {e}"))?;
+        let mut run = || -> Result<Vec<DiffEntry>, String> {
+            global_state
+                .set_cwd(&dir_a)
+                .map_err(|e| format!("chdir A: {e}"))?;
             // Capture a REGULAR file.
             fs::write(name, "captured bytes").map_err(|e| format!("write: {e}"))?;
             let meta = create(&[name], Some("rm -rf ."))?;
@@ -3161,16 +3140,16 @@ mod tests {
         let result = run();
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -3238,9 +3217,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_reported_legacy_relative_without_root_is_rejected() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(tmpdir.path()).unwrap();
@@ -3251,14 +3228,12 @@ mod tests {
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_log = std::env::var("TIRITH_LOG").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
+        global_state.set_env("TIRITH_LOG", "0");
 
         let name = "legacy.txt";
-        let run = || -> Result<RestoreReport, String> {
+        let mut run = || -> Result<RestoreReport, String> {
             // Hand-build a pre-F6 checkpoint: meta.json WITHOUT capture_root, a
             // manifest with a RELATIVE original_path, and a matching blob.
             let cp_base = try_checkpoints_dir().ok_or("checkpoint dir unavailable")?;
@@ -3298,7 +3273,9 @@ mod tests {
                 .map_err(|e| format!("manifest: {e}"))?;
 
             // Restore from a cwd where a leaked write would be observable.
-            std::env::set_current_dir(&cwd_dir).map_err(|e| format!("chdir: {e}"))?;
+            global_state
+                .set_cwd(&cwd_dir)
+                .map_err(|e| format!("chdir: {e}"))?;
             restore_reported(&id)
         };
 
@@ -3306,16 +3283,16 @@ mod tests {
         let leaked = cwd_dir.join(name).exists();
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
             match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
+                Some(v) => global_state.set_env("TIRITH_LOG", v),
+                None => global_state.remove_env("TIRITH_LOG"),
             }
         }
 
@@ -3341,9 +3318,7 @@ mod tests {
     fn test_create_and_purge_removes_expired() {
         // create_and_purge() must create a new checkpoint AND purge age-expired
         // ones in a single call.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -3353,8 +3328,8 @@ mod tests {
         let state_dir = tmpdir.path().join("state");
 
         let prev = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         // Seed an ancient checkpoint (60 days old, past the 30-day default).
         let cp_base = state_dir.join("tirith/checkpoints");
@@ -3388,8 +3363,8 @@ mod tests {
 
         // Restore env before assertions so cleanup runs even on assertion failure.
         match prev {
-            Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            Some(val) => global_state.set_env("XDG_STATE_HOME", val),
+            None => global_state.remove_env("XDG_STATE_HOME"),
         }
 
         assert!(result.is_ok(), "create_and_purge failed: {result:?}");
@@ -3559,21 +3534,19 @@ mod tests {
         // F10 end-to-end: `restore_reported` must reject a traversal/absolute id
         // up front (before reading any manifest), so an attacker cannot point the
         // restore at a checkpoint directory outside the store.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         let traversal = restore_reported("../../../../etc");
         let absolute = restore_reported("/tmp/evil");
 
         match prev_state {
-            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+            None => global_state.remove_env("XDG_STATE_HOME"),
         }
 
         assert!(
@@ -3726,9 +3699,7 @@ mod tests {
         // crash-atomic write, the published files are always whole: assert both
         // parse, the manifest covers every captured file, meta carries a
         // `capture_root`, and the checkpoint dir has no stray temp siblings.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let workdir = tmpdir.path().join("project");
@@ -3736,11 +3707,13 @@ mod tests {
         let state_dir = tmpdir.path().join("state");
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
         let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
-        let run = || -> Result<(CheckpointMeta, PathBuf), String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
+        let mut run = || -> Result<(CheckpointMeta, PathBuf), String> {
+            global_state
+                .set_cwd(&workdir)
+                .map_err(|e| format!("chdir: {e}"))?;
             fs::write("a.txt", "alpha").map_err(|e| format!("write a: {e}"))?;
             fs::write("b.txt", "bravo").map_err(|e| format!("write b: {e}"))?;
             let meta = create(&["a.txt", "b.txt"], Some("rm -rf project"))?;
@@ -3752,11 +3725,11 @@ mod tests {
         let result = run();
 
         if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
+            let _ = global_state.set_cwd(dir);
         }
         match prev_state {
-            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+            None => global_state.remove_env("XDG_STATE_HOME"),
         }
 
         let (meta, cp_dir) = result.expect("create should succeed");
@@ -3802,9 +3775,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn create_aborts_and_cleans_up_when_total_byte_budget_exceeded() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
@@ -3818,8 +3789,8 @@ mod tests {
         fs::write(&file_b, vec![0xBBu8; 3072]).unwrap();
 
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         let a = file_a.to_string_lossy().into_owned();
         let b = file_b.to_string_lossy().into_owned();
@@ -3836,10 +3807,10 @@ mod tests {
                 .unwrap_or(0)
         });
 
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
 
@@ -3864,9 +3835,7 @@ mod tests {
     fn restore_applies_per_path_modes_and_recreates_empty_dirs() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
@@ -3888,8 +3857,8 @@ mod tests {
         fs::set_permissions(&creds_copy, fs::Permissions::from_mode(0o644)).unwrap();
 
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         let root = workdir.to_string_lossy().into_owned();
         let outcome = (|| -> Result<(RestoreReport, PathBuf), String> {
@@ -3905,10 +3874,10 @@ mod tests {
             Ok((report, tmpdir.path().join("store").join(&meta.id)))
         })();
 
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
 
@@ -3952,9 +3921,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_refuses_symlinked_intermediate_parent() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let tmpdir = tempfile::tempdir().unwrap();
         let state_dir = tmpdir.path().join("state");
@@ -3969,8 +3936,8 @@ mod tests {
         fs::write(&victim_file, "ORIGINAL").unwrap();
 
         let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_dir) };
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("XDG_STATE_HOME", &state_dir);
 
         let root = workdir.to_string_lossy().into_owned();
         let outcome = (|| -> Result<RestoreReport, String> {
@@ -3983,10 +3950,10 @@ mod tests {
             restore_reported(&meta.id)
         })();
 
-        unsafe {
+        {
             match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+                Some(v) => global_state.set_env("XDG_STATE_HOME", v),
+                None => global_state.remove_env("XDG_STATE_HOME"),
             }
         }
 

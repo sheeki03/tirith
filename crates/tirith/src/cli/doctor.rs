@@ -2850,9 +2850,10 @@ mod tests {
 
     // --- collect_policy_paths (#112) ---------------------------------------
     //
-    // Each test isolates `TIRITH_POLICY_ROOT` and `XDG_CONFIG_HOME` (which
-    // `with_fake_env` does not fake) so machine-level values can't leak in; cwd
-    // is passed explicitly.
+    // `with_fake_env` installs isolated values for `TIRITH_POLICY_ROOT` and
+    // `XDG_CONFIG_HOME`; these tests remove both so they exercise the fallback
+    // discovery order rather than the explicit-root branches. Cwd is passed
+    // explicitly.
 
     #[test]
     fn collect_policy_paths_finds_repo_root_policy() {
@@ -3666,9 +3667,9 @@ mod tests {
     /// `protection_mode_from_status`, so they must agree for every status value.
     #[test]
     fn doctor_quick_and_prompt_status_agree_on_protection_mode() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut environment = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Restore ambient `TIRITH_STATUS` on Drop; overwritten per-iteration.
-        let _status_guard = EnvGuard::remove("TIRITH_STATUS");
+        environment.remove_env("TIRITH_STATUS");
         // `gather_quick_info` now prefers `TIRITH_BASH_EFFECTIVE_PROTECTION`; a
         // dev running `cargo test` inside a tirith-protected shell would have it
         // ambiently exported, which would override the per-iteration
@@ -3676,10 +3677,7 @@ mod tests {
         let _eff_guard = EnvGuard::remove("TIRITH_BASH_EFFECTIVE_PROTECTION");
 
         for status in ["blocks", "warn-only", "degraded", "off", "", "futureValue"] {
-            // SAFETY: serialized via ENV_LOCK above; restored by the guard.
-            unsafe {
-                std::env::set_var("TIRITH_STATUS", status);
-            }
+            environment.set_env("TIRITH_STATUS", status);
             let doctor_mode = gather_quick_info().protection_mode;
             let prompt_mode = crate::cli::prompt_status::protection_mode_for_test();
             assert_eq!(

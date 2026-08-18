@@ -112,6 +112,7 @@ http-body-util = "0.1"
 
 [dev-dependencies]
 tirith-core = { workspace = true, features = ["test-network-seams"] }
+tirith-test-support = { workspace = true }
 mockito = "1"
 ed25519-dalek = { workspace = true }
 # Build synthetic wheels (ZIP archives) in the `package inspect` / `scan`

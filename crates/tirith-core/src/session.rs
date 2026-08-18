@@ -503,13 +503,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_fallback_file_roundtrip() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let dir = tempfile::tempdir().unwrap();
-        let state_home = dir.path().join("state");
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        let _global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global session state");
 
         let scope = "test-integration-abcd1234";
         let id = load_or_create_fallback_file(scope);
@@ -526,8 +521,6 @@ mod tests {
             let perms = std::fs::metadata(&path).unwrap().permissions();
             assert_eq!(perms.mode() & 0o777, 0o600);
         }
-
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     /// A symlink planted at the fallback path must NOT be followed: the no-follow
@@ -536,20 +529,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_load_fallback_refuses_symlink_and_regenerates() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let dir = tempfile::tempdir().unwrap();
-        let state_home = dir.path().join("state");
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        let global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global session state");
 
         let scope = "symlink-test-abcd1234";
         let path = fallback_file_path(scope).expect("a fallback path");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         // Plant a sentinel and a symlink at the fallback path pointing to it.
-        let sentinel = dir.path().join("sentinel.txt");
+        let sentinel = global.roots().root.join("sentinel.txt");
         let sentinel_id = "11111111-2222-3333-4444-555555555555";
         std::fs::write(&sentinel, format!("{sentinel_id}\n")).unwrap();
         std::os::unix::fs::symlink(&sentinel, &path).unwrap();
@@ -581,8 +569,6 @@ mod tests {
             format!("{id}\n"),
             "the fallback file must contain the regenerated id"
         );
-
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     /// `write_fallback_file` publishes the id atomically: the file holds exactly
@@ -591,13 +577,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_write_fallback_atomic_replaces_and_leaves_no_temp() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let dir = tempfile::tempdir().unwrap();
-        let state_home = dir.path().join("state");
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        let _global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global session state");
 
         let scope = "atomic-write-test-abcd1234";
         let path = fallback_file_path(scope).expect("a fallback path");
@@ -625,8 +606,6 @@ mod tests {
             leftovers.is_empty(),
             "no temp file must remain after an atomic publish, found: {leftovers:?}"
         );
-
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     #[cfg(unix)]

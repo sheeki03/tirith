@@ -3488,6 +3488,7 @@ fn hash_download(path: &Path) -> Result<String, ResolverError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tirith_test_support::GlobalStateGuard;
 
     fn allow_all() -> ResolverAllowances {
         ResolverAllowances {
@@ -3817,29 +3818,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn isolated_env_ignores_forged_windows_directory_variables() {
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let old_system_root = std::env::var_os("SystemRoot");
-        let old_windir = std::env::var_os("windir");
-        // SAFETY: TEST_ENV_LOCK serializes process-environment mutation.
-        unsafe {
-            std::env::set_var("SystemRoot", r"C:\attacker-root");
-            std::env::set_var("windir", r"C:\attacker-windir");
-        }
+        let mut environment = GlobalStateGuard::new().expect("isolate resolver environment");
+        environment.set_env("SystemRoot", r"C:\attacker-root");
+        environment.set_env("windir", r"C:\attacker-windir");
         let directory = tempfile::tempdir().unwrap();
         let env = isolated_env(directory.path(), Path::new(r"C:\Python\python.exe"));
-        // SAFETY: TEST_ENV_LOCK remains held and both original values are restored.
-        unsafe {
-            match old_system_root {
-                Some(value) => std::env::set_var("SystemRoot", value),
-                None => std::env::remove_var("SystemRoot"),
-            }
-            match old_windir {
-                Some(value) => std::env::set_var("windir", value),
-                None => std::env::remove_var("windir"),
-            }
-        }
 
         let map: BTreeMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         assert_ne!(map.get("SystemRoot").copied(), Some(r"C:\attacker-root"));
@@ -4335,39 +4318,19 @@ certifi==2024.2.2 \\
     #[cfg(windows)]
     #[test]
     fn forged_windows_system_roots_cannot_auto_trust_path_tools() {
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut environment = GlobalStateGuard::new().expect("isolate resolver environment");
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("uv.exe"), b"not a trusted uv").unwrap();
         std::fs::write(directory.path().join("python.exe"), b"not a trusted python").unwrap();
         let path = std::env::join_paths([directory.path()]).unwrap();
-        let variables = [
-            ("ProgramFiles", std::env::var_os("ProgramFiles")),
-            ("ProgramFiles(x86)", std::env::var_os("ProgramFiles(x86)")),
-            ("SystemRoot", std::env::var_os("SystemRoot")),
-            ("PATHEXT", std::env::var_os("PATHEXT")),
-        ];
-        // SAFETY: TEST_ENV_LOCK serializes process-environment mutation.
-        unsafe {
-            std::env::set_var("ProgramFiles", directory.path());
-            std::env::set_var("ProgramFiles(x86)", directory.path());
-            std::env::set_var("SystemRoot", directory.path());
-            std::env::set_var("PATHEXT", ".EXE");
-        }
+        environment.set_env("ProgramFiles", directory.path());
+        environment.set_env("ProgramFiles(x86)", directory.path());
+        environment.set_env("SystemRoot", directory.path());
+        environment.set_env("PATHEXT", ".EXE");
 
         let uv = resolve_tool_on_path("uv", &["uv"], &path, &[]);
         let python = resolve_tool_on_path("python", &["python3", "python"], &path, &[]);
 
-        // SAFETY: TEST_ENV_LOCK remains held and each original value is restored.
-        unsafe {
-            for (name, value) in variables {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
         for result in [uv, python] {
             let error = result.unwrap_err();
             assert!(
@@ -4386,16 +4349,12 @@ certifi==2024.2.2 \\
     #[cfg(unix)]
     #[test]
     fn resolver_tool_enrollment_pin_binds_canonical_path_and_digest() {
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let mut environment = GlobalStateGuard::new().expect("isolate resolver enrollment");
         let root = tempfile::Builder::new()
             .prefix("tirith-resolver-enrollment-")
             .tempdir_in(home::home_dir().expect("test home"))
             .unwrap();
-        // SAFETY: TEST_ENV_LOCK serializes environment mutation across tests.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", root.path()) };
+        environment.set_env("XDG_CONFIG_HOME", root.path());
 
         let tool_dir = root.path().join("tools");
         std::fs::create_dir(&tool_dir).unwrap();
@@ -4415,14 +4374,6 @@ certifi==2024.2.2 \\
         assert!(resolver_tool_pin_matches(&canonical).unwrap());
         write_fake_bin(&canonical, "#!/bin/sh\nexit 7\n");
         assert!(!resolver_tool_pin_matches(&canonical).unwrap());
-
-        // SAFETY: TEST_ENV_LOCK remains held and the previous value is restored.
-        unsafe {
-            match old_xdg {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
     }
 
     #[cfg(unix)]
@@ -4549,26 +4500,21 @@ certifi==2024.2.2 \\
 
     #[cfg(unix)]
     struct ResolverEnrollmentTestEnv {
-        previous_xdg_config_home: Option<std::ffi::OsString>,
         root: tempfile::TempDir,
-        _environment: std::sync::MutexGuard<'static, ()>,
+        _environment: GlobalStateGuard,
     }
 
     #[cfg(unix)]
     impl ResolverEnrollmentTestEnv {
         fn new() -> Self {
-            let environment = crate::TEST_ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+            let mut environment =
+                GlobalStateGuard::new().expect("isolate resolver public API environment");
             let root = tempfile::Builder::new()
                 .prefix("tirith-resolver-public-api-")
                 .tempdir_in(home::home_dir().expect("test home"))
                 .unwrap();
-            // SAFETY: TEST_ENV_LOCK is held until this guard is dropped.
-            unsafe { std::env::set_var("XDG_CONFIG_HOME", root.path().join("config")) };
+            environment.set_env("XDG_CONFIG_HOME", root.path().join("config"));
             Self {
-                previous_xdg_config_home,
                 root,
                 _environment: environment,
             }
@@ -4604,20 +4550,6 @@ certifi==2024.2.2 \\
                 &serde_json::to_vec_pretty(&store).unwrap(),
             )
             .unwrap();
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for ResolverEnrollmentTestEnv {
-        fn drop(&mut self) {
-            // SAFETY: TEST_ENV_LOCK is still held while the prior process
-            // environment value is restored.
-            unsafe {
-                match self.previous_xdg_config_home.take() {
-                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-            }
         }
     }
 

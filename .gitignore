@@ -12,11 +12,37 @@
 
 # Fuzz artifacts
 fuzz/artifacts/
-fuzz/corpus/
+fuzz/corpus/*
+!fuzz/corpus/lexical_path/
+fuzz/corpus/lexical_path/*
+!fuzz/corpus/lexical_path/posix-above-root
+!fuzz/corpus/lexical_path/posix-normalized-policy
+!fuzz/corpus/lexical_path/relative-leading-parent
+!fuzz/corpus/lexical_path/unicode-components
+!fuzz/corpus/lexical_path/windows-device
+!fuzz/corpus/lexical_path/windows-drive-absolute
+!fuzz/corpus/lexical_path/windows-drive-relative
+!fuzz/corpus/lexical_path/windows-invalid-unc
+!fuzz/corpus/lexical_path/windows-unc
+!fuzz/corpus/lexical_path/windows-verbatim-drive
+!fuzz/corpus/lexical_path/windows-verbatim-unc
+!fuzz/corpus/npm_command/
+fuzz/corpus/npm_command/*
+!fuzz/corpus/npm_command/exec-child-boundary
+!fuzz/corpus/npm_command/install-scoped-packages
+!fuzz/corpus/npm_command/runner-shell-chain
+!fuzz/corpus/web3_command/
+fuzz/corpus/web3_command/*
+!fuzz/corpus/web3_command/cast-send-keystore
+!fuzz/corpus/web3_command/nested-package-runner
+!fuzz/corpus/web3_command/powershell-solana-deploy
+!fuzz/corpus/workflow_artifact/
+fuzz/corpus/workflow_artifact/*
+!fuzz/corpus/workflow_artifact/consumer-download-exec
+!fuzz/corpus/workflow_artifact/dynamic-workflow
+!fuzz/corpus/workflow_artifact/producer-upload
 fuzz/target/
-# Not currently load-bearing — CI runs `cargo fuzz run` without --locked.
-# Re-track if the workflow switches to --locked for reproducibility.
-fuzz/Cargo.lock
+# `fuzz/Cargo.lock` is deliberately tracked and verified by the fuzz workflow.
 
 # Local env
 .env

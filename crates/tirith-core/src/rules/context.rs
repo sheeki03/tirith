@@ -1317,6 +1317,21 @@ fn rule_id_human(id: &RuleId) -> &'static str {
 mod tests {
     use super::*;
 
+    struct DisabledContextDetection {
+        _global: tirith_test_support::GlobalStateGuard,
+    }
+
+    impl DisabledContextDetection {
+        fn new() -> Self {
+            let mut global = tirith_test_support::GlobalStateGuard::new()
+                .expect("isolate process-global context-rule state");
+            global.set_env("TIRITH_CONTEXT_DETECT_DISABLE", "1");
+            global.after_restore(crate::context_detect::invalidate_cache);
+            crate::context_detect::invalidate_cache();
+            Self { _global: global }
+        }
+    }
+
     fn policy_with_label(label_key: &str, criticality: &str) -> Policy {
         let mut p = Policy {
             context_guard_enabled: true,
@@ -1512,14 +1527,7 @@ mod tests {
 
     #[test]
     fn context_detection_failure_blocks_when_guard_has_provider_labels() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // SAFETY: serialized via TEST_ENV_LOCK.
-        unsafe {
-            std::env::set_var("TIRITH_CONTEXT_DETECT_DISABLE", "1");
-        }
-        crate::context_detect::invalidate_cache();
+        let _disabled = DisabledContextDetection::new();
         let policy = policy_with_label("kube:prod-us-east", "critical");
         let findings = check(
             "kubectl delete namespace payments",
@@ -1529,10 +1537,6 @@ mod tests {
         assert!(findings.iter().any(|finding| {
             finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
         }));
-        unsafe {
-            std::env::remove_var("TIRITH_CONTEXT_DETECT_DISABLE");
-        }
-        crate::context_detect::invalidate_cache();
     }
 
     #[test]

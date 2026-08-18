@@ -1,0 +1,1 @@
+{"on":{"workflow_run":{"workflows":["build"],"types":["completed"]}},"jobs":{"consume":{"steps":[{"uses":"actions/download-artifact@v4","with":{"name":"dist","path":"incoming"}},{"run":"bash incoming/run.sh"}]}}}

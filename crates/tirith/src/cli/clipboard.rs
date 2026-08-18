@@ -1180,7 +1180,7 @@ fn is_service_loaded() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_harness::ENV_LOCK;
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
     use tirith_core::verdict::Action;
 
     /// Regression (CodeRabbit Major): `copy()` analyzes a LOCAL FILE, so it must pass
@@ -1211,23 +1211,11 @@ mod tests {
         );
         std::fs::write(tirith_state.join("clipboard_source.json"), record_json).unwrap();
 
-        let prev_xdg = std::env::var_os("XDG_STATE_HOME");
-        // SAFETY: serialized via ENV_LOCK; restored below.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", state_dir.display().to_string());
-        }
+        let _state = EnvGuard::set("XDG_STATE_HOME", &state_dir);
 
         // Copy path passes `AbsentOrInvalid`; positive control reuses the record via `Unread`.
         let absent = analyze_as_paste(input, ClipboardSourceState::AbsentOrInvalid);
         let unread = analyze_as_paste(input, ClipboardSourceState::Unread);
-
-        // SAFETY: serialized via ENV_LOCK.
-        unsafe {
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-        }
 
         // Copy path (`AbsentOrInvalid`): no mismatch finding despite a matching record on disk.
         assert!(

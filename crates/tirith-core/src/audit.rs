@@ -2627,36 +2627,7 @@ fn redact_command(cmd: &str, custom_patterns: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::verdict::{Action, Verdict};
-
-    struct TestEnvVar {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl TestEnvVar {
-        fn set(name: &'static str, value: &std::path::Path) -> Self {
-            let previous = std::env::var_os(name);
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-
-        fn set_str(name: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(name);
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for TestEnvVar {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.name, value),
-                    None => std::env::remove_var(self.name),
-                }
-            }
-        }
-    }
+    use tirith_test_support::GlobalStateGuard;
 
     /// Write a signing key to `path` with secure (0600, owner-only) permissions so
     /// `audit_signing_secret`'s unix permission gate accepts it. A plain
@@ -2756,19 +2727,16 @@ mod tests {
 
     #[test]
     fn audit_persistence_never_contains_multiline_secret_or_raw_digest() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let directory = tempfile::tempdir().unwrap();
         let log_path = directory.path().join("secret-safe.jsonl");
         let secret = format!("0x{}", "11".repeat(32));
         let command = format!("{{\n  \"PRIVATE_KEY\"\n  :\n  \"{secret}\"\n}}");
         let raw_digest = sha256_hex(command.as_bytes());
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::remove_var("TIRITH_SERVER_URL");
-            std::env::remove_var("TIRITH_API_KEY");
-        }
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
+
         let mut verdict = Verdict::allow_fast(3, crate::verdict::Timings::default());
         verdict.policy_path_used = Some(format!("PRIVATE_KEY={secret}"));
         verdict.manifest_allowed_match = Some(format!("PRIVATE_KEY={secret}"));
@@ -2791,7 +2759,7 @@ mod tests {
         assert!(!persisted.contains(&secret[..18]), "{persisted}");
         assert!(!persisted.contains(&raw_digest), "{persisted}");
         assert!(persisted.contains("REDACTED"), "{persisted}");
-        unsafe { std::env::remove_var("TIRITH_LOG") };
+        global_state.remove_env("TIRITH_LOG");
     }
 
     #[test]
@@ -2882,9 +2850,7 @@ mod tests {
 
     #[test]
     fn hook_trust_and_invalid_receipt_sinks_never_persist_raw_secret_material() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let directory = tempfile::tempdir().expect("audit isolation");
         let secret = format!("0x{}", "22".repeat(32));
         let bare_scalar = format!("{}1", "0".repeat(63));
@@ -2900,15 +2866,13 @@ mod tests {
         let ttl = tainted("ttl");
         let scope = tainted("scope");
 
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", directory.path());
-            std::env::set_var("XDG_CONFIG_HOME", directory.path());
-            std::env::set_var("APPDATA", directory.path());
-            std::env::set_var("LOCALAPPDATA", directory.path());
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::remove_var("TIRITH_SERVER_URL");
-            std::env::remove_var("TIRITH_API_KEY");
-        }
+        global_state.set_env("XDG_DATA_HOME", directory.path());
+        global_state.set_env("XDG_CONFIG_HOME", directory.path());
+        global_state.set_env("APPDATA", directory.path());
+        global_state.set_env("LOCALAPPDATA", directory.path());
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
 
         log_hook_event(&integration, &hook_type, &event, Some(1.0), Some(&detail));
         log_trust_change(&pattern, Some(&rule_id), &action, Some(&ttl), &scope);
@@ -2941,24 +2905,20 @@ mod tests {
         let report = verify_audit_log(&log_path, None);
         assert!(report.ok, "projected chain failed: {:?}", report.problems);
 
-        unsafe {
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::remove_var("APPDATA");
-            std::env::remove_var("LOCALAPPDATA");
-            std::env::remove_var("TIRITH_LOG");
-        }
+        global_state.remove_env("XDG_DATA_HOME");
+        global_state.remove_env("XDG_CONFIG_HOME");
+        global_state.remove_env("APPDATA");
+        global_state.remove_env("LOCALAPPDATA");
+        global_state.remove_env("TIRITH_LOG");
     }
 
     #[test]
     fn test_tirith_log_disabled() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.jsonl");
 
-        unsafe { std::env::set_var("TIRITH_LOG", "0") };
+        global_state.set_env("TIRITH_LOG", "0");
 
         let verdict = Verdict {
             action: Action::Allow,
@@ -2998,19 +2958,17 @@ mod tests {
             "log file should not be created when TIRITH_LOG=0"
         );
 
-        unsafe { std::env::remove_var("TIRITH_LOG") };
+        global_state.remove_env("TIRITH_LOG");
     }
 
     #[test]
     fn required_raw_audit_rejects_disabled_and_real_write_failure() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let directory = tempfile::tempdir().unwrap();
         let log_path = directory.path().join("required.jsonl");
         let verdict = Verdict::allow_fast(1, crate::verdict::Timings::default());
 
-        unsafe { std::env::set_var("TIRITH_LOG", "0") };
+        global_state.set_env("TIRITH_LOG", "0");
         assert!(log_verdict_with_raw(
             &verdict,
             "test",
@@ -3033,32 +2991,28 @@ mod tests {
         .expect_err("required append must reject TIRITH_LOG=0");
         assert!(disabled.contains("disabled"), "{disabled}");
 
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        global_state.set_env("TIRITH_LOG", "1");
         std::fs::create_dir(&log_path).unwrap();
         let write_failure =
             log_verdict_with_raw_required(&verdict, "test", Some(log_path), None, &[], None, None)
                 .expect_err("directory-as-log must be a real required write failure");
         assert!(write_failure.contains("cannot open"), "{write_failure}");
-        unsafe { std::env::remove_var("TIRITH_LOG") };
+        global_state.remove_env("TIRITH_LOG");
     }
 
     #[test]
     fn test_audit_diagnostics_disabled_by_default() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::remove_var("TIRITH_AUDIT_DEBUG") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.remove_env("TIRITH_AUDIT_DEBUG");
         assert!(!audit_diagnostics_enabled());
     }
 
     #[test]
     fn test_audit_diagnostics_enabled_by_env() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_AUDIT_DEBUG", "true") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_AUDIT_DEBUG", "true");
         assert!(audit_diagnostics_enabled());
-        unsafe { std::env::remove_var("TIRITH_AUDIT_DEBUG") };
+        global_state.remove_env("TIRITH_AUDIT_DEBUG");
     }
 
     #[cfg(unix)]
@@ -3092,19 +3046,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_remote_audit_upload_spools_when_configured() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("audit.jsonl");
         let state_home = dir.path().join("state");
 
         // Invalid local URL so drain returns early after spooling.
-        unsafe { std::env::set_var("TIRITH_SERVER_URL", "http://127.0.0.1") };
-        unsafe { std::env::set_var("TIRITH_API_KEY", "dummy") };
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
-        unsafe { std::env::remove_var("TIRITH_LOG") };
+        global_state.set_env("TIRITH_SERVER_URL", "http://127.0.0.1");
+        global_state.set_env("TIRITH_API_KEY", "dummy");
+        global_state.set_env("XDG_STATE_HOME", &state_home);
+        global_state.remove_env("TIRITH_LOG");
 
         let verdict = Verdict {
             action: Action::Allow,
@@ -3138,9 +3090,9 @@ mod tests {
         let spool = state_home.join("tirith").join("audit-queue.jsonl");
         assert!(spool.exists(), "remote audit events should be spooled");
 
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
-        unsafe { std::env::remove_var("TIRITH_API_KEY") };
-        unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("TIRITH_API_KEY");
+        global_state.remove_env("TIRITH_SERVER_URL");
     }
 
     #[cfg(unix)]
@@ -3148,17 +3100,15 @@ mod tests {
     fn test_audit_refuses_symlink() {
         // Hermetic: pin every env input that could otherwise route this through
         // `AuditWrite::Skipped` (which would yield Ok and break the assertion).
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let dir = tempfile::tempdir().unwrap();
         let state_home = dir.path().join("state");
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
-        unsafe { std::env::set_var("APPDATA", &state_home) };
-        unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
-        unsafe { std::env::remove_var("TIRITH_API_KEY") };
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_STATE_HOME", &state_home);
+        global_state.set_env("APPDATA", &state_home);
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
 
         let target = dir.path().join("target");
         std::fs::write(&target, "original").unwrap();
@@ -3207,9 +3157,9 @@ mod tests {
             "audit should refuse to write through symlink"
         );
 
-        unsafe { std::env::remove_var("TIRITH_LOG") };
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
-        unsafe { std::env::remove_var("APPDATA") };
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("APPDATA");
     }
 
     /// CR2: a write that cannot be durably recorded must surface as a failure,
@@ -3217,17 +3167,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_audit_durability_failure_is_reported() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let dir = tempfile::tempdir().unwrap();
         let state_home = dir.path().join("state");
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
-        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
-        unsafe { std::env::set_var("APPDATA", &state_home) };
-        unsafe { std::env::remove_var("TIRITH_SERVER_URL") };
-        unsafe { std::env::remove_var("TIRITH_API_KEY") };
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_STATE_HOME", &state_home);
+        global_state.set_env("APPDATA", &state_home);
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
 
         // A directory can't be opened for append → must report Failed.
         let log_path = dir.path().join("not-a-file");
@@ -3266,9 +3214,9 @@ mod tests {
             "an audit write that cannot be durably recorded must report a failure"
         );
 
-        unsafe { std::env::remove_var("TIRITH_LOG") };
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
-        unsafe { std::env::remove_var("APPDATA") };
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("APPDATA");
     }
 
     /// `agent_origin` must flow through into the audit entry and survive the JSON round-trip.
@@ -3278,20 +3226,16 @@ mod tests {
         use crate::agent_origin::AgentOrigin;
         use crate::audit_aggregator;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("audit.jsonl");
         let state_home = dir.path().join("state");
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_STATE_HOME", &state_home);
-            std::env::set_var("APPDATA", &state_home);
-            std::env::remove_var("TIRITH_SERVER_URL");
-            std::env::remove_var("TIRITH_API_KEY");
-        }
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_STATE_HOME", &state_home);
+        global_state.set_env("APPDATA", &state_home);
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
 
         let mut verdict = Verdict {
             action: Action::Allow,
@@ -3329,11 +3273,9 @@ mod tests {
             other => panic!("expected Agent variant, got {other:?}"),
         }
 
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("APPDATA");
-        }
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("APPDATA");
     }
 
     /// An old log line without an `agent_origin` field must still parse (serde-default).
@@ -3342,9 +3284,7 @@ mod tests {
     fn test_audit_record_parses_legacy_line_without_agent_origin() {
         use crate::audit_aggregator;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("legacy.jsonl");
@@ -3366,20 +3306,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_audit_entry_omits_field_when_no_origin() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("noorigin.jsonl");
         let state_home = dir.path().join("state");
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_STATE_HOME", &state_home);
-            std::env::set_var("APPDATA", &state_home);
-            std::env::remove_var("TIRITH_SERVER_URL");
-            std::env::remove_var("TIRITH_API_KEY");
-        }
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_STATE_HOME", &state_home);
+        global_state.set_env("APPDATA", &state_home);
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
 
         let verdict = Verdict {
             action: Action::Allow,
@@ -3410,11 +3346,9 @@ mod tests {
             "the field must be omitted when None: line was {line}"
         );
 
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("APPDATA");
-        }
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_STATE_HOME");
+        global_state.remove_env("APPDATA");
     }
 
     // finding_id_for / parse_finding_id round-trip — shape contract is
@@ -3513,10 +3447,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn audit_chain_append_then_verify_ok() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
         append_chain(&log, &["Allow", "Block", "Warn"]);
@@ -3537,10 +3469,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn audit_chain_detects_edit() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
         append_chain(&log, &["Allow", "Block", "Warn"]);
@@ -3558,10 +3488,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn audit_chain_detects_truncation() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
         append_chain(&log, &["Allow", "Block", "Warn"]);
@@ -3582,10 +3510,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn audit_chain_tolerates_legacy_prefix() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
         std::fs::write(
@@ -3610,10 +3536,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn audit_verify_expected_head() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
         append_chain(&log, &["Allow", "Block"]);
@@ -3631,10 +3555,8 @@ mod tests {
         // Simulate the documented crash window: the last log line synced to disk
         // but the process died before write_head ran, so the head receipt still
         // points at the SECOND-to-last line. Verification must accept this.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
         append_chain(&log, &["Allow", "Block", "Warn"]);
@@ -3674,10 +3596,8 @@ mod tests {
         // A head pointing at NEITHER the last nor the second-to-last line is not
         // the crash window; it is treated as a possible truncation (the n-2 arm
         // must not over-tolerate). Pins the boundary between the n-2 arm and else.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
         append_chain(&log, &["Allow", "Block", "Warn"]);
@@ -3709,10 +3629,8 @@ mod tests {
         // F3: a receipt whose head_hash MATCHES the current tail but whose `count`
         // is wrong (a stale/rewritten receipt reusing an old hash) must be rejected
         // with a clear count-mismatch status, not silently accepted.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
         append_chain(&log, &["Allow", "Block", "Warn"]);
@@ -3757,9 +3675,7 @@ mod tests {
         // leaves the chain intact (the chain hash excludes `sig`) and the line
         // becomes byte-identical to an unsigned one. The head receipt's
         // signing_enabled flag makes the downgrade detectable.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
@@ -3772,11 +3688,9 @@ mod tests {
         );
         std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_CONFIG_HOME", &cfg);
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
 
         let result = std::panic::catch_unwind(|| {
             let log = dir.path().join("audit.jsonl");
@@ -3821,11 +3735,10 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -3843,9 +3756,7 @@ mod tests {
         // `.pub` is still accepted, so a legitimate signed log verifies ok.
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
@@ -3858,11 +3769,9 @@ mod tests {
         let pub_path = cfg.join("tirith").join("audit-signing.pub");
         std::fs::write(&pub_path, vk.to_bytes()).unwrap();
 
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_CONFIG_HOME", &cfg);
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
 
         let result = std::panic::catch_unwind(|| {
             let log = dir.path().join("audit.jsonl");
@@ -3905,11 +3814,10 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -3922,9 +3830,7 @@ mod tests {
         // `head.signing_enabled` to false (the strip-all + head-rewrite downgrade)
         // invalidates the head signature, so verify must fail on "head signature
         // invalid". An intact signed log (with a signed head) verifies ok.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
@@ -3936,11 +3842,9 @@ mod tests {
         );
         std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_CONFIG_HOME", &cfg);
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
 
         let result = std::panic::catch_unwind(|| {
             let log = dir.path().join("audit.jsonl");
@@ -3989,11 +3893,10 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -4005,9 +3908,7 @@ mod tests {
         // A signed log must NOT verify `ok` when no verifying key is available:
         // the signatures present were never checked, so the verifier cannot
         // authenticate the log. Reporting ok here would be a fail-open hole.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
@@ -4018,11 +3919,9 @@ mod tests {
             &sk.to_bytes(),
         );
 
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_CONFIG_HOME", &cfg);
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
 
         let result = std::panic::catch_unwind(|| {
             let log = dir.path().join("audit.jsonl");
@@ -4047,11 +3946,10 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -4063,9 +3961,7 @@ mod tests {
         // Once a log is signed, an append that cannot sign (key removed) must
         // FAIL rather than silently write an unsigned line that verify cannot
         // distinguish from a stripped-signature attack.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
@@ -4073,11 +3969,9 @@ mod tests {
         let key_path = cfg.join("tirith").join("audit-signing.key");
         write_signing_key(&key_path, &sk.to_bytes());
 
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_CONFIG_HOME", &cfg);
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
 
         let result = std::panic::catch_unwind(|| {
             let log = dir.path().join("audit.jsonl");
@@ -4102,11 +3996,10 @@ mod tests {
             assert_eq!(n, 1, "the unsigned entry must not have been appended");
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -4119,19 +4012,15 @@ mod tests {
         // FAIL (and not append). Verification would otherwise expect every chained
         // line to be signed and flag the intact, legitimately-unsigned prior
         // entries as downgrades. The operator must rotate the log first.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
         let key_path = cfg.join("tirith").join("audit-signing.key");
 
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_CONFIG_HOME", &cfg);
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
 
         let result = std::panic::catch_unwind(|| {
             let log = dir.path().join("audit.jsonl");
@@ -4169,11 +4058,10 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -4185,10 +4073,8 @@ mod tests {
         // The exclusive fs2 lock must serialize concurrent in-process writers so
         // no interleave breaks a prev_hash. Spawn several threads each appending
         // a few entries to ONE log, then verify the chain and line count.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
 
@@ -4227,9 +4113,7 @@ mod tests {
         // Signature verification (and signed_lines counting) must run for it too;
         // the prior bug only verified inside the `prev_hash` branch, so a tampered
         // signature on a single-line log went unauthenticated and uncounted.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
@@ -4241,11 +4125,9 @@ mod tests {
         );
         std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_CONFIG_HOME", &cfg);
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
 
         let result = std::panic::catch_unwind(|| {
             let log = dir.path().join("audit.jsonl");
@@ -4306,11 +4188,10 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -4325,9 +4206,7 @@ mod tests {
         // gated on `is_chained` would miss it and reopen the bypass on the first
         // entry. The check now fires whenever signing is expected and a sig is
         // absent, regardless of chaining.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         std::fs::create_dir_all(cfg.join("tirith")).unwrap();
@@ -4339,11 +4218,9 @@ mod tests {
         );
         std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_CONFIG_HOME", &cfg);
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
 
         let result = std::panic::catch_unwind(|| {
             let log = dir.path().join("audit.jsonl");
@@ -4392,11 +4269,10 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -4408,10 +4284,8 @@ mod tests {
         // F11: deleting the `.head` sidecar of an existing CHAINED log must NOT
         // pass verification (truncation could no longer be ruled out). It stays
         // verifiable only via an explicit out-of-band --expected-head anchor.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LOG", "1") };
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
+        global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
         append_chain(&log, &["Allow", "Block", "Warn"]);
@@ -4462,9 +4336,7 @@ mod tests {
         // sidecar must STILL fail closed (no --expected-head): the receipt is what
         // binds `signing_enabled`, so dropping it makes a truncation-to-empty of a
         // signed log unverifiable. The prior gate (`chained_lines > 0`) missed this.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("cfg");
@@ -4478,11 +4350,9 @@ mod tests {
         );
         std::fs::write(cfg.join("tirith").join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
-        // SAFETY: serialized by TEST_ENV_LOCK across all modules.
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_CONFIG_HOME", &cfg);
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &cfg);
 
         let result = std::panic::catch_unwind(|| {
             let log = dir.path().join("audit.jsonl");
@@ -4528,11 +4398,10 @@ mod tests {
             );
         });
 
-        // SAFETY: serialized by TEST_ENV_LOCK; restore regardless of outcome.
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        // GlobalStateGuard restores the exact prior process state.
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -4541,9 +4410,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn signing_configuration_rejects_stripped_genesis_and_head_downgrade() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let directory = tempfile::tempdir().unwrap();
         let config_home = directory.path().join("config");
         let config_dir = config_home.join("tirith");
@@ -4559,10 +4426,8 @@ mod tests {
         )
         .unwrap();
 
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        }
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &config_home);
 
         let result = std::panic::catch_unwind(|| {
             let log = directory.path().join("audit.jsonl");
@@ -4591,10 +4456,9 @@ mod tests {
             );
         });
 
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        global_state.remove_env("TIRITH_LOG");
+        global_state.remove_env("XDG_CONFIG_HOME");
+
         if let Err(error) = result {
             std::panic::resume_unwind(error);
         }
@@ -4606,9 +4470,7 @@ mod tests {
         // F11 boundary: a purely LEGACY/unchained log (no prev_hash entries) has
         // no truncation anchor by design, so a missing head sidecar must remain
         // tolerant (ok stays true). Only chained logs fail closed.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
         // Write two legacy lines (no prev_hash, no head sidecar) directly.
@@ -4743,9 +4605,7 @@ mod tests {
 
     #[test]
     fn tail_head_line_count_and_problem_caps_fail_closed_at_boundaries() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let directory = tempfile::tempdir().unwrap();
 
         let exact_tail = directory.path().join("exact-tail.jsonl");
@@ -4796,13 +4656,11 @@ mod tests {
 
     #[test]
     fn leading_unsigned_tracking_is_aggregated_constant_space() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let directory = tempfile::tempdir().unwrap();
         let config_home = directory.path().join("empty-config");
         std::fs::create_dir_all(&config_home).unwrap();
-        let _config = TestEnvVar::set("XDG_CONFIG_HOME", &config_home);
+        global_state.set_env("XDG_CONFIG_HOME", &config_home);
 
         let log = directory.path().join("leading-unsigned.jsonl");
         let unsigned_count = 4096usize;
@@ -4830,14 +4688,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn append_rejects_oversized_existing_tail_and_serialized_line() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let directory = tempfile::tempdir().unwrap();
         let config_home = directory.path().join("empty-config");
         std::fs::create_dir_all(&config_home).unwrap();
-        let _log_enabled = TestEnvVar::set_str("TIRITH_LOG", "1");
-        let _config = TestEnvVar::set("XDG_CONFIG_HOME", &config_home);
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_CONFIG_HOME", &config_home);
 
         let oversized_tail = directory.path().join("append-tail.jsonl");
         std::fs::write(&oversized_tail, vec![b'x'; MAX_AUDIT_TAIL_BYTES + 1]).unwrap();
@@ -4869,15 +4725,13 @@ mod tests {
     fn signing_key_permissions_are_enforced() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
 
         let dir = tempfile::tempdir().unwrap();
         let cfg_home = dir.path().join("config");
         // config_dir() resolves to <XDG_CONFIG_HOME>/tirith on unix (etcetera base
         // strategy), so point it at our temp dir.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+        global_state.set_env("XDG_CONFIG_HOME", &cfg_home);
 
         let key_dir = cfg_home.join("tirith");
         std::fs::create_dir_all(&key_dir).unwrap();
@@ -4904,7 +4758,7 @@ mod tests {
             "the 32-byte secret must round-trip"
         );
 
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        global_state.remove_env("XDG_CONFIG_HOME");
     }
 
     /// The D6 chain anchor: when audit signing is configured, the
@@ -4916,20 +4770,16 @@ mod tests {
     // lock), which is unavailable on a Windows append handle.
     #[cfg(unix)]
     fn artifact_receipt_anchor_is_signed_when_signing_enabled() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         // Isolate BOTH the data dir (so the anchor lands in our temp log) and the
         // config dir (so the signing key is the one we plant).
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", dir.path());
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
-            std::env::set_var("APPDATA", dir.path());
-            std::env::set_var("LOCALAPPDATA", dir.path());
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::remove_var("TIRITH_AUDIT_DEBUG");
-        }
+        global_state.set_env("XDG_DATA_HOME", dir.path());
+        global_state.set_env("XDG_CONFIG_HOME", dir.path());
+        global_state.set_env("APPDATA", dir.path());
+        global_state.set_env("LOCALAPPDATA", dir.path());
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.remove_env("TIRITH_AUDIT_DEBUG");
 
         // Plant a signing keypair so the chain signs (and verifies).
         let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
@@ -4971,12 +4821,10 @@ mod tests {
         assert!(report.ok, "signed chain must verify: {:?}", report.problems);
         assert!(report.signed_lines >= 1, "the anchor line must be signed");
 
-        unsafe {
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::remove_var("APPDATA");
-            std::env::remove_var("LOCALAPPDATA");
-            std::env::remove_var("TIRITH_LOG");
-        }
+        global_state.remove_env("XDG_DATA_HOME");
+        global_state.remove_env("XDG_CONFIG_HOME");
+        global_state.remove_env("APPDATA");
+        global_state.remove_env("LOCALAPPDATA");
+        global_state.remove_env("TIRITH_LOG");
     }
 }

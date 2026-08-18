@@ -1289,6 +1289,8 @@ pub fn status() -> i32 {
 mod tests {
     use super::DaemonResponse;
     use tirith_core::verdict::Action;
+    #[cfg(unix)]
+    use tirith_test_support::GlobalStateGuard;
 
     /// repo-0373: a pre-upgrade client payload has no `offline` key; it must
     /// still deserialize with `offline = false` (the historical online
@@ -1416,28 +1418,21 @@ mod tests {
 
     // ---- F19: Unix socket auth / permission hardening ----
 
-    /// Unique temp dir under the system tempdir for a single test, removed on
-    /// drop. Avoids a hard dep on `tempfile` in the test path.
+    /// Unique test directory owned by the workspace-wide global-state guard.
+    /// The guard serializes every process-global environment/cwd mutation and
+    /// removes its complete isolated root on drop, including during unwinding.
     #[cfg(unix)]
-    struct TmpDir(std::path::PathBuf);
+    struct TmpDir {
+        path: std::path::PathBuf,
+        global: GlobalStateGuard,
+    }
 
     #[cfg(unix)]
     impl TmpDir {
         fn new(tag: &str) -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static CTR: AtomicU64 = AtomicU64::new(0);
-            let n = CTR.fetch_add(1, Ordering::Relaxed);
-            let p =
-                std::env::temp_dir().join(format!("tirith-f19-{tag}-{}-{n}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
-            Self(p)
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let global = GlobalStateGuard::new().expect("create isolated daemon test state");
+            let path = global.roots().root.join(tag);
+            Self { path, global }
         }
     }
 
@@ -1456,12 +1451,16 @@ mod tests {
     #[test]
     fn ensure_private_dir_creates_0700() {
         let tmp = TmpDir::new("mkdir");
-        let nested = tmp.0.join("a").join("b");
+        let nested = tmp.path.join("a").join("b");
         super::ensure_private_dir(&nested).expect("create private dir");
         assert!(nested.is_dir());
         assert_eq!(mode_of(&nested), 0o700, "leaf dir must be 0700");
         // The intermediate dir we created is locked down too.
-        assert_eq!(mode_of(&tmp.0.join("a")), 0o700, "parent dir must be 0700");
+        assert_eq!(
+            mode_of(&tmp.path.join("a")),
+            0o700,
+            "parent dir must be 0700"
+        );
     }
 
     /// A pre-existing, looser-permission dir is tightened back to 0700 (closes a
@@ -1471,11 +1470,12 @@ mod tests {
     fn ensure_private_dir_tightens_existing_loose_dir() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TmpDir::new("tighten");
-        std::fs::create_dir_all(&tmp.0).expect("pre-create");
-        std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o777)).expect("loosen");
-        assert_eq!(mode_of(&tmp.0), 0o777, "precondition: world-writable");
-        super::ensure_private_dir(&tmp.0).expect("tighten");
-        assert_eq!(mode_of(&tmp.0), 0o700, "must be re-tightened to 0700");
+        std::fs::create_dir_all(&tmp.path).expect("pre-create");
+        std::fs::set_permissions(&tmp.path, std::fs::Permissions::from_mode(0o777))
+            .expect("loosen");
+        assert_eq!(mode_of(&tmp.path), 0o777, "precondition: world-writable");
+        super::ensure_private_dir(&tmp.path).expect("tighten");
+        assert_eq!(mode_of(&tmp.path), 0o700, "must be re-tightened to 0700");
     }
 
     /// After binding a real listener, `set_socket_perms` leaves the socket file
@@ -1484,13 +1484,13 @@ mod tests {
     #[test]
     fn set_socket_perms_makes_socket_0600() {
         let tmp = TmpDir::new("sock");
-        super::ensure_private_dir(&tmp.0).expect("dir");
-        let sock = tmp.0.join("daemon.sock");
+        super::ensure_private_dir(&tmp.path).expect("dir");
+        let sock = tmp.path.join("daemon.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         super::set_socket_perms(&sock).expect("chmod socket");
         assert_eq!(mode_of(&sock), 0o600, "socket must be owner-only 0600");
         // And the containing runtime dir is 0700.
-        assert_eq!(mode_of(&tmp.0), 0o700, "runtime dir must be 0700");
+        assert_eq!(mode_of(&tmp.path), 0o700, "runtime dir must be 0700");
     }
 
     /// `peer_euid` on a self-connected socket pair reports our own euid, and the
@@ -1578,11 +1578,11 @@ mod tests {
     fn ensure_private_dir_accepts_owned_0700() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TmpDir::new("accept0700");
-        std::fs::create_dir_all(&tmp.0).expect("pre-create");
-        std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        std::fs::create_dir_all(&tmp.path).expect("pre-create");
+        std::fs::set_permissions(&tmp.path, std::fs::Permissions::from_mode(0o700)).expect("0700");
         // Owned by us (this process created it) and exactly 0700 → accepted.
-        super::ensure_private_dir(&tmp.0).expect("owned 0700 dir must be accepted");
-        assert_eq!(mode_of(&tmp.0), 0o700, "still 0700 after the gate");
+        super::ensure_private_dir(&tmp.path).expect("owned 0700 dir must be accepted");
+        assert_eq!(mode_of(&tmp.path), 0o700, "still 0700 after the gate");
     }
 
     /// A fallback dir with loose perms (0777) that WE own is tightened to 0700 and
@@ -1594,12 +1594,14 @@ mod tests {
     fn ensure_private_dir_tightens_loose_owned_dir() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TmpDir::new("loose0777");
-        std::fs::create_dir_all(&tmp.0).expect("pre-create");
-        std::fs::set_permissions(&tmp.0, std::fs::Permissions::from_mode(0o777)).expect("loosen");
-        assert_eq!(mode_of(&tmp.0), 0o777, "precondition: world-writable");
+        std::fs::create_dir_all(&tmp.path).expect("pre-create");
+        std::fs::set_permissions(&tmp.path, std::fs::Permissions::from_mode(0o777))
+            .expect("loosen");
+        assert_eq!(mode_of(&tmp.path), 0o777, "precondition: world-writable");
         // We own it, so the gate tightens 0777 → 0700 and the re-stat passes.
-        super::ensure_private_dir(&tmp.0).expect("owned loose dir must be tightened, not rejected");
-        assert_eq!(mode_of(&tmp.0), 0o700, "must be re-tightened to 0700");
+        super::ensure_private_dir(&tmp.path)
+            .expect("owned loose dir must be tightened, not rejected");
+        assert_eq!(mode_of(&tmp.path), 0o700, "must be re-tightened to 0700");
     }
 
     /// A runtime dir that is a SYMLINK (even to a directory we own) is rejected:
@@ -1613,11 +1615,11 @@ mod tests {
         let tmp = TmpDir::new("symlink");
         // A real target dir we own, locked down to 0700 so ONLY the symlink-ness
         // (not perms/ownership) is what the gate rejects.
-        let target = tmp.0.join("real-target");
+        let target = tmp.path.join("real-target");
         std::fs::create_dir_all(&target).expect("create target");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).expect("0700");
 
-        let link = tmp.0.join("link-to-target");
+        let link = tmp.path.join("link-to-target");
         std::os::unix::fs::symlink(&target, &link).expect("create symlink");
 
         let err = super::ensure_private_dir(&link)
@@ -1643,14 +1645,14 @@ mod tests {
     fn dir_owned_by_euid_rejects_symlink() {
         let tmp = TmpDir::new("ownedby");
         let euid = unsafe { libc::geteuid() };
-        let target = tmp.0.join("d");
+        let target = tmp.path.join("d");
         std::fs::create_dir_all(&target).expect("create dir");
         assert!(
             super::dir_owned_by_euid(&target, euid),
             "a real dir we own must be accepted"
         );
 
-        let link = tmp.0.join("link");
+        let link = tmp.path.join("link");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         assert!(
             !super::dir_owned_by_euid(&link, euid),
@@ -1659,7 +1661,7 @@ mod tests {
 
         // A non-existent path is not a usable base.
         assert!(
-            !super::dir_owned_by_euid(&tmp.0.join("missing"), euid),
+            !super::dir_owned_by_euid(&tmp.path.join("missing"), euid),
             "a missing path must be rejected"
         );
     }
@@ -1670,7 +1672,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TmpDir::new("loosebase");
         let euid = unsafe { libc::geteuid() };
-        let dir = tmp.0.join("d");
+        let dir = tmp.path.join("d");
         std::fs::create_dir_all(&dir).expect("create dir");
         // A base we own but that is group/other-writable lets another user swap the
         // leaf dir or socket from the parent, so it must be rejected.
@@ -1688,26 +1690,23 @@ mod tests {
     }
 
     /// `runtime_dir()` honors `XDG_RUNTIME_DIR` (as `<dir>/tirith`) when
-    /// `state_dir()` is unset. Mutates a process-global env var, so it is marked
-    /// `#[ignore]` to avoid racing the other parallel tests in this binary that
-    /// read env; run explicitly with `--ignored` (or in isolation) to verify.
+    /// `state_dir()` is unset. The shared guard serializes the environment
+    /// override and restores whether every input was originally set or unset.
     #[cfg(unix)]
     #[test]
-    #[ignore = "mutates process-global XDG env; run with --ignored in isolation"]
     fn runtime_dir_prefers_xdg_runtime_dir_when_no_state_dir() {
-        let tmp = TmpDir::new("xdgrt");
-        std::fs::create_dir_all(&tmp.0).expect("create");
+        let mut tmp = TmpDir::new("xdgrt");
+        std::fs::create_dir_all(&tmp.path).expect("create");
         // Clear state-dir inputs so resolution falls past option (1).
-        std::env::remove_var("XDG_STATE_HOME");
-        std::env::remove_var("HOME");
-        std::env::set_var("XDG_RUNTIME_DIR", &tmp.0);
+        tmp.global.remove_env("XDG_STATE_HOME");
+        tmp.global.remove_env("HOME");
+        tmp.global.set_env("XDG_RUNTIME_DIR", &tmp.path);
         let dir = super::runtime_dir();
         assert_eq!(
             dir,
-            tmp.0.join("tirith"),
+            tmp.path.join("tirith"),
             "with no state_dir, XDG_RUNTIME_DIR/tirith should win"
         );
-        std::env::remove_var("XDG_RUNTIME_DIR");
     }
 
     // ---- D: `daemon start --detach` startup verification (FIX S1) ----
@@ -1746,8 +1745,8 @@ mod tests {
     #[test]
     fn poll_startup_reports_socket_up_when_socket_appears() {
         let tmp = TmpDir::new("poll-up");
-        std::fs::create_dir_all(&tmp.0).expect("dir");
-        let sock = tmp.0.join("daemon.sock");
+        std::fs::create_dir_all(&tmp.path).expect("dir");
+        let sock = tmp.path.join("daemon.sock");
         // Create the "socket" file up front; the live child never touches it, so
         // this isolates the socket-appeared decision from any real daemon.
         std::fs::write(&sock, b"").expect("create sock placeholder");
@@ -1768,9 +1767,9 @@ mod tests {
     #[test]
     fn poll_startup_reports_child_exited_when_child_dies() {
         let tmp = TmpDir::new("poll-exit");
-        std::fs::create_dir_all(&tmp.0).expect("dir");
+        std::fs::create_dir_all(&tmp.path).expect("dir");
         // No socket is ever created.
-        let sock = tmp.0.join("daemon.sock");
+        let sock = tmp.path.join("daemon.sock");
 
         // `true` exits 0 immediately; wait for it so the first `try_wait()` in
         // `poll_startup` observes the exit deterministically.
@@ -1799,8 +1798,8 @@ mod tests {
     #[test]
     fn poll_startup_times_out_when_no_socket() {
         let tmp = TmpDir::new("poll-timeout");
-        std::fs::create_dir_all(&tmp.0).expect("dir");
-        let sock = tmp.0.join("daemon.sock"); // never created
+        std::fs::create_dir_all(&tmp.path).expect("dir");
+        let sock = tmp.path.join("daemon.sock"); // never created
 
         let mut live = LiveChild::sleeping();
         let outcome = super::poll_startup(
@@ -1819,17 +1818,15 @@ mod tests {
     /// the daemon is reachable (`status()` pings it successfully), then `stop()`
     /// tears it down.
     ///
-    /// `#[ignore]` because it points process-global `XDG_STATE_HOME` at a temp
-    /// dir (so the detached child resolves an isolated runtime dir) and actually
-    /// binds a socket — mutating that env races the other parallel env-reading
-    /// tests in this binary. Run with `--ignored` in isolation.
+    /// `#[ignore]` because it spawns a real detached daemon and binds a socket;
+    /// the shared guard still isolates and exactly restores its process state.
     #[cfg(unix)]
     #[test]
-    #[ignore = "mutates process-global XDG_STATE_HOME and binds a real socket; run with --ignored in isolation"]
+    #[ignore = "spawns a detached daemon and binds a real socket"]
     fn start_detach_spawns_verifies_and_stops() {
-        let tmp = TmpDir::new("detach-e2e");
-        std::fs::create_dir_all(&tmp.0).expect("create state dir");
-        std::env::set_var("XDG_STATE_HOME", &tmp.0);
+        let mut tmp = TmpDir::new("detach-e2e");
+        std::fs::create_dir_all(&tmp.path).expect("create state dir");
+        tmp.global.set_env("XDG_STATE_HOME", &tmp.path);
 
         // Ensure a clean slate (no leftover pid/sock from a prior run).
         let _ = super::stop();
@@ -1846,8 +1843,6 @@ mod tests {
         assert_eq!(super::status(), 0, "daemon must be reachable via ping");
 
         assert_eq!(super::stop(), 0, "stop() must shut the daemon down");
-
-        std::env::remove_var("XDG_STATE_HOME");
     }
 
     /// The detach path honors the pre-spawn already-running guard: once a daemon
@@ -1855,16 +1850,15 @@ mod tests {
     /// foreground path) instead of mistaking the live socket for a freshly bound
     /// child and reporting `0`.
     ///
-    /// `#[ignore]` for the same reason as the end-to-end test above: it points
-    /// process-global `XDG_STATE_HOME` at a temp dir and binds a real socket,
-    /// which races the other parallel env-reading tests. Run with `--ignored`.
+    /// `#[ignore]` for the same reason as the end-to-end test above: it spawns
+    /// a real detached daemon and binds a socket.
     #[cfg(unix)]
     #[test]
-    #[ignore = "mutates process-global XDG_STATE_HOME and binds a real socket; run with --ignored in isolation"]
+    #[ignore = "spawns a detached daemon and binds a real socket"]
     fn start_detach_short_circuits_when_already_running() {
-        let tmp = TmpDir::new("detach-already-running");
-        std::fs::create_dir_all(&tmp.0).expect("create state dir");
-        std::env::set_var("XDG_STATE_HOME", &tmp.0);
+        let mut tmp = TmpDir::new("detach-already-running");
+        std::fs::create_dir_all(&tmp.path).expect("create state dir");
+        tmp.global.set_env("XDG_STATE_HOME", &tmp.path);
 
         // Clean slate, then bring a daemon up so the socket + PID file exist.
         let _ = super::stop();
@@ -1879,7 +1873,5 @@ mod tests {
         );
 
         assert_eq!(super::stop(), 0, "stop() must shut the daemon down");
-
-        std::env::remove_var("XDG_STATE_HOME");
     }
 }

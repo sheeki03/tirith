@@ -1679,7 +1679,7 @@ mod tests {
     /// (M13 PR #132 cross-lock-domain race class).
     struct CacheHomeGuard {
         _xdg: EnvGuard,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tirith_test_support::GlobalStateGuard,
     }
 
     impl CacheHomeGuard {

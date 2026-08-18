@@ -753,7 +753,7 @@ fn emit_watch_json(
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::test_harness::ENV_LOCK;
+    use crate::cli::test_harness::{CwdGuard, EnvGuard, ENV_LOCK};
     use tirith_core::checkpoint::{self, ManifestEntry};
 
     #[cfg(unix)]
@@ -771,17 +771,8 @@ mod tests {
     #[test]
     fn run_command_single_argument_is_an_explicit_shell_expression() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let previous_shell = std::env::var_os("SHELL");
-        // SAFETY: this module serializes its environment-mutating tests.
-        unsafe { std::env::set_var("SHELL", "/bin/sh") };
+        let _shell = EnvGuard::set("SHELL", std::path::Path::new("/bin/sh"));
         let result = super::run_command(&["exit 7".to_string()]);
-        // SAFETY: restore the process environment before asserting.
-        unsafe {
-            match previous_shell {
-                Some(value) => std::env::set_var("SHELL", value),
-                None => std::env::remove_var("SHELL"),
-            }
-        }
         assert_eq!(result.unwrap(), 7);
     }
 
@@ -844,19 +835,14 @@ mod tests {
         std::fs::create_dir_all(&workdir).unwrap();
         let state_dir = tmpdir.path().join("state");
 
-        let prev_state = std::env::var("XDG_STATE_HOME").ok();
-        let prev_log = std::env::var("TIRITH_LOG").ok();
-        let prev_cwd = std::env::current_dir().ok();
-        // SAFETY: serialized via ENV_LOCK. state_dir() honors XDG_STATE_HOME on all
-        // unix (it is resolved manually, not via etcetera), so this is portable.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &state_dir);
-            std::env::set_var("TIRITH_LOG", "0");
-        }
+        // These guards retain the exact OsString values installed before the
+        // test, including non-UTF-8 values, and restore during unwinding.
+        let _state = EnvGuard::set("XDG_STATE_HOME", &state_dir);
+        let _log = EnvGuard::set("TIRITH_LOG", std::path::Path::new("0"));
+        let _cwd = CwdGuard::set(&workdir);
 
         let name = "a.txt";
         let run = || -> Result<(i32, i32), String> {
-            std::env::set_current_dir(&workdir).map_err(|e| format!("chdir: {e}"))?;
             std::fs::write(name, "alpha").map_err(|e| format!("write: {e}"))?;
             let meta = checkpoint::create(&[name], Some("rm -rf project"))?;
 
@@ -885,21 +871,6 @@ mod tests {
         };
 
         let result = run();
-
-        // Restore cwd + env before assertions so cleanup runs even on failure.
-        if let Some(dir) = prev_cwd {
-            let _ = std::env::set_current_dir(dir);
-        }
-        unsafe {
-            match prev_state {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-            match prev_log {
-                Some(v) => std::env::set_var("TIRITH_LOG", v),
-                None => std::env::remove_var("TIRITH_LOG"),
-            }
-        }
 
         let (clean_code, partial_code) = result.expect("restore flow should run");
         assert_eq!(clean_code, 0, "a fully clean restore must exit 0");

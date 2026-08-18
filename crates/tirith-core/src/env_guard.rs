@@ -1337,8 +1337,8 @@ mod tests {
 
         fn set(&mut self, name: std::ffi::OsString, value: std::ffi::OsString) {
             let previous = std::env::var_os(&name);
-            // SAFETY: the test owns the crate-wide environment lock until this
-            // guard restores every entry.
+            // SAFETY: the test owns GlobalStateGuard's process-global lock until
+            // this guard restores every entry.
             unsafe { std::env::set_var(&name, value) };
             self.0.push((name, previous));
         }
@@ -1348,7 +1348,7 @@ mod tests {
     impl Drop for TestProcessEnv {
         fn drop(&mut self) {
             for (name, previous) in self.0.drain(..).rev() {
-                // SAFETY: the owning test still holds the crate-wide lock.
+                // SAFETY: the owning test still holds GlobalStateGuard.
                 unsafe {
                     match previous {
                         Some(value) => std::env::set_var(name, value),
@@ -1414,9 +1414,8 @@ mod tests {
     fn current_process_snapshot_never_text_converts_values_and_skips_non_utf8_names() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global environment-guard state");
         let mut restore = TestProcessEnv::new();
         let safe_name = std::ffi::OsString::from("TIRITH_C04_NON_UTF8_VALUE");
         restore.set(
@@ -1449,9 +1448,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn production_presence_markers_do_not_leak_or_claim_same_and_changed_values_unchanged() {
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global environment-guard state");
         let mut restore = TestProcessEnv::new();
         let name = "TIRITH_C04_POLICY_SECRET";
         let first = "wallet-secret-first-value";

@@ -4570,37 +4570,13 @@ mod tests {
     // `maybe_background_update` a guaranteed no-op — zero network and no
     // `spawned-at` state file (the breadcrumb written right before a spawn).
 
-    /// RAII guard that sets/removes `TIRITH_OFFLINE` and restores it on Drop.
-    struct OfflineEnvGuard {
-        old: Option<std::ffi::OsString>,
-    }
-    impl OfflineEnvGuard {
-        fn set(val: &str) -> Self {
-            let old = std::env::var_os("TIRITH_OFFLINE");
-            unsafe { std::env::set_var("TIRITH_OFFLINE", val) };
-            Self { old }
-        }
-        fn unset() -> Self {
-            let old = std::env::var_os("TIRITH_OFFLINE");
-            unsafe { std::env::remove_var("TIRITH_OFFLINE") };
-            Self { old }
-        }
-    }
-    impl Drop for OfflineEnvGuard {
-        fn drop(&mut self) {
-            match &self.old {
-                Some(v) => unsafe { std::env::set_var("TIRITH_OFFLINE", v) },
-                None => unsafe { std::env::remove_var("TIRITH_OFFLINE") },
-            }
-        }
-    }
-
     #[test]
     fn offline_env_active_recognizes_truthy_values() {
-        // `offline_env_active` lives in `cli/mod.rs`; exercised here via the env guard.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // `offline_env_active` lives in `cli/mod.rs`; exercise it inside the
+        // shared process-global state guard.
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for v in ["1", "true", "TRUE", "yes", "On", " on "] {
-            let _e = OfflineEnvGuard::set(v);
+            guard.set_env("TIRITH_OFFLINE", v);
             assert!(
                 crate::cli::offline_env_active(),
                 "TIRITH_OFFLINE={v:?} should be treated as offline"
@@ -4610,15 +4586,15 @@ mod tests {
 
     #[test]
     fn offline_env_active_rejects_falsey_and_unset() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for v in ["0", "false", "no", "", "off", "garbage"] {
-            let _e = OfflineEnvGuard::set(v);
+            guard.set_env("TIRITH_OFFLINE", v);
             assert!(
                 !crate::cli::offline_env_active(),
                 "TIRITH_OFFLINE={v:?} should NOT be treated as offline"
             );
         }
-        let _e = OfflineEnvGuard::unset();
+        guard.remove_env("TIRITH_OFFLINE");
         assert!(
             !crate::cli::offline_env_active(),
             "unset TIRITH_OFFLINE should not be offline"
@@ -4629,8 +4605,8 @@ mod tests {
     fn offline_flag_skips_background_update_no_network_attempt() {
         // With `--offline`, `maybe_background_update` must not reach the state
         // dir: no `spawned-at` file, so no child spawned (= zero network).
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _e = OfflineEnvGuard::unset();
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove_env("TIRITH_OFFLINE");
         let tmp = tempfile::tempdir().unwrap();
         let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
 
@@ -4647,8 +4623,8 @@ mod tests {
     fn offline_env_skips_background_update_no_network_attempt() {
         // Same guarantee via `TIRITH_OFFLINE` (the path shell hooks and the
         // conformance harness use, lacking CLI flags per `tirith check`).
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _e = OfflineEnvGuard::set("1");
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        guard.set_env("TIRITH_OFFLINE", "1");
         let tmp = tempfile::tempdir().unwrap();
         let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
 

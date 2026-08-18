@@ -10,6 +10,11 @@ use tirith_core::package_risk::{self, ApiSignals, NameVsPopular, PackageSignals}
 use tirith_core::registry_api::{HttpRegistryClient, RegistryClient};
 use tirith_core::threatdb::Ecosystem;
 
+fn isolate_registry_state() -> tirith_test_support::GlobalStateGuard {
+    tirith_test_support::GlobalStateGuard::new()
+        .expect("isolate registry-history state for registry API tests")
+}
+
 /// A trimmed-but-realistic npm full package document, parameterized so a test
 /// can make the package new/old, deprecated/current, etc.
 fn npm_doc(name: &str, latest: &str, created: &str, latest_time: &str, deprecated: bool) -> String {
@@ -39,6 +44,7 @@ fn npm_doc(name: &str, latest: &str, created: &str, latest_time: &str, deprecate
 
 #[test]
 fn npm_fetch_parses_established_package() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let body = npm_doc(
         "react",
@@ -72,6 +78,7 @@ fn npm_fetch_parses_established_package() {
 
 #[test]
 fn npm_deprecated_latest_version_is_flagged() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let body = npm_doc(
         "somepkg",
@@ -96,6 +103,7 @@ fn npm_deprecated_latest_version_is_flagged() {
 
 #[test]
 fn npm_exact_version_uses_only_selected_release_scripts() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let body = r#"{
         "name": "scripted",
@@ -142,6 +150,7 @@ fn npm_exact_version_uses_only_selected_release_scripts() {
 
 #[test]
 fn npm_exact_missing_version_does_not_reuse_latest() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let body = npm_doc(
         "scripted",
@@ -171,6 +180,7 @@ fn npm_exact_missing_version_does_not_reuse_latest() {
 
 #[test]
 fn npm_exact_wrong_package_identity_does_not_authorize_same_version() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let body = npm_doc(
         "different-package",
@@ -203,6 +213,7 @@ fn npm_exact_wrong_package_identity_does_not_authorize_same_version() {
 
 #[test]
 fn npm_404_degrades_to_unavailable() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let _m = server
         .mock("GET", "/ghost-package")
@@ -227,6 +238,7 @@ fn npm_404_degrades_to_unavailable() {
 
 #[test]
 fn npm_500_degrades_to_unavailable() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let _m = server
         .mock("GET", "/broken")
@@ -247,6 +259,7 @@ fn npm_500_degrades_to_unavailable() {
 
 #[test]
 fn npm_garbage_body_degrades_to_unavailable() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let _m = server
         .mock("GET", "/weird")
@@ -265,6 +278,7 @@ fn npm_garbage_body_degrades_to_unavailable() {
 
 #[test]
 fn pypi_fetch_parses_and_picks_repo_url() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let body = r#"{
         "info": {
@@ -299,6 +313,7 @@ fn pypi_fetch_parses_and_picks_repo_url() {
 
 #[test]
 fn pypi_yanked_latest_version_is_flagged() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let body = r#"{
         "info": { "name": "badpkg", "version": "1.0.0", "yanked": true },
@@ -319,6 +334,7 @@ fn pypi_yanked_latest_version_is_flagged() {
 
 #[test]
 fn crates_fetch_parses_downloads_and_yanked() {
+    let _global = isolate_registry_state();
     let mut server = mockito::Server::new();
     let body = r#"{
         "crate": {
@@ -350,6 +366,7 @@ fn crates_fetch_parses_downloads_and_yanked() {
 
 #[test]
 fn online_score_folds_in_api_factors_end_to_end() {
+    let _global = isolate_registry_state();
     // A brand-new crate with low downloads, no repo, and a version spike.
     let mut server = mockito::Server::new();
     let now = std::time::SystemTime::now()
@@ -434,6 +451,7 @@ fn online_score_folds_in_api_factors_end_to_end() {
 
 #[test]
 fn unsupported_ecosystem_degrades_without_network() {
+    let _global = isolate_registry_state();
     // Go has no registry API wired up — must degrade gracefully, and must not
     // even attempt a request (the mock server has no matching route).
     let server = mockito::Server::new();
@@ -453,6 +471,7 @@ fn unsupported_ecosystem_degrades_without_network() {
 
 #[test]
 fn npm_ownerless_established_package_flags_ownership() {
+    let _global = isolate_registry_state();
     // An established npm package with ZERO maintainers must fire the ownership
     // signal (npm DOES expose maintainers).
     let mut server = mockito::Server::new();
@@ -494,6 +513,7 @@ fn npm_ownerless_established_package_flags_ownership() {
 
 #[test]
 fn pypi_ownership_signal_is_unknown_not_false_positive() {
+    let _global = isolate_registry_state();
     // PyPI carries no maintainer field, so the ownership signal must be `None`,
     // never a false `Some(true)` (the flask false-positive regression guard).
     let mut server = mockito::Server::new();
@@ -548,6 +568,7 @@ fn pypi_ownership_signal_is_unknown_not_false_positive() {
 
 #[test]
 fn npm_response_over_size_cap_degrades() {
+    let _global = isolate_registry_state();
     // A response whose Content-Length exceeds the 8 MiB cap must degrade, not
     // load into memory.
     let mut server = mockito::Server::new();

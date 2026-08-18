@@ -1,16 +1,32 @@
-//! Shared test harness for tests that mutate process-global state (`HOME`,
-//! `cwd`, shell-profile env vars). `ENV_LOCK` serializes them crate-wide so
-//! parallel tests can't clobber each other's `set_var`.
+//! Compatibility harness for CLI tests that mutate process-global state.
+//!
+//! [`ENV_LOCK`] now enters the workspace-wide [`tirith_test_support::GlobalStateGuard`]
+//! domain, so CLI tests serialize with every other crate using the shared test
+//! support. [`EnvGuard`] and [`CwdGuard`] retain the existing narrow override
+//! API for callers that need a value different from the fresh application
+//! roots installed by the shared guard.
 
 use std::ffi::OsString;
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::LockResult;
 
-/// Crate-wide lock for tests that mutate `HOME`, `cwd`, or shell-profile
-/// env vars. Tolerates poisoned locks so a single panicking test doesn't
-/// cascade-fail every later test.
-pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+/// Compatibility facade retaining the former `ENV_LOCK.lock()` API while
+/// acquiring the workspace-wide process-global state guard.
+pub(crate) struct EnvLock;
+
+impl EnvLock {
+    // This source-compatible facade deliberately retains the former
+    // `Mutex::lock` return shape for existing tests. It is always `Ok` because
+    // `GlobalStateGuard` recovers a poisoned shared lock internally.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn lock(&self) -> LockResult<tirith_test_support::GlobalStateGuard> {
+        Ok(tirith_test_support::GlobalStateGuard::new()
+            .expect("create isolated process-global CLI test state"))
+    }
+}
+
+pub(crate) static ENV_LOCK: EnvLock = EnvLock;
 
 /// RAII guard that restores (or removes) an env var on Drop.
 pub(crate) struct EnvGuard {
@@ -69,29 +85,25 @@ pub(crate) fn with_fake_env<F, R>(set_cwd: bool, f: F) -> R
 where
     F: panic::UnwindSafe + FnOnce(&Path, Option<&Path>) -> R,
 {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let home_tmp = tempfile::tempdir().expect("home tempdir");
-    // The `home` crate reads `$HOME` (Unix) / `%USERPROFILE%` (Windows) — set
-    // both so `home::home_dir()` is isolated on either platform.
-    let _home_guard = EnvGuard::set("HOME", home_tmp.path());
-    let _userprofile_guard = EnvGuard::set("USERPROFILE", home_tmp.path());
+    // GlobalStateGuard always installs a fresh cwd. Preserve the compatibility
+    // contract for `set_cwd == false` by temporarily returning to the caller's
+    // cwd inside the shared guard's lifetime; CwdGuard restores the isolated
+    // cwd before GlobalStateGuard restores the original process state.
+    let original_cwd = (!set_cwd).then(|| std::env::current_dir().expect("current_dir"));
+    let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cwd_guard = original_cwd.as_deref().map(CwdGuard::set);
 
-    let cwd_tmp = if set_cwd {
-        Some(tempfile::tempdir().expect("cwd tempdir"))
-    } else {
-        None
-    };
-    let _cwd_guard = cwd_tmp.as_ref().map(|t| CwdGuard::set(t.path()));
+    let home_path = lock.roots().home.clone();
+    let isolated_cwd = set_cwd.then(|| {
+        std::fs::canonicalize(&lock.roots().cwd).unwrap_or_else(|_| lock.roots().cwd.to_path_buf())
+    });
 
     // Hand back the canonical path. macOS puts temp dirs under the /var ->
     // /private/var symlink, so code that observes its own cwd (or canonicalizes
     // one) sees /private/var/... while the tempdir handle reports /var/...;
     // tests that compare the two forms would fail on macOS only.
-    let cwd_path = cwd_tmp
-        .as_ref()
-        .map(|t| std::fs::canonicalize(t.path()).unwrap_or_else(|_| t.path().to_path_buf()));
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        f(home_tmp.path(), cwd_path.as_deref())
+        f(&home_path, isolated_cwd.as_deref())
     }));
     match result {
         Ok(v) => v,

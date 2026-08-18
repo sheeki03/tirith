@@ -6,7 +6,8 @@ use crate::build_receipt::{
     BuildCoverage, BuildEvidence, BuildReceipt, BuildReceiptFacts, BuildSubject, ExecutionLink,
     GitBinding, SignatureAnchor, SignatureTrust, TreeDigest, TreeLimits,
 };
-use crate::ssrf_guard::test_support::{http_response, EnvironmentRestore, ScriptedHttpServer};
+use crate::ssrf_guard::test_support::{http_response, ScriptedHttpServer};
+use tirith_test_support::GlobalStateGuard;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -80,13 +81,10 @@ fn run_fixture(
     files: &[TreeFile],
     settings: FetchSettings,
 ) -> (Vec<RouteOutcome>, Vec<Vec<u8>>) {
-    let _environment = crate::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut environment = GlobalStateGuard::new().expect("isolate deployment receipt fixture");
     let fixture = ScriptedHttpServer::start(responses);
-    let mut restore = EnvironmentRestore::new();
     // The fixture speaks plain HTTP; the destination rules are unchanged.
-    restore.set("TIRITH_ALLOW_HTTP", Some("1"));
+    environment.set_env("TIRITH_ALLOW_HTTP", "1");
     let address = fixture.address();
     let base = url::Url::parse(&format!("http://{FIXTURE_HOST}:{}/", address.port()))
         .expect("parse the fixture base URL");
