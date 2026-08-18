@@ -5364,9 +5364,16 @@ mod tests {
     fn normal_user_managed_manager_is_safely_bound() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        let global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let account_home = global
+            .previous_env("HOME")
+            .map(Path::new)
+            .expect("test account HOME");
         let directory = tempfile::Builder::new()
             .prefix("tirith-user-install-manager-")
-            .tempdir_in(home::home_dir().expect("test account home"))
+            .tempdir_in(account_home)
             .unwrap();
         let bin = directory.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -5393,9 +5400,16 @@ mod tests {
     fn writable_path_shadow_of_system_executable_is_rejected() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        let global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let account_home = global
+            .previous_env("HOME")
+            .map(Path::new)
+            .expect("test account HOME");
         let directory = tempfile::Builder::new()
             .prefix("tirith-install-manager-shadow-")
-            .tempdir_in(home::home_dir().expect("test account home"))
+            .tempdir_in(account_home)
             .unwrap();
         let bin = directory.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -5418,9 +5432,16 @@ mod tests {
     fn shebang_manager_can_load_sibling_relative_resources() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        let global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let account_home = global
+            .previous_env("HOME")
+            .map(Path::new)
+            .expect("test account HOME");
         let directory = tempfile::Builder::new()
             .prefix("tirith-shebang-manager-")
-            .tempdir_in(home::home_dir().expect("test account home"))
+            .tempdir_in(account_home)
             .unwrap();
         let bin = directory.path().join("bin");
         let lib = directory.path().join("lib");

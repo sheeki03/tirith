@@ -4400,12 +4400,9 @@ mod tests {
         // — DSL regexes use `/`, so a Windows `C:\repo\.env` must normalize to `/`
         // before the regex runs, else every Windows path is silently missed.
         //
-        // Skip when `TIRITH_POLICY_ROOT` is set (it wins over cwd discovery and
-        // would race other tests if mutated) — same guard as the env-sensitive
-        // tests below. CI (var unset) runs it fully.
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        // Serialize policy discovery with every other process-global test and
+        // remove the ambient override instead of silently passing without assertions.
+        let _state = isolate_state();
 
         let dir = tempfile::tempdir().unwrap();
         // `.git` marks the repo root so `Policy::discover` stops walking here.
@@ -4488,9 +4485,6 @@ mod tests {
     /// precondition asserting the same input fast-exits without the rule.
     #[test]
     fn dsl_command_cwd_in_rule_forces_past_fast_exit_exec_ctx() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -4562,9 +4556,6 @@ mod tests {
     /// Exec-only.
     #[test]
     fn dsl_command_cwd_in_rule_forces_past_fast_exit_paste_ctx() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -4630,9 +4621,6 @@ mod tests {
     /// built-in-only precondition below.
     #[test]
     fn paste_path_uses_policy_injection_seeds_custom() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -4692,9 +4680,6 @@ mod tests {
     /// keyword gate; this one proves the force-past itself.
     #[test]
     fn paste_custom_seed_without_builtin_keyword_forces_past_fast_exit() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -4752,9 +4737,6 @@ mod tests {
     /// `check_with` never runs, silently gating out the attack.
     #[test]
     fn paste_base64_encoded_seed_forces_past_fast_exit() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
         use base64::Engine as _;
@@ -4803,9 +4785,6 @@ mod tests {
     /// deobfuscation pass in `check_with` never runs (the false-negative this closes).
     #[test]
     fn paste_leetspeak_seed_forces_past_fast_exit() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -4851,9 +4830,6 @@ mod tests {
     /// the `deobf_candidate_triggered` force-past it fast-exits at tier 1.
     #[test]
     fn paste_character_spaced_seed_forces_past_fast_exit() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -4902,9 +4878,6 @@ mod tests {
     /// then the tier-3 reach and the firing rule.
     #[test]
     fn paste_leet_token_seed_forces_past_and_fires() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -4950,9 +4923,6 @@ mod tests {
     /// contract (not a tier), proving the broadened gate is harmless.
     #[test]
     fn paste_benign_leet_no_false_finding() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
 
         let dir = tempfile::tempdir().unwrap();
@@ -4977,9 +4947,7 @@ mod tests {
     /// end through the real pipeline for the file predicate the finding called out.
     #[test]
     fn dsl_file_path_matches_rule_reaches_evaluation_filescan_ctx() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::RuleId;
 
         let dir = tempfile::tempdir().unwrap();
@@ -5035,9 +5003,6 @@ mod tests {
     /// not impose work or create a false finding.
     #[test]
     fn effective_custom_rules_gate_the_tier1_fast_exit() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         let input = "whoami";
 
@@ -5100,9 +5065,6 @@ mod tests {
 
     #[test]
     fn custom_regex_and_dsl_rules_receive_nested_executable_bodies() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -6773,6 +6735,10 @@ mod tests {
         ] {
             global.remove_env(name);
         }
+        assert!(
+            std::env::var_os("TIRITH_POLICY_ROOT").is_none(),
+            "engine policy-discovery tests must execute with the ambient override removed"
+        );
         IsolatedState { root, global }
     }
 
@@ -7037,11 +7003,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exec_guard_on_fires_exec_in_tmp_off_fast_exits() {
-        // A TIRITH_POLICY_ROOT in the environment would override the cwd-based
-        // discovery this test relies on; skip rather than assert falsely.
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::RuleId;
 
         // A leader resolving under /tmp. An absolute path is used as-is by
@@ -7102,9 +7064,7 @@ mod tests {
     /// BLOCKS, and the allowed name appears only in audit context.
     #[test]
     fn manifest_allowed_cannot_weaken_high_pipe_to_interpreter() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7161,9 +7121,7 @@ mod tests {
     /// at High severity, which maps to the Block action.)
     #[test]
     fn manifest_dangerous_pattern_elevates_to_block() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId, Severity};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7188,9 +7146,7 @@ mod tests {
 
     #[test]
     fn manifest_dangerous_pattern_applies_to_nested_executable_body() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId, Severity};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7217,9 +7173,7 @@ mod tests {
     /// `RepoCommandUnknown` does NOT fire (it matched an allowed entry).
     #[test]
     fn manifest_allowed_clean_command_allows_without_unknown() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7245,9 +7199,7 @@ mod tests {
     /// (Allow — Info never raises it).
     #[test]
     fn manifest_uncatalogued_command_emits_unknown_info() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId, Severity};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7272,9 +7224,7 @@ mod tests {
     /// audit-context field stays None.
     #[test]
     fn manifest_absent_no_manifest_rules_fire() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::RuleId;
 
         // A repo boundary but NO .tirith/commands.yaml.
@@ -7297,9 +7247,7 @@ mod tests {
     /// rules aren't applied), not silently ignored. Info never raises the action.
     #[test]
     fn manifest_unloadable_surfaces_info_not_silence() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId, Severity};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7335,9 +7283,7 @@ mod tests {
     /// glob could BLOCK arbitrary text). Same input blocks in Exec, untouched in Paste.
     #[test]
     fn manifest_does_not_run_in_paste_context() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId};
 
         let dir = tempfile::tempdir().unwrap();
