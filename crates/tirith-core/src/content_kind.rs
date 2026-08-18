@@ -76,18 +76,11 @@ pub fn classify(bytes: &[u8]) -> ContentKind {
 pub fn classify_with_ambiguity(bytes: &[u8]) -> ContentClassification {
     let prefix = &bytes[..bytes.len().min(MAGIC_PREFIX_BYTES)];
     let pdf_header_offset = prefix.windows(5).position(|window| window == b"%PDF-");
-    let (trailing_zip_offset, trailing_zip_preflight_ambiguous) =
-        if let Some(pdf_offset) = pdf_header_offset {
-            let analysis = trailing_zip_analysis(bytes);
-            (
-                analysis
-                    .offset
-                    .filter(|zip_offset| *zip_offset > pdf_offset),
-                analysis.candidate_limit_hit || analysis.search_incomplete,
-            )
-        } else {
-            (None, false)
-        };
+    let trailing_zip_probe = if pdf_header_offset.is_some() {
+        trailing_zip_analysis(bytes).probe
+    } else {
+        ZipTailProbe::AbsentExhaustive
+    };
     let strong_kind = match classify_archive_prefix(bytes) {
         ArchiveMagic::Zip => Some(ContentKind::Zip),
         ArchiveMagic::Gzip => Some(ContentKind::Gzip),
@@ -115,8 +108,11 @@ pub fn classify_with_ambiguity(bytes: &[u8]) -> ContentClassification {
             return ContentClassification {
                 kind: ContentKind::Pdf,
                 pdf_header_offset: Some(offset),
-                ambiguous_pdf_ownership: trailing_zip_offset.is_some()
-                    || trailing_zip_preflight_ambiguous,
+                ambiguous_pdf_ownership: match trailing_zip_probe {
+                    ZipTailProbe::Present { offset: zip_offset } => zip_offset > offset,
+                    ZipTailProbe::Indeterminate => true,
+                    ZipTailProbe::AbsentExhaustive => false,
+                },
             };
         }
         return ContentClassification {
@@ -167,21 +163,71 @@ fn read_le_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 
 const ZIP64_EXTRA_ID: u16 = 0x0001;
 
-fn validate_trailing_zip_directory(
-    bytes: &[u8],
-    central_end: usize,
-    central_size: usize,
-    declared_central_offset: usize,
-    total_entries: usize,
-) -> Option<usize> {
-    let physical_central = central_end.checked_sub(central_size)?;
-    let archive_start = physical_central.checked_sub(declared_central_offset)?;
+/// Canonical arithmetic and non-spanned-layout proof shared by file ownership
+/// classification and the bounded archive preflight. `record_offset` is the
+/// physical classic EOCD offset or the physical ZIP64 EOCD-record offset. The
+/// caller remains responsible for locating the record and validating central
+/// and local-header bytes; this function is the single source of truth for the
+/// EOCD counts and archive-relative central-directory layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ZipEocdLayout {
+    pub(crate) archive_start: u64,
+    pub(crate) physical_central: u64,
+    pub(crate) central_size: u64,
+    pub(crate) central_offset: u64,
+    pub(crate) total_entries: u64,
+}
 
-    // A zero-entry ZIP is valid only when the central directory is empty and
-    // starts at archive-relative offset zero. Its archive starts at the EOCD
-    // (or ZIP64 EOCD) rather than at an invented earlier prefix.
+pub(crate) fn validate_zip_eocd_layout(
+    record_offset: u64,
+    disk: u64,
+    central_disk: u64,
+    disk_entries: u64,
+    total_entries: u64,
+    central_size: u64,
+    central_offset: u64,
+) -> Result<ZipEocdLayout, &'static str> {
+    if disk != 0 || central_disk != 0 || disk_entries != total_entries {
+        return Err("multi-disk or inconsistent EOCD");
+    }
     if total_entries == 0 {
-        return (central_size == 0 && declared_central_offset == 0).then_some(archive_start);
+        // zip 2.4.2 deliberately accepts an empty archive without consulting
+        // central-directory bytes or size. Mirror its saturating prefix
+        // calculation so an accepted empty tail cannot restore exclusive PDF
+        // ownership merely through ignored EOCD fields.
+        return Ok(ZipEocdLayout {
+            archive_start: record_offset.saturating_sub(central_offset),
+            physical_central: record_offset,
+            central_size,
+            central_offset,
+            total_entries,
+        });
+    }
+    let physical_central = record_offset
+        .checked_sub(central_size)
+        .ok_or("central directory extends before its EOCD record")?;
+    let archive_start = physical_central
+        .checked_sub(central_offset)
+        .ok_or("central-directory offset is inconsistent")?;
+    Ok(ZipEocdLayout {
+        archive_start,
+        physical_central,
+        central_size,
+        central_offset,
+        total_entries,
+    })
+}
+
+fn validate_trailing_zip_directory(bytes: &[u8], layout: ZipEocdLayout) -> Option<usize> {
+    let physical_central = usize::try_from(layout.physical_central).ok()?;
+    let archive_start = usize::try_from(layout.archive_start).ok()?;
+    let central_size = usize::try_from(layout.central_size).ok()?;
+    let total_entries = usize::try_from(layout.total_entries).ok()?;
+
+    // The locked reader accepts a zero-entry ZIP without reading central bytes.
+    // The shared layout already mirrors its saturating prefix calculation.
+    if total_entries == 0 {
+        return Some(archive_start);
     }
 
     if central_size < 46
@@ -203,6 +249,7 @@ fn validate_trailing_zip_directory(
             bytes,
             physical_central.checked_add(32)?,
         )?))?;
+    let central_end = physical_central.checked_add(central_size)?;
     if first_central_end > central_end {
         return None;
     }
@@ -322,19 +369,52 @@ fn zip64_central_local_offset(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ClassicEocdFields {
-    disk: u16,
-    central_disk: u16,
-    disk_entries: u16,
-    total_entries: u16,
-    central_size: u32,
-    central_offset: u32,
+pub(crate) struct ClassicEocdFields {
+    pub(crate) disk: u16,
+    pub(crate) central_disk: u16,
+    pub(crate) disk_entries: u16,
+    pub(crate) total_entries: u16,
+    pub(crate) central_size: u32,
+    pub(crate) central_offset: u32,
+}
+
+impl ClassicEocdFields {
+    pub(crate) fn requires_zip64(self) -> bool {
+        self.disk == u16::MAX
+            || self.central_disk == u16::MAX
+            || self.disk_entries == u16::MAX
+            || self.total_entries == u16::MAX
+            || self.central_size == u32::MAX
+            || self.central_offset == u32::MAX
+    }
+
+    pub(crate) fn matches_zip64_layout(self, layout: ZipEocdLayout) -> bool {
+        let u16_matches =
+            |legacy: u16, actual: u64| legacy == u16::MAX || u64::from(legacy) == actual;
+        let u32_matches =
+            |legacy: u32, actual: u64| legacy == u32::MAX || u64::from(legacy) == actual;
+        u16_matches(self.disk, 0)
+            && u16_matches(self.central_disk, 0)
+            && u16_matches(self.disk_entries, layout.total_entries)
+            && u16_matches(self.total_entries, layout.total_entries)
+            && u32_matches(self.central_size, layout.central_size)
+            && u32_matches(self.central_offset, layout.central_offset)
+    }
 }
 
 const ZIP_EOCD_BYTES: usize = 22;
+#[cfg(test)]
 const ZIP_MAX_COMMENT_BYTES: usize = u16::MAX as usize;
 const ZIP64_LOCATOR_BYTES: usize = 20;
 const ZIP64_RECORD_BASE_BYTES: usize = 56;
+/// Maximum suffix searched for an EOCD accepted by the locked `zip` reader.
+/// FileScan caps inputs at 10 MiB and archive inspection buffers a member only
+/// through its 64 MiB default ceiling, so both production callers are
+/// exhaustive. Callers passing larger buffers receive `Indeterminate` rather
+/// than a false absence.
+const MAX_ZIP_TAIL_SCAN_BYTES: usize = 64 * 1024 * 1024;
+/// Bound retained EOCD candidates under a signature flood.
+const MAX_ZIP_EOCD_CANDIDATES: usize = 4096;
 /// Maximum bytes inspected in each of the two ZIP64-record search windows.
 ///
 /// One window is adjacent to the locator (the ordinary small-record case); the
@@ -515,43 +595,47 @@ fn structurally_valid_zip64_offset(
         return None;
     }
 
-    let disk = read_le_u32(bytes, record.checked_add(16)?)?;
-    let central_disk = read_le_u32(bytes, record.checked_add(20)?)?;
-    let disk_entries = usize::try_from(read_le_u64(bytes, record.checked_add(24)?)?).ok()?;
-    let total_entries = usize::try_from(read_le_u64(bytes, record.checked_add(32)?)?).ok()?;
-    let central_size = usize::try_from(read_le_u64(bytes, record.checked_add(40)?)?).ok()?;
-    let central_offset = usize::try_from(read_le_u64(bytes, record.checked_add(48)?)?).ok()?;
-    if disk != 0 || central_disk != 0 || disk_entries != total_entries {
-        return None;
-    }
-
-    let legacy_u16_matches =
-        |legacy: u16, actual: usize| legacy == u16::MAX || usize::from(legacy) == actual;
-    let legacy_u32_matches = |legacy: u32, actual: usize| {
-        legacy == u32::MAX || usize::try_from(legacy).ok() == Some(actual)
-    };
-    if !legacy_u16_matches(legacy.disk, 0)
-        || !legacy_u16_matches(legacy.central_disk, 0)
-        || !legacy_u16_matches(legacy.disk_entries, disk_entries)
-        || !legacy_u16_matches(legacy.total_entries, total_entries)
-        || !legacy_u32_matches(legacy.central_size, central_size)
-        || !legacy_u32_matches(legacy.central_offset, central_offset)
-    {
-        return None;
-    }
-
-    let archive_start = validate_trailing_zip_directory(
-        bytes,
-        record,
+    let disk = u64::from(read_le_u32(bytes, record.checked_add(16)?)?);
+    let central_disk = u64::from(read_le_u32(bytes, record.checked_add(20)?)?);
+    let disk_entries = read_le_u64(bytes, record.checked_add(24)?)?;
+    let total_entries = read_le_u64(bytes, record.checked_add(32)?)?;
+    let central_size = read_le_u64(bytes, record.checked_add(40)?)?;
+    let central_offset = read_le_u64(bytes, record.checked_add(48)?)?;
+    let layout = validate_zip_eocd_layout(
+        u64::try_from(record).ok()?,
+        disk,
+        central_disk,
+        disk_entries,
+        total_entries,
         central_size,
         central_offset,
-        total_entries,
-    )?;
+    )
+    .ok()?;
+    if !legacy.matches_zip64_layout(layout) {
+        return None;
+    }
+    if layout.total_entries == 0 {
+        return record.checked_sub(locator.declared_record_offset);
+    }
+
+    let archive_start = validate_trailing_zip_directory(bytes, layout)?;
     (record.checked_sub(archive_start)? == locator.declared_record_offset).then_some(archive_start)
 }
 
+/// Result of the bounded trailing-ZIP proof. Work-budget exhaustion is never
+/// represented as absence because callers use this to decide exclusive parser
+/// ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZipTailProbe {
+    Present { offset: usize },
+    AbsentExhaustive,
+    Indeterminate,
+}
+
 /// Return the physical start of a structurally coherent trailing ZIP archive
-/// plus bounded-work receipts. The EOCD must end at EOF and describe one
+/// plus bounded-work receipts. The EOCD comment may end before EOF because the
+/// locked `zip` 2.4.2 reader deliberately accepts garbage after the comment.
+/// The EOCD must describe one
 /// non-spanned standard or ZIP64 central directory. A non-empty archive's first
 /// central entry must resolve to a real local header after accounting for a
 /// self-extracting/polyglot prefix; a canonical empty archive is valid too.
@@ -559,27 +643,31 @@ fn structurally_valid_zip64_offset(
 /// by themselves.
 #[derive(Debug, Clone, Copy)]
 struct TrailingZipAnalysis {
+    probe: ZipTailProbe,
+    #[cfg_attr(not(test), allow(dead_code))]
     offset: Option<usize>,
     #[cfg_attr(not(test), allow(dead_code))]
     scanned_positions: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
     candidate_limit_hit: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     search_incomplete: bool,
 }
 
 fn trailing_zip_analysis(bytes: &[u8]) -> TrailingZipAnalysis {
     if bytes.len() < ZIP_EOCD_BYTES {
         return TrailingZipAnalysis {
+            probe: ZipTailProbe::AbsentExhaustive,
             offset: None,
             scanned_positions: 0,
             candidate_limit_hit: false,
             search_incomplete: false,
         };
     }
-    let search_start = bytes
-        .len()
-        .saturating_sub(ZIP_EOCD_BYTES.saturating_add(ZIP_MAX_COMMENT_BYTES));
+    let search_start = bytes.len().saturating_sub(MAX_ZIP_TAIL_SCAN_BYTES);
     let mut candidates = Vec::new();
     let mut zip64_locators = std::collections::BTreeMap::new();
+    let mut eocd_candidate_limit_hit = false;
     for eocd in (search_start..=bytes.len() - ZIP_EOCD_BYTES).rev() {
         if bytes.get(eocd..eocd + 4) != Some(b"PK\x05\x06") {
             continue;
@@ -593,7 +681,7 @@ fn trailing_zip_analysis(bytes: &[u8]) -> TrailingZipAnalysis {
         else {
             continue;
         };
-        if candidate_end != bytes.len() {
+        if candidate_end > bytes.len() {
             continue;
         }
         let (Some(disk), Some(central_disk), Some(disk_entries), Some(total_entries)) = (
@@ -618,16 +706,14 @@ fn trailing_zip_analysis(bytes: &[u8]) -> TrailingZipAnalysis {
             central_size,
             central_offset: declared_central_offset,
         };
-        let zip64 = disk == u16::MAX
-            || central_disk == u16::MAX
-            || disk_entries == u16::MAX
-            || total_entries == u16::MAX
-            || central_size == u32::MAX
-            || declared_central_offset == u32::MAX;
-        if zip64 {
+        if legacy.requires_zip64() {
             let Some(locator) = valid_zip64_locator(bytes, eocd) else {
                 continue;
             };
+            if candidates.len() >= MAX_ZIP_EOCD_CANDIDATES {
+                eocd_candidate_limit_hit = true;
+                continue;
+            }
             zip64_locators.insert(locator.offset, locator.declared_record_offset);
             candidates.push(TrailingEocdCandidate {
                 eocd,
@@ -637,6 +723,10 @@ fn trailing_zip_analysis(bytes: &[u8]) -> TrailingZipAnalysis {
             continue;
         }
 
+        if candidates.len() >= MAX_ZIP_EOCD_CANDIDATES {
+            eocd_candidate_limit_hit = true;
+            continue;
+        }
         candidates.push(TrailingEocdCandidate {
             eocd,
             legacy,
@@ -664,45 +754,54 @@ fn trailing_zip_analysis(bytes: &[u8]) -> TrailingZipAnalysis {
                     structurally_valid_zip64_offset(bytes, locator, record, candidate.legacy)
                 {
                     return TrailingZipAnalysis {
+                        probe: ZipTailProbe::Present { offset },
                         offset: Some(offset),
                         scanned_positions: zip64_records.scanned_positions,
-                        candidate_limit_hit: zip64_records.candidate_limit_hit,
-                        search_incomplete: zip64_records.search_incomplete,
+                        candidate_limit_hit: eocd_candidate_limit_hit
+                            || zip64_records.candidate_limit_hit,
+                        search_incomplete: search_start > 0 || zip64_records.search_incomplete,
                     };
                 }
             }
             continue;
         }
 
-        if disk != 0 || central_disk != 0 || disk_entries != total_entries {
+        let Ok(record_offset) = u64::try_from(eocd) else {
             continue;
-        }
-        let (Some(central_size), Some(declared_central_offset)) = (
-            usize::try_from(central_size).ok(),
-            usize::try_from(declared_central_offset).ok(),
+        };
+        let Ok(layout) = validate_zip_eocd_layout(
+            record_offset,
+            u64::from(disk),
+            u64::from(central_disk),
+            u64::from(disk_entries),
+            u64::from(total_entries),
+            u64::from(central_size),
+            u64::from(declared_central_offset),
         ) else {
             continue;
         };
-        if let Some(offset) = validate_trailing_zip_directory(
-            bytes,
-            eocd,
-            central_size,
-            declared_central_offset,
-            usize::from(total_entries),
-        ) {
+        if let Some(offset) = validate_trailing_zip_directory(bytes, layout) {
             return TrailingZipAnalysis {
+                probe: ZipTailProbe::Present { offset },
                 offset: Some(offset),
                 scanned_positions: zip64_records.scanned_positions,
-                candidate_limit_hit: zip64_records.candidate_limit_hit,
-                search_incomplete: zip64_records.search_incomplete,
+                candidate_limit_hit: eocd_candidate_limit_hit || zip64_records.candidate_limit_hit,
+                search_incomplete: search_start > 0 || zip64_records.search_incomplete,
             };
         }
     }
+    let candidate_limit_hit = eocd_candidate_limit_hit || zip64_records.candidate_limit_hit;
+    let search_incomplete = search_start > 0 || zip64_records.search_incomplete;
     TrailingZipAnalysis {
+        probe: if candidate_limit_hit || search_incomplete {
+            ZipTailProbe::Indeterminate
+        } else {
+            ZipTailProbe::AbsentExhaustive
+        },
         offset: None,
         scanned_positions: zip64_records.scanned_positions,
-        candidate_limit_hit: zip64_records.candidate_limit_hit,
-        search_incomplete: zip64_records.search_incomplete,
+        candidate_limit_hit,
+        search_incomplete,
     }
 }
 
@@ -711,8 +810,10 @@ fn trailing_zip_analysis(bytes: &[u8]) -> TrailingZipAnalysis {
 /// ZIP64 candidate whose record search exceeded the bounded windows; the latter
 /// must fail toward incomplete coverage rather than false ownership.
 pub(crate) fn has_trailing_zip_boundary(bytes: &[u8]) -> bool {
-    let analysis = trailing_zip_analysis(bytes);
-    analysis.offset.is_some() || analysis.candidate_limit_hit || analysis.search_incomplete
+    !matches!(
+        trailing_zip_analysis(bytes).probe,
+        ZipTailProbe::AbsentExhaustive
+    )
 }
 
 /// Shared source of truth for archive magic used by file dispatch and the
@@ -961,32 +1062,22 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         let central_size = bytes.len() - archive_start - central_offset;
 
-        let record_start = bytes.len();
-        let mut record = vec![0u8; 56];
-        record[..4].copy_from_slice(b"PK\x06\x06");
-        record[4..12].copy_from_slice(&44u64.to_le_bytes());
-        record[12..14].copy_from_slice(&45u16.to_le_bytes());
-        record[14..16].copy_from_slice(&45u16.to_le_bytes());
-        record[24..32].copy_from_slice(&1u64.to_le_bytes());
-        record[32..40].copy_from_slice(&1u64.to_le_bytes());
-        record[40..48].copy_from_slice(&(central_size as u64).to_le_bytes());
-        record[48..56].copy_from_slice(&(central_offset as u64).to_le_bytes());
-        bytes.extend_from_slice(&record);
-
-        let mut locator = vec![0u8; 20];
-        locator[..4].copy_from_slice(b"PK\x06\x07");
-        locator[8..16].copy_from_slice(&((record_start - archive_start) as u64).to_le_bytes());
-        locator[16..20].copy_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&locator);
-
+        // Per-entry ZIP64 sizes/offsets do not require an archive-level ZIP64
+        // EOCD when the directory count/size/offset still fit classic fields.
         let mut eocd = vec![0u8; 22];
         eocd[..4].copy_from_slice(b"PK\x05\x06");
-        eocd[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
-        eocd[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
-        eocd[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
-        eocd[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        eocd[8..10].copy_from_slice(&1u16.to_le_bytes());
+        eocd[10..12].copy_from_slice(&1u16.to_le_bytes());
+        eocd[12..16].copy_from_slice(&(central_size as u32).to_le_bytes());
+        eocd[16..20].copy_from_slice(&(central_offset as u32).to_le_bytes());
         bytes.extend_from_slice(&eocd);
         bytes
+    }
+
+    fn assert_locked_zip_reader_accepts(bytes: &[u8], label: &str) {
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+            .unwrap_or_else(|error| panic!("locked zip 2.4.2 rejected {label}: {error}"));
+        assert_eq!(archive.len(), 1, "unexpected entry count for {label}");
     }
 
     #[test]
@@ -998,6 +1089,134 @@ mod tests {
         let benign = classify_with_ambiguity(b"%PDF-1.7\n(PK\x03\x04 is text)\n%%EOF\n");
         assert_eq!(benign.kind, ContentKind::Pdf);
         assert!(!benign.ambiguous_pdf_ownership);
+    }
+
+    #[test]
+    fn zip_reader_accepted_trailing_junk_never_restores_exclusive_pdf_ownership() {
+        for trailing_junk in [
+            b"\n".as_slice(),
+            &[b'x'; 4096],
+            &[b'y'; ZIP_MAX_COMMENT_BYTES + 1],
+        ] {
+            let mut bytes = pdf_with_trailing_zip();
+            bytes.extend_from_slice(trailing_junk);
+
+            assert!(
+                zip::ZipArchive::new(std::io::Cursor::new(&bytes)).is_ok(),
+                "fixture must remain accepted by the locked ZIP reader"
+            );
+            let analysis = trailing_zip_analysis(&bytes);
+            assert!(matches!(analysis.probe, ZipTailProbe::Present { .. }));
+            let classification = classify_with_ambiguity(&bytes);
+            assert_eq!(classification.kind, ContentKind::Pdf);
+            assert!(classification.ambiguous_pdf_ownership);
+        }
+    }
+
+    #[test]
+    fn locked_zip_reader_layout_matrix_never_gets_exclusive_pdf_ownership() {
+        for (label, bytes) in [
+            ("classic", pdf_with_trailing_zip()),
+            ("archive-level ZIP64", pdf_with_trailing_zip64()),
+            ("per-entry ZIP64", pdf_with_trailing_per_entry_zip64()),
+        ] {
+            assert_locked_zip_reader_accepts(&bytes, label);
+            let analysis = trailing_zip_analysis(&bytes);
+            assert!(
+                matches!(analysis.probe, ZipTailProbe::Present { .. }),
+                "accepted {label} archive was not detected: {analysis:?}"
+            );
+            assert!(classify_with_ambiguity(&bytes).ambiguous_pdf_ownership);
+        }
+    }
+
+    #[test]
+    fn one_byte_trailing_junk_is_ambiguous_for_every_locked_reader_layout() {
+        for (label, mut bytes) in [
+            ("classic", pdf_with_trailing_zip()),
+            ("archive-level ZIP64", pdf_with_trailing_zip64()),
+            ("per-entry ZIP64", pdf_with_trailing_per_entry_zip64()),
+        ] {
+            bytes.push(b'j');
+            assert_locked_zip_reader_accepts(&bytes, label);
+            assert!(matches!(
+                trailing_zip_analysis(&bytes).probe,
+                ZipTailProbe::Present { .. }
+            ));
+            assert!(classify_with_ambiguity(&bytes).ambiguous_pdf_ownership);
+        }
+    }
+
+    #[test]
+    fn locked_zip_reader_comment_boundaries_never_get_exclusive_pdf_ownership() {
+        for comment_len in [1usize, ZIP_MAX_COMMENT_BYTES] {
+            let mut bytes = pdf_with_trailing_zip();
+            let eocd = bytes.len() - ZIP_EOCD_BYTES;
+            bytes[eocd + 20..eocd + 22].copy_from_slice(&(comment_len as u16).to_le_bytes());
+            bytes.resize(bytes.len() + comment_len, b'c');
+
+            assert_locked_zip_reader_accepts(&bytes, "classic archive comment boundary");
+            assert!(matches!(
+                trailing_zip_analysis(&bytes).probe,
+                ZipTailProbe::Present { .. }
+            ));
+            assert!(classify_with_ambiguity(&bytes).ambiguous_pdf_ownership);
+        }
+    }
+
+    #[test]
+    fn locked_reader_accepted_empty_archive_ignores_unused_directory_fields() {
+        let mut bytes = b"%PDF-1.7\n%%EOF\n".to_vec();
+        let mut eocd = [0u8; ZIP_EOCD_BYTES];
+        eocd[..4].copy_from_slice(b"PK\x05\x06");
+        eocd[12..16].copy_from_slice(&7u32.to_le_bytes());
+        eocd[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&eocd);
+
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes))
+            .expect("locked reader accepts ignored empty-archive directory fields");
+        assert_eq!(archive.len(), 0);
+        assert!(matches!(
+            trailing_zip_analysis(&bytes).probe,
+            ZipTailProbe::Present { .. }
+        ));
+        assert!(classify_with_ambiguity(&bytes).ambiguous_pdf_ownership);
+    }
+
+    #[test]
+    fn malformed_classic_offsets_rejected_by_locked_reader_are_exhaustive_absence() {
+        for malformed_offset in [u32::MAX - 1, u32::MAX] {
+            let mut bytes = pdf_with_trailing_zip();
+            let eocd = bytes.len() - ZIP_EOCD_BYTES;
+            bytes[eocd + 16..eocd + 20].copy_from_slice(&malformed_offset.to_le_bytes());
+
+            assert!(
+                zip::ZipArchive::new(std::io::Cursor::new(&bytes)).is_err(),
+                "locked reader unexpectedly accepted malformed offset {malformed_offset}"
+            );
+            assert!(matches!(
+                trailing_zip_analysis(&bytes).probe,
+                ZipTailProbe::AbsentExhaustive
+            ));
+            assert!(!classify_with_ambiguity(&bytes).ambiguous_pdf_ownership);
+        }
+    }
+
+    #[test]
+    fn classic_eocd_candidate_flood_fails_toward_ambiguity_at_the_exact_cap() {
+        let mut bytes = b"%PDF-1.7\n%%EOF\n".to_vec();
+        for _ in 0..=MAX_ZIP_EOCD_CANDIDATES {
+            let mut invalid = [0u8; ZIP_EOCD_BYTES];
+            invalid[..4].copy_from_slice(b"PK\x05\x06");
+            invalid[4..6].copy_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&invalid);
+        }
+
+        let analysis = trailing_zip_analysis(&bytes);
+        assert!(matches!(analysis.probe, ZipTailProbe::Indeterminate));
+        assert!(analysis.candidate_limit_hit);
+        assert_eq!(analysis.offset, None);
+        assert!(classify_with_ambiguity(&bytes).ambiguous_pdf_ownership);
     }
 
     #[test]
@@ -1214,6 +1433,7 @@ mod tests {
         fake[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         bytes.extend_from_slice(&fake);
 
+        assert_locked_zip_reader_accepts(&bytes, "comment with false EOCD signature");
         assert!(classify_with_ambiguity(&bytes).ambiguous_pdf_ownership);
     }
 

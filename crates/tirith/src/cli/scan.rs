@@ -246,6 +246,9 @@ pub fn run(
     };
 
     let mut result = scan::scan(&config);
+    // Preserve analyzer-originated incompleteness before a presentation profile
+    // can suppress or transform its finding.
+    let analyzer_incomplete = result.analysis_incomplete();
     // Apply the overlay before output and the exit-code decision, so CI sees the
     // profile's verdict. `scanned_count` is left untouched.
     if !rule_overlay.is_empty() {
@@ -290,14 +293,29 @@ pub fn run(
                 .or_else(|| location.installed_path.clone())
                 .unwrap_or_else(|| config.path.clone())
         };
+        // A PDF analyzer gap already has its precise analyzer-originated
+        // `AnalysisIncomplete` finding. Keep the typed root gap, but do not add
+        // a second generic row for the same file unless an output overlay
+        // removed the original finding.
+        let analyzer_finding_already_present = result.coverage_gaps.iter().any(|gap| {
+            gap.location == location && gap.kind == scan::CoverageGapKind::PdfAnalyzerIncomplete
+        }) && result
+            .file_results
+            .iter()
+            .any(|file| file.path == path && file.has_analysis_incomplete_finding());
+        if analyzer_finding_already_present {
+            continue;
+        }
         result.file_results.push(scan::FileScanResult {
             path,
             findings: vec![finding],
             is_config_file: false,
+            coverage_gaps: Vec::new(),
         });
     }
 
-    let analysis_incomplete = !result.coverage_gaps.is_empty();
+    let analysis_incomplete =
+        result.truncated || !result.coverage_gaps.is_empty() || analyzer_incomplete;
     let decision_has_findings_at_or_above = result.has_findings_at_or_above(fail_on_severity);
     let decision_total_findings = result.total_findings();
     for file_result in &mut result.file_results {
@@ -313,6 +331,7 @@ pub fn run(
     let output_ok = if sarif {
         print_sarif_result(
             &result,
+            analysis_incomplete,
             decision_total_findings,
             &compiled_dlp,
             dlp_incomplete,
@@ -434,6 +453,8 @@ fn run_stdin(
 
     let content = String::from_utf8_lossy(&raw_bytes).into_owned();
     let mut result = scan::scan_stdin(&content, &raw_bytes);
+    let analysis_incomplete = result.analysis_incomplete();
+    let coverage_gaps = result.coverage_gaps.clone();
     if !rule_overlay.is_empty() {
         result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
     }
@@ -448,18 +469,26 @@ fn run_stdin(
     tirith_core::redact::redact_findings_with_compiled(&mut result.findings, &compiled_dlp);
     tirith_core::verdict::bound_findings_for_output(&mut result.findings);
 
-    // Stdin has no file path, so a coverage gap is impossible: pass empty gaps.
+    // Parser-originated coverage can still be incomplete for stdin even though
+    // there is no filesystem path; retain its synthetic `<stdin>` location.
     // Write failure must not be a `0` success — see `run`.
     let output_ok = if sarif {
         print_sarif_file_result(
             &result,
-            &[],
+            &coverage_gaps,
+            analysis_incomplete,
             decision_total_findings,
             &compiled_dlp,
             dlp_incomplete,
         )
     } else if json {
-        print_json_file_result(&result, &[], false, &compiled_dlp, dlp_incomplete)
+        print_json_file_result(
+            &result,
+            &coverage_gaps,
+            analysis_incomplete,
+            &compiled_dlp,
+            dlp_incomplete,
+        )
     } else {
         if !ci {
             let mut human = tirith_core::output::HumanInvocationWriter::new(
@@ -476,6 +505,7 @@ fn run_stdin(
                 .is_err();
             }
             failed |= print_human_file_result(&result, &compiled_dlp, &mut human).is_err();
+            failed |= print_coverage_gaps_human(&coverage_gaps, &compiled_dlp, &mut human).is_err();
             failed |= human.finish().is_err();
             if failed {
                 return 1;
@@ -484,7 +514,8 @@ fn run_stdin(
         true
     };
 
-    if decision_has_findings_at_or_above {
+    let ci_coverage_fail = ci && coverage_requires_failure(&coverage_gaps, &policy);
+    if decision_has_findings_at_or_above || ci_coverage_fail {
         1
     } else if decision_has_findings {
         2
@@ -538,7 +569,10 @@ fn run_single_file(
     // capture it before the outcome is consumed by the match below.
     let was_panic = matches!(outcome, GuardedScanOutcome::RulePanic(_));
     let (mut result, coverage_gaps): (FileScanResult, Vec<CoverageGap>) = match outcome {
-        GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(r)) => (r, Vec::new()),
+        GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(r)) => {
+            let coverage_gaps = r.coverage_gaps.clone();
+            (r, coverage_gaps)
+        }
         GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap))
         | GuardedScanOutcome::RulePanic(gap) => {
             // No analyzed content: synthesize a result carrying only the
@@ -552,11 +586,13 @@ fn run_single_file(
                     path: path.clone(),
                     findings,
                     is_config_file: false,
+                    coverage_gaps: Vec::new(),
                 },
                 vec![gap],
             )
         }
     };
+    let analyzer_incomplete = result.analysis_incomplete();
     if !rule_overlay.is_empty() {
         result.findings = apply_rule_overlay(std::mem::take(&mut result.findings), rule_overlay);
     }
@@ -566,13 +602,14 @@ fn run_single_file(
     tirith_core::redact::redact_findings_with_compiled(&mut result.findings, &compiled_dlp);
     tirith_core::verdict::bound_findings_for_output(&mut result.findings);
 
-    let analysis_incomplete = !coverage_gaps.is_empty();
+    let analysis_incomplete = !coverage_gaps.is_empty() || analyzer_incomplete;
 
     // Write failure must not be a `0` success — see `run`.
     let output_ok = if sarif {
         print_sarif_file_result(
             &result,
             &coverage_gaps,
+            analysis_incomplete,
             decision_total_findings,
             &compiled_dlp,
             dlp_incomplete,
@@ -1185,6 +1222,7 @@ fn take_sarif_policy_diagnostics(
 /// Emit a directory-scan result as SARIF. Returns `false` on a write failure.
 fn print_sarif_result(
     result: &scan::ScanResult,
+    analysis_incomplete: bool,
     original_total_findings: usize,
     compiled: &tirith_core::redact::CompiledCustomPatterns,
     dlp_redaction_incomplete: bool,
@@ -1219,6 +1257,7 @@ fn print_sarif_result(
     let policy_diagnostics = take_sarif_policy_diagnostics(compiled);
     let sarif_json = bounded_sarif(
         findings,
+        analysis_incomplete,
         original_total_findings,
         version,
         dlp_redaction_incomplete,
@@ -1235,6 +1274,7 @@ fn print_sarif_result(
 fn print_sarif_file_result(
     result: &scan::FileScanResult,
     coverage_gaps: &[scan::CoverageGap],
+    analysis_incomplete: bool,
     original_total_findings: usize,
     compiled: &tirith_core::redact::CompiledCustomPatterns,
     dlp_redaction_incomplete: bool,
@@ -1262,6 +1302,7 @@ fn print_sarif_file_result(
     let policy_diagnostics = take_sarif_policy_diagnostics(compiled);
     let sarif_json = bounded_sarif(
         findings,
+        analysis_incomplete,
         original_total_findings,
         version,
         dlp_redaction_incomplete,
@@ -1318,6 +1359,7 @@ fn cap_sarif_text(value: &str, byte_cap: usize) -> (String, usize) {
 
 fn bounded_sarif<'a>(
     mut selected: Vec<tirith_core::sarif::SarifFinding<'a>>,
+    scan_analysis_incomplete: bool,
     original_total_findings: usize,
     version: &str,
     dlp_redaction_incomplete: bool,
@@ -1361,12 +1403,18 @@ fn bounded_sarif<'a>(
         }
         let mut sarif = tirith_core::sarif::to_sarif(&view, version);
         let policy_presentation_truncated = policy_diagnostics.presentation_truncated();
-        if omitted > 0 || dlp_redaction_incomplete || policy_diagnostics.total_count > 0 {
+        if scan_analysis_incomplete
+            || omitted > 0
+            || dlp_redaction_incomplete
+            || policy_diagnostics.total_count > 0
+        {
             sarif["runs"][0]["properties"] = serde_json::json!({
                 "presentation_truncated": omitted > 0 || policy_presentation_truncated,
-                "analysis_incomplete": omitted > 0
+                "analysis_incomplete": scan_analysis_incomplete
+                    || omitted > 0
                     || dlp_redaction_incomplete
                     || policy_diagnostics.total_count > 0,
+                "scan_analysis_incomplete": scan_analysis_incomplete,
                 "omitted_findings": omitted,
                 "original_total_findings": original_total_findings,
                 "dlp_redaction_incomplete": dlp_redaction_incomplete,
@@ -1590,6 +1638,7 @@ mod tests {
 
         let sarif = bounded_sarif(
             selected,
+            false,
             1_000,
             "test-version",
             false,
@@ -1612,6 +1661,22 @@ mod tests {
             .any(|result| result["message"]["text"]
                 .as_str()
                 .is_some_and(|text| text.contains("presentation was truncated"))));
+    }
+
+    #[test]
+    fn sarif_preserves_analyzer_incompleteness_without_driver_or_presentation_gap() {
+        let sarif = bounded_sarif(
+            Vec::new(),
+            true,
+            0,
+            "test-version",
+            false,
+            SarifPolicyDiagnostics::default(),
+        );
+        let properties = &sarif["runs"][0]["properties"];
+        assert_eq!(properties["analysis_incomplete"], true);
+        assert_eq!(properties["scan_analysis_incomplete"], true);
+        assert_eq!(properties["presentation_truncated"], false);
     }
     use tirith_core::verdict::Finding;
 
@@ -1697,7 +1762,7 @@ mod tests {
             let _ = tirith_core::policy::Policy::load_from_yaml("[", Some(&split));
             tirith_core::policy::freeze_captured_policy_dlp_patterns(&patterns);
             let diagnostics = take_sarif_policy_diagnostics(&compiled);
-            bounded_sarif(Vec::new(), 0, "test-version", false, diagnostics)
+            bounded_sarif(Vec::new(), false, 0, "test-version", false, diagnostics)
         };
         let sarif_rendered = serde_json::to_string(&sarif).unwrap();
 
@@ -1727,7 +1792,7 @@ mod tests {
         }
 
         let diagnostics = take_sarif_policy_diagnostics(&compiled);
-        let sarif = bounded_sarif(Vec::new(), 0, "test-version", false, diagnostics);
+        let sarif = bounded_sarif(Vec::new(), false, 0, "test-version", false, diagnostics);
         let properties = &sarif["runs"][0]["properties"];
 
         assert_eq!(
@@ -1767,7 +1832,7 @@ mod tests {
         let _ = tirith_core::policy::Policy::load_from_yaml("[", Some(&source));
 
         let diagnostics = take_sarif_policy_diagnostics(&compiled);
-        let sarif = bounded_sarif(Vec::new(), 0, "test-version", false, diagnostics);
+        let sarif = bounded_sarif(Vec::new(), false, 0, "test-version", false, diagnostics);
         let properties = &sarif["runs"][0]["properties"];
 
         assert_eq!(properties["policy_diagnostics_count"], 1);

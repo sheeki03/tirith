@@ -6,7 +6,7 @@ use crate::engine::{self, AnalysisContext};
 use crate::extract::ScanContext;
 use crate::location::SubjectLocation;
 use crate::tokenize::ShellType;
-use crate::verdict::{Finding, Severity};
+use crate::verdict::{Finding, RuleId, Severity};
 
 /// Configuration for a file scan operation.
 pub struct ScanConfig {
@@ -51,8 +51,25 @@ pub struct FileScanResult {
     pub path: PathBuf,
     pub findings: Vec<Finding>,
     pub is_config_file: bool,
+    /// Analyzer-originated coverage gaps for this otherwise-scanned subject.
+    /// Kept on the file result so single-file callers do not have to discard
+    /// either the findings or the typed incompleteness state.
+    pub coverage_gaps: Vec<CoverageGap>,
 }
 
+impl FileScanResult {
+    /// Analyzer-originated incompleteness is part of the scan result even when
+    /// the filesystem driver itself produced no coverage gap.
+    pub fn has_analysis_incomplete_finding(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete)
+    }
+
+    pub fn analysis_incomplete(&self) -> bool {
+        !self.coverage_gaps.is_empty() || self.has_analysis_incomplete_finding()
+    }
+}
 /// The outcome of attempting to scan one file: it was analyzed, or it was
 /// skipped with a recorded reason (a [`CoverageGap`]). Replaces the lossy
 /// `Option<FileScanResult>` so a skip can never be silently read as "clean".
@@ -153,13 +170,16 @@ pub enum CoverageGapKind {
     /// random-access buffer, because it exceeds the native-parse cap; the deep
     /// native analysis is therefore truncated. A coverage limit.
     NativeTruncated,
+    /// The PDF analyzer accepted ownership of the bytes but reported a typed
+    /// parser/structure/coverage reason that prevented a complete analysis.
+    PdfAnalyzerIncomplete,
 }
 
 impl CoverageGapKind {
     /// Every typed coverage-gap reason. Security-enforcing consumers use this in
     /// exhaustive contract tests so a gap kind cannot be silently omitted from
     /// fail-closed install behavior.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Oversized,
         Self::Unreadable,
         Self::EnumerationFailed,
@@ -173,6 +193,7 @@ impl CoverageGapKind {
         Self::MemberTooLarge,
         Self::UnsupportedCompression,
         Self::NativeTruncated,
+        Self::PdfAnalyzerIncomplete,
     ];
 
     /// A short stable wire token for JSON/SARIF.
@@ -191,6 +212,7 @@ impl CoverageGapKind {
             CoverageGapKind::MemberTooLarge => "member_too_large",
             CoverageGapKind::UnsupportedCompression => "unsupported_compression",
             CoverageGapKind::NativeTruncated => "native_truncated",
+            CoverageGapKind::PdfAnalyzerIncomplete => "pdf_analyzer_incomplete",
         }
     }
 }
@@ -616,6 +638,7 @@ fn run_workflow_artifact_post_pass(
             path,
             findings: verdict.findings,
             is_config_file: false,
+            coverage_gaps: Vec::new(),
         });
     }
 
@@ -717,6 +740,7 @@ fn inspect_artifact_candidate_from_handle(
             path: loc,
             findings: vec![finding],
             is_config_file: false,
+            coverage_gaps: Vec::new(),
         });
     }
 
@@ -745,6 +769,7 @@ fn inspect_artifact_candidate_from_handle(
             path: path.to_path_buf(),
             findings: Vec::new(),
             is_config_file: false,
+            coverage_gaps: Vec::new(),
         });
     }
 
@@ -970,10 +995,17 @@ fn scan_single_file_at(
     // emitted here. One workflow file cannot prove a producer-to-consumer chain.
     let mut candidate =
         scan_candidate_at(read_path, logical_path, expected_identity, None, false, 0);
+    let trailing_result = candidate.file_results.pop();
+    if trailing_result
+        .as_ref()
+        .is_some_and(|result| !result.coverage_gaps.is_empty())
+    {
+        return ScanFileOutcome::Scanned(trailing_result.expect("file result was checked above"));
+    }
     if let Some(gap) = candidate.coverage_gaps.into_iter().next() {
         return ScanFileOutcome::Skipped(gap);
     }
-    if let Some(result) = candidate.file_results.pop() {
+    if let Some(result) = trailing_result {
         return ScanFileOutcome::Scanned(result);
     }
     // A genuine unknown media file was byte-classified and intentionally
@@ -983,14 +1015,16 @@ fn scan_single_file_at(
         path: logical_path.to_path_buf(),
         findings: Vec::new(),
         is_config_file: false,
+        coverage_gaps: Vec::new(),
     })
 }
 
 impl CandidateScanResult {
     fn scanned(result: FileScanResult) -> Self {
+        let coverage_gaps = result.coverage_gaps.clone();
         Self {
             file_results: vec![result],
-            coverage_gaps: Vec::new(),
+            coverage_gaps,
             intentionally_ignored: false,
             workflow: None,
         }
@@ -1330,7 +1364,14 @@ fn scan_candidate_at(
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
     };
 
-    let verdict = engine::analyze(&ctx);
+    let (verdict, pdf_coverage) = engine::analyze_file_with_pdf_coverage(&ctx);
+    let coverage_gaps = pdf_analyzer_coverage_gap(
+        SubjectLocation::from_path(logical_path.to_path_buf()),
+        ctx.raw_bytes.as_deref().unwrap_or_default(),
+        &pdf_coverage,
+    )
+    .into_iter()
+    .collect();
 
     let policy = crate::policy::Policy::discover(cwd.as_deref());
     let mut findings = verdict.findings;
@@ -1354,9 +1395,26 @@ fn scan_candidate_at(
         path: logical_path.to_path_buf(),
         findings,
         is_config_file: is_config,
+        coverage_gaps,
     });
     outcome.workflow = workflow;
     outcome
+}
+
+/// The scan dispatch is the single seam that turns parser-local typed PDF
+/// coverage into a path-qualified, serializable coverage gap. The individual
+/// reasons remain represented by the analyzer's `AnalysisIncomplete` finding;
+/// one gap per file avoids multiplying identical UI/exit-state rows.
+fn pdf_analyzer_coverage_gap(
+    location: SubjectLocation,
+    raw_bytes: &[u8],
+    reasons: &[String],
+) -> Option<CoverageGap> {
+    (!reasons.is_empty()).then(|| CoverageGap {
+        location,
+        kind: CoverageGapKind::PdfAnalyzerIncomplete,
+        sha256: Some(sha256_bytes(raw_bytes)),
+    })
 }
 
 /// Wrap `f` in `catch_unwind` for the directory walk: on panic, log a skip and
@@ -1465,7 +1523,14 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
     };
 
-    let verdict = engine::analyze(&ctx);
+    let (verdict, pdf_coverage) = engine::analyze_file_with_pdf_coverage(&ctx);
+    let coverage_gaps = pdf_analyzer_coverage_gap(
+        SubjectLocation::from_path(PathBuf::from("<stdin>")),
+        raw_bytes,
+        &pdf_coverage,
+    )
+    .into_iter()
+    .collect();
 
     let policy = crate::policy::Policy::discover(cwd.as_deref());
     let mut findings = verdict.findings;
@@ -1475,6 +1540,7 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
         path: PathBuf::from("<stdin>"),
         findings,
         is_config_file: false,
+        coverage_gaps,
     }
 }
 
@@ -2503,6 +2569,21 @@ impl ScanResult {
     pub fn total_findings(&self) -> usize {
         self.file_results.iter().map(|r| r.findings.len()).sum()
     }
+    pub fn has_analysis_incomplete_finding(&self) -> bool {
+        self.file_results
+            .iter()
+            .any(FileScanResult::has_analysis_incomplete_finding)
+    }
+
+    /// Objective completeness before presentation redaction/bounding.
+    pub fn analysis_incomplete(&self) -> bool {
+        self.truncated
+            || !self.coverage_gaps.is_empty()
+            || self
+                .file_results
+                .iter()
+                .any(FileScanResult::analysis_incomplete)
+    }
 }
 
 /// Security-relevant file extensions for coverage purposes: a skipped file with
@@ -2698,7 +2779,9 @@ pub fn gap_is_security_relevant(gap: &CoverageGap) -> bool {
     // relevant no matter what the visible path is named.
     if matches!(
         gap.kind,
-        CoverageGapKind::HashBudgetExceeded | CoverageGapKind::EnumerationFailed
+        CoverageGapKind::HashBudgetExceeded
+            | CoverageGapKind::EnumerationFailed
+            | CoverageGapKind::PdfAnalyzerIncomplete
     ) {
         return true;
     }
@@ -4147,6 +4230,62 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete));
+    }
+
+    #[test]
+    fn malformed_exclusive_pdf_retains_findings_and_typed_coverage_gap() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let path = tmp.path().join("malformed.pdf");
+        let bytes = b"%PDF-1.7\nnot a complete PDF\n%%EOF\n";
+        std::fs::write(&path, bytes).unwrap();
+
+        let file = match scan_single_file(&path) {
+            ScanFileOutcome::Scanned(file) => file,
+            ScanFileOutcome::Skipped(gap) => {
+                panic!("owned PDF analysis must retain its file result: {gap:?}")
+            }
+        };
+        assert!(file.has_analysis_incomplete_finding());
+        assert!(file.analysis_incomplete());
+        assert_eq!(file.coverage_gaps.len(), 1);
+        assert_eq!(
+            file.coverage_gaps[0].kind,
+            CoverageGapKind::PdfAnalyzerIncomplete
+        );
+        assert_eq!(file.coverage_gaps[0].primary_path(), Some(path.as_path()));
+        assert!(file.coverage_gaps[0].sha256.is_some());
+        assert!(gap_is_security_relevant(&file.coverage_gaps[0]));
+
+        let aggregate = scan(&ScanConfig {
+            path: tmp.path().to_path_buf(),
+            recursive: true,
+            fail_on: Severity::Critical,
+            ignore_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            max_files: None,
+        });
+        assert!(aggregate.analysis_incomplete());
+        assert!(aggregate.coverage_gaps.iter().any(|gap| {
+            gap.kind == CoverageGapKind::PdfAnalyzerIncomplete
+                && gap.primary_path() == Some(path.as_path())
+        }));
+    }
+
+    #[test]
+    fn malformed_pdf_stdin_has_typed_analyzer_coverage() {
+        let bytes = b"%PDF-1.7\nnot a complete PDF\n%%EOF\n";
+        let result = scan_stdin(&String::from_utf8_lossy(bytes), bytes);
+        assert!(result.analysis_incomplete());
+        assert_eq!(result.coverage_gaps.len(), 1);
+        assert_eq!(
+            result.coverage_gaps[0].kind,
+            CoverageGapKind::PdfAnalyzerIncomplete
+        );
+        assert_eq!(
+            result.coverage_gaps[0].primary_path(),
+            Some(Path::new("<stdin>"))
+        );
     }
 
     /// A non-UTF-8 filename with an artifact extension is still an `ArtifactCandidate`

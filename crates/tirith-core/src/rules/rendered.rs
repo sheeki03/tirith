@@ -6333,11 +6333,16 @@ pub fn analyze_pdf(raw_bytes: &[u8]) -> PdfAnalysis {
         Ok(preflight) => preflight,
         Err(reason) => {
             eprintln!("tirith: scan: PDF rejected by active-xref preflight: {reason}");
-            findings.push(pdf_analysis_incomplete(&[format!(
-                "PDF active-xref preflight failed before parser entry: {reason}"
-            )]));
+            let coverage_reason =
+                format!("PDF active-xref preflight failed before parser entry: {reason}");
+            findings.push(pdf_analysis_incomplete(std::slice::from_ref(
+                &coverage_reason,
+            )));
             return PdfAnalysis {
                 findings,
+                coverage: PdfCoverage {
+                    incomplete_reasons: vec![coverage_reason],
+                },
                 ..PdfAnalysis::default()
             };
         }

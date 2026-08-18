@@ -461,34 +461,53 @@ fn preflight_archive<R: Read + Seek>(reader: &mut R, limits: &ArchiveLimits) -> 
             continue;
         };
 
-        let is_zip64 = disk == u16::MAX
-            || central_disk == u16::MAX
-            || disk_entries == u16::MAX
-            || total_entries == u16::MAX
-            || central_size == u32::MAX
-            || central_offset == u32::MAX;
-        if !is_zip64 {
-            if disk != 0 || central_disk != 0 || disk_entries != total_entries {
-                last_error = "multi-disk or inconsistent classic EOCD".to_string();
-                continue;
+        let legacy = crate::content_kind::ClassicEocdFields {
+            disk,
+            central_disk,
+            disk_entries,
+            total_entries,
+            central_size,
+            central_offset,
+        };
+        if !legacy.requires_zip64() {
+            let declared_total_entries = u64::from(total_entries);
+            // `zip` 2.4.2 locates a non-empty classic directory from the first
+            // CDFH plus the declared relative offset; it does not use the EOCD
+            // central-size field for that lookup. Apply our resource ceilings
+            // before the stricter shared layout arithmetic so an oversized
+            // attacker-controlled declaration cannot bypass the cap merely by
+            // also being inconsistent with the physical directory.
+            if declared_total_entries != 0 {
+                if declared_total_entries > limits.max_entries as u64 {
+                    return preflight_coverage_limit(
+                        CoverageGapKind::EntryCountCapped,
+                        Some(declared_total_entries),
+                    );
+                }
+                if u64::from(central_size) > MAX_CENTRAL_DIRECTORY_BYTES {
+                    return preflight_coverage_limit(
+                        CoverageGapKind::Truncated,
+                        Some(declared_total_entries),
+                    );
+                }
             }
-            let total_entries = u64::from(total_entries);
-            if total_entries > limits.max_entries as u64 {
-                return preflight_coverage_limit(
-                    CoverageGapKind::EntryCountCapped,
-                    Some(total_entries),
-                );
-            }
-            if u64::from(central_size) > MAX_CENTRAL_DIRECTORY_BYTES {
-                return preflight_coverage_limit(CoverageGapKind::Truncated, Some(total_entries));
-            }
-            let Some(physical_central) = eocd.checked_sub(u64::from(central_size)) else {
-                last_error = "classic central directory extends before the file".to_string();
-                continue;
+            let layout = match crate::content_kind::validate_zip_eocd_layout(
+                eocd,
+                u64::from(disk),
+                u64::from(central_disk),
+                u64::from(disk_entries),
+                u64::from(total_entries),
+                u64::from(central_size),
+                u64::from(central_offset),
+            ) {
+                Ok(layout) => layout,
+                Err(error) => {
+                    last_error = format!("invalid classic EOCD layout: {error}");
+                    continue;
+                }
             };
-            if physical_central < u64::from(central_offset) {
-                last_error = "classic central-directory offset is inconsistent".to_string();
-                continue;
+            if layout.total_entries == 0 {
+                return ArchivePreflight::Proceed;
             }
             return ArchivePreflight::Proceed;
         }
@@ -591,33 +610,45 @@ fn preflight_archive<R: Read + Seek>(reader: &mut R, limits: &ArchiveLimits) -> 
             ) else {
                 continue;
             };
-            if version_needed > version_made
-                || record_disk != 0
-                || record_central_disk != 0
-                || record_disk_entries != record_total_entries
-            {
+            if version_needed > version_made {
                 continue;
             }
-            if record_total_entries > limits.max_entries as u64 {
-                return preflight_coverage_limit(
-                    CoverageGapKind::EntryCountCapped,
-                    Some(record_total_entries),
-                );
-            }
-            if record_central_size > MAX_CENTRAL_DIRECTORY_BYTES {
-                return preflight_coverage_limit(
-                    CoverageGapKind::Truncated,
-                    Some(record_total_entries),
-                );
+            // As with classic EOCD metadata, enforce the work ceilings before
+            // layout arithmetic. The locked reader does not use the ZIP64
+            // central-size field to locate the directory, so a forged
+            // over-limit declaration is still a cap hit, not a path around it.
+            if record_total_entries != 0 {
+                if record_total_entries > limits.max_entries as u64 {
+                    return preflight_coverage_limit(
+                        CoverageGapKind::EntryCountCapped,
+                        Some(record_total_entries),
+                    );
+                }
+                if record_central_size > MAX_CENTRAL_DIRECTORY_BYTES {
+                    return preflight_coverage_limit(
+                        CoverageGapKind::Truncated,
+                        Some(record_total_entries),
+                    );
+                }
             }
             let record = declared_record.saturating_add(local_record as u64);
-            let Some(physical_central) = record.checked_sub(record_central_size) else {
-                continue;
+            let layout = match crate::content_kind::validate_zip_eocd_layout(
+                record,
+                u64::from(record_disk),
+                u64::from(record_central_disk),
+                record_disk_entries,
+                record_total_entries,
+                record_central_size,
+                record_central_offset,
+            ) {
+                Ok(layout) if legacy.matches_zip64_layout(layout) => layout,
+                Ok(_) | Err(_) => continue,
             };
-            let Some(archive_start) = physical_central.checked_sub(record_central_offset) else {
+            if layout.total_entries == 0 {
+                bounded_candidate_valid = true;
                 continue;
-            };
-            if record.saturating_sub(archive_start) != declared_record {
+            }
+            if record.saturating_sub(layout.archive_start) != declared_record {
                 continue;
             }
             bounded_candidate_valid = true;
@@ -2538,6 +2569,10 @@ mod tests {
             .expect("test archive has an EOCD");
         bytes[eocd + 12..eocd + 16]
             .copy_from_slice(&((MAX_CENTRAL_DIRECTORY_BYTES + 1) as u32).to_le_bytes());
+
+        let locked_reader = zip::ZipArchive::new(Cursor::new(&bytes))
+            .expect("zip 2.4.2 accepts the ignored forged central-size field");
+        assert_eq!(locked_reader.len(), 1);
 
         let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
         let inspection = match outcome {

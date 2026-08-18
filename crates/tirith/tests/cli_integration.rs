@@ -8785,6 +8785,105 @@ fn package_explain_json_carries_factor_breakdown() {
 // `tirith scan` directory walk — picks up every scannable file type.
 
 #[test]
+fn malformed_pdf_reports_analyzer_incompleteness_for_file_directory_and_stdin_json() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let project = tempfile::tempdir().expect("project tempdir");
+    let pdf = project.path().join("malformed.pdf");
+    let bytes = b"%PDF-1.7\nnot a structurally valid PDF\n";
+    fs::write(&pdf, bytes).expect("write malformed PDF");
+
+    let file_output = tirith()
+        .args(["scan", "--format", "json", "--file", pdf.to_str().unwrap()])
+        .output()
+        .expect("scan malformed PDF file");
+    let directory_output = tirith()
+        .args(["scan", "--format", "json", project.path().to_str().unwrap()])
+        .output()
+        .expect("scan directory containing malformed PDF");
+    let mut stdin_child = tirith()
+        .args(["scan", "--format", "json", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn malformed PDF stdin scan");
+    stdin_child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(bytes)
+        .expect("write malformed PDF to stdin");
+    let stdin_output = stdin_child.wait_with_output().expect("wait for stdin scan");
+
+    for (surface, output) in [
+        ("file", file_output),
+        ("directory", directory_output),
+        ("stdin", stdin_output),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{surface} must fail closed for incomplete PDF analysis; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{surface} scan must emit JSON ({error}); stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        assert_eq!(json["analysis_incomplete"], true, "{surface}: {json}");
+        if surface == "directory" {
+            assert_eq!(json["scan_analysis_incomplete"], true, "{json}");
+        }
+        assert!(
+            json["coverage_gaps"].as_array().is_some_and(|gaps| {
+                gaps.iter()
+                    .any(|gap| gap["kind"] == "pdf_analyzer_incomplete")
+            }),
+            "typed analyzer gap missing: {surface}: {json}"
+        );
+        let rendered = json.to_string();
+        assert!(
+            rendered.contains("\"rule_id\":\"analysis_incomplete\""),
+            "{surface} must retain the analyzer finding: {json}"
+        );
+    }
+
+    let human = tirith()
+        .args(["scan", "--file", pdf.to_str().unwrap()])
+        .output()
+        .expect("scan malformed PDF for human output");
+    assert_eq!(human.status.code(), Some(1));
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(human_stderr.contains("coverage gap"), "{human_stderr}");
+    assert!(
+        human_stderr.contains("pdf_analyzer_incomplete"),
+        "{human_stderr}"
+    );
+    assert!(!human_stderr.contains("no issues found"), "{human_stderr}");
+
+    let sarif_output = tirith()
+        .args(["scan", "--format", "sarif", "--file", pdf.to_str().unwrap()])
+        .output()
+        .expect("scan malformed PDF for SARIF output");
+    assert_eq!(sarif_output.status.code(), Some(1));
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif_output.stdout)
+        .expect("malformed PDF SARIF must be valid JSON");
+    assert_eq!(
+        sarif["runs"][0]["properties"]["scan_analysis_incomplete"],
+        true
+    );
+    assert!(sarif["runs"][0]["results"]
+        .as_array()
+        .is_some_and(|results| results
+            .iter()
+            .any(|result| { result["ruleId"] == "analysis_incomplete" })));
+}
+
+#[test]
 fn scan_directory_walk_finds_dockerfile_workflow_and_notebook() {
     let proj = tempfile::tempdir().expect("project tempdir");
 

@@ -2372,6 +2372,18 @@ pub fn analyze(ctx: &AnalysisContext) -> Verdict {
     analyze_inner(ctx, true).0
 }
 
+/// Analyze a file while retaining the PDF analyzer's typed coverage state for
+/// the filesystem/MCP scan boundary. General engine callers intentionally keep
+/// the stable [`Verdict`] contract; the scan driver is the single dispatch seam
+/// that converts parser-local PDF reasons into a location-bearing coverage gap.
+pub(crate) fn analyze_file_with_pdf_coverage(ctx: &AnalysisContext) -> (Verdict, Vec<String>) {
+    debug_assert_eq!(ctx.scan_context, ScanContext::FileScan);
+    let mut pdf_coverage = Vec::new();
+    let (verdict, _) =
+        analyze_inner_with_policy_and_pdf_coverage(ctx, true, None, false, Some(&mut pdf_coverage));
+    (verdict, pdf_coverage)
+}
+
 /// Resolve the effective policy and every read-only enforcement overlay once.
 fn discover_fully_resolved_policy(ctx: &AnalysisContext) -> Policy {
     let mut policy = Policy::discover(ctx.cwd.as_deref());
@@ -2449,6 +2461,16 @@ fn analyze_inner_with_policy(
     honor_bypass: bool,
     policy_snapshot: Option<&Policy>,
     force_full: bool,
+) -> (Verdict, Policy) {
+    analyze_inner_with_policy_and_pdf_coverage(ctx, honor_bypass, policy_snapshot, force_full, None)
+}
+
+fn analyze_inner_with_policy_and_pdf_coverage(
+    ctx: &AnalysisContext,
+    honor_bypass: bool,
+    policy_snapshot: Option<&Policy>,
+    force_full: bool,
+    pdf_coverage: Option<&mut Vec<String>>,
 ) -> (Verdict, Policy) {
     let start = Instant::now();
 
@@ -2835,6 +2857,9 @@ fn analyze_inner_with_policy(
             // terminal/config/code rules over lossy PDF bytes: only safely
             // extracted text is handed to the applicable text-security helpers.
             let analysis = crate::rules::rendered::analyze_pdf(byte_input);
+            if let Some(coverage) = pdf_coverage {
+                coverage.extend(analysis.coverage.incomplete_reasons.iter().cloned());
+            }
             findings.extend(analysis.findings);
             append_pdf_text_security_findings(
                 ctx,
@@ -4003,6 +4028,36 @@ mod tests {
             finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
                 && finding.description.contains("trailing ZIP")
         }));
+    }
+
+    #[test]
+    fn file_dispatch_preserves_typed_pdf_coverage_once() {
+        let bytes = b"%PDF-1.7\nnot a complete PDF\n%%EOF\n".to_vec();
+        let ctx = AnalysisContext {
+            input: String::from_utf8_lossy(&bytes).into_owned(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::FileScan,
+            raw_bytes: Some(bytes),
+            interactive: false,
+            cwd: None,
+            file_path: Some(std::path::PathBuf::from("malformed.pdf")),
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        };
+
+        let (verdict, coverage) = analyze_file_with_pdf_coverage(&ctx);
+        assert_eq!(coverage.len(), 1);
+        assert!(
+            coverage[0].contains("active-xref preflight"),
+            "{coverage:?}"
+        );
+        assert!(verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
     }
 
     /// CodeRabbit M13 finding C: package reputation must be a real tri-state —

@@ -657,6 +657,7 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
     match scan::scan_single_file_guarded(&path) {
         GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(mut result)) => {
             let findings_count = result.findings.len();
+            let analysis_incomplete = result.analysis_incomplete();
             crate::redact::redact_findings_with_compiled(&mut result.findings, &compiled);
             crate::verdict::bound_findings_for_output(&mut result.findings);
             let structured = file_scan_structured(&result, findings_count, &compiled);
@@ -666,7 +667,7 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
                     content_type: "text".into(),
                     text,
                 }],
-                is_error: false,
+                is_error: analysis_incomplete,
                 structured_content: Some(structured),
             }
         }
@@ -700,6 +701,8 @@ fn file_scan_structured(
         "findings_count": findings_count,
         "presented_findings_count": presented_findings_count,
         "findings": &result.findings,
+        "analysis_incomplete": result.analysis_incomplete(),
+        "coverage_gaps": &result.coverage_gaps,
         "dlp_redaction_incomplete": compiled.incomplete_reason().is_some(),
     });
     crate::redact::redact_json_strings(&mut structured, compiled);
@@ -761,7 +764,9 @@ fn build_directory_scan_response(
     let completeness_violation = directory_scan_is_error(result, policy);
     let mut text = format_dir_scan_text(result, total_findings, compiled);
     if completeness_violation {
-        text = if result.truncated {
+        text = if result.has_analysis_incomplete_finding() {
+            format!("ANALYSIS INCOMPLETE (analyzer reported incomplete coverage)\n{text}")
+        } else if result.truncated {
             format!(
                 "ANALYSIS INCOMPLETE (scan file budget exhausted): {} candidate(s) omitted\n{}",
                 result.skipped_count, text
@@ -788,7 +793,8 @@ fn build_directory_scan_response(
 }
 
 fn directory_scan_is_error(result: &scan::ScanResult, policy: &crate::policy::Policy) -> bool {
-    result.truncated
+    result.has_analysis_incomplete_finding()
+        || result.truncated
         || (!result.coverage_gaps.is_empty()
             && (policy.scan.require_complete
                 || result.coverage_gaps.iter().any(|gap| {
@@ -1075,10 +1081,19 @@ fn format_file_scan_text(
         &result.path.display().to_string(),
         compiled,
     );
-    if result.findings.is_empty() {
+    let analysis_incomplete = result.analysis_incomplete();
+    if result.findings.is_empty() && !analysis_incomplete {
         return format!("{path}: no issues found.");
     }
-    let mut out = format!("{}: {} finding(s):\n", path, result.findings.len());
+    let mut out = if analysis_incomplete {
+        format!(
+            "{path}: ANALYSIS INCOMPLETE — {} finding(s), {} coverage gap(s):\n",
+            result.findings.len(),
+            result.coverage_gaps.len()
+        )
+    } else {
+        format!("{path}: {} finding(s):\n", result.findings.len())
+    };
     for f in &result.findings {
         out.push_str(&format!("  [{}] {} — {}\n", f.severity, f.rule_id, f.title));
     }
@@ -1234,6 +1249,31 @@ mod tests {
     }
 
     #[test]
+    fn actual_scan_file_tool_fails_closed_for_malformed_pdf() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let tmp = tempfile::Builder::new()
+            .prefix("tirith-mcp-pdf-")
+            .tempdir_in(cwd)
+            .expect("create in-scope tempdir");
+        let path = tmp.path().join("malformed.pdf");
+        std::fs::write(&path, b"%PDF-1.7\nnot a complete PDF\n%%EOF\n").unwrap();
+
+        let response = call_scan_file(&json!({"path": path}));
+        let structured = response
+            .structured_content
+            .as_ref()
+            .expect("scan_file structured response");
+        assert!(response.is_error);
+        assert_eq!(structured["analysis_incomplete"], true);
+        assert_eq!(
+            structured["coverage_gaps"][0]["kind"],
+            "pdf_analyzer_incomplete"
+        );
+        assert!(response.content[0].text.contains("ANALYSIS INCOMPLETE"));
+        assert!(!response.content[0].text.contains("no issues found"));
+    }
+
+    #[test]
     fn capped_five_thousand_file_scan_is_incomplete_error_with_omission_marker() {
         let result = scan::ScanResult {
             file_results: Vec::new(),
@@ -1269,6 +1309,47 @@ mod tests {
     }
 
     #[test]
+    fn analyzer_incomplete_finding_makes_directory_tool_an_error_without_driver_gap() {
+        let result = scan::ScanResult {
+            file_results: vec![scan::FileScanResult {
+                path: PathBuf::from("malformed.pdf"),
+                findings: vec![crate::verdict::Finding {
+                    rule_id: crate::verdict::RuleId::AnalysisIncomplete,
+                    severity: crate::verdict::Severity::High,
+                    title: "PDF analysis was incomplete".to_string(),
+                    description: "parser coverage failed".to_string(),
+                    evidence: Vec::new(),
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                }],
+                is_config_file: false,
+                coverage_gaps: Vec::new(),
+            }],
+            scanned_count: 1,
+            skipped_count: 0,
+            truncated: false,
+            truncation_reason: None,
+            panic_files: Vec::new(),
+            coverage_gaps: Vec::new(),
+        };
+        let policy = crate::policy::Policy::default();
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+
+        let response = build_directory_scan_response(&result, 1, &policy, &compiled);
+        assert!(directory_scan_is_error(&result, &policy));
+        assert!(response.is_error);
+        assert_eq!(
+            response.structured_content.as_ref().unwrap()["analysis_incomplete"],
+            true
+        );
+        assert!(response.content[0]
+            .text
+            .contains("analyzer reported incomplete"));
+    }
+
+    #[test]
     fn directory_scan_aggregate_projection_has_a_hard_serialized_cap() {
         let file_results = (0..600)
             .map(|index| scan::FileScanResult {
@@ -1288,6 +1369,7 @@ mod tests {
                     custom_rule_id: None,
                 }],
                 is_config_file: true,
+                coverage_gaps: Vec::new(),
             })
             .collect::<Vec<_>>();
         let result = scan::ScanResult {
@@ -1337,6 +1419,7 @@ mod tests {
             path: PathBuf::from("CLAUDE.md"),
             findings: vec![finding; crate::verdict::MAX_PRESENTED_FINDINGS + 17],
             is_config_file: true,
+            coverage_gaps: Vec::new(),
         };
         let raw_count = result.findings.len();
         let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
@@ -1571,6 +1654,7 @@ mod tests {
                     custom_rule_id: None,
                 }],
                 is_config_file: true,
+                coverage_gaps: Vec::new(),
             }],
             scanned_count: 1,
             skipped_count: 0,

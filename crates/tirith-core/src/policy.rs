@@ -1139,7 +1139,8 @@ impl ScanPolicyConfig {
     /// assembly independently floors enumeration failures at Warn. A `Panicked`,
     /// `Truncated`, `HashBudgetExceeded`, or
     /// any archive coverage-limit gap (`EntryCountCapped`, `TotalBytesCapped`,
-    /// `CompressionRatioExceeded`, `MemberTooLarge`, `NativeTruncated`) has no
+    /// `CompressionRatioExceeded`, `MemberTooLarge`, `NativeTruncated`) and
+    /// `PdfAnalyzerIncomplete` have no
     /// dedicated key; it is treated as an oversized-class gap (the most
     /// conservative of the three configurable buckets) so the strictest configured
     /// coverage action still governs it. An undecodable-compression member maps to
@@ -1156,7 +1157,8 @@ impl ScanPolicyConfig {
             | K::TotalBytesCapped
             | K::CompressionRatioExceeded
             | K::MemberTooLarge
-            | K::NativeTruncated => self.oversized_action(),
+            | K::NativeTruncated
+            | K::PdfAnalyzerIncomplete => self.oversized_action(),
             K::Unreadable | K::EnumerationFailed => self.unreadable_action(),
             K::Unsupported | K::UnsupportedCompression => self.unsupported_action(),
         }
@@ -6549,5 +6551,19 @@ custom_rules:
         let projection = serde_json::to_string(&base.security_projection()).unwrap();
         assert!(!projection.contains("PATTERN-A"));
         assert!(!projection.contains("trusted-a.example"));
+    }
+
+    #[test]
+    fn pdf_analyzer_incomplete_uses_conservative_coverage_action() {
+        let scan = ScanPolicyConfig {
+            oversized_file_action: Some(GapAction::Fail),
+            unreadable_file_action: Some(GapAction::Ignore),
+            unsupported_artifact_action: Some(GapAction::Ignore),
+            ..ScanPolicyConfig::default()
+        };
+        assert_eq!(
+            scan.action_for_gap_kind(crate::scan::CoverageGapKind::PdfAnalyzerIncomplete),
+            GapAction::Fail
+        );
     }
 }

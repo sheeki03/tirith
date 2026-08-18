@@ -8,7 +8,7 @@ const PROJECT_SAFETY_URI: &str = "tirith://project-safety";
 pub const MCP_SCAN_MAX_FILES: usize = 5_000;
 
 pub(super) fn scan_analysis_incomplete(result: &scan::ScanResult) -> bool {
-    result.truncated || !result.coverage_gaps.is_empty()
+    result.analysis_incomplete()
 }
 
 pub(super) fn bounded_scan_projection(
@@ -160,7 +160,8 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
             // `scan.require_complete` (or per-gap Fail actions) coverage gaps
             // must surface as an explicit incomplete marker, not a clean
             // resource response.
-            let completeness_violation = result.truncated
+            let completeness_violation = result.has_analysis_incomplete_finding()
+                || result.truncated
                 || (!result.coverage_gaps.is_empty()
                     && (policy.scan.require_complete
                         || result.coverage_gaps.iter().any(|gap| {
@@ -232,6 +233,14 @@ fn read_project_safety(
         }
     };
 
+    read_project_safety_at(cwd, policy, compiled)
+}
+
+fn read_project_safety_at(
+    cwd: std::path::PathBuf,
+    policy: &crate::policy::Policy,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> ToolCallResult {
     let config = scan::ScanConfig {
         path: cwd,
         recursive: true,
@@ -262,8 +271,9 @@ fn read_project_safety(
         String::new()
     } else {
         format!(
-            " WARNING: analysis incomplete ({} coverage gap(s), truncated={}).",
+            " WARNING: analysis incomplete ({} coverage gap(s), analyzer_incomplete={}, truncated={}).",
             result.coverage_gaps.len(),
+            result.has_analysis_incomplete_finding(),
             result.truncated
         )
     };
@@ -416,6 +426,7 @@ mod tests {
                     ),
                 ],
                 is_config_file: false,
+                coverage_gaps: Vec::new(),
             }],
             truncated: false,
             truncation_reason: None,
@@ -451,6 +462,7 @@ mod tests {
                     ),
                 ],
                 is_config_file: true,
+                coverage_gaps: Vec::new(),
             }],
             truncated: false,
             truncation_reason: None,
@@ -464,6 +476,60 @@ mod tests {
             projection["files"][0]["findings"].as_array().unwrap().len(),
             2
         );
+    }
+
+    #[test]
+    fn analyzer_incomplete_finding_marks_aggregate_projection_incomplete_without_driver_gap() {
+        let result = scan::ScanResult {
+            scanned_count: 1,
+            skipped_count: 0,
+            file_results: vec![scan::FileScanResult {
+                path: std::path::PathBuf::from("malformed.pdf"),
+                findings: vec![finding(
+                    crate::verdict::RuleId::AnalysisIncomplete,
+                    crate::verdict::Severity::High,
+                    "PDF parser coverage was incomplete".to_string(),
+                )],
+                is_config_file: false,
+                coverage_gaps: Vec::new(),
+            }],
+            truncated: false,
+            truncation_reason: None,
+            panic_files: Vec::new(),
+            coverage_gaps: Vec::new(),
+        };
+
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        let projection = bounded_scan_projection(&result, 1, None, &compiled);
+        assert!(scan_analysis_incomplete(&result));
+        assert_eq!(projection["analysis_incomplete"], true);
+        assert_eq!(projection["scan_analysis_incomplete"], true);
+    }
+
+    #[test]
+    fn actual_project_safety_resource_fails_closed_for_malformed_pdf() {
+        let root = tempfile::tempdir().expect("create resource scan root");
+        std::fs::write(
+            root.path().join("malformed.pdf"),
+            b"%PDF-1.7\nnot a complete PDF\n%%EOF\n",
+        )
+        .unwrap();
+        let policy = crate::policy::Policy::default();
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+
+        let response = read_project_safety_at(root.path().to_path_buf(), &policy, &compiled);
+        let structured = response
+            .structured_content
+            .as_ref()
+            .expect("project-safety structured response");
+        assert!(response.is_error);
+        assert_eq!(structured["analysis_incomplete"], true);
+        assert_eq!(
+            structured["coverage_gaps"][0]["kind"],
+            "pdf_analyzer_incomplete"
+        );
+        assert!(response.content[0].text.contains("analysis incomplete"));
+        assert!(!response.content[0].text.contains("no issues found"));
     }
 
     #[test]
