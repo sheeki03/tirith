@@ -847,7 +847,7 @@ fn remote_run_effects() -> std::collections::BTreeSet<crate::effects::CommandEff
 pub struct RemoteRunBoundaryBinding {
     envelope: crate::task::TaskEnvelopeInput,
     effects: std::collections::BTreeSet<crate::effects::CommandEffectKind>,
-    destination: Option<crate::util::ContainedAtomicFile>,
+    destination: Option<DeferredContainedDestination>,
 }
 
 impl RemoteRunBoundaryBinding {
@@ -860,8 +860,112 @@ impl RemoteRunBoundaryBinding {
         }
     }
 
-    fn destination(&self) -> Option<&crate::util::ContainedAtomicFile> {
+    fn destination(&self) -> Option<&DeferredContainedDestination> {
         self.destination.as_ref()
+    }
+}
+
+/// A destination bound without creating any missing parent. The first absent
+/// component is retained beneath the nearest existing directory capability;
+/// the exact remaining component sequence is held privately and included in the
+/// authorization identity. Materialization creates each directory only while a
+/// live effect lease is being revalidated.
+struct DeferredContainedDestination {
+    anchor: crate::util::ContainedAtomicFile,
+    remaining: Vec<std::ffi::OsString>,
+    absolute_path: std::path::PathBuf,
+}
+
+impl DeferredContainedDestination {
+    fn prepare(path: &Path) -> Result<Self, String> {
+        let absolute_path = std::path::absolute(path)
+            .map_err(|error| format!("resolve absolute destination: {error}"))?;
+        let mut existing_root = absolute_path
+            .parent()
+            .ok_or_else(|| "destination has no parent directory".to_string())?;
+        loop {
+            match std::fs::symlink_metadata(existing_root) {
+                Ok(metadata) if metadata.is_dir() => break,
+                Ok(_) => {
+                    return Err(format!(
+                        "destination ancestor {} is not a directory",
+                        existing_root.display()
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    existing_root = existing_root.parent().ok_or_else(|| {
+                        "destination has no existing directory ancestor".to_string()
+                    })?;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "inspect destination ancestor {}: {error}",
+                        existing_root.display()
+                    ))
+                }
+            }
+        }
+
+        let relative = absolute_path.strip_prefix(existing_root).map_err(|_| {
+            "absolute destination is outside its existing directory ancestor".to_string()
+        })?;
+        let components = relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(value) => Ok(value.to_os_string()),
+                _ => Err("destination contains a non-normal relative component".to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (first, remaining) = components
+            .split_first()
+            .ok_or_else(|| "destination names its existing directory ancestor".to_string())?;
+        let anchor_path = existing_root.join(first);
+        let anchor = crate::util::ContainedAtomicFile::prepare(existing_root, &anchor_path, false)
+            .map_err(|error| format!("bind retained destination: {error}"))?;
+        Ok(Self {
+            anchor,
+            remaining: remaining.to_vec(),
+            absolute_path,
+        })
+    }
+
+    fn identity_sha256(&self) -> Result<String, String> {
+        let identity = self
+            .anchor
+            .binding_identity()
+            .map_err(|error| format!("inspect retained destination identity: {error}"))?;
+        let path_sha256 = sha256_hex(self.absolute_path.as_os_str().as_encoded_bytes());
+        Ok(sha256_hex(
+            crate::audit::canonical_json_for_hash(&serde_json::json!({
+                "root": identity.root(),
+                "anchor": identity.destination(),
+                "absolute_path_sha256": path_sha256,
+                "remaining_components": self.remaining.len(),
+            }))
+            .as_bytes(),
+        ))
+    }
+
+    fn with_materialized<T>(
+        &self,
+        mut authorize: impl FnMut() -> Result<(), String>,
+        use_destination: impl FnOnce(&crate::util::ContainedAtomicFile) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let Some((first, rest)) = self.remaining.split_first() else {
+            return use_destination(&self.anchor);
+        };
+        authorize()?;
+        let mut materialized = self
+            .anchor
+            .prepare_child(first, true)
+            .map_err(|error| format!("create authorized destination directory: {error}"))?;
+        for component in rest {
+            authorize()?;
+            materialized = materialized
+                .prepare_child(component, true)
+                .map_err(|error| format!("create authorized destination directory: {error}"))?;
+        }
+        use_destination(&materialized)
     }
 }
 
@@ -915,12 +1019,9 @@ pub fn remote_fetch_save_boundary_binding(
     let expected_sha256 = normalize_sha256_pin(expected_sha256)?;
     let absolute_dest = std::path::absolute(dest)
         .map_err(|error| format!("resolve absolute fetch destination: {error}"))?;
-    let parent = absolute_dest
-        .parent()
-        .ok_or_else(|| "fetch destination has no parent directory".to_string())?;
-    let destination = crate::util::ContainedAtomicFile::prepare(parent, &absolute_dest, false)
+    let destination = DeferredContainedDestination::prepare(&absolute_dest)
         .map_err(|error| format!("bind retained fetch destination: {error}"))?;
-    let destination_identity = contained_destination_identity(&destination)?;
+    let destination_identity = destination.identity_sha256()?;
     let projection = serde_json::json!({
         "projection_version": 1,
         "kind": "remote_fetch_save",
@@ -950,12 +1051,9 @@ pub fn remote_command_card_cache_boundary_binding(
     let parsed = crate::url_validate::validate_fetch_url_syntax(url)?;
     let absolute_cache = std::path::absolute(cache_dir)
         .map_err(|error| format!("resolve absolute command-card cache root: {error}"))?;
-    let parent = absolute_cache
-        .parent()
-        .ok_or_else(|| "command-card cache root has no parent directory".to_string())?;
-    let destination = crate::util::ContainedAtomicFile::prepare(parent, &absolute_cache, false)
+    let destination = DeferredContainedDestination::prepare(&absolute_cache)
         .map_err(|error| format!("bind retained command-card cache root: {error}"))?;
-    let cache_root_identity = contained_destination_identity(&destination)?;
+    let cache_root_identity = destination.identity_sha256()?;
     let projection = serde_json::json!({
         "projection_version": 1,
         "kind": "remote_command_card_cache",
@@ -975,26 +1073,11 @@ pub fn remote_command_card_cache_boundary_binding(
     ))
 }
 
-fn contained_destination_identity(
-    destination: &crate::util::ContainedAtomicFile,
-) -> Result<String, String> {
-    let identity = destination
-        .binding_identity()
-        .map_err(|error| format!("inspect retained destination identity: {error}"))?;
-    Ok(sha256_hex(
-        crate::audit::canonical_json_for_hash(&serde_json::json!({
-            "root": identity.root(),
-            "destination": identity.destination(),
-        }))
-        .as_bytes(),
-    ))
-}
-
 fn remote_download_binding(
     canonical_url: &str,
     source_prefix: &str,
     projection: serde_json::Value,
-    destination: crate::util::ContainedAtomicFile,
+    destination: DeferredContainedDestination,
 ) -> RemoteRunBoundaryBinding {
     let projection_sha256 =
         sha256_hex(crate::audit::canonical_json_for_hash(&projection).as_bytes());
@@ -1972,6 +2055,14 @@ fn persist_cache_entry_authorized(
     persist_cache_entry(cache_dir, cached_path, content)
 }
 
+fn create_cache_dir_after_authorization(
+    cache_dir: &Path,
+    authorize: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    authorize()?;
+    fs::create_dir_all(cache_dir).map_err(|error| format!("create cache: {error}"))
+}
+
 fn save_remote_receipt_authorized(
     receipt: &Receipt,
     authorization: &AuthorizedRemoteRunTransaction,
@@ -2335,7 +2426,13 @@ fn run_impl<'operation, 'envelope>(
     let cache_dir = crate::policy::data_dir()
         .ok_or("cannot determine data directory")?
         .join("cache");
-    fs::create_dir_all(&cache_dir).map_err(|e| format!("create cache: {e}"))?;
+    if let Some(transaction) = remote_transaction.as_ref() {
+        create_cache_dir_after_authorization(&cache_dir, || {
+            transaction.authorize_effect_at(chrono::Utc::now())
+        })?;
+    } else {
+        fs::create_dir_all(&cache_dir).map_err(|e| format!("create cache: {e}"))?;
+    }
     let cached_path = cache_dir.join(&sha256);
     if let Some(transaction) = remote_transaction.as_ref() {
         persist_cache_entry_authorized(&cache_dir, &cached_path, &content, transaction)?;
@@ -2811,8 +2908,12 @@ pub fn download_to_path_and_mark_tainted_authorized<'operation, 'envelope>(
         .binding
         .destination()
         .ok_or_else(|| "fetch authorization lost its retained destination".to_string())?;
-    let result =
-        persist_download_to_contained(downloaded, &absolute_dest, destination, &transaction)?;
+    let result = destination.with_materialized(
+        || transaction.authorize_effect_at(chrono::Utc::now()),
+        |destination| {
+            persist_download_to_contained(downloaded, &absolute_dest, destination, &transaction)
+        },
+    )?;
     Ok((result, taint))
 }
 
@@ -2869,17 +2970,22 @@ pub fn download_and_cache_command_card_authorized<'operation, 'envelope>(
     let file_name = destination
         .file_name()
         .ok_or_else(|| "content-addressed command-card path has no filename".to_string())?;
-    transaction.authorize_effect_at(chrono::Utc::now())?;
-    let cache_file = cache_root
-        .prepare_child(file_name, true)
-        .map_err(|error| format!("bind command-card cache destination: {error}"))?;
-    cache_file
-        .write_atomic_checked(&downloaded.content, true, || {
-            transaction
-                .authorize_effect_at(chrono::Utc::now())
-                .map_err(std::io::Error::other)
-        })
-        .map_err(|error| format!("persist command card {}: {error}", destination.display()))?;
+    cache_root.with_materialized(
+        || transaction.authorize_effect_at(chrono::Utc::now()),
+        |cache_root| {
+            transaction.authorize_effect_at(chrono::Utc::now())?;
+            let cache_file = cache_root
+                .prepare_child(file_name, true)
+                .map_err(|error| format!("bind command-card cache destination: {error}"))?;
+            cache_file
+                .write_atomic_checked(&downloaded.content, true, || {
+                    transaction
+                        .authorize_effect_at(chrono::Utc::now())
+                        .map_err(std::io::Error::other)
+                })
+                .map_err(|error| format!("persist command card {}: {error}", destination.display()))
+        },
+    )?;
     Ok(CachedCommandCardResult {
         path: destination,
         sha256: downloaded.sha256,
@@ -3170,6 +3276,73 @@ mod tests {
         assert!(error.contains("does not bind the exact URL and cache destination"));
         assert!(!approved.exists());
         assert!(!substituted.exists());
+    }
+
+    #[test]
+    fn deferred_destinations_bind_fresh_nested_paths_without_creating_them() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("fresh/nested/script.sh");
+        let binding =
+            remote_fetch_save_boundary_binding("https://1.1.1.1/script", &destination, None)
+                .expect("a fresh nested destination can be bound read-only");
+        assert!(!root.path().join("fresh").exists());
+
+        let calls = std::cell::Cell::new(0usize);
+        binding
+            .destination()
+            .unwrap()
+            .with_materialized(
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .expect("authorized parent creation succeeds");
+        assert_eq!(
+            calls.get(),
+            2,
+            "each missing parent needs a fresh lease check"
+        );
+        assert!(root.path().join("fresh/nested").is_dir());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn expired_deferred_destination_authorization_creates_no_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("fresh/nested/card.json");
+        let binding = remote_command_card_cache_boundary_binding(
+            "https://1.1.1.1/card.json",
+            &destination,
+            64 * 1024,
+        )
+        .expect("fresh command-card roots bind without creation");
+
+        let error = binding
+            .destination()
+            .unwrap()
+            .with_materialized(
+                || Err("authorization expired".to_string()),
+                |_| -> Result<(), String> {
+                    panic!("expired authorization reached the destination effect")
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("expired"));
+        assert!(!root.path().join("fresh").exists());
+    }
+
+    #[test]
+    fn expired_run_cache_authorization_creates_no_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("missing/cache");
+        let error = create_cache_dir_after_authorization(&cache, || {
+            Err("authorization expired".to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("expired"));
+        assert!(!root.path().join("missing").exists());
     }
 
     fn test_script_invocation(interpreter: &str) -> ScriptInvocation {

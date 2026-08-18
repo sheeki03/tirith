@@ -807,6 +807,9 @@ mod tests {
 
     #[test]
     fn test_rejects_http() {
+        let mut global =
+            tirith_test_support::GlobalStateGuard::new().expect("isolate server URL environment");
+        global.remove_env("TIRITH_ALLOW_HTTP");
         let result = validate_server_url("http://example.com/api");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("HTTPS"));
@@ -878,6 +881,7 @@ mod tests {
 
     #[test]
     fn test_rejects_localhost_name() {
+        let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "https://localhost/path",
             UrlValidationMode::Fetch,
@@ -889,6 +893,7 @@ mod tests {
 
     #[test]
     fn test_rejects_localhost_subdomain() {
+        let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "https://api.localhost/path",
             UrlValidationMode::Fetch,
@@ -914,6 +919,7 @@ mod tests {
 
     #[test]
     fn test_rejects_hostname_resolving_to_documentation_range() {
+        let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "https://example.com/path",
             UrlValidationMode::Fetch,
@@ -928,6 +934,7 @@ mod tests {
 
     #[test]
     fn test_fetch_allows_http_when_public() {
+        let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "http://example.com/path",
             UrlValidationMode::Fetch,
@@ -938,6 +945,7 @@ mod tests {
 
     #[test]
     fn fetch_syntax_preflight_accepts_a_domain_without_resolution() {
+        let _policy = PrivatePolicyGuard::disabled();
         let parsed = validate_fetch_url_syntax("https://does-not-resolve.invalid/script")
             .expect("pure preflight must not consult DNS for a domain name");
         assert_eq!(parsed.host_str(), Some("does-not-resolve.invalid"));
@@ -957,6 +965,7 @@ mod tests {
 
     #[test]
     fn fetch_syntax_preflight_rejects_literal_ssrf_and_malformed_inputs() {
+        let _policy = PrivatePolicyGuard::disabled();
         for input in [
             "not a URL",
             "ftp://example.com/script",
@@ -1006,6 +1015,7 @@ mod tests {
 
     #[test]
     fn test_rejects_hostname_resolving_to_ipv4_mapped_ipv6() {
+        let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "https://example.com/api",
             UrlValidationMode::Fetch,
@@ -1096,6 +1106,7 @@ mod tests {
 
     #[test]
     fn test_bypass_resolved_mapped_private() {
+        let _policy = PrivatePolicyGuard::disabled();
         // DNS returns ::ffff:10.0.0.1 for a hostname
         let result = validate_outbound_url_with_resolver(
             "https://attacker.example.com/api",
@@ -1120,6 +1131,7 @@ mod tests {
 
     #[test]
     fn test_rejects_resolved_nat64_encoded_metadata() {
+        let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "https://example.com/api",
             UrlValidationMode::Fetch,
@@ -1242,6 +1254,7 @@ mod tests {
 
     #[test]
     fn test_fetch_rejects_loopback_literal() {
+        let _policy = PrivatePolicyGuard::disabled();
         let result = validate_fetch_url("http://127.0.0.1");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("non-public"));
@@ -1249,6 +1262,7 @@ mod tests {
 
     #[test]
     fn test_fetch_rejects_metadata_literal() {
+        let _policy = PrivatePolicyGuard::disabled();
         let result = validate_fetch_url("http://169.254.169.254");
         assert!(result.is_err());
         // Metadata IPs are now rejected by the dedicated metadata gate (ahead of
@@ -1258,6 +1272,7 @@ mod tests {
 
     #[test]
     fn test_fetch_rejects_ipv6_loopback_literal() {
+        let _policy = PrivatePolicyGuard::disabled();
         let result = validate_fetch_url("http://[::1]");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("non-public"));
@@ -1265,6 +1280,7 @@ mod tests {
 
     #[test]
     fn test_fetch_rejects_private_10_literal() {
+        let _policy = PrivatePolicyGuard::disabled();
         let result = validate_fetch_url("http://10.0.0.1");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("non-public"));
@@ -1411,6 +1427,17 @@ mod tests {
                 slot.replace(self.previous.take());
             });
         }
+    }
+
+    #[test]
+    fn strict_thread_local_fetch_policy_ignores_ambient_private_allowlist() {
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate ambient private-fetch policy");
+        global.set_env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32,10.0.0.0/8");
+        let _policy = PrivatePolicyGuard::disabled();
+
+        assert!(validate_fetch_url("http://127.0.0.1/card.json").is_err());
+        assert!(validate_fetch_url("http://10.42.0.8/card.json").is_err());
     }
 
     #[test]
