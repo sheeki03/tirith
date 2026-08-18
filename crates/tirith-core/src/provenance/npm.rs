@@ -101,11 +101,12 @@ pub const MAX_LOCKFILE_ENTRIES: usize = 50_000;
 
 /// The public npm registry.
 ///
-/// This is the only host whose signing-key availability Tirith can assert
-/// without asking the host itself: npm ships the Sigstore TUF root that pins it.
-/// The subtraction rule below depends on that assertion, so it is spelled once
-/// here rather than inlined at the two places that need it.
+/// The audit launcher pins this host in hermetic public-registry mode. This
+/// constant is an origin identity, not evidence that an entry omitted from
+/// npm's JSON was audited: only an explicit audit bucket is positive evidence.
 pub const PUBLIC_NPM_REGISTRY_HOST: &str = "registry.npmjs.org";
+/// Canonical HTTPS origin paired with [`PUBLIC_NPM_REGISTRY_HOST`].
+pub const PUBLIC_NPM_REGISTRY_ORIGIN: &str = "https://registry.npmjs.org/";
 
 /// Most `attestationBundles` predicate types retained per package.
 const MAX_PREDICATE_TYPES: usize = 8;
@@ -234,15 +235,14 @@ pub enum NpmPackageStatus {
         /// [`Self::Invalid`]).
         subject_bound: bool,
     },
-    /// npm audited this package and named neither an invalid nor a missing
-    /// signature for it, so its registry signature verified, and it publishes no
-    /// provenance attestation. Derived by subtraction from npm's own buckets,
-    /// which is what npm's human summary reports too.
+    /// Legacy wire state for an explicitly reported verified registry signature
+    /// with no provenance attestation.
     ///
-    /// "npm audited it" is not free: npm's JSON carries no counters, so the
-    /// premise has to be re-established from the lockfile and the install tree.
-    /// [`subtraction_block`] is where that happens, and anything it cannot
-    /// establish is [`Self::NotAudited`] instead.
+    /// The currently supported npm JSON contract has no positive per-package
+    /// signature-only bucket, so reconciliation never constructs this state.
+    /// It remains deserializable for receipt compatibility and for a future
+    /// contract that may add explicit membership. Absence from npm's buckets is
+    /// always [`Self::NotAudited`].
     SignatureOnly {
         /// How the state was derived, spelled out so the receipt does not read
         /// as a per-package assertion npm never made.
@@ -383,6 +383,9 @@ pub enum NpmPartialReason {
     /// verifies and where it verifies it from. Running the audit under it would
     /// let the audited project configure its own audit, so no command ran.
     ProjectNpmrcOverride,
+    /// The requested npm audit mode or its registry/TLS/proxy/auth binding was
+    /// incomplete or unsafe, so no command ran.
+    AuditConfigurationInvalid,
     /// At least one dependency is not from a registry.
     UnsupportedSource,
     /// At least one installed package has no lockfile entry.
@@ -420,6 +423,7 @@ impl NpmPartialReason {
             Self::MissingLockfile => "missing_lockfile",
             Self::LockfileTooLarge => "lockfile_too_large",
             Self::ProjectNpmrcOverride => "project_npmrc_override",
+            Self::AuditConfigurationInvalid => "audit_configuration_invalid",
             Self::UnsupportedSource => "unsupported_source",
             Self::UnaccountedInstalledPackage => "unaccounted_installed_package",
             Self::MissingSignature => "missing_signature",
@@ -1482,11 +1486,9 @@ pub struct NpmCoverage {
     /// package. Each one is a statement npm made that the binding could not
     /// consume, so each one gets its own record rather than being discarded.
     pub unmatched_audit_entries: usize,
-    /// True when at least one status was derived by subtraction from npm's
-    /// buckets rather than reported per package. Stated in the receipt because
-    /// npm's `--json --include-attestations` output enumerates only the
-    /// invalid, missing, and ATTESTED packages: a package with a good registry
-    /// signature and no provenance appears in none of them.
+    /// Legacy schema field. Always false: absence from npm's audit buckets is
+    /// never treated as positive signature evidence.
+    #[serde(default)]
     pub signature_only_derived_by_subtraction: bool,
 }
 
@@ -1676,8 +1678,7 @@ fn audit_host_of(entry: &NpmAuditEntry) -> Option<String> {
 /// * every audit entry that matched NOTHING gets its own record, so a signature
 ///   failure npm reported can never be dropped on the floor;
 /// * a registry entry npm did not name in `invalid`, `missing`, or `verified` is
-///   `SignatureOnly` by subtraction ONLY where that subtraction is sound; see
-///   [`subtraction_block`].
+///   `NotAudited`; omission is never positive evidence.
 pub fn reconcile(
     lockfile: &NpmLockfile,
     inventory: &InstalledInventory,
@@ -1693,7 +1694,6 @@ pub fn reconcile(
     let mut records = Vec::new();
     let mut registry_entries = 0usize;
     let mut unsupported_source_entries = 0usize;
-    let mut derived_by_subtraction = false;
     // A set, not a Vec: a large monorepo install tree reaches tens of
     // thousands of entries, and a linear membership scan per installed package
     // would make the accounting quadratic in exactly the case where the
@@ -1724,11 +1724,8 @@ pub fn reconcile(
                     reason: "no audit command ran for this project".to_string(),
                 },
                 Some(index) => {
-                    let (status, host) = status_from_index(index, entry, is_installed);
+                    let (status, host) = status_from_index(index, entry);
                     audit_registry_host = host;
-                    if matches!(status, NpmPackageStatus::SignatureOnly { .. }) {
-                        derived_by_subtraction = true;
-                    }
                     status
                 }
             }
@@ -1837,7 +1834,7 @@ pub fn reconcile(
             inventory_capped: inventory.capped,
             symlinked_entries_skipped: inventory.symlinked_entries,
             unmatched_audit_entries,
-            signature_only_derived_by_subtraction: derived_by_subtraction,
+            signature_only_derived_by_subtraction: false,
         },
         records,
     }
@@ -1877,54 +1874,11 @@ fn unmatched_verified_status() -> NpmPackageStatus {
     }
 }
 
-/// Why a subtraction claim is NOT available for one registry entry, or `None`
-/// when it is sound.
-///
-/// The subtraction fallback asserts "npm audited this package and named no
-/// problem". npm's `--json` output carries no counters, so that assertion is
-/// only as good as Tirith's own replication of the preconditions npm applies in
-/// `getValidPackageInfo` and `getVerifiedInfo` before a package can land in a
-/// bucket at all:
-///
-/// * an entry with no installed version is skipped outright (`!version`), so it
-///   is in none of the three buckets for a reason that has nothing to do with
-///   its signature;
-/// * a registry that serves no signing keys produces neither a `missing` entry
-///   nor a verified count (`else if (keys.length)`), so absence from the buckets
-///   says nothing there either. The public npm registry is the one host whose
-///   key availability Tirith can assert without asking the host itself, because
-///   npm ships the Sigstore TUF root that pins it.
-///
-/// Everything else the caller already handled: a non-registry source never
-/// reaches this function.
-fn subtraction_block(entry: &NpmLockfileEntry, is_installed: bool) -> Option<String> {
-    if !is_installed {
-        return Some(
-            "npm's signature audit skips a lockfile entry with no installed version, so its \
-             absence from npm's buckets is not evidence about its signature"
-                .to_string(),
-        );
-    }
-    match entry.registry_host.as_deref() {
-        Some(PUBLIC_NPM_REGISTRY_HOST) => None,
-        Some(host) => Some(format!(
-            "npm's JSON enumerates only the invalid, missing, and attested packages, and tirith \
-             cannot establish that {host} serves the signing keys npm's audit needs, so absence \
-             from those buckets is not evidence of a verified signature"
-        )),
-        None => Some(
-            "this entry resolves from no recorded registry host, so absence from npm's buckets \
-             is not evidence of a verified signature"
-                .to_string(),
-        ),
-    }
-}
-
 /// Decide one registry entry's status from npm's buckets.
 ///
 /// Bucket precedence is worst-first: `invalid` beats `missing` beats
-/// `verified`. The subtraction fallback is last, and only after all three
-/// buckets were consulted AND [`subtraction_block`] cleared it.
+/// `verified`. Absence from all three is `NotAudited`, even for an installed
+/// package from the public registry.
 ///
 /// Returns the status and the registry host NPM ITSELF named, which is not the
 /// lockfile's: npm picks the registry from config, so a positive result against
@@ -1933,7 +1887,6 @@ fn subtraction_block(entry: &NpmLockfileEntry, is_installed: bool) -> Option<Str
 fn status_from_index(
     index: &mut AuditIndex<'_>,
     entry: &NpmLockfileEntry,
-    is_installed: bool,
 ) -> (NpmPackageStatus, Option<String>) {
     let name = Some(entry.name.as_str());
     let version = entry.version.as_deref();
@@ -1987,18 +1940,14 @@ fn status_from_index(
             host,
         );
     }
-    match subtraction_block(entry, is_installed) {
-        Some(reason) => (NpmPackageStatus::NotAudited { reason }, None),
-        None => (
-            NpmPackageStatus::SignatureOnly {
-                reason: "it is installed from the public npm registry, so npm audited it, and npm \
-                         named it in neither its invalid nor its missing bucket, so its registry \
-                         signature verified; it publishes no provenance attestation"
-                    .to_string(),
-            },
-            None,
-        ),
-    }
+    (
+        NpmPackageStatus::NotAudited {
+            reason: "npm did not name this package in an explicit invalid, missing, or verified \
+                     audit bucket, so its signature status is unknown"
+                .to_string(),
+        },
+        None,
+    )
 }
 
 /// Refuse to read a positive npm result as covering this entry when npm named a
@@ -2072,7 +2021,7 @@ fn status_for_unaccounted(
 // ---------------------------------------------------------------------------
 
 /// Schema version of [`NpmProvenanceReceipt`].
-pub const NPM_PROVENANCE_RECEIPT_SCHEMA: u32 = 1;
+pub const NPM_PROVENANCE_RECEIPT_SCHEMA: u32 = 2;
 
 /// Stable discriminator so a reader can tell this envelope from the capsule and
 /// browser-baseline receipts that share the same canonicalizer.
@@ -2099,6 +2048,88 @@ pub struct NpmToolIdentity {
     pub interpreter_name: Option<String>,
 }
 
+/// The registry/configuration boundary under which npm produced its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NpmAuditMode {
+    /// Public npm audit with user/global config, proxies, and auth removed.
+    HermeticPublicRegistry,
+    /// Explicit operator-trusted private registry configuration.
+    TrustedPrivateRegistry,
+}
+
+impl NpmAuditMode {
+    /// Stable human-readable spelling.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HermeticPublicRegistry => "hermetic-public-registry",
+            Self::TrustedPrivateRegistry => "trusted-private-registry",
+        }
+    }
+}
+
+/// Non-secret identities for every transport input that can change what npm
+/// audits. The npm and Node executable identities live in [`NpmToolIdentity`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpmAuditEnvironment {
+    pub mode: NpmAuditMode,
+    /// Canonical HTTPS registry origin, with no credentials, query, or fragment.
+    pub registry_origin: String,
+    /// Always true in a runnable mode. Kept explicit so a receipt cannot omit
+    /// the TLS decision that authenticated the registry.
+    pub strict_tls: bool,
+    /// `system_roots` or a sha256 identity for an explicitly selected CA file.
+    pub tls_ca_identity: String,
+    /// `direct` or a sha256 identity for the credential-free proxy origin.
+    pub proxy_identity: String,
+    /// `none` in public mode or a metadata identity for the snapshotted private
+    /// auth source. Never credential bytes, a credential hash, or a host path.
+    pub auth_source_identity: String,
+}
+
+impl NpmAuditEnvironment {
+    fn is_complete_and_safe(&self) -> bool {
+        let Ok(url) = url::Url::parse(&self.registry_origin) else {
+            return false;
+        };
+        let canonical_origin = url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.path() == "/"
+            && url.to_string() == self.registry_origin;
+        if !canonical_origin
+            || !self.strict_tls
+            || self.auth_source_identity.is_empty()
+            || !(self.tls_ca_identity == "system_roots"
+                || is_sha256_identity(&self.tls_ca_identity))
+            || !(self.proxy_identity == "direct" || is_sha256_identity(&self.proxy_identity))
+        {
+            return false;
+        }
+        match self.mode {
+            NpmAuditMode::HermeticPublicRegistry => {
+                self.registry_origin == PUBLIC_NPM_REGISTRY_ORIGIN
+                    && self.tls_ca_identity == "system_roots"
+                    && self.proxy_identity == "direct"
+                    && self.auth_source_identity == "none"
+            }
+            NpmAuditMode::TrustedPrivateRegistry => {
+                self.registry_origin != PUBLIC_NPM_REGISTRY_ORIGIN
+                    && is_sha256_identity(&self.auth_source_identity)
+            }
+        }
+    }
+}
+
+fn is_sha256_identity(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
 /// The exact command the contract authorized, as recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NpmAuditInvocation {
@@ -2112,6 +2143,10 @@ pub struct NpmAuditInvocation {
     pub argv: Vec<String>,
     /// Whether the argv returns attestation bundles.
     pub attestation_bundles_available: bool,
+    /// Exact non-secret transport/configuration binding for this invocation.
+    /// Absent only when deserializing a legacy schema-1 receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<NpmAuditEnvironment>,
     /// npm's own exit code, when the command ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -2370,6 +2405,16 @@ impl NpmProvenanceReceipt {
                 "this schema is never audit-chain anchored, so it cannot claim to be".to_string(),
             ));
         }
+        if self.invocation.as_ref().is_some_and(|invocation| {
+            !invocation
+                .environment
+                .as_ref()
+                .is_some_and(NpmAuditEnvironment::is_complete_and_safe)
+        }) {
+            return Err(NpmReceiptError::Invalid(
+                "an npm invocation requires a complete safe audit-environment binding".to_string(),
+            ));
+        }
         if matches!(self.outcome, NpmAttestOutcome::Clean) {
             // An exit code is the proof a process existed. `invocation` alone is
             // not: it also describes the command that WOULD have run.
@@ -2387,6 +2432,18 @@ impl NpmProvenanceReceipt {
             if self.subject.lockfile_sha256.is_none() {
                 return Err(NpmReceiptError::Invalid(
                     "a clean receipt requires the lockfile digest it is bound to".to_string(),
+                ));
+            }
+            if self.tools.npm_sha256.is_none() || self.tools.npm_version.is_none() {
+                return Err(NpmReceiptError::Invalid(
+                    "a clean receipt requires the exact npm executable digest and version"
+                        .to_string(),
+                ));
+            }
+            if self.tools.interpreter_name.is_some() != self.tools.interpreter_sha256.is_some() {
+                return Err(NpmReceiptError::Invalid(
+                    "a clean receipt must bind both the Node interpreter name and digest, or neither"
+                        .to_string(),
                 ));
             }
             if self.coverage.unaccounted_installed > 0 {
@@ -3035,7 +3092,7 @@ mod tests {
     }
 
     #[test]
-    fn signature_only_is_derived_by_subtraction_and_says_so() {
+    fn absence_from_every_audit_bucket_is_not_audited() {
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![registry_entry("node_modules/a", "a", "1.0.0")],
@@ -3046,12 +3103,15 @@ mod tests {
             &installed(&["node_modules/a"]),
             Some(&NpmAuditReport::default()),
         );
-        assert_eq!(assessment.records[0].status.label(), "signature-only");
-        assert!(assessment.coverage.signature_only_derived_by_subtraction);
-        assert_eq!(
+        assert_eq!(assessment.records[0].status.label(), "not-audited");
+        assert!(!assessment.coverage.signature_only_derived_by_subtraction);
+        assert!(matches!(
             overall_outcome(&assessment.statuses(), false),
-            NpmAttestOutcome::Clean
-        );
+            NpmAttestOutcome::Partial {
+                reason: NpmPartialReason::NotAudited,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3095,7 +3155,7 @@ mod tests {
     /// has nothing to do with its signature. Subtracting from empty buckets and
     /// calling that "its registry signature verified" is a claim npm never made.
     #[test]
-    fn an_uninstalled_lockfile_entry_is_never_signature_verified_by_subtraction() {
+    fn neither_installed_nor_uninstalled_omissions_are_signature_verified() {
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![
@@ -3118,7 +3178,7 @@ mod tests {
             .collect();
         assert_eq!(
             by_location["node_modules/chalk"].status.label(),
-            "signature-only"
+            "not-audited"
         );
         assert_eq!(
             by_location["node_modules/fsevents"].status.label(),
@@ -3138,7 +3198,7 @@ mod tests {
     /// nor a verified count (`else if (keys.length)`), so absence from npm's
     /// buckets is not evidence there either.
     #[test]
-    fn a_non_public_registry_host_is_never_signature_verified_by_subtraction() {
+    fn a_non_public_registry_host_is_never_signature_verified_by_omission() {
         let mut entry = registry_entry("node_modules/internal", "internal", "1.0.0");
         entry.registry_host = Some("npm.internal.example".to_string());
         let lockfile = NpmLockfile {
@@ -3510,6 +3570,14 @@ mod tests {
                     .map(|arg| (*arg).to_string())
                     .collect(),
                 attestation_bundles_available: true,
+                environment: Some(NpmAuditEnvironment {
+                    mode: NpmAuditMode::HermeticPublicRegistry,
+                    registry_origin: "https://registry.npmjs.org/".to_string(),
+                    strict_tls: true,
+                    tls_ca_identity: "system_roots".to_string(),
+                    proxy_identity: "direct".to_string(),
+                    auth_source_identity: "none".to_string(),
+                }),
                 exit_code: Some(0),
                 stderr: None,
             }),
@@ -3523,11 +3591,11 @@ mod tests {
             entries: vec![registry_entry("node_modules/a", "a", "1.0.0")],
             root_name: None,
         };
-        reconcile(
-            &lockfile,
-            &installed(&["node_modules/a"]),
-            Some(&NpmAuditReport::default()),
-        )
+        let report = NpmAuditReport {
+            verified: vec![audit_entry("a", "node_modules/a", "1.0.0", None)],
+            ..NpmAuditReport::default()
+        };
+        reconcile(&lockfile, &installed(&["node_modules/a"]), Some(&report))
     }
 
     #[test]
@@ -3545,6 +3613,27 @@ mod tests {
             .caveats
             .iter()
             .any(|caveat| caveat == crate::provenance::npm_facts::NPM_BYTES_NOT_BOUND_CAVEAT));
+    }
+
+    #[test]
+    fn a_schema_one_receipt_without_an_environment_binding_still_deserializes() {
+        let receipt = NpmProvenanceReceipt::new(facts(NpmAttestOutcome::Clean, clean_assessment()));
+        let mut value = serde_json::to_value(receipt).expect("receipt JSON");
+        value["schema"] = serde_json::json!(1);
+        value["invocation"]
+            .as_object_mut()
+            .expect("invocation object")
+            .remove("environment");
+        let legacy: NpmProvenanceReceipt =
+            serde_json::from_value(value).expect("schema-1 shape remains readable");
+        assert!(legacy
+            .invocation
+            .as_ref()
+            .is_some_and(|invocation| invocation.environment.is_none()));
+        assert!(
+            legacy.validate().is_err(),
+            "schema 1 is readable, not current"
+        );
     }
 
     #[test]
@@ -3595,7 +3684,9 @@ mod tests {
         assert!(receipt.validate().is_err());
 
         // --require-provenance with a signature-only package.
-        let mut strict = facts(NpmAttestOutcome::Clean, clean_assessment());
+        let mut signature_only_assessment = clean_assessment();
+        signature_only_assessment.records[0].status = signature_only();
+        let mut strict = facts(NpmAttestOutcome::Clean, signature_only_assessment);
         strict.require_provenance = true;
         let receipt = NpmProvenanceReceipt::new(strict);
         assert!(receipt.validate().is_err());

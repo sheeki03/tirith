@@ -209,9 +209,181 @@ fn every_family_has_a_user_data_root_on_every_supported_platform() {
     }
     // Edge is in scope for C16 and must resolve on all three hosts.
     assert_eq!(
-        user_data_relative_roots(BrowserFamily::Edge, HostPlatform::Windows),
-        &["AppData/Local/Microsoft/Edge/User Data"]
+        user_data_relative_roots(BrowserFamily::Edge, HostPlatform::Windows)[0],
+        "AppData/Local/Microsoft/Edge/User Data"
     );
+}
+
+#[test]
+fn the_root_catalog_covers_every_shipped_channel_and_packaging_layout() {
+    let chrome_mac = browser_root_specs(BrowserFamily::Chrome, HostPlatform::MacOs);
+    assert_eq!(chrome_mac.len(), 4);
+    assert_eq!(
+        chrome_mac
+            .iter()
+            .map(|root| root.identity.channel)
+            .collect::<Vec<_>>(),
+        vec![
+            BrowserChannel::Stable,
+            BrowserChannel::Beta,
+            BrowserChannel::Dev,
+            BrowserChannel::Canary,
+        ]
+    );
+
+    let chromium_linux = browser_root_specs(BrowserFamily::Chromium, HostPlatform::Linux);
+    assert_eq!(
+        chromium_linux
+            .iter()
+            .map(|root| root.identity.edition)
+            .collect::<Vec<_>>(),
+        vec![
+            BrowserRootEdition::Native,
+            BrowserRootEdition::Snap,
+            BrowserRootEdition::Flatpak,
+        ]
+    );
+
+    let brave_linux = browser_root_specs(BrowserFamily::Brave, HostPlatform::Linux);
+    assert!(brave_linux.iter().any(|root| {
+        root.identity.channel == BrowserChannel::Nightly
+            && root.identity.edition == BrowserRootEdition::Native
+    }));
+    let edge_windows = browser_root_specs(BrowserFamily::Edge, HostPlatform::Windows);
+    assert!(edge_windows
+        .iter()
+        .any(|root| root.identity.channel == BrowserChannel::Canary));
+}
+
+fn root_identity(channel: BrowserChannel) -> BrowserRootIdentity {
+    BrowserRootIdentity {
+        family: BrowserFamily::Chrome,
+        channel,
+        edition: BrowserRootEdition::Native,
+    }
+}
+
+#[test]
+fn an_inaccessible_root_records_one_gap_and_later_channels_still_audit() {
+    let root = temp();
+    let inaccessible = root.path().join("not-a-directory");
+    std::fs::write(&inaccessible, "present but not enumerable").expect("write non-directory");
+    let beta = root.path().join("beta");
+    let profile = make_profile(&beta, "Default");
+    write_extension(
+        &profile,
+        PLAIN_ID,
+        "1.0.0_0",
+        MV2_MANIFEST,
+        &[("bg.js", "//")],
+    );
+    write_preferences(&profile, &[(PLAIN_ID, 1, true)]);
+
+    let candidates = vec![
+        (root_identity(BrowserChannel::Stable), inaccessible),
+        (root_identity(BrowserChannel::Beta), beta),
+    ];
+    let mut progress = AuditProgress::new();
+    let record = audit_browser_candidates(
+        BrowserFamily::Chrome,
+        &candidates,
+        &AuditBudget::default(),
+        &mut progress,
+    );
+
+    assert_eq!(record.status, BrowserStatus::Audited);
+    assert_eq!(record.coverage, AuditCoverage::Partial);
+    assert_eq!(record.root_gaps.len(), 1, "{record:?}");
+    assert_eq!(record.root_gaps[0].root.channel, BrowserChannel::Stable);
+    assert_eq!(record.profiles.len(), 1);
+    assert_eq!(
+        record.profiles[0].identity.root.channel,
+        BrowserChannel::Beta
+    );
+    assert_eq!(
+        record.profiles[0].extensions[0]
+            .identity
+            .profile
+            .root
+            .channel,
+        BrowserChannel::Beta
+    );
+}
+
+#[test]
+fn identical_profile_and_extension_names_in_two_channels_remain_distinct() {
+    let root = temp();
+    let mut candidates = Vec::new();
+    for (channel, directory) in [
+        (BrowserChannel::Stable, "stable"),
+        (BrowserChannel::Beta, "beta"),
+    ] {
+        let user_data = root.path().join(directory);
+        let profile = make_profile(&user_data, "Default");
+        write_extension(
+            &profile,
+            PLAIN_ID,
+            "1.0.0_0",
+            MV2_MANIFEST,
+            &[("bg.js", "//")],
+        );
+        write_preferences(&profile, &[(PLAIN_ID, 1, true)]);
+        candidates.push((root_identity(channel), user_data));
+    }
+    let mut progress = AuditProgress::new();
+    let browser = audit_browser_candidates(
+        BrowserFamily::Chrome,
+        &candidates,
+        &AuditBudget::default(),
+        &mut progress,
+    );
+    let report = BrowserAuditReport {
+        schema: BROWSER_AUDIT_SCHEMA,
+        format_version: BROWSER_BASELINE_FORMAT_VERSION,
+        platform: Some(HostPlatform::Linux),
+        browsers: vec![browser],
+        coverage: AuditCoverage::Complete,
+        budget_exhausted: false,
+    };
+
+    let entries = report.entries();
+    assert_eq!(entries.len(), 2);
+    assert_ne!(entries[0].identity, entries[1].identity);
+    assert_eq!(entries[0].extension_id, entries[1].extension_id);
+    assert_eq!(entries[0].profile_directory, entries[1].profile_directory);
+}
+
+#[cfg(unix)]
+#[test]
+fn duplicate_roots_are_suppressed_only_by_stable_filesystem_identity() {
+    let root = temp();
+    let user_data = root.path().join("same-root");
+    let profile = make_profile(&user_data, "Default");
+    write_extension(
+        &profile,
+        PLAIN_ID,
+        "1.0.0_0",
+        MV2_MANIFEST,
+        &[("bg.js", "//")],
+    );
+    write_preferences(&profile, &[(PLAIN_ID, 1, true)]);
+    let candidates = vec![
+        (root_identity(BrowserChannel::Stable), user_data.clone()),
+        (root_identity(BrowserChannel::Beta), user_data),
+    ];
+    let mut progress = AuditProgress::new();
+    let record = audit_browser_candidates(
+        BrowserFamily::Chrome,
+        &candidates,
+        &AuditBudget::default(),
+        &mut progress,
+    );
+
+    assert_eq!(record.profiles.len(), 1, "{record:?}");
+    assert_eq!(record.roots.len(), 2);
+    assert_eq!(record.roots[0].status, BrowserRootStatus::Audited);
+    assert_eq!(record.roots[1].status, BrowserRootStatus::Duplicate);
+    assert!(record.root_gaps.is_empty());
 }
 
 #[test]
@@ -498,15 +670,17 @@ fn no_value_from_outside_the_allowed_preferences_fields_appears_anywhere_in_the_
     );
     write_preferences(&profile, &[(PLAIN_ID, 7, false)]);
 
-    // Every string the Preferences document holds, minus the extension ids and
-    // the three allowed field names. Generated from the file rather than listed
-    // by hand, so a future field added to the fixture is covered automatically.
+    // Every string VALUE the Preferences document holds. Object keys are not
+    // values: Chromium's structural `profile` key legitimately overlaps the
+    // report's structured profile-identity field. The sibling test above keeps
+    // explicit poison canaries for disallowed keys, while this generated set
+    // automatically covers every private string value added to the fixture.
     let document: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(profile.join("Preferences")).expect("read preferences"),
     )
     .expect("parse preferences");
     let mut forbidden = std::collections::BTreeSet::new();
-    collect_strings(&document, &mut forbidden);
+    collect_string_values(&document, &mut forbidden);
     forbidden.remove(PLAIN_ID);
     for allowed in PREFERENCES_ALLOWED_FIELDS {
         forbidden.remove(*allowed);
@@ -540,6 +714,26 @@ fn no_value_from_outside_the_allowed_preferences_fields_appears_anywhere_in_the_
         report["browsers"][0]["profiles"][0]["extensions"][0]["install_class"],
         "enterprise_policy"
     );
+}
+
+/// Every string value in a JSON document, excluding object keys.
+fn collect_string_values(value: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            out.insert(text.clone());
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_string_values(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_string_values(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Every string key and string value in a JSON document.
@@ -1428,6 +1622,17 @@ fn an_edited_baseline_fails_its_own_content_address() {
     assert_eq!(resigned.compute_content_hash(), before);
     assert!(resigned.content_hash_matches());
     assert!(!resigned.signature_verifies(&[7u8; 32]));
+
+    let mut split_identity = baseline.clone();
+    split_identity.entries[0].identity.extension_id = WALLET_ID.to_string();
+    assert_eq!(
+        split_identity.validate(),
+        Err(BaselineError::IdentityMismatch)
+    );
+
+    let mut duplicate = baseline.clone();
+    duplicate.entries.push(duplicate.entries[0].clone());
+    assert_eq!(duplicate.validate(), Err(BaselineError::DuplicateIdentity));
 }
 
 #[test]
@@ -1487,9 +1692,63 @@ fn an_older_hashing_format_reports_one_upgrade_rather_than_phantom_drift() {
     assert!(matches!(
         drifts[0],
         ExtensionDrift::SchemaUpgradeRequired {
+            from_schema: 2,
+            to_schema: 2,
             from_version: 0,
-            to_version: 1
+            to_version: 1,
         }
+    ));
+}
+
+#[test]
+fn a_schema_v1_baseline_parses_only_as_an_upgrade_marker() {
+    let root = temp();
+    let profile = make_profile(root.path(), "Default");
+    write_extension(
+        &profile,
+        PLAIN_ID,
+        "1.0.0_0",
+        MV2_MANIFEST,
+        &[("bg.js", "//")],
+    );
+    write_preferences(&profile, &[(PLAIN_ID, 1, true)]);
+    let report = audit_report(&profile);
+    let mut document =
+        serde_json::to_value(BrowserBaseline::from_report(&report)).expect("serialize baseline");
+    document["schema"] = serde_json::json!(1);
+    document["format_version"] = serde_json::json!(1);
+    for entry in document["entries"].as_array_mut().expect("entries") {
+        entry.as_object_mut().expect("entry").remove("identity");
+    }
+    document["signature"] = serde_json::Value::Null;
+    document["inventory_hash"] = serde_json::Value::String(crate::command_card::sha256_hex(
+        crate::mcp_lock::canonical_json(&document["entries"]).as_bytes(),
+    ));
+    let mut blanked = document.clone();
+    blanked["receipt_id"] = serde_json::Value::String(String::new());
+    blanked["signature"] = serde_json::Value::Null;
+    document["receipt_id"] = serde_json::Value::String(crate::command_card::sha256_hex(
+        crate::audit::canonical_json_for_hash(&blanked).as_bytes(),
+    ));
+
+    let parsed = BrowserBaseline::parse(
+        &serde_json::to_string(&document).expect("serialize legacy baseline"),
+    )
+    .expect("recognize v1 baseline");
+    assert!(parsed.requires_schema_upgrade());
+    assert!(
+        parsed.entries.is_empty(),
+        "legacy entries must not be trusted"
+    );
+    assert_eq!(parsed.receipt_id, "");
+    assert!(matches!(
+        compute_drift(&report, &parsed).as_slice(),
+        [ExtensionDrift::SchemaUpgradeRequired {
+            from_schema: 1,
+            to_schema: 2,
+            from_version: 1,
+            to_version: 1,
+        }]
     ));
 }
 
@@ -2100,6 +2359,10 @@ fn a_version_directory_outside_the_profile_is_refused_by_the_profile_anchor() {
     let record = audit_extension(
         &profile,
         &extensions_root,
+        &BrowserProfileIdentity {
+            root: BrowserRootIdentity::explicit(BrowserFamily::Chrome),
+            profile_directory: "Default".to_string(),
+        },
         PLAIN_ID,
         InstallClass::WebStore,
         InstallClassSource::Preferences,

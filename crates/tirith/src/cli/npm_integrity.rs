@@ -18,21 +18,23 @@
 //!    only, no process and no network;
 //! 2b. the PROJECT CONFIG gate: the audit child's working directory is the
 //!    audited project, and npm reads `<cwd>/.npmrc` above the user and global
-//!    config, so a project-level key deciding what npm verifies or where it
-//!    verifies it from returns Partial and spawns nothing;
+//!    config, so any effective project setting returns Partial and spawns
+//!    nothing;
 //! 3. the OFFLINE gate: `TIRITH_OFFLINE` returns Partial WITHOUT resolving npm
 //!    and without spawning anything;
 //! 4. the PLATFORM gate: Windows npm is `npm.cmd`, which the trusted-child
 //!    validator refuses on purpose, so Windows returns Partial rather than
 //!    pretending;
-//! 5. resolve npm (and, when npm is a shebang script, its interpreter) as
+//! 5. build either a hermetic public-registry environment or a complete,
+//!    explicitly trusted private-registry binding;
+//! 6. resolve npm (and, when npm is a shebang script, its interpreter) as
 //!    trusted executables;
-//! 6. probe `npm --version` and look the version up in the CLOSED contract
+//! 7. probe `npm --version` and look the version up in the CLOSED contract
 //!    table. A version outside every range returns Partial and NO audit command
 //!    runs;
-//! 7. only now, run the one exact argv the contract authorizes.
+//! 8. only now, run the one exact argv the contract authorizes.
 //!
-//! Step 6 before step 7 is the whole point of the slice: handing a speculative
+//! Step 7 before step 8 is the whole point of the slice: handing a speculative
 //! flag to an npm whose output shape has not been characterized would turn this
 //! command into an arbitrary-argv executor.
 //!
@@ -46,25 +48,30 @@
 //! # What this command does not claim
 //!
 //! npm performs its own registry network I/O, entirely outside tirith's fetch
-//! validator, redirect policy, and capsule broker, and it reads `.npmrc` (a
-//! registered credential asset) when HOME is inherited. Tirith never downloads
-//! or inspects a tarball. A clean receipt means npm's signature check passed;
-//! it is not a statement about what the code does.
+//! validator, redirect policy, and capsule broker. Public mode removes ambient
+//! npm config/auth/proxy state. Trusted-private mode snapshots one explicitly
+//! selected credential source and binds every transport input without recording
+//! its credential bytes. Tirith never downloads or inspects a tarball.
 
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest as _, Sha256};
 use tirith_core::policy::Policy;
 use tirith_core::provenance::npm::{
-    self as core_npm, InstalledInventory, NpmAssessment, NpmAttestOutcome, NpmAuditInvocation,
-    NpmAuditReport, NpmAuditSignaturesContract, NpmLockfile, NpmPartialReason,
-    NpmProvenanceReceipt, NpmReceiptFacts, NpmReceiptSubject, NpmToolIdentity,
+    self as core_npm, InstalledInventory, NpmAssessment, NpmAttestOutcome, NpmAuditEnvironment,
+    NpmAuditInvocation, NpmAuditMode, NpmAuditReport, NpmAuditSignaturesContract, NpmLockfile,
+    NpmPartialReason, NpmProvenanceReceipt, NpmReceiptFacts, NpmReceiptSubject, NpmToolIdentity,
 };
 use tirith_core::trusted_child::{
     self, ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable, TrustedExecutableError,
 };
 
 use super::{sanitize_for_human_output, write_json_stdout};
+use url::Url;
 
 /// The audit command's wall-clock budget, from the plan.
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -88,26 +95,20 @@ const MAX_RECORDED_STDERR: usize = 4096;
 /// treated as a native image.
 const MAX_LAUNCHER_PROBE_BYTES: u64 = 1024 * 1024;
 
-/// Environment the audit child inherits, on top of a sanitized `PATH`.
-///
-/// [`trusted_child::run`] clears the environment, and npm needs a home to find
-/// its cache and `.npmrc` (which is how a private registry authenticates). This
-/// is the minimum that keeps npm functional. The inherited USER config can still
-/// change which registry npm asks, which is why the receipt records the registry
-/// host npm ITSELF reported alongside the lockfile's, and why a positive npm
-/// result against a host the lockfile does not resolve from is not read as
-/// covering the package. The PROJECT's own `.npmrc` is refused outright, above.
+/// Locale/temp environment the child may inherit, on top of a sanitized PATH.
+/// HOME and npm configuration are never inherited; [`AuditEnvironment`] owns
+/// their exact replacements.
 #[cfg(unix)]
-const INHERITED_ENV: &[&str] = &["HOME", "TMPDIR", "LANG", "LC_ALL"];
+const INHERITED_ENV: &[&str] = &["TMPDIR", "LANG", "LC_ALL"];
 #[cfg(not(unix))]
-const INHERITED_ENV: &[&str] = &[
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "SystemRoot",
-    "TEMP",
-    "TMP",
-];
+const INHERITED_ENV: &[&str] = &["SystemRoot", "TEMP", "TMP"];
+
+const AUDIT_MODE_ENV: &str = "TIRITH_NPM_AUDIT_MODE";
+const PRIVATE_REGISTRY_ENV: &str = "TIRITH_NPM_REGISTRY";
+const PRIVATE_AUTH_SOURCE_ENV: &str = "TIRITH_NPM_AUTH_SOURCE";
+const PRIVATE_CA_FILE_ENV: &str = "TIRITH_NPM_CA_FILE";
+const PRIVATE_PROXY_ENV: &str = "TIRITH_NPM_PROXY";
+const MAX_AUDIT_ORIGIN_BYTES: usize = 2048;
 
 /// Everything `tirith pkg attest-npm` was asked to do.
 #[derive(Debug, Clone, Default)]
@@ -138,7 +139,8 @@ pub fn run(args: AttestNpmArgs) -> i32 {
         Ok(pair) => pair,
         Err((reason, detail)) => return finish(&args, Assembly::partial(reason, detail)),
     };
-    let npmrc = project_npmrc_override(&project);
+    let npmrc_inspection = project_npmrc_override(&project);
+    let npmrc_present = !matches!(npmrc_inspection, Ok(None));
     let inventory = match core_npm::walk_installed_tree(&project) {
         Some(inventory) => inventory,
         None => {
@@ -152,12 +154,31 @@ pub fn run(args: AttestNpmArgs) -> i32 {
                         capped: false,
                         symlinked_entries: 0,
                     },
-                    npmrc.is_some(),
+                    npmrc_present,
                     NpmAttestOutcome::Partial {
                         reason: NpmPartialReason::MissingInstallTree,
                         detail: "the project has no node_modules directory, so there is no \
                                  install tree for npm to audit; no audit command was run"
                             .to_string(),
+                    },
+                ),
+            );
+        }
+    };
+
+    let npmrc = match npmrc_inspection {
+        Ok(value) => value,
+        Err(detail) => {
+            return finish(
+                &args,
+                Assembly::without_audit(
+                    &lockfile,
+                    lockfile_sha256.clone(),
+                    &inventory,
+                    true,
+                    NpmAttestOutcome::Partial {
+                        reason: NpmPartialReason::AuditConfigurationInvalid,
+                        detail,
                     },
                 ),
             );
@@ -224,7 +245,23 @@ pub fn run(args: AttestNpmArgs) -> i32 {
         );
     }
 
-    // 5. Resolve npm, and its interpreter when npm is a shebang script.
+    // 5. Freeze the registry/configuration boundary before resolving or
+    //    spawning npm. An incomplete private-mode request is never allowed to
+    //    fall back to the public registry or ambient user config.
+    let audit_environment = match AuditEnvironment::from_process() {
+        Ok(environment) => environment,
+        Err(detail) => {
+            return finish(
+                &args,
+                base(NpmAttestOutcome::Partial {
+                    reason: NpmPartialReason::AuditConfigurationInvalid,
+                    detail,
+                }),
+            );
+        }
+    };
+
+    // 6. Resolve npm, and its interpreter when npm is a shebang script.
     let launcher = match resolve_launcher() {
         Ok(launcher) => launcher,
         Err(reason) => {
@@ -238,7 +275,7 @@ pub fn run(args: AttestNpmArgs) -> i32 {
         }
     };
 
-    // 6. Version discovery, THEN contract selection. No audit command exists
+    // 7. Version discovery, THEN contract selection. No audit command exists
     //    yet at this point.
     let version = match probe_version(&launcher) {
         Ok(version) => version,
@@ -264,8 +301,8 @@ pub fn run(args: AttestNpmArgs) -> i32 {
         return finish(&args, assembly);
     };
 
-    // 7. The one authorized command.
-    let spawned = run_audit(&launcher, contract, &project);
+    // 8. The one authorized command under the frozen audit environment.
+    let spawned = run_audit(&launcher, contract, &project, &audit_environment);
     let tools = launcher.identity(Some(version));
 
     let assembly = match spawned {
@@ -275,7 +312,12 @@ pub fn run(args: AttestNpmArgs) -> i32 {
         AuditRun::Failed { reason, detail } => {
             let mut assembly = base(NpmAttestOutcome::Partial { reason, detail });
             assembly.tools = tools;
-            assembly.invocation = Some(invocation_of(contract, None, None));
+            assembly.invocation = Some(invocation_of(
+                contract,
+                &audit_environment.binding,
+                None,
+                None,
+            ));
             assembly
         }
         // No process was ever created, so there is no command to record. An
@@ -291,7 +333,12 @@ pub fn run(args: AttestNpmArgs) -> i32 {
             stderr,
         } => {
             let stderr = redact_child_stderr(&stderr);
-            let invocation = invocation_of(contract, Some(exit_code), stderr);
+            let invocation = invocation_of(
+                contract,
+                &audit_environment.binding,
+                Some(exit_code),
+                stderr,
+            );
             match core_npm::parse_audit_report(&stdout, contract.schema) {
                 Err(error) => {
                     let mut assembly = base(NpmAttestOutcome::Partial {
@@ -406,71 +453,414 @@ fn read_lockfile(path: &Path) -> Result<(NpmLockfile, Option<String>), (NpmParti
     Ok((lockfile, digest))
 }
 
-/// The npm config keys a project-level `.npmrc` may not set under an audit.
-///
-/// Each one changes what the audit VERIFIES or where it verifies it FROM, which
-/// is exactly the answer this command reports:
-///
-/// * `registry` and any `<scope>:registry` decide the host npm fetches signing
-///   keys and manifests from (`pickRegistry(spec, flatOptions)`);
-/// * `ca`, `cafile`, and `strict-ssl` decide whether that host is authenticated
-///   at all;
-/// * a `//host/:_keys` entry overrides the TUF-sourced signing keys, because
-///   `verifySignatures` spreads `flatOptions` AFTER `buildRegistryConfig`;
-/// * `omit` removes whole dependency types from the audit (`config.get('omit')`
-///   in `getValidPackageInfo`);
-/// * `userconfig` and `globalconfig` redirect the rest of the config hierarchy.
-///
-/// Deliberately narrow: a project `.npmrc` that only sets `save-exact` or
-/// `engine-strict` has no say in the audit and is not a reason to refuse.
-const NPMRC_AUDIT_CONTROLLING_KEYS: &[&str] = &[
-    "registry",
-    "ca",
-    "cafile",
-    "strict-ssl",
-    "_keys",
-    "omit",
-    "userconfig",
-    "globalconfig",
-];
-
 /// Largest project `.npmrc` inspected. A config file is a few hundred bytes.
 const MAX_NPMRC_BYTES: u64 = 1024 * 1024;
 
-/// The first audit-controlling key a project's own `.npmrc` sets, if any.
+/// The first effective key a project's own `.npmrc` sets, if any.
 ///
 /// Returns the KEY, never the value: an `.npmrc` line's right-hand side is a
-/// registered credential asset.
-fn project_npmrc_override(project: &Path) -> Option<String> {
+/// registered credential asset. npm reads project config above our isolated
+/// user/global files, and npm can add new audit-affecting keys over time, so a
+/// denylist is not hermetic. Comments and blank lines are harmless; every
+/// assignment refuses the audit before a spawn.
+fn project_npmrc_override(project: &Path) -> Result<Option<String>, String> {
+    let path = project.join(".npmrc");
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "the project's .npmrc could not be inspected safely: {error}"
+            ));
+        }
+        Ok(_) => {}
+    }
     let bytes =
-        tirith_core::util::read_regular_capped(&project.join(".npmrc"), MAX_NPMRC_BYTES).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
+        tirith_core::util::read_regular_capped(&path, MAX_NPMRC_BYTES).map_err(|error| {
+            format!("the project's .npmrc is not a bounded no-follow regular file ({error:?})")
+        })?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "the project's .npmrc is not valid UTF-8".to_string())?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let key = line
+            .split_once('=')
+            .map_or("<unparsed-setting>", |(key, _)| key);
+        let key = key.trim();
+        let key = sanitize_for_human_output(key, false);
+        let key = tirith_core::util::truncate_bytes(&key, 128);
+        return Ok(Some(
+            key.rsplit(':')
+                .next()
+                .unwrap_or(key.as_str())
+                .trim()
+                .to_ascii_lowercase(),
+        ));
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// 5. Registry/configuration binding
+// ---------------------------------------------------------------------------
+
+/// Runtime-only material for one npm audit. The tempdir holds isolated
+/// user/global config, cache, and (for private mode) a private snapshot of the
+/// explicitly selected auth source. Only [`binding`] reaches the receipt.
+struct AuditEnvironment {
+    binding: NpmAuditEnvironment,
+    child_env: Vec<(OsString, OsString)>,
+    _scratch: tempfile::TempDir,
+}
+
+impl AuditEnvironment {
+    fn from_process() -> Result<Self, String> {
+        match optional_utf8_env(AUDIT_MODE_ENV)?.as_deref() {
+            None | Some("") | Some("public") => Self::public(),
+            Some("trusted-private") => Self::trusted_private(),
+            Some(_) => Err(format!(
+                "{AUDIT_MODE_ENV} must be 'public' or 'trusted-private'; no audit command was run"
+            )),
+        }
+    }
+
+    fn public() -> Result<Self, String> {
+        for name in [
+            PRIVATE_REGISTRY_ENV,
+            PRIVATE_AUTH_SOURCE_ENV,
+            PRIVATE_CA_FILE_ENV,
+            PRIVATE_PROXY_ENV,
+        ] {
+            if optional_utf8_env(name)?.is_some_and(|value| !value.trim().is_empty()) {
+                return Err(format!(
+                    "{name} was set without {AUDIT_MODE_ENV}=trusted-private; refusing an \
+                     ambiguous registry configuration"
+                ));
+            }
+        }
+        let scratch = isolated_npm_scratch()?;
+        let registry = core_npm::PUBLIC_NPM_REGISTRY_ORIGIN.to_string();
+        let child_env = base_npm_environment(&scratch, &registry, None, None, None)?;
+        Ok(Self {
+            binding: NpmAuditEnvironment {
+                mode: NpmAuditMode::HermeticPublicRegistry,
+                registry_origin: registry,
+                strict_tls: true,
+                tls_ca_identity: "system_roots".to_string(),
+                proxy_identity: "direct".to_string(),
+                auth_source_identity: "none".to_string(),
+            },
+            child_env,
+            _scratch: scratch,
+        })
+    }
+
+    fn trusted_private() -> Result<Self, String> {
+        let registry = required_utf8_env(PRIVATE_REGISTRY_ENV)?;
+        let registry = canonical_https_origin(&registry, PRIVATE_REGISTRY_ENV)?;
+        if registry == core_npm::PUBLIC_NPM_REGISTRY_ORIGIN {
+            return Err(format!(
+                "{PRIVATE_REGISTRY_ENV} selects the public npm registry; use \
+                 {AUDIT_MODE_ENV}=public so ambient credentials cannot be introduced"
+            ));
+        }
+
+        let auth_source = PathBuf::from(required_utf8_env(PRIVATE_AUTH_SOURCE_ENV)?);
+        let (auth_bytes, auth_identity) = read_private_auth_source(&auth_source)?;
+        let scratch = isolated_npm_scratch()?;
+        let auth_snapshot = scratch.path().join("private-auth.npmrc");
+        write_owner_only(&auth_snapshot, &auth_bytes)?;
+
+        let (ca_snapshot, tls_ca_identity) = match optional_utf8_env(PRIVATE_CA_FILE_ENV)? {
+            Some(value) if !value.trim().is_empty() => {
+                let source = PathBuf::from(value);
+                if !source.is_absolute() {
+                    return Err(format!("{PRIVATE_CA_FILE_ENV} must be an absolute path"));
+                }
+                let bytes = read_public_config_source(&source, PRIVATE_CA_FILE_ENV)?;
+                let identity = format!("sha256:{}", hex_sha256(&bytes));
+                let snapshot = scratch.path().join("private-ca.pem");
+                write_owner_only(&snapshot, &bytes)?;
+                (Some(snapshot), identity)
+            }
+            _ => (None, "system_roots".to_string()),
+        };
+
+        let (proxy, proxy_identity) = match optional_utf8_env(PRIVATE_PROXY_ENV)? {
+            Some(value) if !value.trim().is_empty() && value != "direct" => {
+                let canonical = canonical_https_origin(&value, PRIVATE_PROXY_ENV)?;
+                let identity = format!("sha256:{}", hex_sha256(canonical.as_bytes()));
+                (Some(canonical), identity)
+            }
+            _ => (None, "direct".to_string()),
+        };
+        let child_env = base_npm_environment(
+            &scratch,
+            &registry,
+            Some(&auth_snapshot),
+            ca_snapshot.as_deref(),
+            proxy.as_deref(),
+        )?;
+
+        Ok(Self {
+            binding: NpmAuditEnvironment {
+                mode: NpmAuditMode::TrustedPrivateRegistry,
+                registry_origin: registry,
+                strict_tls: true,
+                tls_ca_identity,
+                proxy_identity,
+                auth_source_identity: auth_identity,
+            },
+            child_env,
+            _scratch: scratch,
+        })
+    }
+
+    fn apply(&self, mut spec: ChildSpec) -> ChildSpec {
+        for (name, value) in &self.child_env {
+            spec = spec.env(name, value);
+        }
+        spec
+    }
+}
+
+fn optional_utf8_env(name: &str) -> Result<Option<String>, String> {
+    match std::env::var_os(name) {
+        None => Ok(None),
+        Some(value) => value.into_string().map(Some).map_err(|_| {
+            format!("{name} is not valid UTF-8, so its audit meaning cannot be bound")
+        }),
+    }
+}
+
+fn required_utf8_env(name: &str) -> Result<String, String> {
+    optional_utf8_env(name)?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+            "{AUDIT_MODE_ENV}=trusted-private requires a non-empty {name}; no audit command was run"
+        )
+        })
+}
+
+fn canonical_https_origin(raw: &str, name: &str) -> Result<String, String> {
+    if raw.len() > MAX_AUDIT_ORIGIN_BYTES {
+        return Err(format!("{name} exceeds the audit-origin size limit"));
+    }
+    let mut url = Url::parse(raw).map_err(|_| {
+        format!("{name} must be a canonical HTTPS origin; no audit command was run")
+    })?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(format!(
+            "{name} must be an HTTPS origin with no credentials, path, query, or fragment"
+        ));
+    }
+    url.set_path("/");
+    Ok(url.to_string())
+}
+
+fn isolated_npm_scratch() -> Result<tempfile::TempDir, String> {
+    let scratch = tempfile::Builder::new()
+        .prefix("tirith-npm-audit-")
+        .tempdir()
+        .map_err(|error| format!("cannot create an isolated npm audit directory: {error}"))?;
+    fs::create_dir(scratch.path().join("cache"))
+        .map_err(|error| format!("cannot create the isolated npm cache: {error}"))?;
+    write_owner_only(&scratch.path().join("empty-user.npmrc"), b"")?;
+    write_owner_only(&scratch.path().join("empty-global.npmrc"), b"")?;
+    Ok(scratch)
+}
+
+fn base_npm_environment(
+    scratch: &tempfile::TempDir,
+    registry: &str,
+    auth_source: Option<&Path>,
+    ca_file: Option<&Path>,
+    proxy: Option<&str>,
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let userconfig = auth_source
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| scratch.path().join("empty-user.npmrc"));
+    let mut env = vec![
+        (
+            OsString::from("HOME"),
+            scratch.path().as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from("NPM_CONFIG_USERCONFIG"),
+            userconfig.into_os_string(),
+        ),
+        (
+            OsString::from("NPM_CONFIG_GLOBALCONFIG"),
+            scratch.path().join("empty-global.npmrc").into_os_string(),
+        ),
+        (
+            OsString::from("NPM_CONFIG_CACHE"),
+            scratch.path().join("cache").into_os_string(),
+        ),
+        (
+            OsString::from("NPM_CONFIG_REGISTRY"),
+            OsString::from(registry),
+        ),
+        (
+            OsString::from("NPM_CONFIG_STRICT_SSL"),
+            OsString::from("true"),
+        ),
+        (OsString::from("NPM_CONFIG_OMIT"), OsString::new()),
+        (
+            OsString::from("NPM_CONFIG_PROXY"),
+            proxy.map_or_else(OsString::new, OsString::from),
+        ),
+        (
+            OsString::from("NPM_CONFIG_HTTPS_PROXY"),
+            proxy.map_or_else(OsString::new, OsString::from),
+        ),
+    ];
+    if let Some(path) = ca_file {
+        env.push((
+            OsString::from("NPM_CONFIG_CAFILE"),
+            path.as_os_str().to_os_string(),
+        ));
+    }
+    Ok(env)
+}
+
+fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("cannot create isolated npm config: {error}"))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("cannot publish isolated npm config: {error}"))
+}
+
+fn read_public_config_source(path: &Path, name: &str) -> Result<Vec<u8>, String> {
+    tirith_core::util::read_regular_capped(path, MAX_NPMRC_BYTES)
+        .map_err(|error| format!("{name} is not a readable bounded regular file: {error:?}"))
+}
+
+fn read_private_auth_source(path: &Path) -> Result<(Vec<u8>, String), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{PRIVATE_AUTH_SOURCE_ENV} must be an absolute path"
+        ));
+    }
+    let mut handle = tirith_core::util::open_regular_capped(path, MAX_NPMRC_BYTES)
+        .map_err(|error| format!("cannot inspect {PRIVATE_AUTH_SOURCE_ENV}: {error:?}"))?;
+    let metadata = handle
+        .metadata()
+        .map_err(|error| format!("cannot inspect {PRIVATE_AUTH_SOURCE_ENV}: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: geteuid has no preconditions and does not mutate state.
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid || metadata.mode() & 0o077 != 0 {
+            return Err(format!(
+                "{PRIVATE_AUTH_SOURCE_ENV} must be owned by the current user and owner-only \
+                 (mode 0600 or stricter)"
+            ));
+        }
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut handle, &mut bytes)
+        .map_err(|error| format!("cannot read {PRIVATE_AUTH_SOURCE_ENV}: {error}"))?;
+    if let Some(key) = disallowed_private_auth_key(&bytes) {
+        let key = sanitize_for_human_output(&key, false);
+        let key = tirith_core::util::truncate_bytes(&key, 128);
+        return Err(format!(
+            "{PRIVATE_AUTH_SOURCE_ENV} contains non-credential setting {key:?}; private mode \
+             binds registry, TLS, and proxy separately"
+        ));
+    }
+    Ok((bytes, auth_source_metadata_identity(&metadata)))
+}
+
+fn disallowed_private_auth_key(bytes: &[u8]) -> Option<String> {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => return Some("<non-utf8>".to_string()),
+    };
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
         let Some((key, _)) = line.split_once('=') else {
-            continue;
+            return Some("<unparsed>".to_string());
         };
-        let key = key.trim();
-        // npm namespaces a key with `<scope>:` or `//host/path:`, and the
-        // controlling part is the last segment.
         let bare = key
+            .trim()
             .rsplit(':')
             .next()
             .unwrap_or(key)
-            .trim()
             .to_ascii_lowercase();
-        if NPMRC_AUDIT_CONTROLLING_KEYS.contains(&bare.as_str()) {
+        if !matches!(
+            bare.as_str(),
+            "_authtoken" | "_auth" | "_password" | "username" | "email" | "always-auth"
+        ) {
             return Some(bare);
         }
     }
     None
 }
 
+fn auth_source_metadata_identity(metadata: &fs::Metadata) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        format!(
+            "sha256:{}",
+            hex_sha256(
+                format!(
+                    "dev={};ino={};uid={};gid={};mode={};len={};mtime={};mtime_ns={};ctime={};ctime_ns={}",
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.uid(),
+                    metadata.gid(),
+                    metadata.mode(),
+                    metadata.len(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec()
+                )
+                .as_bytes()
+            )
+        )
+    }
+    #[cfg(not(unix))]
+    format!(
+        "sha256:{}",
+        hex_sha256(format!("len={}", metadata.len()).as_bytes())
+    )
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
-// 5. Trusted executable resolution
+// 6. Trusted executable resolution
 // ---------------------------------------------------------------------------
 
 /// The trusted executables one run launches.
@@ -556,7 +946,10 @@ impl Launcher {
 /// `resolve_system_helper` would reject those.
 fn resolve_launcher() -> Result<Launcher, String> {
     let npm = trusted_child::resolve_ambient("npm").map_err(describe_resolve_error)?;
-    let npm_sha256 = file_sha256(npm.path());
+    let npm_sha256 = Some(file_sha256(npm.path()).ok_or_else(|| {
+        "the resolved npm executable could not be hashed, so its identity cannot be bound"
+            .to_string()
+    })?);
     let interpreter = match shebang_interpreter_name(npm.path()) {
         Some(name) => {
             let executable = trusted_child::resolve_ambient(&name).map_err(|error| {
@@ -566,7 +959,12 @@ fn resolve_launcher() -> Result<Launcher, String> {
                     describe_resolve_error(error)
                 )
             })?;
-            let sha256 = file_sha256(executable.path());
+            let sha256 = Some(file_sha256(executable.path()).ok_or_else(|| {
+                format!(
+                    "npm's resolved interpreter '{name}' could not be hashed, so its identity \
+                     cannot be bound"
+                )
+            })?);
             Some(Interpreter {
                 name,
                 executable,
@@ -625,7 +1023,7 @@ fn file_sha256(path: &Path) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// 6 and 7. Bounded spawns
+// 7 and 8. Bounded spawns
 // ---------------------------------------------------------------------------
 
 /// Build a [`ChildSpec`] with the shared environment discipline.
@@ -708,6 +1106,7 @@ fn run_audit(
     launcher: &Launcher,
     contract: &NpmAuditSignaturesContract,
     project: &Path,
+    environment: &AuditEnvironment,
 ) -> AuditRun {
     if let Err(detail) = launcher.revalidate_auxiliary() {
         return AuditRun::NotStarted {
@@ -715,11 +1114,12 @@ fn run_audit(
             detail,
         };
     }
-    let spec = spec_for(
-        launcher.argv(contract.argv),
-        ChildLimits::new(AUDIT_TIMEOUT, AUDIT_OUTPUT_CAP, AUDIT_OUTPUT_CAP),
-    )
-    .cwd(project);
+    let spec = environment
+        .apply(spec_for(
+            launcher.argv(contract.argv),
+            ChildLimits::new(AUDIT_TIMEOUT, AUDIT_OUTPUT_CAP, AUDIT_OUTPUT_CAP),
+        ))
+        .cwd(project);
     match trusted_child::run(launcher.program(), &spec) {
         ChildOutcome::Completed {
             status,
@@ -831,6 +1231,7 @@ fn redact_child_stderr(stderr: &[u8]) -> Option<String> {
 
 fn invocation_of(
     contract: &NpmAuditSignaturesContract,
+    environment: &NpmAuditEnvironment,
     exit_code: Option<i32>,
     stderr: Option<String>,
 ) -> NpmAuditInvocation {
@@ -839,6 +1240,7 @@ fn invocation_of(
         version_range: contract.version_range.to_string(),
         argv: contract.argv.iter().map(|arg| (*arg).to_string()).collect(),
         attestation_bundles_available: contract.attestation_bundles_available,
+        environment: Some(environment.clone()),
         exit_code,
         stderr,
     }
@@ -1052,6 +1454,13 @@ fn print_human(receipt: &NpmProvenanceReceipt, out: Option<&Path>) {
         Some(invocation) => {
             eprintln!("  contract:     {}", invocation.contract_id);
             eprintln!("  argv:         npm {}", invocation.argv.join(" "));
+            if let Some(environment) = invocation.environment.as_ref() {
+                eprintln!(
+                    "  audit mode:   {} ({})",
+                    environment.mode.label(),
+                    sanitize_for_human_output(&environment.registry_origin, false)
+                );
+            }
             match invocation.exit_code {
                 Some(code) => eprintln!("  exit code:    {code}"),
                 // Without this row an invocation reads as a completed command.
@@ -1098,12 +1507,6 @@ fn print_human(receipt: &NpmProvenanceReceipt, out: Option<&Path>) {
             eprintln!("    {}", sanitize_for_human_output(location, false));
         }
     }
-    if receipt.coverage.signature_only_derived_by_subtraction {
-        eprintln!(
-            "  note:         'signature-only' is derived by subtraction from npm's own buckets; \
-             npm's JSON enumerates only the invalid, missing, and attested packages"
-        );
-    }
     if let Some(stderr) = receipt
         .invocation
         .as_ref()
@@ -1144,6 +1547,61 @@ fn usage_error(json: bool, message: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only observation seam. Production has no injectable runner: it
+    /// always resolves and executes through `trusted_child`, so tests cannot
+    /// weaken executable ownership, no-follow, or identity validation.
+    trait NpmInvoker {
+        fn invoke(&mut self, environment: &AuditEnvironment);
+    }
+
+    #[derive(Default)]
+    struct RecordingNpmInvoker {
+        mode: Option<NpmAuditMode>,
+        registry: Option<String>,
+    }
+
+    impl NpmInvoker for RecordingNpmInvoker {
+        fn invoke(&mut self, environment: &AuditEnvironment) {
+            self.mode = Some(environment.binding.mode);
+            self.registry = Some(environment.binding.registry_origin.clone());
+        }
+    }
+
+    fn invoke_for_test(invoker: &mut dyn NpmInvoker, environment: &AuditEnvironment) {
+        invoker.invoke(environment);
+    }
+
+    #[test]
+    fn the_npm_invoker_seam_is_test_only_and_observes_the_frozen_binding() {
+        let scratch = isolated_npm_scratch().expect("isolated npm config");
+        let environment = AuditEnvironment {
+            binding: NpmAuditEnvironment {
+                mode: NpmAuditMode::HermeticPublicRegistry,
+                registry_origin: "https://registry.npmjs.org/".to_string(),
+                strict_tls: true,
+                tls_ca_identity: "system_roots".to_string(),
+                proxy_identity: "direct".to_string(),
+                auth_source_identity: "none".to_string(),
+            },
+            child_env: base_npm_environment(
+                &scratch,
+                "https://registry.npmjs.org/",
+                None,
+                None,
+                None,
+            )
+            .expect("public environment"),
+            _scratch: scratch,
+        };
+        let mut invoker = RecordingNpmInvoker::default();
+        invoke_for_test(&mut invoker, &environment);
+        assert_eq!(invoker.mode, Some(NpmAuditMode::HermeticPublicRegistry));
+        assert_eq!(
+            invoker.registry.as_deref(),
+            Some("https://registry.npmjs.org/")
+        );
+    }
 
     #[test]
     fn stderr_redaction_drops_tokens_and_absolute_paths() {

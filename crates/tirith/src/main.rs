@@ -6034,11 +6034,17 @@ What it does:
   a batch launcher (npm.cmd) that the trusted-executable validator refuses, so
   Windows returns partial rather than pretending.
 
-  The audit child runs in the project directory, where npm reads the project's
-  own .npmrc above the user and global config. A project .npmrc that sets a key
-  deciding what npm verifies or where it verifies it from (registry, ca, cafile,
-  strict-ssl, _keys, omit, userconfig, globalconfig) returns partial and runs NO
-  audit command: the audited project does not get to configure its own audit.
+  Public mode is hermetic: it pins https://registry.npmjs.org/, strict TLS, a
+  direct connection, isolated empty user/global npm config, and an isolated
+  cache. Ambient HOME, npm config, auth, and proxy state do not reach the child.
+  Because npm reads the project's own .npmrc above those files, any effective
+  project setting returns partial and runs NO audit command.
+
+  A private registry is used only with TIRITH_NPM_AUDIT_MODE=trusted-private
+  plus an HTTPS TIRITH_NPM_REGISTRY and an absolute owner-only credential file
+  in TIRITH_NPM_AUTH_SOURCE. Optional TIRITH_NPM_CA_FILE and TIRITH_NPM_PROXY
+  are validated and bound too. Credentials are snapshotted for the child but
+  never stored in the receipt; npm and Node executable digests are recorded.
 
 What a clean receipt means:
   npm's own registry signature check passed. It is NOT a statement that the
@@ -6046,11 +6052,9 @@ What a clean receipt means:
   tarball bytes npm will install. npm performs its own registry network I/O,
   outside tirith's fetch validator and capsule broker.
 
-  npm's JSON enumerates only the invalid, missing, and attested packages, so a
-  package with a plain registry signature is derived by subtraction. Tirith
-  makes that derivation only where npm's own eligibility rules say the package
-  was audited at all: it must be installed on disk and resolve from the public
-  npm registry. Everything else is reported as not-audited, which is partial.
+  npm's JSON enumerates invalid, missing, and explicitly attested packages.
+  Absence from all three buckets is never positive evidence: a package without
+  explicit audit membership is not-audited, which is partial.
 
 Exit codes (deliberately distinct from `tirith check`, which uses 3 for a warn
 acknowledgement; per-command codes in tirith are not shared):

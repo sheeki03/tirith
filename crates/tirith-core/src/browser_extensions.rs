@@ -134,7 +134,7 @@ use crate::util::{HashOutcome, OpenRegularError};
 
 /// Schema version of the audit report and the baseline document. Bumped when a
 /// field is added or its meaning changes.
-pub const BROWSER_AUDIT_SCHEMA: u32 = 1;
+pub const BROWSER_AUDIT_SCHEMA: u32 = 2;
 
 /// Version of the HASHING rules (tree digest and surface hash). Bumped
 /// independently of [`BROWSER_AUDIT_SCHEMA`] whenever a digest computed by an
@@ -295,6 +295,91 @@ pub enum BrowserFamily {
     Edge,
 }
 
+/// A Chromium release channel. Kept separate from the installation edition:
+/// Chrome Beta installed natively and a stable Chromium Flatpak are different
+/// roots even when both happen to expose a `Default` profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserChannel {
+    Stable,
+    Beta,
+    Dev,
+    Canary,
+    Nightly,
+    /// The operator supplied `--profile`, so no discovered channel is claimed.
+    Explicit,
+}
+
+impl BrowserChannel {
+    /// Stable wire token, matching the serde spelling.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+            Self::Dev => "dev",
+            Self::Canary => "canary",
+            Self::Nightly => "nightly",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
+/// Which packaging layout owns a browser root. This is a categorical edition,
+/// never an absolute path, so it is safe to carry into reports and receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserRootEdition {
+    Native,
+    Snap,
+    Flatpak,
+    /// The operator supplied `--profile`, so no packaging claim is made.
+    Explicit,
+}
+
+impl BrowserRootEdition {
+    /// Stable wire token, matching the serde spelling.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Snap => "snap",
+            Self::Flatpak => "flatpak",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
+/// Stable, privacy-preserving identity of one catalogued user-data root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BrowserRootIdentity {
+    pub family: BrowserFamily,
+    pub channel: BrowserChannel,
+    pub edition: BrowserRootEdition,
+}
+
+impl BrowserRootIdentity {
+    fn explicit(family: BrowserFamily) -> Self {
+        Self {
+            family,
+            channel: BrowserChannel::Explicit,
+            edition: BrowserRootEdition::Explicit,
+        }
+    }
+}
+
+/// Stable identity of one profile within one browser root.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BrowserProfileIdentity {
+    pub root: BrowserRootIdentity,
+    pub profile_directory: String,
+}
+
+/// Stable identity of one extension within one profile.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BrowserExtensionIdentity {
+    pub profile: BrowserProfileIdentity,
+    pub extension_id: String,
+}
+
 impl BrowserFamily {
     /// Every family, in report order.
     pub const ALL: [Self; 4] = [Self::Chrome, Self::Chromium, Self::Brave, Self::Edge];
@@ -348,6 +433,71 @@ pub fn host_platform() -> Option<HostPlatform> {
     }
 }
 
+/// One catalogued home-relative Chromium user-data directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserRootSpec {
+    pub identity: BrowserRootIdentity,
+    pub relative_path: &'static str,
+}
+
+const CHROME_MAC_ROOTS: &[&str] = &[
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Google/Chrome Beta",
+    "Library/Application Support/Google/Chrome Dev",
+    "Library/Application Support/Google/Chrome Canary",
+];
+const CHROME_LINUX_ROOTS: &[&str] = &[
+    ".config/google-chrome",
+    ".config/google-chrome-beta",
+    ".config/google-chrome-unstable",
+];
+const CHROME_WINDOWS_ROOTS: &[&str] = &[
+    "AppData/Local/Google/Chrome/User Data",
+    "AppData/Local/Google/Chrome Beta/User Data",
+    "AppData/Local/Google/Chrome Dev/User Data",
+    "AppData/Local/Google/Chrome SxS/User Data",
+];
+const CHROMIUM_MAC_ROOTS: &[&str] = &["Library/Application Support/Chromium"];
+const CHROMIUM_LINUX_ROOTS: &[&str] = &[
+    ".config/chromium",
+    "snap/chromium/common/chromium",
+    ".var/app/org.chromium.Chromium/config/chromium",
+];
+const CHROMIUM_WINDOWS_ROOTS: &[&str] = &["AppData/Local/Chromium/User Data"];
+const BRAVE_MAC_ROOTS: &[&str] = &[
+    "Library/Application Support/BraveSoftware/Brave-Browser",
+    "Library/Application Support/BraveSoftware/Brave-Browser-Beta",
+    "Library/Application Support/BraveSoftware/Brave-Browser-Nightly",
+];
+const BRAVE_LINUX_ROOTS: &[&str] = &[
+    ".config/BraveSoftware/Brave-Browser",
+    ".config/BraveSoftware/Brave-Browser-Beta",
+    ".config/BraveSoftware/Brave-Browser-Nightly",
+    ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser",
+];
+const BRAVE_WINDOWS_ROOTS: &[&str] = &[
+    "AppData/Local/BraveSoftware/Brave-Browser/User Data",
+    "AppData/Local/BraveSoftware/Brave-Browser-Beta/User Data",
+    "AppData/Local/BraveSoftware/Brave-Browser-Nightly/User Data",
+];
+const EDGE_MAC_ROOTS: &[&str] = &[
+    "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/Microsoft Edge Beta",
+    "Library/Application Support/Microsoft Edge Dev",
+    "Library/Application Support/Microsoft Edge Canary",
+];
+const EDGE_LINUX_ROOTS: &[&str] = &[
+    ".config/microsoft-edge",
+    ".config/microsoft-edge-beta",
+    ".config/microsoft-edge-dev",
+];
+const EDGE_WINDOWS_ROOTS: &[&str] = &[
+    "AppData/Local/Microsoft/Edge/User Data",
+    "AppData/Local/Microsoft/Edge Beta/User Data",
+    "AppData/Local/Microsoft/Edge Dev/User Data",
+    "AppData/Local/Microsoft/Edge SxS/User Data",
+];
+
 /// Home-relative Chromium user-data directories, in probe order.
 ///
 /// This is the audit's OWN table rather than
@@ -360,31 +510,91 @@ pub fn user_data_relative_roots(
     platform: HostPlatform,
 ) -> &'static [&'static str] {
     match (family, platform) {
-        (BrowserFamily::Chrome, HostPlatform::MacOs) => {
-            &["Library/Application Support/Google/Chrome"]
-        }
-        (BrowserFamily::Chrome, HostPlatform::Linux) => {
-            &[".config/google-chrome", ".config/google-chrome-beta"]
-        }
-        (BrowserFamily::Chrome, HostPlatform::Windows) => {
-            &["AppData/Local/Google/Chrome/User Data"]
-        }
-        (BrowserFamily::Chromium, HostPlatform::MacOs) => &["Library/Application Support/Chromium"],
-        (BrowserFamily::Chromium, HostPlatform::Linux) => &[".config/chromium"],
-        (BrowserFamily::Chromium, HostPlatform::Windows) => &["AppData/Local/Chromium/User Data"],
-        (BrowserFamily::Brave, HostPlatform::MacOs) => {
-            &["Library/Application Support/BraveSoftware/Brave-Browser"]
-        }
-        (BrowserFamily::Brave, HostPlatform::Linux) => &[".config/BraveSoftware/Brave-Browser"],
-        (BrowserFamily::Brave, HostPlatform::Windows) => {
-            &["AppData/Local/BraveSoftware/Brave-Browser/User Data"]
-        }
-        (BrowserFamily::Edge, HostPlatform::MacOs) => {
-            &["Library/Application Support/Microsoft Edge"]
-        }
-        (BrowserFamily::Edge, HostPlatform::Linux) => &[".config/microsoft-edge"],
-        (BrowserFamily::Edge, HostPlatform::Windows) => &["AppData/Local/Microsoft/Edge/User Data"],
+        (BrowserFamily::Chrome, HostPlatform::MacOs) => CHROME_MAC_ROOTS,
+        (BrowserFamily::Chrome, HostPlatform::Linux) => CHROME_LINUX_ROOTS,
+        (BrowserFamily::Chrome, HostPlatform::Windows) => CHROME_WINDOWS_ROOTS,
+        (BrowserFamily::Chromium, HostPlatform::MacOs) => CHROMIUM_MAC_ROOTS,
+        (BrowserFamily::Chromium, HostPlatform::Linux) => CHROMIUM_LINUX_ROOTS,
+        (BrowserFamily::Chromium, HostPlatform::Windows) => CHROMIUM_WINDOWS_ROOTS,
+        (BrowserFamily::Brave, HostPlatform::MacOs) => BRAVE_MAC_ROOTS,
+        (BrowserFamily::Brave, HostPlatform::Linux) => BRAVE_LINUX_ROOTS,
+        (BrowserFamily::Brave, HostPlatform::Windows) => BRAVE_WINDOWS_ROOTS,
+        (BrowserFamily::Edge, HostPlatform::MacOs) => EDGE_MAC_ROOTS,
+        (BrowserFamily::Edge, HostPlatform::Linux) => EDGE_LINUX_ROOTS,
+        (BrowserFamily::Edge, HostPlatform::Windows) => EDGE_WINDOWS_ROOTS,
     }
+}
+
+/// Complete root catalogue with channel and packaging identity. The path table
+/// above remains the single source of path spellings; this function adds the
+/// same-length identity table and debug-asserts the two cannot silently drift.
+pub fn browser_root_specs(family: BrowserFamily, platform: HostPlatform) -> Vec<BrowserRootSpec> {
+    use BrowserChannel::{Beta, Canary, Dev, Nightly, Stable};
+    use BrowserRootEdition::{Flatpak, Native, Snap};
+
+    let identities: &[(BrowserChannel, BrowserRootEdition)] = match (family, platform) {
+        (BrowserFamily::Chrome, HostPlatform::MacOs) => &[
+            (Stable, Native),
+            (Beta, Native),
+            (Dev, Native),
+            (Canary, Native),
+        ],
+        (BrowserFamily::Chrome, HostPlatform::Linux) => {
+            &[(Stable, Native), (Beta, Native), (Dev, Native)]
+        }
+        (BrowserFamily::Chrome, HostPlatform::Windows) => &[
+            (Stable, Native),
+            (Beta, Native),
+            (Dev, Native),
+            (Canary, Native),
+        ],
+        (BrowserFamily::Chromium, HostPlatform::MacOs) => &[(Stable, Native)],
+        (BrowserFamily::Chromium, HostPlatform::Linux) => {
+            &[(Stable, Native), (Stable, Snap), (Stable, Flatpak)]
+        }
+        (BrowserFamily::Chromium, HostPlatform::Windows) => &[(Stable, Native)],
+        (BrowserFamily::Brave, HostPlatform::MacOs) => {
+            &[(Stable, Native), (Beta, Native), (Nightly, Native)]
+        }
+        (BrowserFamily::Brave, HostPlatform::Linux) => &[
+            (Stable, Native),
+            (Beta, Native),
+            (Nightly, Native),
+            (Stable, Flatpak),
+        ],
+        (BrowserFamily::Brave, HostPlatform::Windows) => {
+            &[(Stable, Native), (Beta, Native), (Nightly, Native)]
+        }
+        (BrowserFamily::Edge, HostPlatform::MacOs) => &[
+            (Stable, Native),
+            (Beta, Native),
+            (Dev, Native),
+            (Canary, Native),
+        ],
+        (BrowserFamily::Edge, HostPlatform::Linux) => {
+            &[(Stable, Native), (Beta, Native), (Dev, Native)]
+        }
+        (BrowserFamily::Edge, HostPlatform::Windows) => &[
+            (Stable, Native),
+            (Beta, Native),
+            (Dev, Native),
+            (Canary, Native),
+        ],
+    };
+    let paths = user_data_relative_roots(family, platform);
+    debug_assert_eq!(paths.len(), identities.len());
+    paths
+        .iter()
+        .zip(identities)
+        .map(|(relative_path, (channel, edition))| BrowserRootSpec {
+            identity: BrowserRootIdentity {
+                family,
+                channel: *channel,
+                edition: *edition,
+            },
+            relative_path,
+        })
+        .collect()
 }
 
 /// What shape of profile a directory name declares. Chromium profile directories
@@ -786,6 +996,9 @@ pub struct TreeDigest {
 /// One audited extension.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionRecord {
+    /// Full durable identity. The legacy `id` field remains for consumers that
+    /// only render one profile, but comparisons use this structured value.
+    pub identity: BrowserExtensionIdentity,
     pub id: String,
     /// `manifest.json`'s `name`, display-sanitized and truncated. Attacker
     /// controlled, so it is never used for matching, only for reading.
@@ -842,6 +1055,9 @@ pub struct ExtensionRecord {
 /// `Local State`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileRecord {
+    /// Root + profile directory. Two `Default` profiles in different channels
+    /// are therefore distinct without recording either absolute path.
+    pub identity: BrowserProfileIdentity,
     pub profile_directory: String,
     pub profile_kind: ProfileKind,
     pub install_class_source: InstallClassSource,
@@ -882,13 +1098,56 @@ impl BrowserStatus {
     }
 }
 
+/// Outcome of probing one catalogued root. Missing roots are ordinary (the
+/// channel is not installed); an inaccessible root has one matching
+/// [`BrowserRootGap`] and makes coverage partial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserRootStatus {
+    Audited,
+    NotFound,
+    Inaccessible,
+    /// The OS reported the same stable filesystem identity for an earlier
+    /// root, so it was not audited a second time.
+    Duplicate,
+}
+
+impl BrowserRootStatus {
+    /// Stable wire token.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Audited => "audited",
+            Self::NotFound => "not_found",
+            Self::Inaccessible => "inaccessible",
+            Self::Duplicate => "duplicate",
+        }
+    }
+}
+
+/// One root probe, without its host path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserRootRecord {
+    pub identity: BrowserRootIdentity,
+    pub status: BrowserRootStatus,
+}
+
+/// One and only one gap for a catalogued root that existed but could not be
+/// enumerated. The root identity replaces an absolute-path scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserRootGap {
+    pub root: BrowserRootIdentity,
+    pub kind: CoverageGapKind,
+}
+
 /// One browser's result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserRecord {
     pub browser: BrowserFamily,
     pub status: BrowserStatus,
+    pub roots: Vec<BrowserRootRecord>,
     pub profiles: Vec<ProfileRecord>,
     pub coverage: AuditCoverage,
+    pub root_gaps: Vec<BrowserRootGap>,
 }
 
 /// The whole audit. Carries no absolute path anywhere: browsers are named by
@@ -913,11 +1172,7 @@ impl BrowserAuditReport {
         for browser in &self.browsers {
             for profile in &browser.profiles {
                 for extension in &profile.extensions {
-                    entries.push(BaselineEntry::from_record(
-                        browser.browser,
-                        &profile.profile_directory,
-                        extension,
-                    ));
+                    entries.push(BaselineEntry::from_record(extension));
                 }
             }
         }
@@ -1015,31 +1270,137 @@ fn audit_discovered_browser(
         return BrowserRecord {
             browser: family,
             status: BrowserStatus::PlatformUnsupported,
+            roots: Vec::new(),
             profiles: Vec::new(),
             coverage: AuditCoverage::Partial,
+            root_gaps: Vec::new(),
         };
     };
     let Some(home) = home::home_dir() else {
         return BrowserRecord {
             browser: family,
             status: BrowserStatus::HomeUnresolved,
+            roots: Vec::new(),
             profiles: Vec::new(),
             coverage: AuditCoverage::Partial,
+            root_gaps: Vec::new(),
         };
     };
-    let found = user_data_relative_roots(family, platform)
-        .iter()
-        .map(|relative| home.join(relative))
-        .find(|candidate| candidate.is_dir());
-    let Some(user_data) = found else {
-        return BrowserRecord {
-            browser: family,
-            status: BrowserStatus::UserDataNotFound,
-            profiles: Vec::new(),
-            coverage: AuditCoverage::Complete,
+    let candidates: Vec<(BrowserRootIdentity, PathBuf)> = browser_root_specs(family, platform)
+        .into_iter()
+        .map(|spec| (spec.identity, home.join(spec.relative_path)))
+        .collect();
+    audit_browser_candidates(family, &candidates, budget, state)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StableDirectoryIdentity(u64, u64);
+
+#[cfg(unix)]
+fn stable_directory_identity(metadata: &std::fs::Metadata) -> Option<StableDirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(StableDirectoryIdentity(metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn stable_directory_identity(_metadata: &std::fs::Metadata) -> Option<StableDirectoryIdentity> {
+    // Do not substitute a canonical path, case-folded spelling, timestamps, or
+    // another forgeable/unstable proxy. Without a stable OS file identity this
+    // platform deliberately audits both catalog entries.
+    None
+}
+
+/// Audit every catalogued candidate. Missing channels are ordinary; every root
+/// that exists but cannot be enumerated contributes exactly one root gap and
+/// does not stop later channels from being audited.
+fn audit_browser_candidates(
+    family: BrowserFamily,
+    candidates: &[(BrowserRootIdentity, PathBuf)],
+    budget: &AuditBudget,
+    state: &mut AuditProgress,
+) -> BrowserRecord {
+    let mut roots = Vec::with_capacity(candidates.len());
+    let mut root_gaps = Vec::new();
+    let mut profiles = Vec::new();
+    let mut saw_existing = false;
+    let mut audited_any = false;
+    let mut coverage = AuditCoverage::Complete;
+    let mut stable_identities = BTreeSet::new();
+
+    for (identity, path) in candidates {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                saw_existing = true;
+                coverage = AuditCoverage::Partial;
+                roots.push(BrowserRootRecord {
+                    identity: *identity,
+                    status: BrowserRootStatus::Inaccessible,
+                });
+                root_gaps.push(BrowserRootGap {
+                    root: *identity,
+                    kind: CoverageGapKind::EnumerationFailed,
+                });
+                continue;
+            }
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                roots.push(BrowserRootRecord {
+                    identity: *identity,
+                    status: BrowserRootStatus::NotFound,
+                });
+                continue;
+            }
+            Err(_) => {
+                saw_existing = true;
+                coverage = AuditCoverage::Partial;
+                roots.push(BrowserRootRecord {
+                    identity: *identity,
+                    status: BrowserRootStatus::Inaccessible,
+                });
+                root_gaps.push(BrowserRootGap {
+                    root: *identity,
+                    kind: CoverageGapKind::EnumerationFailed,
+                });
+                continue;
+            }
         };
-    };
-    audit_user_data_dir(family, &user_data, budget, state)
+        saw_existing = true;
+
+        if let Some(stable) = stable_directory_identity(&metadata) {
+            if !stable_identities.insert(stable) {
+                roots.push(BrowserRootRecord {
+                    identity: *identity,
+                    status: BrowserRootStatus::Duplicate,
+                });
+                continue;
+            }
+        }
+
+        let remaining_profiles = budget
+            .max_profiles_per_browser
+            .saturating_sub(profiles.len());
+        let result = audit_user_data_root(*identity, path, budget, state, remaining_profiles);
+        audited_any |= result.status == BrowserStatus::Audited;
+        coverage.degrade(result.coverage == AuditCoverage::Partial);
+        profiles.extend(result.profiles);
+        roots.extend(result.roots);
+        root_gaps.extend(result.root_gaps);
+    }
+
+    BrowserRecord {
+        browser: family,
+        status: if audited_any {
+            BrowserStatus::Audited
+        } else if saw_existing {
+            BrowserStatus::UserDataUnreadable
+        } else {
+            BrowserStatus::UserDataNotFound
+        },
+        roots,
+        profiles,
+        coverage,
+        root_gaps,
+    }
 }
 
 /// Audit one user-data directory. Public so multi-profile enumeration is
@@ -1050,14 +1411,39 @@ pub fn audit_user_data_dir(
     budget: &AuditBudget,
     state: &mut AuditProgress,
 ) -> BrowserRecord {
+    audit_user_data_root(
+        BrowserRootIdentity::explicit(family),
+        user_data,
+        budget,
+        state,
+        budget.max_profiles_per_browser,
+    )
+}
+
+fn audit_user_data_root(
+    root_identity: BrowserRootIdentity,
+    user_data: &Path,
+    budget: &AuditBudget,
+    state: &mut AuditProgress,
+    max_profiles: usize,
+) -> BrowserRecord {
+    let family = root_identity.family;
     let entries = match std::fs::read_dir(user_data) {
         Ok(entries) => entries,
         Err(_) => {
             return BrowserRecord {
                 browser: family,
                 status: BrowserStatus::UserDataUnreadable,
+                roots: vec![BrowserRootRecord {
+                    identity: root_identity,
+                    status: BrowserRootStatus::Inaccessible,
+                }],
                 profiles: Vec::new(),
                 coverage: AuditCoverage::Partial,
+                root_gaps: vec![BrowserRootGap {
+                    root: root_identity,
+                    kind: CoverageGapKind::EnumerationFailed,
+                }],
             }
         }
     };
@@ -1083,23 +1469,50 @@ pub fn audit_user_data_dir(
         }
     }
     names.sort_by(|a, b| a.0.cmp(&b.0));
-    let truncated = names.len() > budget.max_profiles_per_browser;
-    names.truncate(budget.max_profiles_per_browser);
+    let truncated = names.len() > max_profiles;
+    names.truncate(max_profiles);
 
     let mut coverage = AuditCoverage::Complete;
     coverage.degrade(enumeration_failed || truncated);
     let mut profiles = Vec::new();
     for (name, kind) in names {
-        let profile = audit_profile_dir(&user_data.join(&name), &name, kind, budget, state);
+        let profile_identity = BrowserProfileIdentity {
+            root: root_identity,
+            profile_directory: name.clone(),
+        };
+        let profile = audit_profile_dir(
+            &user_data.join(&name),
+            &profile_identity,
+            kind,
+            budget,
+            state,
+        );
         coverage.degrade(profile.coverage == AuditCoverage::Partial);
         profiles.push(profile);
     }
 
+    let root_gaps = enumeration_failed
+        .then_some(BrowserRootGap {
+            root: root_identity,
+            kind: CoverageGapKind::EnumerationFailed,
+        })
+        .into_iter()
+        .collect();
+
     BrowserRecord {
         browser: family,
         status: BrowserStatus::Audited,
+        roots: vec![BrowserRootRecord {
+            identity: root_identity,
+            status: if enumeration_failed {
+                BrowserRootStatus::Inaccessible
+            } else {
+                BrowserRootStatus::Audited
+            },
+        }],
         profiles,
         coverage,
+        root_gaps,
     }
 }
 
@@ -1120,18 +1533,41 @@ fn audit_explicit_profile(
             return BrowserRecord {
                 browser: family,
                 status: BrowserStatus::UserDataUnreadable,
+                roots: vec![BrowserRootRecord {
+                    identity: BrowserRootIdentity::explicit(family),
+                    status: BrowserRootStatus::Inaccessible,
+                }],
                 profiles: Vec::new(),
                 coverage: AuditCoverage::Partial,
+                root_gaps: vec![BrowserRootGap {
+                    root: BrowserRootIdentity::explicit(family),
+                    kind: CoverageGapKind::EnumerationFailed,
+                }],
             }
         }
     }
-    let profile = audit_profile_dir(profile_path, &name, ProfileKind::Explicit, budget, state);
+    let profile_identity = BrowserProfileIdentity {
+        root: BrowserRootIdentity::explicit(family),
+        profile_directory: name,
+    };
+    let profile = audit_profile_dir(
+        profile_path,
+        &profile_identity,
+        ProfileKind::Explicit,
+        budget,
+        state,
+    );
     let coverage = profile.coverage;
     BrowserRecord {
         browser: family,
         status: BrowserStatus::Audited,
+        roots: vec![BrowserRootRecord {
+            identity: BrowserRootIdentity::explicit(family),
+            status: BrowserRootStatus::Audited,
+        }],
         profiles: vec![profile],
         coverage,
+        root_gaps: Vec::new(),
     }
 }
 
@@ -1140,7 +1576,7 @@ fn audit_explicit_profile(
 /// read.
 fn audit_profile_dir(
     profile: &Path,
-    profile_name: &str,
+    identity: &BrowserProfileIdentity,
     kind: ProfileKind,
     budget: &AuditBudget,
     state: &mut AuditProgress,
@@ -1192,6 +1628,7 @@ fn audit_profile_dir(
         let audited = audit_extension(
             profile,
             &extensions_root,
+            identity,
             &id,
             install_class,
             install.source,
@@ -1208,7 +1645,8 @@ fn audit_profile_dir(
     coverage.degrade(!rejected.is_empty() || !gaps.is_empty());
 
     ProfileRecord {
-        profile_directory: profile_name.to_string(),
+        identity: identity.clone(),
+        profile_directory: identity.profile_directory.clone(),
         profile_kind: kind,
         install_class_source: install.source,
         extensions,
@@ -1495,6 +1933,7 @@ fn classify_install(
 fn audit_extension(
     profile_root: &Path,
     extensions_root: &Path,
+    profile_identity: &BrowserProfileIdentity,
     id: &str,
     install_class: InstallClass,
     install_source: InstallClassSource,
@@ -1526,7 +1965,14 @@ fn audit_extension(
                 scope: scope.clone(),
                 kind: CoverageGapKind::EnumerationFailed,
             });
-            return unaudited_record(id, install_class, Vec::new(), local_rejected, local_gaps);
+            return unaudited_record(
+                profile_identity,
+                id,
+                install_class,
+                Vec::new(),
+                local_rejected,
+                local_gaps,
+            );
         }
     };
     for entry in entries {
@@ -1621,7 +2067,14 @@ fn audit_extension(
             path: scope,
             reason: RejectionReason::NoVersionDirectory,
         });
-        return unaudited_record(id, install_class, version_dirs, local_rejected, local_gaps);
+        return unaudited_record(
+            profile_identity,
+            id,
+            install_class,
+            version_dirs,
+            local_rejected,
+            local_gaps,
+        );
     }
     let selected = select_version_directory(&version_dirs);
     let version_dir = extension_dir.join(&selected);
@@ -1636,7 +2089,14 @@ fn audit_extension(
             path: format!("Extensions/{id}/{selected}"),
             reason: RejectionReason::OutsideProfile,
         });
-        return unaudited_record(id, install_class, version_dirs, local_rejected, local_gaps);
+        return unaudited_record(
+            profile_identity,
+            id,
+            install_class,
+            version_dirs,
+            local_rejected,
+            local_gaps,
+        );
     }
 
     let relative_root = format!("Extensions/{id}/{selected}");
@@ -1651,7 +2111,14 @@ fn audit_extension(
                 scope: relative_root,
                 kind: CoverageGapKind::EnumerationFailed,
             });
-            return unaudited_record(id, install_class, version_dirs, local_rejected, local_gaps);
+            return unaudited_record(
+                profile_identity,
+                id,
+                install_class,
+                version_dirs,
+                local_rejected,
+                local_gaps,
+            );
         }
     };
 
@@ -1666,7 +2133,14 @@ fn audit_extension(
                 scope: relative_root,
                 kind: CoverageGapKind::Unreadable,
             });
-            return unaudited_record(id, install_class, version_dirs, local_rejected, local_gaps);
+            return unaudited_record(
+                profile_identity,
+                id,
+                install_class,
+                version_dirs,
+                local_rejected,
+                local_gaps,
+            );
         }
     };
 
@@ -1706,6 +2180,10 @@ fn audit_extension(
     sort_gaps(&mut local_gaps);
 
     ExtensionRecord {
+        identity: BrowserExtensionIdentity {
+            profile: profile_identity.clone(),
+            extension_id: id.to_string(),
+        },
         id: id.to_string(),
         name: facts.name,
         version: facts.version,
@@ -1744,6 +2222,7 @@ fn audit_extension(
 /// over a profile that had just gained it. An unauditable extension is a fact
 /// about the profile, and this is that fact.
 fn unaudited_record(
+    profile_identity: &BrowserProfileIdentity,
     id: &str,
     install_class: InstallClass,
     version_directories: Vec<String>,
@@ -1765,6 +2244,10 @@ fn unaudited_record(
         provenance: ProvenanceClass::Unrecorded,
     });
     ExtensionRecord {
+        identity: BrowserExtensionIdentity {
+            profile: profile_identity.clone(),
+            extension_id: id.to_string(),
+        },
         id: id.to_string(),
         name: String::new(),
         version: String::new(),
@@ -2650,6 +3133,9 @@ fn compute_surface_hash(input: &SurfaceHashInput<'_>) -> String {
 /// run's observations, not facts to compare against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaselineEntry {
+    /// Schema-v2 identity. The flat fields below remain for additive wire
+    /// compatibility, but matching and sorting use this full value.
+    pub identity: BrowserExtensionIdentity,
     pub browser: BrowserFamily,
     pub profile_directory: String,
     pub extension_id: String,
@@ -2682,14 +3168,11 @@ pub struct BaselineEntry {
 }
 
 impl BaselineEntry {
-    fn from_record(
-        browser: BrowserFamily,
-        profile_directory: &str,
-        record: &ExtensionRecord,
-    ) -> Self {
+    fn from_record(record: &ExtensionRecord) -> Self {
         Self {
-            browser,
-            profile_directory: profile_directory.to_string(),
+            identity: record.identity.clone(),
+            browser: record.identity.profile.root.family,
+            profile_directory: record.identity.profile.profile_directory.clone(),
             extension_id: record.id.clone(),
             version: record.version.clone(),
             version_directory: record.version_directory.clone(),
@@ -2715,22 +3198,14 @@ impl BaselineEntry {
         self.tree_complete && self.enumeration_complete
     }
 
-    fn sort_key(&self) -> (u8, String, String) {
-        (
-            match self.browser {
-                BrowserFamily::Chrome => 0,
-                BrowserFamily::Chromium => 1,
-                BrowserFamily::Brave => 2,
-                BrowserFamily::Edge => 3,
-            },
-            self.profile_directory.clone(),
-            self.extension_id.clone(),
-        )
+    fn sort_key(&self) -> BrowserExtensionIdentity {
+        self.identity.clone()
     }
 
     /// The `(browser, profile, id)` identity a drift entry refers to.
     pub fn subject(&self) -> DriftSubject {
         DriftSubject {
+            identity: self.identity.clone(),
             browser: self.browser,
             profile_directory: self.profile_directory.clone(),
             extension_id: self.extension_id.clone(),
@@ -2771,6 +3246,13 @@ pub struct BrowserBaseline {
 }
 
 impl BrowserBaseline {
+    /// Whether this parsed document is a legacy marker that must never be used
+    /// as a comparison or signature-verification anchor.
+    pub fn requires_schema_upgrade(&self) -> bool {
+        self.schema != BROWSER_AUDIT_SCHEMA
+            || self.format_version != BROWSER_BASELINE_FORMAT_VERSION
+    }
+
     /// Build a baseline from a completed audit, stamp the content address, and
     /// sign it when the audit chain has a key.
     pub fn from_report(report: &BrowserAuditReport) -> Self {
@@ -2864,6 +3346,18 @@ impl BrowserBaseline {
         if self.receipt_type != BROWSER_BASELINE_TYPE {
             return Err(BaselineError::WrongType);
         }
+        let mut identities = BTreeSet::new();
+        for entry in &self.entries {
+            if entry.browser != entry.identity.profile.root.family
+                || entry.profile_directory != entry.identity.profile.profile_directory
+                || entry.extension_id != entry.identity.extension_id
+            {
+                return Err(BaselineError::IdentityMismatch);
+            }
+            if !identities.insert(entry.identity.clone()) {
+                return Err(BaselineError::DuplicateIdentity);
+            }
+        }
         if !self.content_hash_matches() {
             return Err(BaselineError::ContentHashMismatch);
         }
@@ -2880,6 +3374,101 @@ impl BrowserBaseline {
 
     /// Parse and validate a baseline document.
     pub fn parse(text: &str) -> Result<Self, BaselineError> {
+        #[derive(Deserialize)]
+        struct BaselineHeader {
+            schema: u32,
+            receipt_type: String,
+        }
+
+        let header: BaselineHeader =
+            serde_json::from_str(text).map_err(|_| BaselineError::MalformedDocument)?;
+        if header.receipt_type != BROWSER_BASELINE_TYPE {
+            return Err(BaselineError::WrongType);
+        }
+        if header.schema == 1 && BROWSER_AUDIT_SCHEMA == 2 {
+            #[derive(Deserialize)]
+            struct LegacyBaselineV1 {
+                schema: u32,
+                receipt_type: String,
+                receipt_id: String,
+                created_at: String,
+                tirith_version: String,
+                format_version: u32,
+                platform: Option<HostPlatform>,
+                coverage: AuditCoverage,
+                entries: Vec<serde_json::Value>,
+                inventory_hash: String,
+                signature: Option<String>,
+            }
+
+            let legacy: LegacyBaselineV1 =
+                serde_json::from_str(text).map_err(|_| BaselineError::MalformedDocument)?;
+            let LegacyBaselineV1 {
+                schema,
+                receipt_type,
+                receipt_id,
+                created_at,
+                tirith_version,
+                format_version,
+                platform,
+                coverage,
+                entries,
+                inventory_hash,
+                signature,
+            } = legacy;
+            let _ = (
+                schema,
+                receipt_type,
+                created_at,
+                tirith_version,
+                platform,
+                coverage,
+                signature,
+            );
+            let entry_value = serde_json::Value::Array(entries);
+            let expected_inventory = crate::command_card::sha256_hex(
+                crate::mcp_lock::canonical_json(&entry_value).as_bytes(),
+            );
+            if inventory_hash != expected_inventory {
+                return Err(BaselineError::InventoryHashMismatch);
+            }
+            let mut value: serde_json::Value =
+                serde_json::from_str(text).map_err(|_| BaselineError::MalformedDocument)?;
+            let Some(object) = value.as_object_mut() else {
+                return Err(BaselineError::MalformedDocument);
+            };
+            object.insert(
+                "receipt_id".to_string(),
+                serde_json::Value::String(String::new()),
+            );
+            object.insert("signature".to_string(), serde_json::Value::Null);
+            let expected_receipt = crate::command_card::sha256_hex(
+                crate::audit::canonical_json_for_hash(&value).as_bytes(),
+            );
+            if receipt_id != expected_receipt {
+                return Err(BaselineError::ContentHashMismatch);
+            }
+            // An old baseline cannot deserialize into schema-v2 entries and it
+            // must never become a comparison anchor. Return a bounded marker
+            // carrying only version facts; callers report one upgrade and may
+            // atomically replace the original after producing a fresh report.
+            return Ok(Self {
+                schema: header.schema,
+                receipt_type: BROWSER_BASELINE_TYPE.to_string(),
+                receipt_id: String::new(),
+                created_at: String::new(),
+                tirith_version: String::new(),
+                format_version,
+                platform: None,
+                coverage: AuditCoverage::Partial,
+                entries: Vec::new(),
+                inventory_hash: String::new(),
+                signature: None,
+            });
+        }
+        if header.schema != BROWSER_AUDIT_SCHEMA {
+            return Err(BaselineError::UnsupportedSchema(header.schema));
+        }
         let baseline: Self =
             serde_json::from_str(text).map_err(|_| BaselineError::MalformedDocument)?;
         baseline.validate()?;
@@ -2899,6 +3488,8 @@ pub enum BaselineError {
     MalformedDocument,
     UnsupportedSchema(u32),
     WrongType,
+    IdentityMismatch,
+    DuplicateIdentity,
     ContentHashMismatch,
     InventoryHashMismatch,
 }
@@ -2911,6 +3502,13 @@ impl std::fmt::Display for BaselineError {
                 write!(f, "unsupported baseline schema {schema}")
             }
             Self::WrongType => write!(f, "the document is not a browser extension baseline"),
+            Self::IdentityMismatch => write!(
+                f,
+                "a baseline entry's structured identity disagrees with its compatibility fields"
+            ),
+            Self::DuplicateIdentity => {
+                write!(f, "the baseline contains a duplicate extension identity")
+            }
             Self::ContentHashMismatch => write!(
                 f,
                 "receipt_id does not match the canonical baseline content"
@@ -2931,6 +3529,7 @@ impl std::error::Error for BaselineError {}
 /// Which extension a drift entry is about.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DriftSubject {
+    pub identity: BrowserExtensionIdentity,
     pub browser: BrowserFamily,
     pub profile_directory: String,
     pub extension_id: String,
@@ -2982,7 +3581,12 @@ impl SurfaceChange {
 pub enum ExtensionDrift {
     /// The baseline was written under different hashing rules. Emitted once, in
     /// place of phantom drift on every extension.
-    SchemaUpgradeRequired { from_version: u32, to_version: u32 },
+    SchemaUpgradeRequired {
+        from_schema: u32,
+        to_schema: u32,
+        from_version: u32,
+        to_version: u32,
+    },
     /// An extension present now that the baseline did not record.
     New {
         subject: DriftSubject,
@@ -3232,8 +3836,12 @@ pub fn compute_drift(
     report: &BrowserAuditReport,
     baseline: &BrowserBaseline,
 ) -> Vec<ExtensionDrift> {
-    if baseline.format_version != BROWSER_BASELINE_FORMAT_VERSION {
+    if baseline.schema != BROWSER_AUDIT_SCHEMA
+        || baseline.format_version != BROWSER_BASELINE_FORMAT_VERSION
+    {
         return vec![ExtensionDrift::SchemaUpgradeRequired {
+            from_schema: baseline.schema,
+            to_schema: BROWSER_AUDIT_SCHEMA,
             from_version: baseline.format_version,
             to_version: BROWSER_BASELINE_FORMAT_VERSION,
         }];
@@ -3244,11 +3852,11 @@ pub fn compute_drift(
         return Vec::new();
     }
 
-    let mut recorded: BTreeMap<(u8, String, String), &BaselineEntry> = BTreeMap::new();
+    let mut recorded: BTreeMap<BrowserExtensionIdentity, &BaselineEntry> = BTreeMap::new();
     for entry in &baseline.entries {
         recorded.insert(entry.sort_key(), entry);
     }
-    let mut observed: BTreeMap<(u8, String, String), &BaselineEntry> = BTreeMap::new();
+    let mut observed: BTreeMap<BrowserExtensionIdentity, &BaselineEntry> = BTreeMap::new();
     for entry in &current {
         observed.insert(entry.sort_key(), entry);
     }

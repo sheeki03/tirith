@@ -41,6 +41,20 @@ use tirith_core::provenance::npm::{
 const CHALK: &str = "node_modules/chalk";
 const SEMVER: &str = "node_modules/semver";
 
+const ATTESTED_ONLY_LOCKFILE: &str = r#"{
+  "name": "attested-only",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"name": "attested-only", "version": "1.0.0"},
+    "node_modules/semver": {
+      "version": "7.8.5",
+      "resolved": "https://registry.npmjs.org/semver/-/semver-7.8.5.tgz",
+      "integrity": "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA=="
+    }
+  }
+}"#;
+
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npm_audit_signatures")
 }
@@ -84,10 +98,22 @@ impl Sandbox {
         self.root.join("argv.log")
     }
 
+    fn env_log(&self) -> PathBuf {
+        self.root.join("env.log")
+    }
+
     /// Every argv the fake npm was invoked with, one per line. Empty (and the
     /// file absent) when it was never spawned.
     fn recorded_argv(&self) -> Vec<String> {
         fs::read_to_string(self.argv_log())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn recorded_environment(&self) -> Vec<String> {
+        fs::read_to_string(self.env_log())
             .unwrap_or_default()
             .lines()
             .map(str::to_string)
@@ -137,6 +163,11 @@ impl Sandbox {
         self.install_package("semver", "7.8.5");
     }
 
+    fn install_attested_only_tree(&self) {
+        self.lockfile(ATTESTED_ONLY_LOCKFILE);
+        self.install_package("semver", "7.8.5");
+    }
+
     /// Write the fake npm.
     ///
     /// It always appends its argv to `argv.log` FIRST, so "was it spawned at
@@ -147,6 +178,7 @@ impl Sandbox {
         let path = self.root.join("tools").join("npm");
         let script = FAKE_NPM_TEMPLATE
             .replace("@@LOG@@", &self.argv_log().display().to_string())
+            .replace("@@ENVLOG@@", &self.env_log().display().to_string())
             .replace("@@VERSION@@", version)
             .replace("@@AUDIT@@", audit_body);
         fs::write(&path, script).expect("write fake npm");
@@ -175,14 +207,22 @@ impl Sandbox {
             .env("TIRITH_LOG", "0")
             .env_remove("TIRITH_OFFLINE")
             .env_remove("TIRITH_POLICY_ROOT")
+            .env_remove("TIRITH_NPM_AUDIT_MODE")
+            .env_remove("TIRITH_NPM_REGISTRY")
+            .env_remove("TIRITH_NPM_AUTH_SOURCE")
+            .env_remove("TIRITH_NPM_CA_FILE")
+            .env_remove("TIRITH_NPM_PROXY")
             .env_remove("SSH_AUTH_SOCK");
         cmd
     }
 
     /// Run `pkg attest-npm --format json` and return `(exit code, receipt)`.
     fn attest(&self, extra: &[&str]) -> (i32, serde_json::Value) {
-        let output = self
-            .tirith()
+        self.run_attest(self.tirith(), extra)
+    }
+
+    fn run_attest(&self, mut command: Command, extra: &[&str]) -> (i32, serde_json::Value) {
+        let output = command
             .args(["pkg", "attest-npm", "--project"])
             .arg(self.project())
             .args(["--format", "json"])
@@ -208,6 +248,9 @@ impl Drop for Sandbox {
 
 const FAKE_NPM_TEMPLATE: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> '@@LOG@@'
+printf 'home=%s|userconfig=%s|registry=%s|strict_ssl=%s|proxy=%s|https_proxy=%s|cafile=%s\n' \
+  "$HOME" "$NPM_CONFIG_USERCONFIG" "$NPM_CONFIG_REGISTRY" "$NPM_CONFIG_STRICT_SSL" \
+  "$NPM_CONFIG_PROXY" "$NPM_CONFIG_HTTPS_PROXY" "$NPM_CONFIG_CAFILE" >> '@@ENVLOG@@'
 if [ "$1" = "--version" ]; then
   printf '%s\n' '@@VERSION@@'
   exit 0
@@ -287,8 +330,8 @@ fn every_contract_entry_has_a_fixture_that_parses_to_its_declared_schema() {
 }
 
 /// The npm 11 fixture and the lockfile it was captured with bind end to end:
-/// `semver` is attested and its in-toto subject digest matches the lockfile
-/// SRI; `chalk` is signature-only by subtraction; the project is clean.
+/// `semver` is explicitly attested and its in-toto subject digest matches the
+/// lockfile SRI; `chalk` appears in no positive bucket and is not audited.
 #[test]
 fn the_captured_npm11_run_binds_its_attested_subject_to_the_lockfile() {
     let lockfile = core_npm::parse_package_lock(&fixture("npm11_clean_package-lock.json"))
@@ -335,12 +378,15 @@ fn the_captured_npm11_run_binds_its_attested_subject_to_the_lockfile() {
         }
         other => panic!("semver must be provenance-verified, got {other:?}"),
     }
-    assert_eq!(by_location[CHALK].status.label(), "signature-only");
-    assert!(assessment.coverage.signature_only_derived_by_subtraction);
-    assert_eq!(
+    assert_eq!(by_location[CHALK].status.label(), "not-audited");
+    assert!(!assessment.coverage.signature_only_derived_by_subtraction);
+    assert!(matches!(
         core_npm::overall_outcome(&assessment.statuses(), false),
-        NpmAttestOutcome::Clean
-    );
+        NpmAttestOutcome::Partial {
+            reason: NpmPartialReason::NotAudited,
+            ..
+        }
+    ));
 }
 
 /// Flip one byte of the lockfile's `integrity` for the attested package and the
@@ -466,12 +512,12 @@ fn an_unsupported_npm_version_runs_the_version_probe_and_no_audit_command() {
 }
 
 /// The supported version runs EXACTLY the contract's argv, byte for byte, and
-/// the captured stdout drives a clean result.
+/// Clean is reachable when every package has explicit positive audit membership.
 #[test]
 #[cfg(unix)]
-fn a_supported_npm_runs_exactly_the_contract_argv_and_reports_clean() {
+fn a_supported_npm_runs_exactly_the_contract_argv_and_requires_positive_membership() {
     let sandbox = Sandbox::new();
-    sandbox.install_capture_tree();
+    sandbox.install_attested_only_tree();
     let stdout = sandbox.stdout_fixture("clean.json", &fixture("npm11_clean.json"));
     sandbox.install_fake_npm("11.17.0", &print_fixture(&stdout, 0));
 
@@ -479,7 +525,7 @@ fn a_supported_npm_runs_exactly_the_contract_argv_and_reports_clean() {
     assert_eq!(
         code,
         0,
-        "a clean run exits 0; receipt: {}",
+        "an explicitly verified project is clean; receipt: {}",
         serde_json::to_string_pretty(&receipt).unwrap_or_default()
     );
     assert_eq!(outcome(&receipt), "clean");
@@ -500,7 +546,14 @@ fn a_supported_npm_runs_exactly_the_contract_argv_and_reports_clean() {
         serde_json::json!(["audit", "signatures", "--json", "--include-attestations"])
     );
     assert_eq!(status_of(&receipt, SEMVER), "provenance_verified");
-    assert_eq!(status_of(&receipt, CHALK), "signature_only");
+    assert_eq!(
+        receipt["invocation"]["environment"]["mode"],
+        "hermetic_public_registry"
+    );
+    assert_eq!(
+        receipt["invocation"]["environment"]["registry_origin"],
+        "https://registry.npmjs.org/"
+    );
     assert_eq!(
         receipt["subject"]["registry_hosts"],
         serde_json::json!(["registry.npmjs.org"])
@@ -517,11 +570,167 @@ fn a_supported_npm_runs_exactly_the_contract_argv_and_reports_clean() {
     );
 }
 
-/// `--require-provenance` tightens the same clean run into a partial, because
-/// `chalk` carries a signature and no attestation.
+/// Ambient npm/user/proxy state cannot redirect public mode. The version probe
+/// also receives no npm config; only the contracted audit receives the pinned
+/// isolated environment.
 #[test]
 #[cfg(unix)]
-fn require_provenance_downgrades_a_signature_only_project_to_partial() {
+fn public_mode_is_hermetic_against_ambient_npm_configuration() {
+    let sandbox = Sandbox::new();
+    sandbox.install_capture_tree();
+    fs::write(
+        sandbox.root.join("home/.npmrc"),
+        "registry=https://ambient-attacker.example/\n//ambient-attacker.example/:_authToken=do-not-use\n",
+    )
+    .expect("write ambient user config");
+    let stdout = sandbox.stdout_fixture("clean.json", &fixture("npm11_clean.json"));
+    sandbox.install_fake_npm("11.17.0", &print_fixture(&stdout, 0));
+
+    let mut command = sandbox.tirith();
+    command
+        .env("NPM_CONFIG_REGISTRY", "https://env-attacker.example/")
+        .env("NPM_CONFIG_USERCONFIG", sandbox.root.join("home/.npmrc"))
+        .env("HTTPS_PROXY", "https://proxy-attacker.example/")
+        .env("npm_config_strict_ssl", "false");
+    let (code, receipt) = sandbox.run_attest(command, &[]);
+    assert_eq!(code, 3, "chalk is explicitly unaudited: {receipt}");
+
+    let environments = sandbox.recorded_environment();
+    assert_eq!(
+        environments.len(),
+        2,
+        "version then audit: {environments:?}"
+    );
+    let audit = &environments[1];
+    assert!(
+        audit.contains("registry=https://registry.npmjs.org/"),
+        "{audit}"
+    );
+    assert!(audit.contains("strict_ssl=true"), "{audit}");
+    assert!(audit.contains("proxy=|https_proxy="), "{audit}");
+    assert!(!audit.contains("ambient-attacker"), "{audit}");
+    assert!(!audit.contains("env-attacker"), "{audit}");
+    assert!(!audit.contains("proxy-attacker"), "{audit}");
+    assert!(!audit.contains(&sandbox.root.join("home/.npmrc").display().to_string()));
+    assert_eq!(
+        receipt["invocation"]["environment"]["auth_source_identity"],
+        "none"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn trusted_private_mode_binds_registry_tls_proxy_auth_source_and_tools() {
+    let sandbox = Sandbox::new();
+    sandbox.lockfile(
+        r#"{
+  "name": "private-demo",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"name": "private-demo", "version": "1.0.0"},
+    "node_modules/internal": {
+      "version": "1.0.0",
+      "resolved": "https://npm.internal.example/internal/-/internal-1.0.0.tgz",
+      "integrity": "sha512-aaaa"
+    }
+  }
+}"#,
+    );
+    sandbox.install_package("internal", "1.0.0");
+    let empty = sandbox.stdout_fixture("empty.json", EMPTY_BUCKETS);
+    sandbox.install_fake_npm("11.17.0", &print_fixture(&empty, 0));
+
+    let auth_source = sandbox.root.join("private-auth.npmrc");
+    let secret = "private-token-must-not-reach-receipt";
+    fs::write(
+        &auth_source,
+        format!("//npm.internal.example/:_authToken={secret}\n"),
+    )
+    .expect("write auth source");
+    set_mode(&auth_source, 0o600);
+    let ca_source = sandbox.root.join("private-ca.pem");
+    fs::write(
+        &ca_source,
+        "-----BEGIN CERTIFICATE-----\ntest-only\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write CA source");
+
+    let mut command = sandbox.tirith();
+    command
+        .env("TIRITH_NPM_AUDIT_MODE", "trusted-private")
+        .env("TIRITH_NPM_REGISTRY", "https://npm.internal.example/")
+        .env("TIRITH_NPM_AUTH_SOURCE", &auth_source)
+        .env("TIRITH_NPM_CA_FILE", &ca_source)
+        .env("TIRITH_NPM_PROXY", "https://proxy.internal.example/");
+    let (code, receipt) = sandbox.run_attest(command, &[]);
+    assert_eq!(code, 3, "empty positive bucket is not audited: {receipt}");
+    assert_eq!(partial_reason(&receipt), "not_audited");
+
+    let binding = &receipt["invocation"]["environment"];
+    assert_eq!(binding["mode"], "trusted_private_registry");
+    assert_eq!(binding["registry_origin"], "https://npm.internal.example/");
+    assert_eq!(binding["strict_tls"], true);
+    assert!(binding["tls_ca_identity"]
+        .as_str()
+        .is_some_and(|identity| identity.starts_with("sha256:")));
+    assert!(binding["proxy_identity"]
+        .as_str()
+        .is_some_and(|identity| identity.starts_with("sha256:")));
+    assert!(binding["auth_source_identity"]
+        .as_str()
+        .is_some_and(|identity| identity.starts_with("sha256:")));
+    assert!(receipt["tools"]["npm_sha256"].as_str().is_some());
+    assert!(receipt["tools"]["interpreter_sha256"].as_str().is_some());
+
+    let serialized = serde_json::to_string(&receipt).expect("serialize receipt");
+    assert!(!serialized.contains(secret));
+    assert!(!serialized.contains(&auth_source.display().to_string()));
+    assert!(!serialized.contains(&ca_source.display().to_string()));
+    assert!(!serialized.contains("proxy.internal.example"));
+    let audit = sandbox
+        .recorded_environment()
+        .into_iter()
+        .last()
+        .expect("audit environment");
+    assert!(
+        audit.contains("registry=https://npm.internal.example/"),
+        "{audit}"
+    );
+    assert!(audit.contains("strict_ssl=true"), "{audit}");
+    assert!(
+        audit.contains(
+            "proxy=https://proxy.internal.example/|https_proxy=https://proxy.internal.example/"
+        ),
+        "{audit}"
+    );
+    assert!(
+        !audit.contains(&auth_source.display().to_string()),
+        "{audit}"
+    );
+    assert!(!audit.contains(&ca_source.display().to_string()), "{audit}");
+}
+
+#[test]
+#[cfg(unix)]
+fn incomplete_private_mode_refuses_before_resolving_npm() {
+    let sandbox = Sandbox::new();
+    sandbox.install_capture_tree();
+    let stdout = sandbox.stdout_fixture("clean.json", &fixture("npm11_clean.json"));
+    sandbox.install_fake_npm("11.17.0", &print_fixture(&stdout, 0));
+
+    let mut command = sandbox.tirith();
+    command.env("TIRITH_NPM_AUDIT_MODE", "trusted-private");
+    let (code, receipt) = sandbox.run_attest(command, &[]);
+    assert_eq!(code, 3);
+    assert_eq!(partial_reason(&receipt), "audit_configuration_invalid");
+    assert!(sandbox.recorded_argv().is_empty());
+}
+
+/// `--require-provenance` does not turn an omitted package into a legacy
+/// signature-only state; omission remains not-audited.
+#[test]
+#[cfg(unix)]
+fn require_provenance_keeps_an_omitted_package_not_audited() {
     let sandbox = Sandbox::new();
     sandbox.install_capture_tree();
     let stdout = sandbox.stdout_fixture("clean.json", &fixture("npm11_clean.json"));
@@ -530,7 +739,7 @@ fn require_provenance_downgrades_a_signature_only_project_to_partial() {
     let (code, receipt) = sandbox.attest(&["--require-provenance"]);
     assert_eq!(code, 3);
     assert_eq!(outcome(&receipt), "partial");
-    assert_eq!(partial_reason(&receipt), "provenance_required_but_absent");
+    assert_eq!(partial_reason(&receipt), "not_audited");
     assert_eq!(receipt["require_provenance"], true);
 }
 
@@ -660,7 +869,8 @@ fn npm_stderr_reaches_the_receipt_redacted() {
     sandbox.install_fake_npm("11.17.0", &body);
 
     let (code, receipt) = sandbox.attest(&[]);
-    assert_eq!(code, 0);
+    assert_eq!(code, 3);
+    assert_eq!(partial_reason(&receipt), "not_audited");
     let serialized = serde_json::to_string(&receipt).expect("serialize receipt");
     assert!(
         !serialized.contains("npm_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"),
@@ -852,7 +1062,7 @@ fn a_group_writable_npm_fails_closed_at_resolution() {
 }
 
 // ---------------------------------------------------------------------------
-// The subtraction rule and the buckets it subtracts from
+// Audit membership: omission is never positive evidence
 // ---------------------------------------------------------------------------
 
 /// A two-entry lockfile where only `chalk` is installed and `fsevents` is not,
@@ -894,7 +1104,7 @@ fn an_uninstalled_lockfile_entry_is_never_reported_as_signature_verified() {
     assert_eq!(code, 3, "an unaudited entry cannot exit 0: {receipt}");
     assert_eq!(outcome(&receipt), "partial");
     assert_eq!(partial_reason(&receipt), "not_audited");
-    assert_eq!(status_of(&receipt, "node_modules/chalk"), "signature_only");
+    assert_eq!(status_of(&receipt, "node_modules/chalk"), "not_audited");
     assert_eq!(status_of(&receipt, "node_modules/fsevents"), "not_audited");
 }
 
@@ -996,11 +1206,11 @@ fn a_project_npmrc_that_reconfigures_the_audit_refuses_to_run_it() {
     );
 }
 
-/// An `.npmrc` that only sets preferences with no say in the audit is not a
-/// reason to refuse.
+/// Even a currently benign project setting is refused: npm can add new
+/// audit-affecting keys, so a denylist would not stay hermetic.
 #[test]
 #[cfg(unix)]
-fn a_project_npmrc_with_no_audit_controlling_key_still_runs_the_audit() {
+fn any_effective_project_npmrc_setting_refuses_the_audit() {
     let sandbox = Sandbox::new();
     sandbox.install_capture_tree();
     sandbox.project_npmrc("# team defaults\nsave-exact=true\nengine-strict=true\n");
@@ -1008,8 +1218,9 @@ fn a_project_npmrc_with_no_audit_controlling_key_still_runs_the_audit() {
     sandbox.install_fake_npm("11.17.0", &print_fixture(&stdout, 0));
 
     let (code, receipt) = sandbox.attest(&[]);
-    assert_eq!(code, 0, "receipt: {receipt}");
-    assert_eq!(outcome(&receipt), "clean");
+    assert_eq!(code, 3, "receipt: {receipt}");
+    assert_eq!(partial_reason(&receipt), "project_npmrc_override");
+    assert!(sandbox.recorded_argv().is_empty());
 }
 
 /// A malformed element inside the `invalid` bucket must not empty that bucket:
@@ -1152,7 +1363,8 @@ fn npmrc_credential_keys_are_redacted_by_key_not_only_by_shape() {
     sandbox.install_fake_npm("11.17.0", &body);
 
     let (code, receipt) = sandbox.attest(&[]);
-    assert_eq!(code, 0, "receipt: {receipt}");
+    assert_eq!(code, 3, "receipt: {receipt}");
+    assert_eq!(partial_reason(&receipt), "not_audited");
     let serialized = serde_json::to_string(&receipt).expect("serialize receipt");
     for secret in [uuid_secret, basic_secret] {
         assert!(
@@ -1340,10 +1552,9 @@ fn the_help_documents_the_exit_codes_and_the_closed_contract_table() {
         "CLOSED, fixture-backed contract table",
         "NOT a statement that the",
         "--require-provenance",
-        // The project cannot configure its own audit, and the subtraction rule
-        // has a stated scope. Both change what a 0 means, so both are in help.
-        "does not get to configure its own audit",
-        "derived by subtraction",
+        "Public mode is hermetic",
+        "TIRITH_NPM_AUDIT_MODE=trusted-private",
+        "Absence from all three buckets is never positive evidence",
     ] {
         assert!(
             text.contains(expected),
@@ -1368,6 +1579,10 @@ fn the_partial_reason_labels_are_stable() {
         (
             NpmPartialReason::ProjectNpmrcOverride,
             "project_npmrc_override",
+        ),
+        (
+            NpmPartialReason::AuditConfigurationInvalid,
+            "audit_configuration_invalid",
         ),
         (NpmPartialReason::DuplicateJsonKey, "duplicate_json_key"),
         (NpmPartialReason::ParseFailure, "parse_failure"),

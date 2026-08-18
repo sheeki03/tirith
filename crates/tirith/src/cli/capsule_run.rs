@@ -314,14 +314,24 @@ pub fn run(
     }
 
     let context = resolve_task_context(argv);
-    let outcome = evaluate_and_run(&source, argv, &context);
+    let mut prepared = None;
+    let outcome = evaluate_and_run(&source, argv, &context, receipt_path, &mut prepared);
     let receipt = build_receipt(&outcome, argv, &context.dlp);
-    let recorded = receipt.record(receipt_path);
+    let recorded = match prepared.as_ref() {
+        Some(prepared) => receipt.record_prepared(prepared),
+        None => receipt.record(receipt_path),
+    };
     emit(&outcome, &receipt, recorded, json, &context.dlp)
 }
 
 /// Everything from "the inputs parse" to "the run is over", with no output.
-fn evaluate_and_run(source: &Path, argv: &[OsString], context: &PresetContext) -> PresetOutcome {
+fn evaluate_and_run(
+    source: &Path,
+    argv: &[OsString],
+    context: &PresetContext,
+    receipt_path: Option<&Path>,
+    prepared_receipt: &mut Option<tirith_core::capsule_receipt::PreparedCapsuleReceipt>,
+) -> PresetOutcome {
     let probe_spec = preset_spec(source, context);
     let backend_id = crate::cli::capsule::select_backend(&probe_spec).backend_id;
 
@@ -359,7 +369,34 @@ fn evaluate_and_run(source: &Path, argv: &[OsString], context: &PresetContext) -
         return PresetOutcome::refused(refused.backend_id, &probe_spec, refused.reason, context);
     }
 
-    contained_run(source, argv, context, backend_id, &probe_spec)
+    // Only after the side-effect-free deny and backend gates have passed:
+    // retain the requested receipt parent before the first tree scan. An
+    // in-project receipt is excluded by this exact relative path.
+    let prepared = match tirith_core::capsule_receipt::PreparedCapsuleReceipt::prepare(
+        receipt_path,
+        Some(source),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return PresetOutcome::refused(
+                backend_id,
+                &probe_spec,
+                format!("prepare capsule receipt destination: {error}"),
+                context,
+            )
+        }
+    };
+    let receipt_exclusion = prepared.project_exclusion().map(Path::to_path_buf);
+    *prepared_receipt = Some(prepared);
+
+    contained_run(
+        source,
+        argv,
+        context,
+        backend_id,
+        &probe_spec,
+        receipt_exclusion.as_deref(),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -369,6 +406,7 @@ fn contained_run(
     context: &PresetContext,
     backend_id: &'static str,
     probe_spec: &CapsuleSpec,
+    _receipt_exclusion: Option<&Path>,
 ) -> PresetOutcome {
     // Unreachable in practice: `preflight_run_to_completion` refuses on every
     // non-Linux host above. Kept as a hard refusal rather than a `todo!()` so a
@@ -425,6 +463,7 @@ fn contained_run(
     context: &PresetContext,
     backend_id: &'static str,
     probe_spec: &CapsuleSpec,
+    receipt_exclusion: Option<&Path>,
 ) -> PresetOutcome {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -494,7 +533,11 @@ fn contained_run(
         }
     };
 
-    if let Err(error) = tirith_core::capsule_project::copy_project_tree(source, &copy_root) {
+    if let Err(error) = tirith_core::capsule_project::copy_project_tree_excluding(
+        source,
+        &copy_root,
+        receipt_exclusion,
+    ) {
         // The copier writes as it walks, so a refusal here is a refusal with an
         // arbitrary prefix of an attacker's repository already on disk.
         return refuse_after_creation(
@@ -507,7 +550,21 @@ fn contained_run(
             true,
         );
     }
-    let input = tirith_core::capsule_project::inventory_project_tree(&copy_root);
+    let input = match tirith_core::capsule_project::inventory_project_tree_stable(&copy_root, None)
+    {
+        Ok(input) => input,
+        Err(error) => {
+            return refuse_after_creation(
+                &mut held,
+                backend_id,
+                probe_spec,
+                error.to_string(),
+                context,
+                None,
+                true,
+            )
+        }
+    };
 
     // The launch spec is the preset over the COPY, re-proved against the same
     // reconciler. The probe above answered for the source root; this answers for
@@ -578,8 +635,14 @@ fn contained_run(
         }
     };
 
-    let output = tirith_core::capsule_project::inventory_project_tree(&copy_root);
-    let diff = tirith_core::capsule_project::diff_project_trees(&input, &output);
+    let output_scan = tirith_core::capsule_project::inventory_project_tree_stable(&copy_root, None);
+    let (output, diff, inventory_reason) = match output_scan {
+        Ok(output) => {
+            let diff = tirith_core::capsule_project::diff_project_trees(&input, &output);
+            (Some(output), diff, None)
+        }
+        Err(error) => (None, ProjectDiff::default(), Some(error.to_string())),
+    };
     let copy_cleaned = match held.cleanup_with_hook(|| {}) {
         Ok(()) => true,
         Err(error) => {
@@ -600,7 +663,7 @@ fn contained_run(
         // unproven, which is not the same as proven true.
         outcome.ephemeral_home_cleanup_confirmed.unwrap_or(false),
     );
-    let (decision, termination_kind, reason) = match &outcome.termination {
+    let (decision, termination_kind, mut reason) = match &outcome.termination {
         Some(termination) => (
             CapsuleRunDecision::TerminatedByTirith,
             Some(format!("{:?}", termination.kind)),
@@ -608,6 +671,12 @@ fn contained_run(
         ),
         None => (CapsuleRunDecision::TargetCompleted, None, None),
     };
+    if let Some(inventory_reason) = inventory_reason {
+        reason = Some(match reason {
+            Some(reason) => format!("{reason}; output inventory failed: {inventory_reason}"),
+            None => format!("output inventory failed: {inventory_reason}"),
+        });
+    }
     let coverage = CapsuleRunCoverage {
         requested: spec.required_coverage(),
         achieved: outcome.coverage,
@@ -616,7 +685,7 @@ fn contained_run(
     let contained = decision == CapsuleRunDecision::TargetCompleted
         && cleanup_confirmed
         && input.complete
-        && output.complete
+        && output.as_ref().is_some_and(|output| output.complete)
         && !coverage.achieved.is_degraded_against(&coverage.requested);
 
     PresetOutcome {
@@ -635,7 +704,7 @@ fn contained_run(
         project_copy_materialized: true,
         cleanup_confirmed,
         project_input: Some(input),
-        project_output: Some(output),
+        project_output: output,
         diff,
         task_gate_binding: context.task_gate_binding.clone(),
         policy_projection_hash: context.policy_projection_hash.clone(),

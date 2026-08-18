@@ -263,6 +263,9 @@ pub enum BaselineTrust {
     /// baseline is trusted on its content hash alone, which any local writer can
     /// recompute.
     Unsigned,
+    /// A legacy document was recognized only far enough to demand an upgrade.
+    /// It was not trusted or used as a comparison anchor.
+    SchemaUpgradeRequired,
 }
 
 impl BaselineTrust {
@@ -270,6 +273,7 @@ impl BaselineTrust {
         match self {
             Self::Verified => "verified",
             Self::Unsigned => "unsigned",
+            Self::SchemaUpgradeRequired => "schema_upgrade_required",
         }
     }
 }
@@ -294,6 +298,9 @@ fn check_baseline_signature(
     baseline: &BrowserBaseline,
     path: &Path,
 ) -> Result<BaselineTrust, String> {
+    if baseline.requires_schema_upgrade() {
+        return Ok(BaselineTrust::SchemaUpgradeRequired);
+    }
     let expected = tirith_core::audit::audit_signing_expected();
     match (baseline.signature.is_some(), expected) {
         (true, _) => {
@@ -337,11 +344,16 @@ fn json_envelope(
         "report": report,
         "extension_count": report.extension_count(),
         "baseline": baseline.map(|(baseline, trust)| serde_json::json!({
-            "receipt_id": baseline.receipt_id,
-            "inventory_hash": baseline.inventory_hash,
+            "schema": baseline.schema,
+            "receipt_id": (*trust != BaselineTrust::SchemaUpgradeRequired)
+                .then_some(&baseline.receipt_id),
+            "inventory_hash": (*trust != BaselineTrust::SchemaUpgradeRequired)
+                .then_some(&baseline.inventory_hash),
             "format_version": baseline.format_version,
-            "coverage": baseline.coverage.token(),
-            "created_at": baseline.created_at,
+            "coverage": (*trust != BaselineTrust::SchemaUpgradeRequired)
+                .then_some(baseline.coverage.token()),
+            "created_at": (*trust != BaselineTrust::SchemaUpgradeRequired)
+                .then_some(&baseline.created_at),
             // A CHECKED statement. `signature.is_some()` said "signed" for a
             // stale signature that verified against nothing.
             "signed": *trust == BaselineTrust::Verified,
@@ -351,9 +363,14 @@ fn json_envelope(
         "drift_count": drifts.len(),
         // Null with no baseline: nothing was verified, so neither `true` nor
         // `false` is an honest answer.
-        "verify_complete": baseline.is_some().then(|| !verify_was_incomplete(report, true)),
+        "verify_complete": baseline.map(|(_, trust)| {
+            *trust != BaselineTrust::SchemaUpgradeRequired
+                && !verify_was_incomplete(report, true)
+        }),
         "baseline_written": written.map(|(path, document)| serde_json::json!({
             "path": path.display().to_string(),
+            "schema": document.schema,
+            "format_version": document.format_version,
             "receipt_id": document.receipt_id,
             "inventory_hash": document.inventory_hash,
             "signed": document.signature.is_some(),
@@ -405,14 +422,24 @@ fn print_human(
     match baseline {
         Some((baseline, trust)) => {
             println!();
-            println!(
-                "baseline {} (format v{}, coverage {}, signature {})",
-                &baseline.receipt_id[..baseline.receipt_id.len().min(16)],
-                baseline.format_version,
-                baseline.coverage.token(),
-                trust.token()
-            );
-            if baseline.coverage == AuditCoverage::Partial {
+            if *trust == BaselineTrust::SchemaUpgradeRequired {
+                println!(
+                    "baseline schema v{} / format v{} requires replacement (not trusted)",
+                    baseline.schema, baseline.format_version
+                );
+            } else {
+                println!(
+                    "baseline {} (schema v{}, format v{}, coverage {}, signature {})",
+                    &baseline.receipt_id[..baseline.receipt_id.len().min(16)],
+                    baseline.schema,
+                    baseline.format_version,
+                    baseline.coverage.token(),
+                    trust.token()
+                );
+            }
+            if *trust != BaselineTrust::SchemaUpgradeRequired
+                && baseline.coverage == AuditCoverage::Partial
+            {
                 println!(
                     "  the baseline itself was taken from a partial run, so absence of drift \
                      here does not prove absence of change"
@@ -470,11 +497,32 @@ fn print_browser(browser: &BrowserRecord) {
         }
         status => println!("{}: {}", browser.browser.token(), status.token()),
     }
+    for root in &browser.roots {
+        println!(
+            "  root {}/{}/{}: {}",
+            root.identity.family.token(),
+            root.identity.channel.token(),
+            root.identity.edition.token(),
+            root.status.token()
+        );
+    }
+    for gap in &browser.root_gaps {
+        println!(
+            "  root gap {}/{}/{}: {}",
+            gap.root.family.token(),
+            gap.root.channel.token(),
+            gap.root.edition.token(),
+            gap.kind.as_str()
+        );
+    }
 }
 
 fn print_profile(profile: &ProfileRecord) {
     println!(
-        "  profile {} ({}, install class from {})",
+        "  profile {}/{}/{}:{} ({}, install class from {})",
+        profile.identity.root.family.token(),
+        profile.identity.root.channel.token(),
+        profile.identity.root.edition.token(),
         sanitize_for_human_output(&profile.profile_directory, false),
         profile.profile_kind.token(),
         profile.install_class_source.token()
@@ -601,8 +649,10 @@ fn describe_drift(drift: &ExtensionDrift) -> String {
         .subject()
         .map(|subject| {
             format!(
-                "{}/{}/{}",
-                subject.browser.token(),
+                "{}/{}/{}/{}/{}",
+                subject.identity.profile.root.family.token(),
+                subject.identity.profile.root.channel.token(),
+                subject.identity.profile.root.edition.token(),
                 sanitize_for_human_output(&subject.profile_directory, false),
                 subject.extension_id
             )
@@ -610,9 +660,14 @@ fn describe_drift(drift: &ExtensionDrift) -> String {
         .unwrap_or_else(|| "<document>".to_string());
     let detail = match drift {
         ExtensionDrift::SchemaUpgradeRequired {
+            from_schema,
+            to_schema,
             from_version,
             to_version,
-        } => format!("baseline hashing format v{from_version} -> v{to_version}; re-take it"),
+        } => format!(
+            "baseline schema v{from_schema} -> v{to_schema}, hashing format v{from_version} -> \
+             v{to_version}; re-take it"
+        ),
         ExtensionDrift::New { version, .. } => {
             format!("v{}", sanitize_for_human_output(version, false))
         }

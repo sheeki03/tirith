@@ -73,6 +73,41 @@ jobs:
       - run: cat dist/coverage.json
 ";
 
+/// A named fork-reachable producer whose local action could contain the upload.
+const UNRESOLVED_PRODUCER: &str = "\
+name: CI
+on:
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/build
+";
+
+fn find_consumer(command: &str) -> String {
+    format!(
+        concat!(
+            "name: Deploy\n",
+            "on:\n",
+            "  workflow_run:\n",
+            "    workflows: [CI]\n",
+            "    types: [completed]\n",
+            "jobs:\n",
+            "  ship:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    steps:\n",
+            "      - uses: actions/download-artifact@v4\n",
+            "        with:\n",
+            "          name: build\n",
+            "          path: dist\n",
+            "          run-id: ${{{{ github.event.workflow_run.id }}}}\n",
+            "      - run: {command}\n",
+        ),
+        command = command,
+    )
+}
+
 fn workflows_dir(root: &Path) -> PathBuf {
     let dir = root.join(".github").join("workflows");
     fs::create_dir_all(&dir).expect("create .github/workflows");
@@ -176,6 +211,66 @@ fn benign_consumer_gets_no_chain_and_a_lowered_presence_trigger() {
         Severity::Medium,
         "full repository visibility with no proven chain lowers the presence rule"
     );
+}
+
+#[test]
+fn unresolved_named_producer_without_direct_upload_keeps_trigger_high() {
+    let tree = tempfile::tempdir().expect("tempdir");
+    let dir = workflows_dir(tree.path());
+    fs::write(dir.join("ci.yml"), UNRESOLVED_PRODUCER).expect("write producer");
+    fs::write(dir.join("deploy.yml"), BENIGN_CONSUMER).expect("write consumer");
+
+    let result = scan_tree(tree.path());
+    assert!(
+        findings_for(&result, RuleId::WorkflowArtifactPoisoning).is_empty(),
+        "missing producer visibility must not fabricate a chain"
+    );
+    let trigger = findings_for(&result, RuleId::WorkflowRunTrigger);
+    assert_eq!(trigger.len(), 1, "{trigger:?}");
+    assert_eq!(
+        trigger[0].1,
+        Severity::High,
+        "a bound local action may contain the producer upload"
+    );
+}
+
+#[test]
+fn find_exec_after_download_keeps_trigger_high() {
+    let tree = tempfile::tempdir().expect("tempdir");
+    let dir = workflows_dir(tree.path());
+    fs::write(dir.join("ci.yml"), PRODUCER).expect("write producer");
+    fs::write(
+        dir.join("deploy.yml"),
+        find_consumer("find dist -type f -exec sh {} +"),
+    )
+    .expect("write consumer");
+
+    let result = scan_tree(tree.path());
+    assert!(
+        findings_for(&result, RuleId::WorkflowArtifactPoisoning).is_empty(),
+        "an unmodelled find action is incomplete, not a fabricated chain"
+    );
+    let trigger = findings_for(&result, RuleId::WorkflowRunTrigger);
+    assert_eq!(trigger.len(), 1, "{trigger:?}");
+    assert_eq!(trigger[0].1, Severity::High);
+}
+
+#[test]
+fn read_only_find_after_download_remains_downgradable() {
+    let tree = tempfile::tempdir().expect("tempdir");
+    let dir = workflows_dir(tree.path());
+    fs::write(dir.join("ci.yml"), PRODUCER).expect("write producer");
+    fs::write(
+        dir.join("deploy.yml"),
+        find_consumer("find -L dist -maxdepth 2 -type f -print"),
+    )
+    .expect("write consumer");
+
+    let result = scan_tree(tree.path());
+    assert!(findings_for(&result, RuleId::WorkflowArtifactPoisoning).is_empty());
+    let trigger = findings_for(&result, RuleId::WorkflowRunTrigger);
+    assert_eq!(trigger.len(), 1, "{trigger:?}");
+    assert_eq!(trigger[0].1, Severity::Medium);
 }
 
 #[test]

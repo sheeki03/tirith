@@ -27,6 +27,10 @@
 //!   then re-open `proj/sub` by name, and a local attacker who turns `sub` into
 //!   a symlink to `~/.ssh` in between gets their credential store copied into
 //!   the tree the untrusted project is about to read;
+//! - on Windows the equivalent walk uses retained directory HANDLEs and
+//!   `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory` for every child;
+//!   enumeration is `NtQueryDirectoryFile` on that same handle and reparse
+//!   points are refused, so there is no pathname fallback on Windows;
 //! - no symlink is ever copied or followed: a symlink entry is a hard refusal,
 //!   not a skip, and a component swapped into a symlink after the entry scan
 //!   fails the `O_NOFOLLOW` open with `ELOOP` and is refused there too;
@@ -68,24 +72,26 @@
 //! along that path, so neither descriptors nor parent memory scale with a
 //! hostile tree's shape.
 //!
-//! # Inventory is deliberately tolerant, and says so
+//! # Stable capsule inventory and tolerant compatibility inventory
 //!
-//! [`inventory_project_tree`] runs over a tree the contained child may already
-//! have written to. It therefore records what it finds (including symlinks and
-//! special files, as typed markers) instead of refusing, and reports
-//! [`ProjectTree::complete`] `false` whenever a cap was hit or an entry could
-//! not be read. A receipt built on an incomplete inventory must never claim a
-//! faithful output digest.
+//! Capsule execution uses [`inventory_project_tree_stable`], a bounded two-pass
+//! retained-capability scan. Any membership, identity, type, exact mode, size,
+//! timestamp, or digest change is [`ProjectCopyError::ChangedDuringScan`], with
+//! no retry. [`inventory_project_tree`] remains the tolerant compatibility API
+//! used when inspecting an already-produced external tree; it marks incomplete
+//! observations rather than making a containment claim from them.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use sha2::Sha256;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::command_card::sha256_hex;
-#[cfg(not(unix))]
-use crate::util::OpenRegularError;
 use crate::util::{open_read_no_follow_capped, HashOutcome};
 
 /// Maximum number of files the preset will copy. Refuses past this; never
@@ -152,6 +158,10 @@ pub enum ProjectCopyError {
     Escape(String),
     /// The opened descriptor is not the inode the directory read observed.
     IdentityChanged(String),
+    /// The retained tree changed between, or during, either of the two bounded
+    /// passes. There is deliberately no retry: a tree that is being mutated is
+    /// not a stable input to an execution receipt.
+    ChangedDuringScan(String),
     /// The file-count cap was reached.
     FileCapExceeded,
     /// The total-entry cap was reached.
@@ -198,6 +208,10 @@ impl std::fmt::Display for ProjectCopyError {
             Self::IdentityChanged(rel) => write!(
                 f,
                 "project entry '{rel}' changed identity between the directory read and the open"
+            ),
+            Self::ChangedDuringScan(rel) => write!(
+                f,
+                "project entry '{rel}' changed during the two-pass stable-tree scan"
             ),
             Self::FileCapExceeded => write!(
                 f,
@@ -298,11 +312,22 @@ pub fn copy_project_tree(
     source: &Path,
     destination: &Path,
 ) -> Result<ProjectCopySummary, ProjectCopyError> {
-    let source_root = std::fs::canonicalize(source)
-        .map_err(|error| ProjectCopyError::Io(format!("resolve project root: {error}")))?;
+    copy_project_tree_excluding(source, destination, None)
+}
+
+/// Copy a project while excluding one exact, normalized relative file. The
+/// exclusion exists for an operator-requested receipt prepared inside the
+/// project before the scan; it never acts as a basename or prefix filter.
+pub fn copy_project_tree_excluding(
+    source: &Path,
+    destination: &Path,
+    excluded_relative: Option<&Path>,
+) -> Result<ProjectCopySummary, ProjectCopyError> {
+    let source_root = trusted_project_root(source)?;
     let destination_root = std::fs::canonicalize(destination).map_err(|error| {
         ProjectCopyError::Destination(format!("resolve copy destination: {error}"))
     })?;
+    let excluded_relative = normalize_exclusion(excluded_relative)?;
     let destination_metadata = std::fs::symlink_metadata(&destination_root)
         .map_err(|error| ProjectCopyError::Destination(format!("inspect destination: {error}")))?;
     if !destination_metadata.is_dir() {
@@ -333,7 +358,68 @@ pub fn copy_project_tree(
         ));
     }
 
-    copy_tree_impl(&source_root, &destination_root)
+    copy_tree_impl(
+        &source_root,
+        &destination_root,
+        excluded_relative.as_deref(),
+    )
+}
+
+fn normalize_exclusion(excluded: Option<&Path>) -> Result<Option<String>, ProjectCopyError> {
+    let Some(excluded) = excluded else {
+        return Ok(None);
+    };
+    if excluded.is_absolute() {
+        return Err(ProjectCopyError::Io(
+            "receipt exclusion must be relative to the project root".to_string(),
+        ));
+    }
+    let mut components = Vec::new();
+    for component in excluded.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                let Some(name) = name.to_str() else {
+                    return Err(ProjectCopyError::NameNotUtf8(
+                        "receipt exclusion".to_string(),
+                    ));
+                };
+                reject_unsafe_name(name, "receipt exclusion")?;
+                components.push(name);
+            }
+            _ => {
+                return Err(ProjectCopyError::UnsafeName(
+                    "receipt exclusion".to_string(),
+                ))
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(ProjectCopyError::UnsafeName(
+            "receipt exclusion".to_string(),
+        ));
+    }
+    Ok(Some(components.join("/")))
+}
+
+/// Resolve only the one platform alias Tirith explicitly trusts. All actual
+/// tree traversal still starts from a retained no-follow root capability.
+fn trusted_project_root(source: &Path) -> Result<PathBuf, ProjectCopyError> {
+    let absolute = if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| ProjectCopyError::Io(format!("resolve current directory: {error}")))?
+            .join(source)
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let var = Path::new("/var");
+        if absolute == var || absolute.starts_with(var) {
+            let suffix = absolute.strip_prefix(var).unwrap_or(Path::new(""));
+            return Ok(Path::new("/private/var").join(suffix));
+        }
+    }
+    Ok(absolute)
 }
 
 /// The fd-relative copy. Every traversal step is `openat`/`fstatat`/`mkdirat`
@@ -348,8 +434,14 @@ pub fn copy_project_tree(
 fn copy_tree_impl(
     source_root: &Path,
     destination_root: &Path,
+    excluded_relative: Option<&str>,
 ) -> Result<ProjectCopySummary, ProjectCopyError> {
-    copy_tree_impl_observed(source_root, destination_root, &mut |_| {})
+    copy_tree_impl_observed_excluding(
+        source_root,
+        destination_root,
+        excluded_relative,
+        &mut |_| {},
+    )
 }
 
 /// One directory of the walk, holding its two descriptors and the entry names
@@ -364,31 +456,237 @@ struct CopyLevel {
     destination: std::os::fd::OwnedFd,
     names: std::vec::IntoIter<std::ffi::OsString>,
     collision_keys: BTreeSet<String>,
+    opened: StableEntry,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StableEntry {
+    kind: u8,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanos: i64,
+    changed_seconds: i64,
+    changed_nanos: i64,
+    digest: Option<String>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StableSnapshot {
+    root: StableEntry,
+    entries: BTreeMap<String, StableEntry>,
+    summary: ProjectCopySummary,
+}
+
+#[cfg(unix)]
+struct ScanLevel {
+    relative: String,
+    depth: usize,
+    source: std::os::fd::OwnedFd,
+    names: std::vec::IntoIter<std::ffi::OsString>,
+    collision_keys: BTreeSet<String>,
+    opened: StableEntry,
+}
+
+#[cfg(all(any(unix, windows), test))]
+thread_local! {
+    static BETWEEN_STABLE_PASSES_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(any(unix, windows))]
+fn run_between_stable_passes_hook() {
+    #[cfg(test)]
+    BETWEEN_STABLE_PASSES_HOOK.with(|slot| {
+        if let Some(mut hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(unix)]
+fn first_stable_pass(
+    source_root: &std::os::fd::OwnedFd,
+    excluded_relative: Option<&str>,
+) -> Result<StableSnapshot, ProjectCopyError> {
+    use std::os::fd::AsRawFd as _;
+
+    let root = fd::stable_directory_facts(source_root, "")?;
+    let root_device = root.device;
+    let root_names = fd::read_entry_names(source_root, MAX_PROJECT_ENTRIES, "")?;
+    let mut entries_seen = root_names.len();
+    let mut entries = BTreeMap::new();
+    let mut summary = ProjectCopySummary {
+        file_count: 0,
+        directory_count: 0,
+        total_bytes: 0,
+    };
+    let mut stack = vec![ScanLevel {
+        relative: String::new(),
+        depth: 0,
+        source: source_root.try_clone().map_err(|error| {
+            ProjectCopyError::Io(format!("retain project root for stable scan: {error}"))
+        })?,
+        names: root_names.into_iter(),
+        collision_keys: BTreeSet::new(),
+        opened: root.clone(),
+    }];
+
+    while let Some(index) = stack.len().checked_sub(1) {
+        let Some(raw_name) = stack[index].names.next() else {
+            let level = stack.pop().expect("indexed level exists");
+            let closed = fd::stable_directory_facts(&level.source, &level.relative)?;
+            if closed != level.opened {
+                return Err(ProjectCopyError::ChangedDuringScan(display_relative(
+                    &level.relative,
+                )));
+            }
+            continue;
+        };
+        let relative_dir = stack[index].relative.clone();
+        let depth = stack[index].depth;
+        let source_dir = stack[index].source.as_raw_fd();
+        let Some(name) = raw_name.to_str() else {
+            return Err(ProjectCopyError::NameNotUtf8(display_relative(
+                &relative_dir,
+            )));
+        };
+        let relative = push_relative(&relative_dir, name);
+        reject_unsafe_name(name, &relative)?;
+        if name == EXCLUDED_NAME || excluded_relative == Some(relative.as_str()) {
+            continue;
+        }
+        if !stack[index].collision_keys.insert(collision_key(name)) {
+            return Err(ProjectCopyError::NameCollision(display_relative(
+                &relative_dir,
+            )));
+        }
+        let component = std::ffi::CString::new(name)
+            .map_err(|_| ProjectCopyError::UnsafeName(relative.clone()))?;
+        let observed = fd::stat_at(source_dir, &component).map_err(|error| {
+            ProjectCopyError::Io(format!("inspect project entry '{relative}': {error}"))
+        })?;
+        if u64::try_from(observed.st_dev).unwrap_or(u64::MAX) != root_device {
+            return Err(ProjectCopyError::Escape(relative));
+        }
+        let kind = observed.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFLNK {
+            return Err(ProjectCopyError::Symlink(relative));
+        }
+        if kind == libc::S_IFDIR {
+            if depth + 1 > MAX_PROJECT_DEPTH {
+                return Err(ProjectCopyError::DepthCapExceeded(relative));
+            }
+            let child = fd::open_directory_at(source_dir, &component)
+                .map_err(|_| ProjectCopyError::ChangedDuringScan(relative.clone()))?;
+            let facts = fd::stable_directory_facts(&child, &relative)?;
+            if facts.device != u64::try_from(observed.st_dev).unwrap_or(u64::MAX)
+                || facts.inode != observed.st_ino
+            {
+                return Err(ProjectCopyError::ChangedDuringScan(relative));
+            }
+            let names = fd::read_entry_names(
+                &child,
+                MAX_PROJECT_ENTRIES.saturating_sub(entries_seen),
+                &relative,
+            )?;
+            entries_seen += names.len();
+            entries.insert(relative.clone(), facts.clone());
+            summary.directory_count += 1;
+            stack.push(ScanLevel {
+                relative,
+                depth: depth + 1,
+                source: child,
+                names: names.into_iter(),
+                collision_keys: BTreeSet::new(),
+                opened: facts,
+            });
+            continue;
+        }
+        if kind != libc::S_IFREG {
+            return Err(ProjectCopyError::UnsupportedEntry(relative));
+        }
+        if summary.file_count >= MAX_PROJECT_FILES {
+            return Err(ProjectCopyError::FileCapExceeded);
+        }
+        let remaining = MAX_PROJECT_BYTES.saturating_sub(summary.total_bytes);
+        let facts = fd::hash_file_at(source_dir, &component, &observed, &relative, remaining)?;
+        summary.file_count += 1;
+        summary.total_bytes = summary.total_bytes.saturating_add(facts.size);
+        entries.insert(relative, facts);
+    }
+    let root_after = fd::stable_directory_facts(source_root, "")?;
+    if root_after != root {
+        return Err(ProjectCopyError::ChangedDuringScan(".".to_string()));
+    }
+    Ok(StableSnapshot {
+        root,
+        entries,
+        summary,
+    })
 }
 
 /// The walk, with an observer that is handed the number of RETAINED levels after
 /// every descent. The retained-descriptor bound is a security-relevant resource
 /// property (a copy that dies on `RLIMIT_NOFILE` is a refusal an attacker can
 /// force), so it is made observable rather than argued about.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn copy_tree_impl_observed(
     source_root: &Path,
     destination_root: &Path,
     observer: &mut dyn FnMut(usize),
 ) -> Result<ProjectCopySummary, ProjectCopyError> {
+    copy_tree_impl_observed_excluding(source_root, destination_root, None, observer)
+}
+
+#[cfg(unix)]
+fn copy_tree_impl_observed_excluding(
+    source_root: &Path,
+    destination_root: &Path,
+    excluded_relative: Option<&str>,
+    observer: &mut dyn FnMut(usize),
+) -> Result<ProjectCopySummary, ProjectCopyError> {
     use std::os::fd::AsRawFd as _;
 
-    let source_fd = fd::open_directory(source_root)
+    let source_fd = fd::open_directory_tree(source_root)
         .map_err(|error| ProjectCopyError::Io(format!("open project root: {error}")))?;
-    let destination_fd = fd::open_directory(destination_root).map_err(|error| {
+    let destination_fd = fd::open_directory_tree(destination_root).map_err(|error| {
         ProjectCopyError::Destination(format!("open copy destination: {error}"))
     })?;
+    if !fd::read_entry_names(&destination_fd, 1, "")?.is_empty() {
+        return Err(ProjectCopyError::Destination(
+            "retained destination is not empty".to_string(),
+        ));
+    }
+    let source_identity_fd = source_fd
+        .try_clone()
+        .map_err(|error| ProjectCopyError::Io(format!("retain project root identity: {error}")))?;
+    let destination_identity_fd = destination_fd.try_clone().map_err(|error| {
+        ProjectCopyError::Destination(format!("retain copy destination identity: {error}"))
+    })?;
+    let source_identity = fd::stable_directory_facts(&source_fd, "")?;
+    let destination_identity = fd::stable_directory_facts(&destination_fd, "")?;
+    if source_identity.device == destination_identity.device
+        && source_identity.inode == destination_identity.inode
+    {
+        return Err(ProjectCopyError::Destination(
+            "destination is the retained project root itself".to_string(),
+        ));
+    }
     // Every entry must live on this device. A filesystem mounted inside the
     // project is not part of the project the operator named, and refusing it
     // also refuses the one shape a same-device hardlink cannot take.
-    let root_device = fd::stat_fd(source_fd.as_raw_fd())
-        .map_err(|error| ProjectCopyError::Io(format!("inspect project root: {error}")))?
-        .st_dev;
+    let first = first_stable_pass(&source_fd, excluded_relative)?;
+    run_between_stable_passes_hook();
+    if !fd::visible_directory_matches(source_root, &source_fd)? {
+        return Err(ProjectCopyError::ChangedDuringScan(".".to_string()));
+    }
+    let root_device = first.root.device;
 
     let mut summary = ProjectCopySummary {
         file_count: 0,
@@ -396,6 +694,7 @@ fn copy_tree_impl_observed(
         total_bytes: 0,
     };
     let mut entries_seen = 0usize;
+    let mut second_entries = BTreeMap::new();
     let root_names = fd::read_entry_names(&source_fd, MAX_PROJECT_ENTRIES, "")?;
     entries_seen += root_names.len();
     // Iterative, so a pathological tree cannot blow the stack before the depth
@@ -408,11 +707,18 @@ fn copy_tree_impl_observed(
         destination: destination_fd,
         names: root_names.into_iter(),
         collision_keys: BTreeSet::new(),
+        opened: first.root.clone(),
     }];
 
     while let Some(index) = stack.len().checked_sub(1) {
         let Some(raw_name) = stack[index].names.next() else {
-            stack.pop();
+            let level = stack.pop().expect("indexed level exists");
+            let closed = fd::stable_directory_facts(&level.source, &level.relative)?;
+            if closed != level.opened {
+                return Err(ProjectCopyError::ChangedDuringScan(display_relative(
+                    &level.relative,
+                )));
+            }
             continue;
         };
         let relative_dir = stack[index].relative.clone();
@@ -426,7 +732,7 @@ fn copy_tree_impl_observed(
         };
         let relative = push_relative(&relative_dir, name);
         reject_unsafe_name(name, &relative)?;
-        if name == EXCLUDED_NAME {
+        if name == EXCLUDED_NAME || excluded_relative == Some(relative.as_str()) {
             continue;
         }
         if !stack[index].collision_keys.insert(collision_key(name)) {
@@ -440,7 +746,7 @@ fn copy_tree_impl_observed(
         let observed = fd::stat_at(source_dir, &component).map_err(|error| {
             ProjectCopyError::Io(format!("inspect project entry '{relative}': {error}"))
         })?;
-        if observed.st_dev != root_device {
+        if u64::try_from(observed.st_dev).unwrap_or(u64::MAX) != root_device {
             return Err(ProjectCopyError::Escape(relative));
         }
         let kind = observed.st_mode & libc::S_IFMT;
@@ -451,18 +757,15 @@ fn copy_tree_impl_observed(
             if depth + 1 > MAX_PROJECT_DEPTH {
                 return Err(ProjectCopyError::DepthCapExceeded(relative));
             }
-            let child_source = fd::open_directory_at(source_dir, &component).map_err(|error| {
-                ProjectCopyError::Io(format!("open project directory '{relative}': {error}"))
-            })?;
+            let child_source = fd::open_directory_at(source_dir, &component)
+                .map_err(|_| ProjectCopyError::ChangedDuringScan(relative.clone()))?;
             // The descriptor we will actually traverse must be the inode the
             // entry scan saw, or the name was swapped between the two calls.
-            let opened = fd::stat_fd(child_source.as_raw_fd()).map_err(|error| {
-                ProjectCopyError::Io(format!(
-                    "inspect opened project directory '{relative}': {error}"
-                ))
-            })?;
-            if opened.st_dev != observed.st_dev || opened.st_ino != observed.st_ino {
-                return Err(ProjectCopyError::IdentityChanged(relative));
+            let opened = fd::stable_directory_facts(&child_source, &relative)?;
+            if opened.device != u64::try_from(observed.st_dev).unwrap_or(u64::MAX)
+                || opened.inode != observed.st_ino
+            {
+                return Err(ProjectCopyError::ChangedDuringScan(relative));
             }
             let child_names = fd::read_entry_names(
                 &child_source,
@@ -476,6 +779,7 @@ fn copy_tree_impl_observed(
                     ProjectCopyError::Io(format!("open copied directory '{relative}': {error}"))
                 })?;
             summary.directory_count += 1;
+            second_entries.insert(relative.clone(), opened.clone());
             stack.push(CopyLevel {
                 relative,
                 depth: depth + 1,
@@ -483,6 +787,7 @@ fn copy_tree_impl_observed(
                 destination: child_destination,
                 names: child_names.into_iter(),
                 collision_keys: BTreeSet::new(),
+                opened,
             });
             observer(stack.len());
             continue;
@@ -495,7 +800,7 @@ fn copy_tree_impl_observed(
             return Err(ProjectCopyError::FileCapExceeded);
         }
         let remaining = MAX_PROJECT_BYTES.saturating_sub(summary.total_bytes);
-        let copied = fd::copy_file_at(
+        let copied = fd::copy_file_at_stable(
             source_dir,
             destination_dir,
             &component,
@@ -504,132 +809,43 @@ fn copy_tree_impl_observed(
             remaining,
         )?;
         summary.file_count += 1;
-        summary.total_bytes = summary.total_bytes.saturating_add(copied);
+        summary.total_bytes = summary.total_bytes.saturating_add(copied.size);
+        second_entries.insert(relative, copied);
+    }
+    let root_after = fd::stable_directory_facts(&source_identity_fd, "")?;
+    if root_after != first.root
+        || second_entries != first.entries
+        || summary != first.summary
+        || !fd::visible_directory_matches(source_root, &source_identity_fd)?
+        || !fd::visible_directory_matches(destination_root, &destination_identity_fd)?
+    {
+        return Err(ProjectCopyError::ChangedDuringScan(".".to_string()));
     }
     Ok(summary)
 }
 
-/// Pathname-based fallback for targets without `openat`.
-///
-/// Stated plainly: this retains a directory-swap race that the unix walk above
-/// does not have, because each directory is re-resolved by name between the
-/// check and the read. It exists so `tirith-core` compiles everywhere; the
-/// preset itself refuses to launch on any non-Linux host, so no contained run
-/// ever depends on it.
-#[cfg(not(unix))]
+/// Windows uses the same two-pass algorithm over NT RootDirectory-relative
+/// handles. No checked pathname is re-opened during either pass.
+#[cfg(windows)]
 fn copy_tree_impl(
     source_root: &Path,
     destination_root: &Path,
+    excluded_relative: Option<&str>,
 ) -> Result<ProjectCopySummary, ProjectCopyError> {
-    let mut summary = ProjectCopySummary {
-        file_count: 0,
-        directory_count: 0,
-        total_bytes: 0,
-    };
-    let mut pending: Vec<(String, usize)> = vec![(String::new(), 0)];
-    while let Some((relative_dir, depth)) = pending.pop() {
-        let source_dir = join_relative(source_root, &relative_dir);
-        let destination_dir = join_relative(destination_root, &relative_dir);
-        let mut collision_keys: BTreeSet<String> = BTreeSet::new();
-        let reader = std::fs::read_dir(&source_dir).map_err(|error| {
-            ProjectCopyError::Io(format!("read project directory '{relative_dir}': {error}"))
-        })?;
-        for entry in reader {
-            let entry = entry.map_err(|error| {
-                ProjectCopyError::Io(format!("read project entry in '{relative_dir}': {error}"))
-            })?;
-            let raw_name = entry.file_name();
-            let Some(name) = raw_name.to_str() else {
-                return Err(ProjectCopyError::NameNotUtf8(display_relative(
-                    &relative_dir,
-                )));
-            };
-            let relative = push_relative(&relative_dir, name);
-            reject_unsafe_name(name, &relative)?;
-            if name == EXCLUDED_NAME {
-                continue;
-            }
-            if !collision_keys.insert(collision_key(name)) {
-                return Err(ProjectCopyError::NameCollision(display_relative(
-                    &relative_dir,
-                )));
-            }
-
-            let source_path = source_dir.join(name);
-            let metadata = std::fs::symlink_metadata(&source_path).map_err(|error| {
-                ProjectCopyError::Io(format!("inspect project entry '{relative}': {error}"))
-            })?;
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
-                return Err(ProjectCopyError::Symlink(relative));
-            }
-            if file_type.is_dir() {
-                if depth + 1 > MAX_PROJECT_DEPTH {
-                    return Err(ProjectCopyError::DepthCapExceeded(relative));
-                }
-                if !crate::util::canonical_within(&source_path, source_root) {
-                    return Err(ProjectCopyError::Escape(relative));
-                }
-                create_private_directory(&destination_dir.join(name), &relative)?;
-                summary.directory_count += 1;
-                pending.push((relative, depth + 1));
-                continue;
-            }
-            if !file_type.is_file() {
-                return Err(ProjectCopyError::UnsupportedEntry(relative));
-            }
-
-            if summary.file_count >= MAX_PROJECT_FILES {
-                return Err(ProjectCopyError::FileCapExceeded);
-            }
-            let remaining = MAX_PROJECT_BYTES.saturating_sub(summary.total_bytes);
-            let copied = copy_one_file(
-                &source_path,
-                &destination_dir.join(name),
-                &relative,
-                remaining,
-            )?;
-            summary.file_count += 1;
-            summary.total_bytes = summary.total_bytes.saturating_add(copied);
-        }
-    }
-    Ok(summary)
+    windows_capability::copy_stable(source_root, destination_root, excluded_relative)
 }
 
-/// Copy one already-`symlink_metadata`-checked regular file by pathname. Used
-/// only by the non-unix fallback walk.
-#[cfg(not(unix))]
-fn copy_one_file(
-    source_path: &Path,
-    destination_path: &Path,
-    relative: &str,
-    remaining_bytes: u64,
-) -> Result<u64, ProjectCopyError> {
-    use std::io::Read as _;
-
-    let source_file =
-        open_read_no_follow_capped(source_path, remaining_bytes).map_err(|error| match error {
-            OpenRegularError::TooLarge => ProjectCopyError::ByteCapExceeded,
-            OpenRegularError::NotRegularFile => {
-                ProjectCopyError::UnsupportedEntry(relative.to_string())
-            }
-            OpenRegularError::NotFound => ProjectCopyError::IdentityChanged(relative.to_string()),
-            OpenRegularError::Io(io) => {
-                ProjectCopyError::Io(format!("open project file '{relative}': {io}"))
-            }
-        })?;
-    let mut destination_file = create_private_file(destination_path, relative)?;
-    // `remaining + 1` so a file that GREW past the budget between the post-open
-    // fstat and the read is caught here rather than copied unbounded.
-    let copied = std::io::copy(
-        &mut source_file.take(remaining_bytes.saturating_add(1)),
-        &mut destination_file,
-    )
-    .map_err(|error| ProjectCopyError::Io(format!("copy project file '{relative}': {error}")))?;
-    if copied > remaining_bytes {
-        return Err(ProjectCopyError::ByteCapExceeded);
-    }
-    Ok(copied)
+/// Unsupported targets fail closed rather than silently regressing to a
+/// pathname walk.
+#[cfg(not(any(unix, windows)))]
+fn copy_tree_impl(
+    _source_root: &Path,
+    _destination_root: &Path,
+    _excluded_relative: Option<&str>,
+) -> Result<ProjectCopySummary, ProjectCopyError> {
+    Err(ProjectCopyError::Io(
+        "stable project traversal is unavailable on this platform".to_string(),
+    ))
 }
 
 /// The `openat` family the unix walk is built from. Every helper takes a
@@ -640,8 +856,9 @@ fn copy_one_file(
 mod fd {
     use std::ffi::CStr;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::fs::MetadataExt as _;
 
-    use super::{ProjectCopyError, MAX_PROJECT_BYTES};
+    use super::{ProjectCopyError, StableEntry};
 
     const DIRECTORY_FLAGS: libc::c_int =
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
@@ -662,6 +879,93 @@ mod fd {
         }
         // SAFETY: open returned a fresh owned descriptor.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Traverse an absolute root one component at a time. This is the root
+    /// analogue of `open_directory_at`: intermediate symlinks are refused too,
+    /// rather than being followed by one pathname `open`.
+    pub(super) fn open_directory_tree(path: &std::path::Path) -> std::io::Result<OwnedFd> {
+        use std::path::Component;
+
+        if !path.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "project capability root is not absolute",
+            ));
+        }
+        let mut held = open_directory(std::path::Path::new("/"))?;
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "project path contains an interior NUL",
+                        )
+                    })?;
+                    held = open_directory_at(held.as_raw_fd(), &name)?;
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "project path is not lexically normalized",
+                    ))
+                }
+            }
+        }
+        Ok(held)
+    }
+
+    pub(super) fn visible_directory_matches(
+        path: &std::path::Path,
+        held: &OwnedFd,
+    ) -> Result<bool, ProjectCopyError> {
+        let visible = match open_directory_tree(path) {
+            Ok(visible) => visible,
+            Err(_) => return Ok(false),
+        };
+        let visible = stable_directory_facts(&visible, "")?;
+        let held = stable_directory_facts(held, "")?;
+        Ok(visible.device == held.device && visible.inode == held.inode)
+    }
+
+    fn stable_metadata(metadata: &std::fs::Metadata, kind: u8) -> StableEntry {
+        StableEntry {
+            kind,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanos: metadata.ctime_nsec(),
+            digest: None,
+        }
+    }
+
+    pub(super) fn stable_directory_facts(
+        directory: &OwnedFd,
+        relative: &str,
+    ) -> Result<StableEntry, ProjectCopyError> {
+        let file: std::fs::File = directory
+            .try_clone()
+            .map_err(|error| {
+                ProjectCopyError::Io(format!("retain project directory '{relative}': {error}"))
+            })?
+            .into();
+        let metadata = file.metadata().map_err(|error| {
+            ProjectCopyError::Io(format!("inspect project directory '{relative}': {error}"))
+        })?;
+        if !metadata.is_dir() {
+            return Err(ProjectCopyError::ChangedDuringScan(
+                super::display_relative(relative),
+            ));
+        }
+        Ok(stable_metadata(&metadata, b'd'))
     }
 
     pub(super) fn open_directory_at(parent: i32, name: &CStr) -> std::io::Result<OwnedFd> {
@@ -694,16 +998,6 @@ mod fd {
         Ok(unsafe { buffer.assume_init() })
     }
 
-    pub(super) fn stat_fd(fd: i32) -> std::io::Result<libc::stat> {
-        let mut buffer = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: `fd` is live and the output buffer is writable for the call.
-        if unsafe { libc::fstat(fd, buffer.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: fstat initialized the structure on success.
-        Ok(unsafe { buffer.assume_init() })
-    }
-
     /// Create the copied directory owner-only. `EEXIST` is reported as a
     /// collision rather than an I/O fault: on a case-insensitive destination it
     /// is exactly how two distinct source names try to become one entry.
@@ -720,6 +1014,46 @@ mod fd {
             } else {
                 ProjectCopyError::Io(format!("create copied directory '{relative}': {error}"))
             });
+        }
+        // mkdirat is subject to the process umask. With a restrictive umask the
+        // new directory can therefore be mode 000, which cannot be opened for
+        // the retained traversal below. Establish owner access relative to the
+        // already-held parent before opening it. AT_SYMLINK_NOFOLLOW is
+        // essential: if the just-created name is exchanged, chmod must never
+        // reach through an attacker-provided symlink.
+        let created = stat_at(parent, name).map_err(|error| {
+            ProjectCopyError::Io(format!(
+                "inspect copied directory '{relative}' before securing it: {error}"
+            ))
+        })?;
+        if created.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(ProjectCopyError::ChangedDuringScan(relative.to_string()));
+        }
+        // SAFETY: `parent` is retained, `name` is one NUL-terminated component,
+        // and AT_SYMLINK_NOFOLLOW prevents a replacement symlink from being
+        // traversed.
+        if unsafe { libc::fchmodat(parent, name.as_ptr(), 0o700, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(ProjectCopyError::Io(format!(
+                "secure copied directory '{relative}' before opening it: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let directory = open_directory_at(parent, name).map_err(|error| {
+            ProjectCopyError::Io(format!("open copied directory '{relative}': {error}"))
+        })?;
+        let opened = stable_directory_facts(&directory, relative)?;
+        if opened.device != u64::try_from(created.st_dev).unwrap_or(u64::MAX)
+            || opened.inode != created.st_ino
+        {
+            return Err(ProjectCopyError::ChangedDuringScan(relative.to_string()));
+        }
+        // umask may clear requested bits. The copy contract is exact 0700, so
+        // establish it on the opened directory capability before descent.
+        if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+            return Err(ProjectCopyError::Io(format!(
+                "secure copied directory '{relative}': {}",
+                std::io::Error::last_os_error()
+            )));
         }
         Ok(())
     }
@@ -739,8 +1073,12 @@ mod fd {
         use std::os::unix::ffi::OsStrExt as _;
 
         let read = || -> std::io::Result<Result<Vec<std::ffi::OsString>, ()>> {
-            let duplicated = directory.try_clone()?;
-            let mut stream = DirStream::adopt(duplicated)?;
+            let dot = c".";
+            // `dup` shares a directory offset. Opening `.` relative to the held
+            // directory creates an independent stream for each pass without
+            // re-resolving any path component.
+            let independent = open_directory_at(directory.as_raw_fd(), dot)?;
+            let mut stream = DirStream::adopt(independent)?;
             let mut names = Vec::new();
             loop {
                 match stream.next_name()? {
@@ -770,6 +1108,7 @@ mod fd {
     }
 
     /// Copy one regular file between two retained directory capabilities.
+    #[cfg(test)]
     pub(super) fn copy_file_at(
         source_parent: i32,
         destination_parent: i32,
@@ -778,7 +1117,62 @@ mod fd {
         relative: &str,
         remaining_bytes: u64,
     ) -> Result<u64, ProjectCopyError> {
-        use std::io::Read as _;
+        copy_file_at_stable(
+            source_parent,
+            destination_parent,
+            name,
+            observed,
+            relative,
+            remaining_bytes,
+        )
+        .map(|facts| facts.size)
+    }
+
+    pub(super) fn hash_file_at(
+        source_parent: i32,
+        name: &CStr,
+        observed: &libc::stat,
+        relative: &str,
+        remaining_bytes: u64,
+    ) -> Result<StableEntry, ProjectCopyError> {
+        read_file_at_stable(
+            source_parent,
+            None,
+            name,
+            observed,
+            relative,
+            remaining_bytes,
+        )
+    }
+
+    pub(super) fn copy_file_at_stable(
+        source_parent: i32,
+        destination_parent: i32,
+        name: &CStr,
+        observed: &libc::stat,
+        relative: &str,
+        remaining_bytes: u64,
+    ) -> Result<StableEntry, ProjectCopyError> {
+        read_file_at_stable(
+            source_parent,
+            Some(destination_parent),
+            name,
+            observed,
+            relative,
+            remaining_bytes,
+        )
+    }
+
+    fn read_file_at_stable(
+        source_parent: i32,
+        destination_parent: Option<i32>,
+        name: &CStr,
+        observed: &libc::stat,
+        relative: &str,
+        remaining_bytes: u64,
+    ) -> Result<StableEntry, ProjectCopyError> {
+        use sha2::Digest as _;
+        use std::io::{Read as _, Write as _};
 
         // `O_NONBLOCK` so a fifo planted at this name returns immediately
         // instead of blocking on a writer; the post-open `fstat` then refuses it.
@@ -789,69 +1183,130 @@ mod fd {
             let error = std::io::Error::last_os_error();
             return Err(match error.raw_os_error() {
                 // A component swapped into a symlink after the entry scan.
-                Some(libc::ELOOP) => ProjectCopyError::Symlink(relative.to_string()),
-                Some(libc::ENOENT) => ProjectCopyError::IdentityChanged(relative.to_string()),
+                Some(libc::ELOOP) => ProjectCopyError::ChangedDuringScan(relative.to_string()),
+                Some(libc::ENOENT) => ProjectCopyError::ChangedDuringScan(relative.to_string()),
                 _ => ProjectCopyError::Io(format!("open project file '{relative}': {error}")),
             });
         }
         // SAFETY: openat returned a fresh owned descriptor.
-        let source_file = unsafe { std::fs::File::from_raw_fd(raw) };
-        let opened = stat_fd(source_file.as_raw_fd()).map_err(|error| {
+        let mut source_file = unsafe { std::fs::File::from_raw_fd(raw) };
+        let metadata = source_file.metadata().map_err(|error| {
             ProjectCopyError::Io(format!("inspect opened project file '{relative}': {error}"))
         })?;
-        if opened.st_mode & libc::S_IFMT != libc::S_IFREG {
-            return Err(ProjectCopyError::UnsupportedEntry(relative.to_string()));
+        let mut opened = stable_metadata(&metadata, b'f');
+        if !metadata.is_file() {
+            return Err(ProjectCopyError::ChangedDuringScan(relative.to_string()));
         }
-        if opened.st_dev != observed.st_dev || opened.st_ino != observed.st_ino {
-            return Err(ProjectCopyError::IdentityChanged(relative.to_string()));
+        if opened.device != u64::try_from(observed.st_dev).unwrap_or(u64::MAX)
+            || opened.inode != observed.st_ino
+        {
+            return Err(ProjectCopyError::ChangedDuringScan(relative.to_string()));
         }
         // Read from the OPENED inode, so the count cannot be raced after the
         // entry scan. A second link means this content is also reachable under a
         // name the walk never saw, which for a project that arrived from a
         // stranger is the operator's own credential store as often as not.
-        if opened.st_nlink > 1 {
+        if opened.links > 1 {
             return Err(ProjectCopyError::HardLink(relative.to_string()));
         }
-        let size = u64::try_from(opened.st_size).unwrap_or(MAX_PROJECT_BYTES);
+        let size = opened.size;
         if size > remaining_bytes {
             return Err(ProjectCopyError::ByteCapExceeded);
         }
 
-        let create_flags =
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        // SAFETY: the destination parent is live and `name` is a component.
-        let raw = unsafe {
-            libc::openat(
-                destination_parent,
-                name.as_ptr(),
-                create_flags,
-                0o600 as libc::c_uint,
-            )
-        };
-        if raw < 0 {
-            let error = std::io::Error::last_os_error();
-            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
-                ProjectCopyError::NameCollision(relative.to_string())
+        let mut destination_file = if let Some(destination_parent) = destination_parent {
+            let create_flags =
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            // SAFETY: the destination parent is live and `name` is a component.
+            let raw = unsafe {
+                libc::openat(
+                    destination_parent,
+                    name.as_ptr(),
+                    create_flags,
+                    0o600 as libc::c_uint,
+                )
+            };
+            if raw < 0 {
+                let error = std::io::Error::last_os_error();
+                return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    ProjectCopyError::NameCollision(relative.to_string())
+                } else {
+                    ProjectCopyError::Io(format!("create copied file '{relative}': {error}"))
+                });
+            }
+            // SAFETY: openat returned a fresh owned descriptor.
+            let file = unsafe { std::fs::File::from_raw_fd(raw) };
+            let mode = if opened.mode & 0o111 != 0 {
+                0o700
             } else {
-                ProjectCopyError::Io(format!("create copied file '{relative}': {error}"))
-            });
-        }
-        // SAFETY: openat returned a fresh owned descriptor.
-        let mut destination_file = unsafe { std::fs::File::from_raw_fd(raw) };
+                0o600
+            };
+            // Source executable intent comes from this exact opened handle.
+            // fchmod happens before any untrusted child can observe the tree.
+            if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: retained parent + component, and this function alone
+                // created the entry with O_EXCL.
+                unsafe { libc::unlinkat(destination_parent, name.as_ptr(), 0) };
+                return Err(ProjectCopyError::Io(format!(
+                    "secure copied file '{relative}': {error}"
+                )));
+            }
+            Some((destination_parent, file))
+        } else {
+            None
+        };
 
-        // `remaining + 1` so a file that GREW past the budget between the
-        // post-open fstat and the read is caught here, not copied unbounded.
-        let copied = std::io::copy(
-            &mut source_file.take(remaining_bytes.saturating_add(1)),
-            &mut destination_file,
-        )
-        .map_err(|error| {
-            ProjectCopyError::Io(format!("copy project file '{relative}': {error}"))
-        })?;
-        if copied > remaining_bytes {
-            return Err(ProjectCopyError::ByteCapExceeded);
+        let mut hasher = super::Sha256::new();
+        let mut copied = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = source_file.read(&mut buffer).map_err(|error| {
+                ProjectCopyError::Io(format!("read project file '{relative}': {error}"))
+            })?;
+            if read == 0 {
+                break;
+            }
+            copied = copied.saturating_add(read as u64);
+            if copied > remaining_bytes {
+                if let Some((parent, _)) = destination_file.take() {
+                    // SAFETY: retained parent + component.
+                    unsafe { libc::unlinkat(parent, name.as_ptr(), 0) };
+                }
+                return Err(ProjectCopyError::ByteCapExceeded);
+            }
+            hasher.update(&buffer[..read]);
+            if let Some((_, file)) = destination_file.as_mut() {
+                file.write_all(&buffer[..read]).map_err(|error| {
+                    ProjectCopyError::Io(format!("copy project file '{relative}': {error}"))
+                })?;
+            }
         }
-        Ok(copied)
+        if copied != size {
+            if let Some((parent, _)) = destination_file.take() {
+                // SAFETY: retained parent + component.
+                unsafe { libc::unlinkat(parent, name.as_ptr(), 0) };
+            }
+            return Err(ProjectCopyError::ChangedDuringScan(relative.to_string()));
+        }
+        let after_metadata = source_file.metadata().map_err(|error| {
+            ProjectCopyError::Io(format!("reinspect project file '{relative}': {error}"))
+        })?;
+        let after = stable_metadata(&after_metadata, b'f');
+        if after != opened {
+            if let Some((parent, _)) = destination_file.take() {
+                // SAFETY: retained parent + component.
+                unsafe { libc::unlinkat(parent, name.as_ptr(), 0) };
+            }
+            return Err(ProjectCopyError::ChangedDuringScan(relative.to_string()));
+        }
+        if let Some((_, file)) = destination_file.as_mut() {
+            file.sync_all().map_err(|error| {
+                ProjectCopyError::Io(format!("flush copied file '{relative}': {error}"))
+            })?;
+        }
+        opened.digest = Some(format!("{:x}", hasher.finalize()));
+        Ok(opened)
     }
 
     /// Reset `errno` so a NULL `readdir` can be classified.
@@ -938,38 +1393,677 @@ mod fd {
     }
 }
 
-/// Create the copied directory for the non-unix fallback walk.
-#[cfg(not(unix))]
-fn create_private_directory(path: &Path, relative: &str) -> Result<(), ProjectCopyError> {
-    std::fs::DirBuilder::new()
-        .create(path)
-        .map_err(|error| collision_or_io(error, relative, "create copied directory"))
-}
+#[cfg(windows)]
+mod windows_capability {
+    use std::ffi::{OsStr, OsString};
+    use std::io::{Read as _, Write as _};
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use std::path::{Component, Path, PathBuf};
+    use std::ptr::{null, null_mut};
 
-/// Create the copied file for the non-unix fallback walk.
-#[cfg(not(unix))]
-fn create_private_file(path: &Path, relative: &str) -> Result<std::fs::File, ProjectCopyError> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| collision_or_io(error, relative, "create copied file"))
-}
+    use sha2::{Digest as _, Sha256};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileIdBothDirectoryInformation, NtCreateFile, NtQueryDirectoryFile, FILE_CREATE,
+        FILE_DIRECTORY_FILE, FILE_ID_BOTH_DIR_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    };
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, RtlNtStatusToDosError, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
+        STATUS_NO_MORE_FILES, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-/// `create_new` is the second, filesystem-level collision gate: on a
-/// case-insensitive destination two distinct source names land on one entry and
-/// the second create fails, which must be reported as the collision it is
-/// rather than as a generic I/O fault.
-#[cfg(not(unix))]
-fn collision_or_io(
-    error: std::io::Error,
-    relative: &str,
-    context: &'static str,
-) -> ProjectCopyError {
-    if error.kind() == std::io::ErrorKind::AlreadyExists {
-        ProjectCopyError::NameCollision(relative.to_string())
-    } else {
-        ProjectCopyError::Io(format!("{context} '{relative}': {error}"))
+    use super::{
+        collision_key, directory_marker, display_relative, push_relative, reject_unsafe_name,
+        roll_up_digest, ProjectCopyError, ProjectCopySummary, ProjectTree, StableEntry,
+        StableSnapshot, EXCLUDED_NAME, MAX_PROJECT_BYTES, MAX_PROJECT_DEPTH, MAX_PROJECT_ENTRIES,
+        MAX_PROJECT_FILES,
+    };
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                // SAFETY: this wrapper owns the handle exactly once.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    impl OwnedHandle {
+        fn into_file(mut self) -> std::fs::File {
+            let raw = self.0;
+            self.0 = null_mut();
+            // SAFETY: ownership transfers from this wrapper to File.
+            unsafe { std::fs::File::from_raw_handle(raw) }
+        }
+    }
+
+    struct DirCapability {
+        handle: OwnedHandle,
+        display: PathBuf,
+    }
+
+    fn io_error(operation: &str, error: std::io::Error) -> ProjectCopyError {
+        ProjectCopyError::Io(format!("{operation}: {error}"))
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    fn safe_relative_name(name: &OsStr) -> std::io::Result<Vec<u16>> {
+        let encoded = name.encode_wide().collect::<Vec<_>>();
+        if encoded.is_empty()
+            || (encoded.len() == 1 && encoded[0] == b'.' as u16)
+            || (encoded.len() == 2 && encoded[0] == b'.' as u16 && encoded[1] == b'.' as u16)
+            || encoded.iter().any(|unit| {
+                *unit == 0 || *unit == b'/' as u16 || *unit == b'\\' as u16 || *unit == b':' as u16
+            })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe Windows capability component",
+            ));
+        }
+        Ok(encoded)
+    }
+
+    fn nt_open_relative(
+        parent: HANDLE,
+        display_parent: &Path,
+        name: &OsStr,
+        access: u32,
+        disposition: u32,
+        options: u32,
+        attributes: u32,
+    ) -> std::io::Result<OwnedHandle> {
+        let mut encoded = safe_relative_name(name)?;
+        let length = u16::try_from(encoded.len() * std::mem::size_of::<u16>()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows capability component is too long",
+            )
+        })?;
+        let unicode = UNICODE_STRING {
+            Length: length,
+            MaximumLength: length,
+            Buffer: encoded.as_mut_ptr(),
+        };
+        let attributes_block = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent,
+            ObjectName: &unicode,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: null(),
+            SecurityQualityOfService: null(),
+        };
+        let mut status_block = IO_STATUS_BLOCK::default();
+        let mut handle: HANDLE = null_mut();
+        // SAFETY: every pointer references live storage and RootDirectory is a
+        // retained directory handle. ObjectName is one validated component.
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                access | SYNCHRONIZE,
+                &attributes_block,
+                &mut status_block,
+                null(),
+                attributes,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                disposition,
+                options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                null(),
+                0,
+            )
+        };
+        if status < 0 {
+            // SAFETY: translating an NTSTATUS has no memory preconditions.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(std::io::Error::new(
+                std::io::Error::from_raw_os_error(code as i32).kind(),
+                format!(
+                    "open retained child {}: {}",
+                    display_parent.join(name).display(),
+                    std::io::Error::from_raw_os_error(code as i32)
+                ),
+            ));
+        }
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::other(
+                "NtCreateFile returned no retained handle",
+            ));
+        }
+        Ok(OwnedHandle(handle))
+    }
+
+    fn handle_info(handle: HANDLE) -> std::io::Result<BY_HANDLE_FILE_INFORMATION> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: handle is live and info is writable.
+        if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info)
+    }
+
+    fn stable_facts(handle: HANDLE, kind: u8) -> Result<StableEntry, ProjectCopyError> {
+        let info =
+            handle_info(handle).map_err(|error| io_error("inspect retained handle", error))?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ProjectCopyError::Symlink("retained handle".to_string()));
+        }
+        let is_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        if (kind == b'd') != is_directory {
+            return Err(ProjectCopyError::ChangedDuringScan(
+                "retained handle".to_string(),
+            ));
+        }
+        Ok(StableEntry {
+            kind,
+            device: info.dwVolumeSerialNumber as u64,
+            inode: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+            mode: info.dwFileAttributes,
+            links: info.nNumberOfLinks as u64,
+            size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
+            modified_seconds: info.ftLastWriteTime.dwHighDateTime as i64,
+            modified_nanos: info.ftLastWriteTime.dwLowDateTime as i64,
+            changed_seconds: info.ftCreationTime.dwHighDateTime as i64,
+            changed_nanos: info.ftCreationTime.dwLowDateTime as i64,
+            digest: None,
+        })
+    }
+
+    impl DirCapability {
+        fn open_tree(path: &Path) -> Result<Self, ProjectCopyError> {
+            let mut anchor = PathBuf::new();
+            let mut rest = Vec::<OsString>::new();
+            let mut rooted = false;
+            for component in path.components() {
+                match component {
+                    Component::Prefix(prefix) if !rooted => anchor.push(prefix.as_os_str()),
+                    Component::RootDir if !rooted => {
+                        anchor.push(component.as_os_str());
+                        rooted = true;
+                    }
+                    Component::Normal(name) if rooted => rest.push(name.to_os_string()),
+                    _ => {
+                        return Err(ProjectCopyError::Io(
+                            "Windows project root is not absolute and normalized".to_string(),
+                        ))
+                    }
+                }
+            }
+            if !rooted {
+                return Err(ProjectCopyError::Io(
+                    "Windows project root has no volume root".to_string(),
+                ));
+            }
+            let encoded = wide(&anchor);
+            // SAFETY: encoded is NUL-terminated and this call returns a new
+            // owned handle.
+            let root = unsafe {
+                CreateFileW(
+                    encoded.as_ptr(),
+                    FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    null_mut(),
+                )
+            };
+            if root == INVALID_HANDLE_VALUE {
+                return Err(io_error(
+                    "open Windows volume root",
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            let mut current = Self {
+                handle: OwnedHandle(root),
+                display: anchor,
+            };
+            stable_facts(current.handle.0, b'd')?;
+            for name in rest {
+                current = current.open_directory(&name)?;
+            }
+            Ok(current)
+        }
+
+        fn open_directory(&self, name: &OsStr) -> Result<Self, ProjectCopyError> {
+            let handle = nt_open_relative(
+                self.handle.0,
+                &self.display,
+                name,
+                FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE,
+                FILE_ATTRIBUTE_DIRECTORY,
+            )
+            .map_err(|error| io_error("open project directory", error))?;
+            stable_facts(handle.0, b'd')?;
+            Ok(Self {
+                handle,
+                display: self.display.join(name),
+            })
+        }
+
+        fn create_directory(&self, name: &OsStr) -> Result<Self, ProjectCopyError> {
+            let handle = nt_open_relative(
+                self.handle.0,
+                &self.display,
+                name,
+                FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | FILE_GENERIC_WRITE,
+                FILE_CREATE,
+                FILE_DIRECTORY_FILE,
+                FILE_ATTRIBUTE_DIRECTORY,
+            )
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    ProjectCopyError::NameCollision(name.to_string_lossy().into_owned())
+                } else {
+                    io_error("create copied directory", error)
+                }
+            })?;
+            Ok(Self {
+                handle,
+                display: self.display.join(name),
+            })
+        }
+
+        fn open_file(&self, name: &OsStr) -> Result<OwnedHandle, ProjectCopyError> {
+            nt_open_relative(
+                self.handle.0,
+                &self.display,
+                name,
+                FILE_GENERIC_READ | FILE_READ_ATTRIBUTES,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                FILE_ATTRIBUTE_NORMAL,
+            )
+            .map_err(|error| io_error("open project file", error))
+        }
+
+        fn create_file(&self, name: &OsStr) -> Result<OwnedHandle, ProjectCopyError> {
+            nt_open_relative(
+                self.handle.0,
+                &self.display,
+                name,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+                FILE_CREATE,
+                FILE_NON_DIRECTORY_FILE,
+                FILE_ATTRIBUTE_NORMAL,
+            )
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    ProjectCopyError::NameCollision(name.to_string_lossy().into_owned())
+                } else {
+                    io_error("create copied file", error)
+                }
+            })
+        }
+
+        fn names(&self, budget: usize, relative: &str) -> Result<Vec<OsString>, ProjectCopyError> {
+            const BUFFER_SIZE: usize = 64 * 1024;
+            let mut buffer = vec![0u8; BUFFER_SIZE];
+            let mut result = Vec::new();
+            let mut restart = true;
+            loop {
+                let mut io_status = IO_STATUS_BLOCK::default();
+                // SAFETY: the directory handle is synchronous and retained;
+                // buffer and status storage are live for the whole call.
+                let status = unsafe {
+                    NtQueryDirectoryFile(
+                        self.handle.0,
+                        null_mut(),
+                        None,
+                        null(),
+                        &mut io_status,
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len() as u32,
+                        FileIdBothDirectoryInformation,
+                        false,
+                        null(),
+                        restart,
+                    )
+                };
+                restart = false;
+                if status == STATUS_NO_MORE_FILES {
+                    break;
+                }
+                if status < 0 {
+                    // SAFETY: pure status translation.
+                    let code = unsafe { RtlNtStatusToDosError(status) };
+                    return Err(io_error(
+                        "enumerate retained project directory",
+                        std::io::Error::from_raw_os_error(code as i32),
+                    ));
+                }
+                let used = io_status.Information.min(buffer.len());
+                if used == 0 {
+                    return Err(ProjectCopyError::Io(
+                        "retained Windows directory enumeration made no progress".to_string(),
+                    ));
+                }
+                let mut offset = 0usize;
+                while offset < used {
+                    let name_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFORMATION, FileName);
+                    let record_remaining = used.saturating_sub(offset);
+                    if record_remaining < name_offset + std::mem::size_of::<u16>() {
+                        return Err(ProjectCopyError::Io(
+                            "truncated retained Windows directory record".to_string(),
+                        ));
+                    }
+                    // SAFETY: the kernel returned a chain of aligned directory
+                    // records inside `used` bytes.
+                    let info = unsafe {
+                        std::ptr::read_unaligned(
+                            buffer
+                                .as_ptr()
+                                .add(offset)
+                                .cast::<FILE_ID_BOTH_DIR_INFORMATION>(),
+                        )
+                    };
+                    if name_offset.saturating_add(info.FileNameLength as usize) > record_remaining
+                        || info.FileNameLength as usize % std::mem::size_of::<u16>() != 0
+                    {
+                        return Err(ProjectCopyError::Io(
+                            "malformed retained Windows directory record".to_string(),
+                        ));
+                    }
+                    let units = info.FileNameLength as usize / std::mem::size_of::<u16>();
+                    let name_bytes = &buffer
+                        [offset + name_offset..offset + name_offset + info.FileNameLength as usize];
+                    let wide_name = name_bytes
+                        .chunks_exact(std::mem::size_of::<u16>())
+                        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                        .collect::<Vec<_>>();
+                    debug_assert_eq!(wide_name.len(), units);
+                    let name = OsString::from_wide(&wide_name);
+                    if name != "." && name != ".." {
+                        if result.len() >= budget {
+                            return Err(ProjectCopyError::EntryCapExceeded(display_relative(
+                                relative,
+                            )));
+                        }
+                        result.push(name);
+                    }
+                    if info.NextEntryOffset == 0 {
+                        break;
+                    }
+                    if info.NextEntryOffset as usize > record_remaining
+                        || (info.NextEntryOffset as usize) < name_offset
+                    {
+                        return Err(ProjectCopyError::Io(
+                            "malformed retained Windows directory chain".to_string(),
+                        ));
+                    }
+                    offset = offset.saturating_add(info.NextEntryOffset as usize);
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    struct ScanState {
+        entries: std::collections::BTreeMap<String, StableEntry>,
+        summary: ProjectCopySummary,
+        entries_seen: usize,
+        root_device: u64,
+    }
+
+    fn scan_file(
+        source: &DirCapability,
+        destination: Option<&DirCapability>,
+        name: &OsStr,
+        relative: &str,
+        remaining: u64,
+    ) -> Result<StableEntry, ProjectCopyError> {
+        let source_handle = source.open_file(name)?;
+        let mut before = stable_facts(source_handle.0, b'f')?;
+        if before.links > 1 {
+            return Err(ProjectCopyError::HardLink(relative.to_string()));
+        }
+        if before.size > remaining {
+            return Err(ProjectCopyError::ByteCapExceeded);
+        }
+        let mut source_file = source_handle.into_file();
+        let mut destination_file = destination
+            .map(|destination| destination.create_file(name).map(OwnedHandle::into_file))
+            .transpose()?;
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = source_file
+                .read(&mut buffer)
+                .map_err(|error| io_error("read retained project file", error))?;
+            if read == 0 {
+                break;
+            }
+            size = size.saturating_add(read as u64);
+            if size > remaining {
+                return Err(ProjectCopyError::ByteCapExceeded);
+            }
+            hasher.update(&buffer[..read]);
+            if let Some(destination) = destination_file.as_mut() {
+                destination
+                    .write_all(&buffer[..read])
+                    .map_err(|error| io_error("write retained project copy", error))?;
+            }
+        }
+        if let Some(destination) = destination_file.as_mut() {
+            destination
+                .sync_all()
+                .map_err(|error| io_error("flush retained project copy", error))?;
+        }
+        let after = stable_facts(source_file.as_raw_handle(), b'f')?;
+        if before != after || size != before.size {
+            return Err(ProjectCopyError::ChangedDuringScan(relative.to_string()));
+        }
+        before.digest = Some(format!("{:x}", hasher.finalize()));
+        Ok(before)
+    }
+
+    fn scan_directory(
+        source: &DirCapability,
+        destination: Option<&DirCapability>,
+        relative_dir: &str,
+        depth: usize,
+        excluded: Option<&str>,
+        state: &mut ScanState,
+    ) -> Result<(), ProjectCopyError> {
+        let before = stable_facts(source.handle.0, b'd')?;
+        let names = source.names(
+            MAX_PROJECT_ENTRIES.saturating_sub(state.entries_seen),
+            relative_dir,
+        )?;
+        state.entries_seen = state.entries_seen.saturating_add(names.len());
+        let mut collisions = std::collections::BTreeSet::new();
+        for raw_name in names {
+            let Some(name) = raw_name.to_str() else {
+                return Err(ProjectCopyError::NameNotUtf8(display_relative(
+                    relative_dir,
+                )));
+            };
+            let relative = push_relative(relative_dir, name);
+            reject_unsafe_name(name, &relative)?;
+            if name == EXCLUDED_NAME || excluded == Some(relative.as_str()) {
+                continue;
+            }
+            if !collisions.insert(collision_key(name)) {
+                return Err(ProjectCopyError::NameCollision(display_relative(
+                    relative_dir,
+                )));
+            }
+            let child_directory = source.open_directory(&raw_name);
+            match child_directory {
+                Ok(child) => {
+                    if depth + 1 > MAX_PROJECT_DEPTH {
+                        return Err(ProjectCopyError::DepthCapExceeded(relative));
+                    }
+                    let facts = stable_facts(child.handle.0, b'd')?;
+                    if facts.device != state.root_device {
+                        return Err(ProjectCopyError::Escape(relative));
+                    }
+                    let destination_child = destination
+                        .map(|destination| destination.create_directory(&raw_name))
+                        .transpose()?;
+                    state.entries.insert(relative.clone(), facts);
+                    state.summary.directory_count += 1;
+                    scan_directory(
+                        &child,
+                        destination_child.as_ref(),
+                        &relative,
+                        depth + 1,
+                        excluded,
+                        state,
+                    )?;
+                }
+                Err(ProjectCopyError::Io(_)) => {
+                    if state.summary.file_count >= MAX_PROJECT_FILES {
+                        return Err(ProjectCopyError::FileCapExceeded);
+                    }
+                    let remaining = MAX_PROJECT_BYTES.saturating_sub(state.summary.total_bytes);
+                    let facts = scan_file(source, destination, &raw_name, &relative, remaining)?;
+                    if facts.device != state.root_device {
+                        return Err(ProjectCopyError::Escape(relative));
+                    }
+                    state.summary.file_count += 1;
+                    state.summary.total_bytes =
+                        state.summary.total_bytes.saturating_add(facts.size);
+                    state.entries.insert(relative, facts);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if stable_facts(source.handle.0, b'd')? != before {
+            return Err(ProjectCopyError::ChangedDuringScan(display_relative(
+                relative_dir,
+            )));
+        }
+        Ok(())
+    }
+
+    fn scan(
+        source: &DirCapability,
+        destination: Option<&DirCapability>,
+        excluded: Option<&str>,
+    ) -> Result<StableSnapshot, ProjectCopyError> {
+        let root = stable_facts(source.handle.0, b'd')?;
+        let mut state = ScanState {
+            entries: std::collections::BTreeMap::new(),
+            summary: ProjectCopySummary {
+                file_count: 0,
+                directory_count: 0,
+                total_bytes: 0,
+            },
+            entries_seen: 0,
+            root_device: root.device,
+        };
+        scan_directory(source, destination, "", 0, excluded, &mut state)?;
+        if stable_facts(source.handle.0, b'd')? != root {
+            return Err(ProjectCopyError::ChangedDuringScan(".".to_string()));
+        }
+        Ok(StableSnapshot {
+            root,
+            entries: state.entries,
+            summary: state.summary,
+        })
+    }
+
+    fn visible_matches(path: &Path, held: &DirCapability) -> Result<bool, ProjectCopyError> {
+        let visible = match DirCapability::open_tree(path) {
+            Ok(visible) => visible,
+            Err(_) => return Ok(false),
+        };
+        let visible = stable_facts(visible.handle.0, b'd')?;
+        let held = stable_facts(held.handle.0, b'd')?;
+        Ok(visible.device == held.device && visible.inode == held.inode)
+    }
+
+    pub(super) fn copy_stable(
+        source_root: &Path,
+        destination_root: &Path,
+        excluded: Option<&str>,
+    ) -> Result<ProjectCopySummary, ProjectCopyError> {
+        let source = DirCapability::open_tree(source_root)?;
+        let destination = DirCapability::open_tree(destination_root)?;
+        let source_identity = stable_facts(source.handle.0, b'd')?;
+        let destination_identity = stable_facts(destination.handle.0, b'd')?;
+        if source_identity.device == destination_identity.device
+            && source_identity.inode == destination_identity.inode
+        {
+            return Err(ProjectCopyError::Destination(
+                "destination is the retained project root itself".to_string(),
+            ));
+        }
+        if !destination.names(1, "")?.is_empty() {
+            return Err(ProjectCopyError::Destination(
+                "destination is not empty".to_string(),
+            ));
+        }
+        let first = scan(&source, None, excluded)?;
+        super::run_between_stable_passes_hook();
+        if !visible_matches(source_root, &source)? {
+            return Err(ProjectCopyError::ChangedDuringScan(".".to_string()));
+        }
+        let second = scan(&source, Some(&destination), excluded)?;
+        if first != second
+            || !visible_matches(source_root, &source)?
+            || !visible_matches(destination_root, &destination)?
+        {
+            return Err(ProjectCopyError::ChangedDuringScan(".".to_string()));
+        }
+        Ok(second.summary)
+    }
+
+    pub(super) fn inventory_stable(
+        root: &Path,
+        excluded: Option<&str>,
+    ) -> Result<ProjectTree, ProjectCopyError> {
+        let source = DirCapability::open_tree(root)?;
+        let first = scan(&source, None, excluded)?;
+        super::run_between_stable_passes_hook();
+        if !visible_matches(root, &source)? {
+            return Err(ProjectCopyError::ChangedDuringScan(".".to_string()));
+        }
+        let second = scan(&source, None, excluded)?;
+        if first != second || !visible_matches(root, &source)? {
+            return Err(ProjectCopyError::ChangedDuringScan(".".to_string()));
+        }
+        let entries = first
+            .entries
+            .into_iter()
+            .map(|(relative, facts)| {
+                let marker = if facts.kind == b'd' {
+                    directory_marker()
+                } else {
+                    format!(
+                        "f:{}",
+                        facts.digest.expect("stable regular file has a digest")
+                    )
+                };
+                (relative, marker)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let digest = roll_up_digest(&entries);
+        Ok(ProjectTree {
+            file_count: first.summary.file_count,
+            total_bytes: first.summary.total_bytes,
+            digest,
+            complete: true,
+            entries,
+        })
     }
 }
 
@@ -1015,6 +2109,78 @@ fn display_relative(relative: &str) -> String {
     } else {
         relative.to_string()
     }
+}
+
+/// Inventory a quiescent tree through one retained root capability in exactly
+/// two passes. Unlike [`inventory_project_tree`], this is the security boundary
+/// used by capsule execution: mutation is an error, not a partial digest.
+pub fn inventory_project_tree_stable(
+    root: &Path,
+    excluded_relative: Option<&Path>,
+) -> Result<ProjectTree, ProjectCopyError> {
+    let root = trusted_project_root(root)?;
+    let excluded = normalize_exclusion(excluded_relative)?;
+    #[cfg(unix)]
+    {
+        let held = fd::open_directory_tree(&root)
+            .map_err(|error| ProjectCopyError::Io(format!("open inventory root: {error}")))?;
+        let first = first_stable_pass(&held, excluded.as_deref())?;
+        run_between_stable_passes_hook();
+        if !fd::visible_directory_matches(&root, &held)? {
+            return Err(ProjectCopyError::ChangedDuringScan(".".to_string()));
+        }
+        let second = first_stable_pass(&held, excluded.as_deref())?;
+        if first != second || !fd::visible_directory_matches(&root, &held)? {
+            return Err(ProjectCopyError::ChangedDuringScan(".".to_string()));
+        }
+        let entries = first
+            .entries
+            .into_iter()
+            .map(|(relative, facts)| {
+                let marker = if facts.kind == b'd' {
+                    directory_marker()
+                } else {
+                    format!(
+                        "f:{}",
+                        facts.digest.expect("stable regular file has a digest")
+                    )
+                };
+                (relative, marker)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let digest = roll_up_digest(&entries);
+        Ok(ProjectTree {
+            file_count: first.summary.file_count,
+            total_bytes: first.summary.total_bytes,
+            digest,
+            complete: true,
+            entries,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows is implemented by the retained-handle walker below; targets
+        // without either openat or Windows NT relative handles fail closed.
+        stable_non_unix_inventory(&root, excluded.as_deref())
+    }
+}
+
+#[cfg(windows)]
+fn stable_non_unix_inventory(
+    root: &Path,
+    excluded_relative: Option<&str>,
+) -> Result<ProjectTree, ProjectCopyError> {
+    windows_capability::inventory_stable(root, excluded_relative)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stable_non_unix_inventory(
+    _root: &Path,
+    _excluded_relative: Option<&str>,
+) -> Result<ProjectTree, ProjectCopyError> {
+    Err(ProjectCopyError::Io(
+        "stable project inventory is unavailable on this platform".to_string(),
+    ))
 }
 
 /// Inventory `root` into a bounded, order-independent tree digest.
@@ -1262,6 +2428,206 @@ mod tests {
         assert_eq!(directory.permissions().mode() & 0o077, 0);
         let file = std::fs::metadata(destination.join("src/main.rs")).expect("stat file");
         assert_eq!(file.permissions().mode() & 0o077, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_modes_are_exact_and_preserve_only_executable_intent_under_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD_ENV: &str = "TIRITH_CAPSULE_PROJECT_RESTRICTIVE_UMASK_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // umask is process-global, not thread-local. Run the mutation in an
+            // exact child test process so this regression cannot make fixtures
+            // created by parallel tests mode 000.
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .args([
+                "--exact",
+                "capsule_project::tests::copy_modes_are_exact_and_preserve_only_executable_intent_under_umask",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run restrictive-umask child test");
+            assert!(
+                output.status.success(),
+                "restrictive-umask child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let source = base.path().join("project");
+        write(&source, "bin/tool", "#!/bin/sh\nexit 0\n");
+        write(&source, "data.txt", "data");
+        std::fs::set_permissions(
+            source.join("bin/tool"),
+            std::fs::Permissions::from_mode(0o6755),
+        )
+        .expect("source executable mode");
+        std::fs::set_permissions(
+            source.join("data.txt"),
+            std::fs::Permissions::from_mode(0o4666),
+        )
+        .expect("source data mode");
+        let destination = empty_destination(base.path());
+
+        // SAFETY: serialized with the shared process-global guard and restored
+        // before that guard is released.
+        let previous = unsafe { libc::umask(0o777) };
+        struct Restore(libc::mode_t);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: this guard still owns the shared global lock.
+                unsafe { libc::umask(self.0) };
+            }
+        }
+        let _restore = Restore(previous);
+        copy_project_tree(&source, &destination).expect("copy succeeds under restrictive umask");
+
+        assert_eq!(
+            std::fs::metadata(destination.join("bin"))
+                .expect("directory")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join("bin/tool"))
+                .expect("executable")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700,
+            "executable intent survives but set-id and group/other bits do not"
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join("data.txt"))
+                .expect("data")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    fn install_between_passes(hook: impl FnMut() + 'static) {
+        BETWEEN_STABLE_PASSES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn same_size_content_change_is_refused_without_retry() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let source = base.path().join("project");
+        write(&source, "same.bin", "AAAA");
+        let destination = empty_destination(base.path());
+        let changed = source.join("same.bin");
+        install_between_passes(move || std::fs::write(&changed, "BBBB").expect("mutate"));
+
+        let error = copy_project_tree(&source, &destination).expect_err("mutation refuses");
+        assert!(matches!(error, ProjectCopyError::ChangedDuringScan(_)));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn visible_root_replacement_is_refused() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let source = base.path().join("project");
+        write(&source, "sub/file", "data");
+        let destination = empty_destination(base.path());
+        let source_for_hook = source.clone();
+        install_between_passes(move || {
+            let moved = source_for_hook.with_extension("moved");
+            std::fs::rename(&source_for_hook, &moved).expect("move retained root");
+            std::fs::create_dir(&source_for_hook).expect("plant replacement root");
+        });
+        let error = copy_project_tree(&source, &destination).expect_err("replacement refuses");
+        assert!(matches!(error, ProjectCopyError::ChangedDuringScan(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_mode_changes_are_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let source = base.path().join("project");
+        write(&source, "sub/file", "data");
+        let destination = empty_destination(base.path());
+        let source_for_hook = source.clone();
+        install_between_passes(move || {
+            std::fs::set_permissions(
+                source_for_hook.join("sub"),
+                std::fs::Permissions::from_mode(0o711),
+            )
+            .expect("change directory mode");
+        });
+        let error = copy_project_tree(&source, &destination).expect_err("mutation refuses");
+        assert!(matches!(error, ProjectCopyError::ChangedDuringScan(_)));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn membership_add_remove_and_rename_are_all_refused() {
+        for mutation in ["add", "remove", "rename"] {
+            let base = tempfile::tempdir().expect("tempdir");
+            let source = base.path().join("project");
+            write(&source, "keep", "data");
+            write(&source, "remove", "gone");
+            let destination = empty_destination(base.path());
+            let source_for_hook = source.clone();
+            install_between_passes(move || match mutation {
+                "add" => std::fs::write(source_for_hook.join("added"), "new").expect("add"),
+                "remove" => std::fs::remove_file(source_for_hook.join("remove")).expect("remove"),
+                "rename" => std::fs::rename(
+                    source_for_hook.join("keep"),
+                    source_for_hook.join("renamed"),
+                )
+                .expect("rename"),
+                _ => unreachable!(),
+            });
+            let error = copy_project_tree(&source, &destination).expect_err("mutation refuses");
+            assert!(
+                matches!(error, ProjectCopyError::ChangedDuringScan(_)),
+                "{mutation}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_exclusion_is_exact_not_a_basename_or_prefix_filter() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let source = base.path().join("project");
+        write(&source, "receipts/run.json", "old receipt");
+        write(&source, "nested/run.json", "ordinary project file");
+        write(&source, "receipts/run.json.extra", "ordinary sibling");
+        let destination = empty_destination(base.path());
+
+        copy_project_tree_excluding(&source, &destination, Some(Path::new("receipts/run.json")))
+            .expect("copy succeeds");
+        assert!(!destination.join("receipts/run.json").exists());
+        assert!(destination.join("nested/run.json").exists());
+        assert!(destination.join("receipts/run.json.extra").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_var_alias_is_the_only_explicit_root_alias() {
+        assert_eq!(
+            trusted_project_root(Path::new("/var/folders/example")).expect("trusted alias"),
+            Path::new("/private/var/folders/example")
+        );
+        assert_eq!(
+            trusted_project_root(Path::new("/tmp/example")).expect("ordinary path"),
+            Path::new("/tmp/example")
+        );
     }
 
     #[cfg(unix)]

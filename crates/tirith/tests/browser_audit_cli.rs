@@ -207,6 +207,25 @@ fn a_clean_audit_emits_a_parseable_envelope_and_exits_zero() {
         envelope["report"]["browsers"][0]["profiles"][0]["profile_directory"],
         "Default"
     );
+    assert_eq!(
+        envelope["report"]["browsers"][0]["profiles"][0]["identity"]["root"]["family"],
+        "chrome"
+    );
+    assert_eq!(
+        envelope["report"]["browsers"][0]["profiles"][0]["identity"]["root"]["channel"],
+        "explicit"
+    );
+    assert_eq!(
+        envelope["report"]["browsers"][0]["profiles"][0]["identity"]["root"]["edition"],
+        "explicit"
+    );
+    assert_eq!(
+        extensions[0]["identity"]["profile"]["profile_directory"],
+        "Default"
+    );
+    assert!(extensions
+        .iter()
+        .all(|extension| { extension["identity"]["extension_id"] == extension["id"] }));
 
     // Install classes come from the three allowed Preferences fields.
     let by_id = |id: &str| {
@@ -423,7 +442,16 @@ fn a_written_baseline_is_idempotent_and_carries_no_private_data() {
     );
     assert_eq!(a["entries"], b["entries"]);
     assert_eq!(a["receipt_type"], "browser_extension_baseline");
+    assert_eq!(a["schema"], 2);
     assert_eq!(a["format_version"], 1);
+    assert!(a["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .all(|entry| {
+            entry["identity"]["extension_id"] == entry["extension_id"]
+                && entry["identity"]["profile"]["root"]["family"] == entry["browser"]
+        }));
 
     let text = fs::read_to_string(&first).expect("read baseline");
     for poison in [
@@ -617,6 +645,64 @@ fn browser_all_on_a_host_with_no_profiles_stays_explicit() {
         assert!(browser["profiles"].as_array().expect("profiles").is_empty());
     }
     assert_eq!(envelope["extension_count"], 0);
+}
+
+#[test]
+fn discovery_continues_from_an_inaccessible_stable_root_into_beta() {
+    let home = fresh_home();
+    let (stable, beta) = if cfg!(target_os = "macos") {
+        (
+            home.join("Library/Application Support/Google/Chrome"),
+            home.join("Library/Application Support/Google/Chrome Beta"),
+        )
+    } else if cfg!(target_os = "windows") {
+        (
+            home.join("AppData/Local/Google/Chrome/User Data"),
+            home.join("AppData/Local/Google/Chrome Beta/User Data"),
+        )
+    } else {
+        (
+            home.join(".config/google-chrome"),
+            home.join(".config/google-chrome-beta"),
+        )
+    };
+    fs::create_dir_all(stable.parent().expect("stable parent")).expect("create stable parent");
+    fs::write(&stable, "present but not a directory").expect("write inaccessible root");
+    let profile = beta.join("Default");
+    fs::create_dir_all(profile.join("Extensions")).expect("create beta profile");
+    install_fixture(&profile, "legacy-mv2", PLAIN_ID, "1.2.3_0");
+    write_preferences(&profile, &[(PLAIN_ID, 1, true)]);
+
+    let (code, envelope, _) = run_json(
+        &home,
+        &[
+            "browser",
+            "audit",
+            "--browser",
+            "chrome",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "a partial audit without a baseline is informational"
+    );
+    assert_eq!(envelope["status"], "partial");
+    let browser = &envelope["report"]["browsers"][0];
+    assert_eq!(browser["status"], "audited");
+    assert_eq!(browser["root_gaps"].as_array().expect("root gaps").len(), 1);
+    assert_eq!(browser["root_gaps"][0]["root"]["channel"], "stable");
+    assert_eq!(browser["profiles"].as_array().expect("profiles").len(), 1);
+    assert_eq!(
+        browser["profiles"][0]["identity"]["root"]["channel"],
+        "beta"
+    );
+    assert!(browser["roots"]
+        .as_array()
+        .expect("roots")
+        .iter()
+        .any(|root| { root["identity"]["channel"] == "beta" && root["status"] == "audited" }));
 }
 
 #[test]
@@ -913,6 +999,142 @@ fn reseal(document: &mut serde_json::Value) {
     blanked["receipt_id"] = serde_json::Value::String(String::new());
     blanked["signature"] = serde_json::Value::Null;
     document["receipt_id"] = serde_json::Value::String(sha256_hex(&canonical(&blanked)));
+}
+
+fn downgrade_baseline_to_v1(path: &Path) -> String {
+    let mut document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).expect("read current baseline"))
+            .expect("parse current baseline");
+    document["schema"] = serde_json::json!(1);
+    document["format_version"] = serde_json::json!(1);
+    for entry in document["entries"].as_array_mut().expect("entries") {
+        entry
+            .as_object_mut()
+            .expect("baseline entry")
+            .remove("identity");
+    }
+    document["signature"] = serde_json::Value::Null;
+    reseal(&mut document);
+    let legacy = serde_json::to_string_pretty(&document).expect("serialize v1 baseline");
+    fs::write(path, &legacy).expect("write v1 baseline");
+    legacy
+}
+
+#[test]
+fn a_v1_baseline_reports_upgrade_and_is_replaced_atomically_on_request() {
+    let home = fresh_home();
+    let profile = build_profile(&home);
+    let baseline = home.join("legacy-baseline.json");
+    let (code, envelope, _) = run_json(
+        &home,
+        &[
+            "browser",
+            "audit",
+            "--profile",
+            &profile.to_string_lossy(),
+            "--write-baseline",
+            &baseline.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{envelope}");
+    let legacy = downgrade_baseline_to_v1(&baseline);
+
+    let (code, envelope, _) = run_json(
+        &home,
+        &[
+            "browser",
+            "audit",
+            "--profile",
+            &profile.to_string_lossy(),
+            "--baseline",
+            &baseline.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(envelope["baseline"]["schema"], 1);
+    assert_eq!(envelope["baseline"]["trust"], "schema_upgrade_required");
+    assert_eq!(envelope["drift_count"], 1);
+    assert_eq!(envelope["drift"][0]["kind"], "schema_upgrade_required");
+    assert_eq!(envelope["verify_complete"], false);
+    assert_eq!(fs::read_to_string(&baseline).expect("read legacy"), legacy);
+
+    let (code, envelope, _) = run_json(
+        &home,
+        &[
+            "browser",
+            "audit",
+            "--profile",
+            &profile.to_string_lossy(),
+            "--baseline",
+            &baseline.to_string_lossy(),
+            "--write-baseline",
+            &baseline.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        code, 1,
+        "the old comparison still requires upgrade: {envelope}"
+    );
+    let replacement: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&baseline).expect("read replacement"))
+            .expect("parse replacement");
+    assert_eq!(replacement["schema"], 2);
+    assert_eq!(replacement["format_version"], 1);
+    assert!(replacement["entries"][0]["identity"].is_object());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_v1_replacement_leaves_the_old_file_byte_for_byte() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = fresh_home();
+    let profile = build_profile(&home);
+    let locked = home.join("locked-baseline-dir");
+    fs::create_dir_all(&locked).expect("create locked directory");
+    let baseline = locked.join("legacy.json");
+    let (code, envelope, _) = run_json(
+        &home,
+        &[
+            "browser",
+            "audit",
+            "--profile",
+            &profile.to_string_lossy(),
+            "--write-baseline",
+            &baseline.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{envelope}");
+    let legacy = downgrade_baseline_to_v1(&baseline);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).expect("lock directory");
+
+    let output = tirith(&home)
+        .args([
+            "browser",
+            "audit",
+            "--profile",
+            &profile.to_string_lossy(),
+            "--baseline",
+            &baseline.to_string_lossy(),
+            "--write-baseline",
+            &baseline.to_string_lossy(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run tirith");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("unlock directory");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(fs::read_to_string(&baseline).expect("read legacy"), legacy);
 }
 
 /// A baseline used to be accepted on nothing but its own unkeyed

@@ -75,6 +75,22 @@ const MAX_UPLOADS_PER_WORKFLOW: usize = 256;
 const MAX_EVENTS_PER_JOB: usize = 512;
 const MAX_UNRESOLVED_NOTES: usize = 32;
 
+/// The bounded resource whose exhaustion made a [`WorkflowModel`] partial.
+///
+/// A model may record more than one reason when independent structural bounds
+/// are crossed. Callers that only need the legacy complete/partial distinction
+/// can continue to use [`WorkflowModel::steps_truncated`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum WorkflowTruncationReason {
+    /// The per-workflow job limit was exhausted before every job was visited.
+    JobBudgetExhausted,
+    /// The caller-provided repository step allowance was exhausted.
+    StepBudgetExhausted,
+    /// The per-workflow retained-upload limit was exhausted.
+    UploadBudgetExhausted,
+}
+
 /// Evidence text ceiling, matching the sibling workflow rules.
 const EVIDENCE_CHARS: usize = 160;
 
@@ -312,6 +328,7 @@ pub struct WorkflowModel {
     unresolved: Vec<String>,
     step_count: usize,
     steps_truncated: bool,
+    truncation_reasons: BTreeSet<WorkflowTruncationReason>,
     source_bytes: usize,
     parse_failed: bool,
 }
@@ -333,10 +350,18 @@ impl WorkflowModel {
         self.source_bytes
     }
 
-    /// Whether the caller's step budget ran out part-way through this workflow,
-    /// so its own model is partial.
+    /// Whether any bounded job, step, or upload collection ran out part-way
+    /// through this workflow, so its own model is partial.
     pub fn steps_truncated(&self) -> bool {
         self.steps_truncated
+    }
+
+    /// Exact bounded resources that made this model partial, in deterministic
+    /// order. This is additive to [`WorkflowModel::steps_truncated`].
+    pub fn truncation_reasons(
+        &self,
+    ) -> impl ExactSizeIterator<Item = WorkflowTruncationReason> + '_ {
+        self.truncation_reasons.iter().copied()
     }
 
     /// Whether this workflow is reachable by an untrusted contributor.
@@ -351,10 +376,22 @@ impl WorkflowModel {
         self.triggers.contains("workflow_run")
     }
 
+    /// Whether any modelled part of this workflow left the artifact flow
+    /// unresolved. Some structural failures carry a workflow note while bounded
+    /// event parsing records the uncertainty directly on the affected job.
+    fn artifact_flow_unresolved(&self) -> bool {
+        !self.unresolved.is_empty() || self.jobs.iter().any(|job| job.unresolved)
+    }
+
     fn note(&mut self, note: String) {
         if self.unresolved.len() < MAX_UNRESOLVED_NOTES && !self.unresolved.contains(&note) {
             self.unresolved.push(note);
         }
+    }
+
+    fn mark_truncated(&mut self, reason: WorkflowTruncationReason) {
+        self.steps_truncated = true;
+        self.truncation_reasons.insert(reason);
     }
 }
 
@@ -376,6 +413,7 @@ pub fn build_model(path: &Path, content: &str, step_budget: usize) -> WorkflowMo
         unresolved: Vec::new(),
         step_count: 0,
         steps_truncated: false,
+        truncation_reasons: BTreeSet::new(),
         source_bytes: content.len(),
         parse_failed: false,
     };
@@ -405,7 +443,7 @@ pub fn build_model(path: &Path, content: &str, step_budget: usize) -> WorkflowMo
     let mut remaining_steps = step_budget;
     for (index, (job_key, job)) in jobs.iter().enumerate() {
         if index >= MAX_JOBS_PER_WORKFLOW {
-            model.steps_truncated = true;
+            model.mark_truncated(WorkflowTruncationReason::JobBudgetExhausted);
             break;
         }
         let job_name = job_key.as_str().unwrap_or("<job>").to_string();
@@ -438,7 +476,7 @@ pub fn build_model(path: &Path, content: &str, step_budget: usize) -> WorkflowMo
         let mut job_touches_artifacts = false;
         for step in steps {
             if remaining_steps == 0 {
-                model.steps_truncated = true;
+                model.mark_truncated(WorkflowTruncationReason::StepBudgetExhausted);
                 job_model.unresolved = true;
                 break;
             }
@@ -458,7 +496,7 @@ pub fn build_model(path: &Path, content: &str, step_budget: usize) -> WorkflowMo
                         if model.uploads.len() < MAX_UPLOADS_PER_WORKFLOW {
                             model.uploads.push(upload);
                         } else {
-                            model.steps_truncated = true;
+                            model.mark_truncated(WorkflowTruncationReason::UploadBudgetExhausted);
                         }
                     }
                     UsesRole::CrossRunDownload(download) => {
@@ -1189,7 +1227,10 @@ fn analyze_run_body(script: &str, shell: ShellType, job: &mut JobModel) -> bool 
         // and `unzip` relocate the bytes out from under the containment test,
         // and `pip install` / `npm ci` run them. Only the provably inert
         // read-only commands are exempt.
-        if !modelled && seen_download && !INERT_COMMANDS.contains(&name.as_str()) {
+        if !modelled
+            && seen_download
+            && !command_is_provably_inert_after_download(&name, &effective, shell)
+        {
             push_event(job, FlowEvent::Unmodelled);
         }
 
@@ -1198,6 +1239,201 @@ fn analyze_run_body(script: &str, shell: ShellType, job: &mut JobModel) -> bool 
 
     incomplete
 }
+
+/// Whether an otherwise-unmodelled command is known not to execute, relocate,
+/// mutate, or publish downloaded bytes. Most entries are simple command-name
+/// facts. `find` needs its own closed parser because its expression language
+/// contains execution and mutation actions.
+fn command_is_provably_inert_after_download(
+    name: &str,
+    effective: &tokenize::Segment,
+    shell: ShellType,
+) -> bool {
+    match name {
+        "find" => find_is_provably_read_only(effective, shell),
+        _ => INERT_COMMANDS.contains(&name),
+    }
+}
+
+/// Recognise only the read-only subset of POSIX/GNU `find`.
+///
+/// The expression grammar is deliberately closed. In particular, execution
+/// (`-exec*`/`-ok*`), mutation (`-delete`), file-writing (`-fprint*`, `-fprintf`,
+/// `-fls`), shell substitutions, and every unknown option/action return false,
+/// which turns the post-download step into [`FlowEvent::Unmodelled`]. Predicate
+/// operands are consumed according to their known arity, so an operand named
+/// `-exec` cannot be confused with an action.
+fn find_is_provably_read_only(effective: &tokenize::Segment, shell: ShellType) -> bool {
+    if !matches!(shell, ShellType::Posix | ShellType::Fish)
+        || effective.raw.contains("$(")
+        || effective.raw.contains("<(")
+        || effective.raw.contains(">(")
+        || effective.raw.contains('`')
+    {
+        return false;
+    }
+
+    let args: Vec<String> = effective
+        .args
+        .iter()
+        .map(|arg| command::normalize_shell_token(arg, shell))
+        .collect();
+    let mut index = 0usize;
+
+    // POSIX traversal flags and GNU debug/optimisation options precede paths.
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        match arg {
+            "-H" | "-L" | "-P" => index += 1,
+            "-D" => {
+                if args.get(index + 1).is_none() {
+                    return false;
+                }
+                index += 2;
+            }
+            _ if is_find_optimization_option(arg) => index += 1,
+            _ => break,
+        }
+    }
+
+    let mut in_expression = false;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        if !in_expression {
+            if !find_expression_starts_with(arg) {
+                // A leading non-option is a search root. A path whose spelling
+                // starts with `-` must be written as `./-name`; otherwise find
+                // itself treats it as expression syntax and so do we.
+                if arg.starts_with('-') {
+                    return false;
+                }
+                index += 1;
+                continue;
+            }
+            in_expression = true;
+        }
+
+        if FIND_READ_ONLY_NULLARY.contains(&arg) {
+            index += 1;
+            continue;
+        }
+        if FIND_READ_ONLY_UNARY.contains(&arg) || is_find_newer_predicate(arg) {
+            if args.get(index + 1).is_none() {
+                return false;
+            }
+            index += 2;
+            continue;
+        }
+
+        // This also rejects every known execution/mutation/file-writing action.
+        return false;
+    }
+
+    true
+}
+
+fn find_expression_starts_with(arg: &str) -> bool {
+    arg.starts_with('-') || matches!(arg, "!" | "(" | ")" | ",")
+}
+
+fn is_find_optimization_option(arg: &str) -> bool {
+    let Some(level) = arg.strip_prefix("-O") else {
+        return false;
+    };
+    !level.is_empty() && level.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_find_newer_predicate(arg: &str) -> bool {
+    let Some(suffix) = arg.strip_prefix("-newer") else {
+        return false;
+    };
+    suffix.len() == 2
+        && suffix
+            .bytes()
+            .all(|kind| matches!(kind, b'a' | b'B' | b'c' | b'm' | b't'))
+}
+
+/// Read-only `find` operators, options, tests, and stdout-only actions that take
+/// no operand. Side-effecting actions are intentionally absent.
+const FIND_READ_ONLY_NULLARY: &[&str] = &[
+    "!",
+    "(",
+    ")",
+    ",",
+    "-a",
+    "-and",
+    "-o",
+    "-or",
+    "-not",
+    "-true",
+    "-false",
+    "-empty",
+    "-readable",
+    "-writable",
+    "-executable",
+    "-nouser",
+    "-nogroup",
+    "-print",
+    "-print0",
+    "-ls",
+    "-prune",
+    "-quit",
+    "-depth",
+    "-ignore_readdir_race",
+    "-noignore_readdir_race",
+    "-mount",
+    "-xdev",
+    "-daystart",
+    "-follow",
+    "-warn",
+    "-nowarn",
+    "-help",
+    "--help",
+    "-version",
+    "--version",
+];
+
+/// Read-only `find` options/tests/actions that consume exactly one following
+/// operand. The consumed word may itself start with `-` without becoming an
+/// action.
+const FIND_READ_ONLY_UNARY: &[&str] = &[
+    "-name",
+    "-iname",
+    "-path",
+    "-ipath",
+    "-wholename",
+    "-iwholename",
+    "-lname",
+    "-ilname",
+    "-regex",
+    "-iregex",
+    "-type",
+    "-xtype",
+    "-context",
+    "-perm",
+    "-user",
+    "-group",
+    "-uid",
+    "-gid",
+    "-inum",
+    "-links",
+    "-size",
+    "-used",
+    "-amin",
+    "-atime",
+    "-cmin",
+    "-ctime",
+    "-mmin",
+    "-mtime",
+    "-anewer",
+    "-cnewer",
+    "-newer",
+    "-samefile",
+    "-fstype",
+    "-maxdepth",
+    "-mindepth",
+    "-regextype",
+    "-files0-from",
+    "-printf",
+];
 
 /// Commands that can neither execute a downloaded file, nor point a later step
 /// at one, nor move one somewhere the containment test stops seeing it, nor
@@ -1250,7 +1486,6 @@ const INERT_COMMANDS: &[&str] = &[
     "stat",
     "du",
     "df",
-    "find",
     "basename",
     "dirname",
     "realpath",
@@ -1687,9 +1922,13 @@ pub fn analyze_repository(
     // presence removes the right to say "no chain exists".
     let global_blind_spot = models.iter().any(|m| m.parse_failed || m.steps_truncated);
 
-    let producers: Vec<&WorkflowModel> = models
+    // Keep a named, fork-reachable producer in the binding set when its model is
+    // unresolved even if no direct upload survived modelling. A local action or
+    // reusable workflow may contain the upload; filtering it out here would turn
+    // that missing visibility into a false proof that the consumer is benign.
+    let producer_candidates: Vec<&WorkflowModel> = models
         .iter()
-        .filter(|m| m.fork_reachable() && !m.uploads.is_empty())
+        .filter(|m| m.fork_reachable() && (!m.uploads.is_empty() || m.artifact_flow_unresolved()))
         .collect();
 
     // A `workflow_run` workflow that downloads a cross-run artifact and then
@@ -1715,13 +1954,13 @@ pub fn analyze_repository(
             ConsumedWorkflows::Names(names) => {
                 // A fork-reachable uploader with no `name:` key takes its name
                 // from its path, which this analyzer does not reconstruct.
-                if producers.iter().any(|p| p.display_name.is_none()) {
+                if producer_candidates.iter().any(|p| p.display_name.is_none()) {
                     unresolved = true;
                 }
                 if unnamed_relay || names.iter().any(|n| relay_names.contains(n.as_str())) {
                     unresolved = true;
                 }
-                producers
+                producer_candidates
                     .iter()
                     .copied()
                     .filter(|p| {
@@ -1739,7 +1978,8 @@ pub fn analyze_repository(
         };
 
         if bound.iter().any(|p| {
-            p.uploads.iter().any(|u| u.name == ArtifactName::Unresolved) || !p.unresolved.is_empty()
+            p.uploads.iter().any(|u| u.name == ArtifactName::Unresolved)
+                || p.artifact_flow_unresolved()
         }) {
             unresolved = true;
         }
@@ -2092,6 +2332,84 @@ jobs:
         assert_eq!(
             result.unproven_consumers,
             vec![PathBuf::from(".github/workflows/deploy.yml")]
+        );
+    }
+
+    #[test]
+    fn unresolved_named_producer_without_direct_upload_blocks_downgrade() {
+        let local_action = r#"
+name: CI
+on:
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/build
+"#;
+        let reusable_workflow = r#"
+name: CI
+on:
+  pull_request:
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+"#;
+        let yaml = consumer(&format!(
+            "{CROSS_RUN_DOWNLOAD}      - run: cat dist/coverage.json\n"
+        ));
+
+        for producer in [local_action, reusable_workflow] {
+            let result = analyze(producer, &yaml);
+            assert!(result.findings.is_empty(), "{:?}", result.findings);
+            assert!(
+                result.unproven_consumers.is_empty(),
+                "an unresolved producer bound by name may hide the upload"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_named_producer_without_an_upload_does_not_block_downgrade() {
+        let producer = r#"
+name: CI
+on:
+  pull_request:
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo fmt --check
+"#;
+        let yaml = consumer(&format!(
+            "{CROSS_RUN_DOWNLOAD}      - run: cat dist/coverage.json\n"
+        ));
+        let result = analyze(producer, &yaml);
+        assert!(result.findings.is_empty(), "{:?}", result.findings);
+        assert_eq!(result.unproven_consumers.len(), 1);
+    }
+
+    #[test]
+    fn unresolved_producer_that_is_not_fork_reachable_does_not_block_downgrade() {
+        let producer = r#"
+name: CI
+on:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/build
+"#;
+        let yaml = consumer(&format!(
+            "{CROSS_RUN_DOWNLOAD}      - run: cat dist/coverage.json\n"
+        ));
+        let result = analyze(producer, &yaml);
+        assert!(result.findings.is_empty(), "{:?}", result.findings);
+        assert_eq!(
+            result.unproven_consumers.len(),
+            1,
+            "only fork-reachable producer uncertainty blocks the downgrade"
         );
     }
 
@@ -2453,11 +2771,52 @@ jobs:
             build_model(Path::new(".github/workflows/deploy.yml"), &yaml, 1),
         ];
         assert!(models[1].steps_truncated());
+        assert_eq!(
+            models[1].truncation_reasons().collect::<Vec<_>>(),
+            vec![WorkflowTruncationReason::StepBudgetExhausted]
+        );
         let result = analyze_repository(&models, true);
         assert!(result.findings.is_empty());
         assert!(
             result.unproven_consumers.is_empty(),
             "a truncated model must never claim the absence of a chain"
+        );
+    }
+
+    #[test]
+    fn workflow_structural_truncation_reasons_are_exact() {
+        let jobs = (0..=MAX_JOBS_PER_WORKFLOW)
+            .map(|index| format!(r#""job-{index}":{{"steps":[]}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let job_limited = build_model(
+            Path::new(".github/workflows/jobs.json"),
+            &format!(r#"{{"jobs":{{{jobs}}}}}"#),
+            MAX_TOTAL_STEPS,
+        );
+        assert!(job_limited.steps_truncated());
+        assert_eq!(
+            job_limited.truncation_reasons().collect::<Vec<_>>(),
+            vec![WorkflowTruncationReason::JobBudgetExhausted]
+        );
+
+        let upload_steps = (0..=MAX_UPLOADS_PER_WORKFLOW)
+            .map(|index| {
+                format!(
+                    r#"{{"uses":"actions/upload-artifact@v4","with":{{"name":"build-{index}","path":"dist"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let upload_limited = build_model(
+            Path::new(".github/workflows/uploads.json"),
+            &format!(r#"{{"jobs":{{"build":{{"steps":[{upload_steps}]}}}}}}"#),
+            MAX_TOTAL_STEPS,
+        );
+        assert!(upload_limited.steps_truncated());
+        assert_eq!(
+            upload_limited.truncation_reasons().collect::<Vec<_>>(),
+            vec![WorkflowTruncationReason::UploadBudgetExhausted]
         );
     }
 
@@ -2741,6 +3100,59 @@ jobs:
             "{CROSS_RUN_DOWNLOAD}      - run: cat dist/coverage.json\n      - run: ls -la dist\n"
         ));
         assert_eq!(analyze(PRODUCER, &inert).unproven_consumers.len(), 1);
+    }
+
+    #[test]
+    fn find_execution_mutation_and_unknown_actions_block_the_downgrade() {
+        for command in [
+            "find dist -type f -exec {} +",
+            "find dist -type f -execdir sh {} +",
+            "find dist -type f -ok cat {} ;",
+            "find dist -type f -okdir cat {} ;",
+            "find dist -type f -delete",
+            "find dist -type f -fprint files.txt",
+            "find dist -type f -fprint0 files.bin",
+            "find dist -type f -fprintf files.txt '%p\\n'",
+            "find dist -type f -fls files.txt",
+            "find dist -type f -unknown-action",
+            "find <(bash dist/install.sh) -print",
+        ] {
+            let yaml = consumer(&format!("{CROSS_RUN_DOWNLOAD}      - run: {command}\n"));
+            let result = analyze(PRODUCER, &yaml);
+            assert!(
+                result.findings.is_empty(),
+                "{command}: {:?}",
+                result.findings
+            );
+            assert!(
+                result.unproven_consumers.is_empty(),
+                "a side-effecting or unknown find action must block the downgrade: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn proven_read_only_find_remains_downgradable() {
+        for command in [
+            "find dist -type f -print",
+            "find -L dist -maxdepth 2 -name '*.json' -printf '%p\\n'",
+            "find -D search -O2 dist -newermt 2024-01-01 -print0",
+            "find dist -name -exec -print",
+            "find dist ! -empty -a -readable -ls",
+        ] {
+            let yaml = consumer(&format!("{CROSS_RUN_DOWNLOAD}      - run: {command}\n"));
+            let result = analyze(PRODUCER, &yaml);
+            assert!(
+                result.findings.is_empty(),
+                "{command}: {:?}",
+                result.findings
+            );
+            assert_eq!(
+                result.unproven_consumers.len(),
+                1,
+                "a proven read-only find must remain inert: {command}"
+            );
+        }
     }
 
     #[test]

@@ -260,6 +260,103 @@ pub struct RecordedCapsuleReceipt {
     pub anchor_warning: Option<String>,
 }
 
+/// A receipt destination bound to its retained parent before the project scan.
+/// If it is inside the source tree, [`Self::project_exclusion`] names exactly
+/// that one relative file so the receipt cannot become part of its own subject.
+pub struct PreparedCapsuleReceipt {
+    requested: Option<PreparedRequestedReceipt>,
+}
+
+struct PreparedRequestedReceipt {
+    path: PathBuf,
+    reported_path: PathBuf,
+    destination: crate::util::ContainedAtomicFile,
+    project_exclusion: Option<PathBuf>,
+}
+
+impl PreparedCapsuleReceipt {
+    /// Retain the requested destination parent, creating missing parents
+    /// capability-relatively, before any tree bytes are scanned.
+    pub fn prepare(
+        requested_path: Option<&Path>,
+        project_root: Option<&Path>,
+    ) -> Result<Self, CapsuleReceiptError> {
+        let requested = requested_path
+            .map(|path| {
+                let reported_path = path.to_path_buf();
+                let path = absolute_path(path).map_err(CapsuleReceiptError::Io)?;
+                let anchor = filesystem_anchor(&path).ok_or_else(|| {
+                    CapsuleReceiptError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "receipt path has no filesystem root",
+                    ))
+                })?;
+                let destination = crate::util::ContainedAtomicFile::prepare(&anchor, &path, true)
+                    .map_err(CapsuleReceiptError::Io)?;
+                match destination.read_capped(0) {
+                    Ok(_) | Err(crate::util::OpenRegularError::TooLarge) => {}
+                    Err(crate::util::OpenRegularError::NotFound) => {}
+                    Err(crate::util::OpenRegularError::NotRegularFile) => {
+                        return Err(CapsuleReceiptError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "receipt destination exists but is not a regular file",
+                        )))
+                    }
+                    Err(crate::util::OpenRegularError::Io(error)) => {
+                        return Err(CapsuleReceiptError::Io(error))
+                    }
+                }
+                let project_exclusion = project_root
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .filter(|relative| {
+                        !relative.as_os_str().is_empty()
+                            && relative.components().all(|component| {
+                                matches!(component, std::path::Component::Normal(_))
+                            })
+                    })
+                    .map(Path::to_path_buf);
+                Ok(PreparedRequestedReceipt {
+                    path,
+                    reported_path,
+                    destination,
+                    project_exclusion,
+                })
+            })
+            .transpose()?;
+        Ok(Self { requested })
+    }
+
+    /// The one project-relative file omitted from the capsule copy.
+    pub fn project_exclusion(&self) -> Option<&Path> {
+        self.requested
+            .as_ref()
+            .and_then(|requested| requested.project_exclusion.as_deref())
+    }
+}
+
+fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn filesystem_anchor(path: &Path) -> Option<PathBuf> {
+    let mut anchor = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+            std::path::Component::RootDir => {
+                anchor.push(component.as_os_str());
+                return Some(anchor);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Everything the constructor needs. Grouped so the assembly site reads as one
 /// record rather than a fourteen-argument call.
 #[derive(Debug, Clone)]
@@ -499,16 +596,40 @@ impl CapsuleRunReceipt {
         requested_path: Option<&Path>,
     ) -> Result<RecordedCapsuleReceipt, CapsuleReceiptError> {
         self.validate()?;
+        let prepared = PreparedCapsuleReceipt::prepare(requested_path, None)?;
+        self.record_prepared(&prepared)
+    }
+
+    /// Save using a destination retained since before the project scan. Every
+    /// publication is immediately re-read through that same parent capability
+    /// and compared byte-for-byte before success can be reported.
+    pub fn record_prepared(
+        &self,
+        prepared: &PreparedCapsuleReceipt,
+    ) -> Result<RecordedCapsuleReceipt, CapsuleReceiptError> {
+        self.validate()?;
         let json = serde_json::to_string_pretty(self).map_err(|error| {
             CapsuleReceiptError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
         })?;
+        if json.len() > MAX_CAPSULE_RECEIPT_BYTES {
+            return Err(CapsuleReceiptError::Invalid(format!(
+                "serialized receipt exceeds the {MAX_CAPSULE_RECEIPT_BYTES}-byte limit"
+            )));
+        }
 
         let mut store_path = None;
         if let Some(directory) = capsule_receipts_dir() {
-            crate::util::create_dir_durable(&directory).map_err(CapsuleReceiptError::Io)?;
-            let path = directory.join(format!("{}.json", self.receipt_id));
-            crate::util::write_file_atomic_0600(&path, json.as_bytes())
+            let path = absolute_path(&directory.join(format!("{}.json", self.receipt_id)))
                 .map_err(CapsuleReceiptError::Io)?;
+            let anchor = filesystem_anchor(&path).ok_or_else(|| {
+                CapsuleReceiptError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "receipt store path has no filesystem root",
+                ))
+            })?;
+            let destination = crate::util::ContainedAtomicFile::prepare(&anchor, &path, true)
+                .map_err(CapsuleReceiptError::Io)?;
+            publish_and_verify(&destination, &path, json.as_bytes())?;
             store_path = Some(path);
         }
 
@@ -523,10 +644,9 @@ impl CapsuleRunReceipt {
         };
 
         let mut written_requested = None;
-        if let Some(path) = requested_path {
-            crate::util::write_file_atomic_0600(path, json.as_bytes())
-                .map_err(CapsuleReceiptError::Io)?;
-            written_requested = Some(path.to_path_buf());
+        if let Some(requested) = &prepared.requested {
+            publish_and_verify(&requested.destination, &requested.path, json.as_bytes())?;
+            written_requested = Some(requested.reported_path.clone());
         }
 
         Ok(RecordedCapsuleReceipt {
@@ -537,6 +657,45 @@ impl CapsuleRunReceipt {
             anchor_warning,
         })
     }
+}
+
+fn publish_and_verify(
+    destination: &crate::util::ContainedAtomicFile,
+    visible_path: &Path,
+    bytes: &[u8],
+) -> Result<(), CapsuleReceiptError> {
+    destination
+        .write_atomic(bytes, true)
+        .map_err(CapsuleReceiptError::Io)?;
+    let cap = u64::try_from(MAX_CAPSULE_RECEIPT_BYTES).unwrap_or(u64::MAX);
+    let visible = destination.read_capped(cap).map_err(|error| {
+        CapsuleReceiptError::Io(std::io::Error::other(format!(
+            "verify published capsule receipt: {error:?}"
+        )))
+    })?;
+    if visible != bytes {
+        return Err(CapsuleReceiptError::Io(std::io::Error::other(
+            "published capsule receipt did not read back byte-for-byte",
+        )));
+    }
+    let mut visible_file =
+        crate::util::open_read_no_follow_capped(visible_path, cap).map_err(|error| {
+            CapsuleReceiptError::Io(std::io::Error::other(format!(
+                "verify visible capsule receipt: {error:?}"
+            )))
+        })?;
+    use std::io::Read as _;
+    let mut visible_bytes = Vec::new();
+    (&mut visible_file)
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut visible_bytes)
+        .map_err(CapsuleReceiptError::Io)?;
+    if visible_bytes != bytes {
+        return Err(CapsuleReceiptError::Io(std::io::Error::other(
+            "visible capsule receipt did not read back byte-for-byte",
+        )));
+    }
+    Ok(())
 }
 
 /// What an absolute host path becomes in a durable receipt.
@@ -671,6 +830,69 @@ mod tests {
         assert_eq!(receipt.receipt_id.len(), 64);
         assert!(receipt.content_hash_matches());
         receipt.validate().expect("a coherent receipt validates");
+    }
+
+    #[test]
+    fn in_project_receipt_parent_is_prepared_and_exclusion_is_exact() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let project = base.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        let requested = project.join("receipts/run.json");
+        let prepared = PreparedCapsuleReceipt::prepare(Some(&requested), Some(&project))
+            .expect("prepare retained parent");
+
+        assert_eq!(
+            prepared.project_exclusion(),
+            Some(Path::new("receipts/run.json"))
+        );
+        assert!(project.join("receipts").is_dir());
+    }
+
+    #[test]
+    fn a_directory_cannot_become_a_broad_receipt_exclusion() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let project = base.path().join("project");
+        let requested = project.join("receipts/run.json");
+        std::fs::create_dir_all(&requested).expect("directory at requested leaf");
+
+        let error = match PreparedCapsuleReceipt::prepare(Some(&requested), Some(&project)) {
+            Err(error) => error,
+            Ok(_) => panic!("non-file receipt leaf must refuse"),
+        };
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn publication_requires_immediate_retained_and_visible_readback() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let project = base.path().join("project");
+        std::fs::create_dir_all(project.join("receipts")).expect("receipt parent");
+        let requested = project.join("receipts/run.json");
+        let prepared = PreparedCapsuleReceipt::prepare(Some(&requested), Some(&project))
+            .expect("prepare retained parent");
+        let requested_capability = prepared.requested.as_ref().expect("requested capability");
+        publish_and_verify(
+            &requested_capability.destination,
+            &requested_capability.path,
+            b"receipt-one",
+        )
+        .expect("matching readback succeeds");
+
+        let retained_parent = project.join("receipts-retained");
+        std::fs::rename(project.join("receipts"), &retained_parent).expect("swap parent");
+        std::fs::create_dir(project.join("receipts")).expect("visible replacement");
+        let error = publish_and_verify(
+            &requested_capability.destination,
+            &requested_capability.path,
+            b"receipt-two",
+        )
+        .expect_err("hidden publication cannot report success");
+        assert!(error.to_string().contains("visible capsule receipt"));
+        assert_eq!(
+            std::fs::read(retained_parent.join("run.json")).expect("retained publication"),
+            b"receipt-two"
+        );
+        assert!(!requested.exists());
     }
 
     #[test]
