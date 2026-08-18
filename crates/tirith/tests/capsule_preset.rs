@@ -426,7 +426,10 @@ fn an_unwritable_receipt_path_is_reported_and_never_reads_as_success() {
     // asked for a file and it could not be written, the command must say so
     // rather than print a receipt id over nothing.
     let fixture = fixture();
-    let unwritable = fixture.project.join("no-such-directory").join("run.json");
+    let non_directory = fixture.project.join("not-a-directory");
+    std::fs::write(&non_directory, "blocks receipt parent creation\n")
+        .expect("write non-directory parent");
+    let unwritable = non_directory.join("run.json");
     let (code, value) = run_json(
         &fixture,
         &[

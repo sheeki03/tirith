@@ -568,7 +568,7 @@ mod tests {
         let link = dir.path().join("policy.yaml");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let err = update_policy_guard_key(&link, true).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "do not touch\n");
     }
 

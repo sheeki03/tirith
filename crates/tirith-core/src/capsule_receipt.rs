@@ -632,8 +632,10 @@ impl CapsuleRunReceipt {
 
         let mut store_path = None;
         if let Some(directory) = capsule_receipts_dir() {
-            let path = absolute_path(&directory.join(format!("{}.json", self.receipt_id)))
-                .map_err(CapsuleReceiptError::Io)?;
+            let path = crate::capsule_project::trusted_platform_root_alias(
+                &absolute_path(&directory.join(format!("{}.json", self.receipt_id)))
+                    .map_err(CapsuleReceiptError::Io)?,
+            );
             let anchor = filesystem_anchor(&path).ok_or_else(|| {
                 CapsuleReceiptError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,

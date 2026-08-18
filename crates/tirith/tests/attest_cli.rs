@@ -9,14 +9,14 @@
 //!
 //! ```text
 //! <CARGO_TARGET_TMPDIR>/attest-c18/<pid>-<n>/
-//!   project/.git/        an empty marker directory, excluded from every digest
+//!   .git/                a real containing repository with an empty commit
 //!   project/src/...      the source tree
 //!   project/dist/...     the output tree
 //! ```
 //!
-//! `CARGO_TARGET_TMPDIR` is inside this repository, and an empty `.git` is not a
-//! repository, so git walks UP and answers with tirith's own HEAD. That is git's
-//! real behavior from a subdirectory and the receipt records it honestly through
+//! The fixture owns its containing repository rather than assuming
+//! `CARGO_TARGET_TMPDIR` lives under tirith's checkout. Git therefore resolves a
+//! real HEAD from `project/`, and the receipt records it honestly through
 //! `source_is_repository_root: false`, which the build test pins.
 //!
 //! Nothing is written outside `CARGO_TARGET_TMPDIR`.
@@ -46,7 +46,7 @@ impl Sandbox {
             ));
         // A previous run of the same pid slot must not leak into this one.
         let _ = fs::remove_dir_all(&root);
-        for relative in ["project/.git", "project/src", "project/dist"] {
+        for relative in ["project/src", "project/dist"] {
             fs::create_dir_all(root.join(relative)).expect("create sandbox directory");
         }
         fs::create_dir_all(root.join("config")).expect("create the isolated config directory");
@@ -55,7 +55,35 @@ impl Sandbox {
         sandbox.write("src/lib.rs", "pub fn hello() {}\n");
         sandbox.write("dist/index.html", "<html>built</html>\n");
         sandbox.write("dist/app.js", "console.log(1)\n");
+        sandbox.initialize_containing_repository();
         sandbox
+    }
+
+    fn initialize_containing_repository(&self) {
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&self.root)
+            .status()
+            .expect("run git init for the fixture");
+        assert!(initialized.success(), "initialize fixture repository");
+
+        let committed = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args([
+                "-c",
+                "user.name=Tirith Test",
+                "-c",
+                "user.email=tirith@example.invalid",
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "fixture root",
+            ])
+            .status()
+            .expect("create fixture commit");
+        assert!(committed.success(), "create fixture repository commit");
     }
 
     fn project(&self) -> PathBuf {

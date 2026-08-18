@@ -8784,6 +8784,32 @@ fn package_explain_json_carries_factor_breakdown() {
 
 // `tirith scan` directory walk — picks up every scannable file type.
 
+fn pdf_with_valid_xref_and_malformed_content() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>\nendobj\n",
+        // The active xref, object envelope, and direct stream length are all
+        // valid. The unterminated content-array operand is deliberately an
+        // analyzer failure, after preflight and lopdf document parsing.
+        b"4 0 obj\n<< /Length 4 >>\nstream\nBT\n[\nendstream\nendobj\n",
+    ] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 #[test]
 fn malformed_pdf_reports_analyzer_incompleteness_for_file_directory_and_stdin_json() {
     use std::io::Write as _;
@@ -8791,19 +8817,34 @@ fn malformed_pdf_reports_analyzer_incompleteness_for_file_directory_and_stdin_js
 
     let project = tempfile::tempdir().expect("project tempdir");
     let pdf = project.path().join("malformed.pdf");
-    let bytes = b"%PDF-1.7\nnot a structurally valid PDF\n";
-    fs::write(&pdf, bytes).expect("write malformed PDF");
+    let bytes = pdf_with_valid_xref_and_malformed_content();
+    fs::write(&pdf, &bytes).expect("write malformed PDF");
 
     let file_output = tirith()
-        .args(["scan", "--format", "json", "--file", pdf.to_str().unwrap()])
+        .args([
+            "scan",
+            "--format",
+            "json",
+            "--fail-on",
+            "high",
+            "--file",
+            pdf.to_str().unwrap(),
+        ])
         .output()
         .expect("scan malformed PDF file");
     let directory_output = tirith()
-        .args(["scan", "--format", "json", project.path().to_str().unwrap()])
+        .args([
+            "scan",
+            "--format",
+            "json",
+            "--fail-on",
+            "high",
+            project.path().to_str().unwrap(),
+        ])
         .output()
         .expect("scan directory containing malformed PDF");
     let mut stdin_child = tirith()
-        .args(["scan", "--format", "json", "--stdin"])
+        .args(["scan", "--format", "json", "--fail-on", "high", "--stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -8812,7 +8853,7 @@ fn malformed_pdf_reports_analyzer_incompleteness_for_file_directory_and_stdin_js
         .stdin
         .take()
         .expect("stdin pipe")
-        .write_all(bytes)
+        .write_all(&bytes)
         .expect("write malformed PDF to stdin");
     let stdin_output = stdin_child.wait_with_output().expect("wait for stdin scan");
 
@@ -8853,7 +8894,7 @@ fn malformed_pdf_reports_analyzer_incompleteness_for_file_directory_and_stdin_js
     }
 
     let human = tirith()
-        .args(["scan", "--file", pdf.to_str().unwrap()])
+        .args(["scan", "--fail-on", "high", "--file", pdf.to_str().unwrap()])
         .output()
         .expect("scan malformed PDF for human output");
     assert_eq!(human.status.code(), Some(1));
@@ -8866,7 +8907,15 @@ fn malformed_pdf_reports_analyzer_incompleteness_for_file_directory_and_stdin_js
     assert!(!human_stderr.contains("no issues found"), "{human_stderr}");
 
     let sarif_output = tirith()
-        .args(["scan", "--format", "sarif", "--file", pdf.to_str().unwrap()])
+        .args([
+            "scan",
+            "--format",
+            "sarif",
+            "--fail-on",
+            "high",
+            "--file",
+            pdf.to_str().unwrap(),
+        ])
         .output()
         .expect("scan malformed PDF for SARIF output");
     assert_eq!(sarif_output.status.code(), Some(1));
