@@ -185,7 +185,7 @@ fn assessment_writes_nothing_into_a_clean_home() {
 
 /// C11's exit gate: the core, CLI, and MCP views of one assessment must be the
 /// same normalized projection. This pins the CLI end of that to
-/// `task::decision_projection`; the MCP end is pinned by
+/// `task::document_decision_projection`; the MCP end is pinned by
 /// `mcp::tools::c11_preview_tests::the_mcp_projection_is_the_shared_one`.
 ///
 /// Without this, the two surfaces drift the moment someone adds a field to one
@@ -200,8 +200,9 @@ fn the_cli_prints_the_shared_projection() {
     let (_, stdout, _) = run_stdin(envelope_text, &["--format", "json"]);
     let printed: serde_json::Value = serde_json::from_str(&stdout).expect("json output");
 
-    let envelope = tirith_core::task::parse_envelope(envelope_text).expect("parse");
-    let rejections = tirith_core::task::validate_envelope(&envelope);
+    let document = tirith_core::task::parse_envelope_document(envelope_text).expect("parse");
+    let envelope = &document.envelope;
+    let rejections = tirith_core::task::validate_envelope(envelope);
     let policy = tirith_core::policy::Policy::discover_local_only(None);
     let provenance = envelope
         .sources
@@ -215,15 +216,38 @@ fn the_cli_prints_the_shared_projection() {
             )
         })
         .collect::<Vec<_>>();
-    let decision = tirith_core::task::decide(
-        &envelope,
+    let decision = tirith_core::task::decide_document(
+        &document,
         provenance,
         &policy.task_gate,
         tirith_core::effects::BoundaryCapability::ObserveOnly,
+        None,
     );
     assert_eq!(
         printed,
-        tirith_core::task::decision_projection(&decision, &rejections),
+        tirith_core::task::document_decision_projection(&document, &decision, &rejections),
         "the CLI rendered its own projection instead of the shared one"
     );
+}
+
+#[test]
+fn v2_shell_claims_are_visible_but_never_authoritative() {
+    let envelope = r#"{
+        "version": 2,
+        "task_id": "task-cli-v2-shell-claims",
+        "actions": [
+            {"shell": {"command": "cast call 0xabc 'x()'", "claimed_shell": "fish"}},
+            {"shell": {"command": "Write-Output ok", "claimed_shell": "powershell"}}
+        ]
+    }"#;
+    let (code, stdout, _) = run_stdin(envelope, &["--format", "json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json output");
+    assert_eq!(json["envelope_version"], 2);
+    assert_eq!(
+        json["shell_dialect_claims"],
+        serde_json::json!(["fish", "power_shell"])
+    );
+    assert_eq!(json["shell_dialect_claims_authoritative"], false);
+    assert_eq!(json["complete"], false);
+    assert_eq!(code, 1);
 }

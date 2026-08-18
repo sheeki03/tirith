@@ -535,11 +535,11 @@ Examples:
   tirith pkg verify-env --target .venv requests flask
   tirith pkg receipt list
 
-`tirith pkg install` is the ENFORCING path (contained, hash-pinned, and supported
-only on x86_64 Linux). Every other platform or architecture refuses before pip
-executes. This platform limit applies only to enforcing execution: `pkg approve`
-does not install, `pkg verify-env` only verifies an existing tree, and
-`tirith install` remains the analysis path.")]
+`tirith pkg approve` native approval issuance and `tirith pkg install` enforcing
+execution are supported only on x86_64 Linux. Other platforms and architectures
+fail closed instead of issuing an approval that cannot be redeemed. `pkg
+verify-env` remains a read-only verifier, and `tirith install` remains the
+portable analysis path.")]
     Pkg {
         #[command(subcommand)]
         action: PkgAction,
@@ -2656,8 +2656,8 @@ Examples:
     #[cfg_attr(
         unix,
         command(after_help = "\
-A command card is an ed25519-signed attestation of what a command DOES: the
-exact command string, the domains it should contact, the SHA-256 of any script
+A command card is an ed25519-signed attestation of what a command DOES: a
+shell-bound digest of the exact command, the domains it should contact, the SHA-256 of any script
 it pipes, the paths it writes, whether it needs sudo, and an expiry date. A
 maintainer publishes a card next to their install one-liner; a user verifies
 the card against the command they are about to run.
@@ -2696,15 +2696,15 @@ Subcommands:
 Examples:
   tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' \\
     --expected-domain example.com --writes /usr/local/bin/example > install-card.json
-  tirith command-card sign --key ed25519-priv.bin install-card.json
+  tirith command-card sign --key ed25519-priv.bin --command 'curl -fsSL https://example.com/install.sh | sh' install-card.json
   tirith command-card verify install-card.json
   tirith command-card fetch https://example.com/install-card.json")
     )]
     #[cfg_attr(
         not(unix),
         command(after_help = "\
-A command card is an ed25519-signed attestation of what a command DOES: the
-exact command string, the domains it should contact, the SHA-256 of any script
+A command card is an ed25519-signed attestation of what a command DOES: a
+shell-bound digest of the exact command, the domains it should contact, the SHA-256 of any script
 it pipes, the paths it writes, whether it needs sudo, and an expiry date. A
 maintainer publishes a card next to their install one-liner; a user verifies
 the card against the command they are about to run.
@@ -2739,7 +2739,7 @@ Subcommands:
 Examples:
   tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' \\
     --expected-domain example.com --writes /usr/local/bin/example > install-card.json
-  tirith command-card sign --key ed25519-priv.bin install-card.json
+  tirith command-card sign --key ed25519-priv.bin --command 'curl -fsSL https://example.com/install.sh | sh' install-card.json
   tirith command-card verify install-card.json")
     )]
     CommandCard {
@@ -3994,7 +3994,9 @@ enum CommandCardAction {
     #[command(after_help = "\
 Flag-driven when --command is supplied; otherwise prompts for the command on
 the terminal. The card is printed as pretty JSON on stdout, so you can redirect
-it to a file. Sign it next with `tirith command-card sign`.
+it to a file. New cards store only a shell-bound command digest; the raw command
+and credential paths are never persisted. Raw private keys, mnemonics, and raw
+keypairs are refused. Sign the card next with `tirith command-card sign`.
 
 If --expires is omitted, the card expires 90 days from today.
 
@@ -4003,18 +4005,22 @@ Examples:
   tirith command-card create --command 'sh ./setup.sh' --requires-sudo --writes /etc/foo
   tirith command-card create --command 'x' --expected-domain example.com --expected-domain github.com/example/project")]
     Create {
-        /// The exact command the card attests to. Prompts if omitted.
+        /// The exact command to digest and attest to. Prompts if omitted; the
+        /// raw value is not stored in newly-created cards.
         #[arg(long)]
         command: Option<String>,
+        /// Shell dialect under which the command will execute.
+        #[arg(long, default_value = "posix")]
+        shell: String,
         /// A domain (or host/path prefix) the command is expected to contact.
         /// Repeatable.
         #[arg(long = "expected-domain")]
         expected_domain: Vec<String>,
         /// SHA-256 (hex) of the script the command downloads/pipes, if any.
-        /// RECORDED-BUT-NOT-ENFORCED in v1: it is part of the signed
+        /// RECORDED-BUT-NOT-ENFORCED: it is part of the signed
         /// attestation, but `tirith check` does NOT fetch the script to compare
         /// it (the hot path never makes network calls). v1 verifies only the
-        /// signature, expiry, and exact command.
+        /// signature, expiry, and shell-bound command digest.
         #[arg(long)]
         script_sha256: Option<String>,
         /// A filesystem path the command is expected to write. Repeatable.
@@ -4040,14 +4046,26 @@ Reads the card JSON, signs the canonical (signature-cleared) payload with the
 supplied ed25519 private key, and rewrites the file with the `signature` block
 populated (algo, key_id, hex value). The key file may be 32 raw bytes, hex, or
 base64. The key_id stamped on the card is the first 16 hex chars of
-sha256(public-key).
+sha256(public-key). Unsigned legacy cards are migrated in place to the
+privacy-safe shell-bound command-digest schema before signing.
+
+Schema-3 cards require `--command` at signing time. Tirith verifies it against
+the stored digest before producing a signature and never writes it to the card.
 
 Examples:
-  tirith command-card sign --key ed25519-priv.bin install-card.json")]
+  tirith command-card sign --key ed25519-priv.bin --command 'sh ./setup.sh' install-card.json")]
     Sign {
         /// Path to the ed25519 private key (32 raw bytes, hex, or base64).
         #[arg(long)]
         key: String,
+        /// Shell dialect to bind when promoting schema v1 or migrating a
+        /// legacy schema-v2 Web3 card that has no shell binding.
+        #[arg(long, default_value = "posix")]
+        shell: String,
+        /// Re-supply the reviewed command when signing a privacy-safe card.
+        /// Required for schema 3 so the signer verifies the opaque digest.
+        #[arg(long)]
+        command: Option<String>,
         /// Path to the card JSON to sign in place.
         card: String,
         /// Output format (default: human).
@@ -5815,12 +5833,15 @@ impl PkgEcosystem {
 
 #[derive(Subcommand)]
 enum PkgAction {
-    /// Resolve + inspect a requirement set and approve its install plan, printing
-    /// the plan digest the approval binds to. Does NOT install.
+    /// Resolve + inspect a requirement set and approve its install plan through
+    /// the x86_64 Linux native authority. Does NOT install.
     #[command(after_help = "\
 Examples:
   tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
-  tirith pkg approve pip flask --target .venv")]
+  tirith pkg approve pip flask --target .venv
+
+Native approval issuance is available only on x86_64 Linux. Unsupported
+platforms fail closed before publishing an approval record.")]
     Approve {
         /// The ecosystem (only `pip` is enforced).
         #[arg(value_enum)]
@@ -9404,6 +9425,7 @@ fn run() {
         Commands::CommandCard { action } => match action {
             CommandCardAction::Create {
                 command,
+                shell,
                 expected_domain,
                 script_sha256,
                 writes,
@@ -9413,24 +9435,61 @@ fn run() {
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::command_card::create(
-                    command,
-                    expected_domain,
-                    script_sha256,
-                    writes,
-                    requires_sudo,
-                    expires,
-                    json,
-                )
+                match shell.parse::<tirith_core::tokenize::ShellType>() {
+                    Ok(shell) => cli::command_card::create(
+                        command,
+                        shell,
+                        expected_domain,
+                        script_sha256,
+                        writes,
+                        requires_sudo,
+                        expires,
+                        json,
+                    ),
+                    Err(error) => {
+                        if json {
+                            let _ = cli::write_json_stdout(
+                                &serde_json::json!({ "error": error }),
+                                "tirith command-card create: failed to write JSON output",
+                            );
+                        } else {
+                            eprintln!(
+                                "tirith command-card create: {}",
+                                cli::sanitize_for_human_output(&error, false)
+                            );
+                        }
+                        2
+                    }
+                }
             }
             CommandCardAction::Sign {
                 key,
+                shell,
+                command,
                 card,
                 format,
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::command_card::sign(&key, &card, json)
+                match shell.parse::<tirith_core::tokenize::ShellType>() {
+                    Ok(shell) => {
+                        cli::command_card::sign(&key, &card, command.as_deref(), shell, json)
+                    }
+                    Err(error) => {
+                        if json {
+                            let _ = cli::write_json_stdout(
+                                &serde_json::json!({ "error": error }),
+                                "tirith command-card sign: failed to write JSON output",
+                            );
+                        } else {
+                            eprintln!(
+                                "tirith command-card sign: {}",
+                                cli::sanitize_for_human_output(&error, false)
+                            );
+                        }
+                        2
+                    }
+                }
             }
             CommandCardAction::Verify { card, format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);

@@ -27,6 +27,41 @@ pub struct CloakingResult {
     pub diff_pairs: Vec<DiffPair>,
 }
 
+/// A completed cloaking check together with the exact owned-boundary decision
+/// that authorized its network transaction.
+#[cfg(unix)]
+pub struct AuthorizedCloakingResult {
+    pub result: CloakingResult,
+    pub assessment: crate::task_boundary::BoundaryAssessment,
+}
+
+/// A cloaking failure that retains any boundary assessment already reached.
+/// Syntax failures occur before an assessment exists; policy denials and
+/// post-authorization network failures retain it for structured output.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct CloakingCheckError {
+    message: String,
+    assessment: Option<Box<crate::task_boundary::BoundaryAssessment>>,
+}
+
+#[cfg(unix)]
+impl CloakingCheckError {
+    pub fn assessment(&self) -> Option<&crate::task_boundary::BoundaryAssessment> {
+        self.assessment.as_deref()
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for CloakingCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for CloakingCheckError {}
+
 #[cfg(unix)]
 pub struct AgentResponse {
     pub agent_name: String,
@@ -140,9 +175,111 @@ impl CloakingResult {
     }
 }
 
-/// Check a URL for server-side cloaking.
+/// Check a URL for server-side cloaking under the frozen operator task gate.
+///
+/// The boundary binding performs syntax-only URL validation. The typed permit
+/// is consumed before `network` is invoked, so an enforcing refusal cannot
+/// reach DNS resolution, client construction, or a socket. The ordered
+/// [`USER_AGENTS`] set is included in the operation binding and is therefore
+/// authorized as one fixed multi-request probe transaction.
 #[cfg(unix)]
-pub fn check(url: &str) -> Result<CloakingResult, String> {
+pub fn check(
+    url: &str,
+    gate: &crate::web3_policy::TaskGatePolicy,
+) -> Result<CloakingResult, String> {
+    authorize_then_check(url, gate, check_network)
+}
+
+/// Check with an explicit audit sink. The callback runs exactly once for every
+/// recordable assessment, after the policy decision and before target DNS on
+/// allows, or after the refusal on denies. It never runs in Off mode.
+#[cfg(unix)]
+pub fn check_with_audit(
+    url: &str,
+    gate: &crate::web3_policy::TaskGatePolicy,
+    audit: impl FnMut(&crate::task_boundary::BoundaryAssessment),
+) -> Result<AuthorizedCloakingResult, CloakingCheckError> {
+    authorize_then_check_with_audit(url, gate, check_network, audit)
+        .map(|(result, assessment)| AuthorizedCloakingResult { result, assessment })
+}
+
+#[cfg(unix)]
+fn authorize_then_check<T>(
+    url: &str,
+    gate: &crate::web3_policy::TaskGatePolicy,
+    network: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    authorize_then_check_with_audit(url, gate, network, |_| {})
+        .map(|(result, _assessment)| result)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn authorize_then_check_with_audit<T>(
+    url: &str,
+    gate: &crate::web3_policy::TaskGatePolicy,
+    network: impl FnOnce(&str) -> Result<T, String>,
+    mut audit: impl FnMut(&crate::task_boundary::BoundaryAssessment),
+) -> Result<(T, crate::task_boundary::BoundaryAssessment), CloakingCheckError> {
+    let binding = crate::task_boundary::fetch_cloaking_operation_binding(url, USER_AGENTS)
+        .map_err(|message| CloakingCheckError {
+            message,
+            assessment: None,
+        })?;
+    let operation = binding.operation();
+    let pending = match crate::task_boundary::prepare_locally_derived_boundary_authorization::<
+        crate::task_boundary::FetchCloakingBoundary,
+    >(
+        &operation,
+        gate,
+        &crate::task_analysis::TaskAnalysisContext::default(),
+    ) {
+        Ok(pending) => pending,
+        Err(error) => {
+            let assessment = error.assessment().cloned();
+            if let Some(assessment) = assessment.as_ref().filter(|value| value.is_recordable()) {
+                audit(assessment);
+            }
+            return Err(CloakingCheckError {
+                message: format!("cloaking task authorization refused: {error}"),
+                assessment: assessment.map(Box::new),
+            });
+        }
+    };
+    let assessment = pending.assessment().clone();
+    let permit = match pending.consume_default_for_operation(&operation, chrono::Utc::now()) {
+        Ok(permit) => permit,
+        Err(error) => {
+            if assessment.is_recordable() {
+                audit(&assessment);
+            }
+            return Err(CloakingCheckError {
+                message: format!("cloaking task authorization refused: {error}"),
+                assessment: Some(Box::new(assessment)),
+            });
+        }
+    };
+    if let Err(error) = permit.authorize_effect_at(&operation, chrono::Utc::now()) {
+        if assessment.is_recordable() {
+            audit(&assessment);
+        }
+        return Err(CloakingCheckError {
+            message: format!("cloaking task authorization refused: {error}"),
+            assessment: Some(Box::new(assessment)),
+        });
+    }
+    if assessment.is_recordable() {
+        audit(&assessment);
+    }
+    let result = network(url).map_err(|message| CloakingCheckError {
+        message,
+        assessment: Some(Box::new(assessment.clone())),
+    })?;
+    Ok((result, assessment))
+}
+
+#[cfg(unix)]
+fn check_network(url: &str) -> Result<CloakingResult, String> {
     let validated_url = crate::url_validate::validate_fetch_url(url)?;
     let client = cloaking_client(crate::ssrf_guard::fetch_resolver())?;
 
@@ -593,13 +730,123 @@ mod tests {
     }
 
     #[test]
+    fn enforcing_network_denial_never_reaches_the_network_sink() {
+        let calls = std::cell::Cell::new(0usize);
+        let gate = crate::web3_policy::TaskGatePolicy {
+            mode: crate::web3_policy::TaskGateMode::Enforce,
+            effects_denied_for_untrusted_sources: [
+                crate::effects::CommandEffectKind::NetworkEgress,
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let result = authorize_then_check("https://example.com", &gate, |_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 0, "a denied probe reached DNS/client setup");
+    }
+
+    #[test]
+    fn off_and_observe_preserve_cloaking_probe_execution() {
+        for mode in [
+            crate::web3_policy::TaskGateMode::Off,
+            crate::web3_policy::TaskGateMode::Observe,
+        ] {
+            let calls = std::cell::Cell::new(0usize);
+            let gate = crate::web3_policy::TaskGatePolicy {
+                mode,
+                effects_denied_for_untrusted_sources: [
+                    crate::effects::CommandEffectKind::NetworkEgress,
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            };
+            authorize_then_check("https://example.com", &gate, |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls.get(), 1, "{mode:?} changed fetch behavior");
+        }
+    }
+
+    #[test]
+    fn recordable_assessments_reach_the_explicit_audit_sink_once() {
+        let calls = std::cell::Cell::new(0usize);
+        let audits = std::cell::RefCell::new(Vec::new());
+        let gate = crate::web3_policy::TaskGatePolicy {
+            mode: crate::web3_policy::TaskGateMode::Observe,
+            effects_denied_for_untrusted_sources: [
+                crate::effects::CommandEffectKind::NetworkEgress,
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let (_result, assessment) = authorize_then_check_with_audit(
+            "https://example.com",
+            &gate,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            |assessment| audits.borrow_mut().push(assessment.projection()),
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(audits.borrow().len(), 1);
+        assert_eq!(audits.borrow()[0]["boundary"], "fetch_cloaking");
+        assert_eq!(audits.borrow()[0]["mode"], "observe");
+        assert!(assessment.is_recordable());
+    }
+
+    #[test]
+    fn denied_assessment_is_audited_and_retained_without_network() {
+        let calls = std::cell::Cell::new(0usize);
+        let audits = std::cell::RefCell::new(Vec::new());
+        let gate = crate::web3_policy::TaskGatePolicy {
+            mode: crate::web3_policy::TaskGateMode::Enforce,
+            effects_denied_for_untrusted_sources: [
+                crate::effects::CommandEffectKind::NetworkEgress,
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let error = authorize_then_check_with_audit(
+            "https://example.com",
+            &gate,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            |assessment| audits.borrow_mut().push(assessment.projection()),
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 0);
+        assert_eq!(audits.borrow().len(), 1);
+        assert_eq!(audits.borrow()[0]["outcome"], "deny");
+        assert_eq!(
+            error.assessment().unwrap().boundary,
+            crate::task_boundary::OwnedBoundary::FetchCloaking
+        );
+    }
+
+    #[test]
     fn test_cloaking_rejects_localhost_target_before_fetch() {
         // Serialize with the empty-baseline test below: that test sets
         // `TIRITH_PRIVATE_FETCH_ALLOW` process-wide, which (if it overlapped)
         // would relax the very localhost rejection this test asserts.
         let _global = tirith_test_support::GlobalStateGuard::new()
             .expect("isolate process-global cloaking state");
-        match check("http://localhost/") {
+        match check(
+            "http://localhost/",
+            &crate::web3_policy::TaskGatePolicy::default(),
+        ) {
             Ok(_) => panic!("expected localhost target to be rejected"),
             Err(err) => assert!(
                 matches!(
@@ -813,7 +1060,10 @@ mod tests {
             }
         });
 
-        let result = check(&format!("http://{addr}/"));
+        let result = check(
+            &format!("http://{addr}/"),
+            &crate::web3_policy::TaskGatePolicy::default(),
+        );
         let _ = server.join();
 
         // The contract: an empty baseline is inconclusive (Err), NOT a successful

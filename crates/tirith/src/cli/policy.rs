@@ -335,21 +335,6 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
         return 1;
     }
 
-    // If we create `.tirith` on a fresh repo, its new entry in `repo_root` must be
-    // fsync'd too, or a crash could lose it — `write_file_atomic` only fsyncs
-    // `.tirith` (policy.yaml's parent), not `repo_root`. CodeRabbit R13b.
-    let tirith_dir_existed = tirith_dir.is_dir();
-    if let Err(e) = tirith_core::util::create_dir_durable(&tirith_dir) {
-        eprintln!(
-            "tirith policy init: cannot create {}: {e}",
-            tirith_dir.display()
-        );
-        return 1;
-    }
-    if !tirith_dir_existed {
-        tirith_core::util::fsync_parent_dir_logged(&tirith_dir, "policy .tirith directory");
-    }
-
     let template_body = match (template, minimal) {
         (Some(t), _) => t.body(),
         (None, true) => MINIMAL_TEMPLATE,
@@ -366,12 +351,13 @@ fn init_with_template(force: bool, minimal: bool, template: Option<PolicyTemplat
     // policy is discovered offline: a repository being initialised must not get
     // to authorise the write that creates its own policy.
     let operator_policy = tirith_core::policy::Policy::discover_local_only(cwd.as_deref());
-    if let Err(e) = super::write_config_file_permitted(
+    if let Err(e) = super::write_config_file_permitted_with_parent_creation(
         &repo_root,
         &policy_path,
         template_body.as_bytes(),
         force,
         &operator_policy,
+        true,
         true,
     ) {
         eprintln!(

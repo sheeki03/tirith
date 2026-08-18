@@ -4867,7 +4867,21 @@ mod tests {
             let command = "printf blocked";
             let policy = Policy::default();
             let verdict = block_verdict_with_allow_fallback();
-            let token = create(&verdict, &policy, command, session_id, false);
+            let prepared = prepare(&verdict, &policy, command, session_id);
+            assert_eq!(prepared.draft.decision.action, Action::Block);
+            assert!(
+                !prepared.draft.decision.requires_approval,
+                "final approval normalization must make Block terminal"
+            );
+            assert!(prepared.draft.effective_verdict.approval_fallback.is_none());
+            let token = create_shell_execution_receipt(
+                &prepared,
+                ShellReceiptChannel::Zsh,
+                true,
+                false,
+                Duration::from_secs(60),
+            )
+            .expect("create normalized block receipt");
 
             for outcome in [
                 ShellApprovalOutcome::Granted,

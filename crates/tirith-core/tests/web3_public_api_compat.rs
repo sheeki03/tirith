@@ -1,4 +1,6 @@
-use tirith_core::effects::{CommandEffects, Completeness, IncompleteReason, SourceSpan};
+use tirith_core::effects::{
+    CommandEffects, Completeness, IncompleteReason, IncompleteReasonV2, SourceSpan,
+};
 use tirith_core::rules::web3::{
     parse_web3_commands, parse_web3_commands_v2, NetworkEvidence, RpcReference, RpcReferenceV2,
     SelectorSource, SignerKind, SignerReferenceV2, Web3CommandFacts, Web3JsonDecodeError,
@@ -290,6 +292,14 @@ fn schema_v2_is_discriminated_and_old_new_wire_shapes_negotiate() {
     let legacy_wire = serde_json::to_vec(&legacy_wire).unwrap();
     let upgraded = Web3ParseResultV2::from_json_slice_bounded(&legacy_wire).unwrap();
     assert_eq!(upgraded.commands.len(), 1);
+    assert!(upgraded
+        .completeness
+        .gaps()
+        .any(|gap| gap == IncompleteReasonV2::LegacyProjectionIncomplete));
+    assert!(upgraded.commands[0]
+        .completeness
+        .gaps()
+        .any(|gap| gap == IncompleteReasonV2::LegacyProjectionIncomplete));
 
     let mut explicit_v1 = serde_json::to_value(&decoded_v1).unwrap();
     explicit_v1["schema_version"] = serde_json::json!(1);

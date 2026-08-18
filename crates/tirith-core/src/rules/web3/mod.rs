@@ -4,8 +4,14 @@
 //! intentionally deferred to later stack commits.
 
 mod config;
+mod coverage;
 mod model;
 mod parse;
+
+pub(crate) use coverage::analyze_task_coverage;
+#[cfg(test)]
+pub(crate) use model::MAX_RETAINED_RPC_PATH_MATCH_OUTCOMES;
+pub(crate) use parse::parse_web3_commands_with_occurrences_v2;
 
 pub use config::{Web3ParseContext, Web3ParseContextV2, MAX_CONTEXT_SELECTORS, MAX_SELECTOR_BYTES};
 pub use model::{

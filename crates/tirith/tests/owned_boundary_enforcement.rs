@@ -71,6 +71,57 @@ impl Workspace {
             String::from_utf8_lossy(&output.stderr).to_string(),
         )
     }
+
+    /// Run a fetch-shaped command against a closed loopback port. The explicit
+    /// private-fetch allowance makes the URL valid, while clearing every proxy
+    /// spelling ensures the control can never send bytes beyond loopback.
+    fn run_local_fetch(&self, args: &[&str]) -> (i32, String, String) {
+        let mut command = self.command();
+        command.env("TIRITH_PRIVATE_FETCH_ALLOW", "localhost");
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            command.env_remove(key);
+        }
+        let output = command.args(args).output().expect("run tirith");
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
+    /// Opt into the registry path while keeping ambient proxies out of the
+    /// experiment. Enforcing tests must refuse before this can issue HTTP.
+    fn run_online(&self, args: &[&str]) -> (i32, String, String) {
+        let mut command = self.command();
+        command.env_remove("TIRITH_OFFLINE");
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            command.env_remove(key);
+        }
+        let output = command.args(args).output().expect("run tirith");
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
 }
 
 /// Denies the one effect every guarded boundary in these tests actually has.
@@ -99,36 +150,46 @@ const DENY_PACKAGE_INSTALL: &str =
 // tirith run: deny before download
 // ---------------------------------------------------------------------------
 
-/// The runner's own URL validation ("fetch URL must use http:// or https://",
-/// `tirith-core/src/url_validate.rs`) is emitted from INSIDE
-/// `runner::run_with_verified_executor`, which is also where `download_bounded`
-/// lives. Its presence therefore proves the runner was entered; its absence,
-/// together with the task-gate message, proves it was not, and so proves no
-/// download could have been attempted.
-const RUNNER_REACHED: &str = "fetch URL must use http:// or https://";
+/// Pure URL syntax validation deliberately precedes task authorization so an
+/// invalid request can never consume a one-time receipt. The boundary controls
+/// use the same valid loopback URL on a closed port; reaching its download
+/// failure proves the authorization boundary was crossed without external I/O.
+const PURE_URL_REJECTED: &str = "fetch URL must use http:// or https://";
+const DOWNLOAD_REACHED: &str = "download failed:";
+const LOCAL_REMOTE_URL: &str = "http://localhost:0/install.sh";
 
 #[test]
-fn run_without_the_gate_reaches_the_runner() {
+fn run_without_the_gate_rejects_an_invalid_request_in_pure_preflight() {
     let workspace = Workspace::new(None);
     let (_, _, stderr) = workspace.run(&["run", "ftp://example.com/install.sh", "--no-exec"]);
     assert!(
-        stderr.contains(RUNNER_REACHED),
-        "the control must reach the runner, or the enforcing case proves nothing: {stderr}"
+        stderr.contains(PURE_URL_REJECTED),
+        "the pure preflight contract drifted: {stderr}"
     );
 }
 
 #[test]
-fn run_denies_before_the_runner_is_ever_entered() {
+fn run_without_the_gate_reaches_the_authorized_download_boundary() {
+    let workspace = Workspace::new(None);
+    let (_, _, stderr) = workspace.run_local_fetch(&["run", LOCAL_REMOTE_URL, "--no-exec"]);
+    assert!(
+        stderr.contains(DOWNLOAD_REACHED),
+        "the control never crossed the authorization boundary: {stderr}"
+    );
+}
+
+#[test]
+fn run_denies_a_valid_request_before_dns_or_download() {
     let workspace = Workspace::new(Some(DENY_NETWORK));
-    let (code, _, stderr) = workspace.run(&["run", "ftp://example.com/install.sh", "--no-exec"]);
+    let (code, _, stderr) = workspace.run_local_fetch(&["run", LOCAL_REMOTE_URL, "--no-exec"]);
     assert_eq!(code, 1);
     assert!(
         stderr.contains("task gate refused before any download"),
         "stderr: {stderr}"
     );
     assert!(
-        !stderr.contains(RUNNER_REACHED),
-        "the runner ran before the gate refused: {stderr}"
+        !stderr.contains(DOWNLOAD_REACHED),
+        "the download boundary ran before the gate refused: {stderr}"
     );
 }
 
@@ -138,28 +199,39 @@ fn run_denies_before_the_runner_is_ever_entered() {
 /// swapping two words, so the control and the enforcing case are asserted for
 /// both commands, not just for `tirith run`.
 #[test]
-fn install_url_without_the_gate_reaches_the_runner() {
+fn install_url_without_the_gate_rejects_an_invalid_request_in_pure_preflight() {
     let workspace = Workspace::new(None);
     let (_, _, stderr) = workspace.run(&["install", "--no-exec", "url", "ftp://example.com/i.sh"]);
     assert!(
-        stderr.contains(RUNNER_REACHED),
-        "the control must reach the runner, or the enforcing case proves nothing: {stderr}"
+        stderr.contains(PURE_URL_REJECTED),
+        "the pure preflight contract drifted: {stderr}"
     );
 }
 
 #[test]
-fn install_url_denies_before_the_runner_is_ever_entered() {
+fn install_url_without_the_gate_reaches_the_authorized_download_boundary() {
+    let workspace = Workspace::new(None);
+    let (_, _, stderr) =
+        workspace.run_local_fetch(&["install", "--no-exec", "url", "http://localhost:0/i.sh"]);
+    assert!(
+        stderr.contains(DOWNLOAD_REACHED),
+        "the control never crossed the authorization boundary: {stderr}"
+    );
+}
+
+#[test]
+fn install_url_denies_a_valid_request_before_dns_or_download() {
     let workspace = Workspace::new(Some(DENY_NETWORK));
     let (code, _, stderr) =
-        workspace.run(&["install", "--no-exec", "url", "ftp://example.com/i.sh"]);
+        workspace.run_local_fetch(&["install", "--no-exec", "url", "http://localhost:0/i.sh"]);
     assert_eq!(code, 1);
     assert!(
         stderr.contains("task gate refused at the remote_script_run boundary before any download"),
         "stderr: {stderr}"
     );
     assert!(
-        !stderr.contains(RUNNER_REACHED),
-        "the runner ran before the gate refused: {stderr}"
+        !stderr.contains(DOWNLOAD_REACHED),
+        "the download boundary ran before the gate refused: {stderr}"
     );
     // The refusal precedes the preflight report too, so a refused transaction
     // publishes no analysis of a URL it never fetched.
@@ -170,23 +242,24 @@ fn install_url_denies_before_the_runner_is_ever_entered() {
 }
 
 #[test]
-fn install_url_under_observe_mode_still_reaches_the_runner() {
+fn install_url_under_observe_mode_reaches_the_authorized_download_boundary() {
     let workspace = Workspace::new(Some(OBSERVE_NETWORK));
-    let (_, _, stderr) = workspace.run(&["install", "--no-exec", "url", "ftp://example.com/i.sh"]);
+    let (_, _, stderr) =
+        workspace.run_local_fetch(&["install", "--no-exec", "url", "http://localhost:0/i.sh"]);
     assert!(
-        stderr.contains(RUNNER_REACHED),
-        "observe mode enforced: {stderr}"
+        stderr.contains(DOWNLOAD_REACHED),
+        "observe mode enforced before the download boundary: {stderr}"
     );
     assert!(!stderr.contains("task gate refused"), "stderr: {stderr}");
 }
 
 #[test]
-fn run_under_observe_mode_still_reaches_the_runner() {
+fn run_under_observe_mode_reaches_the_authorized_download_boundary() {
     let workspace = Workspace::new(Some(OBSERVE_NETWORK));
-    let (_, _, stderr) = workspace.run(&["run", "ftp://example.com/install.sh", "--no-exec"]);
+    let (_, _, stderr) = workspace.run_local_fetch(&["run", LOCAL_REMOTE_URL, "--no-exec"]);
     assert!(
-        stderr.contains(RUNNER_REACHED),
-        "observe mode enforced: {stderr}"
+        stderr.contains(DOWNLOAD_REACHED),
+        "observe mode enforced before the download boundary: {stderr}"
     );
     assert!(!stderr.contains("task gate refused"), "stderr: {stderr}");
 }
@@ -194,10 +267,10 @@ fn run_under_observe_mode_still_reaches_the_runner() {
 #[test]
 fn run_with_a_populated_denial_set_but_no_mode_is_inert() {
     let workspace = Workspace::new(Some(OFF_BUT_POPULATED));
-    let (_, _, stderr) = workspace.run(&["run", "ftp://example.com/install.sh", "--no-exec"]);
+    let (_, _, stderr) = workspace.run_local_fetch(&["run", LOCAL_REMOTE_URL, "--no-exec"]);
     assert!(
-        stderr.contains(RUNNER_REACHED),
-        "a default-off gate enforced because its effect sets were filled in: {stderr}"
+        stderr.contains(DOWNLOAD_REACHED),
+        "a default-off gate enforced before the download boundary: {stderr}"
     );
 }
 
@@ -215,7 +288,23 @@ fn reached_prepare_plan(stderr: &str) -> bool {
 #[test]
 fn pkg_approve_without_the_gate_reaches_plan_preparation() {
     let workspace = Workspace::new(None);
-    let (_, _, stderr) = workspace.run(&["pkg", "approve", "pip", "requests==2.31.0"]);
+    let target = workspace.dir.path().join("approved-target");
+    let target = target.to_string_lossy();
+    let (_, _, stderr) = workspace.run(&[
+        "pkg",
+        "approve",
+        "pip",
+        "requests==2.31.0",
+        "--target",
+        &target,
+    ]);
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        assert!(
+            stderr.contains("package approvals are redeemable only on x86_64 Linux"),
+            "the native capability refusal drifted: {stderr}"
+        );
+        return;
+    }
     assert!(
         reached_prepare_plan(&stderr),
         "the control must reach prepare_plan: {stderr}"
@@ -225,8 +314,25 @@ fn pkg_approve_without_the_gate_reaches_plan_preparation() {
 #[test]
 fn pkg_approve_denies_before_any_resolver_or_quarantine_work() {
     let workspace = Workspace::new(Some(DENY_NETWORK));
-    let (code, _, stderr) = workspace.run(&["pkg", "approve", "pip", "requests==2.31.0"]);
+    let target = workspace.dir.path().join("approved-target");
+    let target = target.to_string_lossy();
+    let (code, _, stderr) = workspace.run(&[
+        "pkg",
+        "approve",
+        "pip",
+        "requests==2.31.0",
+        "--target",
+        &target,
+    ]);
     assert_eq!(code, 1);
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        assert!(
+            stderr.contains("package approvals are redeemable only on x86_64 Linux"),
+            "the native capability refusal drifted: {stderr}"
+        );
+        assert!(collect_paths(&workspace.home().join("data")).is_empty());
+        return;
+    }
     assert!(
         stderr.contains("refused before any network or install step"),
         "stderr: {stderr}"
@@ -251,22 +357,35 @@ fn pkg_approve_denies_before_any_resolver_or_quarantine_work() {
 #[test]
 fn pkg_approve_json_reports_the_refusal_as_structured_output() {
     let workspace = Workspace::new(Some(DENY_NETWORK));
+    let target = workspace.dir.path().join("approved-target");
+    let target = target.to_string_lossy();
     let (code, stdout, _) = workspace.run(&[
         "pkg",
         "approve",
         "pip",
         "requests==2.31.0",
+        "--target",
+        &target,
         "--format",
         "json",
     ]);
     assert_eq!(code, 1);
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("json output");
-    assert_eq!(json["refused"], true);
-    assert_eq!(json["stage"], "task_gate");
-    assert_eq!(json["boundary"], "package_approval");
-    // The projection is the shared one, and it says it is not a diagnostic.
-    assert_eq!(json["task_decision"]["diagnostic"], false);
-    assert_eq!(json["task_decision"]["enforceability"], "enforceable");
+    assert_eq!(json["success"], false);
+    assert_eq!(json["command"], "approve");
+    assert_eq!(
+        json["error_phase"],
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            "task_gate"
+        } else {
+            "native_authority"
+        }
+    );
+    assert_eq!(json["target_executed"], false);
+    assert_eq!(json["target_published"], false);
+    assert!(json["reason"]
+        .as_str()
+        .is_some_and(|reason| !reason.is_empty()));
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +393,7 @@ fn pkg_approve_json_reports_the_refusal_as_structured_output() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn install_denies_before_analysis_and_records_no_outcome() {
+fn offline_install_does_not_invent_a_network_boundary_or_execution_outcome() {
     let workspace = Workspace::new(Some(DENY_NETWORK));
     let (code, stdout, stderr) = workspace.run(&[
         "install",
@@ -284,14 +403,37 @@ fn install_denies_before_analysis_and_records_no_outcome() {
         "npm",
         "left-pad",
     ]);
+    assert_eq!(code, 0);
+    assert!(
+        !stderr.contains("package_manager_network"),
+        "stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("analysis envelope");
+    assert_eq!(json["outcome"], serde_json::Value::Null);
+}
+
+#[test]
+fn online_install_denies_an_exact_registry_request_before_http_or_output() {
+    let workspace = Workspace::new(Some(DENY_NETWORK));
+    let (code, stdout, stderr) = workspace.run_online(&[
+        "install",
+        "--online",
+        "--no-exec",
+        "--format",
+        "json",
+        "npm",
+        "left-pad@1.3.0",
+    ]);
     assert_eq!(code, 1);
     assert!(
-        stderr.contains("task gate refused at the package_manager_network boundary"),
+        stderr.contains(
+            "task gate refused at the package_manager_network boundary before any registry request"
+        ),
         "stderr: {stderr}"
     );
     assert!(
         stdout.trim().is_empty(),
-        "a refused install emitted an analysis envelope it never produced: {stdout}"
+        "a refused registry request emitted an analysis envelope it never produced: {stdout}"
     );
 }
 
@@ -360,7 +502,7 @@ fn install_denies_before_the_manager_is_spawned_and_records_no_execution() {
             "the analysis gate fired, so this proves nothing about the spawn gate: {stderr}"
         );
         assert!(
-            stderr.contains("task gate refused before"),
+            stderr.contains("task gate refused at the package_manager_execution boundary before"),
             "stderr: {stderr}"
         );
         let json: serde_json::Value =
@@ -501,7 +643,6 @@ fn the_default_installation_is_unaffected_at_every_boundary() {
     fs::create_dir_all(workspace.dir.path().join(".git")).expect("create .git");
     for args in [
         vec!["run", "ftp://example.com/install.sh", "--no-exec"],
-        vec!["pkg", "approve", "pip", "requests==2.31.0"],
         vec!["install", "--no-exec", "npm", "left-pad"],
         vec!["install", "--no-exec", "url", "ftp://example.com/i.sh"],
         vec!["policy", "init", "--minimal", "--force"],
@@ -515,6 +656,20 @@ fn the_default_installation_is_unaffected_at_every_boundary() {
             "the default policy refused {args:?}: {stderr}{stdout}"
         );
     }
+    let target = workspace.dir.path().join("approved-target");
+    let target = target.to_string_lossy();
+    let (_, stdout, stderr) = workspace.run(&[
+        "pkg",
+        "approve",
+        "pip",
+        "requests==2.31.0",
+        "--target",
+        &target,
+    ]);
+    assert!(
+        !stderr.contains("task gate") && !stdout.contains("\"error_phase\": \"task_gate\""),
+        "the default policy refused pkg approve: {stderr}{stdout}"
+    );
 }
 
 // ---------------------------------------------------------------------------

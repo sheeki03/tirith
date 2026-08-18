@@ -16,9 +16,12 @@ use crate::rules::command::{
 };
 use crate::tokenize::{self, ShellType};
 use crate::util::OpenRegularError;
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub const MAX_SHELL_SEGMENTS: usize = 64;
@@ -5715,27 +5718,40 @@ fn effects_for(commands: &[Web3CommandFactsV2], completeness: &mut Completeness)
             kind: EffectEvidenceKind::CommandOperation,
             span: Some(facts.source_span),
         };
-        if matches!(
+        let writes = matches!(
             facts.write_mode,
             Web3WriteMode::StateChanging | Web3WriteMode::PotentialWrite
-        ) && !push_effect(CommandEffect {
-            kind: CommandEffectKind::Web3Write,
-            source: evidence,
-            enforceability: BoundaryCapability::BoundaryDependent,
-            completeness: facts.completeness.clone(),
-        }) {
+        );
+        if writes
+            && (!push_effect(CommandEffect {
+                kind: CommandEffectKind::Web3Write,
+                source: evidence,
+                enforceability: BoundaryCapability::BoundaryDependent,
+                completeness: facts.completeness.clone(),
+            }) || !push_effect(CommandEffect {
+                // Signing is an invariant of every chain write. Keep this
+                // categorical effect even when the concrete signer is selected
+                // by config, a prompt, a KMS, or another unresolved boundary.
+                kind: CommandEffectKind::Web3SignerUse,
+                source: evidence,
+                enforceability: BoundaryCapability::BoundaryDependent,
+                completeness: facts.completeness.clone(),
+            }))
+        {
             break 'commands;
         }
         for tagged in &facts.signers {
-            if !push_effect(CommandEffect {
-                kind: CommandEffectKind::Web3SignerUse,
-                source: EffectEvidence {
-                    kind: EffectEvidenceKind::CommandFlag,
-                    span: tagged.signer.span(),
-                },
-                enforceability: BoundaryCapability::BoundaryDependent,
-                completeness: facts.completeness.clone(),
-            }) {
+            if !writes
+                && !push_effect(CommandEffect {
+                    kind: CommandEffectKind::Web3SignerUse,
+                    source: EffectEvidence {
+                        kind: EffectEvidenceKind::CommandFlag,
+                        span: tagged.signer.span(),
+                    },
+                    enforceability: BoundaryCapability::BoundaryDependent,
+                    completeness: facts.completeness.clone(),
+                })
+            {
                 break 'commands;
             }
             if matches!(
@@ -7508,6 +7524,7 @@ fn restore_temporary_posix_function_assignments(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_posix_function(
     name: &str,
     call_span: SourceSpan,
@@ -7516,6 +7533,7 @@ fn execute_posix_function(
     fact_budget: &mut CommandFactBudget,
     nested_depth: usize,
     completeness: &mut Completeness,
+    coverage: Option<CoverageRecorder>,
 ) -> Vec<Web3CommandFactsV2> {
     if budget.remaining_calls == 0
         || budget.stack.len() >= MAX_WRAPPER_DEPTH
@@ -7546,6 +7564,7 @@ fn execute_posix_function(
             fact_budget,
             nested_depth,
             completeness,
+            coverage.clone(),
         ),
         crate::extract::PosixFunctionBodyKind::Subshell => execute_posix_child_shell_body(
             &body,
@@ -7555,6 +7574,7 @@ fn execute_posix_function(
             fact_budget,
             nested_depth,
             completeness,
+            coverage,
         ),
     };
     budget.stack.pop();
@@ -7573,6 +7593,7 @@ fn execute_posix_function_invocation(
     completeness: &mut Completeness,
     separator: Option<&str>,
     outgoing_separator: Option<&str>,
+    coverage: Option<CoverageRecorder>,
 ) -> Vec<Web3CommandFactsV2> {
     let state_isolated = matches!(separator, Some("|" | "|&"))
         || matches!(outgoing_separator, Some("|" | "|&" | "&"));
@@ -7599,6 +7620,7 @@ fn execute_posix_function_invocation(
         fact_budget,
         nested_depth,
         completeness,
+        coverage,
     );
     restore_temporary_posix_function_assignments(temporary, state);
     if let Some((
@@ -7638,6 +7660,7 @@ fn execute_posix_inline_current_shell_body(
     completeness: &mut Completeness,
     separator: Option<&str>,
     outgoing_separator: Option<&str>,
+    coverage: Option<CoverageRecorder>,
 ) -> Vec<Web3CommandFactsV2> {
     if nested_depth >= MAX_WRAPPER_DEPTH {
         completeness.add(IncompleteReason::WrapperDepthExceeded);
@@ -7667,6 +7690,7 @@ fn execute_posix_inline_current_shell_body(
         fact_budget,
         nested_depth + 1,
         completeness,
+        coverage,
     );
     if let Some((
         context,
@@ -7694,6 +7718,7 @@ fn execute_posix_inline_current_shell_body(
     commands
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_posix_child_shell_body(
     body: &str,
     call_span: SourceSpan,
@@ -7702,6 +7727,7 @@ fn execute_posix_child_shell_body(
     fact_budget: &mut CommandFactBudget,
     nested_depth: usize,
     completeness: &mut Completeness,
+    coverage: Option<CoverageRecorder>,
 ) -> Vec<Web3CommandFactsV2> {
     if nested_depth >= MAX_WRAPPER_DEPTH {
         completeness.add(IncompleteReason::WrapperDepthExceeded);
@@ -7725,6 +7751,7 @@ fn execute_posix_child_shell_body(
         fact_budget,
         nested_depth + 1,
         completeness,
+        coverage,
     );
     let (
         context,
@@ -7752,6 +7779,7 @@ struct PosixChildShellExecution {
     consumes_segment: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_posix_child_shells_for_segment(
     segment: &tokenize::Segment,
     call_span: SourceSpan,
@@ -7760,6 +7788,7 @@ fn execute_posix_child_shells_for_segment(
     fact_budget: &mut CommandFactBudget,
     nested_depth: usize,
     completeness: &mut Completeness,
+    coverage: Option<CoverageRecorder>,
 ) -> PosixChildShellExecution {
     match crate::extract::literal_posix_subshell_group_body(segment) {
         Ok(Some(body)) => {
@@ -7772,6 +7801,9 @@ fn execute_posix_child_shells_for_segment(
                     fact_budget,
                     nested_depth,
                     completeness,
+                    coverage
+                        .as_ref()
+                        .and_then(|recorder| recorder.nested_frame(0, &body)),
                 ),
                 consumes_segment: true,
             };
@@ -7801,7 +7833,7 @@ fn execute_posix_child_shells_for_segment(
         completeness.add(IncompleteReason::UnresolvedIndirection);
     }
     let mut commands = Vec::new();
-    for body in scan.bodies {
+    for (body_index, body) in scan.bodies.into_iter().enumerate() {
         commands.extend(execute_posix_child_shell_body(
             &body.input,
             call_span,
@@ -7810,6 +7842,9 @@ fn execute_posix_child_shells_for_segment(
             fact_budget,
             nested_depth,
             completeness,
+            coverage
+                .as_ref()
+                .and_then(|recorder| recorder.nested_frame(body_index, &body.input)),
         ));
     }
     PosixChildShellExecution {
@@ -7844,6 +7879,7 @@ fn posix_control_body_needs_shared_execution(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_posix_conditional_control_body(
     segment: &tokenize::Segment,
     call_span: SourceSpan,
@@ -7852,6 +7888,7 @@ fn execute_posix_conditional_control_body(
     fact_budget: &mut CommandFactBudget,
     nested_depth: usize,
     completeness: &mut Completeness,
+    coverage: Option<CoverageRecorder>,
 ) -> Option<Vec<Web3CommandFactsV2>> {
     let scan = crate::extract::posix_current_scope_dispatch_scan(segment)?;
     if scan.bodies.len() > MAX_SHELL_SEGMENTS {
@@ -7884,6 +7921,7 @@ fn execute_posix_conditional_control_body(
         fact_budget,
         nested_depth,
         completeness,
+        coverage,
     ))
 }
 
@@ -7897,6 +7935,7 @@ fn execute_posix_conditional_candidates(
     fact_budget: &mut CommandFactBudget,
     nested_depth: usize,
     completeness: &mut Completeness,
+    coverage: Option<CoverageRecorder>,
 ) -> Vec<Web3CommandFactsV2> {
     if nested_depth >= MAX_WRAPPER_DEPTH {
         completeness.add(IncompleteReason::WrapperDepthExceeded);
@@ -7904,6 +7943,7 @@ fn execute_posix_conditional_candidates(
         return Vec::new();
     }
 
+    let retain_proven_state = retain_proven_function_bodies && candidates.len() == 1;
     let baseline_context = (*state.context).clone();
     let baseline_shell_variables = (*state.shell_variables).clone();
     let baseline_exported_variables = (*state.exported_variables).clone();
@@ -7914,7 +7954,7 @@ fn execute_posix_conditional_candidates(
     let baseline_function_state_unresolved = budget.function_state_unresolved;
     let mut discovered_functions = BTreeMap::<String, PosixFunctionBinding>::new();
     let mut commands = Vec::new();
-    for body in candidates {
+    for (candidate_index, body) in candidates.into_iter().enumerate() {
         *state.context = baseline_context.clone();
         *state.shell_variables = baseline_shell_variables.clone();
         *state.exported_variables = baseline_exported_variables.clone();
@@ -7931,6 +7971,9 @@ fn execute_posix_conditional_candidates(
             fact_budget,
             nested_depth + 1,
             completeness,
+            coverage
+                .as_ref()
+                .and_then(|recorder| recorder.nested_frame(candidate_index, &body)),
         ));
         for (name, binding) in state.functions.iter() {
             if baseline_functions.get(name) == Some(binding) {
@@ -7955,25 +7998,23 @@ fn execute_posix_conditional_candidates(
                 .body = None;
         }
     }
-    *state.context = baseline_context;
-    *state.shell_variables = baseline_shell_variables;
-    *state.exported_variables = baseline_exported_variables;
-    *state.export_all = baseline_export_all;
-    *state.cwd_tainted = baseline_cwd_tainted;
-    *state.cwd_conditionally_set = baseline_cwd_conditionally_set;
-    *state.functions = baseline_functions;
-    budget.function_state_unresolved = baseline_function_state_unresolved;
-    for (name, mut binding) in discovered_functions {
-        // Unless one branch is proven to execute, keep only the name so a
-        // later external command cannot be trusted as the same spelling.
-        // A literal `if true; then ...; fi` has exactly one taken branch, so
-        // its function definitions do become current-shell bindings.
-        if !retain_proven_function_bodies {
+    if !retain_proven_state {
+        *state.context = baseline_context;
+        *state.shell_variables = baseline_shell_variables;
+        *state.exported_variables = baseline_exported_variables;
+        *state.export_all = baseline_export_all;
+        *state.cwd_tainted = baseline_cwd_tainted;
+        *state.cwd_conditionally_set = baseline_cwd_conditionally_set;
+        *state.functions = baseline_functions;
+        budget.function_state_unresolved = baseline_function_state_unresolved;
+        for (name, mut binding) in discovered_functions {
+            // Multiple possible branches expose the function name but not one
+            // authoritative body to subsequent commands.
             binding.body = None;
+            state.functions.insert(name, binding);
         }
-        state.functions.insert(name, binding);
+        taint_posix_function_execution(state, budget, completeness);
     }
-    taint_posix_function_execution(state, budget, completeness);
     commands
 }
 
@@ -8045,6 +8086,7 @@ fn execute_owned_posix_control(
     fact_budget: &mut CommandFactBudget,
     nested_depth: usize,
     completeness: &mut Completeness,
+    coverage: Option<CoverageRecorder>,
 ) -> Vec<Web3CommandFactsV2> {
     let mut recovered = Vec::<String>::new();
     let mut recovered_bytes = 0usize;
@@ -8097,9 +8139,11 @@ fn execute_owned_posix_control(
         fact_budget,
         nested_depth,
         completeness,
+        coverage,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_posix_current_shell_body(
     input: &str,
     call_span: SourceSpan,
@@ -8108,6 +8152,7 @@ fn execute_posix_current_shell_body(
     fact_budget: &mut CommandFactBudget,
     nested_depth: usize,
     completeness: &mut Completeness,
+    coverage: Option<CoverageRecorder>,
 ) -> Vec<Web3CommandFactsV2> {
     if !fact_budget.enter_parse(completeness) {
         taint_posix_function_execution(state, budget, completeness);
@@ -8173,6 +8218,9 @@ fn execute_posix_current_shell_body(
             .map(|region| region.end)
             .unwrap_or(segment_index);
         let outgoing_separator = posix_outgoing_separator(input, &segments, outgoing_segment);
+        let segment_coverage = coverage
+            .as_ref()
+            .and_then(|recorder| recorder.nested_frame(segment_index, &segment.raw));
         if separator == Some("&") {
             pending_assignments = None;
             pending_cwd = None;
@@ -8236,6 +8284,9 @@ fn execute_posix_current_shell_body(
                 fact_budget,
                 nested_depth,
                 completeness,
+                segment_coverage
+                    .as_ref()
+                    .and_then(|recorder| recorder.branch(0)),
             ));
             continue;
         }
@@ -8271,6 +8322,9 @@ fn execute_posix_current_shell_body(
                 fact_budget,
                 nested_depth,
                 completeness,
+                segment_coverage
+                    .as_ref()
+                    .and_then(|recorder| recorder.branch(0)),
             );
             commands.extend(argument_shells.commands);
             if argument_shells.consumes_segment {
@@ -8287,6 +8341,9 @@ fn execute_posix_current_shell_body(
                 completeness,
                 separator,
                 outgoing_separator,
+                segment_coverage
+                    .as_ref()
+                    .and_then(|recorder| recorder.branch(1)),
             ));
             continue;
         }
@@ -8307,6 +8364,9 @@ fn execute_posix_current_shell_body(
                     completeness,
                     separator,
                     outgoing_separator,
+                    segment_coverage
+                        .as_ref()
+                        .and_then(|recorder| recorder.branch(0)),
                 ));
                 continue;
             }
@@ -8329,6 +8389,9 @@ fn execute_posix_current_shell_body(
                     completeness,
                     separator,
                     outgoing_separator,
+                    segment_coverage
+                        .as_ref()
+                        .and_then(|recorder| recorder.branch(0)),
                 ));
                 continue;
             }
@@ -8347,6 +8410,9 @@ fn execute_posix_current_shell_body(
             fact_budget,
             nested_depth,
             completeness,
+            segment_coverage
+                .as_ref()
+                .and_then(|recorder| recorder.branch(0)),
         ) {
             commands.extend(nested);
             continue;
@@ -8360,6 +8426,9 @@ fn execute_posix_current_shell_body(
             fact_budget,
             nested_depth,
             completeness,
+            segment_coverage
+                .as_ref()
+                .and_then(|recorder| recorder.branch(0)),
         );
         commands.extend(child_shells.commands);
         if child_shells.consumes_segment {
@@ -8435,6 +8504,7 @@ fn execute_posix_current_shell_body(
             Completeness::complete(),
             fact_budget,
             false,
+            segment_coverage,
         );
         for facts in &mut nested.commands {
             rebase_nested_fact(facts, call_span);
@@ -8523,7 +8593,298 @@ pub fn parse_web3_commands_v2(
         completeness,
         &mut fact_budget,
         true,
+        None,
     )
+}
+
+/// Internal parser-owned occurrence sidecar for consumers that must account
+/// for exact executable coverage rather than comparing aggregate fact counts.
+/// The sidecar is derived from the same traversal/result before any caller can
+/// reinterpret facts as coverage.
+pub(crate) struct Web3ParseWithOccurrences {
+    pub(crate) result: Web3ParseResultV2,
+    pub(crate) occurrences: Vec<ParserCoverageOccurrence>,
+    pub(crate) coverage_complete: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ParserCoverageOccurrence {
+    pub(crate) frame_digest: [u8; 32],
+    pub(crate) byte_start: usize,
+    pub(crate) byte_end: usize,
+    pub(crate) nested_path: Vec<u16>,
+    pub(crate) incoming_separator: Option<String>,
+    pub(crate) outgoing_separator: Option<String>,
+    pub(crate) control_owner_index: Option<u16>,
+    pub(crate) control_branch: ParserControlBranch,
+    pub(crate) shell: ShellType,
+    pub(crate) disposition: ParserCoverageDisposition,
+}
+
+impl ParserCoverageOccurrence {
+    pub(crate) fn is_modelled(&self) -> bool {
+        matches!(
+            self.disposition,
+            ParserCoverageDisposition::ModelledNoEffect | ParserCoverageDisposition::ModelledFacts
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParserCoverageDisposition {
+    ModelledNoEffect,
+    ModelledFacts,
+    Unmodelled(ParserCoverageGap),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParserCoverageGap {
+    UnsupportedCommand,
+    DynamicCommand,
+    UnsupportedControl,
+    BudgetExceeded,
+    SemanticGap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ParserControlBranch {
+    None,
+    Condition,
+    Then,
+    Else,
+    ElseIf,
+    LoopBody,
+    CaseArm,
+    Unknown,
+}
+
+const MAX_COVERAGE_OCCURRENCES: usize = MAX_WEB3_PARSE_WORK_UNITS * 2;
+
+#[derive(Default)]
+struct ParserCoverageState {
+    occurrences: Vec<ParserCoverageOccurrence>,
+    complete: bool,
+}
+
+#[derive(Clone)]
+struct CoverageRecorder {
+    state: Rc<RefCell<ParserCoverageState>>,
+    frame_digest: [u8; 32],
+    path_prefix: Vec<u16>,
+}
+
+impl CoverageRecorder {
+    fn root(input: &str) -> Self {
+        Self {
+            state: Rc::new(RefCell::new(ParserCoverageState {
+                occurrences: Vec::new(),
+                complete: true,
+            })),
+            frame_digest: Sha256::digest(input.as_bytes()).into(),
+            path_prefix: Vec::new(),
+        }
+    }
+
+    fn mark_incomplete(&self) {
+        self.state.borrow_mut().complete = false;
+    }
+
+    fn segment_scope(&self, segment_index: usize) -> Option<Self> {
+        let Ok(segment_index) = u16::try_from(segment_index) else {
+            self.mark_incomplete();
+            return None;
+        };
+        let mut nested = self.clone();
+        nested.path_prefix.push(segment_index);
+        Some(nested)
+    }
+
+    fn nested_frame(&self, occurrence_index: usize, input: &str) -> Option<Self> {
+        let Ok(occurrence_index) = u16::try_from(occurrence_index) else {
+            self.mark_incomplete();
+            return None;
+        };
+        let mut nested = self.clone();
+        nested.path_prefix.push(occurrence_index);
+        nested.frame_digest = Sha256::digest(input.as_bytes()).into();
+        Some(nested)
+    }
+
+    fn branch(&self, occurrence_index: usize) -> Option<Self> {
+        let Ok(occurrence_index) = u16::try_from(occurrence_index) else {
+            self.mark_incomplete();
+            return None;
+        };
+        let mut nested = self.clone();
+        nested.path_prefix.push(occurrence_index);
+        Some(nested)
+    }
+
+    fn guard(
+        &self,
+        segment: &tokenize::Segment,
+        shell: ShellType,
+        outgoing_separator: Option<&str>,
+        control_owner_index: Option<usize>,
+        control_branch: ParserControlBranch,
+    ) -> CoverageSegmentGuard {
+        CoverageSegmentGuard {
+            recorder: self.clone(),
+            no_effect_eligible: parser_segment_has_no_redirection(&segment.raw),
+            occurrence: Some(ParserCoverageOccurrence {
+                frame_digest: self.frame_digest,
+                byte_start: segment.byte_range.start,
+                byte_end: segment.byte_range.end,
+                nested_path: self.path_prefix.clone(),
+                incoming_separator: segment.preceding_separator.clone(),
+                outgoing_separator: outgoing_separator.map(str::to_string),
+                control_owner_index: control_owner_index
+                    .and_then(|index| u16::try_from(index).ok()),
+                control_branch,
+                shell,
+                disposition: ParserCoverageDisposition::Unmodelled(
+                    ParserCoverageGap::UnsupportedCommand,
+                ),
+            }),
+        }
+    }
+
+    fn finish(self) -> (Vec<ParserCoverageOccurrence>, bool) {
+        let mut state = self.state.borrow_mut();
+        let complete = state.complete;
+        (std::mem::take(&mut state.occurrences), complete)
+    }
+}
+
+struct CoverageSegmentGuard {
+    recorder: CoverageRecorder,
+    no_effect_eligible: bool,
+    occurrence: Option<ParserCoverageOccurrence>,
+}
+
+impl CoverageSegmentGuard {
+    fn modelled_no_effect(&mut self) {
+        if let Some(occurrence) = &mut self.occurrence {
+            occurrence.disposition = if self.no_effect_eligible {
+                ParserCoverageDisposition::ModelledNoEffect
+            } else {
+                ParserCoverageDisposition::Unmodelled(ParserCoverageGap::SemanticGap)
+            };
+        }
+    }
+
+    fn require_no_redirection<'a>(&mut self, raw_segments: impl IntoIterator<Item = &'a str>) {
+        self.no_effect_eligible &= raw_segments
+            .into_iter()
+            .all(parser_segment_has_no_redirection);
+    }
+
+    fn modelled_facts(&mut self) {
+        if let Some(occurrence) = &mut self.occurrence {
+            occurrence.disposition = if self.no_effect_eligible {
+                ParserCoverageDisposition::ModelledFacts
+            } else {
+                ParserCoverageDisposition::Unmodelled(ParserCoverageGap::SemanticGap)
+            };
+        }
+    }
+
+    fn unmodelled(&mut self, gap: ParserCoverageGap) {
+        if let Some(occurrence) = &mut self.occurrence {
+            occurrence.disposition = ParserCoverageDisposition::Unmodelled(gap);
+        }
+    }
+}
+
+fn parser_segment_has_no_redirection(raw: &str) -> bool {
+    // This is intentionally conservative. Quoted operator-looking bytes may
+    // cause diagnostic incompleteness, but an unowned shell redirection must
+    // never be labelled as a no-effect structural node. The shell dataflow IR
+    // does not yet model filesystem reads/writes for these parent nodes.
+    !raw.bytes().any(|byte| matches!(byte, b'<' | b'>'))
+}
+
+impl Drop for CoverageSegmentGuard {
+    fn drop(&mut self) {
+        let Some(occurrence) = self.occurrence.take() else {
+            return;
+        };
+        let mut state = self.recorder.state.borrow_mut();
+        if state.occurrences.len() >= MAX_COVERAGE_OCCURRENCES {
+            state.complete = false;
+            return;
+        }
+        state.occurrences.push(occurrence);
+    }
+}
+
+fn parser_control_branch(segment: &tokenize::Segment, shell: ShellType) -> ParserControlBranch {
+    let word = segment
+        .command
+        .as_deref()
+        .filter(|word| command_word_is_statically_bound(word, shell))
+        .map(|word| normalize_cmd_base(word, shell));
+    match word.as_deref() {
+        Some("if" | "while" | "until") => ParserControlBranch::Condition,
+        Some("then") => ParserControlBranch::Then,
+        Some("elif" | "elseif") => ParserControlBranch::ElseIf,
+        Some("else") => ParserControlBranch::Else,
+        Some("for" | "foreach" | "do") => ParserControlBranch::LoopBody,
+        Some("case" | "switch") => ParserControlBranch::CaseArm,
+        Some("fi" | "done" | "esac") | None => ParserControlBranch::None,
+        Some(_) => ParserControlBranch::Unknown,
+    }
+}
+
+fn coverage_no_effect(guard: &mut Option<CoverageSegmentGuard>) {
+    if let Some(guard) = guard {
+        guard.modelled_no_effect();
+    }
+}
+
+fn coverage_facts(guard: &mut Option<CoverageSegmentGuard>) {
+    if let Some(guard) = guard {
+        guard.modelled_facts();
+    }
+}
+
+fn coverage_gap(guard: &mut Option<CoverageSegmentGuard>, gap: ParserCoverageGap) {
+    if let Some(guard) = guard {
+        guard.unmodelled(gap);
+    }
+}
+
+pub(crate) fn parse_web3_commands_with_occurrences_v2(
+    input: &str,
+    shell: ShellType,
+    context: &Web3ParseContextV2,
+) -> Web3ParseWithOccurrences {
+    if input.len() > MAX_INPUT_BYTES {
+        return Web3ParseWithOccurrences {
+            result: input_too_large_result(),
+            occurrences: Vec::new(),
+            coverage_complete: false,
+        };
+    }
+    let recorder = CoverageRecorder::root(input);
+    let (context, completeness) = bounded_parse_context(context);
+    let mut fact_budget = CommandFactBudget::default();
+    let result = parse_web3_commands_depth(
+        input,
+        shell,
+        context,
+        0,
+        completeness,
+        &mut fact_budget,
+        true,
+        Some(recorder.clone()),
+    );
+    let (occurrences, coverage_complete) = recorder.finish();
+    Web3ParseWithOccurrences {
+        result,
+        occurrences,
+        coverage_complete,
+    }
 }
 
 /// Backwards-compatible schema-v1 entry point. New callers that need trusted
@@ -8547,10 +8908,12 @@ pub fn parse_web3_commands(
         completeness,
         &mut fact_budget,
         true,
+        None,
     )
     .into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_web3_commands_depth(
     input: &str,
     shell: ShellType,
@@ -8559,13 +8922,20 @@ fn parse_web3_commands_depth(
     initial_completeness: Completeness,
     fact_budget: &mut CommandFactBudget,
     scan_posix_child_shells: bool,
+    coverage: Option<CoverageRecorder>,
 ) -> Web3ParseResultV2 {
     let mut completeness = initial_completeness;
     if !fact_budget.enter_parse(&mut completeness) {
+        if let Some(coverage) = &coverage {
+            coverage.mark_incomplete();
+        }
         return empty_parse_result(completeness);
     }
     if input.len() > MAX_INPUT_BYTES {
         completeness.add(IncompleteReason::InputBytesExceeded);
+        if let Some(coverage) = &coverage {
+            coverage.mark_incomplete();
+        }
         return empty_parse_result(completeness);
     }
     let (mut segments, token_budget) = tokenize::tokenize_bounded(
@@ -8577,17 +8947,34 @@ fn parse_web3_commands_depth(
     );
     if token_budget.segments_truncated {
         completeness.add(IncompleteReason::SegmentBudgetExceeded);
+        if let Some(coverage) = &coverage {
+            coverage.mark_incomplete();
+        }
     }
     if token_budget.words_truncated {
         completeness.add(IncompleteReason::ArgumentCountExceeded);
+        if let Some(coverage) = &coverage {
+            coverage.mark_incomplete();
+        }
     }
     if token_budget.word_bytes_truncated {
         completeness.add(IncompleteReason::ArgumentBytesExceeded);
+        if let Some(coverage) = &coverage {
+            coverage.mark_incomplete();
+        }
     }
     let retained_work = fact_budget.retain_work(segments.len(), &mut completeness);
+    if retained_work != segments.len() {
+        if let Some(coverage) = &coverage {
+            coverage.mark_incomplete();
+        }
+    }
     segments.truncate(retained_work);
     if has_incomplete_quoting(input, shell) {
         completeness.add(IncompleteReason::IncompleteQuoting);
+        if let Some(coverage) = &coverage {
+            coverage.mark_incomplete();
+        }
     }
     let conditional_cwd_flow = conditional_cwd_lists(&segments, shell);
     let (posix_control_owner, posix_control_regions) = if shell == ShellType::Posix {
@@ -8627,6 +9014,37 @@ fn parse_web3_commands_depth(
         posix_function_budget.function_state_unresolved;
     for (segment_index, segment) in segments.iter().take(MAX_SHELL_SEGMENTS).enumerate() {
         if posix_control_owner[segment_index].is_some_and(|owner| owner != segment_index) {
+            if matches!(
+                parser_control_branch(segment, shell),
+                ParserControlBranch::Then
+                    | ParserControlBranch::Else
+                    | ParserControlBranch::ElseIf
+                    | ParserControlBranch::LoopBody
+                    | ParserControlBranch::CaseArm
+                    | ParserControlBranch::None
+            ) && segment.command.as_deref().is_some_and(|command| {
+                matches!(
+                    normalize_cmd_base(command, shell).as_str(),
+                    "then" | "else" | "elif" | "do" | "fi" | "done" | "esac"
+                )
+            }) {
+                if let Some(scope) = coverage
+                    .as_ref()
+                    .and_then(|recorder| recorder.segment_scope(segment_index))
+                {
+                    let outgoing = segments
+                        .get(segment_index + 1)
+                        .and_then(|next| next.preceding_separator.as_deref());
+                    let mut structural = scope.guard(
+                        segment,
+                        shell,
+                        outgoing,
+                        posix_control_owner[segment_index],
+                        parser_control_branch(segment, shell),
+                    );
+                    structural.modelled_no_effect();
+                }
+            }
             continue;
         }
         let control_region = posix_control_regions[segment_index];
@@ -8641,6 +9059,25 @@ fn parse_web3_commands_depth(
                 .get(outgoing_segment + 1)
                 .and_then(|next| next.preceding_separator.as_deref())
         };
+        let segment_coverage = coverage
+            .as_ref()
+            .and_then(|recorder| recorder.segment_scope(segment_index));
+        let mut coverage_guard = segment_coverage.as_ref().map(|recorder| {
+            recorder.guard(
+                segment,
+                shell,
+                outgoing_separator,
+                posix_control_owner[segment_index],
+                parser_control_branch(segment, shell),
+            )
+        });
+        if let (Some(region), Some(guard)) = (control_region, coverage_guard.as_mut()) {
+            guard.require_no_redirection(
+                segments[segment_index..=region.end]
+                    .iter()
+                    .map(|member| member.raw.as_str()),
+            );
+        }
         if separator == Some("&") && shell != ShellType::Cmd {
             // A trailing `&` backgrounds the complete preceding AND-list. Its
             // shell assignments and cwd changes occurred in a child context,
@@ -8721,7 +9158,15 @@ fn parse_web3_commands_depth(
                     fact_budget,
                     nested_depth,
                     &mut completeness,
+                    segment_coverage
+                        .as_ref()
+                        .and_then(|recorder| recorder.branch(0)),
                 ));
+                if region.complete {
+                    coverage_no_effect(&mut coverage_guard);
+                } else {
+                    coverage_gap(&mut coverage_guard, ParserCoverageGap::UnsupportedControl);
+                }
                 continue;
             }
             if register_posix_function_definition(
@@ -8730,6 +9175,7 @@ fn parse_web3_commands_depth(
                 &mut posix_function_budget,
                 &mut completeness,
             ) {
+                coverage_no_effect(&mut coverage_guard);
                 continue;
             }
             let direct_function = direct_posix_function_name(segment, &posix_functions);
@@ -8756,6 +9202,7 @@ fn parse_web3_commands_depth(
                         &mut posix_function_budget,
                         &mut completeness,
                     );
+                    coverage_gap(&mut coverage_guard, ParserCoverageGap::DynamicCommand);
                     continue;
                 }
             };
@@ -8777,9 +9224,13 @@ fn parse_web3_commands_depth(
                     fact_budget,
                     nested_depth,
                     &mut completeness,
+                    segment_coverage
+                        .as_ref()
+                        .and_then(|recorder| recorder.branch(0)),
                 );
                 commands.extend(argument_shells.commands);
                 if argument_shells.consumes_segment {
+                    coverage_no_effect(&mut coverage_guard);
                     continue;
                 }
                 commands.extend(execute_posix_function_invocation(
@@ -8793,7 +9244,11 @@ fn parse_web3_commands_depth(
                     &mut completeness,
                     separator,
                     outgoing_separator,
+                    segment_coverage
+                        .as_ref()
+                        .and_then(|recorder| recorder.branch(1)),
                 ));
+                coverage_no_effect(&mut coverage_guard);
                 continue;
             }
             if apply_posix_function_table_mutation(
@@ -8802,6 +9257,7 @@ fn parse_web3_commands_depth(
                 &mut posix_function_budget,
                 &mut completeness,
             ) {
+                coverage_no_effect(&mut coverage_guard);
                 continue;
             }
             match literal_posix_eval_body(segment) {
@@ -8825,7 +9281,11 @@ fn parse_web3_commands_depth(
                         &mut completeness,
                         separator,
                         outgoing_separator,
+                        segment_coverage
+                            .as_ref()
+                            .and_then(|recorder| recorder.branch(0)),
                     ));
+                    coverage_no_effect(&mut coverage_guard);
                     continue;
                 }
                 Err(()) => {
@@ -8843,6 +9303,7 @@ fn parse_web3_commands_depth(
                         &mut posix_function_budget,
                         &mut completeness,
                     );
+                    coverage_gap(&mut coverage_guard, ParserCoverageGap::DynamicCommand);
                     continue;
                 }
                 Ok(None) => {}
@@ -8868,7 +9329,11 @@ fn parse_web3_commands_depth(
                         &mut completeness,
                         separator,
                         outgoing_separator,
+                        segment_coverage
+                            .as_ref()
+                            .and_then(|recorder| recorder.branch(0)),
                     ));
+                    coverage_no_effect(&mut coverage_guard);
                     continue;
                 }
                 Err(()) => {
@@ -8886,6 +9351,7 @@ fn parse_web3_commands_depth(
                         &mut posix_function_budget,
                         &mut completeness,
                     );
+                    coverage_gap(&mut coverage_guard, ParserCoverageGap::DynamicCommand);
                     continue;
                 }
                 Ok(None) => {}
@@ -8907,8 +9373,12 @@ fn parse_web3_commands_depth(
                 fact_budget,
                 nested_depth,
                 &mut completeness,
+                segment_coverage
+                    .as_ref()
+                    .and_then(|recorder| recorder.branch(0)),
             ) {
                 commands.extend(nested);
+                coverage_no_effect(&mut coverage_guard);
                 continue;
             }
             if scan_posix_child_shells {
@@ -8920,9 +9390,13 @@ fn parse_web3_commands_depth(
                     fact_budget,
                     nested_depth,
                     &mut completeness,
+                    segment_coverage
+                        .as_ref()
+                        .and_then(|recorder| recorder.branch(0)),
                 );
                 commands.extend(child_shells.commands);
                 if child_shells.consumes_segment {
+                    coverage_no_effect(&mut coverage_guard);
                     continue;
                 }
             }
@@ -8946,6 +9420,7 @@ fn parse_web3_commands_depth(
                     &mut posix_function_budget,
                     &mut completeness,
                 );
+                coverage_gap(&mut coverage_guard, ParserCoverageGap::DynamicCommand);
                 continue;
             }
         }
@@ -8968,6 +9443,7 @@ fn parse_web3_commands_depth(
                 &mut completeness,
             )
         {
+            coverage_no_effect(&mut coverage_guard);
             continue;
         }
         if shell == ShellType::Posix {
@@ -8977,6 +9453,7 @@ fn parse_web3_commands_depth(
                     conditionally_executed: matches!(separator, Some("&&" | "||")),
                     incoming_pipeline: matches!(separator, Some("|" | "|&")),
                 });
+                coverage_no_effect(&mut coverage_guard);
                 continue;
             }
         }
@@ -8989,6 +9466,7 @@ fn parse_web3_commands_depth(
                 },
                 incoming_pipeline: matches!(separator, Some("|" | "|&")),
             });
+            coverage_no_effect(&mut coverage_guard);
             continue;
         }
         let effective = match resolve_effective_command_bounded(segment, shell, MAX_WRAPPER_DEPTH) {
@@ -9026,6 +9504,21 @@ fn parse_web3_commands_depth(
                         }
                     });
                 }
+                coverage_gap(
+                    &mut coverage_guard,
+                    match error {
+                        EffectiveCommandError::WorkBudgetExceeded
+                        | EffectiveCommandError::WrapperChainTooDeep => {
+                            ParserCoverageGap::BudgetExceeded
+                        }
+                        EffectiveCommandError::MissingOrAmbiguousCommand if dynamic_identity => {
+                            ParserCoverageGap::DynamicCommand
+                        }
+                        EffectiveCommandError::MissingOrAmbiguousCommand => {
+                            ParserCoverageGap::SemanticGap
+                        }
+                    },
+                );
                 continue;
             }
         };
@@ -9049,6 +9542,7 @@ fn parse_web3_commands_depth(
                 },
                 incoming_pipeline: matches!(separator, Some("|" | "|&")),
             });
+            coverage_no_effect(&mut coverage_guard);
             continue;
         }
         let mut invocation_completeness = Completeness::complete();
@@ -9076,6 +9570,11 @@ fn parse_web3_commands_depth(
             })
             .collect();
         let Some(command) = effective.segment.command.clone() else {
+            if segment.raw.trim().is_empty() {
+                coverage_no_effect(&mut coverage_guard);
+            } else {
+                coverage_gap(&mut coverage_guard, ParserCoverageGap::SemanticGap);
+            }
             continue;
         };
         let invocation = Invocation {
@@ -9092,6 +9591,7 @@ fn parse_web3_commands_depth(
             if contains_web3_token(segment, shell) || !invocation_completeness.is_complete() {
                 completeness.merge(&invocation_completeness);
             }
+            coverage_gap(&mut coverage_guard, ParserCoverageGap::SemanticGap);
             continue;
         };
         let UnwrappedInvocation {
@@ -9110,6 +9610,7 @@ fn parse_web3_commands_depth(
         if nested_execution.is_unsupported() {
             invocation_completeness.add(IncompleteReason::DynamicExecutionUnsupported);
             completeness.merge(&invocation_completeness);
+            coverage_gap(&mut coverage_guard, ParserCoverageGap::DynamicCommand);
             continue;
         }
         if nested_execution.is_not_nested() && !is_web3_tool_name(&tool_name) {
@@ -9121,6 +9622,12 @@ fn parse_web3_commands_depth(
             if !invocation_completeness.is_complete() {
                 completeness.merge(&invocation_completeness);
             }
+            // An ordinary command name is not enough to prove no effect: a
+            // path lookup, function, alias, cmdlet, or shell startup hook can
+            // replace even familiar names such as `echo` and `true`.  Only
+            // structural nodes whose semantics are owned by this parser are
+            // eligible for ModelledNoEffect.
+            coverage_gap(&mut coverage_guard, ParserCoverageGap::UnsupportedCommand);
             continue;
         }
         if cwd_tainted && effective_context.cwd.is_none() {
@@ -9141,6 +9648,7 @@ fn parse_web3_commands_depth(
                 if nested_depth >= MAX_WRAPPER_DEPTH {
                     invocation_completeness.add(IncompleteReason::WrapperDepthExceeded);
                     completeness.merge(&invocation_completeness);
+                    coverage_gap(&mut coverage_guard, ParserCoverageGap::BudgetExceeded);
                     continue;
                 }
                 let mut nested = parse_web3_commands_depth(
@@ -9151,6 +9659,9 @@ fn parse_web3_commands_depth(
                     Completeness::complete(),
                     fact_budget,
                     true,
+                    segment_coverage
+                        .as_ref()
+                        .and_then(|recorder| recorder.nested_frame(0, &body)),
                 );
                 for facts in &mut nested.commands {
                     rebase_nested_fact(facts, source_span(segment));
@@ -9159,6 +9670,7 @@ fn parse_web3_commands_depth(
                 completeness.merge(&invocation_completeness);
                 completeness.merge(&nested.completeness);
                 commands.extend(nested.commands);
+                coverage_no_effect(&mut coverage_guard);
                 continue;
             }
             NestedExecution::Unsupported => unreachable!("handled above"),
@@ -9196,6 +9708,24 @@ fn parse_web3_commands_depth(
             ),
             _ => continue,
         };
+        // Parsing a Web3 CLI invocation proves useful diagnostic facts, but a
+        // command spelling does not prove which executable the boundary will
+        // run. Bare names are PATH-dependent and path-qualified names can be
+        // replaced between analysis and execution. Until TaskAnalysisContext
+        // binds this exact occurrence to a trusted executable descriptor or
+        // digest, inferred facts must not authorize execution as complete.
+        invocation_completeness.add(IncompleteReason::DynamicExecutionUnsupported);
+        if matches!(
+            facts.write_mode,
+            Web3WriteMode::StateChanging | Web3WriteMode::PotentialWrite
+        ) {
+            if facts.signers.is_empty() {
+                facts.completeness.add(IncompleteReason::SignerMissing);
+            }
+            if facts.rpc.is_none() {
+                facts.completeness.add(IncompleteReason::ConfigMissing);
+            }
+        }
         redact_public_fact_secret_shapes(&mut facts);
         facts.completeness.merge(&invocation_completeness);
         completeness.merge(&facts.completeness);
@@ -9203,6 +9733,9 @@ fn parse_web3_commands_depth(
         facts.safety_flags.dedup();
         if fact_budget.retain(&facts, &mut completeness) {
             commands.push(facts);
+            coverage_facts(&mut coverage_guard);
+        } else {
+            coverage_gap(&mut coverage_guard, ParserCoverageGap::BudgetExceeded);
         }
     }
     finalize_bounded_parse_result(commands, completeness)
@@ -12167,7 +12700,8 @@ mod tests {
                 .iter()
                 .filter(|effect| effect.kind == CommandEffectKind::Web3SignerUse)
                 .count(),
-            3
+            1,
+            "a chain write has one categorical signer-use capability; concrete roles remain on facts"
         );
         assert_eq!(
             result
@@ -12239,7 +12773,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_produced_effects_obey_the_reader_budget_and_round_trip() {
+    fn parser_produced_effects_remain_bounded_and_round_trip() {
         let command = "solana --url https://rpc.example --keypair wallet.json \
                        program deploy program.so --program-id program.json \
                        --upgrade-authority authority.json --fee-payer fee-payer.json";
@@ -12248,15 +12782,25 @@ mod tests {
             .join("; ");
         let result = parse(&input);
         assert_eq!(result.commands.len(), MAX_SHELL_SEGMENTS, "{result:?}");
-        assert_eq!(result.effects.effects().len(), MAX_COMMAND_EFFECTS);
-        assert!(result
+        // A write now emits one categorical signer-use effect while retaining
+        // each concrete signer role on the fact and each proven secret read as
+        // its own effect. This makes the previous 512-effect overflow fixture
+        // unreachable under the 64-segment parser cap, but the parser output
+        // must still stay below the bounded reader ceiling.
+        let expected_per_command = 7usize; // write + signer-use + 4 secret reads + network
+        assert_eq!(
+            result.effects.effects().len(),
+            MAX_SHELL_SEGMENTS * expected_per_command
+        );
+        assert!(result.effects.effects().len() <= MAX_COMMAND_EFFECTS);
+        assert!(!result
             .completeness
             .gaps()
             .any(|gap| gap == IncompleteReason::EffectBudgetExceeded));
         let encoded = serde_json::to_string(&result).unwrap();
         let decoded = Web3ParseResultV2::from_json_slice_bounded(encoded.as_bytes()).unwrap();
-        assert_eq!(decoded.effects.effects().len(), MAX_COMMAND_EFFECTS);
-        assert!(decoded
+        assert_eq!(decoded.effects.effects(), result.effects.effects());
+        assert!(!decoded
             .completeness
             .gaps()
             .any(|gap| gap == IncompleteReason::EffectBudgetExceeded));
@@ -13299,7 +13843,14 @@ mod tests {
             Some("group.example"),
             "{brace_group:?}"
         );
-        assert!(brace_group.completeness.is_complete(), "{brace_group:?}");
+        assert!(brace_group
+            .completeness
+            .gaps()
+            .any(|gap| gap == IncompleteReason::DynamicExecutionUnsupported));
+        assert!(!brace_group
+            .completeness
+            .gaps()
+            .any(|gap| gap == IncompleteReason::UnresolvedIndirection));
 
         for command in [
             "readonly ETH_RPC_URL=https://readonly.example; cast balance 0xabc",
@@ -13312,7 +13863,6 @@ mod tests {
             "read ETH_RPC_URL; cast balance 0xabc",
             "trap 'export ETH_RPC_URL=https://trap.example' DEBUG; cast balance 0xabc",
             "builtin trap 'export ETH_RPC_URL=https://builtin-trap.example' DEBUG; cast balance 0xabc",
-            "if true; then export ETH_RPC_URL=https://if.example; fi; cast balance 0xabc",
         ] {
             let result = parse_web3_commands(command, ShellType::Posix, &context);
             assert_eq!(result.commands.len(), 1, "{command}: {result:?}");
@@ -13330,6 +13880,29 @@ mod tests {
                 .any(|gap| gap == IncompleteReason::UnresolvedIndirection),
                 "{command}: {result:?}");
         }
+
+        let proven_if = parse_web3_commands(
+            "if true; then export ETH_RPC_URL=https://if.example; fi; cast balance 0xabc",
+            ShellType::Posix,
+            &context,
+        );
+        assert_eq!(proven_if.commands.len(), 1, "{proven_if:?}");
+        assert_eq!(
+            proven_if.commands[0]
+                .rpc
+                .as_ref()
+                .and_then(|rpc| rpc.host.as_deref()),
+            Some("if.example"),
+            "{proven_if:?}"
+        );
+        assert!(!proven_if
+            .completeness
+            .gaps()
+            .any(|gap| gap == IncompleteReason::UnresolvedIndirection));
+        assert!(proven_if
+            .completeness
+            .gaps()
+            .any(|gap| gap == IncompleteReason::DynamicExecutionUnsupported));
 
         for (shell, command) in [
             (
@@ -13394,7 +13967,14 @@ mod tests {
             Some("original.example"),
             "{inert_cmd_do:?}"
         );
-        assert!(inert_cmd_do.completeness.is_complete(), "{inert_cmd_do:?}");
+        assert!(inert_cmd_do
+            .completeness
+            .gaps()
+            .any(|gap| gap == IncompleteReason::DynamicExecutionUnsupported));
+        assert!(!inert_cmd_do
+            .completeness
+            .gaps()
+            .any(|gap| gap == IncompleteReason::UnresolvedIndirection));
 
         for command in [
             "Set-Item Env:ETH_RPC_URL https://set-item.example; cast balance 0xabc",
@@ -13950,7 +14530,10 @@ mod tests {
 
     #[test]
     fn rpc_path_digest_truncation_taints_facts_and_effects() {
-        let private_path = "s".repeat(4096);
+        // Trusted path prefixes are segment-bound: `/ssss` must not match a
+        // sibling such as `/ssssuffix`. Keep a complete matching segment while
+        // retaining a path long enough to exercise digest truncation/privacy.
+        let private_path = format!("ssss/{}", "s".repeat(4096));
         let missing_context = parse(&format!(
             "cast call 0xabc --rpc-url https://rpc.example/{private_path}"
         ));
@@ -14106,6 +14689,7 @@ mod tests {
                 Completeness::complete(),
                 &mut expansion_budget,
                 true,
+                None,
             ));
         }
         let expansion_result = expansion_result.unwrap();
@@ -14129,6 +14713,7 @@ mod tests {
                 Completeness::complete(),
                 &mut work_budget,
                 true,
+                None,
             ));
         }
         let work_result = work_result.unwrap();
@@ -14180,10 +14765,11 @@ mod tests {
 
     #[test]
     fn shared_serialized_command_budget_truncates_before_decoder_limit() {
-        let long_path = format!("wallet-{}.json", "x".repeat(15_900));
-        let fact = only(&format!(
-            "solana --url devnet --keypair '{long_path}' program deploy program.so"
-        ));
+        // Signer paths are intentionally projected to fixed-size digests at
+        // the public boundary. Use a long non-credential artifact reference
+        // so this test continues to exercise the serialized-command budget.
+        let long_path = format!("program-{}.so", "x".repeat(15_900));
+        let fact = only(&format!("solana --url devnet program deploy '{long_path}'"));
         let mut budget = CommandFactBudget::default();
         let mut completeness = Completeness::complete();
         let mut commands = Vec::new();
@@ -14635,10 +15221,14 @@ mod tests {
             "if true; then branch_deploy() { cast send 0xabc --rpc-url https://branch.example; }; branch_deploy; fi; branch_deploy",
         );
         assert_eq!(conditional.commands.len(), 2, "{conditional:?}");
-        assert!(conditional
+        assert!(!conditional
             .completeness
             .gaps()
             .any(|gap| gap == IncompleteReason::UnresolvedIndirection));
+        assert!(conditional
+            .completeness
+            .gaps()
+            .any(|gap| gap == IncompleteReason::DynamicExecutionUnsupported));
 
         let unknown_definition = parse(
             "if runtime_condition; then maybe_deploy() { cast send 0xabc --rpc-url https://unknown-branch.example; }; fi; maybe_deploy",

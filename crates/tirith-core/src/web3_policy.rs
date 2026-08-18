@@ -115,12 +115,7 @@ pub struct RpcMatcher {
 }
 
 impl RpcMatcher {
-    /// Does this matcher cover the given observed endpoint?
-    ///
-    /// Host comparison is ASCII-case-insensitive and, for the subdomain form,
-    /// anchored on a label boundary so `evil-example.test` cannot satisfy a
-    /// matcher for `example.test`.
-    pub fn matches(&self, scheme: &str, host: &str, port: Option<u16>, path: Option<&str>) -> bool {
+    pub fn matches_origin(&self, scheme: &str, host: &str, port: Option<u16>) -> bool {
         if !self.scheme.eq_ignore_ascii_case(scheme) {
             return false;
         }
@@ -140,17 +135,38 @@ impl RpcMatcher {
         if !host_ok {
             return false;
         }
-        if let Some(expected) = self.port {
-            if port != Some(expected) {
-                return false;
-            }
+        self.port
+            .is_none_or(|expected| effective_rpc_port(scheme, port) == Some(expected))
+    }
+
+    /// Does this matcher cover the given observed endpoint?
+    ///
+    /// Host comparison is ASCII-case-insensitive and, for the subdomain form,
+    /// anchored on a label boundary so `evil-example.test` cannot satisfy a
+    /// matcher for `example.test`.
+    pub fn matches(&self, scheme: &str, host: &str, port: Option<u16>, path: Option<&str>) -> bool {
+        if !self.matches_origin(scheme, host, port) {
+            return false;
         }
         match (&self.path_prefix, path) {
             (None, _) => true,
             (Some(_), None) => false,
-            (Some(prefix), Some(path)) => path.starts_with(prefix.as_str()),
+            (Some(prefix), Some(path)) => {
+                path == prefix
+                    || (path.starts_with(prefix.as_str())
+                        && (prefix.ends_with('/')
+                            || path.as_bytes().get(prefix.len()) == Some(&b'/')))
+            }
         }
     }
+}
+
+fn effective_rpc_port(scheme: &str, port: Option<u16>) -> Option<u16> {
+    port.or_else(|| match scheme.to_ascii_lowercase().as_str() {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    })
 }
 
 /// Chain identity, kept separate from the human-facing name so a repo cannot
@@ -541,19 +557,23 @@ pub fn validate_web3_guard(guard: &Web3GuardPolicy) -> Vec<Web3PolicyIssue> {
         }
     }
 
-    // The same endpoint speaking for two different networks makes an alias
-    // ambiguous, which is exactly where a fork gets mistaken for mainnet.
+    // Semantically overlapping endpoints speaking for different networks are
+    // ambiguous, which is exactly where a fork gets mistaken for mainnet. A
+    // structural equality check is insufficient: an exact host overlaps a
+    // parent `host_and_subdomains` matcher, an omitted port overlaps every
+    // explicit port, and nested path prefixes can cover the same request.
     for (index, network) in guard.networks.iter().enumerate() {
         for other in guard.networks.iter().skip(index + 1) {
-            if network
-                .endpoints
-                .iter()
-                .any(|endpoint| other.endpoints.contains(endpoint))
-            {
+            if network.endpoints.iter().any(|endpoint| {
+                other
+                    .endpoints
+                    .iter()
+                    .any(|candidate| rpc_matchers_overlap(endpoint, candidate))
+            }) {
                 issues.push(issue(
                     "web3_guard.networks",
                     format!(
-                        "endpoint identity is shared by '{}' and '{}'",
+                        "endpoint coverage overlaps between '{}' and '{}'",
                         network.name, other.name
                     ),
                 ));
@@ -646,6 +666,46 @@ fn validate_matcher(matcher: &RpcMatcher, field: &str) -> Vec<Web3PolicyIssue> {
     issues
 }
 
+fn rpc_matchers_overlap(left: &RpcMatcher, right: &RpcMatcher) -> bool {
+    left.scheme.eq_ignore_ascii_case(&right.scheme)
+        && ports_overlap(left.port, right.port)
+        && host_scopes_overlap(left, right)
+        && path_scopes_overlap(left.path_prefix.as_deref(), right.path_prefix.as_deref())
+}
+
+fn ports_overlap(left: Option<u16>, right: Option<u16>) -> bool {
+    left.is_none() || right.is_none() || left == right
+}
+
+fn host_scopes_overlap(left: &RpcMatcher, right: &RpcMatcher) -> bool {
+    matcher_covers_host(left, &right.host) || matcher_covers_host(right, &left.host)
+}
+
+fn matcher_covers_host(matcher: &RpcMatcher, host: &str) -> bool {
+    host.eq_ignore_ascii_case(&matcher.host)
+        || (matcher.subdomains == SubdomainPolicy::HostAndSubdomains
+            && host.len() > matcher.host.len()
+            && host
+                .get(..host.len() - matcher.host.len())
+                .is_some_and(|prefix| prefix.ends_with('.'))
+            && host[host.len() - matcher.host.len()..].eq_ignore_ascii_case(&matcher.host))
+}
+
+fn path_scopes_overlap(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (None, _) | (_, None) => true,
+        (Some(left), Some(right)) => {
+            path_prefix_covers(left, right) || path_prefix_covers(right, left)
+        }
+    }
+}
+
+fn path_prefix_covers(prefix: &str, path: &str) -> bool {
+    path == prefix
+        || (path.starts_with(prefix)
+            && (prefix.ends_with('/') || path.as_bytes().get(prefix.len()) == Some(&b'/')))
+}
+
 /// Validate a trusted `task_gate`.
 pub fn validate_task_gate(gate: &TaskGatePolicy) -> Vec<Web3PolicyIssue> {
     let mut issues = Vec::new();
@@ -723,6 +783,60 @@ mod tests {
         // The classic allowlist bypass: a suffix that is not a label boundary.
         assert!(!wide.matches("https", "evil-example.test", None, None));
         assert!(!wide.matches("https", "example.test.attacker.tld", None, None));
+    }
+
+    #[test]
+    fn explicit_default_ports_match_omitted_and_explicit_spellings() {
+        for (scheme, default_port) in [("http", 80), ("https", 443), ("ws", 80), ("wss", 443)] {
+            let matcher = RpcMatcher {
+                scheme: scheme.into(),
+                host: "rpc.example".into(),
+                port: Some(default_port),
+                path_prefix: None,
+                subdomains: SubdomainPolicy::ExactHost,
+            };
+            assert!(matcher.matches_origin(scheme, "rpc.example", None));
+            assert!(matcher.matches_origin(scheme, "rpc.example", Some(default_port)));
+            assert!(!matcher.matches_origin(scheme, "rpc.example", Some(default_port + 1)));
+        }
+
+        let nondefault = RpcMatcher {
+            scheme: "https".into(),
+            host: "rpc.example".into(),
+            port: Some(8443),
+            path_prefix: None,
+            subdomains: SubdomainPolicy::ExactHost,
+        };
+        assert!(!nondefault.matches_origin("https", "rpc.example", None));
+        assert!(nondefault.matches_origin("https", "rpc.example", Some(8443)));
+    }
+
+    #[test]
+    fn validation_rejects_semantically_overlapping_network_endpoints() {
+        let mut parent = evm_network("parent", 1, "example.test");
+        parent.endpoints[0].subdomains = SubdomainPolicy::HostAndSubdomains;
+        parent.endpoints[0].path_prefix = Some("/rpc".into());
+        let mut child = evm_network("child", 10, "rpc.example.test");
+        child.endpoints[0].port = Some(443);
+        child.endpoints[0].path_prefix = Some("/rpc/mainnet".into());
+        let guard = Web3GuardPolicy {
+            networks: vec![parent, child],
+            ..Web3GuardPolicy::default()
+        };
+        assert!(validate_web3_guard(&guard).iter().any(|issue| {
+            issue.field == "web3_guard.networks" && issue.message.contains("overlaps")
+        }));
+
+        let disjoint = Web3GuardPolicy {
+            networks: vec![
+                evm_network("one", 1, "one.example.test"),
+                evm_network("two", 10, "two.example.test"),
+            ],
+            ..Web3GuardPolicy::default()
+        };
+        assert!(!validate_web3_guard(&disjoint)
+            .iter()
+            .any(|issue| issue.message.contains("overlaps")));
     }
 
     #[test]

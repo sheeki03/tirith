@@ -2371,7 +2371,7 @@ fn run_rejects_unsupported_forced_argv_before_url_or_network() {
 
 #[cfg(unix)]
 #[test]
-fn run_resolves_forced_interpreter_before_url_or_network() {
+fn run_resolves_forced_interpreter_after_url_syntax_but_before_network() {
     let out = tirith()
         .args([
             "run",
@@ -2380,7 +2380,7 @@ fn run_resolves_forced_interpreter_before_url_or_network() {
             "--interpreter",
             "bash",
             "--no-exec",
-            "not-a-url",
+            "https://example.com/install.sh",
         ])
         .env_remove("PATH")
         .output()
@@ -2390,17 +2390,17 @@ fn run_resolves_forced_interpreter_before_url_or_network() {
     assert!(
         stderr.contains("cannot select trusted stdin interpreter 'bash'")
             && stderr.contains("PATH is unset"),
-        "interpreter selection must fail before URL/network handling: {stderr}"
+        "interpreter selection must fail before network handling: {stderr}"
     );
     assert!(
-        !stderr.contains("invalid URL"),
-        "ordering regressed: {stderr}"
+        !stderr.contains("download failed"),
+        "network handling ran before interpreter selection: {stderr}"
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn run_rejects_a_path_shadow_before_url_or_network() {
+fn run_rejects_a_path_shadow_after_url_syntax_but_before_network() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let temp = tempfile::tempdir().expect("tempdir");
@@ -2419,7 +2419,7 @@ fn run_rejects_a_path_shadow_before_url_or_network() {
             "--interpreter",
             "bash",
             "--no-exec",
-            "not-a-url",
+            "https://example.com/install.sh",
         ])
         .env("PATH", path)
         .output()
@@ -2432,8 +2432,8 @@ fn run_rejects_a_path_shadow_before_url_or_network() {
         "first PATH shadow must fail closed: {stderr}"
     );
     assert!(
-        !stderr.contains("invalid URL"),
-        "ordering regressed: {stderr}"
+        !stderr.contains("download failed"),
+        "network handling ran before interpreter selection: {stderr}"
     );
 }
 
@@ -10635,11 +10635,25 @@ fn install_agent_rules_deny_skipped_under_tirith_bypass_today() {
     let out = tirith()
         .env("TIRITH", "0")
         .env("TIRITH_LOG", "1")
+        .env("TIRITH_PRIVATE_FETCH_ALLOW", "localhost")
         .env("TIRITH_INTEGRATION", "claude-code-install-bypass-deny-test")
         .env("TIRITH_POLICY_ROOT", &policy_root)
         .env("XDG_DATA_HOME", &data_dir)
         .env("APPDATA", &data_dir)
-        .args(["install", "--no-exec", "url", "http://127.0.0.1/install.sh"])
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("NO_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .env_remove("no_proxy")
+        .args([
+            "install",
+            "--no-exec",
+            "url",
+            "http://localhost:0/install.sh",
+        ])
         .output()
         .expect("failed to run tirith install url");
 
@@ -13686,6 +13700,8 @@ fn command_card_create_sign_verify_check_roundtrip() {
             "sign",
             "--key",
             key_path.to_str().unwrap(),
+            "--command",
+            command,
             card_path.to_str().unwrap(),
         ])
         .env("HOME", home.path())
@@ -13813,6 +13829,8 @@ fn check_card_flag_alone_forces_past_tier1_on_clean_command() {
             "sign",
             "--key",
             key_path.to_str().unwrap(),
+            "--command",
+            command,
             card_path.to_str().unwrap(),
         ])
         .env("HOME", home.path())
@@ -14047,6 +14065,8 @@ fn command_card_create_trims_padded_expires_and_verifies() {
             "sign",
             "--key",
             key_path.to_str().unwrap(),
+            "--command",
+            "echo hi",
             card_path.to_str().unwrap(),
         ])
         .env("HOME", home.path())
@@ -14130,6 +14150,93 @@ fn command_card_create_rejects_whitespace_only_command() {
         v["error"], "a non-empty --command is required",
         "JSON error object must carry the validation message, got: {v}"
     );
+}
+
+#[test]
+fn command_card_authoring_refuses_raw_signer_material_and_never_persists_commands() {
+    use tirith_core::command_card;
+
+    let home = tempfile::tempdir().unwrap();
+    let secret = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let secret_command = format!("cast send 0xdead --private-key {secret}");
+    let refused = tirith()
+        .args([
+            "command-card",
+            "create",
+            "--json",
+            "--command",
+            &secret_command,
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("create secret-bearing card");
+    assert_ne!(refused.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&refused.stderr).contains(secret));
+
+    let credential_path = "/Users/alice/.keys/production-wallet.json";
+    let safe_command = format!("echo reviewing {credential_path}");
+    let created = tirith()
+        .args(["command-card", "create", "--command", &safe_command])
+        .env("HOME", home.path())
+        .output()
+        .expect("create privacy-safe card");
+    assert_eq!(created.status.code(), Some(0));
+    let rendered = String::from_utf8(created.stdout).unwrap();
+    assert!(!rendered.contains(&safe_command));
+    assert!(!rendered.contains(credential_path));
+    let card: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(card["schema_version"], 3);
+    assert_eq!(card["command_shell"], "posix");
+    assert_eq!(card["command_sha256"].as_str().map(str::len), Some(64));
+    assert!(card.get("command").is_none());
+
+    let card_path = home.path().join("privacy-safe-card.json");
+    fs::write(&card_path, &rendered).unwrap();
+    let (signing_key, _) = command_card::generate_keypair().unwrap();
+    let key_path = home.path().join("card-signing-key.bin");
+    fs::write(&key_path, signing_key).unwrap();
+    let blind_sign = tirith()
+        .args([
+            "command-card",
+            "sign",
+            "--json",
+            "--key",
+            key_path.to_str().unwrap(),
+            card_path.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("refuse blind digest signing");
+    assert_ne!(blind_sign.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&blind_sign.stdout).contains("--command is required"));
+    assert!(!String::from_utf8_lossy(&blind_sign.stdout).contains(credential_path));
+
+    let legacy_path = home.path().join("legacy-secret-card.json");
+    fs::write(
+        &legacy_path,
+        serde_json::json!({
+            "command": secret_command,
+            "expected_domains": [],
+            "writes": [],
+            "requires_sudo": false,
+            "expires": "2099-01-01"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let legacy_verify = tirith()
+        .args([
+            "command-card",
+            "verify",
+            legacy_path.to_str().unwrap(),
+            "--json",
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("verify legacy card");
+    assert!(!String::from_utf8_lossy(&legacy_verify.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&legacy_verify.stderr).contains(secret));
 }
 
 /// CodeRabbit R19 #3: `command-card create` with NO `--command` and a NON-INTERACTIVE (piped,
@@ -14294,6 +14401,13 @@ fn command_card_sign_json_fatal_error_is_parseable_nonzero() {
         v["error"].as_str().is_some(),
         "JSON fatal error must carry an `error` string, got: {v}"
     );
+    assert_eq!(
+        v["error"], "command-card signing key file was not found",
+        "key read failures must stay categorical"
+    );
+    let private_path = missing_key.to_string_lossy();
+    assert!(!String::from_utf8_lossy(&json.stdout).contains(private_path.as_ref()));
+    assert!(!String::from_utf8_lossy(&json.stderr).contains(private_path.as_ref()));
     assert!(
         json.stderr.is_empty() || !json.stdout.is_empty(),
         "the error must be delivered as JSON on stdout in --json mode"
@@ -14318,6 +14432,74 @@ fn command_card_sign_json_fatal_error_is_parseable_nonzero() {
         "human stderr must carry the error context, got: {}",
         String::from_utf8_lossy(&human.stderr)
     );
+    assert!(String::from_utf8_lossy(&human.stderr)
+        .contains("command-card signing key file was not found"));
+    assert!(!String::from_utf8_lossy(&human.stderr).contains(private_path.as_ref()));
+}
+
+#[test]
+fn web3_private_rpc_path_prefix_is_enforced_end_to_end_without_disclosure() {
+    let root = tempfile::tempdir().unwrap();
+    let org = root.path().join("org/.tirith");
+    let project = root.path().join("project");
+    fs::create_dir_all(&org).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        org.join("policy.yaml"),
+        r#"web3_guard:
+  deny_rpc:
+    - scheme: https
+      host: rpc.test
+      path_prefix: /private
+      subdomains: exact_host
+  action_incomplete_analysis: allow
+"#,
+    )
+    .unwrap();
+
+    let canary = "C04-private-rpc-path-canary";
+    let run = |path: &str| {
+        tirith()
+            .current_dir(&project)
+            .env("TIRITH_POLICY_ROOT", root.path().join("org"))
+            .args([
+                "check",
+                "--non-interactive",
+                "--no-daemon",
+                "--json",
+                "--shell",
+                "posix",
+                "--",
+                &format!("cast call 0xabc --rpc-url https://rpc.test{path}"),
+            ])
+            .output()
+            .expect("run Web3 private-path policy check")
+    };
+
+    let positive_path = format!("/private/{canary}");
+    let positive = run(&positive_path);
+    assert_eq!(positive.status.code(), Some(1));
+    let positive_json: serde_json::Value = serde_json::from_slice(&positive.stdout).unwrap();
+    assert_eq!(positive_json["action"], "block");
+    assert!(String::from_utf8_lossy(&positive.stdout).contains("status=denied_endpoint"));
+
+    let negative_path = format!("/private2/{canary}");
+    let negative = run(&negative_path);
+    assert_eq!(negative.status.code(), Some(0));
+    let negative_json: serde_json::Value = serde_json::from_slice(&negative.stdout).unwrap();
+    assert_eq!(negative_json["action"], "allow");
+    assert!(!String::from_utf8_lossy(&negative.stdout).contains("status=denied_endpoint"));
+
+    for output in [&positive, &negative] {
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!rendered.contains(canary));
+        assert!(!rendered.contains("/private/"));
+        assert!(!rendered.contains("/private2/"));
+    }
 }
 
 #[cfg(unix)]
@@ -14721,6 +14903,8 @@ fn command_card_comment_carried_verifies_not_mismatch() {
             "sign",
             "--key",
             key_path.to_str().unwrap(),
+            "--command",
+            command,
             card_path.to_str().unwrap(),
         ])
         .env("HOME", home.path())
@@ -14806,6 +14990,8 @@ fn command_card_mismatch_is_high_and_other_findings_fire() {
             "sign",
             "--key",
             key_path.to_str().unwrap(),
+            "--command",
+            carded,
             card_path.to_str().unwrap(),
         ])
         .env("HOME", home.path())
@@ -21512,17 +21698,25 @@ fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
 
     for action in ["approve", "install"] {
         let state = tempfile::tempdir().unwrap();
+        let target = state.path().join("dedicated-target");
         let mut command = tirith();
         command
             .env("PATH", &bin)
             .env("XDG_CONFIG_HOME", state.path().join("config"))
             .env("XDG_DATA_HOME", state.path().join("data"))
             .env("APPDATA", state.path().join("data"));
+        let mut args = vec![
+            "pkg".to_string(),
+            action.to_string(),
+            "pip".to_string(),
+            "examplepkg==1.0.0".to_string(),
+            "--target".to_string(),
+            target.display().to_string(),
+        ];
         if action == "install" {
-            command.args(["pkg", action, "pip", "--yes", "examplepkg==1.0.0"]);
-        } else {
-            command.args(["pkg", action, "pip", "examplepkg==1.0.0"]);
+            args.push("--yes".to_string());
         }
+        command.args(args);
         let output = command
             .output()
             .unwrap_or_else(|error| panic!("run pkg {action}: {error}"));
@@ -21533,10 +21727,23 @@ fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("resolve failed") && stderr.contains("explicit `tirith pkg trust-tool"),
-            "pkg {action} must report the resolver trust boundary: {stderr}"
-        );
+        if action == "approve" && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert!(
+                stderr.contains("package approvals are redeemable only on x86_64 Linux"),
+                "pkg approve must report its native capability boundary: {stderr}"
+            );
+        } else if action == "install" && !cfg!(target_os = "linux") {
+            assert!(
+                stderr.contains("enforcing package target binding is supported only on Linux"),
+                "pkg install must report its target capability boundary: {stderr}"
+            );
+        } else {
+            assert!(
+                stderr.contains("resolve failed")
+                    && stderr.contains("explicit `tirith pkg trust-tool"),
+                "pkg {action} must report the resolver trust boundary: {stderr}"
+            );
+        }
     }
     assert!(
         !marker.exists(),
@@ -21581,10 +21788,18 @@ fn pkg_install_pip_fails_closed_when_toolchain_absent() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("tirith pkg install:") && stderr.contains("resolve failed"),
-        "the refusal must name the failed resolve, not silently proceed: {stderr}"
-    );
+    if cfg!(target_os = "linux") {
+        assert!(
+            stderr.contains("tirith pkg install:") && stderr.contains("resolve failed"),
+            "the refusal must name the failed resolve, not silently proceed: {stderr}"
+        );
+    } else {
+        assert!(
+            stderr.contains("target_binding")
+                && stderr.contains("enforcing package target binding is supported only on Linux"),
+            "the refusal must name the unavailable native target binding: {stderr}"
+        );
+    }
     // The enforcing surface must NOT have installed into the target environment.
     assert!(
         !target.exists()
@@ -21666,7 +21881,14 @@ fn pkg_install_pip_json_still_fails_closed_when_toolchain_absent() {
         )
     });
     assert_eq!(json["success"], false);
-    assert_eq!(json["error_phase"], "plan_preparation");
+    assert_eq!(
+        json["error_phase"],
+        if cfg!(target_os = "linux") {
+            "plan_preparation"
+        } else {
+            "target_binding"
+        }
+    );
     assert_eq!(json["target_executed"], false);
     assert_eq!(json["target_published"], false);
     assert!(

@@ -82,6 +82,42 @@ pub fn validate_fetch_url(url: &str) -> Result<url::Url, String> {
     validate_outbound_url_with_resolver(url, UrlValidationMode::Fetch, &resolve_host)
 }
 
+/// Pure fetch-URL preflight used before consuming a one-shot authorization.
+///
+/// This validates every property available without name resolution: syntax,
+/// scheme, credentials, host/port presence, cloud-metadata hostnames, and
+/// literal-IP policy. Domain names are deliberately not resolved here. The
+/// ordinary [`validate_fetch_url`] call remains mandatory after authorization
+/// and immediately before constructing the network request.
+pub fn validate_fetch_url_syntax(url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(url).map_err(|_| "invalid URL".to_string())?;
+    validate_parsed_url_syntax(&parsed, UrlValidationMode::Fetch)?;
+
+    let host_label = parsed
+        .host_str()
+        .ok_or_else(|| "URL is missing a host".to_string())?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let policy = private_fetch_policy_from_env()?;
+    let literal = match parsed
+        .host()
+        .ok_or_else(|| "URL is missing a host".to_string())?
+    {
+        url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
+        url::Host::Domain(_) => {
+            if is_localhost_host(&host_label) && !policy.approves_host(&host_label) {
+                return Err("refusing to connect to localhost destination".to_string());
+            }
+            None
+        }
+    };
+    if let Some(ip) = literal {
+        validate_resolved_destination(&host_label, &[ip], Some(&policy))?;
+    }
+    Ok(parsed)
+}
+
 /// Hermetic preflight seam for crate tests that need to model the first DNS
 /// answer independently from the connect-time resolver answer.
 #[cfg(any(test, feature = "test-network-seams"))]
@@ -117,11 +153,7 @@ fn validate_parsed_url_with_resolver(
     resolver: &HostResolver<'_>,
     fetch_policy_override: Option<&PrivateFetchPolicy>,
 ) -> Result<(), String> {
-    validate_scheme(parsed, mode)?;
-
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("refusing to connect to URLs with embedded credentials".to_string());
-    }
+    validate_parsed_url_syntax(parsed, mode)?;
 
     let host = parsed
         .host()
@@ -131,12 +163,6 @@ fn validate_parsed_url_with_resolver(
         .ok_or_else(|| "URL is missing a host".to_string())?
         .trim_end_matches('.')
         .to_ascii_lowercase();
-
-    // Reject canonical metadata names before DNS. The connect-time resolver
-    // repeats this exact check so a redirect or rebind cannot bypass it.
-    if is_cloud_metadata_host(&host_label) {
-        return Err("refusing to connect to cloud metadata endpoint".to_string());
-    }
 
     let private_policy = match mode {
         UrlValidationMode::Server => None,
@@ -166,6 +192,25 @@ fn validate_parsed_url_with_resolver(
     };
 
     validate_resolved_destination(&host_label, &addrs, private_policy.as_ref())
+}
+
+fn validate_parsed_url_syntax(parsed: &url::Url, mode: UrlValidationMode) -> Result<(), String> {
+    validate_scheme(parsed, mode)?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("refusing to connect to URLs with embedded credentials".to_string());
+    }
+    let host_label = parsed
+        .host_str()
+        .ok_or_else(|| "URL is missing a host".to_string())?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if is_cloud_metadata_host(&host_label) {
+        return Err("refusing to connect to cloud metadata endpoint".to_string());
+    }
+    parsed
+        .port_or_known_default()
+        .ok_or_else(|| "unsupported URL scheme".to_string())?;
+    Ok(())
 }
 
 fn validate_scheme(parsed: &url::Url, mode: UrlValidationMode) -> Result<(), String> {
@@ -889,6 +934,42 @@ mod tests {
             &resolver_with("93.184.216.34".parse().unwrap()),
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fetch_syntax_preflight_accepts_a_domain_without_resolution() {
+        let parsed = validate_fetch_url_syntax("https://does-not-resolve.invalid/script")
+            .expect("pure preflight must not consult DNS for a domain name");
+        assert_eq!(parsed.host_str(), Some("does-not-resolve.invalid"));
+
+        let resolver_called = std::cell::Cell::new(false);
+        let full = validate_outbound_url_with_resolver(
+            parsed.as_str(),
+            UrlValidationMode::Fetch,
+            &|_, _| {
+                resolver_called.set(true);
+                Err("synthetic DNS failure".to_string())
+            },
+        );
+        assert!(full.is_err());
+        assert!(resolver_called.get());
+    }
+
+    #[test]
+    fn fetch_syntax_preflight_rejects_literal_ssrf_and_malformed_inputs() {
+        for input in [
+            "not a URL",
+            "ftp://example.com/script",
+            "https://user:secret@example.com/script",
+            "https://api.localhost/script",
+            "https://169.254.169.254/latest/meta-data",
+            "https://metadata.google.internal/computeMetadata/v1",
+        ] {
+            assert!(
+                validate_fetch_url_syntax(input).is_err(),
+                "accepted {input}"
+            );
+        }
     }
 
     #[test]

@@ -485,9 +485,6 @@ pub(crate) fn apply_stateless_policy_effects(
         if let Some(meta) = crate::approval::check_approval(&effective, policy) {
             crate::approval::apply_approval(&mut effective, &meta);
             causal_rule_ids.insert(meta.rule_id.clone());
-            if caller != CallerContext::Cli && effective.requires_approval == Some(true) {
-                effective.action = Action::Block;
-            }
         }
     }
 
@@ -543,7 +540,36 @@ pub(crate) fn apply_stateless_policy_effects(
         }
     }
 
+    normalize_approval_contract(&mut effective, caller);
     effective
+}
+
+fn clear_approval_metadata(verdict: &mut Verdict) {
+    verdict.requires_approval = None;
+    verdict.approval_timeout_secs = None;
+    verdict.approval_fallback = None;
+    verdict.approval_rule = None;
+    verdict.approval_description = None;
+}
+
+/// Keep the action and approval channel as one invariant at every return seam:
+/// a Block is never approvable, and a caller without a prompt channel must turn
+/// a live approval requirement into an unambiguous Block.
+fn normalize_approval_contract(verdict: &mut Verdict, caller: CallerContext) {
+    if verdict.action == Action::Block {
+        clear_approval_metadata(verdict);
+        return;
+    }
+    if verdict.requires_approval == Some(true) {
+        if caller != CallerContext::Cli {
+            verdict.action = Action::Block;
+            clear_approval_metadata(verdict);
+        } else if verdict.action == Action::Allow {
+            // Filtering may hide the causal finding, but it cannot turn a live
+            // approval gate into an executable Allow.
+            verdict.action = Action::Warn;
+        }
+    }
 }
 
 pub(crate) fn apply_correlation_findings(
@@ -615,6 +641,7 @@ pub fn post_process_verdict_for_verification(
         reapply_monotonic_policy_effects(&mut effective, policy, caller);
     }
 
+    normalize_approval_contract(&mut effective, caller);
     effective
 }
 
@@ -664,9 +691,6 @@ fn reapply_monotonic_policy_effects(
         if let Some(meta) = crate::approval::check_approval(effective, policy) {
             crate::approval::apply_approval(effective, &meta);
             causal_rule_ids.insert(meta.rule_id.clone());
-            if caller != CallerContext::Cli && effective.requires_approval == Some(true) {
-                effective.action = Action::Block;
-            }
         }
     }
 
@@ -693,6 +717,7 @@ fn reapply_monotonic_policy_effects(
             effective.findings.push(causal.clone());
         }
     }
+    normalize_approval_contract(effective, caller);
 }
 
 /// Post-processing pipeline applied after the engine produces a raw verdict:
@@ -803,6 +828,7 @@ pub fn post_process_verdict(
         reapply_monotonic_policy_effects(&mut effective, policy, caller);
     }
 
+    normalize_approval_contract(&mut effective, caller);
     effective
 }
 
@@ -2974,6 +3000,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn engine_native_approval_is_preserved_for_cli_and_refused_for_mcp() {
+        let mut raw = raw_verdict_with(Action::Warn, vec![], None);
+        raw.requires_approval = Some(true);
+        raw.approval_timeout_secs = Some(0);
+        raw.approval_fallback = Some("block".into());
+        raw.approval_rule = Some("web3_network_policy_violation".into());
+        raw.approval_description = Some("Web3 endpoint requires approval".into());
+        let policy = crate::policy::Policy::default();
+
+        let cli = apply_stateless_policy_effects(&raw, &policy, CallerContext::Cli);
+        assert_eq!(cli.action, Action::Warn);
+        assert_eq!(cli.requires_approval, Some(true));
+
+        let mcp = apply_stateless_policy_effects(&raw, &policy, CallerContext::McpServer);
+        assert_eq!(mcp.action, Action::Block);
+        assert_eq!(mcp.requires_approval, None);
+        assert_eq!(mcp.approval_rule, None);
+
+        let mut later_block = cli;
+        later_block.action = Action::Block;
+        normalize_approval_contract(&mut later_block, CallerContext::Cli);
+        assert_eq!(later_block.requires_approval, None);
+        assert_eq!(later_block.approval_timeout_secs, None);
+        assert_eq!(later_block.approval_fallback, None);
+        assert_eq!(later_block.approval_rule, None);
+        assert_eq!(later_block.approval_description, None);
+    }
+
     // --- W7: derive_typed_events -------------------------------------------
 
     fn kinds(events: &[TypedEvent]) -> Vec<EventKind> {
@@ -3692,6 +3747,11 @@ mod tests {
         // silently ignored and the Medium correlation stayed at Warn.
         let correlation = make_finding(RuleId::DependencyChangeThenNetwork, Severity::Medium);
         let mut effective = raw_verdict_with(Action::Warn, vec![correlation], None);
+        effective.requires_approval = Some(true);
+        effective.approval_timeout_secs = Some(0);
+        effective.approval_fallback = Some("block".into());
+        effective.approval_rule = Some("web3_network_policy_violation".into());
+        effective.approval_description = Some("Web3 approval".into());
         let mut policy = crate::policy::Policy::default();
         policy.action_overrides.insert(
             RuleId::DependencyChangeThenNetwork.to_string(),
@@ -3709,6 +3769,11 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.rule_id == RuleId::DependencyChangeThenNetwork));
+        assert_eq!(effective.requires_approval, None);
+        assert_eq!(effective.approval_timeout_secs, None);
+        assert_eq!(effective.approval_fallback, None);
+        assert_eq!(effective.approval_rule, None);
+        assert_eq!(effective.approval_description, None);
     }
 
     #[test]
@@ -3730,6 +3795,11 @@ mod tests {
         let mut effective = raw_verdict_with(Action::Warn, vec![correlation], None);
         reapply_monotonic_policy_effects(&mut effective, &policy, CallerContext::Gateway);
         assert_eq!(effective.action, Action::Block);
+        assert_eq!(effective.requires_approval, None);
+        assert_eq!(effective.approval_timeout_secs, None);
+        assert_eq!(effective.approval_fallback, None);
+        assert_eq!(effective.approval_rule, None);
+        assert_eq!(effective.approval_description, None);
     }
 
     #[test]

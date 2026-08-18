@@ -180,6 +180,45 @@ pub fn preview_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn task_authorization_receipt_v2_schema() -> Value {
+    let properties = json!({
+        "schema_version": {"type": "integer", "enum": [2]},
+        "receipt_id": {"type": "string", "maxLength": 256},
+        "issuer_key_id": {"type": "string", "minLength": 16, "maxLength": 16, "pattern": "^[0-9a-f]{16}$"},
+        "task_id": {"type": "string", "maxLength": 1024},
+        "source_id": {"type": "string", "maxLength": 1024},
+        "source_kind": {"type": "string"},
+        "content_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "adapter": {"type": "string"},
+        "acquisition_identity_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "boundary": {"type": "string", "enum": ["gateway_forward", "package_approval", "package_resolve", "package_install_preparation", "package_manager_network", "package_manager_execution", "remote_script_run", "fetch_cloaking", "config_write"]},
+        "action_index": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "action_identity": {"type": "string", "maxLength": 256},
+        "action_projection_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "effects_projection_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "enforcement_projection_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "boundary_operation_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "authorization_projection_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "issued_at": {"type": "string", "maxLength": 64},
+        "expires_at": {"type": "string", "maxLength": 64},
+        "nonce": {"type": "string", "maxLength": 256},
+        "signature": {"type": "string", "minLength": 128, "maxLength": 128, "pattern": "^[0-9a-fA-F]{128}$"}
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": [
+            "schema_version", "receipt_id", "issuer_key_id", "task_id", "source_id",
+            "source_kind", "content_sha256", "adapter", "acquisition_identity_sha256",
+            "boundary", "action_index", "action_identity", "action_projection_sha256",
+            "effects_projection_sha256", "enforcement_projection_sha256",
+            "boundary_operation_sha256", "authorization_projection_sha256", "issued_at",
+            "expires_at", "nonce", "signature"
+        ]
+    })
+}
+
 /// Tools advertised ONLY under the preview capability.
 ///
 /// `tirith_check_task` is diagnostic: it reports what an untrusted task
@@ -187,6 +226,7 @@ pub fn preview_enabled() -> bool {
 /// nothing. Every object is `additionalProperties: false` so a client cannot
 /// smuggle an unmodelled field past the bounded envelope parser.
 pub fn preview_tools() -> Vec<ToolDefinition> {
+    let authorization_receipt_schema = task_authorization_receipt_v2_schema();
     vec![ToolDefinition {
         name: "tirith_check_task".into(),
         description: "PREVIEW, DIAGNOSTIC. Assess an untrusted task envelope (issue body, PDF,                       web page, and similar) and report which effects it would be allowed.                       Executes nothing, fetches nothing, resolves no package, and writes                       nothing. The response is advisory and is not an enforcement decision."
@@ -200,6 +240,7 @@ pub fn preview_tools() -> Vec<ToolDefinition> {
                     "additionalProperties": false,
                     "description": "The bounded task envelope to assess.",
                     "properties": {
+                        "version": {"type": "integer", "enum": [2]},
                         "task_id": {"type": "string", "maxLength": 4096},
                         "sources": {
                             "type": "array",
@@ -208,6 +249,7 @@ pub fn preview_tools() -> Vec<ToolDefinition> {
                                 "type": "object",
                                 "additionalProperties": false,
                                 "properties": {
+                                    "source_id": {"type": "string", "maxLength": 1024},
                                     "claimed_source": {
                                         "type": "string",
                                         "description": "What the document CLAIMS this is. Recorded as a claim; never trusted.",
@@ -260,7 +302,14 @@ pub fn preview_tools() -> Vec<ToolDefinition> {
                                     "shell": {
                                         "type": "object",
                                         "additionalProperties": false,
-                                        "properties": {"command": {"type": "string", "maxLength": 4096}},
+                                        "properties": {
+                                            "command": {"type": "string", "maxLength": 4096},
+                                            "claimed_shell": {
+                                                "type": "string",
+                                                "maxLength": 64,
+                                                "enum": ["posix", "bash", "zsh", "sh", "fish", "powershell", "pwsh", "cmd", "cmd.exe", "unknown"]
+                                            }
+                                        },
                                         "required": ["command"]
                                     },
                                     "package_install": {
@@ -287,8 +336,24 @@ pub fn preview_tools() -> Vec<ToolDefinition> {
                                 }
                             }
                         },
-                        "requested_effects": {"type": "array", "maxItems": 32, "items": {"type": "string"}}
-                    }
+                        "requested_effects": {"type": "array", "maxItems": 32, "items": {"type": "string"}},
+                        "authorizations": {
+                            "type": "array",
+                            "maxItems": 1024,
+                            "items": authorization_receipt_schema
+                        }
+                    },
+                    "allOf": [{
+                        "if": {"required": ["version"]},
+                        "then": {
+                            "required": ["version", "task_id"],
+                            "properties": {
+                                "sources": {
+                                    "items": {"required": ["source_id", "claimed_source"]}
+                                }
+                            }
+                        }
+                    }]
                 },
                 "adapter": {
                     "type": "string",
@@ -316,6 +381,38 @@ pub fn list_with_preview() -> Vec<ToolDefinition> {
 
 /// Dispatch a tool call by name.
 pub fn call(name: &str, arguments: &Value) -> ToolCallResult {
+    #[cfg(unix)]
+    if name == "tirith_fetch_cloaking" {
+        let policy = crate::policy::Policy::discover(None);
+        return call_with_policy(name, arguments, &policy);
+    }
+    // Other legacy direct callers do not use the frozen policy parameter and
+    // retain their previous discovery behavior inside their own handlers.
+    call_with_policy(name, arguments, &crate::policy::Policy::default())
+}
+
+/// Dispatch using the operator policy frozen by the MCP dispatcher.
+///
+/// In particular, the cloaking fetch must not rediscover policy from a
+/// repository-controlled working directory between session initialization and
+/// its first DNS lookup.
+pub fn call_with_policy(
+    name: &str,
+    arguments: &Value,
+    operator_policy: &crate::policy::Policy,
+) -> ToolCallResult {
+    call_with_policy_and_audit(name, arguments, operator_policy, &mut |_| {})
+}
+
+/// Dispatch using a frozen operator policy and an explicit task-boundary audit
+/// sink. The sink receives only recordable assessments and is invoked before
+/// an authorized cloaking probe can begin target DNS or HTTP work.
+pub fn call_with_policy_and_audit(
+    name: &str,
+    arguments: &Value,
+    operator_policy: &crate::policy::Policy,
+    audit: &mut dyn FnMut(&crate::task_boundary::BoundaryAssessment),
+) -> ToolCallResult {
     match name {
         "tirith_check_command" => call_check_command(arguments),
         "tirith_check_url" => call_check_url(arguments),
@@ -324,7 +421,7 @@ pub fn call(name: &str, arguments: &Value) -> ToolCallResult {
         "tirith_scan_directory" => call_scan_directory(arguments),
         "tirith_verify_mcp_config" => call_verify_mcp_config(arguments),
         #[cfg(unix)]
-        "tirith_fetch_cloaking" => call_fetch_cloaking(arguments),
+        "tirith_fetch_cloaking" => call_fetch_cloaking(arguments, operator_policy, audit),
         #[cfg(not(unix))]
         "tirith_fetch_cloaking" => tool_error("Not available on this platform"),
         // Preview surface. Refused unless the operator opted in, so a client
@@ -350,10 +447,11 @@ fn call_check_task(arguments: &Value) -> ToolCallResult {
         Ok(raw) => raw,
         Err(error) => return tool_error(&format!("Invalid envelope: {error}")),
     };
-    let envelope = match crate::task::parse_envelope(&raw) {
-        Ok(envelope) => envelope,
+    let document = match crate::task::parse_envelope_document(&raw) {
+        Ok(document) => document,
         Err(rejection) => return tool_error(&format!("Envelope rejected: {rejection:?}")),
     };
+    let envelope = &document.envelope;
 
     // The adapter is caller-asserted and selects only which claimed kind is
     // believable. No source kind is trusted, so this can never grant.
@@ -373,17 +471,18 @@ fn call_check_task(arguments: &Value) -> ToolCallResult {
         .iter()
         .map(|source| crate::task::assign_provenance(source, adapter, None, None))
         .collect::<Vec<_>>();
-    let decision = crate::task::decide(
-        &envelope,
+    let decision = crate::task::decide_document(
+        &document,
         provenance,
         &policy.task_gate,
         crate::effects::BoundaryCapability::ObserveOnly,
+        None,
     );
 
     // The same projection the CLI prints. C11 requires the two to be equal, so
     // they render from one function instead of two that happen to agree today.
-    let rejections = crate::task::validate_envelope(&envelope);
-    let structured = crate::task::decision_projection(&decision, &rejections);
+    let rejections = crate::task::validate_envelope(envelope);
+    let structured = crate::task::document_decision_projection(&document, &decision, &rejections);
 
     // The text and structured views must agree after redaction, so the text is
     // rendered FROM the same structured value rather than assembled separately.
@@ -934,19 +1033,68 @@ fn build_mcp_config_response(
 }
 
 #[cfg(unix)]
-fn call_fetch_cloaking(args: &Value) -> ToolCallResult {
+fn call_fetch_cloaking(
+    args: &Value,
+    policy: &crate::policy::Policy,
+    audit: &mut dyn FnMut(&crate::task_boundary::BoundaryAssessment),
+) -> ToolCallResult {
     let url = match args.get("url").and_then(|v| v.as_str()) {
         Some(u) => u,
         None => return tool_error("Missing required parameter: url"),
     };
 
-    let policy = crate::policy::Policy::discover(None);
     let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    let mut task_boundary = None;
 
-    match crate::rules::cloaking::check(url) {
-        Ok(result) => build_cloaking_response_with_compiled(result, &compiled),
-        Err(e) => tool_error_with_compiled(&format!("Cloaking check failed: {e}"), &compiled),
+    match crate::rules::cloaking::check_with_audit(url, &policy.task_gate, |assessment| {
+        audit(assessment);
+        task_boundary = Some(redacted_task_boundary_projection(assessment, &compiled));
+    }) {
+        Ok(authorized) => build_cloaking_response_with_boundary(
+            authorized.result,
+            &compiled,
+            task_boundary.as_ref(),
+        ),
+        Err(error) => {
+            if task_boundary.is_none() {
+                task_boundary = error.assessment().and_then(|assessment| {
+                    assessment
+                        .is_recordable()
+                        .then(|| redacted_task_boundary_projection(assessment, &compiled))
+                });
+            }
+            cloaking_tool_error(&error, &compiled, task_boundary.as_ref())
+        }
     }
+}
+
+#[cfg(unix)]
+fn redacted_task_boundary_projection(
+    assessment: &crate::task_boundary::BoundaryAssessment,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> Value {
+    let mut projection = assessment.projection();
+    crate::redact::redact_json_strings(&mut projection, compiled);
+    crate::verdict::bound_json_value_for_output(projection)
+}
+
+#[cfg(unix)]
+fn cloaking_tool_error(
+    error: &crate::rules::cloaking::CloakingCheckError,
+    compiled: &crate::redact::CompiledCustomPatterns,
+    task_boundary: Option<&Value>,
+) -> ToolCallResult {
+    let safe_error = crate::redact::redact_sanitize_redact_with_compiled(
+        &format!("Cloaking check failed: {error}"),
+        compiled,
+    );
+    let mut result = tool_error_with_compiled(&safe_error, compiled);
+    let mut structured = json!({"error": safe_error});
+    if let Some(task_boundary) = task_boundary {
+        structured["task_boundary"] = task_boundary.clone();
+    }
+    result.structured_content = Some(crate::verdict::bound_json_value_for_output(structured));
+    result
 }
 
 /// Build the MCP response for a cloaking result. Extracted for testability;
@@ -960,10 +1108,19 @@ fn build_cloaking_response(
     build_cloaking_response_with_compiled(result, &compiled)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn build_cloaking_response_with_compiled(
+    result: crate::rules::cloaking::CloakingResult,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> ToolCallResult {
+    build_cloaking_response_with_boundary(result, compiled, None)
+}
+
+#[cfg(unix)]
+fn build_cloaking_response_with_boundary(
     mut result: crate::rules::cloaking::CloakingResult,
     compiled: &crate::redact::CompiledCustomPatterns,
+    task_boundary: Option<&Value>,
 ) -> ToolCallResult {
     result.url = crate::redact::redact_sanitize_redact_with_compiled(&result.url, compiled);
     crate::redact::redact_findings_with_compiled(&mut result.findings, compiled);
@@ -1007,7 +1164,11 @@ fn build_cloaking_response_with_compiled(
 
     let text = bounded_safe_mcp_text(text, compiled);
     let mut structured = result.to_json(true);
+    if let Some(task_boundary) = task_boundary {
+        structured["task_boundary"] = task_boundary.clone();
+    }
     crate::redact::redact_json_strings(&mut structured, compiled);
+    let structured = crate::verdict::bound_json_value_for_output(structured);
 
     ToolCallResult {
         content: vec![ContentItem {
@@ -1537,6 +1698,38 @@ mod tests {
             diff_text.contains("[REDACTED:OpenAI API Key]"),
             "diff_text should contain redaction marker: {diff_text}"
         );
+    }
+
+    #[test]
+    fn cloaking_uses_the_explicit_frozen_operator_task_gate() {
+        let policy = crate::policy::Policy {
+            task_gate: crate::web3_policy::TaskGatePolicy {
+                mode: crate::web3_policy::TaskGateMode::Enforce,
+                effects_denied_for_untrusted_sources: [
+                    crate::effects::CommandEffectKind::NetworkEgress,
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let audits = std::cell::RefCell::new(Vec::new());
+        let result = call_with_policy_and_audit(
+            "tirith_fetch_cloaking",
+            &json!({"url": "https://example.com"}),
+            &policy,
+            &mut |assessment| audits.borrow_mut().push(assessment.projection()),
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("authorization refused"));
+        assert_eq!(audits.borrow().len(), 1);
+        assert_eq!(audits.borrow()[0]["boundary"], "fetch_cloaking");
+        assert_eq!(audits.borrow()[0]["outcome"], "deny");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["task_boundary"]["boundary"], "fetch_cloaking");
+        assert_eq!(structured["task_boundary"]["mode"], "enforce");
+        assert_eq!(structured["task_boundary"]["outcome"], "deny");
     }
 
     #[test]
@@ -2150,12 +2343,45 @@ mod c11_preview_tests {
         }
     }
 
+    #[test]
+    fn the_preview_schema_and_handler_accept_the_strict_v2_diagnostic_shape() {
+        let tool = preview_tools()
+            .into_iter()
+            .find(|tool| tool.name == "tirith_check_task")
+            .expect("preview task tool");
+        let envelope_schema = &tool.input_schema["properties"]["envelope"];
+        assert_eq!(envelope_schema["properties"]["version"]["enum"], json!([2]));
+        assert!(envelope_schema["properties"]["authorizations"].is_object());
+        assert!(
+            envelope_schema["properties"]["sources"]["items"]["properties"]["source_id"]
+                .is_object()
+        );
+
+        let envelope = json!({
+            "version": 2,
+            "task_id": "mcp-v2-diagnostic",
+            "sources": [{
+                "source_id": "source-1",
+                "claimed_source": "unknown",
+                "content": "diagnostic only"
+            }],
+            "actions": [{
+                "shell": {"command": "echo ok", "claimed_shell": "fish"}
+            }]
+        });
+        let result = call_check_task(&json!({"envelope": envelope}));
+        assert!(!result.is_error, "strict v2 diagnostic was refused");
+        let structured = result.structured_content.expect("structured response");
+        assert_eq!(structured["envelope_version"], 2);
+        assert_eq!(structured["shell_dialect_claims"], json!(["fish"]));
+        assert_eq!(structured["shell_dialect_claims_authoritative"], false);
+    }
+
     /// C11's exit gate: the core, CLI, and MCP views of one assessment must be
     /// the same normalized projection. This pins the MCP end of that to
-    /// `task::decision_projection`; `crates/tirith/tests/task_cli.rs` pins the
-    /// CLI end to the same function. Hand-rolling either side breaks a test
-    /// rather than silently letting the two surfaces disagree about what was
-    /// denied.
+    /// `task::document_decision_projection`; `crates/tirith/tests/task_cli.rs`
+    /// pins the CLI end to the same function. Hand-rolling either side breaks a
+    /// test rather than silently letting the two surfaces disagree.
     ///
     /// It calls the handler directly so it does not have to mutate the
     /// process-wide preview env var and race other tests.
@@ -2172,8 +2398,9 @@ mod c11_preview_tests {
             .expect("preview tool returned no structured content");
 
         let raw = serde_json::to_string(&envelope_value).expect("serialize");
-        let envelope = crate::task::parse_envelope(&raw).expect("parse");
-        let rejections = crate::task::validate_envelope(&envelope);
+        let document = crate::task::parse_envelope_document(&raw).expect("parse");
+        let envelope = &document.envelope;
+        let rejections = crate::task::validate_envelope(envelope);
         let policy = crate::policy::Policy::discover_local_only(None);
         let provenance = envelope
             .sources
@@ -2187,15 +2414,16 @@ mod c11_preview_tests {
                 )
             })
             .collect::<Vec<_>>();
-        let decision = crate::task::decide(
-            &envelope,
+        let decision = crate::task::decide_document(
+            &document,
             provenance,
             &policy.task_gate,
             crate::effects::BoundaryCapability::ObserveOnly,
+            None,
         );
         assert_eq!(
             structured,
-            crate::task::decision_projection(&decision, &rejections),
+            crate::task::document_decision_projection(&document, &decision, &rejections),
             "the MCP surface rendered its own projection instead of the shared one"
         );
 

@@ -254,11 +254,11 @@ pub fn run(
                         policy_path_used: resp.policy_path_used,
                         timings_ms: resp.timings_ms,
                         urls_extracted_count: resp.urls_extracted_count,
-                        requires_approval: None,
-                        approval_timeout_secs: None,
-                        approval_fallback: None,
-                        approval_rule: None,
-                        approval_description: None,
+                        requires_approval: resp.requires_approval,
+                        approval_timeout_secs: resp.approval_timeout_secs,
+                        approval_fallback: resp.approval_fallback,
+                        approval_rule: resp.approval_rule,
+                        approval_description: resp.approval_description,
                         escalation_reason: None,
                         agent_origin: None,
                         // M11 ch2 — matched `allowed[]` name carried across the
@@ -982,18 +982,23 @@ fn resolve_owned_interactions(
             .map(|timeout| format!("Approve? ({}s timeout) [y/N] ", timeout.as_secs()))
             .unwrap_or_else(|| "Approve? [y/N] ".to_string());
         let answer = io.prompt(&prompt, approval.timeout)?;
-        approval_outcome = Some(match answer {
-            PromptAnswer::Accepted => ShellApprovalOutcome::Granted,
-            PromptAnswer::Rejected => ShellApprovalOutcome::Rejected,
-            PromptAnswer::TimedOut => ShellApprovalOutcome::TimedOut,
-        });
-        if !matches!(answer, PromptAnswer::Accepted) {
-            io.notify(&format!(
-                "tirith: approval not granted — fallback: {}",
-                approval.fallback.label()
-            ))?;
-            if !approval.fallback.permits_execution() {
+        match answer {
+            PromptAnswer::Accepted => {
+                approval_outcome = Some(ShellApprovalOutcome::Granted);
+            }
+            PromptAnswer::Rejected => {
+                io.notify("tirith: approval rejected — command blocked")?;
                 return Ok(OwnedInteractionResolution::Blocked);
+            }
+            PromptAnswer::TimedOut => {
+                approval_outcome = Some(ShellApprovalOutcome::TimedOut);
+                io.notify(&format!(
+                    "tirith: approval timed out — fallback: {}",
+                    approval.fallback.label()
+                ))?;
+                if !approval.fallback.permits_execution() {
+                    return Ok(OwnedInteractionResolution::Blocked);
+                }
             }
         }
     }
@@ -2628,7 +2633,7 @@ mod receipt_interaction_tests {
     #[test]
     fn block_fallback_stops_before_warning_ack() {
         let requirements = approval_requirements(ApprovalFallback::Block, None, Some(3));
-        let mut io = FakeInteractionIo::answering([Ok(PromptAnswer::Rejected)]);
+        let mut io = FakeInteractionIo::answering([Ok(PromptAnswer::TimedOut)]);
 
         let resolution = resolve_owned_interactions(&requirements, &dlp(&[]), &mut io).unwrap();
 
@@ -2638,6 +2643,31 @@ mod receipt_interaction_tests {
             .notifications
             .iter()
             .any(|message| message.ends_with("fallback: block")));
+    }
+
+    #[test]
+    fn explicit_approval_rejection_blocks_every_fallback_without_arming_metadata() {
+        for fallback in [
+            ApprovalFallback::Allow,
+            ApprovalFallback::Warn,
+            ApprovalFallback::Block,
+        ] {
+            let requirements = approval_requirements(fallback, Some(Duration::from_secs(7)), None);
+            let mut io = FakeInteractionIo::answering([Ok(PromptAnswer::Rejected)]);
+
+            let resolution = resolve_owned_interactions(&requirements, &dlp(&[]), &mut io).unwrap();
+
+            assert_eq!(resolution, OwnedInteractionResolution::Blocked);
+            assert_eq!(io.prompts.len(), 1);
+            assert!(io
+                .notifications
+                .iter()
+                .any(|message| message.ends_with("approval rejected — command blocked")));
+            assert!(io
+                .notifications
+                .iter()
+                .all(|message| !message.contains("fallback:")));
+        }
     }
 
     #[test]

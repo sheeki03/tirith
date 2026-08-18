@@ -271,21 +271,14 @@ pub fn install_extension(
         return 0;
     }
 
-    // --apply: write the manifest (idempotent).
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            let msg = format!("failed to create {}: {e}", parent.display());
-            return apply_failure(json, platform, browser, &path, &msg);
-        }
-    }
-
     // Idempotent: skip the write when on-disk content already matches.
-    let needs_write =
-        !matches!(std::fs::read_to_string(&path), Ok(existing) if existing == manifest);
+    let needs_write = !matches!(
+        tirith_core::util::read_text_no_follow_capped(&path, 1024 * 1024),
+        Ok(existing) if existing == manifest.as_bytes()
+    );
     if needs_write {
-        if let Err(e) =
-            super::write_file_atomic(&path, manifest.as_bytes(), /*overwrite=*/ true)
-        {
+        let policy = tirith_core::policy::Policy::discover_local_only(None);
+        if let Err(e) = write_manifest_permitted(&path, manifest.as_bytes(), &policy) {
             let msg = format!("failed to write {}: {e}", path.display());
             return apply_failure(json, platform, browser, &path, &msg);
         }
@@ -328,6 +321,20 @@ pub fn install_extension(
         }
     }
     0
+}
+
+fn write_manifest_permitted(
+    path: &std::path::Path,
+    contents: &[u8],
+    policy: &tirith_core::policy::Policy,
+) -> std::io::Result<()> {
+    let root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    super::write_config_file_permitted_with_parent_creation(
+        root, path, contents, true, policy, false, true,
+    )
 }
 
 /// Emit an `--apply` write failure (with the known `manifest_path`) and return
@@ -691,5 +698,54 @@ mod tests {
         assert!(Browser::from_str("safari").is_err());
         // The default is Chrome.
         assert_eq!(Browser::default(), Browser::Chrome);
+    }
+
+    #[test]
+    fn manifest_deny_creates_neither_parent_nor_file() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root
+            .path()
+            .join("browser-config")
+            .join("NativeMessagingHosts");
+        let path = parent.join("dev.tirith.host.json");
+        let mut policy = tirith_core::policy::Policy::default();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_denied_for_untrusted_sources
+            .insert(tirith_core::effects::CommandEffectKind::FilesystemWrite);
+
+        let error = write_manifest_permitted(&path, b"{}\n", &policy)
+            .expect_err("the task gate must refuse browser persistence");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!parent.exists());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_write_refuses_a_final_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = root.path().join("NativeMessagingHosts");
+        std::fs::create_dir(&parent).unwrap();
+        let outside_path = outside.path().join("manifest.json");
+        std::fs::write(&outside_path, b"outside\n").unwrap();
+        let path = parent.join("dev.tirith.host.json");
+        std::os::unix::fs::symlink(&outside_path, &path).unwrap();
+
+        let error = write_manifest_permitted(
+            &path,
+            b"replacement\n",
+            &tirith_core::policy::Policy::default(),
+        )
+        .expect_err("native manifest publication must not follow a final symlink");
+
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(std::fs::read(&outside_path).unwrap(), b"outside\n");
     }
 }

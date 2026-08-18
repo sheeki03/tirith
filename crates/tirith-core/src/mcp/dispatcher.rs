@@ -41,26 +41,24 @@ pub fn run_with_options(
     let mut state = State::AwaitingInit;
 
     // The JSON-RPC dispatcher is itself a public output boundary. Freeze one
-    // local policy DLP plan for the whole session and capture every later
-    // policy diagnostic so malformed-policy text can never bypass the protocol
-    // through raw stderr.
+    // fully resolved effective policy for the whole session, and capture every
+    // later policy diagnostic so malformed-policy text can never bypass the
+    // protocol through raw stderr.
     let _policy_diagnostic_capture = crate::policy::PolicyDiagnosticCapture::start();
     let policy_cwd = std::env::current_dir()
         .ok()
         .and_then(|path| path.to_str().map(String::from));
-    let output_policy = crate::policy::Policy::discover_local_only(policy_cwd.as_deref());
+    let output_policy = crate::policy::Policy::discover(policy_cwd.as_deref());
     crate::policy::freeze_captured_policy_dlp_patterns(&output_policy.dlp_custom_patterns);
     let output_dlp =
         crate::redact::CompiledCustomPatterns::new_silent(&output_policy.dlp_custom_patterns);
     drain_policy_diagnostics_to_log(&mut log, &output_dlp);
 
-    // C3a — MCP policy seam. The dispatcher holds no core `Policy`, so discover
-    // one ONCE at server init (OFFLINE: no network, and `discover_local_only`
-    // neutralizes a repo-scoped `mcp_redact_injection`), compile the operator's
-    // `injection_seeds_custom`, and read the redact flag into an
-    // `OutputFilterContext` reused for every `tools/call`. Built only when the
-    // filter is enabled; the default-off path stays allocation-free. This is init,
-    // not the hot path, so each bad seed is reported ONCE (to `log`, the server's
+    // C3a — MCP policy seam. Discover the full effective policy ONCE at server
+    // init, compile the operator's `injection_seeds_custom`, and read the redact
+    // flag into an `OutputFilterContext` reused for every `tools/call`. Built
+    // only when the filter is enabled; the default-off path stays allocation-free.
+    // This is init, not the hot path, so each bad seed is reported ONCE (to `log`, the server's
     // diagnostic sink — never stderr, which can be the JSON-RPC transport) rather
     // than silently dropped: a seed that passes `policy validate` but fails the
     // real compile would otherwise vanish with no signal.
@@ -281,7 +279,12 @@ pub fn run_with_options(
                     JsonRpcResponse::ok(id, json!({ "tools": tools }))
                 }
                 "tools/call" => {
-                    let mut result = handle_tools_call(&params);
+                    let mut task_boundary_audit =
+                        |assessment: &crate::task_boundary::BoundaryAssessment| {
+                            write_mcp_task_boundary_audit(assessment, &output_dlp);
+                        };
+                    let mut result =
+                        handle_tools_call(&params, &output_policy, &mut task_boundary_audit);
                     if options.sanitize_tool_output {
                         // M7 ch4 — fail closed (deny on truncation), stricter than
                         // the gateway default: the calling agent is the
@@ -384,7 +387,11 @@ fn handle_initialize(params: &Option<Value>) -> Value {
     })
 }
 
-fn handle_tools_call(params: &Option<Value>) -> ToolCallResult {
+fn handle_tools_call(
+    params: &Option<Value>,
+    operator_policy: &crate::policy::Policy,
+    task_boundary_audit: &mut dyn FnMut(&crate::task_boundary::BoundaryAssessment),
+) -> ToolCallResult {
     let params = match params {
         Some(p) => p,
         None => {
@@ -413,7 +420,12 @@ fn handle_tools_call(params: &Option<Value>) -> ToolCallResult {
         }
     };
 
-    tools::call(&call_params.name, &call_params.arguments)
+    tools::call_with_policy_and_audit(
+        &call_params.name,
+        &call_params.arguments,
+        operator_policy,
+        task_boundary_audit,
+    )
 }
 
 fn handle_resources_read(
@@ -549,6 +561,26 @@ fn write_invalid_seed_diagnostics_to_log(
         output.push_str("\n");
     }
     let _ = log.write_all(output.finish().as_bytes());
+}
+
+/// Record a cloaking task-boundary decision through the shared durable audit
+/// path. The assessment projection is redacted and bounded before persistence;
+/// this callback runs before an allowed probe performs target DNS or HTTP.
+fn write_mcp_task_boundary_audit(
+    assessment: &crate::task_boundary::BoundaryAssessment,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) {
+    let mut projection = assessment.projection();
+    crate::redact::redact_json_strings(&mut projection, compiled);
+    let projection = crate::verdict::bound_json_value_for_output(projection);
+    let detail = serde_json::to_string(&projection).ok();
+    crate::audit::log_hook_event(
+        "mcp",
+        "fetch_cloaking",
+        "task_boundary",
+        None,
+        detail.as_deref(),
+    );
 }
 
 /// Emit a best-effort JSONL audit line for an output-filter pass to `log`
@@ -1086,6 +1118,35 @@ mod tests {
         assert_eq!(decoded["id"], "request-7");
         assert_eq!(decoded["result"]["presentation_truncated"], true);
         assert_eq!(decoded["result"]["result_omitted"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_call_threads_the_frozen_operator_gate_to_cloaking() {
+        let policy = crate::policy::Policy {
+            task_gate: crate::web3_policy::TaskGatePolicy {
+                mode: crate::web3_policy::TaskGateMode::Enforce,
+                effects_denied_for_untrusted_sources: [
+                    crate::effects::CommandEffectKind::NetworkEgress,
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let params = Some(json!({
+            "name": "tirith_fetch_cloaking",
+            "arguments": {"url": "https://example.com"}
+        }));
+        let audits = std::cell::RefCell::new(Vec::new());
+        let result = handle_tools_call(&params, &policy, &mut |assessment| {
+            audits.borrow_mut().push(assessment.projection())
+        });
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("authorization refused"));
+        assert_eq!(audits.borrow().len(), 1);
+        assert_eq!(audits.borrow()[0]["boundary"], "fetch_cloaking");
     }
 
     #[test]

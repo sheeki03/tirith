@@ -43,12 +43,11 @@
 #![allow(dead_code)]
 
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
-#[cfg(target_os = "linux")]
-use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::io::Write as _;
 #[cfg(target_os = "linux")]
@@ -68,11 +67,15 @@ use tirith_core::artifact::install::{
     InstallCommand, PostInstallIntegrity,
 };
 use tirith_core::artifact::quarantine::{QuarantineError, QuarantineTransaction};
-use tirith_core::artifact::resolver::BoundResolverTools;
+use tirith_core::artifact::resolver::{BoundResolverTools, ResolverRequest};
 use tirith_core::policy::Policy;
 use tirith_core::receipt::{
     ArtifactScanReceipt, CapsuleReceipt, PostInstallRecordSummary, ReceiptError,
     RecordedCommittedReceipt, RecordedReceipt, VerdictSummary,
+};
+use tirith_core::task_boundary::{
+    BoundaryOperation, PackageInstallPreparationBoundary, PackageOperationBinding,
+    PackageTargetIdentity, TaskBoundaryPermit,
 };
 
 use crate::cli::capsule::{self, BoundLaunchArg, BoundLaunchDirectory, BoundLaunchInput};
@@ -233,6 +236,25 @@ impl InstallTargetBinding {
         }
     }
 
+    /// Canonical, receipt-safe identity used by the package task boundary. The
+    /// retained parent descriptor and final component remain the execution
+    /// authority; the path digest prevents disclosure while still detecting an
+    /// operation swap.
+    pub fn package_target_identity(&self) -> PackageTargetIdentity {
+        #[cfg(target_os = "linux")]
+        let target_path_sha256 =
+            tirith_core::command_card::sha256_hex(self.target.as_os_str().as_bytes());
+        #[cfg(not(target_os = "linux"))]
+        let target_path_sha256 =
+            tirith_core::command_card::sha256_hex(self.target.to_string_lossy().as_bytes());
+
+        PackageTargetIdentity::new(
+            target_path_sha256,
+            self.parent_identity(),
+            self.target_component(),
+        )
+    }
+
     #[cfg(target_os = "linux")]
     fn verify_visible_parent(&self) -> std::io::Result<()> {
         let visible = open_directory_nofollow(&self.parent_path)?;
@@ -250,7 +272,6 @@ impl InstallTargetBinding {
     }
 }
 
-#[derive(Debug)]
 pub struct EnvironmentCheckpoint {
     #[cfg(target_os = "linux")]
     target: PathBuf,
@@ -277,8 +298,33 @@ pub struct EnvironmentCheckpoint {
     #[cfg(target_os = "linux")]
     _lock: File,
     private_target: PathBuf,
+    task_authorization: Option<TaskBoundaryPermit<PackageInstallPreparationBoundary>>,
+    task_envelope: Option<tirith_core::task::TaskEnvelopeInput>,
     #[cfg(target_os = "linux")]
     state: CheckpointState,
+}
+
+impl std::fmt::Debug for EnvironmentCheckpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvironmentCheckpoint")
+            .field("private_target", &self.private_target)
+            .field(
+                "task_authorization_retained",
+                &self.task_authorization.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// One-shot install-launch authority extracted from a still-live checkpoint.
+/// Its fields are private and it is neither cloneable nor serializable, so a
+/// package permit cannot be reduced to a reusable path or boolean.
+pub struct AuthorizedInstallLaunch {
+    target_install_path: PathBuf,
+    target_handle: File,
+    task_authorization: TaskBoundaryPermit<PackageInstallPreparationBoundary>,
+    task_envelope: tirith_core::task::TaskEnvelopeInput,
 }
 
 #[cfg(target_os = "linux")]
@@ -440,7 +486,46 @@ impl Drop for CheckpointInitGuard<'_> {
 }
 
 impl EnvironmentCheckpoint {
-    pub fn begin(binding: &InstallTargetBinding) -> std::io::Result<Self> {
+    /// Begin the install-preparation side effect only with a consumed permit for
+    /// this exact operation. The marker type prevents another owned boundary's
+    /// token from reaching checkpoint creation, while the digest check prevents
+    /// reuse for another package set or envelope.
+    pub fn begin_authorized(
+        binding: &InstallTargetBinding,
+        permit: TaskBoundaryPermit<PackageInstallPreparationBoundary>,
+        ecosystem: &str,
+        request: &ResolverRequest,
+        artifact_origins: &[String],
+    ) -> std::io::Result<Self> {
+        let target_identity = binding.package_target_identity();
+        let package_binding =
+            PackageOperationBinding::new(ecosystem, request, artifact_origins, &target_identity);
+        let envelope =
+            tirith_core::task_boundary::package_envelope(&package_binding).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+            })?;
+        let operation = BoundaryOperation {
+            boundary: tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+            envelope: &envelope,
+            adapter: tirith_core::task::IngressAdapter::Unattributed,
+            boundary_effects: Default::default(),
+        };
+        if !permit.binds_operation(&operation) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "task boundary permit does not bind this exact install-preparation operation",
+            ));
+        }
+        let mut checkpoint = Self::begin(binding)?;
+        checkpoint.task_authorization = Some(permit);
+        checkpoint.task_envelope = Some(envelope);
+        Ok(checkpoint)
+    }
+
+    /// Untyped initialization is private so production callers cannot bypass
+    /// [`Self::begin_authorized`]. Unit tests in this module exercise the
+    /// descriptor/journal machinery directly through this inner seam.
+    fn begin(binding: &InstallTargetBinding) -> std::io::Result<Self> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = binding;
@@ -612,6 +697,8 @@ impl EnvironmentCheckpoint {
                 journal,
                 _lock: lock,
                 private_target,
+                task_authorization: None,
+                task_envelope: None,
                 state: CheckpointState::Private,
             })
         }
@@ -620,6 +707,7 @@ impl EnvironmentCheckpoint {
     /// Canonical private target path used only to rebase the capsule's approved
     /// write root. The approval, receipt, and final publication identity remain
     /// [`InstallTargetBinding::target`].
+    #[cfg(test)]
     pub fn install_path(&self) -> &Path {
         &self.private_target
     }
@@ -646,18 +734,38 @@ impl EnvironmentCheckpoint {
         self.state
     }
 
-    /// Duplicate the exact target-directory capability for the capsule launcher.
-    pub fn try_clone_target_handle(&self) -> std::io::Result<std::fs::File> {
+    /// Move the retained task permit and a duplicate of the exact private
+    /// target descriptor into the sole contained-spawn transaction. A second
+    /// call fails, preventing retry or operation reuse without reauthorization.
+    pub fn take_authorized_launch(&mut self) -> std::io::Result<AuthorizedInstallLaunch> {
         #[cfg(target_os = "linux")]
         {
             self.verify_private_identity()?;
-            self.target_handle.try_clone()
+            let target_handle = self.target_handle.try_clone()?;
+            let task_authorization = self.task_authorization.take().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "install launch authorization was already consumed",
+                )
+            })?;
+            let task_envelope = self.task_envelope.take().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "install launch operation binding was already consumed",
+                )
+            })?;
+            Ok(AuthorizedInstallLaunch {
+                target_install_path: self.private_target.clone(),
+                target_handle,
+                task_authorization,
+                task_envelope,
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "held install targets are not implemented on this platform",
+                "held authorized install launches are not implemented on this platform",
             ))
         }
     }
@@ -1369,13 +1477,18 @@ pub fn run_contained_install(
     transaction: &QuarantineTransaction,
     tools: &BoundResolverTools,
     target_environment: &Path,
-    target_install_path: &Path,
-    target_handle: std::fs::File,
+    launch: AuthorizedInstallLaunch,
     installed_distributions: &[ExpectedInstalledDistribution],
     policy: &Policy,
     suppress_child_output: bool,
     task_denied_effects: &std::collections::BTreeSet<tirith_core::effects::CommandEffectKind>,
 ) -> Result<ContainedInstallOutcome, ContainedInstallError> {
+    let AuthorizedInstallLaunch {
+        target_install_path,
+        target_handle,
+        task_authorization,
+        task_envelope,
+    } = launch;
     // C12: the last hop before the capsule launch re-asserts the decision the
     // caller already made, rather than re-deriving one. Re-deriving here would
     // let this site and `pkg.rs` disagree about the same install; asserting
@@ -1507,14 +1620,16 @@ pub fn run_contained_install(
         .map_err(|error| ContainedInstallError::ToolBinding(error.to_string()))?;
     #[cfg(test)]
     invoke_pre_bound_launch_test_hook();
-    let outcome = capsule::run_to_completion_bound_inputs(
+    let outcome = run_authorized_install_capsule(
+        task_authorization,
+        task_envelope,
         &plan.spec,
         tools.python(),
         &args,
         inputs,
         BoundLaunchDirectory {
             policy_root: target_environment.to_path_buf(),
-            visible_path: target_install_path.to_path_buf(),
+            visible_path: target_install_path.clone(),
             handle: target_handle,
         },
         &[],
@@ -1535,7 +1650,7 @@ pub fn run_contained_install(
         let verification_root =
             PathBuf::from(format!("/proc/self/fd/{}", verification_handle.as_raw_fd()));
         #[cfg(not(target_os = "linux"))]
-        let verification_root = target_install_path.to_path_buf();
+        let verification_root = target_install_path;
         Some(verify_post_install_record_exact(
             &verification_root,
             installed_distributions,
@@ -1555,6 +1670,43 @@ pub fn run_contained_install(
         approved_requirements_path: approved_path,
         post_install,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_authorized_install_capsule(
+    task_authorization: TaskBoundaryPermit<PackageInstallPreparationBoundary>,
+    task_envelope: tirith_core::task::TaskEnvelopeInput,
+    spec: &tirith_core::capsule::CapsuleSpec,
+    program: &tirith_core::trusted_child::TrustedExecutable,
+    args: &[BoundLaunchArg],
+    inputs: Vec<BoundLaunchInput>,
+    target: BoundLaunchDirectory,
+    extra_env: &[(String, String)],
+    output_presentation: capsule::BoundOutputPresentation,
+) -> Result<capsule::CapsuleExecutionOutcome, capsule::CapsuleExecutionError> {
+    let operation = BoundaryOperation {
+        boundary: tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+        envelope: &task_envelope,
+        adapter: tirith_core::task::IngressAdapter::Unattributed,
+        boundary_effects: Default::default(),
+    };
+    task_authorization
+        .authorize_effect_at(&operation, chrono::Utc::now())
+        .map_err(|error| {
+            capsule::CapsuleExecutionError::from(capsule::CapsuleRefused {
+                backend_id: "task-boundary",
+                reason: format!("package install authorization expired or changed: {error}"),
+            })
+        })?;
+    capsule::run_to_completion_bound_inputs(
+        spec,
+        program,
+        args,
+        inputs,
+        target,
+        extra_env,
+        output_presentation,
+    )
 }
 
 #[cfg(windows)]
@@ -1662,7 +1814,7 @@ pub fn build_install_receipt(
 
     ArtifactScanReceipt::new(
         env!("CARGO_PKG_VERSION").to_string(),
-        policy.security_projection_hash(),
+        policy.enforcement_projection_hash(),
         outcome.bound_db_sequence,
         provenance.resolver_command.clone(),
         provenance.resolver_version.clone(),
@@ -1740,6 +1892,21 @@ mod tests {
         (dir, transaction, plan)
     }
 
+    fn preparation_permit(
+        operation: &BoundaryOperation<'_>,
+    ) -> TaskBoundaryPermit<PackageInstallPreparationBoundary> {
+        tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<
+            PackageInstallPreparationBoundary,
+        >(
+            operation,
+            &tirith_core::web3_policy::TaskGatePolicy::default(),
+            &tirith_core::task_analysis::TaskAnalysisContext::default(),
+        )
+        .unwrap()
+        .consume_default(chrono::Utc::now())
+        .unwrap()
+    }
+
     #[test]
     fn writing_approved_txt_lands_the_requirements_in_the_txn_dir() {
         // We exercise the write half WITHOUT spawning: write approved.txt and check
@@ -1782,6 +1949,62 @@ mod tests {
             .expect_err("preexisting targets must fail closed before journaling");
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&original).unwrap(), b"safe = True\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authorized_checkpoint_reconstructs_and_rejects_a_target_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let approved_target = root.path().join("approved");
+        let changed_target = root.path().join("changed");
+        let changed_journal = root.path().join(checkpoint_journal_name(&changed_target));
+        let approved_binding = InstallTargetBinding::bind(&approved_target).unwrap();
+        let changed_binding = InstallTargetBinding::bind(&changed_target).unwrap();
+        let request = ResolverRequest::single("approved==1.0");
+        let approved_identity = approved_binding.package_target_identity();
+        let approved_package_binding =
+            PackageOperationBinding::new("pip", &request, &[], &approved_identity);
+        let approved_envelope =
+            tirith_core::task_boundary::package_envelope(&approved_package_binding).unwrap();
+        let approved_operation = BoundaryOperation {
+            boundary: tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+            envelope: &approved_envelope,
+            adapter: tirith_core::task::IngressAdapter::Unattributed,
+            boundary_effects: Default::default(),
+        };
+        let permit = preparation_permit(&approved_operation);
+
+        let changed_identity = changed_binding.package_target_identity();
+        let changed_package_binding =
+            PackageOperationBinding::new("pip", &request, &[], &changed_identity);
+        let changed_envelope =
+            tirith_core::task_boundary::package_envelope(&changed_package_binding).unwrap();
+        let changed_operation = BoundaryOperation {
+            boundary: tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+            envelope: &changed_envelope,
+            adapter: tirith_core::task::IngressAdapter::Unattributed,
+            boundary_effects: Default::default(),
+        };
+        let error =
+            EnvironmentCheckpoint::begin_authorized(&changed_binding, permit, "pip", &request, &[])
+                .expect_err("a permit for another target identity must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!approved_target.exists());
+        assert!(!changed_target.exists());
+        assert!(!changed_journal.exists());
+
+        let permit = preparation_permit(&changed_operation);
+        let mut checkpoint =
+            EnvironmentCheckpoint::begin_authorized(&changed_binding, permit, "pip", &request, &[])
+                .expect("the exact typed permit authorizes private checkpoint creation");
+        let _launch = checkpoint
+            .take_authorized_launch()
+            .expect("the exact authorization reaches one launch transaction");
+        let reused = checkpoint
+            .take_authorized_launch()
+            .expect_err("the task permit must not authorize a retry");
+        assert_eq!(reused.kind(), std::io::ErrorKind::PermissionDenied);
+        checkpoint.rollback().unwrap();
     }
 
     #[cfg(target_os = "linux")]

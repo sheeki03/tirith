@@ -2,6 +2,8 @@
 //! `.tirith/` policy dirs exercise blocklist/allowlist/severity overrides and
 //! discovery through the full engine pipeline.
 
+#![allow(deprecated)]
+
 use std::fs;
 
 use tempfile::TempDir;

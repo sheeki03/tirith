@@ -50,61 +50,107 @@ pub fn run(
 
     let interactive = is_terminal::is_terminal(std::io::stderr());
 
-    // C12: the owned download-and-launch transition. The download itself lives
-    // in the core runner (`runner::run_impl` -> `download_bounded`), so gating
-    // from the CLI keeps that heavily frozen code untouched while still sitting
-    // upstream of every byte: nothing below this point has resolved DNS, opened
-    // a socket, written a temporary file, or launched an interpreter.
+    // C12: prepare the owned download-and-launch transition here, then hand its
+    // non-cloneable authorization and exact operation to the core runner. The
+    // runner consumes it at the last safe point before `download_bounded`, so
+    // nothing below this preparation has yet resolved DNS, opened a socket,
+    // written a temporary file, or launched an interpreter.
     //
     // Stated honestly: this gate covers the `tirith run` COMMAND. A program that
     // links tirith-core and calls `runner::run` directly is not routed through
     // it, exactly as `docs/threat-model.md` says.
     //
-    // Network egress is a boundary effect because it is true of the URL whatever
-    // its text parses to. The effects a downloaded script would have once it
-    // runs are not guessed here; the runner's existing post-download review
-    // already gates those against the ordinary verdict.
-    let run_assessment = {
-        let envelope = tirith_core::task_boundary::shell_envelope(url);
-        let operation = tirith_core::task_boundary::BoundaryOperation {
-            boundary: tirith_core::task_boundary::OwnedBoundary::RemoteScriptRun,
-            envelope: &envelope,
-            adapter: tirith_core::task::IngressAdapter::Unattributed,
-            boundary_effects: [tirith_core::effects::CommandEffectKind::NetworkEgress]
-                .into_iter()
-                .collect(),
-        };
-        tirith_core::task_boundary::evaluate(&operation, &output_policy.task_gate)
-    };
-    if let Some(reason) = run_assessment.refusal(false) {
-        let message = format!("task gate refused before any download: {reason}");
-        if json {
-            let error = build_run_error_json(&message, &output_dlp);
-            let _ = write_run_json(&error);
-        } else {
-            eprintln!(
-                "tirith run: {}",
-                tirith_core::output::sanitize_human_field_with_compiled(&message, &output_dlp),
-            );
+    // The exact binding includes canonical URL, digest pin, inspect/execute
+    // purpose, forced interpreter argv, redirect policy, and all durable
+    // download effects. Construction is pure: domain DNS remains inside the
+    // runner after this pending authorization is consumed.
+    let run_binding = match runner::remote_run_boundary_binding(
+        url,
+        expected_sha256.as_deref(),
+        no_exec,
+        requested_pipe_invocation.as_ref(),
+    ) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            let message = format!("invalid remote-script request before authorization: {reason}");
+            if json {
+                let error = build_run_error_json(&message, &output_dlp);
+                let _ = write_run_json(&error);
+            } else {
+                eprintln!(
+                    "tirith run: {}",
+                    tirith_core::output::sanitize_human_field_with_compiled(&message, &output_dlp),
+                );
+            }
+            return 1;
         }
-        return 1;
-    }
+    };
+    let run_operation = run_binding.operation();
+    let pending_authorization =
+        match tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<
+            tirith_core::task_boundary::RemoteScriptRunBoundary,
+        >(
+            &run_operation,
+            &output_policy.task_gate,
+            &tirith_core::task_analysis::TaskAnalysisContext::default(),
+        ) {
+            Ok(pending) => {
+                if let Err(error) =
+                    tirith_core::audit::log_task_boundary_assessment(pending.assessment())
+                {
+                    tirith_core::audit::audit_diagnostic(format!(
+                        "task-boundary audit append failed: {error}"
+                    ));
+                }
+                pending
+            }
+            Err(error) => {
+                if let Some(assessment) = error.assessment() {
+                    if let Err(audit_error) =
+                        tirith_core::audit::log_task_boundary_assessment(assessment)
+                    {
+                        tirith_core::audit::audit_diagnostic(format!(
+                            "task-boundary audit append failed: {audit_error}"
+                        ));
+                    }
+                }
+                let reason = error
+                    .assessment()
+                    .and_then(|assessment| assessment.refusal(false))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| error.to_string());
+                let message = format!("task gate refused before any download: {reason}");
+                if json {
+                    let error = build_run_error_json(&message, &output_dlp);
+                    let _ = write_run_json(&error);
+                } else {
+                    eprintln!(
+                        "tirith run: {}",
+                        tirith_core::output::sanitize_human_field_with_compiled(
+                            &message,
+                            &output_dlp
+                        ),
+                    );
+                }
+                return 1;
+            }
+        };
     // The effects the gate refused tighten the capsule the script would run in,
     // so a decision that survives to launch still narrows what launch means.
     // `enforced_denied_effects` is empty unless the gate is enforcing, so an
     // operator who filled in the effect sets without choosing a mode does not
     // get a silently narrower capsule.
-    let denied_effects = run_assessment.enforced_denied_effects();
+    let denied_effects = pending_authorization.assessment().enforced_denied_effects();
 
     // Every live path now uses the same stopped-target capsule controller. The
     // legacy `--capsule` spelling remains accepted, but omitting it no longer
     // falls back to an ordinary spawn that could run before durable execution
     // state is committed.
     let _capsule_requested = capsule;
-    let verified_executor: Option<tirith_core::runner::VerifiedScriptExecutor> =
-        Some(Box::new(move |invocation, reviewed, authorizer| {
+    let verified_executor: tirith_core::runner::VerifiedScriptExecutor =
+        Box::new(move |invocation, reviewed, authorizer| {
             capsuled_exec_tightened(invocation, reviewed, authorizer, &denied_effects)
-        }));
+        });
 
     let opts = RunOptions {
         url: url.to_string(),
@@ -114,16 +160,13 @@ pub fn run(
         exec_fn: None,
     };
 
-    let result = match (verified_executor, requested_pipe_invocation) {
-        (Some(executor), Some(requested)) => {
-            runner::run_with_verified_pipe_executor(opts, requested, executor)
-        }
-        (Some(executor), None) => runner::run_with_verified_executor(opts, executor),
-        (None, Some(_)) => {
-            Err("forced stdin execution requires the fail-closed capsule executor".to_string())
-        }
-        (None, None) => runner::run(opts),
-    };
+    let result = runner::run_with_authorized_verified_executor(
+        opts,
+        requested_pipe_invocation,
+        pending_authorization,
+        &run_operation,
+        verified_executor,
+    );
     match result {
         Ok(result) => {
             let presentation_patterns = tirith_core::policy::captured_policy_dlp_patterns_or(

@@ -1660,8 +1660,23 @@ pub(crate) fn is_internal_categorical_evidence_record(detail: &str) -> bool {
             && is_web3_tool_token(tool)
             && matches!(
                 status,
-                "denied_endpoint" | "signer_not_permitted" | "unclassified_endpoint"
+                "ambiguous_hardhat_production_run"
+                    | "command_card_required"
+                    | "denied_destination"
+                    | "denied_endpoint"
+                    | "destination_unresolved"
+                    | "incomplete_analysis"
+                    | "policy_context_mismatch"
+                    | "signer_missing"
+                    | "signer_not_permitted"
+                    | "unclassified_endpoint"
             );
+    }
+    if let Some(mut tail) = detail.strip_prefix("tirith:v1:web3_enforcement;") {
+        let Some(action) = take_categorical_field(&mut tail, "action=", true) else {
+            return false;
+        };
+        return tail.is_empty() && action == "block";
     }
     if let Some(mut tail) = detail.strip_prefix("tirith:v1:data_flow;") {
         let Some(source) = take_categorical_field(&mut tail, "source=", false) else {
@@ -3223,6 +3238,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn web3_enforcement_floor_has_an_exact_closed_wire_grammar() {
+        assert!(is_internal_categorical_evidence_record(
+            "tirith:v1:web3_enforcement;action=block"
+        ));
+        for forged in [
+            "tirith:v1:web3_enforcement;action=warn",
+            "tirith:v1:web3_enforcement;action=block;extra=value",
+            "tirith:v1:web3_enforcement;status=block",
+        ] {
+            assert!(!is_internal_categorical_evidence_record(forged));
+        }
+        assert!(is_internal_categorical_evidence_record(
+            "tirith:v1:web3_policy;tool=hardhat;status=ambiguous_hardhat_production_run"
+        ));
     }
 
     #[test]

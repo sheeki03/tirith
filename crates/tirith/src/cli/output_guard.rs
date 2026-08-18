@@ -12,6 +12,89 @@
 use std::fs;
 use std::path::PathBuf;
 
+const PROFILE_READ_CAP: u64 = 1024 * 1024;
+
+fn read_profile_retained(
+    profile: &std::path::Path,
+) -> std::io::Result<(
+    PathBuf,
+    Option<tirith_core::util::ContainedAtomicFile>,
+    String,
+    bool,
+)> {
+    let root = profile
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let policy = tirith_core::policy::Policy::discover_local_only(None);
+    super::preflight_config_write_authorization(&root, profile, true, &policy, false)?;
+    let destination = match tirith_core::util::ContainedAtomicFile::prepare(&root, profile, false) {
+        Ok(destination) => destination,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((root, None, String::new(), false));
+        }
+        Err(error) => return Err(error),
+    };
+    destination.lock_parent_for_mutation()?;
+    match destination.read_capped(PROFILE_READ_CAP) {
+        Ok(bytes) => {
+            let content = String::from_utf8(bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "shell profile is not valid UTF-8",
+                )
+            })?;
+            Ok((root, Some(destination), content, true))
+        }
+        Err(tirith_core::util::OpenRegularError::NotFound) => {
+            Ok((root, Some(destination), String::new(), false))
+        }
+        Err(error) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing unsafe shell profile: {error:?}"),
+        )),
+    }
+}
+
+fn publish_profile(
+    root: &std::path::Path,
+    profile: &std::path::Path,
+    destination: Option<tirith_core::util::ContainedAtomicFile>,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    let policy = tirith_core::policy::Policy::discover_local_only(None);
+    publish_profile_with_policy(root, profile, destination, contents, &policy)
+}
+
+fn publish_profile_with_policy(
+    root: &std::path::Path,
+    profile: &std::path::Path,
+    destination: Option<tirith_core::util::ContainedAtomicFile>,
+    contents: &[u8],
+    policy: &tirith_core::policy::Policy,
+) -> std::io::Result<()> {
+    super::preflight_config_write_authorization(root, profile, true, policy, false)?;
+    let destination = match destination {
+        Some(destination) => destination,
+        None => {
+            let destination = tirith_core::util::ContainedAtomicFile::prepare(root, profile, true)?;
+            destination.lock_parent_for_mutation()?;
+            destination.expect_absent_preimage()?;
+            destination
+        }
+    };
+    super::write_prepared_config_file_permitted(
+        root,
+        profile,
+        destination,
+        contents,
+        true,
+        policy,
+        false,
+    )
+}
+
 /// BEGIN / END markers for the `tirith output wrap` block. Distinct from the
 /// `tirith init` hook markers so the two regions are independently removable.
 const BEGIN_MARKER: &str = "# BEGIN tirith-output-wrap v1";
@@ -35,22 +118,11 @@ fn enable() -> i32 {
         return 1;
     };
 
-    if let Some(parent) = profile.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            eprintln!(
-                "tirith output wrap: failed to create profile dir {}: {e}",
-                parent.display()
-            );
-            return 1;
-        }
-    }
-
     // repo-0224: only a MISSING file means "empty profile". Any other read
     // failure (invalid UTF-8, permissions, transient I/O) must abort rather
     // than replacing the real profile with just our snippet.
-    let current = match fs::read_to_string(&profile) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let (root, mut destination, current, _) = match read_profile_retained(&profile) {
+        Ok(profile) => profile,
         Err(e) => {
             eprintln!(
                 "tirith output wrap: cannot read {} ({e}); refusing to modify it",
@@ -98,7 +170,8 @@ fn enable() -> i32 {
             return 1;
         };
         let new_content = format!("{stripped}{expected}");
-        if let Err(e) = super::write_file_atomic(&profile, new_content.as_bytes(), true) {
+        if let Err(e) = publish_profile(&root, &profile, destination.take(), new_content.as_bytes())
+        {
             eprintln!(
                 "tirith output wrap: failed to repair {}: {e}",
                 profile.display()
@@ -121,7 +194,7 @@ fn enable() -> i32 {
     let new_content = format!("{current}{separator}{snippet}");
     // Atomic write: a crash mid read-modify-write of the user's rc file must
     // never truncate or corrupt their shell config.
-    if let Err(e) = super::write_file_atomic(&profile, new_content.as_bytes(), true) {
+    if let Err(e) = publish_profile(&root, &profile, destination.take(), new_content.as_bytes()) {
         eprintln!(
             "tirith output wrap: failed to write {}: {e}",
             profile.display()
@@ -151,13 +224,23 @@ fn disable() -> i32 {
         return 1;
     };
 
-    let Ok(current) = fs::read_to_string(&profile) else {
+    let (root, destination, current, existed) = match read_profile_retained(&profile) {
+        Ok(profile) => profile,
+        Err(error) => {
+            eprintln!(
+                "tirith output wrap: cannot read {} ({error}); refusing to modify it",
+                profile.display()
+            );
+            return 1;
+        }
+    };
+    if !existed {
         eprintln!(
             "tirith output wrap: {} not found — nothing to disable",
             profile.display()
         );
         return 0;
-    };
+    }
 
     if !current.contains(BEGIN_MARKER) {
         eprintln!(
@@ -177,7 +260,7 @@ fn disable() -> i32 {
         return 1;
     };
     // Atomic write (see `enable`): removing the block also rewrites the rc file.
-    if let Err(e) = super::write_file_atomic(&profile, new_content.as_bytes(), true) {
+    if let Err(e) = publish_profile(&root, &profile, destination, new_content.as_bytes()) {
         eprintln!(
             "tirith output wrap: failed to write {}: {e}",
             profile.display()
@@ -339,5 +422,25 @@ mod tests {
         let s = build_snippet("fish");
         assert!(s.contains("function tirith-output-guard-wrap"));
         assert!(s.contains("alias tirith-out 'tirith-output-guard-wrap'"));
+    }
+
+    #[test]
+    fn denied_profile_write_creates_neither_parent_nor_file() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("missing-profile-dir");
+        let profile = parent.join("config.nu");
+        let mut policy = tirith_core::policy::Policy::default();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_denied_for_untrusted_sources
+            .insert(tirith_core::effects::CommandEffectKind::PersistenceChange);
+
+        let error = publish_profile_with_policy(&parent, &profile, None, b"managed\n", &policy)
+            .expect_err("task gate must refuse profile persistence");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!parent.exists());
+        assert!(!profile.exists());
     }
 }

@@ -1,4 +1,6 @@
-use crate::effects::{CommandEffects, CommandEffectsV2, Completeness, CompletenessV2, SourceSpan};
+use crate::effects::{
+    CommandEffects, CommandEffectsV2, Completeness, CompletenessV2, IncompleteReasonV2, SourceSpan,
+};
 use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
 use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Serialize};
@@ -353,7 +355,17 @@ impl<'de> Deserialize<'de> for SelectorReference {
 #[derive(Clone, PartialEq, Eq)]
 pub struct TrustedRpcPathPrefix {
     id: RpcPathMatcherId,
-    prefix: String,
+    raw_prefix: String,
+    canonical_prefix: String,
+    origin: Option<TrustedRpcOrigin>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TrustedRpcOrigin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+    subdomains: bool,
 }
 
 impl TrustedRpcPathPrefix {
@@ -364,8 +376,31 @@ impl TrustedRpcPathPrefix {
         }
         Some(Self {
             id,
-            prefix: canonical_path(&prefix)?,
+            canonical_prefix: canonical_path(&prefix)?,
+            raw_prefix: prefix,
+            origin: None,
         })
+    }
+
+    /// Construct a path probe scoped to one RPC origin. Policy compilation uses
+    /// this form so unrelated path-bearing endpoints cannot consume the bounded
+    /// outcome budget for the endpoint currently being parsed.
+    pub(crate) fn for_origin(
+        id: RpcPathMatcherId,
+        prefix: impl Into<String>,
+        scheme: impl Into<String>,
+        host: impl Into<String>,
+        port: Option<u16>,
+        subdomains: bool,
+    ) -> Option<Self> {
+        let mut matcher = Self::new(id, prefix)?;
+        matcher.origin = Some(TrustedRpcOrigin {
+            scheme: scheme.into(),
+            host: host.into(),
+            port,
+            subdomains,
+        });
+        Some(matcher)
     }
 
     pub fn id(&self) -> RpcPathMatcherId {
@@ -373,12 +408,48 @@ impl TrustedRpcPathPrefix {
     }
 
     pub(crate) fn prefix_len(&self) -> usize {
-        self.prefix.len()
+        self.raw_prefix.len() + self.canonical_prefix.len()
     }
 
-    fn matches(&self, observed_path: &str) -> bool {
-        observed_path.starts_with(&self.prefix)
+    fn matches_origin(&self, scheme: &str, host: &str, port: Option<u16>) -> bool {
+        let Some(origin) = self.origin.as_ref() else {
+            return true;
+        };
+        if !origin.scheme.eq_ignore_ascii_case(scheme)
+            || origin
+                .port
+                .is_some_and(|expected| effective_rpc_port(scheme, port) != Some(expected))
+        {
+            return false;
+        }
+        host.eq_ignore_ascii_case(&origin.host)
+            || (origin.subdomains
+                && host.len() > origin.host.len()
+                && host
+                    .get(..host.len() - origin.host.len())
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+                && host[host.len() - origin.host.len()..].eq_ignore_ascii_case(&origin.host))
     }
+
+    fn matches_raw_and_canonical(&self, raw_path: &str, canonical_path: &str) -> Option<bool> {
+        let raw = path_prefix_matches(raw_path, &self.raw_prefix);
+        let canonical = path_prefix_matches(canonical_path, &self.canonical_prefix);
+        (raw == canonical).then_some(raw)
+    }
+}
+
+fn path_prefix_matches(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || (path.starts_with(prefix)
+            && (prefix.ends_with('/') || path.as_bytes().get(prefix.len()) == Some(&b'/')))
+}
+
+fn effective_rpc_port(scheme: &str, port: Option<u16>) -> Option<u16> {
+    port.or_else(|| match scheme.to_ascii_lowercase().as_str() {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    })
 }
 
 impl fmt::Debug for TrustedRpcPathPrefix {
@@ -461,10 +532,18 @@ impl RpcPathMatchOutcomes {
 
     pub(crate) fn compare(
         matchers: &[TrustedRpcPathPrefix],
-        observed_path: &str,
+        scheme: &str,
+        host: &str,
+        port: Option<u16>,
+        raw_path: &str,
+        canonical_path: &str,
     ) -> Result<(Self, bool), RpcPathMatcherValidationError> {
-        if matchers.len() > MAX_TRUSTED_RPC_PATH_MATCHERS
-            || matchers
+        let relevant = matchers
+            .iter()
+            .filter(|matcher| matcher.matches_origin(scheme, host, port))
+            .collect::<Vec<_>>();
+        if relevant.len() > MAX_TRUSTED_RPC_PATH_MATCHERS
+            || relevant
                 .iter()
                 .try_fold(0usize, |total, matcher| {
                     total.checked_add(matcher.prefix_len())
@@ -475,19 +554,22 @@ impl RpcPathMatchOutcomes {
         }
         let mut ids = BTreeSet::new();
         let mut outcomes =
-            Vec::with_capacity(matchers.len().min(MAX_RETAINED_RPC_PATH_MATCH_OUTCOMES));
-        for matcher in matchers {
+            Vec::with_capacity(relevant.len().min(MAX_RETAINED_RPC_PATH_MATCH_OUTCOMES));
+        for matcher in relevant.iter().copied() {
             if !ids.insert(matcher.id) {
                 return Err(RpcPathMatcherValidationError::Invalid);
             }
+            let matched = matcher
+                .matches_raw_and_canonical(raw_path, canonical_path)
+                .ok_or(RpcPathMatcherValidationError::Ambiguous)?;
             if outcomes.len() < MAX_RETAINED_RPC_PATH_MATCH_OUTCOMES {
                 outcomes.push(RpcPathMatchOutcome {
                     matcher_id: matcher.id,
-                    matched: matcher.matches(observed_path),
+                    matched,
                 });
             }
         }
-        let truncated = matchers.len() > outcomes.len();
+        let truncated = relevant.len() > outcomes.len();
         Ok((Self(outcomes), truncated))
     }
 }
@@ -496,6 +578,7 @@ impl RpcPathMatchOutcomes {
 pub(crate) enum RpcPathMatcherValidationError {
     BudgetExceeded,
     Invalid,
+    Ambiguous,
 }
 
 impl fmt::Debug for RpcPathMatchOutcomes {
@@ -1100,6 +1183,28 @@ pub struct SignerReferenceV2 {
     reference: Option<String>,
 }
 
+const SIGNER_REFERENCE_PROJECTION_PREFIX: &str = "sha256:";
+
+pub(crate) fn signer_reference_projection_digest(value: &str) -> Option<&str> {
+    let digest = value.strip_prefix(SIGNER_REFERENCE_PROJECTION_PREFIX)?;
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(digest)
+}
+
+pub(crate) fn privacy_project_signer_reference(value: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    if let Some(digest) = signer_reference_projection_digest(value) {
+        return format!(
+            "{SIGNER_REFERENCE_PROJECTION_PREFIX}{}",
+            digest.to_ascii_lowercase()
+        );
+    }
+    format!(
+        "{SIGNER_REFERENCE_PROJECTION_PREFIX}{:x}",
+        Sha256::digest(value.as_bytes())
+    )
+}
+
 #[derive(Deserialize)]
 struct SignerReferenceV2Wire {
     kind: SignerKindV2,
@@ -1131,6 +1236,27 @@ impl SignerReferenceV2 {
         span: Option<SourceSpan>,
         reference: Option<String>,
     ) -> Self {
+        if kind == SignerKindV2::KeypairFile {
+            match reference.as_deref() {
+                Some("-") => {
+                    return Self {
+                        kind: SignerKindV2::Stdin,
+                        source,
+                        span,
+                        reference: None,
+                    }
+                }
+                Some(value) if value.eq_ignore_ascii_case("ASK") => {
+                    return Self {
+                        kind: SignerKindV2::Prompt,
+                        source,
+                        span,
+                        reference: None,
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(raw_kind) = reference.as_deref().and_then(classify_raw_signer_value) {
             return Self::raw(raw_kind, source, span);
         }
@@ -1453,13 +1579,17 @@ fn plausible_solana_numeric_secret_array(value: &str) -> bool {
 
 impl fmt::Debug for SignerReferenceV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reference = self
+            .reference
+            .as_deref()
+            .map(privacy_project_signer_reference);
         let mut value = formatter.debug_struct("SignerReferenceV2");
         value
             .field("kind", &self.kind)
             .field("source", &self.source)
             .field("span", &self.span);
         if !self.kind.is_raw_secret() {
-            value.field("reference", &self.reference);
+            value.field("reference", &reference);
         }
         value.finish()
     }
@@ -1470,14 +1600,21 @@ impl Serialize for SignerReferenceV2 {
     where
         S: serde::Serializer,
     {
-        let include_reference = !self.kind.is_raw_secret() && self.reference.is_some();
+        let reference = (!self.kind.is_raw_secret())
+            .then(|| {
+                self.reference
+                    .as_deref()
+                    .map(privacy_project_signer_reference)
+            })
+            .flatten();
+        let include_reference = reference.is_some();
         let mut state = serializer
             .serialize_struct("SignerReferenceV2", if include_reference { 4 } else { 3 })?;
         state.serialize_field("kind", &self.kind)?;
         state.serialize_field("source", &self.source)?;
         state.serialize_field("span", &self.span)?;
         if include_reference {
-            state.serialize_field("reference", &self.reference)?;
+            state.serialize_field("reference", &reference)?;
         }
         state.end()
     }
@@ -1492,6 +1629,20 @@ impl<'de> Deserialize<'de> for SignerReferenceV2 {
         let reference = wire.reference.map(|value| value.0);
         if wire.kind.is_raw_secret() {
             return Ok(Self::raw(wire.kind, wire.source, wire.span));
+        }
+        if let Some(projected) = reference
+            .as_deref()
+            .and_then(signer_reference_projection_digest)
+        {
+            return Ok(Self {
+                kind: wire.kind,
+                source: wire.source,
+                span: wire.span,
+                reference: Some(format!(
+                    "{SIGNER_REFERENCE_PROJECTION_PREFIX}{}",
+                    projected.to_ascii_lowercase()
+                )),
+            });
         }
         if wire.kind == SignerKindV2::Unknown {
             let reference = reference.filter(|reference| {
@@ -1559,13 +1710,17 @@ impl SignerReference {
 
 impl fmt::Debug for SignerReference {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reference = self
+            .reference
+            .as_deref()
+            .map(privacy_project_signer_reference);
         let mut value = formatter.debug_struct("SignerReference");
         value
             .field("kind", &self.kind)
             .field("source", &self.source)
             .field("span", &self.span);
         if !self.kind.is_raw_secret() {
-            value.field("reference", &self.reference);
+            value.field("reference", &reference);
         }
         value.finish()
     }
@@ -1576,14 +1731,21 @@ impl Serialize for SignerReference {
     where
         S: serde::Serializer,
     {
-        let include_reference = !self.kind.is_raw_secret() && self.reference.is_some();
+        let reference = (!self.kind.is_raw_secret())
+            .then(|| {
+                self.reference
+                    .as_deref()
+                    .map(privacy_project_signer_reference)
+            })
+            .flatten();
+        let include_reference = reference.is_some();
         let mut state = serializer
             .serialize_struct("SignerReference", if include_reference { 4 } else { 3 })?;
         state.serialize_field("kind", &self.kind)?;
         state.serialize_field("source", &self.source)?;
         state.serialize_field("span", &self.span)?;
         if include_reference {
-            state.serialize_field("reference", &self.reference)?;
+            state.serialize_field("reference", &reference)?;
         }
         state.end()
     }
@@ -1601,6 +1763,22 @@ impl<'de> Deserialize<'de> for SignerReference {
                 source: wire.source,
                 span: wire.span,
                 reference: None,
+            });
+        }
+        if let Some(projected) = wire
+            .reference
+            .as_ref()
+            .map(|value| value.0.as_str())
+            .and_then(signer_reference_projection_digest)
+        {
+            return Ok(Self {
+                kind: wire.kind,
+                source: wire.source,
+                span: wire.span,
+                reference: Some(format!(
+                    "{SIGNER_REFERENCE_PROJECTION_PREFIX}{}",
+                    projected.to_ascii_lowercase()
+                )),
             });
         }
         if wire.kind == SignerKind::Unknown {
@@ -1680,7 +1858,13 @@ pub struct DestinationReference {
 
 impl fmt::Debug for DestinationReference {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = public_retained_value(self.value.as_deref());
+        let value = public_retained_value(self.value.as_deref()).map(|value| {
+            if self.kind == DestinationKind::ProgramIdFile {
+                privacy_project_signer_reference(value)
+            } else {
+                value.to_string()
+            }
+        });
         let source = if self.value.is_some() && value.is_none() {
             SelectorSource::Unresolved
         } else {
@@ -1701,7 +1885,13 @@ impl Serialize for DestinationReference {
     where
         S: serde::Serializer,
     {
-        let value = public_retained_value(self.value.as_deref());
+        let value = public_retained_value(self.value.as_deref()).map(|value| {
+            if self.kind == DestinationKind::ProgramIdFile {
+                privacy_project_signer_reference(value)
+            } else {
+                value.to_string()
+            }
+        });
         let source = if self.value.is_some() && value.is_none() {
             SelectorSource::Unresolved
         } else {
@@ -2079,6 +2269,8 @@ impl From<Web3CommandFactsV2> for Web3CommandFacts {
 
 impl From<Web3CommandFacts> for Web3CommandFactsV2 {
     fn from(facts: Web3CommandFacts) -> Self {
+        let mut completeness: CompletenessV2 = facts.completeness.clone().into();
+        completeness.add(IncompleteReasonV2::LegacyProjectionIncomplete);
         let signer = facts.signer.map(SignerReferenceV2::from);
         let signers = signer
             .clone()
@@ -2103,7 +2295,7 @@ impl From<Web3CommandFacts> for Web3CommandFactsV2 {
             artifact: facts.artifact,
             safety_flags: facts.safety_flags,
             source_span: facts.source_span,
-            completeness: facts.completeness.into(),
+            completeness,
         }
     }
 }
@@ -2708,10 +2900,97 @@ impl From<Web3ParseResultV2> for Web3ParseResult {
 
 impl From<Web3ParseResult> for Web3ParseResultV2 {
     fn from(result: Web3ParseResult) -> Self {
+        let mut completeness: CompletenessV2 = result.completeness.into();
+        completeness.add(IncompleteReasonV2::LegacyProjectionIncomplete);
         Self {
             commands: result.commands.into_iter().map(Into::into).collect(),
             effects: result.effects.into(),
-            completeness: result.completeness.into(),
+            completeness,
+        }
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    #[test]
+    fn signer_reference_debug_and_wire_use_stable_privacy_projection() {
+        let raw = "/Users/alice/.config/solana/id.json";
+        let signer = SignerReferenceV2::literal_reference(
+            SignerKindV2::KeypairFile,
+            SelectorSource::ExplicitFlag,
+            None,
+            Some(raw.to_string()),
+        );
+
+        let debug = format!("{signer:?}");
+        let json = serde_json::to_string(&signer).unwrap();
+        assert!(!debug.contains(raw));
+        assert!(!json.contains(raw));
+        let projected = privacy_project_signer_reference(raw);
+        assert!(debug.contains(&projected));
+        assert!(json.contains(&projected));
+
+        let decoded: SignerReferenceV2 = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.kind(), SignerKindV2::KeypairFile);
+        assert_eq!(decoded.nonsecret_reference(), Some(projected.as_str()));
+    }
+
+    #[test]
+    fn keypair_reference_classifies_runtime_sentinels_but_literal_paths_do_not() {
+        for (value, expected) in [
+            ("-", SignerKindV2::Stdin),
+            ("ASK", SignerKindV2::Prompt),
+            ("ask", SignerKindV2::Prompt),
+        ] {
+            let signer = SignerReferenceV2::reference(
+                SignerKindV2::KeypairFile,
+                SelectorSource::ExplicitFlag,
+                None,
+                Some(value.to_string()),
+            );
+            assert_eq!(signer.kind(), expected);
+            assert!(signer.nonsecret_reference().is_none());
+        }
+        let literal = SignerReferenceV2::literal_reference(
+            SignerKindV2::KeypairFile,
+            SelectorSource::ExplicitFlag,
+            None,
+            Some("ASK".to_string()),
+        );
+        assert_eq!(literal.kind(), SignerKindV2::KeypairFile);
+        assert_eq!(literal.nonsecret_reference(), Some("ASK"));
+    }
+
+    #[test]
+    fn legacy_signer_and_program_id_destination_do_not_serialize_credential_paths() {
+        let raw = "C:\\wallets\\program-authority.json";
+        let signer: SignerReference = SignerReferenceV2::literal_reference(
+            SignerKindV2::KeypairFile,
+            SelectorSource::ExplicitFlag,
+            None,
+            Some(raw.to_string()),
+        )
+        .into();
+        let destination = DestinationReference {
+            kind: DestinationKind::ProgramIdFile,
+            value: Some(raw.to_string()),
+            source: SelectorSource::ExplicitFlag,
+            span: None,
+        };
+
+        for rendered in [
+            format!("{signer:?}"),
+            serde_json::to_string(&signer).unwrap(),
+            format!("{destination:?}"),
+            serde_json::to_string(&destination).unwrap(),
+        ] {
+            assert!(
+                !rendered.contains("program-authority.json"),
+                "credential path leaked: {rendered}"
+            );
+            assert!(rendered.contains("sha256:"));
         }
     }
 }

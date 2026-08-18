@@ -81,6 +81,11 @@ pub enum IncompleteReasonV2 {
     WorkingDirectoryUnresolved,
     SignerMissing,
     DynamicExecutionUnsupported,
+    /// A schema-v1 fact was projected into v2. V1 cannot represent the exact
+    /// ordered signer/destination sets required by v2 enforcement, so the
+    /// projection is diagnostic-only even when the legacy producer reported
+    /// complete analysis.
+    LegacyProjectionIncomplete,
     IncompleteQuoting,
     DynamicConfigUnsupported,
     ConfigMissing,
@@ -151,7 +156,8 @@ impl From<IncompleteReasonV2> for IncompleteReason {
             | IncompleteReasonV2::ExecutionContextChanged
             | IncompleteReasonV2::WorkingDirectoryUnresolved
             | IncompleteReasonV2::SignerMissing
-            | IncompleteReasonV2::DynamicExecutionUnsupported => Self::UnresolvedIndirection,
+            | IncompleteReasonV2::DynamicExecutionUnsupported
+            | IncompleteReasonV2::LegacyProjectionIncomplete => Self::UnresolvedIndirection,
         }
     }
 }

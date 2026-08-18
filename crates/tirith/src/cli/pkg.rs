@@ -38,7 +38,10 @@
 //! digest comparison, the `verify-env` fold, and the receipt rendering) have direct
 //! tests in this module.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+
+use fs2::FileExt as _;
 
 use tirith_core::artifact::install::{
     installed_distribution_identities, installed_distribution_names, rebind_for_install,
@@ -52,14 +55,29 @@ use tirith_core::artifact::resolver::{
     ResolverError, ResolverRequest, ResolverTools, PIP_TREE_BINDING_VERSION, PIP_TREE_MAX_BYTES,
     PIP_TREE_MAX_FILES, PIP_TREE_MAX_FILE_BYTES, PIP_TREE_MAX_PATH_BYTES,
 };
+use tirith_core::package_approval::{
+    expiry_independent_plan, verify_package_approval, PackageApprovalError,
+    PackageApprovalRecordV2, VerifiedPackageApproval,
+};
 use tirith_core::policy::Policy;
 use tirith_core::receipt::ArtifactScanReceipt;
+use tirith_core::task_analysis::TaskAnalysisContext;
+use tirith_core::task_boundary::{
+    BoundaryAuthorizationError, BoundaryMarker, BoundaryOperation, PackageApprovalBoundary,
+    PackageInstallApprovalChannel, PackageInstallPreparationBoundary, PackageOperationBinding,
+    PackageResolveBoundary, PendingBoundaryAuthorization, TaskBoundaryPermit,
+};
 use tirith_core::threatdb::ThreatDb;
 
 use crate::cli::capsule::{self, DegradedPolicy};
+#[cfg(test)]
+use crate::cli::package_approval_authority::{NativeAuthorityError, PackageApprovalIssuer};
+use crate::cli::package_approval_authority::{
+    NativePackageApprovalAuthority, PackageApprovalAuthority, PackageApprovalKeyProvider,
+};
 use crate::cli::pkg_install::{
-    build_install_receipt, run_contained_install, ContainedInstallError, EnvironmentCheckpoint,
-    InstallTargetBinding, ResolverProvenance,
+    build_install_receipt, run_contained_install, AuthorizedInstallLaunch, ContainedInstallError,
+    EnvironmentCheckpoint, InstallTargetBinding, ResolverProvenance,
 };
 
 /// tirith-owned options that no package manager interprets. If one of these appears
@@ -69,10 +87,11 @@ use crate::cli::pkg_install::{
 /// can carry their own flag sets.
 const MISPLACED_TIRITH_FLAGS: &[&str] = &["--yes", "--allow-degraded", "--online"];
 
-/// The default approval lifetime when `pkg approve` does not get an explicit window:
-/// short, so a stale approval cannot be redeemed long after the situation it was
-/// bound to. 30 minutes.
-const DEFAULT_APPROVAL_TTL_SECS: i64 = 30 * 60;
+const MAX_PERSISTED_APPROVAL_RECORDS: usize = 256;
+
+fn discover_pkg_enforcement_policy(cwd: Option<&str>) -> Policy {
+    Policy::discover(cwd)
+}
 
 /// What the `pkg` command should do, parsed from the CLI. Mirrors the clap
 /// subcommand in `main.rs`; kept here so the dispatch logic lives with the module.
@@ -285,23 +304,8 @@ impl InstallTarget {
     /// Bind an explicit, dedicated pip target. Inferring a write root from
     /// `<python>/../..` can select `/usr`, `/opt/homebrew`, or another shared
     /// installation prefix and make rollback copy an enormous unrelated tree.
-    fn derive_from_interpreter(
-        interpreter: PathBuf,
-        target: Option<PathBuf>,
-    ) -> Result<Self, String> {
-        let target = target.ok_or_else(|| {
-            "an explicit --target is required for enforcing installs; choose a new dedicated directory whose parent already exists"
-                .to_string()
-        })?;
-        let binding = InstallTargetBinding::bind(&target)
-            .map_err(|error| format!("cannot bind --target parent and final component: {error}"))?;
+    fn from_binding(interpreter: PathBuf, binding: InstallTargetBinding) -> Self {
         let environment = binding.target().to_path_buf();
-        if is_broad_install_target(&environment) {
-            return Err(format!(
-                "refusing broad/shared install target {}; choose a new dedicated package directory",
-                environment.display()
-            ));
-        }
 
         // The interpreter prefix: `<prefix>/bin/python` -> `<prefix>`. Best-effort;
         // it is READ-only launch support and never becomes the install destination.
@@ -315,13 +319,32 @@ impl InstallTarget {
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| PathBuf::from("/"))
             });
-        Ok(InstallTarget {
+        InstallTarget {
             interpreter,
             environment,
             extra_read_roots: vec![prefix],
             binding,
-        })
+        }
     }
+}
+
+/// Bind the exact target before task authorization. The retained descriptor is
+/// then moved through resolver preparation and checkpoint creation, so neither
+/// side-effect API can reconstruct authority from a mutable path.
+fn bind_install_target(target: Option<PathBuf>) -> Result<InstallTargetBinding, String> {
+    let target = target.ok_or_else(|| {
+        "an explicit --target is required for enforcing installs; choose a new dedicated directory whose parent already exists"
+            .to_string()
+    })?;
+    let binding = InstallTargetBinding::bind(&target)
+        .map_err(|error| format!("cannot bind --target parent and final component: {error}"))?;
+    if is_broad_install_target(binding.target()) {
+        return Err(format!(
+            "refusing broad/shared install target {}; choose a new dedicated package directory",
+            binding.target().display()
+        ));
+    }
+    Ok(binding)
 }
 
 fn is_broad_install_target(path: &Path) -> bool {
@@ -372,10 +395,27 @@ struct PreparedPlan {
 /// the [`InstallPlanDigest`] the operation binds to. `expiry` time-boxes the digest
 /// (an empty string means none). Shared by `approve` (which stops after this and
 /// prints the digest) and `install` (which proceeds to run the plan).
-fn prepare_plan(
+fn validated_resolver_request(
     requirements: &[String],
-    target: Option<PathBuf>,
     index_url: &[String],
+    artifact_origin: &[String],
+) -> Result<ResolverRequest, PrepareError> {
+    let request = ResolverRequest {
+        requirements: requirements.to_vec(),
+        index_urls: index_url.to_vec(),
+        allowances: Default::default(),
+    };
+    // Pure parsing and policy checks run before a replayable authorization is
+    // consumed. They perform no PATH lookup, quarantine mutation, DNS, or child
+    // execution, so malformed input cannot burn a one-shot permit.
+    validate_resolver_request_with_artifact_origins(&request, artifact_origin)
+        .map_err(PrepareError::Resolver)?;
+    Ok(request)
+}
+
+fn prepare_plan(
+    request: &ResolverRequest,
+    target_binding: InstallTargetBinding,
     artifact_origin: &[String],
     policy: &Policy,
     expiry: String,
@@ -383,21 +423,11 @@ fn prepare_plan(
 ) -> Result<PreparedPlan, PrepareError> {
     // Resolve uv + python by executable provenance (never a bare PATH name in the
     // child), with the locked-down default allowances (no sdist/VCS/editable/...).
-    let request = ResolverRequest {
-        requirements: requirements.to_vec(),
-        index_urls: index_url.to_vec(),
-        allowances: Default::default(),
-    };
-    // Parse and policy-check all attacker-controlled strings before PATH lookup,
-    // quarantine creation, broker binding, DNS, or child execution.
-    validate_resolver_request_with_artifact_origins(&request, artifact_origin)
-        .map_err(PrepareError::Resolver)?;
     let discovered =
         ResolverTools::discover(&request.allowances).map_err(PrepareError::Resolver)?;
-    // Bind the target parent and final component before any resolver/version child
-    // runs, so approval authority cannot race with tool probing or network resolve.
-    let target = InstallTarget::derive_from_interpreter(discovered.python.clone(), target)
-        .map_err(PrepareError::Target)?;
+    // The target was capability-bound before authorization. Move that exact
+    // descriptor through the resolver rather than reopening its path.
+    let target = InstallTarget::from_binding(discovered.python.clone(), target_binding);
     let tools = BoundResolverTools::bind(&discovered).map_err(PrepareError::Resolver)?;
 
     // A fresh quarantine transaction under the real data dir. The id is a
@@ -409,9 +439,8 @@ fn prepare_plan(
         .map_err(PrepareError::Quarantine)?;
 
     // D2: resolve + download + ingest into the quarantine (re-hashing on the way in).
-    let resolved =
-        resolve_into_quarantine_with_bound_tools(&request, &tools, &txn, artifact_origin)
-            .map_err(PrepareError::Resolver)?;
+    let resolved = resolve_into_quarantine_with_bound_tools(request, &tools, &txn, artifact_origin)
+        .map_err(PrepareError::Resolver)?;
 
     // The live threat DB sequence the plan binds to. `cached()` is the same DB the
     // rest of tirith consults; `None` is sequence 0.
@@ -457,6 +486,186 @@ fn prepare_plan(
         tools,
         _store: store,
     })
+}
+
+/// The install resolver boundary consumes its permit at the networked plan
+/// preparation seam. Approval uses [`AuthorizedPackageApprovalTransaction`]
+/// instead because its permit must remain live through grant publication.
+/// Keeping this trait private prevents an unrelated boundary token from being
+/// accepted accidentally.
+trait ResolverPreparationBoundary: BoundaryMarker {}
+
+impl ResolverPreparationBoundary for PackageResolveBoundary {}
+
+/// Consume a boundary-typed permit at the first resolver/quarantine/network
+/// seam. The operation binding is checked again by the side-effect API rather
+/// than relying on the caller to keep the right operation beside the token.
+#[allow(clippy::too_many_arguments)]
+fn prepare_plan_authorized<B: ResolverPreparationBoundary>(
+    permit: TaskBoundaryPermit<B>,
+    ecosystem: &str,
+    request: &ResolverRequest,
+    target_binding: InstallTargetBinding,
+    artifact_origin: &[String],
+    policy: &Policy,
+    expiry: String,
+    task_gate_binding: String,
+) -> Result<PreparedPlan, PrepareError> {
+    let target_identity = target_binding.package_target_identity();
+    let package_binding =
+        PackageOperationBinding::new(ecosystem, request, artifact_origin, &target_identity);
+    let envelope = tirith_core::task_boundary::package_envelope(&package_binding)
+        .map_err(|error| PrepareError::Authorization(error.to_string()))?;
+    let operation = package_boundary_operation::<B>(&envelope);
+    permit
+        .authorize_effect_at(&operation, chrono::Utc::now())
+        .map_err(|error| PrepareError::Authorization(error.to_string()))?;
+    prepare_plan(
+        request,
+        target_binding,
+        artifact_origin,
+        policy,
+        expiry,
+        task_gate_binding,
+    )
+}
+
+/// One PackageApproval permit retained across resolver/quarantine work and the
+/// final durable approval-record publication. The transaction is non-cloneable
+/// because its permit is non-cloneable; a failed or completed publication
+/// cannot be retried through a reusable boolean authorization.
+struct AuthorizedPackageApprovalTransaction {
+    permit: TaskBoundaryPermit<PackageApprovalBoundary>,
+    envelope: tirith_core::task::TaskEnvelopeInput,
+}
+
+impl AuthorizedPackageApprovalTransaction {
+    fn new(
+        permit: TaskBoundaryPermit<PackageApprovalBoundary>,
+        envelope: tirith_core::task::TaskEnvelopeInput,
+    ) -> Result<Self, PrepareError> {
+        let operation = package_boundary_operation::<PackageApprovalBoundary>(&envelope);
+        if !permit.binds_operation(&operation) {
+            return Err(PrepareError::Authorization(
+                "task boundary permit does not bind this exact package approval".to_string(),
+            ));
+        }
+        Ok(Self { permit, envelope })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        self,
+        ecosystem: &str,
+        request: &ResolverRequest,
+        target_binding: InstallTargetBinding,
+        artifact_origin: &[String],
+        policy: &Policy,
+        expiry: String,
+        task_gate_binding: String,
+    ) -> Result<AuthorizedPreparedApproval, PrepareError> {
+        let target_identity = target_binding.package_target_identity();
+        let package_binding =
+            PackageOperationBinding::new(ecosystem, request, artifact_origin, &target_identity);
+        let actual_envelope = tirith_core::task_boundary::package_envelope(&package_binding)
+            .map_err(|error| PrepareError::Authorization(error.to_string()))?;
+        let actual_operation =
+            package_boundary_operation::<PackageApprovalBoundary>(&actual_envelope);
+        if actual_envelope != self.envelope || !self.permit.binds_operation(&actual_operation) {
+            return Err(PrepareError::Authorization(
+                "task boundary permit does not bind this exact package approval".to_string(),
+            ));
+        }
+        let prepared = prepare_plan(
+            request,
+            target_binding,
+            artifact_origin,
+            policy,
+            expiry,
+            task_gate_binding,
+        )?;
+        Ok(AuthorizedPreparedApproval {
+            authorization: self,
+            prepared,
+        })
+    }
+}
+
+/// A prepared approval whose original typed authorization remains live. Only
+/// consuming this value may publish the durable approval record.
+struct AuthorizedPreparedApproval {
+    authorization: AuthorizedPackageApprovalTransaction,
+    prepared: PreparedPlan,
+}
+
+impl AuthorizedPreparedApproval {
+    fn digest(&self) -> &InstallPlanDigest {
+        &self.prepared.digest
+    }
+
+    fn publish(self) -> Result<(PreparedPlan, PathBuf), ApprovalPublishError> {
+        self.publish_with_issuer(&NativePackageApprovalAuthority)
+    }
+
+    fn publish_with_issuer(
+        mut self,
+        authority: &dyn PackageApprovalAuthority,
+    ) -> Result<(PreparedPlan, PathBuf), ApprovalPublishError> {
+        let AuthorizedPackageApprovalTransaction { permit, envelope } = self.authorization;
+        let operation = package_boundary_operation::<PackageApprovalBoundary>(&envelope);
+        let record = authority
+            .issue(&self.prepared.digest)
+            .map_err(|error| ApprovalPublishError::NativeAuthority(error.to_string()))?;
+        let requested = expiry_independent_plan(&self.prepared.digest)
+            .map_err(|error| ApprovalPublishError::TrustVerification(error.to_string()))?;
+        let trusted_keys = authority
+            .trusted_keys()
+            .map_err(|error| ApprovalPublishError::TrustVerification(error.to_string()))?;
+        verify_package_approval(&record, &requested, &trusted_keys, chrono::Utc::now()).map_err(
+            |error| {
+                ApprovalPublishError::TrustVerification(format!(
+                    "native authority proof did not verify: {error}"
+                ))
+            },
+        )?;
+        self.prepared.digest = record.digest().clone();
+        let path = persist_approval_record_authorized(
+            &record,
+            permit,
+            &operation,
+            &trusted_keys,
+            chrono::Utc::now(),
+        )
+        .map_err(ApprovalPublishError::RecordPersistence)?;
+        Ok((self.prepared, path))
+    }
+}
+
+#[derive(Debug)]
+enum ApprovalPublishError {
+    NativeAuthority(String),
+    TrustVerification(String),
+    RecordPersistence(String),
+}
+
+impl ApprovalPublishError {
+    fn phase(&self) -> &'static str {
+        match self {
+            Self::NativeAuthority(_) => "native_authority",
+            Self::TrustVerification(_) => "trust_verification",
+            Self::RecordPersistence(_) => "record_persistence",
+        }
+    }
+}
+
+impl std::fmt::Display for ApprovalPublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NativeAuthority(reason)
+            | Self::TrustVerification(reason)
+            | Self::RecordPersistence(reason) => f.write_str(reason),
+        }
+    }
 }
 
 /// Build the [`InstallPlanDigest`] for a prepared plan: gather every binding input
@@ -512,7 +721,7 @@ fn build_plan_digest(
         target_component: target.binding.target_component().to_string(),
         platform_tags,
         install_command_semantics,
-        policy_projection_hash: policy.security_projection_hash(),
+        policy_projection_hash: policy.enforcement_projection_hash(),
         threat_db_sequence: plan.bound_db_sequence,
         capsule_backend: capsule_backend.to_string(),
         required_coverage: plan.spec.required_coverage(),
@@ -582,7 +791,7 @@ enum PrepareError {
     Resolver(ResolverError),
     Quarantine(QuarantineError),
     Install(InstallError),
-    Target(String),
+    Authorization(String),
 }
 
 impl std::fmt::Display for PrepareError {
@@ -591,7 +800,7 @@ impl std::fmt::Display for PrepareError {
             PrepareError::Resolver(e) => write!(f, "resolve failed: {e}"),
             PrepareError::Quarantine(e) => write!(f, "quarantine error: {e}"),
             PrepareError::Install(e) => write!(f, "{e}"),
-            PrepareError::Target(reason) => write!(f, "unsafe install target: {reason}"),
+            PrepareError::Authorization(reason) => write!(f, "task authorization failed: {reason}"),
         }
     }
 }
@@ -630,28 +839,61 @@ fn run_trust_tool(path: &Path, json: bool) -> i32 {
 // C12: the owned package transitions
 // ---------------------------------------------------------------------------
 
-/// Evaluate one owned package boundary.
-///
-/// The effects come from [`tirith_core::task::ProposedAction::PackageInstall`],
-/// which already derives package install, network egress, and filesystem write;
-/// there is no second deriver here. The policy is the offline operator-only one
-/// the caller already discovered, so a repository cannot weaken its own install.
-fn evaluate_package_boundary(
-    boundary: tirith_core::task_boundary::OwnedBoundary,
-    ecosystem: Ecosystem,
-    requirements: &[String],
-    policy: &Policy,
-) -> tirith_core::task_boundary::BoundaryAssessment {
-    let envelope = tirith_core::task_boundary::package_envelope(ecosystem.label(), requirements);
-    let operation = tirith_core::task_boundary::BoundaryOperation {
-        boundary,
-        envelope: &envelope,
+/// Construct the exact package operation that both authorization and the
+/// eventual side-effect API bind. Package behavior comes from
+/// [`tirith_core::task::ProposedAction::PackageInstall`]; the approval boundary
+/// adds only the transition-owned PolicyChange caused by publishing a durable
+/// authorization grant.
+fn package_boundary_operation<B: BoundaryMarker>(
+    envelope: &tirith_core::task::TaskEnvelopeInput,
+) -> BoundaryOperation<'_> {
+    let boundary_effects =
+        if B::BOUNDARY == tirith_core::task_boundary::OwnedBoundary::PackageApproval {
+            // The approval record is a durable authorization grant consumed by a
+            // later install, not merely an incidental file. PackageInstall
+            // inference supplies PersistenceChange; this boundary-owned effect
+            // additionally lets policy classify the grant as a policy change.
+            [tirith_core::effects::CommandEffectKind::PolicyChange]
+                .into_iter()
+                .collect()
+        } else {
+            Default::default()
+        };
+    BoundaryOperation {
+        boundary: B::BOUNDARY,
+        envelope,
         // An argv identifies no origin. Claiming one would be a lie the
         // provenance model exists to prevent.
         adapter: tirith_core::task::IngressAdapter::Unattributed,
-        boundary_effects: Default::default(),
+        boundary_effects,
+    }
+}
+
+/// Prepare a typed authorization for a locally derived package operation. No
+/// schema-v2 provider exists on this compatibility path, so a policy that
+/// requires provenance fails closed before a pending permit can be returned.
+fn prepare_package_boundary_authorization<B: BoundaryMarker>(
+    operation: &BoundaryOperation<'_>,
+    policy: &Policy,
+) -> Result<PendingBoundaryAuthorization<B>, BoundaryAuthorizationError> {
+    let authorization =
+        tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<B>(
+            operation,
+            &policy.task_gate,
+            &TaskAnalysisContext::default(),
+        );
+    let assessment = match &authorization {
+        Ok(pending) => Some(pending.assessment()),
+        Err(error) => error.assessment(),
     };
-    tirith_core::task_boundary::evaluate(&operation, &policy.task_gate)
+    if let Some(assessment) = assessment {
+        if let Err(error) = tirith_core::audit::log_task_boundary_assessment(assessment) {
+            tirith_core::audit::audit_diagnostic(format!(
+                "task-boundary audit append failed: {error}"
+            ));
+        }
+    }
+    authorization
 }
 
 /// Report a task-gate refusal on a `pkg` subcommand.
@@ -677,9 +919,68 @@ fn report_task_gate_refusal(
     1
 }
 
+fn report_task_authorization_error(
+    command: &str,
+    boundary: tirith_core::task_boundary::OwnedBoundary,
+    error: &BoundaryAuthorizationError,
+    json: bool,
+) -> i32 {
+    if let Some(assessment) = error.assessment() {
+        let reason = assessment
+            .refusal(false)
+            .unwrap_or("task boundary authorization was refused");
+        return report_task_gate_refusal(command, assessment, reason, json);
+    }
+    let reason = error.to_string();
+    if json {
+        let out = serde_json::json!({
+            "refused": true,
+            "stage": "task_gate",
+            "boundary": boundary.token(),
+            "reason": reason,
+        });
+        let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
+        println!();
+    } else {
+        eprintln!("tirith pkg {command}: refused before any network or install step: {reason}");
+    }
+    1
+}
+
 // ---------------------------------------------------------------------------
 // pkg approve
 // ---------------------------------------------------------------------------
+
+fn report_approve_error(phase: &'static str, reason: &str, json: bool, exit_code: i32) -> i32 {
+    if json {
+        let value = approve_error_json(phase, reason);
+        let _ = write_json_document(std::io::stdout().lock(), &value);
+    } else {
+        let reason = crate::cli::sanitize_for_human_output(reason, false);
+        eprintln!("tirith pkg approve: {reason}");
+    }
+    exit_code
+}
+
+fn approve_error_json(phase: &'static str, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "success": false,
+        "command": "approve",
+        "error_phase": phase,
+        "target_executed": false,
+        "target_published": false,
+        "reason": reason,
+    })
+}
+
+fn report_approve_authorization_error(error: &BoundaryAuthorizationError, json: bool) -> i32 {
+    let reason = error
+        .assessment()
+        .and_then(|assessment| assessment.refusal(false))
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    report_approve_error("task_gate", &reason, json, 1)
+}
 
 fn run_approve(
     ecosystem: Ecosystem,
@@ -689,53 +990,117 @@ fn run_approve(
     artifact_origin: &[String],
     json: bool,
 ) -> i32 {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return report_approve_error(
+            "native_authority",
+            "blocked_native: package approvals are redeemable only on x86_64 Linux",
+            json,
+            1,
+        );
+    }
     if let Some(failure) = precheck(ecosystem, requirements) {
-        return report_pkg_precheck_failure("approve", &failure, json);
+        return report_approve_error("precheck", &failure.reason, json, failure.exit_code);
     }
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
-    // Operator policy only (offline / local-only), so a repo-scoped policy cannot
-    // weaken the approval; the resolver never reads repo-local pip/uv config.
-    let policy = Policy::discover_local_only(cwd.as_deref());
-
-    // C12: the owned network-egress transition. `prepare_plan` does PATH
-    // lookup, quarantine creation, broker binding, DNS, and resolver child
-    // execution, so the gate has to sit here: one line later and packages have
-    // already been fetched. `approve` has no separate human gate of its own to
-    // satisfy a required approval, so it passes `false`.
-    let task_assessment = evaluate_package_boundary(
-        tirith_core::task_boundary::OwnedBoundary::PackageApproval,
-        ecosystem,
-        requirements,
-        &policy,
-    );
-    if let Some(reason) = task_assessment.refusal(false) {
-        return report_task_gate_refusal("approve", &task_assessment, reason, json);
-    }
-
-    let expiry =
-        (chrono::Utc::now() + chrono::Duration::seconds(DEFAULT_APPROVAL_TTL_SECS)).to_rfc3339();
-    let prepared = match prepare_plan(
-        requirements,
-        target,
-        index_url,
-        artifact_origin,
-        &policy,
-        expiry,
-        tirith_core::task_boundary::ceiling_binding(&task_assessment.decision),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("tirith pkg approve: {e}");
-            return 1;
+    // Enforcement uses the full discovered policy, including configured remote
+    // sources. A remote refusal must happen before resolver or quarantine work.
+    let policy = discover_pkg_enforcement_policy(cwd.as_deref());
+    let request = match validated_resolver_request(requirements, index_url, artifact_origin) {
+        Ok(request) => request,
+        Err(error) => {
+            return report_approve_error("request_validation", &error.to_string(), json, 1);
+        }
+    };
+    let target_binding = match bind_install_target(target) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return report_approve_error(
+                "target_binding",
+                &format!("unsafe install target: {error}"),
+                json,
+                1,
+            );
         }
     };
 
-    // Persist the approval record keyed by the plan digest, so `pkg install` can
-    // verify a matching approval exists.
-    match ApprovalRecord::from_digest(&prepared.digest).save() {
-        Ok(path) => {
+    // C12: derive a non-cloneable authorization for the exact approval
+    // operation. `approve` has no separate human gate, so RequireApproval is a
+    // typed refusal. A provenance requirement also refuses because this local
+    // argv path has no schema-v2 receipt provider.
+    let target_identity = target_binding.package_target_identity();
+    let package_binding = PackageOperationBinding::new(
+        ecosystem.label(),
+        &request,
+        artifact_origin,
+        &target_identity,
+    );
+    let envelope = match tirith_core::task_boundary::package_envelope(&package_binding) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return report_approve_error("operation_binding", &error.to_string(), json, 1);
+        }
+    };
+    let operation = package_boundary_operation::<PackageApprovalBoundary>(&envelope);
+    let pending = match prepare_package_boundary_authorization::<PackageApprovalBoundary>(
+        &operation, &policy,
+    ) {
+        Ok(pending) => pending,
+        Err(error) => return report_approve_authorization_error(&error, json),
+    };
+    let task_gate_binding =
+        tirith_core::task_boundary::ceiling_binding(&pending.assessment().decision);
+    // Replay state (when a future v2 provider supplies it) is consumed at the
+    // last possible point before PATH lookup, quarantine creation, DNS, or a
+    // resolver child. Receipt-less decisions do not open the replay ledger.
+    if !pending.binds_operation(&operation) {
+        return report_approve_authorization_error(
+            &BoundaryAuthorizationError::EnvelopeMismatch,
+            json,
+        );
+    }
+    let permit = match pending.consume_default_for_operation(&operation, chrono::Utc::now()) {
+        Ok(permit) => permit,
+        Err(error) => return report_approve_authorization_error(&error, json),
+    };
+
+    let approval = match AuthorizedPackageApprovalTransaction::new(permit, envelope) {
+        Ok(approval) => approval,
+        Err(error) => {
+            return report_approve_error("approval_transaction", &error.to_string(), json, 1);
+        }
+    };
+    let prepared = match approval.prepare(
+        ecosystem.label(),
+        &request,
+        target_binding,
+        artifact_origin,
+        &policy,
+        String::new(),
+        task_gate_binding,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return report_approve_error("plan_preparation", &error.to_string(), json, 1),
+    };
+
+    let approval_projection =
+        match tirith_core::package_approval::package_approval_plan_projection(prepared.digest()) {
+            Ok(projection) => projection,
+            Err(error) => {
+                return report_approve_error("plan_preparation", &error.to_string(), json, 1)
+            }
+        };
+    // Keep stdout machine-stable in JSON mode, but always render the exact
+    // canonical plan to the operator channel. The privileged helper renders
+    // these same bytes independently before it can sign.
+    eprintln!("tirith pkg approve: exact plan awaiting privileged confirmation:");
+    eprintln!("{approval_projection}");
+
+    // The typed approval transaction survives resolver/quarantine work and is
+    // consumed only by the final durable grant publication.
+    match prepared.publish() {
+        Ok((prepared, path)) => {
             if json {
                 let out = serde_json::json!({
                     "approved": true,
@@ -773,10 +1138,7 @@ fn run_approve(
             }
             0
         }
-        Err(e) => {
-            eprintln!("tirith pkg approve: could not save approval record: {e}");
-            1
-        }
+        Err(error) => report_approve_error(error.phase(), &error.to_string(), json, 1),
     }
 }
 
@@ -801,32 +1163,110 @@ fn run_install(
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
-    let policy = Policy::discover_local_only(cwd.as_deref());
+    let policy = discover_pkg_enforcement_policy(cwd.as_deref());
+    let request = match validated_resolver_request(requirements, index_url, artifact_origin) {
+        Ok(request) => request,
+        Err(error) => {
+            return report_install_failure(
+                "plan_preparation",
+                &error.to_string(),
+                false,
+                false,
+                json,
+                1,
+            );
+        }
+    };
+    let target_binding = match bind_install_target(target) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return report_install_failure(
+                "target_binding",
+                &format!("unsafe install target: {error}"),
+                false,
+                false,
+                json,
+                1,
+            );
+        }
+    };
 
     // An install's digest is NOT time-boxed by itself (the install happens now); the
     // approval record it must match carries the expiry. So the install builds the
     // digest with no expiry and looks for a matching approval (whose own expiry is
     // checked). This keeps "the bytes/situation I am about to install" stable while
     // the approval governs the time window.
-    // C12: same owned network-egress transition, before the resolver runs.
-    let network_assessment = evaluate_package_boundary(
-        tirith_core::task_boundary::OwnedBoundary::PackageResolve,
-        ecosystem,
-        requirements,
-        &policy,
+    // C12: same typed network-egress transition, before the resolver runs. This
+    // local argv path has no v2 authorization provider, so provenance-required
+    // policy fails closed here rather than silently falling back to assessment.
+    let target_identity = target_binding.package_target_identity();
+    let package_binding = PackageOperationBinding::new(
+        ecosystem.label(),
+        &request,
+        artifact_origin,
+        &target_identity,
     );
-    if let Some(reason) = network_assessment.refusal(false) {
-        return report_task_gate_refusal("install", &network_assessment, reason, json);
+    let envelope = match tirith_core::task_boundary::package_envelope(&package_binding) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return report_install_failure(
+                "task_authorization",
+                &error.to_string(),
+                false,
+                false,
+                json,
+                1,
+            );
+        }
+    };
+    let resolve_operation = package_boundary_operation::<PackageResolveBoundary>(&envelope);
+    let pending_resolve = match prepare_package_boundary_authorization::<PackageResolveBoundary>(
+        &resolve_operation,
+        &policy,
+    ) {
+        Ok(pending) => pending,
+        Err(error) => {
+            return report_task_authorization_error(
+                "install",
+                tirith_core::task_boundary::OwnedBoundary::PackageResolve,
+                &error,
+                json,
+            );
+        }
+    };
+    let task_gate_binding =
+        tirith_core::task_boundary::ceiling_binding(&pending_resolve.assessment().decision);
+    if !pending_resolve.binds_operation(&resolve_operation) {
+        return report_task_authorization_error(
+            "install",
+            tirith_core::task_boundary::OwnedBoundary::PackageResolve,
+            &BoundaryAuthorizationError::EnvelopeMismatch,
+            json,
+        );
     }
+    let resolve_permit = match pending_resolve
+        .consume_default_for_operation(&resolve_operation, chrono::Utc::now())
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            return report_task_authorization_error(
+                "install",
+                tirith_core::task_boundary::OwnedBoundary::PackageResolve,
+                &error,
+                json,
+            );
+        }
+    };
 
-    let prepared = match prepare_plan(
-        requirements,
-        target,
-        index_url,
+    let prepared = match prepare_plan_authorized(
+        resolve_permit,
+        ecosystem.label(),
+        &request,
+        target_binding,
         artifact_origin,
         &policy,
         String::new(),
-        tirith_core::task_boundary::ceiling_binding(&network_assessment.decision),
+        task_gate_binding,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -841,17 +1281,62 @@ fn run_install(
         }
     };
 
-    // Authorisation: a matching, un-expired approval record, or an explicit `--yes`
-    // (the unattended path). `--yes` is recorded honestly: the receipt's verdict +
-    // chain still attest the install, but no prior human approval gate was crossed.
-    if !yes {
-        match approval_status(&prepared.digest) {
-            ApprovalStatus::Valid => {}
+    let envelope = match tirith_core::task_boundary::package_install_plan_envelope(&prepared.digest)
+    {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return report_install_failure(
+                "task_authorization",
+                &error.to_string(),
+                false,
+                false,
+                json,
+                1,
+            );
+        }
+    };
+
+    let preparation_operation =
+        package_boundary_operation::<PackageInstallPreparationBoundary>(&envelope);
+    // C12: derive the policy decision before selecting an approval channel.
+    // `--yes` remains the package command's unattended business confirmation,
+    // but it can never satisfy a task-policy RequireApproval decision. Only an
+    // authentic schema-v2 native-authority record can mint that typed channel.
+    let pending_preparation = match prepare_package_boundary_authorization::<
+        PackageInstallPreparationBoundary,
+    >(&preparation_operation, &policy)
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            return report_task_authorization_error(
+                "install",
+                tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+                &error,
+                json,
+            );
+        }
+    };
+    let preparation_denied_effects = pending_preparation.assessment().enforced_denied_effects();
+    let pending_preparation = if yes {
+        match accept_unattended_preparation(pending_preparation) {
+            Ok(pending) => pending,
+            Err(error) => {
+                return report_task_authorization_error(
+                    "install",
+                    tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+                    &error,
+                    json,
+                )
+            }
+        }
+    } else {
+        let verified = match approval_status(&prepared.digest) {
+            ApprovalStatus::Valid(approval) => *approval,
             ApprovalStatus::Missing => {
                 return report_install_failure(
                     "approval",
                     &format!(
-                        "no matching approval for plan {}; run `tirith pkg approve {} {}` first, or pass --yes to install unattended",
+                        "no authentic matching approval for plan {}; run `tirith pkg approve {} {}` first, or pass --yes only when task policy does not require approval",
                         prepared.digest.plan_digest,
                         ecosystem.label(),
                         requirements.join(" ")
@@ -866,7 +1351,7 @@ fn run_install(
                 return report_install_failure(
                     "approval",
                     &format!(
-                        "the approval for plan {} has expired; re-run `tirith pkg approve`",
+                        "the signed approval for plan {} has expired; re-run `tirith pkg approve`",
                         prepared.digest.plan_digest
                     ),
                     false,
@@ -875,26 +1360,36 @@ fn run_install(
                     1,
                 );
             }
+            ApprovalStatus::BlockedNative(reason) => {
+                return report_install_failure("approval", &reason, false, false, json, 1);
+            }
+        };
+        let approval_channel = match PackageInstallApprovalChannel::from_native_authority(
+            verified,
+            &preparation_operation,
+        ) {
+            Ok(approval) => approval,
+            Err(error) => {
+                return report_task_authorization_error(
+                    "install",
+                    tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+                    &error,
+                    json,
+                );
+            }
+        };
+        match pending_preparation.with_package_install_approval(approval_channel) {
+            Ok(pending) => pending,
+            Err(error) => {
+                return report_task_authorization_error(
+                    "install",
+                    tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+                    &error,
+                    json,
+                );
+            }
         }
-    }
-
-    // C12: the owned install-preparation transition. Everything irreversible
-    // about the install starts at `EnvironmentCheckpoint::begin` below, which
-    // creates and retains the target environment before pip gets write access,
-    // so the second gate sits above it. Unlike the resolve gate this site HAS
-    // crossed a human gate already: either a matching un-expired approval record
-    // was just validated, or the operator passed `--yes` for the unattended
-    // path, so a required approval is satisfied rather than refused.
-    let preparation_assessment = evaluate_package_boundary(
-        tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
-        ecosystem,
-        requirements,
-        &policy,
-    );
-    if let Some(reason) = preparation_assessment.refusal(true) {
-        return report_task_gate_refusal("install", &preparation_assessment, reason, json);
-    }
-
+    };
     // The contained install (D4) always fails closed. `--allow-degraded` remains a
     // compatibility flag but cannot weaken the enforcing package path; analysis-only
     // execution is a separate command.
@@ -905,11 +1400,38 @@ fn run_install(
     };
 
     let installed_distributions = installed_distribution_identities(&prepared.resolved);
+    if !pending_preparation.binds_operation(&preparation_operation) {
+        return report_task_authorization_error(
+            "install",
+            tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+            &BoundaryAuthorizationError::EnvelopeMismatch,
+            json,
+        );
+    }
+    let preparation_permit = match pending_preparation
+        .consume_default_for_operation(&preparation_operation, chrono::Utc::now())
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            return report_task_authorization_error(
+                "install",
+                tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+                &error,
+                json,
+            );
+        }
+    };
     // Atomically create and retain the new dedicated target before pip gets write
     // access. The narrow journal remains live through RECORD verification and
     // mandatory signed-receipt recording; every safely recoverable failed gate
     // removes only this newly created target.
-    let mut environment_checkpoint = match EnvironmentCheckpoint::begin(&prepared.target.binding) {
+    let mut environment_checkpoint = match EnvironmentCheckpoint::begin_authorized(
+        &prepared.target.binding,
+        preparation_permit,
+        ecosystem.label(),
+        &request,
+        artifact_origin,
+    ) {
         Ok(checkpoint) => checkpoint,
         Err(e) => {
             return report_install_failure(
@@ -925,8 +1447,8 @@ fn run_install(
             );
         }
     };
-    let target_handle = match environment_checkpoint.try_clone_target_handle() {
-        Ok(handle) => handle,
+    let authorized_launch = match environment_checkpoint.take_authorized_launch() {
+        Ok(launch) => launch,
         Err(error) => {
             let rollback = environment_checkpoint.rollback();
             return report_install_failure(
@@ -941,19 +1463,17 @@ fn run_install(
             );
         }
     };
-    let target_install_path = environment_checkpoint.install_path().to_path_buf();
     let outcome = match run_contained_install_with_policy(
         &prepared.plan,
         &prepared.txn,
         &prepared.tools,
         &prepared.target.environment,
-        &target_install_path,
-        target_handle,
+        authorized_launch,
         &installed_distributions,
         &policy,
         json,
         degraded_policy,
-        &preparation_assessment.enforced_denied_effects(),
+        &preparation_denied_effects,
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -1142,8 +1662,7 @@ fn run_contained_install_with_policy(
     transaction: &QuarantineTransaction,
     tools: &BoundResolverTools,
     target_environment: &Path,
-    target_install_path: &Path,
-    target_handle: std::fs::File,
+    authorized_launch: AuthorizedInstallLaunch,
     installed_distributions: &[ExpectedInstalledDistribution],
     policy: &Policy,
     json: bool,
@@ -1156,8 +1675,7 @@ fn run_contained_install_with_policy(
         transaction,
         tools,
         target_environment,
-        target_install_path,
-        target_handle,
+        authorized_launch,
         installed_distributions,
         policy,
         json,
@@ -1785,48 +2303,123 @@ fn print_receipt_full(r: &ArtifactScanReceipt, json: bool) {
 // approval record persistence
 // ---------------------------------------------------------------------------
 
-/// A persisted approval: the [`InstallPlanDigest`] an operator approved, saved under
-/// `data_dir()/approvals/<plan_digest>.json`. `pkg install` re-derives the plan
-/// digest of what it is about to run and looks up a matching, un-expired record.
-///
-/// The record IS the digest (serialized): saving the whole digest means the install
-/// can re-validate `digest_matches()` AND the expiry, so an edited record (a swapped
-/// interpreter with a stale digest) is rejected.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ApprovalRecord {
-    digest: InstallPlanDigest,
+/// Publish a schema-v2 signed record atomically (0600), consuming the exact
+/// typed permit at the write API itself. The surrounding transaction keeps this
+/// permit live across resolver/quarantine and native-authority work.
+fn persist_approval_record_authorized(
+    record: &PackageApprovalRecordV2,
+    permit: TaskBoundaryPermit<PackageApprovalBoundary>,
+    operation: &BoundaryOperation<'_>,
+    trusted_keys: &std::collections::BTreeMap<String, [u8; 32]>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<PathBuf, String> {
+    permit
+        .authorize_effect_at(operation, now)
+        .map_err(|error| format!("task authorization expired before publication: {error}"))?;
+    with_approval_store_lock(|dir| {
+        let path = persist_approval_record_bytes_unlocked(record, dir)?;
+        collect_expired_approval_records_unlocked(dir, trusted_keys, now);
+        Ok(path)
+    })
 }
 
-impl ApprovalRecord {
-    fn from_digest(digest: &InstallPlanDigest) -> Self {
-        ApprovalRecord {
-            digest: digest.clone(),
+#[cfg(test)]
+fn persist_approval_record_bytes(record: &PackageApprovalRecordV2) -> Result<PathBuf, String> {
+    with_approval_store_lock(|dir| persist_approval_record_bytes_unlocked(record, dir))
+}
+
+fn persist_approval_record_bytes_unlocked(
+    record: &PackageApprovalRecordV2,
+    dir: &Path,
+) -> Result<PathBuf, String> {
+    let requested = expiry_independent_plan(record.digest()).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}.json", requested.plan_digest));
+    let json = record
+        .to_json_pretty()
+        .map_err(|e| format!("serialize: {e}"))?;
+    tirith_core::util::write_file_atomic_0600(&path, json.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    Ok(path)
+}
+
+fn with_approval_store_lock<T>(f: impl FnOnce(&Path) -> Result<T, String>) -> Result<T, String> {
+    let dir = approvals_dir().ok_or("cannot determine approvals directory")?;
+    tirith_core::util::create_dir_durable(&dir).map_err(|e| format!("create dir: {e}"))?;
+    let lock_path = dir.join(".approval-store.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let lock = options
+        .open(&lock_path)
+        .map_err(|error| format!("open approval-store lock: {error}"))?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("lock approval store: {error}"))?;
+    let result = f(&dir);
+    let _ = fs2::FileExt::unlock(&lock);
+    result
+}
+
+/// Best-effort, bounded garbage collection. A file is removed only after its
+/// signed record verifies under the native trust roots as an expired approval,
+/// and only when its filename matches the expiry-independent requested plan.
+/// Malformed, untrusted, or concurrently changed records are never deleted.
+fn collect_expired_approval_records_unlocked(
+    dir: &Path,
+    trusted_keys: &std::collections::BTreeMap<String, [u8; 32]>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.take(MAX_PERSISTED_APPROVAL_RECORDS) {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Ok(destination) = tirith_core::util::ContainedAtomicFile::prepare(dir, &path, false)
+        else {
+            continue;
+        };
+        let Ok(content) = destination.read_capped(128 * 1024) else {
+            continue;
+        };
+        let Ok(record) = PackageApprovalRecordV2::from_json(&content) else {
+            continue;
+        };
+        let Ok(requested) = expiry_independent_plan(record.digest()) else {
+            continue;
+        };
+        if path.file_name().and_then(|name| name.to_str())
+            != Some(&format!("{}.json", requested.plan_digest))
+        {
+            continue;
+        }
+        if matches!(
+            verify_package_approval(&record, &requested, trusted_keys, now),
+            Err(PackageApprovalError::Expired)
+        ) {
+            let _ = destination.remove_if_contents(&content);
         }
     }
+}
 
-    /// Save the record atomically (0600) under `data_dir()/approvals/<digest>.json`.
-    fn save(&self) -> Result<PathBuf, String> {
-        let dir = approvals_dir().ok_or("cannot determine approvals directory")?;
-        tirith_core::util::create_dir_durable(&dir).map_err(|e| format!("create dir: {e}"))?;
-        let path = dir.join(format!("{}.json", self.digest.plan_digest));
-        let json = serde_json::to_string_pretty(self).map_err(|e| format!("serialize: {e}"))?;
-        tirith_core::util::write_file_atomic_0600(&path, json.as_bytes())
-            .map_err(|e| format!("write: {e}"))?;
-        Ok(path)
-    }
-
-    /// Load the approval record for a plan digest, if one exists. Used by tests to
-    /// assert a saved record round-trips by id; the runtime authorisation path
-    /// ([`approval_status`]) scans the approvals directory instead, because the
-    /// install digest differs from the approval digest by the expiry field and so
-    /// cannot key directly on the approval's id.
-    #[cfg(test)]
-    fn load(plan_digest: &str) -> Option<Self> {
-        let dir = approvals_dir()?;
-        let path = dir.join(format!("{plan_digest}.json"));
-        let content = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
-    }
+#[cfg(test)]
+fn load_approval_record(plan_digest: &str) -> Option<PackageApprovalRecordV2> {
+    let dir = approvals_dir()?;
+    let path = dir.join(format!("{plan_digest}.json"));
+    let mut file = tirith_core::util::open_read_no_follow_capped(&path, 128 * 1024).ok()?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content).ok()?;
+    PackageApprovalRecordV2::from_json(&content).ok()
 }
 
 /// The directory persisted approvals live in.
@@ -1835,14 +2428,16 @@ fn approvals_dir() -> Option<PathBuf> {
 }
 
 /// The authorisation state of an install plan against the persisted approvals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalStatus {
-    /// A matching, un-expired, content-consistent approval exists.
-    Valid,
+    /// A matching, fresh approval signed by the native authority exists.
+    Valid(Box<VerifiedPackageApproval>),
     /// No approval record matches this plan digest.
     Missing,
     /// A matching record exists but it has expired.
     Expired,
+    /// The platform-native authority or its admin-protected trust hierarchy is
+    /// unavailable. There is deliberately no weaker fallback.
+    BlockedNative(String),
 }
 
 /// Decide whether `digest` (the plan about to run) is authorised by a saved
@@ -1850,53 +2445,65 @@ enum ApprovalStatus {
 /// install digest's `plan_digest`, and the SAVED record's expiry is what gates the
 /// time window.
 fn approval_status(digest: &InstallPlanDigest) -> ApprovalStatus {
-    // The install digest has empty expiry; an approval record's digest carries a real
-    // expiry, so the two `plan_digest`s differ by the expiry field. Recompute the
-    // install digest's id WITH each candidate expiry would be circular; instead the
-    // approval record stores the full digest, and we match on every binding field
-    // EXCEPT expiry, then check the record's expiry.
-    //
-    // We do this by scanning the approvals dir for a record whose digest equals the
-    // install digest on all fields but expiry. In practice there is at most one such
-    // record per situation; the install digest's own id is recomputed with the
-    // record's expiry to confirm the binding is intact.
+    approval_status_with(digest, &NativePackageApprovalAuthority, chrono::Utc::now())
+}
+
+fn approval_status_with(
+    digest: &InstallPlanDigest,
+    key_provider: &dyn PackageApprovalKeyProvider,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ApprovalStatus {
+    let trusted_keys = match key_provider.trusted_keys() {
+        Ok(keys) => keys,
+        Err(error) => return ApprovalStatus::BlockedNative(error.to_string()),
+    };
     let Some(dir) = approvals_dir() else {
-        return ApprovalStatus::Missing;
+        return ApprovalStatus::BlockedNative(
+            "blocked_native: cannot determine the package approval store".to_string(),
+        );
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return ApprovalStatus::Missing;
+    let requested = match expiry_independent_plan(digest) {
+        Ok(requested) => requested,
+        Err(_) => return ApprovalStatus::Missing,
     };
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut saw_expired_match = false;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
+    let path = dir.join(format!("{}.json", requested.plan_digest));
+    let mut file = match tirith_core::util::open_read_no_follow_capped(&path, 128 * 1024) {
+        Ok(file) => file,
+        Err(tirith_core::util::OpenRegularError::NotFound) => {
+            return ApprovalStatus::Missing;
         }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_str::<ApprovalRecord>(&content) else {
-            continue;
-        };
-        // The record must be internally consistent (no edited binding field), and it
-        // must bind the SAME situation as the install plan (every field but expiry).
-        if !record.digest.digest_matches() {
-            continue;
+        Err(_) => {
+            return ApprovalStatus::BlockedNative(
+                "blocked_native: package approval record could not be read safely".to_string(),
+            );
         }
-        if !same_plan_modulo_expiry(&record.digest, digest) {
-            continue;
-        }
-        if record.digest.is_expired_at(&now) {
-            saw_expired_match = true;
-            continue;
-        }
-        return ApprovalStatus::Valid;
+    };
+    let mut content = Vec::new();
+    if file.read_to_end(&mut content).is_err() {
+        return ApprovalStatus::BlockedNative(
+            "blocked_native: package approval record changed while reading".to_string(),
+        );
     }
-    if saw_expired_match {
-        ApprovalStatus::Expired
+    let Ok(record) = PackageApprovalRecordV2::from_json(&content) else {
+        return ApprovalStatus::Missing;
+    };
+    match verify_package_approval(&record, &requested, &trusted_keys, now) {
+        Ok(approval) => ApprovalStatus::Valid(Box::new(approval)),
+        Err(PackageApprovalError::Expired) => ApprovalStatus::Expired,
+        Err(_) => ApprovalStatus::Missing,
+    }
+}
+
+fn accept_unattended_preparation(
+    pending: PendingBoundaryAuthorization<PackageInstallPreparationBoundary>,
+) -> Result<
+    PendingBoundaryAuthorization<PackageInstallPreparationBoundary>,
+    BoundaryAuthorizationError,
+> {
+    if pending.requires_approval() {
+        Err(BoundaryAuthorizationError::ApprovalRequired)
     } else {
-        ApprovalStatus::Missing
+        Ok(pending)
     }
 }
 
@@ -1912,6 +2519,7 @@ fn approval_status(digest: &InstallPlanDigest) -> ApprovalStatus {
 /// digest and never checked when an approval was redeemed. A field added in
 /// future is therefore bound by default; the failure direction if it should not
 /// have been is a re-approval, not an unbound install.
+#[cfg(test)]
 fn same_plan_modulo_expiry(a: &InstallPlanDigest, b: &InstallPlanDigest) -> bool {
     // `plan_digest` is derived from every other field, so comparing it would be
     // circular; `expiry` is the one binding input the install deliberately does
@@ -1930,6 +2538,31 @@ mod tests {
     use super::*;
     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
     use tirith_core::capsule::CapsuleSpec;
+
+    #[test]
+    fn approve_failures_share_one_stable_json_dto() {
+        for phase in [
+            "precheck",
+            "request_validation",
+            "target_binding",
+            "operation_binding",
+            "task_gate",
+            "approval_transaction",
+            "plan_preparation",
+            "native_authority",
+            "trust_verification",
+            "record_persistence",
+        ] {
+            let value = approve_error_json(phase, "refused");
+            assert_eq!(value["success"], false);
+            assert_eq!(value["command"], "approve");
+            assert_eq!(value["error_phase"], phase);
+            assert_eq!(value["target_executed"], false);
+            assert_eq!(value["target_published"], false);
+            assert_eq!(value["reason"], "refused");
+            assert_eq!(value.as_object().unwrap().len(), 6);
+        }
+    }
 
     /// A digest for tests, with a given expiry, built from fixed inputs so two
     /// digests differ only where a test changes them.
@@ -1972,6 +2605,355 @@ mod tests {
 
     fn digest_with_expiry(expiry: &str) -> InstallPlanDigest {
         InstallPlanDigest::new(plan_inputs_with_expiry(expiry))
+    }
+
+    struct TestAuthority {
+        signing_key: ed25519_dalek::SigningKey,
+    }
+
+    impl TestAuthority {
+        fn new() -> Self {
+            Self {
+                signing_key: ed25519_dalek::SigningKey::from_bytes(&[73_u8; 32]),
+            }
+        }
+
+        fn record(&self, digest: &InstallPlanDigest) -> PackageApprovalRecordV2 {
+            let (digest, issued, expires) = if digest.expiry.is_empty() {
+                let issued = chrono::Utc::now();
+                let expires = issued + chrono::Duration::minutes(30);
+                let mut stamped = digest.clone();
+                stamped.expiry = expires.to_rfc3339();
+                stamped.plan_digest = stamped.compute_plan_digest();
+                (stamped, issued, expires)
+            } else {
+                let expires = chrono::DateTime::parse_from_rfc3339(&digest.expiry)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc);
+                let issued = expires - chrono::Duration::minutes(30);
+                (digest.clone(), issued, expires)
+            };
+            PackageApprovalRecordV2::issue(
+                digest,
+                &issued.to_rfc3339(),
+                &expires.to_rfc3339(),
+                &self.signing_key,
+            )
+            .unwrap()
+        }
+    }
+
+    impl PackageApprovalIssuer for TestAuthority {
+        fn issue(
+            &self,
+            digest: &InstallPlanDigest,
+        ) -> Result<PackageApprovalRecordV2, NativeAuthorityError> {
+            Ok(self.record(digest))
+        }
+    }
+
+    impl PackageApprovalKeyProvider for TestAuthority {
+        fn trusted_keys(
+            &self,
+        ) -> Result<std::collections::BTreeMap<String, [u8; 32]>, NativeAuthorityError> {
+            let public = self.signing_key.verifying_key().to_bytes();
+            let key_id = tirith_core::command_card::key_id_for_pubkey(&public);
+            Ok(std::collections::BTreeMap::from([(key_id, public)]))
+        }
+    }
+
+    fn save_signed_for_test(digest: &InstallPlanDigest) -> Result<PathBuf, String> {
+        persist_approval_record_bytes(&TestAuthority::new().record(digest))
+    }
+
+    fn approval_status_for_test(digest: &InstallPlanDigest) -> ApprovalStatus {
+        let now = chrono::DateTime::parse_from_rfc3339("2098-12-31T23:59:59Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        approval_status_with(digest, &TestAuthority::new(), now)
+    }
+
+    fn test_package_envelope(requirements: &[String]) -> tirith_core::task::TaskEnvelopeInput {
+        let request = ResolverRequest {
+            requirements: requirements.to_vec(),
+            index_urls: Vec::new(),
+            allowances: Default::default(),
+        };
+        let target = tirith_core::task_boundary::PackageTargetIdentity::new(
+            "ab".repeat(32),
+            "linux-devino-v1:1:2",
+            "target",
+        );
+        let binding = PackageOperationBinding::new(Ecosystem::Pip.label(), &request, &[], &target);
+        tirith_core::task_boundary::package_envelope(&binding).unwrap()
+    }
+
+    fn package_ceiling<B: BoundaryMarker>(requirements: &[String], policy: &Policy) -> String {
+        let envelope = test_package_envelope(requirements);
+        let operation = package_boundary_operation::<B>(&envelope);
+        let pending = prepare_package_boundary_authorization::<B>(&operation, policy).unwrap();
+        tirith_core::task_boundary::ceiling_binding(&pending.assessment().decision)
+    }
+
+    #[test]
+    fn locally_derived_pkg_authorization_fails_closed_when_provenance_is_required() {
+        let requirements = ["requests==2.31.0".to_string()];
+        let envelope = test_package_envelope(&requirements);
+        let operation = package_boundary_operation::<PackageResolveBoundary>(&envelope);
+        let policy = Policy {
+            task_gate: tirith_core::web3_policy::TaskGatePolicy {
+                mode: tirith_core::web3_policy::TaskGateMode::Enforce,
+                effects_requiring_verified_provenance: [
+                    tirith_core::effects::CommandEffectKind::NetworkEgress,
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..Policy::default()
+        };
+
+        assert!(matches!(
+            prepare_package_boundary_authorization::<PackageResolveBoundary>(&operation, &policy),
+            Err(BoundaryAuthorizationError::SchemaV2Required)
+        ));
+    }
+
+    #[test]
+    fn remote_policy_failure_denies_pkg_before_any_package_side_effect() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let policy_dir = root.path().join(".tirith");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        std::fs::write(
+            policy_dir.join("policy.yaml"),
+            "policy_fetch_fail_mode: closed\n",
+        )
+        .unwrap();
+        let data_dir = root.path().join("data");
+        let _guards = [
+            EnvGuard::set("TIRITH_POLICY_ROOT", root.path()),
+            EnvGuard::set("TIRITH_SERVER_URL", Path::new("http://127.0.0.1:1")),
+            EnvGuard::set("TIRITH_API_KEY", Path::new("test-only-key")),
+            EnvGuard::set("XDG_DATA_HOME", &data_dir),
+        ];
+        let policy = discover_pkg_enforcement_policy(root.path().to_str());
+        assert_eq!(policy.path.as_deref(), Some("fail-closed"));
+
+        let envelope = test_package_envelope(&["requests==2.31.0".to_string()]);
+        let operation = package_boundary_operation::<PackageResolveBoundary>(&envelope);
+        assert!(
+            prepare_package_boundary_authorization::<PackageResolveBoundary>(&operation, &policy,)
+                .is_err()
+        );
+        assert!(!approvals_dir().unwrap().exists());
+    }
+
+    #[test]
+    fn unattended_yes_cannot_satisfy_task_policy_require_approval() {
+        let requirements = ["requests==2.31.0".to_string()];
+        let mut envelope = test_package_envelope(&requirements);
+        envelope
+            .actions
+            .push(tirith_core::task::ProposedAction::Narrative {
+                text: "intentionally incomplete package preparation".to_string(),
+            });
+        let operation = package_boundary_operation::<PackageInstallPreparationBoundary>(&envelope);
+        let policy = Policy {
+            task_gate: tirith_core::web3_policy::TaskGatePolicy {
+                mode: tirith_core::web3_policy::TaskGateMode::Enforce,
+                action_incomplete_analysis:
+                    tirith_core::web3_policy::Web3GuardAction::RequireApproval,
+                ..Default::default()
+            },
+            ..Policy::default()
+        };
+        let pending = prepare_package_boundary_authorization::<PackageInstallPreparationBoundary>(
+            &operation, &policy,
+        )
+        .unwrap();
+        assert!(pending.requires_approval());
+        assert!(matches!(
+            accept_unattended_preparation(pending),
+            Err(BoundaryAuthorizationError::ApprovalRequired)
+        ));
+    }
+
+    #[test]
+    fn package_approval_denied_persistence_never_creates_a_grant_record() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _guards = isolate(root.path());
+        let requirements = ["requests==2.31.0".to_string()];
+        let envelope = test_package_envelope(&requirements);
+        let operation = package_boundary_operation::<PackageApprovalBoundary>(&envelope);
+        assert!(operation
+            .boundary_effects
+            .contains(&tirith_core::effects::CommandEffectKind::PolicyChange));
+        let policy = Policy {
+            task_gate: tirith_core::web3_policy::TaskGatePolicy {
+                mode: tirith_core::web3_policy::TaskGateMode::Enforce,
+                effects_denied_for_untrusted_sources: [
+                    tirith_core::effects::CommandEffectKind::PersistenceChange,
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..Policy::default()
+        };
+
+        let error = match prepare_package_boundary_authorization::<PackageApprovalBoundary>(
+            &operation, &policy,
+        ) {
+            Ok(_) => panic!("persistence denial unexpectedly authorized an approval record"),
+            Err(error) => error,
+        };
+        let assessment = error.assessment().expect("denial assessment");
+        assert!(assessment
+            .decision
+            .inferred_effects
+            .contains(&tirith_core::effects::CommandEffectKind::PersistenceChange));
+        assert!(assessment
+            .decision
+            .inferred_effects
+            .contains(&tirith_core::effects::CommandEffectKind::PolicyChange));
+        assert!(!approvals_dir().unwrap().exists());
+    }
+
+    #[test]
+    fn package_approval_transaction_rejects_a_changed_package_set() {
+        let approved_envelope = test_package_envelope(&["requests==2.31.0".to_string()]);
+        let approved_operation =
+            package_boundary_operation::<PackageApprovalBoundary>(&approved_envelope);
+        let permit = prepare_package_boundary_authorization::<PackageApprovalBoundary>(
+            &approved_operation,
+            &Policy::default(),
+        )
+        .unwrap()
+        .consume_default_for_operation(&approved_operation, chrono::Utc::now())
+        .unwrap();
+        let changed_envelope = test_package_envelope(&["urllib3==2.2.0".to_string()]);
+
+        assert!(matches!(
+            AuthorizedPackageApprovalTransaction::new(permit, changed_envelope),
+            Err(PrepareError::Authorization(_))
+        ));
+    }
+
+    #[test]
+    fn approval_record_effect_api_rejects_changed_operation_without_writing() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _guards = isolate(root.path());
+        let approved_envelope = test_package_envelope(&["requests==2.31.0".to_string()]);
+        let approved_operation =
+            package_boundary_operation::<PackageApprovalBoundary>(&approved_envelope);
+        let permit = prepare_package_boundary_authorization::<PackageApprovalBoundary>(
+            &approved_operation,
+            &Policy::default(),
+        )
+        .unwrap()
+        .consume_default_for_operation(&approved_operation, chrono::Utc::now())
+        .unwrap();
+        let changed_envelope = test_package_envelope(&["urllib3==2.2.0".to_string()]);
+        let changed_operation =
+            package_boundary_operation::<PackageApprovalBoundary>(&changed_envelope);
+        let record = TestAuthority::new().record(&digest_with_expiry("2099-01-01T00:00:00+00:00"));
+
+        let trusted_keys = TestAuthority::new().trusted_keys().unwrap();
+        assert!(persist_approval_record_authorized(
+            &record,
+            permit,
+            &changed_operation,
+            &trusted_keys,
+            chrono::Utc::now(),
+        )
+        .is_err());
+        assert!(!approvals_dir().unwrap().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resolver_permit(
+        request: &ResolverRequest,
+        artifact_origins: &[String],
+        target: &InstallTargetBinding,
+    ) -> TaskBoundaryPermit<PackageResolveBoundary> {
+        let target_identity = target.package_target_identity();
+        let binding = PackageOperationBinding::new(
+            Ecosystem::Pip.label(),
+            request,
+            artifact_origins,
+            &target_identity,
+        );
+        let envelope = tirith_core::task_boundary::package_envelope(&binding).unwrap();
+        let operation = package_boundary_operation::<PackageResolveBoundary>(&envelope);
+        prepare_package_boundary_authorization::<PackageResolveBoundary>(
+            &operation,
+            &Policy::default(),
+        )
+        .unwrap()
+        .consume_default_for_operation(&operation, chrono::Utc::now())
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolver_preparation_reconstructs_and_rejects_an_index_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let target_path = root.path().join("target");
+        let target = InstallTargetBinding::bind(&target_path).unwrap();
+        let original = validated_resolver_request(
+            &["demo==1.0".to_string()],
+            &["https://index.example/simple".to_string()],
+            &[],
+        )
+        .unwrap();
+        let permit = resolver_permit(&original, &[], &target);
+        let changed = validated_resolver_request(
+            &["demo==1.0".to_string()],
+            &["https://other.example/simple".to_string()],
+            &[],
+        )
+        .unwrap();
+
+        let result = prepare_plan_authorized(
+            permit,
+            Ecosystem::Pip.label(),
+            &changed,
+            target,
+            &[],
+            &Policy::default(),
+            String::new(),
+            String::new(),
+        );
+        assert!(matches!(result, Err(PrepareError::Authorization(_))));
+        assert!(!target_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolver_preparation_reconstructs_and_rejects_an_artifact_origin_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let target_path = root.path().join("target");
+        let target = InstallTargetBinding::bind(&target_path).unwrap();
+        let request = validated_resolver_request(&["demo==1.0".to_string()], &[], &[]).unwrap();
+        let approved_origins = ["https://cdn.example/wheels".to_string()];
+        let permit = resolver_permit(&request, &approved_origins, &target);
+        let changed_origins = ["https://other.example/wheels".to_string()];
+
+        let result = prepare_plan_authorized(
+            permit,
+            Ecosystem::Pip.label(),
+            &request,
+            target,
+            &changed_origins,
+            &Policy::default(),
+            String::new(),
+            String::new(),
+        );
+        assert!(matches!(result, Err(PrepareError::Authorization(_))));
+        assert!(!target_path.exists());
     }
 
     // ── precheck / misplaced-flag guard ─────────────────────────────────────
@@ -2063,7 +3045,7 @@ mod tests {
 
         // Approve a plan with a far-future expiry.
         let approved = digest_with_expiry("2099-01-01T00:00:00+00:00");
-        let path = ApprovalRecord::from_digest(&approved).save().unwrap();
+        let path = save_signed_for_test(&approved).unwrap();
         assert!(path.exists());
 
         // The install builds the SAME situation with NO expiry.
@@ -2073,12 +3055,16 @@ mod tests {
         assert!(same_plan_modulo_expiry(&approved, &install_digest));
 
         // The install is authorised by the saved approval.
-        assert_eq!(approval_status(&install_digest), ApprovalStatus::Valid);
+        assert!(matches!(
+            approval_status_for_test(&install_digest),
+            ApprovalStatus::Valid(_)
+        ));
 
         // Loadable directly, too.
-        let loaded = ApprovalRecord::load(&approved.plan_digest).unwrap();
-        assert_eq!(loaded.digest, approved);
-        assert!(loaded.digest.digest_matches());
+        let requested = expiry_independent_plan(&approved).unwrap();
+        let loaded = load_approval_record(&requested.plan_digest).unwrap();
+        assert_eq!(loaded.digest(), &approved);
+        assert!(loaded.digest().digest_matches());
     }
 
     #[test]
@@ -2087,7 +3073,31 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _g = isolate(root.path());
         let install_digest = digest_with_expiry("");
-        assert_eq!(approval_status(&install_digest), ApprovalStatus::Missing);
+        assert!(matches!(
+            approval_status_for_test(&install_digest),
+            ApprovalStatus::Missing
+        ));
+    }
+
+    #[test]
+    fn legacy_unsigned_v1_record_never_authorizes() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _g = isolate(root.path());
+        let approved = digest_with_expiry("2099-01-01T00:00:00+00:00");
+        let requested = expiry_independent_plan(&approved).unwrap();
+        let dir = approvals_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.json", requested.plan_digest)),
+            serde_json::to_vec(&serde_json::json!({ "digest": approved })).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            approval_status_for_test(&digest_with_expiry("")),
+            ApprovalStatus::Missing
+        ));
     }
 
     #[test]
@@ -2098,11 +3108,74 @@ mod tests {
 
         // An already-expired approval.
         let approved = digest_with_expiry("2000-01-01T00:00:00+00:00");
-        ApprovalRecord::from_digest(&approved).save().unwrap();
+        save_signed_for_test(&approved).unwrap();
 
         let install_digest = digest_with_expiry("");
         assert!(same_plan_modulo_expiry(&approved, &install_digest));
-        assert_eq!(approval_status(&install_digest), ApprovalStatus::Expired);
+        assert!(matches!(
+            approval_status_for_test(&install_digest),
+            ApprovalStatus::Expired
+        ));
+    }
+
+    #[test]
+    fn verified_plan_proof_cannot_authorize_a_relabelled_install_operation() {
+        let requested = digest_with_expiry("");
+        let authority = TestAuthority::new();
+        let record = authority.record(&requested);
+        let trusted_keys = authority.trusted_keys().unwrap();
+        let verified =
+            verify_package_approval(&record, &requested, &trusted_keys, chrono::Utc::now())
+                .unwrap();
+        let canonical =
+            tirith_core::task_boundary::package_install_plan_envelope(&requested).unwrap();
+        let mut relabelled = canonical.clone();
+        relabelled.actions[0] = tirith_core::task::ProposedAction::PackageInstall {
+            ecosystem: "pip".to_string(),
+            package: "attacker-controlled".to_string(),
+        };
+        let relabelled_operation =
+            package_boundary_operation::<PackageInstallPreparationBoundary>(&relabelled);
+
+        assert!(matches!(
+            PackageInstallApprovalChannel::from_native_authority(verified, &relabelled_operation),
+            Err(BoundaryAuthorizationError::ApprovalMismatch)
+        ));
+
+        let verified =
+            verify_package_approval(&record, &requested, &trusted_keys, chrono::Utc::now())
+                .unwrap();
+        let canonical_operation =
+            package_boundary_operation::<PackageInstallPreparationBoundary>(&canonical);
+        PackageInstallApprovalChannel::from_native_authority(verified, &canonical_operation)
+            .expect("the exact canonical signed-plan operation must authorize");
+    }
+
+    #[test]
+    fn renewed_approval_atomically_replaces_the_expiry_independent_key() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _g = isolate(root.path());
+        let first = digest_with_expiry("2099-01-01T00:00:00+00:00");
+        let second = digest_with_expiry("2099-01-01T00:10:00+00:00");
+        let first_path = save_signed_for_test(&first).unwrap();
+        let second_path = save_signed_for_test(&second).unwrap();
+        assert_eq!(first_path, second_path);
+        let requested = expiry_independent_plan(&first).unwrap();
+        assert_eq!(
+            first_path.file_name().unwrap().to_string_lossy(),
+            format!("{}.json", requested.plan_digest)
+        );
+        let loaded = load_approval_record(&requested.plan_digest).unwrap();
+        assert_eq!(loaded.digest(), &second);
+        assert_eq!(
+            std::fs::read_dir(approvals_dir().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2113,7 +3186,7 @@ mod tests {
 
         // Approve one situation.
         let approved = digest_with_expiry("2099-01-01T00:00:00+00:00");
-        ApprovalRecord::from_digest(&approved).save().unwrap();
+        save_signed_for_test(&approved).unwrap();
 
         // A DIFFERENT install: a different interpreter. Build it by hand.
         let mut other_inputs = plan_inputs_with_expiry("");
@@ -2121,7 +3194,10 @@ mod tests {
         let other = InstallPlanDigest::new(other_inputs);
         assert!(!same_plan_modulo_expiry(&approved, &other));
         // No matching approval for the changed situation.
-        assert_eq!(approval_status(&other), ApprovalStatus::Missing);
+        assert!(matches!(
+            approval_status_for_test(&other),
+            ApprovalStatus::Missing
+        ));
     }
 
     /// The task-gate ceiling is part of the binding, not decoration.
@@ -2147,20 +3223,9 @@ mod tests {
             },
             ..Policy::default()
         };
-        let ceiling = |policy: &Policy, boundary| {
-            tirith_core::task_boundary::ceiling_binding(
-                &evaluate_package_boundary(boundary, Ecosystem::Pip, &requirements, policy)
-                    .decision,
-            )
-        };
-        let approved_under = ceiling(
-            &enforcing,
-            tirith_core::task_boundary::OwnedBoundary::PackageApproval,
-        );
-        let installed_under = ceiling(
-            &Policy::default(),
-            tirith_core::task_boundary::OwnedBoundary::PackageResolve,
-        );
+        let approved_under = package_ceiling::<PackageApprovalBoundary>(&requirements, &enforcing);
+        let installed_under =
+            package_ceiling::<PackageResolveBoundary>(&requirements, &Policy::default());
         assert_ne!(
             approved_under, installed_under,
             "the ceiling must differ, or this test proves nothing"
@@ -2169,7 +3234,7 @@ mod tests {
         let mut approved_inputs = plan_inputs_with_expiry("2099-01-01T00:00:00+00:00");
         approved_inputs.task_gate_binding = approved_under;
         let approved = InstallPlanDigest::new(approved_inputs);
-        ApprovalRecord::from_digest(&approved).save().unwrap();
+        save_signed_for_test(&approved).unwrap();
 
         let mut install_inputs = plan_inputs_with_expiry("");
         install_inputs.task_gate_binding = installed_under;
@@ -2179,7 +3244,10 @@ mod tests {
             !same_plan_modulo_expiry(&approved, &install_digest),
             "an approval taken under an enforcing gate matched an install under a relaxed one"
         );
-        assert_eq!(approval_status(&install_digest), ApprovalStatus::Missing);
+        assert!(matches!(
+            approval_status_for_test(&install_digest),
+            ApprovalStatus::Missing
+        ));
     }
 
     /// The same ceiling still authorises: the check above must not have made
@@ -2191,11 +3259,11 @@ mod tests {
         let _g = isolate(root.path());
 
         let approved = digest_with_expiry("2099-01-01T00:00:00+00:00");
-        ApprovalRecord::from_digest(&approved).save().unwrap();
-        assert_eq!(
-            approval_status(&digest_with_expiry("")),
-            ApprovalStatus::Valid
-        );
+        save_signed_for_test(&approved).unwrap();
+        assert!(matches!(
+            approval_status_for_test(&digest_with_expiry("")),
+            ApprovalStatus::Valid(_)
+        ));
     }
 
     #[test]
@@ -2206,13 +3274,16 @@ mod tests {
 
         // Approve bound to DB sequence 3.
         let approved = digest_with_expiry("2099-01-01T00:00:00+00:00");
-        ApprovalRecord::from_digest(&approved).save().unwrap();
+        save_signed_for_test(&approved).unwrap();
 
         // Install plan now bound to DB sequence 4 (a newer DB) -> not authorised.
         let mut install_inputs = plan_inputs_with_expiry("");
         install_inputs.threat_db_sequence = 4;
         let install_digest = InstallPlanDigest::new(install_inputs);
-        assert_eq!(approval_status(&install_digest), ApprovalStatus::Missing);
+        assert!(matches!(
+            approval_status_for_test(&install_digest),
+            ApprovalStatus::Missing
+        ));
     }
 
     #[test]
@@ -2224,17 +3295,21 @@ mod tests {
         // Save a valid approval, then EDIT the saved file to swap the interpreter
         // while leaving the stored plan_digest stale.
         let approved = digest_with_expiry("2099-01-01T00:00:00+00:00");
-        let path = ApprovalRecord::from_digest(&approved).save().unwrap();
-        let mut record: ApprovalRecord =
+        let path = save_signed_for_test(&approved).unwrap();
+        let mut record: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        record.digest.interpreter = "/attacker/python".to_string();
-        // Write the tampered record back (stale digest, changed interpreter).
+        record["digest"]["interpreter"] = "/attacker/python".into();
+        // Write the tampered record back (stale digest and signature, changed
+        // interpreter).
         std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
 
         // The install for the ORIGINAL situation must NOT be authorised: the tampered
         // record fails digest_matches() and is skipped.
         let install_digest = digest_with_expiry("");
-        assert_eq!(approval_status(&install_digest), ApprovalStatus::Missing);
+        assert!(matches!(
+            approval_status_for_test(&install_digest),
+            ApprovalStatus::Missing
+        ));
     }
 
     // ── failed-install verdict ──────────────────────────────────────────────
@@ -2296,11 +3371,8 @@ mod tests {
     fn install_target_uses_explicit_target_dir() {
         let parent = tempfile::tempdir().unwrap();
         let requested = parent.path().join("dedicated-target");
-        let t = InstallTarget::derive_from_interpreter(
-            PathBuf::from("/opt/py/bin/python3"),
-            Some(requested.clone()),
-        )
-        .unwrap();
+        let binding = bind_install_target(Some(requested.clone())).unwrap();
+        let t = InstallTarget::from_binding(PathBuf::from("/opt/py/bin/python3"), binding);
         assert_eq!(t.interpreter, PathBuf::from("/opt/py/bin/python3"));
         assert_eq!(
             t.environment,
@@ -2318,9 +3390,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn install_target_never_defaults_to_interpreter_prefix() {
-        let error =
-            InstallTarget::derive_from_interpreter(PathBuf::from("/opt/py/bin/python3"), None)
-                .expect_err("enforcing installs require an explicit dedicated target");
+        let error = bind_install_target(None)
+            .expect_err("enforcing installs require an explicit dedicated target");
         assert!(error.contains("explicit --target is required"));
     }
 

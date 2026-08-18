@@ -69,6 +69,10 @@ pub type VerifiedScriptExecutor = Box<
 /// exec-stop transition; dropping it leaves the target unauthorized.
 pub struct ExecutionAuthorizer {
     gate: Option<crate::execution_state::ExecutionGate>,
+    // Retain the exact content/interpreter/effect authorization through the
+    // trusted executor call. The capsule controller can only be reached with
+    // this owner alive, so the permit is not reduced to an earlier boolean.
+    remote_launch_authorization: Option<AuthorizedRemoteLaunch>,
     #[cfg(target_os = "linux")]
     evidence_id: String,
     #[cfg(target_os = "linux")]
@@ -270,11 +274,15 @@ fn relocate_parent_endpoint(
 }
 
 impl ExecutionAuthorizer {
-    fn new(gate: crate::execution_state::ExecutionGate) -> Self {
+    fn new(
+        gate: crate::execution_state::ExecutionGate,
+        remote_launch_authorization: AuthorizedRemoteLaunch,
+    ) -> Self {
         #[cfg(target_os = "linux")]
         let controller_id = uuid::Uuid::new_v4().simple().to_string();
         Self {
             gate: Some(gate),
+            remote_launch_authorization: Some(remote_launch_authorization),
             #[cfg(target_os = "linux")]
             evidence_id: format!("kernel-stop-{controller_id}"),
             #[cfg(target_os = "linux")]
@@ -352,19 +360,24 @@ impl ExecutionAuthorizer {
             .gate
             .take()
             .ok_or_else(|| "kernel exec-stop gate disappeared before confirmation".to_string());
+        let remote_launch_authorization =
+            self.remote_launch_authorization.take().ok_or_else(|| {
+                "remote-script authorization disappeared before kernel confirmation".to_string()
+            });
         // Closing the parent copies of the child endpoints is part of entering
         // confirmation: EOF now reflects the actual capsule guard, not a stale
         // raw descriptor retained by the CLI.
         drop(arm);
-        let result = match (channel, gate) {
-            (Ok(channel), Ok(gate)) => confirm_linux_kernel_exec(
+        let result = match (channel, gate, remote_launch_authorization) {
+            (Ok(channel), Ok(gate), Ok(remote_launch_authorization)) => confirm_linux_kernel_exec(
                 channel,
                 gate,
+                remote_launch_authorization,
                 &self.evidence_id,
                 remaining_budget,
                 abort_target,
             ),
-            (channel, gate) => {
+            (channel, gate, remote_launch_authorization) => {
                 // Keep whichever channel/gate still exists alive until target
                 // cleanup has completed. In particular, never release the
                 // stable session lock while an unconfirmed child may run.
@@ -373,10 +386,12 @@ impl ExecutionAuthorizer {
                     .err()
                     .cloned()
                     .or_else(|| gate.as_ref().err().cloned())
+                    .or_else(|| remote_launch_authorization.as_ref().err().cloned())
                     .unwrap_or_else(|| "kernel exec-stop controller lost ownership".to_string());
                 let abort = abort_target();
                 drop(channel);
                 drop(gate);
+                drop(remote_launch_authorization);
                 match abort {
                     Ok(()) => Err(KernelExecConfirmationError::BeforeAck(error)),
                     Err(cleanup) => Err(KernelExecConfirmationError::BeforeAck(format!(
@@ -394,7 +409,9 @@ impl ExecutionAuthorizer {
     }
 
     fn completed(&self) -> bool {
-        self.phase == KernelExecPhase::Complete && self.gate.is_none()
+        self.phase == KernelExecPhase::Complete
+            && self.gate.is_none()
+            && self.remote_launch_authorization.is_none()
     }
 }
 
@@ -402,6 +419,7 @@ impl ExecutionAuthorizer {
 fn confirm_linux_kernel_exec(
     channel: TargetLaunchStatusPipe,
     gate: crate::execution_state::ExecutionGate,
+    remote_launch_authorization: AuthorizedRemoteLaunch,
     evidence_id: &str,
     remaining_budget: std::time::Duration,
     abort_target: impl FnOnce() -> Result<(), String>,
@@ -423,8 +441,18 @@ fn confirm_linux_kernel_exec(
     confirm_linux_kernel_exec_until(
         channel,
         deadline,
-        Some(gate),
-        |gate| {
+        (Some(gate), Some(remote_launch_authorization)),
+        |(gate, remote_launch_authorization)| {
+            let remote_launch_authorization = remote_launch_authorization
+                .take()
+                .ok_or_else(|| "remote-script authorization was already consumed".to_string())?;
+            let operation = remote_launch_authorization._binding.operation();
+            remote_launch_authorization
+                ._permit
+                .authorize_effect_at(&operation, chrono::Utc::now())
+                .map_err(|error| {
+                    format!("remote-script authorization expired before kernel ACK: {error}")
+                })?;
             let gate_ref = gate
                 .as_mut()
                 .ok_or_else(|| "kernel execution gate was already transferred".to_string())?;
@@ -794,6 +822,191 @@ pub struct RunOptions {
     pub exec_fn: Option<ScriptExecutor>,
 }
 
+const REMOTE_RUN_REDIRECT_POLICY_V1: &str =
+    "max_10;ssrf_guard_each_hop;execute_redirects_https_only";
+const REMOTE_INSPECT_REDIRECT_POLICY_V1: &str =
+    "max_10;ssrf_guard_each_hop;inspect_redirects_http_or_https";
+const REMOTE_FETCH_SAVE_REDIRECT_POLICY_V1: &str =
+    "max_10;ssrf_guard_each_hop;save_redirects_http_or_https";
+
+fn remote_run_effects() -> std::collections::BTreeSet<crate::effects::CommandEffectKind> {
+    [
+        crate::effects::CommandEffectKind::NetworkEgress,
+        crate::effects::CommandEffectKind::FilesystemWrite,
+        crate::effects::CommandEffectKind::PersistenceChange,
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Exact, pure binding for one Tirith-owned remote-run transaction.
+///
+/// Construction performs syntax and literal-IP validation only. Domain DNS is
+/// intentionally deferred until the resulting pending authorization has been
+/// consumed inside the runner.
+pub struct RemoteRunBoundaryBinding {
+    envelope: crate::task::TaskEnvelopeInput,
+    effects: std::collections::BTreeSet<crate::effects::CommandEffectKind>,
+    destination: Option<crate::util::ContainedAtomicFile>,
+}
+
+impl RemoteRunBoundaryBinding {
+    pub fn operation(&self) -> crate::task_boundary::BoundaryOperation<'_> {
+        crate::task_boundary::BoundaryOperation {
+            boundary: crate::task_boundary::OwnedBoundary::RemoteScriptRun,
+            envelope: &self.envelope,
+            adapter: crate::task::IngressAdapter::Unattributed,
+            boundary_effects: self.effects.clone(),
+        }
+    }
+
+    fn destination(&self) -> Option<&crate::util::ContainedAtomicFile> {
+        self.destination.as_ref()
+    }
+}
+
+pub fn remote_run_boundary_binding(
+    url: &str,
+    expected_sha256: Option<&str>,
+    no_exec: bool,
+    requested_pipe_invocation: Option<&RequestedPipeInvocation>,
+) -> Result<RemoteRunBoundaryBinding, String> {
+    let parsed = crate::url_validate::validate_fetch_url_syntax(url)?;
+    let expected_sha256 = normalize_sha256_pin(expected_sha256)?;
+    let pipe = requested_pipe_invocation.map(|requested| {
+        serde_json::json!({
+            "interpreter": requested.interpreter.as_str(),
+            "argv": &requested.args,
+        })
+    });
+    let projection = serde_json::json!({
+        "projection_version": 2,
+        "kind": "remote_run",
+        "canonical_url": parsed.as_str(),
+        "expected_sha256": expected_sha256,
+        "purpose": if no_exec { "inspect" } else { "execute" },
+        "no_exec": no_exec,
+        "redirect_policy": if no_exec {
+            REMOTE_INSPECT_REDIRECT_POLICY_V1
+        } else {
+            REMOTE_RUN_REDIRECT_POLICY_V1
+        },
+        "pipe_invocation": pipe,
+    });
+    let projection_sha256 =
+        sha256_hex(crate::audit::canonical_json_for_hash(&projection).as_bytes());
+    let mut envelope = crate::task_boundary::shell_envelope(parsed.as_str());
+    envelope.sources[0].content = format!("tirith-remote-run:v2:sha256:{projection_sha256}");
+    Ok(RemoteRunBoundaryBinding {
+        envelope,
+        effects: remote_run_effects(),
+        destination: None,
+    })
+}
+
+/// Exact, pure binding for `tirith fetch --save`, including the absolute
+/// destination identity and the durable taint-record side effect.
+pub fn remote_fetch_save_boundary_binding(
+    url: &str,
+    dest: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<RemoteRunBoundaryBinding, String> {
+    let parsed = crate::url_validate::validate_fetch_url_syntax(url)?;
+    let expected_sha256 = normalize_sha256_pin(expected_sha256)?;
+    let absolute_dest = std::path::absolute(dest)
+        .map_err(|error| format!("resolve absolute fetch destination: {error}"))?;
+    let parent = absolute_dest
+        .parent()
+        .ok_or_else(|| "fetch destination has no parent directory".to_string())?;
+    let destination = crate::util::ContainedAtomicFile::prepare(parent, &absolute_dest, false)
+        .map_err(|error| format!("bind retained fetch destination: {error}"))?;
+    let destination_identity = contained_destination_identity(&destination)?;
+    let projection = serde_json::json!({
+        "projection_version": 1,
+        "kind": "remote_fetch_save",
+        "canonical_url": parsed.as_str(),
+        "expected_sha256": expected_sha256,
+        "destination_identity_sha256": destination_identity,
+        "purpose": "save_and_mark_tainted",
+        "redirect_policy": REMOTE_FETCH_SAVE_REDIRECT_POLICY_V1,
+    });
+    Ok(remote_download_binding(
+        parsed.as_str(),
+        "tirith-fetch-save:v1",
+        projection,
+        destination,
+    ))
+}
+
+/// Exact pre-network binding for command-card fetch. The final filename is
+/// content-addressed and therefore unknowable before the authorized response;
+/// the binding instead commits to the exact absolute cache root and the fixed
+/// `sha256(valid-card-bytes).json` destination derivation.
+pub fn remote_command_card_cache_boundary_binding(
+    url: &str,
+    cache_dir: &Path,
+    card_read_cap: u64,
+) -> Result<RemoteRunBoundaryBinding, String> {
+    let parsed = crate::url_validate::validate_fetch_url_syntax(url)?;
+    let absolute_cache = std::path::absolute(cache_dir)
+        .map_err(|error| format!("resolve absolute command-card cache root: {error}"))?;
+    let parent = absolute_cache
+        .parent()
+        .ok_or_else(|| "command-card cache root has no parent directory".to_string())?;
+    let destination = crate::util::ContainedAtomicFile::prepare(parent, &absolute_cache, false)
+        .map_err(|error| format!("bind retained command-card cache root: {error}"))?;
+    let cache_root_identity = contained_destination_identity(&destination)?;
+    let projection = serde_json::json!({
+        "projection_version": 1,
+        "kind": "remote_command_card_cache",
+        "canonical_url": parsed.as_str(),
+        "expected_sha256": null,
+        "cache_root_identity_sha256": cache_root_identity,
+        "destination_derivation": "sha256(valid-card-bytes).json",
+        "card_read_cap": card_read_cap,
+        "purpose": "validate_and_cache_command_card",
+        "redirect_policy": REMOTE_FETCH_SAVE_REDIRECT_POLICY_V1,
+    });
+    Ok(remote_download_binding(
+        parsed.as_str(),
+        "tirith-command-card-cache:v1",
+        projection,
+        destination,
+    ))
+}
+
+fn contained_destination_identity(
+    destination: &crate::util::ContainedAtomicFile,
+) -> Result<String, String> {
+    let identity = destination
+        .binding_identity()
+        .map_err(|error| format!("inspect retained destination identity: {error}"))?;
+    Ok(sha256_hex(
+        crate::audit::canonical_json_for_hash(&serde_json::json!({
+            "root": identity.root(),
+            "destination": identity.destination(),
+        }))
+        .as_bytes(),
+    ))
+}
+
+fn remote_download_binding(
+    canonical_url: &str,
+    source_prefix: &str,
+    projection: serde_json::Value,
+    destination: crate::util::ContainedAtomicFile,
+) -> RemoteRunBoundaryBinding {
+    let projection_sha256 =
+        sha256_hex(crate::audit::canonical_json_for_hash(&projection).as_bytes());
+    let mut envelope = crate::task_boundary::shell_envelope(canonical_url);
+    envelope.sources[0].content = format!("{source_prefix}:sha256:{projection_sha256}");
+    RemoteRunBoundaryBinding {
+        envelope,
+        effects: remote_run_effects(),
+        destination: Some(destination),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DownloadPurpose {
     Execute,
@@ -804,6 +1017,72 @@ enum DownloadPurpose {
 struct ValidatedDownloadRequest {
     url: url::Url,
     expected_sha256: Option<String>,
+}
+
+struct AuthorizedRemoteRunTransaction {
+    binding: RemoteRunBoundaryBinding,
+    lease: crate::task_boundary::TaskBoundaryEffectLease<
+        crate::task_boundary::RemoteScriptRunBoundary,
+    >,
+}
+
+impl AuthorizedRemoteRunTransaction {
+    fn begin(
+        permit: crate::task_boundary::TaskBoundaryPermit<
+            crate::task_boundary::RemoteScriptRunBoundary,
+        >,
+        binding: RemoteRunBoundaryBinding,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Self, String> {
+        let operation = binding.operation();
+        let lease = permit
+            .into_effect_lease_at(&operation, now)
+            .map_err(|error| {
+                format!("remote-script authorization expired before network effect: {error}")
+            })?;
+        Ok(Self { binding, lease })
+    }
+
+    fn authorize_effect_at(&self, now: chrono::DateTime<chrono::Utc>) -> Result<(), String> {
+        let operation = self.binding.operation();
+        self.lease
+            .authorize_effect_at(&operation, now)
+            .map_err(|error| {
+                format!("remote-script authorization expired before side effect: {error}")
+            })
+    }
+}
+
+struct RemoteLaunchBinding {
+    envelope: crate::task::TaskEnvelopeInput,
+    effects: std::collections::BTreeSet<crate::effects::CommandEffectKind>,
+}
+
+impl RemoteLaunchBinding {
+    fn operation(&self) -> crate::task_boundary::BoundaryOperation<'_> {
+        crate::task_boundary::BoundaryOperation {
+            boundary: crate::task_boundary::OwnedBoundary::RemoteScriptRun,
+            envelope: &self.envelope,
+            adapter: crate::task::IngressAdapter::Unattributed,
+            boundary_effects: self.effects.clone(),
+        }
+    }
+}
+
+struct PreparedRemoteLaunchAuthorization {
+    binding: RemoteLaunchBinding,
+    authorization: crate::task_boundary::PendingBoundaryAuthorization<
+        crate::task_boundary::RemoteScriptRunBoundary,
+    >,
+}
+
+/// Exact one-shot launch grant retained until the stopped target reports its
+/// kernel exec transition. The permit's deadline and operation binding are
+/// checked inside the OBSERVED-to-ACK critical section.
+struct AuthorizedRemoteLaunch {
+    _binding: RemoteLaunchBinding,
+    _permit:
+        crate::task_boundary::TaskBoundaryPermit<crate::task_boundary::RemoteScriptRunBoundary>,
 }
 
 struct DownloadedBytes {
@@ -923,7 +1202,7 @@ fn normalize_sha256_pin(expected: Option<&str>) -> Result<Option<String>, String
 /// resolving a hostname. Execution requires authenticated transport: HTTPS, or
 /// the narrow compatibility case of a directly requested HTTP URL with a valid
 /// digest pin. Save-only downloads retain their historical HTTP support.
-fn validate_download_request(
+fn preflight_download_request(
     url: &str,
     expected_sha256: Option<&str>,
     purpose: DownloadPurpose,
@@ -931,13 +1210,30 @@ fn validate_download_request(
     // The pin is intentionally first: malformed integrity metadata must fail
     // before DNS, socket, proxy, or other network-visible work.
     let expected_sha256 = normalize_sha256_pin(expected_sha256)?;
-    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let parsed = crate::url_validate::validate_fetch_url_syntax(url)?;
     validate_initial_transport(&parsed, expected_sha256.is_some(), purpose)?;
-    crate::url_validate::validate_fetch_url(parsed.as_str())?;
     Ok(ValidatedDownloadRequest {
         url: parsed,
         expected_sha256,
     })
+}
+
+fn validate_download_destination(
+    request: ValidatedDownloadRequest,
+) -> Result<ValidatedDownloadRequest, String> {
+    let validated = crate::url_validate::validate_fetch_url(request.url.as_str())?;
+    if validated != request.url {
+        return Err("validated download URL identity changed before request".to_string());
+    }
+    Ok(request)
+}
+
+fn validate_download_request(
+    url: &str,
+    expected_sha256: Option<&str>,
+    purpose: DownloadPurpose,
+) -> Result<ValidatedDownloadRequest, String> {
+    validate_download_destination(preflight_download_request(url, expected_sha256, purpose)?)
 }
 
 fn validate_initial_transport(
@@ -986,12 +1282,10 @@ fn sha256_hex(content: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn download_bounded(
-    url: &str,
-    expected_sha256: Option<&str>,
+fn download_bounded_validated(
+    request: ValidatedDownloadRequest,
     purpose: DownloadPurpose,
 ) -> Result<DownloadedBytes, String> {
-    let request = validate_download_request(url, expected_sha256, purpose)?;
     let redirect_list = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let redirect_list_clone = redirect_list.clone();
 
@@ -1061,6 +1355,24 @@ fn download_bounded(
         final_url,
         redirects,
     })
+}
+
+fn download_bounded_authorized(
+    request: ValidatedDownloadRequest,
+    purpose: DownloadPurpose,
+    authorization: &AuthorizedRemoteRunTransaction,
+) -> Result<DownloadedBytes, String> {
+    authorization.authorize_effect_at(chrono::Utc::now())?;
+    download_bounded_validated(request, purpose)
+}
+
+fn download_bounded(
+    url: &str,
+    expected_sha256: Option<&str>,
+    purpose: DownloadPurpose,
+) -> Result<DownloadedBytes, String> {
+    let request = validate_download_request(url, expected_sha256, purpose)?;
+    download_bounded_validated(request, purpose)
 }
 
 fn interpreter_analysis(
@@ -1650,6 +1962,27 @@ fn persist_cache_entry(cache_dir: &Path, cached_path: &Path, content: &[u8]) -> 
     Ok(())
 }
 
+fn persist_cache_entry_authorized(
+    cache_dir: &Path,
+    cached_path: &Path,
+    content: &[u8],
+    authorization: &AuthorizedRemoteRunTransaction,
+) -> Result<(), String> {
+    authorization.authorize_effect_at(chrono::Utc::now())?;
+    persist_cache_entry(cache_dir, cached_path, content)
+}
+
+fn save_remote_receipt_authorized(
+    receipt: &Receipt,
+    authorization: &AuthorizedRemoteRunTransaction,
+) -> Result<(), String> {
+    authorization.authorize_effect_at(chrono::Utc::now())?;
+    receipt
+        .save()
+        .map(|_| ())
+        .map_err(|error| format!("save receipt: {error}"))
+}
+
 pub fn run(opts: RunOptions) -> Result<RunResult, String> {
     if !opts.no_exec && opts.exec_fn.is_some() {
         return Err(
@@ -1657,7 +1990,7 @@ pub fn run(opts: RunOptions) -> Result<RunResult, String> {
                 .to_string(),
         );
     }
-    run_impl(opts, None, None)
+    run_impl(opts, None, None, None)
 }
 
 /// Run with an additive executor that receives only the immutable reviewed
@@ -1671,7 +2004,7 @@ pub fn run_with_verified_executor(
     if opts.exec_fn.is_some() {
         return Err("cannot combine legacy and verified script executors".to_string());
     }
-    run_impl(opts, None, Some(&executor))
+    run_impl(opts, None, Some(&executor), None)
 }
 
 /// Additive verified stdin API. The typed invocation is deliberately kept out
@@ -1685,13 +2018,241 @@ pub fn run_with_verified_pipe_executor(
     if opts.exec_fn.is_some() {
         return Err("cannot combine legacy and verified script executors".to_string());
     }
-    run_impl(opts, Some(requested_pipe_invocation), Some(&executor))
+    run_impl(opts, Some(requested_pipe_invocation), Some(&executor), None)
 }
 
-fn run_impl(
+/// Tirith-owned remote-script transition.
+///
+/// The caller prepares a pure, operation-bound decision, but this function
+/// deliberately consumes it only after all local platform/executor/interpreter
+/// validation and immediately before the first network effect. Both live runs
+/// and `--no-exec` inspections use this entry point in Tirith's CLI because
+/// inspection still downloads remote bytes.
+pub fn run_with_authorized_verified_executor<'operation, 'envelope>(
+    opts: RunOptions,
+    requested_pipe_invocation: Option<RequestedPipeInvocation>,
+    pending_authorization: crate::task_boundary::PendingBoundaryAuthorization<
+        crate::task_boundary::RemoteScriptRunBoundary,
+    >,
+    operation: &'operation crate::task_boundary::BoundaryOperation<'envelope>,
+    executor: VerifiedScriptExecutor,
+) -> Result<RunResult, String> {
+    if opts.exec_fn.is_some() {
+        return Err("cannot combine legacy and verified script executors".to_string());
+    }
+    run_impl(
+        opts,
+        requested_pipe_invocation,
+        Some(&executor),
+        Some((pending_authorization, operation)),
+    )
+}
+
+fn validate_and_authorize_remote_download<'operation, 'envelope, F>(
+    url: &str,
+    expected_sha256: Option<&str>,
+    purpose: DownloadPurpose,
+    requested_pipe_invocation: Option<&RequestedPipeInvocation>,
+    pending: crate::task_boundary::PendingBoundaryAuthorization<
+        crate::task_boundary::RemoteScriptRunBoundary,
+    >,
+    operation: &'operation crate::task_boundary::BoundaryOperation<'envelope>,
+    consume: F,
+) -> Result<(ValidatedDownloadRequest, AuthorizedRemoteRunTransaction), String>
+where
+    F: FnOnce(
+        crate::task_boundary::PendingBoundaryAuthorization<
+            crate::task_boundary::RemoteScriptRunBoundary,
+        >,
+    ) -> Result<
+        crate::task_boundary::TaskBoundaryPermit<crate::task_boundary::RemoteScriptRunBoundary>,
+        crate::task_boundary::BoundaryAuthorizationError,
+    >,
+{
+    // Syntax, literal-IP policy, pin shape, and transport policy are pure and
+    // run before replay consumption. Domain DNS is deliberately deferred until
+    // after authorization so a denied request cannot resolve its target.
+    let request = preflight_download_request(url, expected_sha256, purpose)?;
+    let runner_binding = remote_run_boundary_binding(
+        url,
+        expected_sha256,
+        purpose == DownloadPurpose::SaveOnly,
+        requested_pipe_invocation,
+    )?;
+    let runner_operation = runner_binding.operation();
+    if !pending.binds_operation(operation) || !pending.binds_operation(&runner_operation) {
+        return Err(
+            "remote-script authorization does not bind the exact validated download operation"
+                .to_string(),
+        );
+    }
+    let permit = consume(pending).map_err(|error| {
+        format!("remote-script authorization failed immediately before download: {error}")
+    })?;
+    if !permit.binds_operation(operation) || !permit.binds_operation(&runner_operation) {
+        return Err(
+            "remote-script authorization does not bind the exact validated download operation"
+                .to_string(),
+        );
+    }
+    let transaction =
+        AuthorizedRemoteRunTransaction::begin(permit, runner_binding, chrono::Utc::now())?;
+    // First DNS lookup. The guarded reqwest resolver independently repeats the
+    // destination policy at connect time and for every redirect hop.
+    let request = validate_download_destination(request)?;
+    Ok((request, transaction))
+}
+
+fn remote_launch_effects(
+    content: &[u8],
+    invocation: &ScriptInvocation,
+    cwd: Option<&Path>,
+    policy_identity: &str,
+) -> Result<crate::task::InferredEffects, String> {
+    let content = std::str::from_utf8(content)
+        .map_err(|_| "live remote launch content is not valid UTF-8".to_string())?;
+    let Some((shell, command_semantics, _)) = interpreter_analysis(&invocation.interpreter) else {
+        return Ok(crate::task::InferredEffects {
+            effects: Default::default(),
+            complete: false,
+        });
+    };
+    if !command_semantics {
+        // The task effect grammar is a command grammar. Running Python, Ruby,
+        // Perl, or JavaScript through it would create false semantic facts;
+        // leave those languages explicitly incomplete instead.
+        return Ok(crate::task::InferredEffects {
+            effects: Default::default(),
+            complete: false,
+        });
+    }
+    let action = crate::task::ProposedAction::Shell {
+        command: content.to_string(),
+    };
+    let analysis =
+        crate::task_analysis::TaskAnalysisContext::trusted(shell, cwd, Some(policy_identity));
+    Ok(crate::task::infer_effects_detailed_with_context(
+        &action, &analysis,
+    ))
+}
+
+fn prepare_remote_launch_authorization(
+    content: &[u8],
+    content_sha256: &str,
+    invocation: &ScriptInvocation,
+    cwd: Option<&Path>,
+    policy: &crate::policy::Policy,
+) -> Result<PreparedRemoteLaunchAuthorization, String> {
+    if sha256_hex(content) != content_sha256 {
+        return Err(
+            "remote-script launch content does not match its immutable SHA-256 binding".to_string(),
+        );
+    }
+    let policy_identity = policy.enforcement_projection_hash();
+    let inferred = remote_launch_effects(content, invocation, cwd, &policy_identity)?;
+    let input_mode = match invocation.input_mode {
+        ScriptInputMode::File => "file",
+        ScriptInputMode::Stdin => "stdin",
+    };
+    let projection = serde_json::json!({
+        "projection_version": 1,
+        "content_sha256": content_sha256,
+        "interpreter": invocation.interpreter.as_str(),
+        "argv": &invocation.args,
+        "input_mode": input_mode,
+        "policy_identity": policy_identity.as_str(),
+        "effects": &inferred.effects,
+        "effect_analysis_complete": inferred.complete,
+    });
+    let projection_sha256 =
+        sha256_hex(crate::audit::canonical_json_for_hash(&projection).as_bytes());
+    let mut actions = Vec::new();
+    if !inferred.complete {
+        // This compact action carries no attacker bytes, but deliberately
+        // preserves incompleteness so an enforcing `action_incomplete_analysis`
+        // policy still controls a language or shell construct Tirith could not
+        // model completely.
+        actions.push(crate::task::ProposedAction::Narrative {
+            text: format!("remote-launch-analysis-incomplete:{projection_sha256}"),
+        });
+    }
+    let binding = RemoteLaunchBinding {
+        envelope: crate::task::TaskEnvelopeInput {
+            task_id: None,
+            sources: vec![crate::task::TaskSourceInput {
+                claimed_source: crate::task::SourceKind::Unknown,
+                content: format!("remote-launch-v1:{projection_sha256}"),
+                locator: None,
+                receipt: None,
+            }],
+            actions,
+            requested_effects: inferred.effects.clone(),
+        },
+        effects: inferred.effects,
+    };
+    let operation = binding.operation();
+    let authorization = crate::task_boundary::prepare_locally_derived_boundary_authorization::<
+        crate::task_boundary::RemoteScriptRunBoundary,
+    >(
+        &operation,
+        &policy.task_gate,
+        &crate::task_analysis::TaskAnalysisContext::default(),
+    );
+    let assessment = match &authorization {
+        Ok(pending) => Some(pending.assessment()),
+        Err(error) => error.assessment(),
+    };
+    if let Some(assessment) = assessment {
+        if let Err(error) = crate::audit::log_task_boundary_assessment(assessment) {
+            crate::audit::audit_diagnostic(format!("task-boundary audit append failed: {error}"));
+        }
+    }
+    let authorization = authorization
+        .map_err(|error| format!("remote-script launch authorization refused: {error}"))?;
+    Ok(PreparedRemoteLaunchAuthorization {
+        binding,
+        authorization,
+    })
+}
+
+fn consume_remote_launch_authorization(
+    prepared: PreparedRemoteLaunchAuthorization,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<AuthorizedRemoteLaunch, String> {
+    let PreparedRemoteLaunchAuthorization {
+        binding,
+        authorization,
+    } = prepared;
+    let operation = binding.operation();
+    if !authorization.binds_operation(&operation) {
+        return Err(
+            "remote-script launch authorization binding changed before execution".to_string(),
+        );
+    }
+    let permit = authorization
+        .consume_default(now)
+        .map_err(|error| format!("remote-script launch authorization refused: {error}"))?;
+    if !permit.binds_operation(&operation) {
+        return Err(
+            "remote-script launch authorization binding changed before execution".to_string(),
+        );
+    }
+    Ok(AuthorizedRemoteLaunch {
+        _binding: binding,
+        _permit: permit,
+    })
+}
+
+fn run_impl<'operation, 'envelope>(
     opts: RunOptions,
     requested_pipe_invocation: Option<RequestedPipeInvocation>,
     verified_executor: Option<&VerifiedScriptExecutor>,
+    remote_authorization: Option<(
+        crate::task_boundary::PendingBoundaryAuthorization<
+            crate::task_boundary::RemoteScriptRunBoundary,
+        >,
+        &'operation crate::task_boundary::BoundaryOperation<'envelope>,
+    )>,
 ) -> Result<RunResult, String> {
     if !opts.no_exec && !opts.interactive {
         return Err("tirith run requires an interactive terminal or --no-exec flag".to_string());
@@ -1750,7 +2311,24 @@ fn run_impl(
     } else {
         DownloadPurpose::Execute
     };
-    let downloaded = download_bounded(&opts.url, opts.expected_sha256.as_deref(), purpose)?;
+    let (downloaded, remote_transaction) = if let Some((pending, operation)) = remote_authorization
+    {
+        let (request, transaction) = validate_and_authorize_remote_download(
+            &opts.url,
+            opts.expected_sha256.as_deref(),
+            purpose,
+            requested_pipe_invocation.as_ref(),
+            pending,
+            operation,
+            |pending| pending.consume_default(chrono::Utc::now()),
+        )?;
+        let downloaded = download_bounded_authorized(request, purpose, &transaction)?;
+        (downloaded, Some(transaction))
+    } else {
+        let request =
+            validate_download_request(&opts.url, opts.expected_sha256.as_deref(), purpose)?;
+        (download_bounded_validated(request, purpose)?, None)
+    };
     let content = downloaded.content;
     let sha256 = downloaded.sha256;
 
@@ -1759,7 +2337,11 @@ fn run_impl(
         .join("cache");
     fs::create_dir_all(&cache_dir).map_err(|e| format!("create cache: {e}"))?;
     let cached_path = cache_dir.join(&sha256);
-    persist_cache_entry(&cache_dir, &cached_path, &content)?;
+    if let Some(transaction) = remote_transaction.as_ref() {
+        persist_cache_entry_authorized(&cache_dir, &cached_path, &content, transaction)?;
+    } else {
+        persist_cache_entry(&cache_dir, &cached_path, &content)?;
+    }
 
     let cwd = std::env::current_dir().ok();
     let forced_interpreter = requested_pipe_invocation
@@ -1891,7 +2473,11 @@ fn run_impl(
         if let Some(effective) = review.effective_verdict.as_ref() {
             audit_complete_review(&review, effective, &audit_subject, false)?;
         }
-        receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+        if let Some(transaction) = remote_transaction.as_ref() {
+            save_remote_receipt_authorized(&receipt, transaction)?;
+        } else {
+            receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+        }
         return Ok(RunResult {
             receipt,
             verdict: preview_result_verdict,
@@ -1922,7 +2508,11 @@ fn run_impl(
         if let Some(effective) = review.effective_verdict.as_ref() {
             audit_complete_review(&review, effective, &audit_subject, false)?;
         }
-        receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+        if let Some(transaction) = remote_transaction.as_ref() {
+            save_remote_receipt_authorized(&receipt, transaction)?;
+        } else {
+            receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+        }
         return Ok(RunResult {
             receipt,
             verdict: preview_result_verdict,
@@ -1971,7 +2561,11 @@ fn run_impl(
     if !read_tty_confirmation(&tty, prompt)? {
         eprintln!("tirith: execution cancelled");
         audit_complete_review(&review, &displayed_effective, &audit_subject, false)?;
-        receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+        if let Some(transaction) = remote_transaction.as_ref() {
+            save_remote_receipt_authorized(&receipt, transaction)?;
+        } else {
+            receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+        }
         return Ok(RunResult {
             receipt,
             verdict: preview_result_verdict,
@@ -1982,7 +2576,11 @@ fn run_impl(
         });
     }
 
-    receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+    if let Some(transaction) = remote_transaction.as_ref() {
+        save_remote_receipt_authorized(&receipt, transaction)?;
+    } else {
+        receipt.save().map_err(|e| format!("save receipt: {e}"))?;
+    }
 
     // Confirmation is never an authorization of the preview snapshot. Re-run
     // the complete engine over the exact immutable bytes and selected
@@ -2054,6 +2652,13 @@ fn run_impl(
     } else {
         prepared
     };
+    let launch_authorization = prepare_remote_launch_authorization(
+        &content,
+        &sha256,
+        &invocation,
+        cwd.as_deref(),
+        final_policy,
+    )?;
     // Never execute the stable content-addressed cache path. Materialize the
     // reviewed in-memory bytes into a fully sealed anonymous descriptor and
     // verify its digest through that still-open descriptor before acquiring the
@@ -2064,13 +2669,25 @@ fn run_impl(
     let execution_bytes = execution.read_verified(content.len(), &sha256)?;
     let reviewed_script = execution.reviewed(&execution_bytes);
     let draft = prepared.into_authorizable_draft()?;
+    // This is distinct from the pre-download network authorization: it binds
+    // the now-known immutable bytes, final interpreter/argv/mode, final policy,
+    // and semantic effect result. Consume it only after every local launch
+    // preparation succeeded and retain it across the sole executor call.
+    let launch_permit =
+        consume_remote_launch_authorization(launch_authorization, chrono::Utc::now())?;
     let gate = crate::execution_state::ExecutionGate::acquire(
         draft,
         crate::execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
     )?;
-    let mut authorizer = ExecutionAuthorizer::new(gate);
+    let mut authorizer = ExecutionAuthorizer::new(gate, launch_permit);
     let exec = verified_executor.expect("live executor checked before download");
-    let exit_code = Some(exec(&invocation, reviewed_script, &mut authorizer)?);
+    let exit_code = Some(execute_verified_remote_script(
+        remote_transaction.as_ref(),
+        exec,
+        &invocation,
+        reviewed_script,
+        &mut authorizer,
+    )?);
     if !authorizer.completed() {
         return Err(
             "trusted executor returned without completing observed -> durable commit -> ACK -> resumed -> EOF authorization"
@@ -2088,6 +2705,22 @@ fn run_impl(
     })
 }
 
+fn execute_verified_remote_script(
+    download_authorization: Option<&AuthorizedRemoteRunTransaction>,
+    executor: &VerifiedScriptExecutor,
+    invocation: &ScriptInvocation,
+    reviewed_script: ReviewedScript<'_>,
+    authorizer: &mut ExecutionAuthorizer,
+) -> Result<i32, String> {
+    // Tirith's owned CLI path always supplies the retained download transaction.
+    // `None` exists only for the explicitly compatible library entry points;
+    // their boundary ownership remains outside the CLI contract.
+    if let Some(authorization) = download_authorization {
+        authorization.authorize_effect_at(chrono::Utc::now())?;
+    }
+    executor(invocation, reviewed_script, authorizer)
+}
+
 /// Outcome of [`download_to_path`].
 pub struct DownloadResult {
     /// The path the content was written to (the caller-supplied destination).
@@ -2102,6 +2735,13 @@ pub struct DownloadResult {
     pub interpreter: String,
 }
 
+/// Result of the typed command-card cache transaction.
+pub struct CachedCommandCardResult {
+    pub path: std::path::PathBuf,
+    pub sha256: String,
+    pub final_url: String,
+}
+
 /// Download `url` to `dest` WITHOUT executing it (the primitive behind
 /// `tirith fetch --save`). Shares [`run`]'s redirect / 30s-timeout / 10 MiB-cap
 /// policy, verifies `expected_sha256`, and writes atomically (sibling temp +
@@ -2112,6 +2752,145 @@ pub fn download_to_path(
     expected_sha256: Option<&str>,
 ) -> Result<DownloadResult, String> {
     let downloaded = download_bounded(url, expected_sha256, DownloadPurpose::SaveOnly)?;
+    persist_download_to_path(downloaded, dest)
+}
+
+/// Tirith-owned `fetch --save` transaction. Pure request validation happens
+/// before replay consumption; DNS, HTTP, the atomic destination write, and its
+/// durable taint record all occur while the exact typed permit remains alive.
+pub fn download_to_path_and_mark_tainted_authorized<'operation, 'envelope>(
+    url: &str,
+    dest: &std::path::Path,
+    expected_sha256: Option<&str>,
+    pending: crate::task_boundary::PendingBoundaryAuthorization<
+        crate::task_boundary::RemoteScriptRunBoundary,
+    >,
+    operation: &'operation crate::task_boundary::BoundaryOperation<'envelope>,
+) -> Result<(DownloadResult, crate::taint::TaintEntry), String> {
+    let absolute_dest = std::path::absolute(dest)
+        .map_err(|error| format!("resolve absolute fetch destination: {error}"))?;
+    let request = preflight_download_request(url, expected_sha256, DownloadPurpose::SaveOnly)?;
+    let binding = remote_fetch_save_boundary_binding(url, &absolute_dest, expected_sha256)?;
+    let reconstructed = binding.operation();
+    if !pending.binds_operation(operation) || !pending.binds_operation(&reconstructed) {
+        return Err(
+            "fetch-save authorization does not bind the exact URL, pin, and destination"
+                .to_string(),
+        );
+    }
+    let permit = pending
+        .consume_default(chrono::Utc::now())
+        .map_err(|error| format!("fetch-save authorization failed before download: {error}"))?;
+    if !permit.binds_operation(operation) || !permit.binds_operation(&reconstructed) {
+        return Err(
+            "fetch-save authorization does not bind the exact URL, pin, and destination"
+                .to_string(),
+        );
+    }
+    let transaction = AuthorizedRemoteRunTransaction::begin(permit, binding, chrono::Utc::now())?;
+    let request = validate_download_destination(request)?;
+    let downloaded = download_bounded_authorized(request, DownloadPurpose::SaveOnly, &transaction)?;
+    transaction.authorize_effect_at(chrono::Utc::now())?;
+    // Provenance is made durable before publication. A later destination-write
+    // failure can leave a conservative stale mark, but a taint-store failure
+    // can never leave downloaded bytes published as apparently clean.
+    let taint = crate::taint::mark_tainted(
+        &absolute_dest,
+        "fetch --save",
+        Some(downloaded.final_url.clone()),
+        None,
+    )
+    .map_err(|error| {
+        format!(
+            "refusing to publish {} because mandatory taint provenance could not be recorded: {error}",
+            absolute_dest.display()
+        )
+    })?;
+    transaction.authorize_effect_at(chrono::Utc::now())?;
+    let destination = transaction
+        .binding
+        .destination()
+        .ok_or_else(|| "fetch authorization lost its retained destination".to_string())?;
+    let result =
+        persist_download_to_contained(downloaded, &absolute_dest, destination, &transaction)?;
+    Ok((result, taint))
+}
+
+/// Download, validate, and content-address one command card while retaining an
+/// exact remote-download permit across DNS, HTTP, temp creation, and cache
+/// publication. No cache directory or temp file is created before consumption.
+pub fn download_and_cache_command_card_authorized<'operation, 'envelope>(
+    url: &str,
+    cache_dir: &std::path::Path,
+    card_read_cap: u64,
+    pending: crate::task_boundary::PendingBoundaryAuthorization<
+        crate::task_boundary::RemoteScriptRunBoundary,
+    >,
+    operation: &'operation crate::task_boundary::BoundaryOperation<'envelope>,
+) -> Result<CachedCommandCardResult, String> {
+    let absolute_cache = std::path::absolute(cache_dir)
+        .map_err(|error| format!("resolve absolute command-card cache root: {error}"))?;
+    let request = preflight_download_request(url, None, DownloadPurpose::SaveOnly)?;
+    let binding = remote_command_card_cache_boundary_binding(url, &absolute_cache, card_read_cap)?;
+    let reconstructed = binding.operation();
+    if !pending.binds_operation(operation) || !pending.binds_operation(&reconstructed) {
+        return Err(
+            "command-card fetch authorization does not bind the exact URL and cache destination"
+                .to_string(),
+        );
+    }
+    let permit = pending
+        .consume_default(chrono::Utc::now())
+        .map_err(|error| format!("command-card fetch authorization failed: {error}"))?;
+    if !permit.binds_operation(operation) || !permit.binds_operation(&reconstructed) {
+        return Err(
+            "command-card fetch authorization does not bind the exact URL and cache destination"
+                .to_string(),
+        );
+    }
+    let transaction = AuthorizedRemoteRunTransaction::begin(permit, binding, chrono::Utc::now())?;
+    let request = validate_download_destination(request)?;
+    let downloaded = download_bounded_authorized(request, DownloadPurpose::SaveOnly, &transaction)?;
+    if downloaded.content.len() as u64 > card_read_cap {
+        return Err(format!(
+            "downloaded card is {} bytes, exceeding the {card_read_cap}-byte read cap; not caching",
+            downloaded.content.len()
+        ));
+    }
+    crate::command_card::Card::from_json(&downloaded.content).map_err(|_| {
+        "downloaded content is not a valid command card (JSON parse failed)".to_string()
+    })?;
+
+    let destination = absolute_cache.join(format!("{}.json", downloaded.sha256));
+    let cache_root = transaction
+        .binding
+        .destination()
+        .ok_or_else(|| "command-card authorization lost its retained cache root".to_string())?;
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| "content-addressed command-card path has no filename".to_string())?;
+    transaction.authorize_effect_at(chrono::Utc::now())?;
+    let cache_file = cache_root
+        .prepare_child(file_name, true)
+        .map_err(|error| format!("bind command-card cache destination: {error}"))?;
+    cache_file
+        .write_atomic_checked(&downloaded.content, true, || {
+            transaction
+                .authorize_effect_at(chrono::Utc::now())
+                .map_err(std::io::Error::other)
+        })
+        .map_err(|error| format!("persist command card {}: {error}", destination.display()))?;
+    Ok(CachedCommandCardResult {
+        path: destination,
+        sha256: downloaded.sha256,
+        final_url: downloaded.final_url,
+    })
+}
+
+fn persist_download_to_path(
+    downloaded: DownloadedBytes,
+    dest: &std::path::Path,
+) -> Result<DownloadResult, String> {
     let content = downloaded.content;
     let sha256 = downloaded.sha256;
 
@@ -2156,11 +2935,344 @@ pub fn download_to_path(
     })
 }
 
+fn persist_download_to_contained(
+    downloaded: DownloadedBytes,
+    display_path: &std::path::Path,
+    destination: &crate::util::ContainedAtomicFile,
+    authorization: &AuthorizedRemoteRunTransaction,
+) -> Result<DownloadResult, String> {
+    destination
+        .write_atomic_checked(&downloaded.content, true, || {
+            authorization
+                .authorize_effect_at(chrono::Utc::now())
+                .map_err(std::io::Error::other)
+        })
+        .map_err(|error| format!("persist download: {error}"))?;
+    let size = downloaded.content.len() as u64;
+    let interpreter =
+        script_analysis::detect_interpreter(&String::from_utf8_lossy(&downloaded.content))
+            .to_string();
+    Ok(DownloadResult {
+        path: display_path.to_path_buf(),
+        sha256: downloaded.sha256,
+        final_url: downloaded.final_url,
+        size,
+        interpreter,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(unix)]
     use std::process::Command;
+
+    fn pending_remote_script_authorization<'a>(
+        operation: &crate::task_boundary::BoundaryOperation<'a>,
+    ) -> crate::task_boundary::PendingBoundaryAuthorization<
+        crate::task_boundary::RemoteScriptRunBoundary,
+    > {
+        crate::task_boundary::prepare_locally_derived_boundary_authorization::<
+            crate::task_boundary::RemoteScriptRunBoundary,
+        >(
+            operation,
+            &crate::web3_policy::TaskGatePolicy::default(),
+            &crate::task_analysis::TaskAnalysisContext::default(),
+        )
+        .expect("default receiptless remote-script authorization")
+    }
+
+    #[test]
+    fn authorized_remote_runner_rejects_an_operation_swap_before_download() {
+        let authorized_binding =
+            remote_run_boundary_binding("https://1.1.1.1/a.sh", None, true, None).unwrap();
+        let authorized_operation = authorized_binding.operation();
+        let pending = pending_remote_script_authorization(&authorized_operation);
+
+        let substituted_binding =
+            remote_run_boundary_binding("https://8.8.8.8/b.sh", None, true, None).unwrap();
+        let substituted_operation = substituted_binding.operation();
+        let result = run_with_authorized_verified_executor(
+            RunOptions {
+                url: "https://8.8.8.8/b.sh".to_string(),
+                no_exec: true,
+                interactive: false,
+                expected_sha256: None,
+                exec_fn: None,
+            },
+            None,
+            pending,
+            &substituted_operation,
+            Box::new(|_, _, _| panic!("--no-exec invoked an executor")),
+        );
+        let error = match result {
+            Ok(_) => panic!("a permit authorized a substituted operation"),
+            Err(error) => error,
+        };
+        assert!(error.contains("does not bind the exact validated download operation"));
+    }
+
+    #[test]
+    fn invalid_remote_requests_do_not_reach_replay_consumption() {
+        for (url, pin, expected_error) in [
+            ("not a URL", None, "invalid URL"),
+            (
+                "https://example.test/a.sh",
+                Some("bad-pin"),
+                "invalid SHA-256 pin",
+            ),
+            (
+                "https://169.254.169.254/a.sh",
+                None,
+                "cloud metadata endpoint",
+            ),
+        ] {
+            let binding =
+                remote_run_boundary_binding("https://1.1.1.1/placeholder", None, true, None)
+                    .unwrap();
+            let operation = binding.operation();
+            let pending = pending_remote_script_authorization(&operation);
+            let consumed = std::cell::Cell::new(false);
+            let result = validate_and_authorize_remote_download(
+                url,
+                pin,
+                DownloadPurpose::SaveOnly,
+                None,
+                pending,
+                &operation,
+                |_| {
+                    consumed.set(true);
+                    panic!("invalid request reached replay consumption")
+                },
+            );
+            let error = match result {
+                Ok(_) => panic!("invalid request unexpectedly validated"),
+                Err(error) => error,
+            };
+            assert!(error.contains(expected_error), "{error}");
+            assert!(!consumed.get(), "invalid request consumed replay state");
+        }
+    }
+
+    #[test]
+    fn remote_authorization_binds_pin_purpose_and_pipe_argv_before_consumption() {
+        let pin_a = "11".repeat(32);
+        let pin_b = "22".repeat(32);
+        let requested = RequestedPipeInvocation {
+            interpreter: PipeInterpreter::Sh,
+            args: vec!["-s".to_string(), "--".to_string()],
+        };
+        let binding = remote_run_boundary_binding(
+            "https://1.1.1.1/script",
+            Some(&pin_a),
+            false,
+            Some(&requested),
+        )
+        .unwrap();
+        let operation = binding.operation();
+
+        for (pin, purpose, pipe) in [
+            (
+                Some(pin_b.as_str()),
+                DownloadPurpose::Execute,
+                Some(&requested),
+            ),
+            (
+                Some(pin_a.as_str()),
+                DownloadPurpose::SaveOnly,
+                Some(&requested),
+            ),
+            (Some(pin_a.as_str()), DownloadPurpose::Execute, None),
+        ] {
+            let pending = pending_remote_script_authorization(&operation);
+            let consumed = std::cell::Cell::new(false);
+            let result = validate_and_authorize_remote_download(
+                "https://1.1.1.1/script",
+                pin,
+                purpose,
+                pipe,
+                pending,
+                &operation,
+                |_| {
+                    consumed.set(true);
+                    panic!("an operation swap reached replay consumption")
+                },
+            );
+            let error = match result {
+                Ok(_) => panic!("the exact remote request projection was mutable"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("does not bind the exact validated download operation"),
+                "{error}"
+            );
+            assert!(!consumed.get());
+        }
+    }
+
+    #[test]
+    fn fetch_save_authorization_binds_destination_and_all_durable_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let approved = root.path().join("approved.sh");
+        let substituted = root.path().join("substituted.sh");
+        let binding =
+            remote_fetch_save_boundary_binding("https://1.1.1.1/script", &approved, None).unwrap();
+        let operation = binding.operation();
+        assert_eq!(
+            operation.boundary_effects,
+            [
+                crate::effects::CommandEffectKind::NetworkEgress,
+                crate::effects::CommandEffectKind::FilesystemWrite,
+                crate::effects::CommandEffectKind::PersistenceChange,
+            ]
+            .into_iter()
+            .collect()
+        );
+        let pending = pending_remote_script_authorization(&operation);
+        let error = match download_to_path_and_mark_tainted_authorized(
+            "https://1.1.1.1/script",
+            &substituted,
+            None,
+            pending,
+            &operation,
+        ) {
+            Ok(_) => panic!("a fetch permit authorized another destination"),
+            Err(error) => error,
+        };
+        assert!(error.contains("does not bind the exact URL, pin, and destination"));
+        assert!(!approved.exists());
+        assert!(!substituted.exists());
+    }
+
+    #[test]
+    fn command_card_fetch_authorization_binds_cache_root_before_network() {
+        let root = tempfile::tempdir().unwrap();
+        let approved = root.path().join("approved-cards");
+        let substituted = root.path().join("substituted-cards");
+        let binding = remote_command_card_cache_boundary_binding(
+            "https://1.1.1.1/card.json",
+            &approved,
+            64 * 1024,
+        )
+        .unwrap();
+        let operation = binding.operation();
+        let pending = pending_remote_script_authorization(&operation);
+        let error = match download_and_cache_command_card_authorized(
+            "https://1.1.1.1/card.json",
+            &substituted,
+            64 * 1024,
+            pending,
+            &operation,
+        ) {
+            Ok(_) => panic!("a command-card permit authorized another cache root"),
+            Err(error) => error,
+        };
+        assert!(error.contains("does not bind the exact URL and cache destination"));
+        assert!(!approved.exists());
+        assert!(!substituted.exists());
+    }
+
+    fn test_script_invocation(interpreter: &str) -> ScriptInvocation {
+        ScriptInvocation {
+            interpreter: interpreter.to_string(),
+            resolved_executable: None,
+            args: Vec::new(),
+            input_mode: ScriptInputMode::File,
+        }
+    }
+
+    #[test]
+    fn remote_launch_authorization_binds_immutable_bytes_and_final_invocation() {
+        let policy = crate::policy::Policy::default();
+        let first_bytes = b"#!/bin/sh\nprintf first\n";
+        let first_invocation = test_script_invocation("sh");
+        let first = prepare_remote_launch_authorization(
+            first_bytes,
+            &sha256_hex(first_bytes),
+            &first_invocation,
+            Some(Path::new("/tmp")),
+            &policy,
+        )
+        .expect("first launch authorization");
+        let mut changed_invocation = test_script_invocation("sh");
+        changed_invocation.args.push("-e".to_string());
+        let changed_bytes = b"#!/bin/sh\nprintf changed\n";
+        let content_changed = prepare_remote_launch_authorization(
+            changed_bytes,
+            &sha256_hex(changed_bytes),
+            &first_invocation,
+            Some(Path::new("/tmp")),
+            &policy,
+        )
+        .expect("content-changed launch authorization");
+        let invocation_changed = prepare_remote_launch_authorization(
+            first_bytes,
+            &sha256_hex(first_bytes),
+            &changed_invocation,
+            Some(Path::new("/tmp")),
+            &policy,
+        )
+        .expect("invocation-changed launch authorization");
+        let mut mode_changed = first_invocation.clone();
+        mode_changed.input_mode = ScriptInputMode::Stdin;
+        let mode_changed = prepare_remote_launch_authorization(
+            first_bytes,
+            &sha256_hex(first_bytes),
+            &mode_changed,
+            Some(Path::new("/tmp")),
+            &policy,
+        )
+        .expect("mode-changed launch authorization");
+        let mut policy_changed = policy.clone();
+        policy_changed.task_gate.mode = crate::web3_policy::TaskGateMode::Observe;
+        let policy_changed = prepare_remote_launch_authorization(
+            first_bytes,
+            &sha256_hex(first_bytes),
+            &first_invocation,
+            Some(Path::new("/tmp")),
+            &policy_changed,
+        )
+        .expect("policy-changed launch authorization");
+
+        assert!(first
+            .authorization
+            .binds_operation(&first.binding.operation()));
+        for changed in [
+            &content_changed,
+            &invocation_changed,
+            &mode_changed,
+            &policy_changed,
+        ] {
+            assert!(!first
+                .authorization
+                .binds_operation(&changed.binding.operation()));
+        }
+    }
+
+    #[test]
+    fn remote_launch_refuses_a_denied_inferred_script_effect() {
+        let mut policy = crate::policy::Policy::default();
+        policy.task_gate.mode = crate::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_denied_for_untrusted_sources
+            .insert(crate::effects::CommandEffectKind::Web3Write);
+        let content = b"cast send 0xabc --private-key 0xdead\n";
+
+        let result = prepare_remote_launch_authorization(
+            content,
+            &sha256_hex(content),
+            &test_script_invocation("sh"),
+            Some(Path::new("/tmp")),
+            &policy,
+        );
+        let error = match result {
+            Ok(_) => panic!("a denied Web3 write effect was authorized"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("remote-script launch authorization refused"));
+    }
 
     #[cfg(target_os = "linux")]
     fn target_test_channel(

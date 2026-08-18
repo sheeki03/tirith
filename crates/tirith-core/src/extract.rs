@@ -2993,6 +2993,47 @@ fn capture_shell_body(
     None
 }
 
+fn capture_executable_body(
+    raw: &str,
+    open: usize,
+    shell: ShellType,
+    relation: ExecutableRelation,
+    bodies: &mut Vec<ExecutableBody>,
+) -> Option<usize> {
+    let close = if raw.as_bytes().get(open) == Some(&b'(') {
+        find_substitution_close(raw, open, shell)
+    } else {
+        find_shell_delimiter_close(raw, open, shell)
+    };
+    if let Some(close) = close {
+        if let Some(body) = raw.get(open + 1..close) {
+            bodies.push(ExecutableBody {
+                input: body.to_string(),
+                shell,
+                origin: Some(ExecutableBodyOrigin {
+                    parent_range: open + 1..close,
+                    relation,
+                }),
+            });
+        }
+        return Some(close + 1);
+    }
+
+    if let Some(suffix) = raw.get(open + 1..) {
+        if !suffix.trim().is_empty() {
+            bodies.push(ExecutableBody {
+                input: suffix.to_string(),
+                shell,
+                origin: Some(ExecutableBodyOrigin {
+                    parent_range: open + 1..raw.len(),
+                    relation: ExecutableRelation::Unknown,
+                }),
+            });
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 struct PosixFunctionDefinition {
     name: String,
@@ -3335,12 +3376,60 @@ pub(crate) enum ShellExecutionGap {
 pub(crate) struct ExecutableBody {
     pub input: String,
     pub shell: ShellType,
+    /// Discovery-time source identity. Decoded/generated bodies may not have a
+    /// byte-for-byte child range, but they still retain the exact parent
+    /// occurrence and execution role selected by the parser branch that found
+    /// them.
+    pub origin: Option<ExecutableBodyOrigin>,
+}
+
+impl ExecutableBody {
+    fn without_origin(input: String, shell: ShellType) -> Self {
+        Self {
+            input,
+            shell,
+            origin: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ExecutableSubstitutionScan {
     pub bodies: Vec<ExecutableBody>,
     pub gap: Option<ShellExecutionGap>,
+}
+
+/// How one recovered body participates in its parent command. Flow analysis
+/// must distinguish a replacement shell body from a command substitution used
+/// as an argv value; merging all recovered bodies as stdout is unsound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutableRelation {
+    WrapperReplacement,
+    ArgumentValue { index: usize },
+    Concurrent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutableBodyOrigin {
+    pub parent_range: std::ops::Range<usize>,
+    pub relation: ExecutableRelation,
+}
+
+fn executable_argument_relation(argument: Option<usize>) -> ExecutableRelation {
+    argument.map_or(ExecutableRelation::Unknown, |index| {
+        ExecutableRelation::ArgumentValue { index }
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct ExecutableBodyOccurrence {
+    pub body: ExecutableBody,
+    pub relation: ExecutableRelation,
+    /// Best-effort byte range in the parent segment. If decoding or shell
+    /// normalization changed the body bytes, this is the exact parent segment
+    /// range rather than a fabricated child offset.
+    pub parent_range: std::ops::Range<usize>,
 }
 
 const MAX_HEREDOCS: usize = 32;
@@ -3598,6 +3687,7 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
                         .extend(recovered.into_iter().map(|input| ExecutableBody {
                             input,
                             shell: ShellType::Posix,
+                            origin: None,
                         }));
                     index = next;
                 }
@@ -3620,6 +3710,7 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
                 scan.bodies.push(ExecutableBody {
                     input: input.to_string(),
                     shell: ShellType::Posix,
+                    origin: None,
                 });
             }
             index = close + 1;
@@ -3820,7 +3911,9 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                         unescape_unquoted_heredoc(&body)
                     };
                     if !input.trim().is_empty() {
-                        recovery.bodies.push(ExecutableBody { input, shell });
+                        recovery
+                            .bodies
+                            .push(ExecutableBody::without_origin(input, shell));
                     }
                 }
             }
@@ -4015,17 +4108,16 @@ fn bounded_executable_candidates(raw: &str, shell: ShellType) -> (&str, bool) {
 }
 
 fn bound_executable_bodies(scan: &mut ExecutableSubstitutionScan) -> bool {
-    let mut seen = std::collections::HashSet::<(ShellType, &str)>::new();
     let mut keep = Vec::with_capacity(scan.bodies.len());
     let mut retained_bodies = 0usize;
     let mut retained_bytes = 0usize;
     let mut exhausted = false;
 
     for body in &scan.bodies {
-        if !seen.insert((body.shell, body.input.as_str())) {
-            keep.push(false);
-            continue;
-        }
+        // Preserve occurrences. Equal source strings at different byte ranges
+        // are distinct execution events and can have different pipe,
+        // redirection, and control-flow parents. Callers that only need unique
+        // strings may deduplicate after analysis; enforcement callers must not.
         let next_bytes = retained_bytes.saturating_add(body.input.len());
         if retained_bodies >= MAX_EXECUTABLE_SCAN_BODIES
             || next_bytes > MAX_EXECUTABLE_SCAN_BODY_BYTES
@@ -4039,7 +4131,6 @@ fn bound_executable_bodies(scan: &mut ExecutableSubstitutionScan) -> bool {
         keep.push(true);
     }
 
-    drop(seen);
     let mut keep = keep.into_iter();
     scan.bodies.retain(|_| keep.next().unwrap_or(false));
     exhausted
@@ -4069,13 +4160,7 @@ pub(crate) fn executable_substitution_scan(
         powershell_executable_substitution_scan(scan_input)
     } else {
         let (bodies, gap) = lexical_executable_substitutions(scan_input, shell);
-        ExecutableSubstitutionScan {
-            bodies: bodies
-                .into_iter()
-                .map(|input| ExecutableBody { input, shell })
-                .collect(),
-            gap,
-        }
+        ExecutableSubstitutionScan { bodies, gap }
     };
     for segment in tokenize::tokenize(scan_input, shell) {
         if shell != ShellType::PowerShell
@@ -4117,6 +4202,48 @@ pub(crate) fn executable_substitution_scan(
         scan.gap = Some(ShellExecutionGap::WorkBudgetExceeded);
     }
     scan
+}
+
+/// Occurrence-preserving executable bodies for one tokenizer segment.
+pub(crate) fn executable_body_occurrences(
+    segment: &tokenize::Segment,
+    shell: ShellType,
+    outgoing_separator: Option<&str>,
+) -> (Vec<ExecutableBodyOccurrence>, Option<ShellExecutionGap>) {
+    let scan = executable_substitution_scan(&segment.raw, shell);
+    let mut occurrences = Vec::with_capacity(scan.bodies.len());
+    for body in scan.bodies {
+        let (mut relation, parent_range) = body.origin.as_ref().map_or_else(
+            || (ExecutableRelation::Unknown, segment.byte_range.clone()),
+            |origin| {
+                (
+                    origin.relation,
+                    // The scanner works on `segment.raw`; rebase its exact
+                    // local occurrence once, without searching normalized body
+                    // text or guessing which equal argv value owned it.
+                    {
+                        segment
+                            .byte_range
+                            .start
+                            .saturating_add(origin.parent_range.start)
+                            ..segment
+                                .byte_range
+                                .start
+                                .saturating_add(origin.parent_range.end)
+                    },
+                )
+            },
+        );
+        if outgoing_separator == Some("&") {
+            relation = ExecutableRelation::Concurrent;
+        }
+        occurrences.push(ExecutableBodyOccurrence {
+            body,
+            relation,
+            parent_range,
+        });
+    }
+    (occurrences, scan.gap)
 }
 
 pub(crate) fn is_complete_literal_posix_function_definition(
@@ -4544,18 +4671,7 @@ pub(crate) fn posix_child_shell_scan_bounded(
     if bodies.len() > max_bodies {
         return Err(ExecutableSubstitutionLimitError::CardinalityExceeded);
     }
-    let mut seen = std::collections::HashSet::new();
-    Ok(ExecutableSubstitutionScan {
-        bodies: bodies
-            .into_iter()
-            .filter(|body| seen.insert(body.clone()))
-            .map(|input| ExecutableBody {
-                input,
-                shell: ShellType::Posix,
-            })
-            .collect(),
-        gap,
-    })
+    Ok(ExecutableSubstitutionScan { bodies, gap })
 }
 
 const MAX_ENCODED_POWERSHELL_BODY_BYTES: usize = 256 * 1024;
@@ -4595,6 +4711,7 @@ fn push_literal_wrapper_body(
             scan.bodies.push(ExecutableBody {
                 input,
                 shell: child_shell,
+                origin: None,
             });
         }
         Some(_) => {}
@@ -4647,7 +4764,8 @@ fn push_control_prefix_body(
     if first.is_none() {
         record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
     } else if !body.trim().is_empty() {
-        scan.bodies.push(ExecutableBody { input: body, shell });
+        scan.bodies
+            .push(ExecutableBody::without_origin(body, shell));
     }
 }
 
@@ -4962,6 +5080,7 @@ fn scan_cmd_for_f_command(args: &[String], scan: &mut ExecutableSubstitutionScan
             scan.bodies.push(ExecutableBody {
                 input: body.to_string(),
                 shell: ShellType::Cmd,
+                origin: None,
             });
         }
     } else if set.starts_with("('") || set.starts_with("(`") {
@@ -5003,6 +5122,7 @@ fn scan_cmd_cli_body(
                 scan.bodies.push(ExecutableBody {
                     input,
                     shell: ShellType::Cmd,
+                    origin: None,
                 });
             }
         } else if outer_shell == ShellType::Cmd {
@@ -5046,6 +5166,7 @@ fn scan_cmd_cli_body(
                 scan.bodies.push(ExecutableBody {
                     input,
                     shell: ShellType::Cmd,
+                    origin: None,
                 });
             } else {
                 record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
@@ -5595,7 +5716,7 @@ fn posix_body_calls_parent_alias(
                 return true;
             }
             *remaining_bodies -= 1;
-            if posix_body_calls_parent_alias(&body, state, depth + 1, remaining_bodies) {
+            if posix_body_calls_parent_alias(&body.input, state, depth + 1, remaining_bodies) {
                 return true;
             }
         }
@@ -5647,6 +5768,7 @@ fn recover_posix_parent_dispatch_body(
                         scan.bodies.push(ExecutableBody {
                             input,
                             shell: ShellType::Posix,
+                            origin: None,
                         });
                     }
                     recovered = true;
@@ -5668,6 +5790,7 @@ fn recover_posix_parent_dispatch_body(
                 scan.bodies.push(ExecutableBody {
                     input: binding.definition.body.clone(),
                     shell: ShellType::Posix,
+                    origin: None,
                 });
                 recovered = true;
             }
@@ -5908,7 +6031,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
             let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
             if (nested_gap.is_some() && (!state.aliases.is_empty() || !state.unresolved.is_empty()))
                 || nested_bodies.iter().any(|body| {
-                    posix_body_calls_parent_alias(body, &state, 0, &mut remaining_bodies)
+                    posix_body_calls_parent_alias(&body.input, &state, 0, &mut remaining_bodies)
                 })
             {
                 record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
@@ -5999,6 +6122,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
                 scan.bodies.push(ExecutableBody {
                     input: binding.definition.body.clone(),
                     shell: ShellType::Posix,
+                    origin: None,
                 });
                 if posix_function_invocation_needs_context(
                     raw,
@@ -6349,6 +6473,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
     scan.bodies.push(ExecutableBody {
         input: expanded,
         shell,
+        origin: None,
     });
 }
 
@@ -6526,11 +6651,12 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 push_control_prefix_body(&args, shell, scan);
             }
         }
+        let replacement_body_start = scan.bodies.len();
         match command.as_str() {
             "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" => {
                 if let Some(body_index) = shell_command_operand(&args, shell, false) {
                     push_required_literal_wrapper_body(
-                        args.get(body_index..).unwrap_or_default(),
+                        args.get(body_index..=body_index).unwrap_or_default(),
                         shell,
                         ShellType::Posix,
                         scan,
@@ -6545,7 +6671,7 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
             "fish" => {
                 if let Some(body_index) = shell_command_operand(&args, shell, true) {
                     push_required_literal_wrapper_body(
-                        args.get(body_index..).unwrap_or_default(),
+                        args.get(body_index..=body_index).unwrap_or_default(),
                         shell,
                         ShellType::Fish,
                         scan,
@@ -6588,6 +6714,7 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                                 scan.bodies.push(ExecutableBody {
                                     input,
                                     shell: ShellType::PowerShell,
+                                    origin: None,
                                 });
                             }
                             Some(_) => {}
@@ -6685,6 +6812,33 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 push_control_prefix_body(&args, shell, scan);
             }
             _ => {}
+        }
+        if matches!(
+            command.as_str(),
+            "sh" | "bash"
+                | "zsh"
+                | "dash"
+                | "ksh"
+                | "csh"
+                | "tcsh"
+                | "ash"
+                | "mksh"
+                | "fish"
+                | "pwsh"
+                | "powershell"
+                | "cmd"
+                | "eval"
+                | "iex"
+                | "invoke-expression"
+                | "call"
+                | "start"
+        ) {
+            for body in scan.bodies.iter_mut().skip(replacement_body_start) {
+                body.origin.get_or_insert_with(|| ExecutableBodyOrigin {
+                    parent_range: segment.byte_range.clone(),
+                    relation: ExecutableRelation::WrapperReplacement,
+                });
+            }
         }
     }
 }
@@ -6922,8 +7076,12 @@ fn posix_body_calls_parent_function(
                 return true;
             }
             *remaining_bodies -= 1;
-            if posix_body_calls_parent_function(&body, function_names, depth + 1, remaining_bodies)
-            {
+            if posix_body_calls_parent_function(
+                &body.input,
+                function_names,
+                depth + 1,
+                remaining_bodies,
+            ) {
                 return true;
             }
         }
@@ -7689,7 +7847,7 @@ fn posix_reserved_time_word_at(
 fn lexical_executable_substitutions(
     raw: &str,
     shell: ShellType,
-) -> (Vec<String>, Option<ShellExecutionGap>) {
+) -> (Vec<ExecutableBody>, Option<ShellExecutionGap>) {
     let bytes = raw.as_bytes();
     let mut bodies = Vec::new();
     let mut functions = std::collections::HashMap::<String, PosixFunctionBinding>::new();
@@ -7699,6 +7857,11 @@ fn lexical_executable_substitutions(
     let mut command_start = true;
     let mut word_start = true;
     let mut assignment_word = false;
+    // Updated by this same lexical traversal so each substitution is bound to
+    // its owning argv occurrence at discovery time. `None` means the command
+    // word, an assignment, or a control position rather than a normal argv.
+    let mut current_argument = None;
+    let mut next_argument = 0usize;
     let mut incomplete = false;
     let mut gap = None;
     let mut i = 0usize;
@@ -7731,7 +7894,14 @@ fn lexical_executable_substitutions(
                     if let Some(command) = posix_function_command_word(segment) {
                         if let Some(binding) = functions.get(&command) {
                             let body_index = bodies.len();
-                            bodies.push(binding.definition.body.clone());
+                            bodies.push(ExecutableBody {
+                                input: binding.definition.body.clone(),
+                                shell,
+                                origin: Some(ExecutableBodyOrigin {
+                                    parent_range: segment.byte_range.clone(),
+                                    relation: ExecutableRelation::WrapperReplacement,
+                                }),
+                            });
                             function_body_indices.insert(body_index);
                             invoked_function_needs_context |=
                                 posix_function_invocation_needs_context(
@@ -7771,7 +7941,13 @@ fn lexical_executable_substitutions(
                 }
                 if shell != ShellType::Cmd && byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
                     let open = i + 1;
-                    let Some(next) = capture_shell_body(raw, open, shell, &mut bodies) else {
+                    let Some(next) = capture_executable_body(
+                        raw,
+                        open,
+                        shell,
+                        executable_argument_relation(current_argument),
+                        &mut bodies,
+                    ) else {
                         incomplete = true;
                         break;
                     };
@@ -7786,14 +7962,28 @@ fn lexical_executable_substitutions(
                     let Some(close) = find_backtick_close(raw, i) else {
                         if let Some(suffix) = raw.get(i + 1..) {
                             if !suffix.trim().is_empty() {
-                                bodies.push(suffix.to_string());
+                                bodies.push(ExecutableBody {
+                                    input: suffix.to_string(),
+                                    shell,
+                                    origin: Some(ExecutableBodyOrigin {
+                                        parent_range: i + 1..raw.len(),
+                                        relation: ExecutableRelation::Unknown,
+                                    }),
+                                });
                             }
                         }
                         incomplete = true;
                         break;
                     };
                     if let Some(body) = raw.get(i + 1..close) {
-                        bodies.push(body.to_string());
+                        bodies.push(ExecutableBody {
+                            input: body.to_string(),
+                            shell,
+                            origin: Some(ExecutableBodyOrigin {
+                                parent_range: i + 1..close,
+                                relation: executable_argument_relation(current_argument),
+                            }),
+                        });
                     }
                     i = close + 1;
                     word_start = false;
@@ -7808,6 +7998,22 @@ fn lexical_executable_substitutions(
             ShellLexQuote::Normal => {}
         }
 
+        // Assign argv ownership before consuming the first byte of the word;
+        // quoted and unquoted substitutions therefore share the same exact
+        // owner without a second tokenization/search pass.
+        if word_start
+            && !byte.is_ascii_whitespace()
+            && !matches!(byte, b';' | b'|' | b'&' | b')' | b'}')
+        {
+            if command_start {
+                current_argument = None;
+                next_argument = 0;
+            } else {
+                current_argument = Some(next_argument);
+                next_argument = next_argument.saturating_add(1);
+            }
+        }
+
         if starts_shell_line_comment(bytes, i, shell, word_start) {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
@@ -7817,6 +8023,8 @@ fn lexical_executable_substitutions(
                 command_start = true;
                 word_start = true;
                 assignment_word = false;
+                current_argument = None;
+                next_argument = 0;
             }
             continue;
         }
@@ -7846,7 +8054,14 @@ fn lexical_executable_substitutions(
                         if let Some(binding) = functions.get(&word) {
                             let definition = &binding.definition;
                             let body_index = bodies.len();
-                            bodies.push(definition.body.clone());
+                            bodies.push(ExecutableBody {
+                                input: definition.body.clone(),
+                                shell,
+                                origin: Some(ExecutableBodyOrigin {
+                                    parent_range: i..end,
+                                    relation: ExecutableRelation::WrapperReplacement,
+                                }),
+                            });
                             function_body_indices.insert(body_index);
                             invoked_function_needs_context |=
                                 posix_segments.as_deref().is_none_or(|segments| {
@@ -7932,7 +8147,14 @@ fn lexical_executable_substitutions(
                 PosixFunctionParse::Incomplete { body_start } => {
                     if let Some(suffix) = raw.get(body_start..) {
                         if !suffix.trim().is_empty() {
-                            bodies.push(suffix.to_string());
+                            bodies.push(ExecutableBody {
+                                input: suffix.to_string(),
+                                shell,
+                                origin: Some(ExecutableBodyOrigin {
+                                    parent_range: body_start..raw.len(),
+                                    relation: ExecutableRelation::Unknown,
+                                }),
+                            });
                         }
                     }
                     incomplete = true;
@@ -7956,7 +8178,13 @@ fn lexical_executable_substitutions(
 
         if shell != ShellType::Cmd && byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
             let open = i + 1;
-            let Some(next) = capture_shell_body(raw, open, shell, &mut bodies) else {
+            let Some(next) = capture_executable_body(
+                raw,
+                open,
+                shell,
+                executable_argument_relation(current_argument),
+                &mut bodies,
+            ) else {
                 incomplete = true;
                 break;
             };
@@ -7973,7 +8201,13 @@ fn lexical_executable_substitutions(
             && bytes.get(i + 1) == Some(&b'(')
         {
             let open = i + 1;
-            let Some(next) = capture_shell_body(raw, open, shell, &mut bodies) else {
+            let Some(next) = capture_executable_body(
+                raw,
+                open,
+                shell,
+                executable_argument_relation(current_argument),
+                &mut bodies,
+            ) else {
                 incomplete = true;
                 break;
             };
@@ -7987,14 +8221,20 @@ fn lexical_executable_substitutions(
                 || (shell == ShellType::Posix && command_start && word_start))
         {
             let recovered_start = bodies.len();
-            let Some(next) = capture_shell_body(raw, i, shell, &mut bodies) else {
+            let Some(next) = capture_executable_body(
+                raw,
+                i,
+                shell,
+                ExecutableRelation::WrapperReplacement,
+                &mut bodies,
+            ) else {
                 incomplete = true;
                 break;
             };
             if shell == ShellType::Posix
-                && bodies
-                    .get(recovered_start..)
-                    .is_none_or(|recovered| recovered.iter().all(|body| body.trim().is_empty()))
+                && bodies.get(recovered_start..).is_none_or(|recovered| {
+                    recovered.iter().all(|body| body.input.trim().is_empty())
+                })
             {
                 // An empty command-position `()` is not a valid subshell and
                 // often indicates a malformed or split function header. Keep
@@ -8008,7 +8248,13 @@ fn lexical_executable_substitutions(
         }
 
         if shell == ShellType::Cmd && byte == b'(' {
-            let Some(next) = capture_shell_body(raw, i, shell, &mut bodies) else {
+            let Some(next) = capture_executable_body(
+                raw,
+                i,
+                shell,
+                ExecutableRelation::WrapperReplacement,
+                &mut bodies,
+            ) else {
                 incomplete = true;
                 break;
             };
@@ -8027,7 +8273,13 @@ fn lexical_executable_substitutions(
                 .is_some_and(|next| next.is_ascii_whitespace())
         {
             let body_start = i + 1;
-            let Some(next) = capture_shell_body(raw, i, shell, &mut bodies) else {
+            let Some(next) = capture_executable_body(
+                raw,
+                i,
+                shell,
+                ExecutableRelation::WrapperReplacement,
+                &mut bodies,
+            ) else {
                 incomplete = true;
                 break;
             };
@@ -8060,14 +8312,28 @@ fn lexical_executable_substitutions(
             let Some(close) = find_backtick_close(raw, i) else {
                 if let Some(suffix) = raw.get(i + 1..) {
                     if !suffix.trim().is_empty() {
-                        bodies.push(suffix.to_string());
+                        bodies.push(ExecutableBody {
+                            input: suffix.to_string(),
+                            shell,
+                            origin: Some(ExecutableBodyOrigin {
+                                parent_range: i + 1..raw.len(),
+                                relation: ExecutableRelation::Unknown,
+                            }),
+                        });
                     }
                 }
                 incomplete = true;
                 break;
             };
             if let Some(body) = raw.get(i + 1..close) {
-                bodies.push(body.to_string());
+                bodies.push(ExecutableBody {
+                    input: body.to_string(),
+                    shell,
+                    origin: Some(ExecutableBodyOrigin {
+                        parent_range: i + 1..close,
+                        relation: executable_argument_relation(current_argument),
+                    }),
+                });
             }
             i = close + 1;
             word_start = false;
@@ -8085,9 +8351,11 @@ fn lexical_executable_substitutions(
         if syntax_whitespace {
             if byte == b'\n' {
                 command_start = true;
+                next_argument = 0;
             }
             word_start = true;
             assignment_word = false;
+            current_argument = None;
             i += 1;
             continue;
         }
@@ -8099,6 +8367,8 @@ fn lexical_executable_substitutions(
             command_start = true;
             word_start = true;
             assignment_word = false;
+            current_argument = None;
+            next_argument = 0;
             i += if bytes.get(i + 1) == Some(&byte) {
                 2
             } else {
@@ -8121,7 +8391,14 @@ fn lexical_executable_substitutions(
                             if let Some(binding) = functions.get(&word) {
                                 let definition = &binding.definition;
                                 let body_index = bodies.len();
-                                bodies.push(definition.body.clone());
+                                bodies.push(ExecutableBody {
+                                    input: definition.body.clone(),
+                                    shell,
+                                    origin: Some(ExecutableBodyOrigin {
+                                        parent_range: i..end,
+                                        relation: ExecutableRelation::WrapperReplacement,
+                                    }),
+                                });
                                 function_body_indices.insert(body_index);
                                 invoked_function_needs_context |=
                                     posix_segments.as_deref().is_none_or(|segments| {
@@ -8159,12 +8436,17 @@ fn lexical_executable_substitutions(
         let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
         if invoked_function_needs_context
             || bodies.iter().any(|body| {
-                posix_body_calls_parent_function(body, &function_names, 0, &mut remaining_bodies)
+                posix_body_calls_parent_function(
+                    &body.input,
+                    &function_names,
+                    0,
+                    &mut remaining_bodies,
+                )
             })
             || function_body_indices.iter().any(|index| {
                 bodies
                     .get(*index)
-                    .is_some_and(|body| contains_literal_posix_dispatch_mutation(body))
+                    .is_some_and(|body| contains_literal_posix_dispatch_mutation(&body.input))
             })
         {
             gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
@@ -8473,6 +8755,7 @@ fn push_powershell_named_function_blocks(raw: &str, scan: &mut ExecutableSubstit
             scan.bodies.push(ExecutableBody {
                 input: body.to_string(),
                 shell: ShellType::PowerShell,
+                origin: None,
             });
             pending_keyword = false;
             continue;
@@ -8714,6 +8997,7 @@ fn capture_powershell_executable_body(
             scan.bodies.push(ExecutableBody {
                 input: body.to_string(),
                 shell: ShellType::PowerShell,
+                origin: None,
             });
         }
         return Some(close + 1);
@@ -8727,6 +9011,7 @@ fn capture_powershell_executable_body(
             scan.bodies.push(ExecutableBody {
                 input: suffix.to_string(),
                 shell: ShellType::PowerShell,
+                origin: None,
             });
         }
     }
@@ -9570,6 +9855,7 @@ fn push_powershell_switch_clause_bodies(raw: &str, scan: &mut ExecutableSubstitu
                 scan.bodies.push(ExecutableBody {
                     input: body.to_string(),
                     shell: ShellType::PowerShell,
+                    origin: None,
                 });
             }
             index = close + 1;
@@ -9903,6 +10189,7 @@ fn scan_powershell_fragment_at_hashtable_depth(
                         scan.bodies.push(ExecutableBody {
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
+                            origin: None,
                         });
                     }
                     token_class = PowerShellLexTokenClass::Start;
@@ -9953,11 +10240,13 @@ fn scan_powershell_fragment_at_hashtable_depth(
                                 scan.bodies.push(ExecutableBody {
                                     input: scriptblock.to_string(),
                                     shell: ShellType::PowerShell,
+                                    origin: None,
                                 });
                             } else {
                                 scan.bodies.push(ExecutableBody {
                                     input: body.to_string(),
                                     shell: ShellType::PowerShell,
+                                    origin: None,
                                 });
                                 record_shell_execution_gap(
                                     scan,
@@ -10021,11 +10310,13 @@ fn scan_powershell_fragment_at_hashtable_depth(
                         scan.bodies.push(ExecutableBody {
                             input: scriptblock.to_string(),
                             shell: ShellType::PowerShell,
+                            origin: None,
                         });
                     } else if let Some(body) = raw.get(i + 1..close) {
                         scan.bodies.push(ExecutableBody {
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
+                            origin: None,
                         });
                         record_shell_execution_gap(
                             scan,
@@ -10073,6 +10364,7 @@ fn scan_powershell_fragment_at_hashtable_depth(
                         scan.bodies.push(ExecutableBody {
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
+                            origin: None,
                         });
                     }
                     i = method_end;
@@ -11219,6 +11511,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
                         scan.bodies.push(ExecutableBody {
                             input: definition.body.clone(),
                             shell: ShellType::PowerShell,
+                            origin: None,
                         });
                         push_powershell_named_function_blocks(&definition.body, &mut scan);
                     } else {
@@ -11251,6 +11544,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
                 scan.bodies.push(ExecutableBody {
                     input: body,
                     shell: ShellType::PowerShell,
+                    origin: None,
                 });
             } else if unresolved_aliases.contains(&command) {
                 record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
@@ -11264,6 +11558,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
                 scan.bodies.push(ExecutableBody {
                     input: definition.body.clone(),
                     shell: ShellType::PowerShell,
+                    origin: None,
                 });
                 push_powershell_named_function_blocks(&definition.body, &mut scan);
                 child_scope_body_indices.extend(body_start..scan.bodies.len());

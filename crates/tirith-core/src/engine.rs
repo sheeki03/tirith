@@ -273,7 +273,7 @@ pub fn dsl_backing_for_input(
     scan_context: ScanContext,
 ) -> DslBacking {
     let analyzed: std::borrow::Cow<'_, str> = if scan_context == ScanContext::Exec {
-        crate::command_card::strip_card_comment_lines_cow(input)
+        crate::command_card::strip_card_comment_lines_cow_for_shell(input, shell)
     } else {
         std::borrow::Cow::Borrowed(input)
     };
@@ -1537,7 +1537,7 @@ fn check_command_manifest_hot(
     // Strip any `# tirith-card:` prelude before matching (as the card path does):
     // otherwise `allowed[]` exact-matches miss and `dangerous[]` globs match the
     // wrapper, not the real command.
-    let command = crate::command_card::strip_card_comment_lines(&ctx.input);
+    let command = crate::command_card::strip_card_comment_lines_for_shell(&ctx.input, ctx.shell);
     let mut outcome = manifest.evaluate(&command, engine_findings);
 
     // `allowed[]` and the invocation-level unknown annotation keep their
@@ -1609,6 +1609,15 @@ fn read_card_bytes_guarded(path: &std::path::Path) -> Result<Vec<u8>, CardReadEr
 ///
 /// V1: NO remote URL is fetched (a URL-shaped value yields a "fetch first" Info
 /// note). ATTESTATION-ONLY: none of these change another finding's action.
+fn command_card_shell_token(shell: crate::tokenize::ShellType) -> &'static str {
+    match shell {
+        crate::tokenize::ShellType::Posix => "posix",
+        crate::tokenize::ShellType::Fish => "fish",
+        crate::tokenize::ShellType::PowerShell => "powershell",
+        crate::tokenize::ShellType::Cmd => "cmd",
+    }
+}
+
 fn check_command_card_hot(ctx: &AnalysisContext) -> Vec<Finding> {
     // Delegate to the inner form so tests can exercise the unresolvable-trust-store
     // branch deterministically (mirrors `check_taint_hot_with_store`).
@@ -1629,7 +1638,7 @@ fn check_command_card_hot_with_trusted_dir(
     // Sidecar `--card` flag wins; otherwise look for a `# tirith-card:` comment.
     let card_ref = match ctx.card_ref.as_deref() {
         Some(p) if !p.is_empty() => CardRef::LocalPath(p.to_string()),
-        _ => match command_card::find_card_comment(&ctx.input) {
+        _ => match command_card::find_card_comment_for_shell(&ctx.input, ctx.shell) {
             Some(r) => r,
             None => return Vec::new(),
         },
@@ -1750,9 +1759,144 @@ fn check_command_card_hot_with_trusted_dir(
     // Strip `# tirith-card:` marker lines before the byte-for-byte comparison
     // (the marker is transport metadata) — else a comment-carried command always
     // falsely MISMATCHES its own correctly-signed card. No-op for `--card`.
-    let command = command_card::strip_card_comment_lines(&ctx.input);
-    let outcome = command_card::evaluate_card(&card, &command, &trusted_dir, today);
+    let command = command_card::strip_card_comment_lines_for_shell(&ctx.input, ctx.shell);
+    let outcome = command_card::evaluate_card_for_shell(
+        &card,
+        &command,
+        command_card_shell_token(ctx.shell),
+        &trusted_dir,
+        today,
+    );
     command_card::findings_for_outcome(&outcome)
+}
+
+const WEB3_CARD_ARTIFACT_READ_CAP: u64 = 16 * 1024 * 1024;
+
+/// Return a card only after the same trust, expiry, and exact-command checks as
+/// the attestation finding path. Diagnostics remain owned by
+/// `check_command_card_hot`; this helper is intentionally boolean/opaque so a
+/// malformed card cannot become an authorization oracle.
+fn verified_command_card_hot(ctx: &AnalysisContext) -> Option<crate::command_card::Card> {
+    use crate::command_card::{self, CardOutcome, CardRef};
+
+    let card_ref = ctx
+        .card_ref
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| CardRef::LocalPath(value.to_string()))
+        .or_else(|| command_card::find_card_comment_for_shell(&ctx.input, ctx.shell))?;
+    let CardRef::LocalPath(path) = card_ref else {
+        return None;
+    };
+    let path = std::path::PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else if let Some(cwd) = ctx.cwd.as_deref() {
+        std::path::Path::new(cwd).join(path)
+    } else {
+        path
+    };
+    let bytes = read_card_bytes_guarded(&path).ok()?;
+    let card = command_card::Card::from_json(&bytes).ok()?;
+    let trusted = command_card::trusted_card_keys_dir()?;
+    let command = command_card::strip_card_comment_lines_for_shell(&ctx.input, ctx.shell);
+    matches!(
+        command_card::evaluate_card_for_shell(
+            &card,
+            &command,
+            command_card_shell_token(ctx.shell),
+            &trusted,
+            chrono::Utc::now().date_naive(),
+        ),
+        CardOutcome::Verified
+    )
+    .then_some(card)
+}
+
+fn command_card_approves_web3(
+    ctx: &AnalysisContext,
+    policy: &Policy,
+    observation: &crate::rules::web3_gate::Web3ApprovalObservation,
+) -> bool {
+    use sha2::{Digest as _, Sha256};
+
+    let Some(card) = verified_command_card_hot(ctx) else {
+        return false;
+    };
+    let Some(signature_key_id) = card
+        .signature
+        .as_ref()
+        .map(|signature| signature.key_id.as_str())
+    else {
+        return false;
+    };
+    if !web3_command_card_key_is_authorized(policy, signature_key_id) {
+        return false;
+    }
+    // Artifact-bearing approvals need an execution-owned snapshot that is
+    // revalidated immediately before the Web3 tool opens the artifact. This
+    // analysis boundary can hash a regular file, but it cannot keep the
+    // downstream tool on that same handle; accepting here would leave a
+    // check-to-use replacement window. Until that recheck capability is carried
+    // by the execution boundary, fail closed rather than claim exact approval.
+    if !web3_artifact_approval_recheckable(observation) {
+        return false;
+    }
+    let mut artifact_sha256 = Vec::with_capacity(observation.artifacts.len());
+    for artifact in &observation.artifacts {
+        let path = std::path::PathBuf::from(artifact);
+        let path = if path.is_absolute() {
+            path
+        } else if let Some(cwd) = ctx.cwd.as_deref() {
+            std::path::Path::new(cwd).join(path)
+        } else {
+            return false;
+        };
+        let Ok(bytes) = crate::util::read_regular_capped(&path, WEB3_CARD_ARTIFACT_READ_CAP) else {
+            return false;
+        };
+        artifact_sha256.push(format!("{:x}", Sha256::digest(bytes)));
+    }
+    let Ok(policy_identity) = policy.execution_identity_hash() else {
+        return false;
+    };
+    card.approves_web3_exact(
+        &crate::command_card::ObservedWeb3Approval {
+            shell: match ctx.shell {
+                crate::tokenize::ShellType::Posix => "posix",
+                crate::tokenize::ShellType::Fish => "fish",
+                crate::tokenize::ShellType::PowerShell => "powershell",
+                crate::tokenize::ShellType::Cmd => "cmd",
+            },
+            network_policy_id: &observation.network_policy_id,
+            family: &observation.family,
+            chain_or_genesis: &observation.chain_or_genesis,
+            signer_kind: &observation.signer_kind,
+            policy_identity: &policy_identity,
+            operations: &observation.operations,
+            destinations: &observation.destinations,
+            artifact_sha256: &artifact_sha256,
+        },
+        &observation.signers,
+    )
+    .is_ok()
+}
+
+fn web3_command_card_key_is_authorized(policy: &Policy, signature_key_id: &str) -> bool {
+    policy
+        .web3_guard
+        .command_card_key_ids
+        .contains(signature_key_id)
+}
+
+/// The analyzer cannot make an external Web3 executable consume the same
+/// no-follow file handle it hashed. Empty is therefore the only artifact
+/// projection this boundary can currently authorize. An execution boundary
+/// that snapshots and rechecks the opened object can replace this refusal.
+fn web3_artifact_approval_recheckable(
+    observation: &crate::rules::web3_gate::Web3ApprovalObservation,
+) -> bool {
+    observation.artifacts.is_empty()
 }
 
 /// Does `leader` look like a path (so it is ITSELF the executed file, e.g.
@@ -2497,7 +2641,7 @@ fn analyze_inner_with_policy_and_pdf_coverage(
     // form (the marker is transport metadata; stripping is zero-alloc when absent).
     let bypass_inline = ctx.scan_context == ScanContext::Exec
         && find_inline_bypass(
-            &crate::command_card::strip_card_comment_lines_cow(&ctx.input),
+            &crate::command_card::strip_card_comment_lines_cow_for_shell(&ctx.input, ctx.shell),
             ctx.shell,
         );
     let bypass_requested = honor_bypass && (bypass_env || bypass_inline);
@@ -2540,7 +2684,8 @@ fn analyze_inner_with_policy_and_pdf_coverage(
     // body (notably PowerShell `-EncodedCommand`) may contain the only built-in
     // risk signal even though the outer base64 spelling is otherwise clean.
     let executable_body_triggered = if ctx.scan_context == ScanContext::Exec {
-        let stripped = crate::command_card::strip_card_comment_lines_cow(&ctx.input);
+        let stripped =
+            crate::command_card::strip_card_comment_lines_cow_for_shell(&ctx.input, ctx.shell);
         let (nested, incomplete) = collect_nested_executable_inputs(&stripped, ctx.shell);
         incomplete
             || nested.iter().any(|body| {
@@ -2559,7 +2704,8 @@ fn analyze_inner_with_policy_and_pdf_coverage(
         // R13c) — else a `# tirith-card:` line hides the `tirith <subcommand>`
         // leader. The byte scan below still runs on the ORIGINAL `ctx.input`, so
         // translate the range back by the stripped prelude length (0 when absent).
-        let stripped = crate::command_card::strip_card_comment_lines_cow(&ctx.input);
+        let stripped =
+            crate::command_card::strip_card_comment_lines_cow_for_shell(&ctx.input, ctx.shell);
         let prelude_off = ctx.input.len() - stripped.len();
         extract::tirith_inert_arg_range(&stripped, ctx.shell)
             .map(|r| (r.start + prelude_off)..(r.end + prelude_off))
@@ -2607,7 +2753,9 @@ fn analyze_inner_with_policy_and_pdf_coverage(
             let hooks = policy.hooks_guard_enabled
                 && leader_is_hook_triggering(
                     ctx,
-                    &crate::command_card::strip_card_comment_lines_cow(&ctx.input),
+                    &crate::command_card::strip_card_comment_lines_cow_for_shell(
+                        &ctx.input, ctx.shell,
+                    ),
                 );
             (policy.exec_guard_enabled, hooks)
         }
@@ -2690,6 +2838,14 @@ fn analyze_inner_with_policy_and_pdf_coverage(
     let manifest_triggered = ctx.scan_context == ScanContext::Exec
         && crate::commands_manifest::CommandsManifest::exists_for(ctx.cwd.as_deref());
 
+    // `web3_guard` is policy-driven and its aliases/path probes are intentionally
+    // outside the coarse pattern table. Once configured, never let a clean-looking
+    // Web3 spelling take the tier-1 Allow fast path before semantic parsing.
+    let web3_guard_triggered = matches!(ctx.scan_context, ScanContext::Exec | ScanContext::Paste)
+        && gate_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.web3_guard.is_default());
+
     let tier1_ms = tier1_start.elapsed().as_secs_f64() * 1000.0;
 
     if !force_full
@@ -2708,6 +2864,7 @@ fn analyze_inner_with_policy_and_pdf_coverage(
         && !canary_triggered
         && !card_triggered
         && !manifest_triggered
+        && !web3_guard_triggered
         && !paste_source_triggered
         && !custom_rules_triggered
         && !custom_seeds_triggered
@@ -2813,7 +2970,7 @@ fn analyze_inner_with_policy_and_pdf_coverage(
     // no-marker exec path zero-alloc, and the byte scan below still runs on
     // `ctx.input` (offsets/`inert_range` are keyed to it).
     let analyzed_input: std::borrow::Cow<'_, str> = if ctx.scan_context == ScanContext::Exec {
-        crate::command_card::strip_card_comment_lines_cow(&ctx.input)
+        crate::command_card::strip_card_comment_lines_cow_for_shell(&ctx.input, ctx.shell)
     } else {
         std::borrow::Cow::Borrowed(ctx.input.as_str())
     };
@@ -2824,6 +2981,7 @@ fn analyze_inner_with_policy_and_pdf_coverage(
     // `normalize_path_separators` so production and `tirith rule test` match (F2).
     let file_path_str: Option<String> =
         crate::util::normalize_path_separators(ctx.file_path.as_deref());
+    let mut web3_decision = None;
 
     if ctx.scan_context == ScanContext::FileScan {
         let byte_input = if let Some(ref bytes) = ctx.raw_bytes {
@@ -3084,17 +3242,27 @@ fn analyze_inner_with_policy_and_pdf_coverage(
         // cwd, so an analysis with no working directory never touches the
         // filesystem.
         {
-            let mut web3_context = match ctx.cwd.as_deref() {
+            let web3_context = match ctx.cwd.as_deref() {
                 Some(cwd) => crate::rules::web3::Web3ParseContextV2::for_cwd(cwd),
                 None => crate::rules::web3::Web3ParseContextV2::without_filesystem(),
             };
-            web3_context.trusted_rpc_path_prefixes = None;
-            let parsed = crate::rules::web3::parse_web3_commands_v2(
-                &analyzed_input,
-                ctx.shell,
-                &web3_context,
+            let compiled = crate::rules::web3_gate::CompiledWeb3Guard::new(&policy.web3_guard);
+            let bound = compiled.analyze(&analyzed_input, ctx.shell, web3_context);
+            let card_approved = crate::rules::web3_gate::approval_observation(
+                &bound,
+                &policy.web3_guard,
+                &compiled,
+            )
+            .as_ref()
+            .is_some_and(|observation| command_card_approves_web3(ctx, &policy, observation));
+            let decision = crate::rules::web3_gate::decide(
+                &bound,
+                &policy.web3_guard,
+                &compiled,
+                card_approved,
             );
-            findings.extend(crate::rules::web3_gate::check(&parsed, &policy.web3_guard));
+            findings.extend(decision.findings.iter().cloned());
+            web3_decision = Some(decision);
         }
 
         // PowerShell-specific rules (M5 item 16). The checker follows
@@ -3456,14 +3624,59 @@ fn analyze_inner_with_policy_and_pdf_coverage(
     // M11 ch2 — audit-only (never read by action derivation).
     verdict.manifest_allowed_match = manifest_allowed_match;
 
+    if let Some(decision) = web3_decision {
+        match decision.action {
+            crate::web3_policy::Web3GuardAction::Allow => {}
+            crate::web3_policy::Web3GuardAction::Warn => {
+                if verdict.action == crate::verdict::Action::Allow {
+                    verdict.action = crate::verdict::Action::Warn;
+                }
+            }
+            crate::web3_policy::Web3GuardAction::RequireApproval => {
+                if verdict.action != crate::verdict::Action::Block {
+                    verdict.action = crate::verdict::Action::Warn;
+                    verdict.requires_approval = Some(true);
+                    verdict.approval_timeout_secs = Some(0);
+                    verdict.approval_fallback = Some("block".to_string());
+                    verdict.approval_rule =
+                        Some(crate::verdict::RuleId::Web3NetworkPolicyViolation.to_string());
+                    verdict.approval_description = decision.approval_cause;
+                }
+            }
+            crate::web3_policy::Web3GuardAction::Block => {
+                verdict.action = crate::verdict::Action::Block;
+                verdict.requires_approval = None;
+                verdict.approval_timeout_secs = None;
+                verdict.approval_fallback = None;
+                verdict.approval_rule = None;
+                verdict.approval_description = None;
+            }
+        }
+    }
+
     (verdict, policy)
 }
 
 /// Filter a verdict's findings by paranoia level (output-layer only; the engine
 /// always detects everything). 1-2: Medium+; 3: also Low; 4: also Info.
 pub fn filter_findings_by_paranoia(verdict: &mut Verdict, paranoia: u8) {
+    let authoritative_web3_block = verdict
+        .findings
+        .iter()
+        .find(|finding| crate::rules::web3_gate::is_authoritative_block_finding(finding))
+        .cloned();
     retain_by_paranoia(&mut verdict.findings, paranoia);
     verdict.action = recalculate_action(&verdict.findings);
+    if let Some(cause) = authoritative_web3_block {
+        if !verdict
+            .findings
+            .iter()
+            .any(crate::rules::web3_gate::is_authoritative_block_finding)
+        {
+            verdict.findings.push(cause);
+        }
+        verdict.action = crate::verdict::Action::Block;
+    }
 }
 
 /// Like [`filter_findings_by_paranoia`] but on raw findings.
@@ -5391,6 +5604,62 @@ mod tests {
     }
 
     #[test]
+    fn paranoia_filter_cannot_downgrade_an_authoritative_web3_block() {
+        use crate::verdict::{Evidence, Finding, RuleId, Severity, Timings, Verdict};
+
+        let finding = Finding {
+            rule_id: RuleId::Web3NetworkPolicyViolation,
+            severity: Severity::Info,
+            title: "policy-overridden informational severity".into(),
+            description: String::new(),
+            evidence: vec![
+                Evidence::Text {
+                    detail: "tirith:v1:web3_policy;tool=cast;status=denied_endpoint".into(),
+                },
+                Evidence::Text {
+                    detail: "tirith:v1:web3_enforcement;action=block".into(),
+                },
+            ],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let timings = Timings {
+            tier0_ms: 0.0,
+            tier1_ms: 0.0,
+            tier2_ms: None,
+            tier3_ms: None,
+            total_ms: 0.0,
+        };
+        let mut verdict = Verdict::from_findings(vec![finding], 3, timings);
+        filter_findings_by_paranoia(&mut verdict, 1);
+        assert_eq!(verdict.action, Action::Block);
+        assert_eq!(verdict.findings.len(), 1);
+        assert!(crate::rules::web3_gate::is_authoritative_block_finding(
+            &verdict.findings[0]
+        ));
+    }
+
+    #[test]
+    fn required_web3_command_card_accepts_only_a_policy_trusted_key_id() {
+        let mut policy = Policy::default();
+        policy
+            .web3_guard
+            .command_card_key_ids
+            .insert("trusted-key-id".into());
+        assert!(web3_command_card_key_is_authorized(
+            &policy,
+            "trusted-key-id"
+        ));
+        assert!(!web3_command_card_key_is_authorized(
+            &policy,
+            "other-key-id"
+        ));
+        assert!(!web3_command_card_key_is_authorized(&policy, ""));
+    }
+
+    #[test]
     fn test_inline_bypass_bare_prefix() {
         assert!(find_inline_bypass(
             "TIRITH=0 curl evil.com",
@@ -5747,6 +6016,63 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         }
+    }
+
+    #[test]
+    fn web3_require_approval_is_a_first_class_verdict_contract() {
+        let policy = Policy {
+            web3_guard: crate::web3_policy::Web3GuardPolicy {
+                networks: vec![crate::web3_policy::TrustedNetwork {
+                    name: "prod".into(),
+                    family: crate::web3_policy::Web3Family::Evm,
+                    identity: crate::web3_policy::NetworkIdentity::Evm { evm_chain_id: 1 },
+                    endpoints: vec![crate::web3_policy::RpcMatcher {
+                        scheme: "https".into(),
+                        host: "trusted.test".into(),
+                        port: None,
+                        path_prefix: None,
+                        subdomains: crate::web3_policy::SubdomainPolicy::ExactHost,
+                    }],
+                }],
+                action_unclassified_rpc: crate::web3_policy::Web3GuardAction::RequireApproval,
+                ..Default::default()
+            },
+            ..Policy::default()
+        };
+        let verdict = analyze_inner_with_policy(
+            &exec_ctx("cast call 0xabc --rpc-url https://unknown.test"),
+            false,
+            Some(&policy),
+            true,
+        )
+        .0;
+        assert_eq!(verdict.action, crate::verdict::Action::Warn);
+        assert_eq!(verdict.requires_approval, Some(true));
+        assert_eq!(verdict.approval_fallback.as_deref(), Some("block"));
+        assert_eq!(
+            verdict.approval_rule.as_deref(),
+            Some("web3_network_policy_violation")
+        );
+    }
+
+    #[test]
+    fn artifact_card_cannot_approve_without_execution_owned_recheck() {
+        let mut observation = crate::rules::web3_gate::Web3ApprovalObservation {
+            network_policy_id: "prod".into(),
+            family: "evm".into(),
+            chain_or_genesis: "1".into(),
+            signer_kind: "hardware_wallet".into(),
+            signers: vec![],
+            operations: vec!["deploy".into()],
+            destinations: vec![],
+            artifacts: vec![],
+        };
+        assert!(web3_artifact_approval_recheckable(&observation));
+        observation.artifacts.push("./target/contract.bin".into());
+        assert!(
+            !web3_artifact_approval_recheckable(&observation),
+            "analysis-only hashing must not claim an artifact can be rechecked at execution"
+        );
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6904,6 +7230,22 @@ mod tests {
             detail.contains("trust store unavailable")
                 && detail.contains("verification attempted but could not complete"),
             "evidence must explain the trust store was unavailable, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn cmd_hash_marker_is_not_resolved_as_card_metadata() {
+        let mut ctx = exec_ctx("# tirith-card: ./card.json\r\necho hi");
+        ctx.shell = crate::tokenize::ShellType::Cmd;
+        let trusted = tempfile::tempdir().unwrap();
+        assert!(
+            check_command_card_hot_with_trusted_dir(&ctx, Some(trusted.path().to_path_buf()),)
+                .is_empty(),
+            "Cmd `#` content must not trigger command-card resolution"
+        );
+        assert_eq!(
+            crate::command_card::strip_card_comment_lines_for_shell(&ctx.input, ctx.shell),
+            ctx.input
         );
     }
 
@@ -8153,7 +8495,8 @@ mod tests {
 
         // A real `bash ./install.sh` carried behind a card-comment prelude.
         let ctx = exec_ctx_in("# tirith-card: ./card.json\nbash ./install.sh", cwd);
-        let stripped = crate::command_card::strip_card_comment_lines_cow(&ctx.input);
+        let stripped =
+            crate::command_card::strip_card_comment_lines_cow_for_shell(&ctx.input, ctx.shell);
 
         // The STRIPPED command (what the engine now passes) fires the taint rule
         // against the real tainted file.
@@ -8187,7 +8530,8 @@ mod tests {
         // CodeRabbit R6 #2 (hook side): `leader_is_hook_triggering` must see the
         // real `git commit` even when carried behind a `# tirith-card:` prelude.
         let ctx = exec_ctx("# tirith-card: ./card.json\ngit commit -m wip");
-        let stripped = crate::command_card::strip_card_comment_lines_cow(&ctx.input);
+        let stripped =
+            crate::command_card::strip_card_comment_lines_cow_for_shell(&ctx.input, ctx.shell);
         assert!(
             leader_is_hook_triggering(&ctx, &stripped),
             "the stripped command's leader (git commit) must be hook-triggering"
@@ -9017,7 +9361,10 @@ mod tests {
         // command — a card-prelude'd command must classify identically to the
         // un-prelude'd one (else the `#` comment skews leader/ecosystem/sudo).
         let with_prelude = exec_ctx("# tirith-card: ./c.json\nsudo npm install left-pad");
-        let stripped = crate::command_card::strip_card_comment_lines_cow(&with_prelude.input);
+        let stripped = crate::command_card::strip_card_comment_lines_cow_for_shell(
+            &with_prelude.input,
+            with_prelude.shell,
+        );
         let (eco_p, sudo_p, _) = baseline_shared_components(&with_prelude, &stripped);
 
         let plain = exec_ctx("sudo npm install left-pad");

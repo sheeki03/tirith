@@ -126,44 +126,23 @@ pub fn init(force: bool, json: bool) -> i32 {
         return 1;
     }
 
-    if let Some(parent) = path.parent() {
-        // If `.tirith` is created fresh, fsync its entry in the repo root too:
-        // `write_file_atomic` only fsyncs commands.yaml's parent, so a crash could
-        // otherwise lose the whole `.tirith` dir despite init succeeding (CodeRabbit R13b).
-        let parent_existed = parent.is_dir();
-        if let Err(e) = tirith_core::util::create_dir_durable(parent) {
-            if !emit_commands_error(
-                json,
-                "init",
-                &format!("create {}: {e}", parent.display()),
-                1,
-                Some(&invocation.output_dlp),
-            ) {
-                return 2;
-            }
-            return 1;
-        }
-        if !parent_existed {
-            tirith_core::util::fsync_parent_dir_logged(parent, "commands .tirith directory");
-        }
-    }
-
     // Write ATOMICALLY (temp → fsync → rename → parent fsync), not truncate-in-
     // place, so a crash can't lose or half-write the manifest. No-clobber unless
     // `--force` so a manifest created in the post-`exists()` race window survives.
     //
     // C12: the commands manifest is a Tirith-owned configuration file, so its
-    // publication goes through the gated single-use permit. It governs which
-    // commands are allowed, not Tirith's policy document itself, so it is not
-    // flagged as a policy change.
+    // publication goes through the gated single-use permit. Because it governs
+    // which commands are allowed, it is classified as PolicyChange even though
+    // the on-disk format is not policy.yaml.
     let operator_policy = tirith_core::policy::Policy::discover_local_only(Some(&invocation.cwd));
-    if let Err(e) = super::write_config_file_permitted(
+    if let Err(e) = super::write_config_file_permitted_with_parent_creation(
         repo_root,
         &path,
         tirith_core::commands_manifest::STARTER_MANIFEST.as_bytes(),
         force,
         &operator_policy,
-        false,
+        true,
+        true,
     ) {
         if !emit_commands_error(
             json,

@@ -64,7 +64,8 @@ pub struct AuditEntry {
     pub event_id: Option<String>,
     pub tier_reached: u8,
 
-    /// Tagged-union discriminator — "verdict", "hook_telemetry", or "trust_change".
+    /// Tagged-union discriminator — "verdict", "hook_telemetry",
+    /// "trust_change", or "task_boundary".
     pub entry_type: String,
 
     pub event: Option<String>,
@@ -2330,15 +2331,70 @@ pub fn log_hook_event(
     let _ = append_to_audit_log(&entry, None);
 }
 
-/// Log a trust change (`entry_type = "trust_change"`). Best-effort, never panics;
-/// reuses the same log file / I/O pattern as `log_verdict`.
+/// Persist one recordable owned-boundary assessment in the tamper-evident
+/// audit stream. Off-mode assessments are deliberately inert. The complete
+/// structured projection passes through the mandatory durable privacy
+/// projection both here and again in the append path.
+#[must_use = "a failed task-boundary audit write is silently lost unless handled"]
+pub fn log_task_boundary_assessment(
+    assessment: &crate::task_boundary::BoundaryAssessment,
+) -> Result<(), String> {
+    if !assessment.is_recordable() {
+        return Ok(());
+    }
+    let projection = serde_json::to_string(&assessment.projection())
+        .map_err(|error| format!("serialize task-boundary assessment: {error}"))?;
+    let action = match &assessment.outcome {
+        crate::task_boundary::BoundaryOutcome::Allow => "allow",
+        crate::task_boundary::BoundaryOutcome::RequireApproval { .. } => "require_approval",
+        crate::task_boundary::BoundaryOutcome::Deny { .. } => "deny",
+    };
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: privacy_project_audit_text(&crate::session::resolve_session_id()),
+        action: action.to_string(),
+        rule_ids: Vec::new(),
+        command_redacted: String::new(),
+        bypass_requested: false,
+        bypass_honored: false,
+        interactive: false,
+        policy_path: None,
+        event_id: None,
+        tier_reached: 0,
+        entry_type: "task_boundary".to_string(),
+        event: Some("owned_boundary_assessment".to_string()),
+        integration: Some(assessment.boundary.token().to_string()),
+        hook_type: None,
+        detail: Some(privacy_project_audit_text(&projection)),
+        elapsed_ms: None,
+        raw_action: None,
+        raw_rule_ids: None,
+        trust_pattern: None,
+        trust_rule_id: None,
+        trust_action: None,
+        trust_ttl_expires: None,
+        trust_scope: None,
+        agent_origin: None,
+        manifest_allowed_match: None,
+        prev_hash: None,
+        sig: None,
+    };
+    match append_to_audit_log(&entry, None) {
+        AuditWrite::Written(_) | AuditWrite::Skipped => Ok(()),
+        AuditWrite::Failed(reason) => Err(reason),
+    }
+}
+
+/// Log a trust change (`entry_type = "trust_change"`). A real append failure is
+/// returned so a successful trust-store mutation cannot be reported as fully
+/// successful when its journal entry was lost.
 pub fn log_trust_change(
     pattern: &str,
     rule_id: Option<&str>,
     trust_action: &str,
     ttl_expires: Option<&str>,
     scope: &str,
-) {
+) -> Result<(), String> {
     let entry = AuditEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         session_id: privacy_project_audit_text(&crate::session::resolve_session_id()),
@@ -2377,8 +2433,10 @@ pub fn log_trust_change(
         sig: None,
     };
 
-    // Best-effort: a write failure here is not surfaced to the user.
-    let _ = append_to_audit_log(&entry, None);
+    match append_to_audit_log(&entry, None) {
+        AuditWrite::Written(_) | AuditWrite::Skipped => Ok(()),
+        AuditWrite::Failed(reason) => Err(reason),
+    }
 }
 
 /// The outcome of anchoring a D6 [`crate::receipt::ArtifactScanReceipt`] in the
@@ -2875,7 +2933,8 @@ mod tests {
         global_state.remove_env("TIRITH_API_KEY");
 
         log_hook_event(&integration, &hook_type, &event, Some(1.0), Some(&detail));
-        log_trust_change(&pattern, Some(&rule_id), &action, Some(&ttl), &scope);
+        log_trust_change(&pattern, Some(&rule_id), &action, Some(&ttl), &scope)
+            .expect("append trust audit entry");
         assert!(matches!(
             log_artifact_scan_receipt(
                 &bare_scalar,
@@ -3217,6 +3276,33 @@ mod tests {
         global_state.remove_env("TIRITH_LOG");
         global_state.remove_env("XDG_STATE_HOME");
         global_state.remove_env("APPDATA");
+    }
+
+    #[test]
+    fn trust_change_propagates_audit_append_failure() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("TIRITH_LOG", "1");
+            std::env::set_var("XDG_DATA_HOME", directory.path());
+            std::env::set_var("APPDATA", directory.path());
+            std::env::remove_var("TIRITH_SERVER_URL");
+            std::env::remove_var("TIRITH_API_KEY");
+        }
+        let log_path = audit_log_path().expect("isolated audit path");
+        std::fs::create_dir_all(&log_path).unwrap();
+
+        let error = log_trust_change("npm:*", None, "add", None, "user")
+            .expect_err("directory-as-log must surface the append failure");
+        assert!(error.contains("cannot open"), "{error}");
+
+        unsafe {
+            std::env::remove_var("TIRITH_LOG");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("APPDATA");
+        }
     }
 
     /// `agent_origin` must flow through into the audit entry and survive the JSON round-trip.

@@ -2320,8 +2320,10 @@ impl Policy {
             m.insert(k.to_string(), v);
         };
 
-        // Projection format version: v3 privacy-projects every string before it
-        // can participate in a durable value or digest. v2 hashed raw free text.
+        // C00 compatibility contract: this legacy projection remains v3.
+        // New authorization-grade consumers use `enforcement_projection`,
+        // which extends these frozen bytes without changing existing receipt
+        // and downstream library identities.
         put("projection_version", json!(3));
         put("schema_version", json!(self.schema_version));
         put("scope", json!(format!("{:?}", self.scope)));
@@ -2500,6 +2502,41 @@ impl Policy {
         format!("{:x}", h.finalize())
     }
 
+    /// Authorization-grade extension of the frozen legacy security projection.
+    ///
+    /// Version 4 binds the complete Web3 guard and task-gate postures while
+    /// preserving [`Self::security_projection`] byte-for-byte for C00 and
+    /// downstream compatibility. New execution, approval, command-card,
+    /// ConfigWrite, gateway, and receipt-v2 identities must use this projection.
+    pub fn enforcement_projection(&self) -> serde_json::Value {
+        let serde_json::Value::Object(mut projection) = self.security_projection() else {
+            unreachable!("security projection is always an object")
+        };
+        projection.insert("projection_version".to_string(), serde_json::json!(4));
+        projection.insert(
+            "web3_guard_sha256".to_string(),
+            serde_json::json!(projection_rule_digests(std::slice::from_ref(
+                &self.web3_guard
+            ))),
+        );
+        projection.insert(
+            "task_gate_sha256".to_string(),
+            serde_json::json!(projection_rule_digests(std::slice::from_ref(
+                &self.task_gate
+            ))),
+        );
+        serde_json::Value::Object(projection)
+    }
+
+    /// Lowercase SHA-256 of the canonical authorization-grade projection.
+    pub fn enforcement_projection_hash(&self) -> String {
+        let canon = crate::audit::canonical_json_for_hash(&self.enforcement_projection());
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(canon.as_bytes());
+        format!("{:x}", h.finalize())
+    }
+
     /// Durable non-secret identity for an execution decision's policy posture.
     ///
     /// Command-specific effects are independently bound by the frozen verdict
@@ -2508,7 +2545,7 @@ impl Policy {
     /// that decision boundary, so execution state uses the same mandatory
     /// privacy projection as public receipts.
     pub(crate) fn execution_identity_hash(&self) -> Result<String, String> {
-        Ok(self.security_projection_hash())
+        Ok(self.enforcement_projection_hash())
     }
 
     /// Return a fail-closed policy that blocks everything.
@@ -2533,6 +2570,29 @@ impl Policy {
                 description: "Tirith cannot validate the configured effective policy; fail-closed enforcement refuses the operation.".to_string(),
                 action: Some(crate::verdict::Action::Block),
             }],
+            // Owned task boundaries do not execute the ordinary verdict rule
+            // engine. Carry the same fail-closed posture into their dedicated
+            // policy vocabulary so a malformed/unavailable effective policy
+            // cannot silently become `task_gate.mode: off` at a network,
+            // filesystem, package, or execution transition.
+            task_gate: crate::web3_policy::TaskGatePolicy {
+                mode: crate::web3_policy::TaskGateMode::Enforce,
+                effects_requiring_verified_provenance: Default::default(),
+                effects_denied_for_untrusted_sources: [
+                    crate::effects::CommandEffectKind::PackageInstall,
+                    crate::effects::CommandEffectKind::PersistenceChange,
+                    crate::effects::CommandEffectKind::PolicyChange,
+                    crate::effects::CommandEffectKind::SecretRead,
+                    crate::effects::CommandEffectKind::NetworkEgress,
+                    crate::effects::CommandEffectKind::FilesystemWrite,
+                    crate::effects::CommandEffectKind::ResourceEscalation,
+                    crate::effects::CommandEffectKind::Web3Write,
+                    crate::effects::CommandEffectKind::Web3SignerUse,
+                ]
+                .into_iter()
+                .collect(),
+                action_incomplete_analysis: crate::web3_policy::Web3GuardAction::Block,
+            },
             path: Some("fail-closed".into()),
             ..Default::default()
         }
@@ -3683,9 +3743,9 @@ fn merge_context_label_bytes(
     }
 }
 
-/// Write a single label entry (creating file + parent), preserving existing
-/// entries and overwriting only the target key. Used by `tirith context label`
-/// and `tirith ssh label`.
+/// Compatibility-only label writer retained for external library callers.
+/// Tirith-owned CLI paths use their typed ConfigWrite boundary and must not call
+/// this legacy publisher.
 ///
 /// F17 — both label paths are `<root>/<dir>/<file>.yaml` where the repo-scope
 /// `<dir>` (`<repo>/.tirith`) is attacker-influenceable. A retained
@@ -3693,6 +3753,11 @@ fn merge_context_label_bytes(
 /// links, reads the prior file through that held parent, and keeps the same
 /// capability through tempfile creation and atomic publication. A parent-path
 /// replacement therefore cannot redirect either the read or the write.
+#[doc(hidden)]
+#[deprecated(
+    since = "0.1.0",
+    note = "outside Tirith-owned CLI boundaries; use an authorized ConfigWrite integration"
+)]
 pub fn write_context_label(path: &Path, label_key: &str, criticality: &str) -> std::io::Result<()> {
     write_context_label_with_hook(path, label_key, criticality, || Ok(()))
 }
@@ -3714,6 +3779,7 @@ fn write_context_label_with_hook(
     })?;
 
     let destination = crate::util::ContainedAtomicFile::prepare(containment_root, path, true)?;
+    destination.lock_parent_for_mutation()?;
     let mut existing: BTreeMap<String, String> = BTreeMap::new();
     match destination.read_capped(LABELS_FILE_READ_CAP) {
         Ok(bytes) => merge_context_label_bytes(path, bytes, &mut existing, LabelMergeMode::Trusted),
@@ -3734,7 +3800,7 @@ fn write_context_label_with_hook(
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("serialize: {e}"))
     })?;
     after_parent_bound()?;
-    destination.write_atomic(yaml.as_bytes(), true)
+    destination.write_atomic_if_observed(yaml.as_bytes(), true)
 }
 
 /// Cache path for the origin-bound remote policy envelope.
@@ -4732,6 +4798,74 @@ custom_rules:
         crate::incident::invalidate_cache();
     }
 
+    fn assert_task_boundaries_fail_closed(policy: &Policy) {
+        assert_eq!(policy.path.as_deref(), Some("fail-closed"));
+        assert_eq!(
+            policy.task_gate.mode,
+            crate::web3_policy::TaskGateMode::Enforce
+        );
+        assert_eq!(
+            policy.task_gate.action_incomplete_analysis,
+            crate::web3_policy::Web3GuardAction::Block
+        );
+        let every_effect = [
+            crate::effects::CommandEffectKind::PackageInstall,
+            crate::effects::CommandEffectKind::PersistenceChange,
+            crate::effects::CommandEffectKind::PolicyChange,
+            crate::effects::CommandEffectKind::SecretRead,
+            crate::effects::CommandEffectKind::NetworkEgress,
+            crate::effects::CommandEffectKind::FilesystemWrite,
+            crate::effects::CommandEffectKind::ResourceEscalation,
+            crate::effects::CommandEffectKind::Web3Write,
+            crate::effects::CommandEffectKind::Web3SignerUse,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            policy.task_gate.effects_denied_for_untrusted_sources,
+            every_effect
+        );
+    }
+
+    #[test]
+    fn malformed_repo_policy_closes_every_task_boundary() {
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
+        global.remove_env("TIRITH_POLICY_ROOT");
+        global.after_restore(crate::incident::invalidate_cache);
+        crate::incident::invalidate_cache();
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::create_dir(repo.path().join(".tirith")).unwrap();
+        std::fs::write(repo.path().join(".tirith/policy.yaml"), "task_gate: [").unwrap();
+
+        let policy = Policy::discover_local_only(repo.path().to_str());
+        assert_task_boundaries_fail_closed(&policy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_repo_policy_closes_every_task_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
+        global.remove_env("TIRITH_POLICY_ROOT");
+        global.after_restore(crate::incident::invalidate_cache);
+        crate::incident::invalidate_cache();
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::create_dir(repo.path().join(".tirith")).unwrap();
+        let outside_policy = outside.path().join("policy.yaml");
+        std::fs::write(&outside_policy, "task_gate:\n  mode: off\n").unwrap();
+        symlink(&outside_policy, repo.path().join(".tirith/policy.yaml")).unwrap();
+
+        let policy = Policy::discover_local_only(repo.path().to_str());
+        assert_task_boundaries_fail_closed(&policy);
+    }
     fn discovery_test_rule(id: &str, pattern: &str) -> CustomRule {
         CustomRule {
             id: id.to_string(),
@@ -6339,6 +6473,98 @@ custom_rules:
         let h = p.security_projection_hash();
         assert_eq!(h.len(), 64);
         assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn execution_identity_binds_web3_and_task_enforcement() {
+        let base = Policy::default();
+        let base_hash = base.execution_identity_hash().unwrap();
+        let assert_changed = |label: &str, policy: &Policy| {
+            assert_ne!(
+                base_hash,
+                policy.execution_identity_hash().unwrap(),
+                "{label} must change execution identity"
+            );
+        };
+        let matcher = crate::web3_policy::RpcMatcher {
+            scheme: "https".into(),
+            host: "rpc.example".into(),
+            port: Some(443),
+            path_prefix: Some("/rpc".into()),
+            subdomains: crate::web3_policy::SubdomainPolicy::ExactHost,
+        };
+
+        let mut networks = base.clone();
+        networks
+            .web3_guard
+            .networks
+            .push(crate::web3_policy::TrustedNetwork {
+                name: "prod".into(),
+                family: crate::web3_policy::Web3Family::Evm,
+                identity: crate::web3_policy::NetworkIdentity::Evm { evm_chain_id: 1 },
+                endpoints: vec![matcher.clone()],
+            });
+        assert_changed("networks", &networks);
+
+        let mut aliases = base.clone();
+        aliases
+            .web3_guard
+            .selector_aliases
+            .entry("cast".into())
+            .or_default()
+            .insert("prod".into(), "mainnet".into());
+        assert_changed("selector_aliases", &aliases);
+
+        let mut allowed_signers = base.clone();
+        allowed_signers
+            .web3_guard
+            .allowed_signers
+            .insert(crate::web3_policy::TrustedSignerKind::HardwareWallet);
+        assert_changed("allowed_signers", &allowed_signers);
+
+        let mut require_card = base.clone();
+        require_card.web3_guard.require_command_card = true;
+        assert_changed("require_command_card", &require_card);
+
+        let mut signer_keys = base.clone();
+        signer_keys
+            .web3_guard
+            .command_card_key_ids
+            .insert("0123456789abcdef".into());
+        assert_changed("command_card_key_ids", &signer_keys);
+
+        let mut deny_rpc = base.clone();
+        deny_rpc.web3_guard.deny_rpc.push(matcher);
+        assert_changed("deny_rpc", &deny_rpc);
+
+        let mut deny_destinations = base.clone();
+        deny_destinations
+            .web3_guard
+            .deny_destinations
+            .insert("0xdead".into());
+        assert_changed("deny_destinations", &deny_destinations);
+
+        let mut unclassified = base.clone();
+        unclassified.web3_guard.action_unclassified_rpc =
+            crate::web3_policy::Web3GuardAction::RequireApproval;
+        assert_changed("action_unclassified_rpc", &unclassified);
+
+        let mut incomplete = base.clone();
+        incomplete.web3_guard.action_incomplete_analysis =
+            crate::web3_policy::Web3GuardAction::Block;
+        assert_changed("action_incomplete_analysis", &incomplete);
+
+        let mut hardhat = base.clone();
+        hardhat.web3_guard.action_ambiguous_hardhat_production_run =
+            crate::web3_policy::Web3GuardAction::Block;
+        assert_changed("action_ambiguous_hardhat_production_run", &hardhat);
+
+        let mut task = base.clone();
+        task.task_gate.mode = crate::web3_policy::TaskGateMode::Enforce;
+        assert_changed("task_gate", &task);
+
+        let projection = serde_json::to_string(&signer_keys.enforcement_projection()).unwrap();
+        assert!(!projection.contains("0123456789abcdef"));
     }
 
     #[test]

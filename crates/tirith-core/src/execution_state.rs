@@ -1359,6 +1359,40 @@ pub struct GatewayExecutionPermit {
     deferred: DeferredExecution,
 }
 
+/// Retryable ownership of a gateway forward that is proven to have written zero
+/// upstream bytes but whose provisional strict-history record has not yet been
+/// durably erased. The continuation is intentionally non-cloneable; callers must
+/// retain and retry it until [`Self::retry`] succeeds.
+#[must_use = "known-zero rollback ownership must be retried until durable cleanup succeeds"]
+pub struct GatewayKnownZeroRollback {
+    deferred: Option<DeferredExecution>,
+}
+
+impl fmt::Debug for GatewayKnownZeroRollback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayKnownZeroRollback")
+            .field("pending", &self.deferred.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GatewayKnownZeroRollback {
+    /// Retry durable cleanup without surrendering ownership on failure.
+    pub fn retry(&mut self, lock_timeout: Duration) -> Result<(), String> {
+        let Some(deferred) = self.deferred.as_ref() else {
+            return Ok(());
+        };
+        deferred.abort_gateway_known_zero(lock_timeout)?;
+        self.deferred = None;
+        Ok(())
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.deferred.is_none()
+    }
+}
+
 impl fmt::Debug for GatewayExecutionPermit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1414,6 +1448,24 @@ impl GatewayExecutionPermit {
             .map_err(GatewayCompletionError::InvalidResponse)?;
         self.deferred
             .promote_gateway_completed(format!("gateway-result-{response_identity}"), lock_timeout)
+    }
+
+    /// Remove an unresolved gateway-forward record after the caller proves no
+    /// upstream write was attempted. This is the only rollback transition for
+    /// a pre-write preparation; transport errors must never call it because a
+    /// partial write is commit-unknown and must remain conservative history.
+    pub fn abort_known_zero(self, lock_timeout: Duration) -> Result<(), String> {
+        let mut rollback = self.into_known_zero_rollback();
+        rollback.retry(lock_timeout)
+    }
+
+    /// Convert this permit into retryable known-zero cleanup ownership. Gateway
+    /// transport code uses this form so a transient strict-state failure never
+    /// drops the only capability that can erase the false unresolved record.
+    pub fn into_known_zero_rollback(self) -> GatewayKnownZeroRollback {
+        GatewayKnownZeroRollback {
+            deferred: Some(self.deferred),
+        }
     }
 
     pub fn completion_window_open(&self) -> bool {
@@ -1482,6 +1534,106 @@ pub(crate) struct DeferredExecution {
 }
 
 impl DeferredExecution {
+    fn abort_gateway_known_zero(&self, timeout: Duration) -> Result<(), String> {
+        #[cfg(not(unix))]
+        {
+            let _ = (self, timeout);
+            return Err("gateway known-zero rollback is unsupported on this platform".to_string());
+        }
+
+        #[cfg(unix)]
+        {
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| "gateway known-zero rollback deadline overflowed".to_string())?;
+            let state_path =
+                crate::session_warnings::session_state_path(self.draft.session_id())
+                    .ok_or_else(|| "gateway rollback has an invalid session id".to_string())?;
+            let lock_path = crate::session_warnings::session_lock_path(self.draft.session_id())
+                .ok_or_else(|| "gateway rollback has no stable lock path".to_string())?;
+            let parent = state_path
+                .parent()
+                .ok_or_else(|| "gateway rollback session path has no parent".to_string())?;
+            ensure_secure_session_directory(parent)?;
+            let lock_file =
+                open_and_lock_secure(&lock_path, deadline).map_err(|error| error.to_string())?;
+            let lock_identity = secure_regular_identity(&lock_file, "execution rollback lock")?;
+            let strict_candidate = strict_state_path(parent, self.draft.session_id());
+            if retire_legacy_unsafe_strict_state_if_needed(
+                &lock_file,
+                &lock_path,
+                &strict_candidate,
+                self.draft.session_id(),
+            )? == LegacyStrictStateRetirement::Retired
+            {
+                return Err(legacy_strict_state_retired_error());
+            }
+            let (mut strict_file, mut ledger, active_slot, strict_path, strict_identity) =
+                open_or_initialize_strict_state(parent, self.draft.session_id(), None, None)?;
+            validate_execution_ledger(&ledger, self.draft.session_id())?;
+            require_strict_anchor(&lock_file, &lock_path, &ledger)?;
+            let index = ledger
+                .unresolved
+                .iter()
+                .position(|record| {
+                    record.execution_id == self.draft.execution_id()
+                        && record.identity_matches(&self.draft)
+                        && record.evidence_id == self.unresolved_evidence_id
+                        && record.evidence_grade
+                            == ExecutionEvidenceGrade::GatewayForwardedUnresolved
+                        && record.generation == self.unresolved_generation
+                        && record.evidence_history.len() == 1
+                })
+                .or_else(|| {
+                    // A previous attempt may have published the removal but lost
+                    // the acknowledgement while syncing or reopening the strict
+                    // state. Treat an advanced ledger with no record for this
+                    // execution as idempotent success; a conflicting confirmed or
+                    // unresolved record remains a hard invariant failure.
+                    let conflicting = ledger
+                        .confirmed
+                        .iter()
+                        .chain(ledger.unresolved.iter())
+                        .any(|record| record.execution_id == self.draft.execution_id());
+                    if !conflicting && ledger.generation > self.unresolved_generation {
+                        Some(usize::MAX)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    "gateway known-zero rollback lost its exact unresolved record".to_string()
+                })?;
+            if index == usize::MAX {
+                fs2::FileExt::unlock(&lock_file)
+                    .map_err(|error| format!("unlock idempotent gateway rollback: {error}"))?;
+                return Ok(());
+            }
+            ledger.unresolved.remove(index).ok_or_else(|| {
+                "gateway known-zero rollback record disappeared while locked".to_string()
+            })?;
+            let _ = advance_ledger(&mut ledger)?;
+            validate_execution_ledger(&ledger, self.draft.session_id())?;
+            if path_identity(&lock_path, "execution rollback lock")? != lock_identity {
+                return Err("execution rollback lock changed while held".to_string());
+            }
+            write_strict_state(
+                &lock_file,
+                &lock_path,
+                &mut strict_file,
+                &strict_path,
+                strict_identity,
+                active_slot,
+                &ledger,
+                PublishFailureInjection::default(),
+            )
+            .map_err(|error| error.to_string())?;
+            fs2::FileExt::unlock(&lock_file)
+                .map_err(|error| format!("unlock gateway known-zero rollback: {error}"))?;
+            Ok(())
+        }
+    }
+
     pub(crate) fn promote_gateway_completed(
         &mut self,
         evidence_id: impl Into<String>,
@@ -5549,6 +5701,61 @@ mod tests {
             assert!(confirmed.unresolved.is_empty());
             assert_eq!(confirmed.confirmed.len(), 1);
             assert_eq!(confirmed.confirmed[0].evidence_history.len(), 2);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_known_zero_abort_removes_unresolved_history() {
+        isolated_state(|_| {
+            let session_id = "gateway_known_zero_abort";
+            let permit = GatewayExecutionPermit::record_forwarded(
+                prepare_gateway("echo safe", session_id),
+                "tirith-0123456789abcdef0123456789abcdef",
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+            )
+            .expect("durable unresolved gateway forward");
+            assert_eq!(read_test_ledger(session_id).unresolved.len(), 1);
+
+            permit
+                .abort_known_zero(Duration::from_secs(1))
+                .expect("known-zero rollback");
+            let ledger = read_test_ledger(session_id);
+            assert!(ledger.unresolved.is_empty());
+            assert!(ledger.confirmed.is_empty());
+            assert_eq!(ledger.generation, 2);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_known_zero_rollback_retains_capability_across_lock_failure() {
+        isolated_state(|_| {
+            let session_id = "gateway_known_zero_retry";
+            let permit = GatewayExecutionPermit::record_forwarded(
+                prepare_gateway("echo safe", session_id),
+                "tirith-1123456789abcdef0123456789abcdef",
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+            )
+            .expect("durable unresolved gateway forward");
+            let lock_path = crate::session_warnings::session_lock_path(session_id).unwrap();
+            let held = open_and_lock_secure(
+                &lock_path,
+                Instant::now().checked_add(Duration::from_secs(1)).unwrap(),
+            )
+            .expect("hold strict state lock");
+            let mut rollback = permit.into_known_zero_rollback();
+
+            assert!(rollback.retry(Duration::from_millis(10)).is_err());
+            assert!(!rollback.is_complete());
+            assert_eq!(read_test_ledger(session_id).unresolved.len(), 1);
+            fs2::FileExt::unlock(&held).unwrap();
+
+            rollback.retry(Duration::from_secs(1)).unwrap();
+            assert!(rollback.is_complete());
+            assert!(read_test_ledger(session_id).unresolved.is_empty());
         });
     }
 

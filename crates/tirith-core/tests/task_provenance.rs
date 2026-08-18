@@ -11,10 +11,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tirith_core::effects::{BoundaryCapability, CommandEffectKind};
 use tirith_core::task::{
-    assign_provenance, decide, parse_envelope, validate_envelope, AssignedProvenance,
-    EnvelopeRejection, IngressAdapter, ProposedAction, ReceiptStatus, ReceiptVerification,
-    ReplayCache, SourceKind, TaskEnvelopeInput, TaskSourceInput,
+    assign_provenance, decide, decide_document, decide_with_analysis_context,
+    document_decision_projection, parse_envelope, parse_envelope_document, validate_envelope,
+    AssignedProvenance, EnvelopeRejection, IngressAdapter, ProposedAction, ReceiptStatus,
+    ReceiptVerification, ReplayCache, SourceKind, TaskEnvelopeInput, TaskSourceInput,
 };
+use tirith_core::task_analysis::TaskAnalysisContext;
+use tirith_core::task_envelope::ShellDialectClaim;
+use tirith_core::tokenize::ShellType;
 use tirith_core::web3_policy::{TaskGateMode, TaskGatePolicy};
 
 fn enforcing_gate() -> TaskGatePolicy {
@@ -167,10 +171,8 @@ fn an_unmodelled_shell_segment_always_leaves_the_assessment_incomplete() {
         );
     }
 
-    // Positive control: the signal must still MEAN something. A line the
-    // grammar fully models reports complete, otherwise this flag would be a
-    // constant false and an enforcing boundary could never distinguish
-    // "understood" from "unknown".
+    // V1 has no authoritative dialect/cwd/policy identity. It remains source
+    // compatible, but cannot be complete at an enforcing boundary.
     for command in [
         "cast call 0xabc 'x()'",
         "cast send 0xabc --rpc-url https://x.test",
@@ -188,10 +190,124 @@ fn an_unmodelled_shell_segment_always_leaves_the_assessment_incomplete() {
             BoundaryCapability::Enforceable,
         );
         assert!(
-            decision.complete,
-            "a fully modelled command was reported incomplete: {command}"
+            !decision.complete,
+            "a v1 shell action became authoritative: {command}"
         );
     }
+}
+
+#[test]
+fn trusted_boundary_identity_is_required_for_shell_completeness() {
+    let envelope = TaskEnvelopeInput {
+        actions: vec![ProposedAction::Shell {
+            command: "cast call 0xabc 'x()'".to_string(),
+        }],
+        ..TaskEnvelopeInput::default()
+    };
+    let missing_policy =
+        TaskAnalysisContext::trusted(ShellType::Posix, Some(std::path::Path::new("/repo")), None);
+    let incomplete = decide_with_analysis_context(
+        &envelope,
+        vec![issue_provenance()],
+        &enforcing_gate(),
+        BoundaryCapability::Enforceable,
+        &missing_policy,
+    );
+    assert!(
+        !incomplete.complete,
+        "missing policy identity became complete"
+    );
+
+    let trusted = TaskAnalysisContext::trusted(
+        ShellType::Posix,
+        Some(std::path::Path::new("/repo")),
+        Some("policy-v1"),
+    );
+    let unresolved_executable = decide_with_analysis_context(
+        &envelope,
+        vec![issue_provenance()],
+        &enforcing_gate(),
+        BoundaryCapability::Enforceable,
+        &trusted,
+    );
+    assert!(
+        !unresolved_executable.complete,
+        "an unbound PATH-resolved Web3 executable became authoritative"
+    );
+}
+
+#[test]
+fn v2_dialect_is_only_a_claim_and_unknown_values_fail_closed() {
+    let document = parse_envelope_document(
+        r#"{"version":2,"task_id":"task-v2-dialect","sources":[{"source_id":"source-1","claimed_source":"unknown"}],"actions":[{"shell":{"command":"cast call 0xabc 'x()'","claimed_shell":"future-shell"}}]}"#,
+    )
+    .expect("v2 envelope");
+    assert_eq!(document.version, 2);
+    assert_eq!(document.shell_claims, vec![ShellDialectClaim::Unknown]);
+    let decision = decide_document(
+        &document,
+        vec![issue_provenance()],
+        &enforcing_gate(),
+        BoundaryCapability::Enforceable,
+        None,
+    );
+    assert!(
+        !decision.complete,
+        "an unknown caller dialect became authoritative"
+    );
+    let projection = document_decision_projection(&document, &decision, &[]);
+    assert_eq!(projection["envelope_version"], serde_json::json!(2));
+    assert_eq!(
+        projection["shell_dialect_claims"],
+        serde_json::json!(["unknown"])
+    );
+    assert_eq!(
+        projection["shell_dialect_claims_authoritative"],
+        serde_json::json!(false)
+    );
+}
+
+#[test]
+fn v1_remains_incomplete_even_with_trusted_runtime_shell() {
+    let document =
+        parse_envelope_document(r#"{"actions":[{"shell":{"command":"cast call 0xabc 'x()'"}}]}"#)
+            .expect("v1 envelope");
+    let trusted = TaskAnalysisContext::trusted(
+        ShellType::Posix,
+        Some(std::path::Path::new("/repo")),
+        Some("policy-v1"),
+    );
+    let decision = decide_document(
+        &document,
+        vec![issue_provenance()],
+        &enforcing_gate(),
+        BoundaryCapability::Enforceable,
+        Some(&trusted),
+    );
+    assert!(!decision.complete);
+}
+
+#[test]
+fn nested_facts_cannot_launder_an_unmodelled_same_body_child() {
+    let envelope = TaskEnvelopeInput {
+        actions: vec![ProposedAction::Shell {
+            command: "sh -c 'cast call 0xabc \"x()\"; cat ~/.ssh/id_ed25519'".to_string(),
+        }],
+        ..TaskEnvelopeInput::default()
+    };
+    let context = TaskAnalysisContext::trusted(
+        ShellType::Posix,
+        Some(std::path::Path::new("/repo")),
+        Some("policy-v1"),
+    );
+    let decision = decide_with_analysis_context(
+        &envelope,
+        vec![issue_provenance()],
+        &enforcing_gate(),
+        BoundaryCapability::Enforceable,
+        &context,
+    );
+    assert!(!decision.complete);
 }
 
 #[test]
@@ -365,4 +481,35 @@ fn requested_effects_can_only_narrow_the_result() {
     assert!(decision
         .inferred_effects
         .contains(&CommandEffectKind::FilesystemWrite));
+}
+
+#[test]
+fn requested_effects_cannot_understate_an_atomic_action() {
+    let envelope = TaskEnvelopeInput {
+        actions: vec![ProposedAction::PackageInstall {
+            ecosystem: "npm".to_string(),
+            package: "left-pad".to_string(),
+        }],
+        requested_effects: [CommandEffectKind::NetworkEgress].into_iter().collect(),
+        ..TaskEnvelopeInput::default()
+    };
+    let decision = decide(
+        &envelope,
+        Vec::new(),
+        &TaskGatePolicy {
+            mode: TaskGateMode::Enforce,
+            ..TaskGatePolicy::default()
+        },
+        BoundaryCapability::Enforceable,
+    );
+
+    assert!(decision
+        .unrequested_effects
+        .contains(&CommandEffectKind::PackageInstall));
+    assert!(decision
+        .unrequested_effects
+        .contains(&CommandEffectKind::FilesystemWrite));
+    assert!(decision
+        .denied_effects
+        .is_superset(&decision.unrequested_effects));
 }

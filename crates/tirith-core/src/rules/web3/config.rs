@@ -280,7 +280,14 @@ pub(crate) fn rpc_reference(
                 completeness.add(IncompleteReason::RpcPathMatcherContextMissing);
                 RpcPathMatchOutcomes::default()
             }
-            Some(matchers) => match RpcPathMatchOutcomes::compare(matchers, url.path()) {
+            Some(matchers) => match RpcPathMatchOutcomes::compare(
+                matchers,
+                url.scheme(),
+                host.as_deref().unwrap_or_default(),
+                url.port(),
+                raw_url_path(value),
+                url.path(),
+            ) {
                 Ok((outcomes, truncated)) => {
                     if truncated {
                         completeness.add(IncompleteReason::RpcPathMatcherBudgetExceeded);
@@ -291,7 +298,10 @@ pub(crate) fn rpc_reference(
                     completeness.add(IncompleteReason::RpcPathMatcherBudgetExceeded);
                     RpcPathMatchOutcomes::default()
                 }
-                Err(RpcPathMatcherValidationError::Invalid) => {
+                Err(
+                    RpcPathMatcherValidationError::Invalid
+                    | RpcPathMatcherValidationError::Ambiguous,
+                ) => {
                     completeness.add(IncompleteReason::RpcPathMatcherInvalid);
                     RpcPathMatchOutcomes::default()
                 }
@@ -348,6 +358,23 @@ pub(crate) fn rpc_reference(
         source,
         span,
     }
+}
+
+/// Return the path spelling supplied by the caller, without query/fragment.
+/// This is consumed transiently by trusted policy probes and never retained in
+/// a fact. Comparing it with `Url::path()` catches dot-segment and encoding
+/// normalizations that would otherwise let policy and execution see different
+/// paths.
+fn raw_url_path(value: &str) -> &str {
+    let Some((_, remainder)) = value.split_once("://") else {
+        return "/";
+    };
+    let Some(path_start) = remainder.find('/') else {
+        return "/";
+    };
+    let path = &remainder[path_start..];
+    let end = path.find(['?', '#']).unwrap_or(path.len());
+    &path[..end]
 }
 
 fn toml_string(value: &toml::Value) -> Option<&str> {
@@ -607,7 +634,9 @@ pub(crate) fn anchor_selectors(context: &Web3ParseContextV2) -> StaticSelectors 
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::{RpcPathMatcherId, MAX_TRUSTED_RPC_PATH_MATCHERS};
+    use super::super::model::{
+        RpcPathMatcherId, MAX_RETAINED_RPC_PATH_MATCH_OUTCOMES, MAX_TRUSTED_RPC_PATH_MATCHERS,
+    };
     use super::*;
 
     #[test]
@@ -811,6 +840,217 @@ mod tests {
         let json = serde_json::to_string(&reference).unwrap();
         assert!(!json.contains("rpc-path.invalid"));
         assert!(!json.contains("/v3"));
+    }
+
+    #[test]
+    fn raw_and_canonical_path_disagreement_is_incomplete() {
+        let id = RpcPathMatcherId::new(41);
+        let matchers = vec![TrustedRpcPathPrefix::for_origin(
+            id,
+            "/private",
+            "https",
+            "rpc.example",
+            None,
+            false,
+        )
+        .unwrap()];
+        let mut completeness = Completeness::complete();
+        let reference = rpc_reference(
+            "https://rpc.example/trusted/../private",
+            SelectorSource::ExplicitFlag,
+            None,
+            Some(&matchers),
+            &mut completeness,
+        );
+        assert_eq!(reference.trusted_path_outcome(id), None);
+        assert!(completeness
+            .gaps()
+            .any(|gap| gap == IncompleteReason::RpcPathMatcherInvalid));
+    }
+
+    #[test]
+    fn path_probe_retention_is_scoped_to_the_observed_origin() {
+        let mut matchers = (0..100)
+            .map(|index| {
+                TrustedRpcPathPrefix::for_origin(
+                    RpcPathMatcherId::new(index),
+                    "/private",
+                    "https",
+                    "unrelated.example",
+                    None,
+                    false,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let relevant = RpcPathMatcherId::new(100);
+        matchers.push(
+            TrustedRpcPathPrefix::for_origin(
+                relevant,
+                "/private",
+                "https",
+                "rpc.example",
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let mut completeness = Completeness::complete();
+        let reference = rpc_reference(
+            "https://rpc.example/private",
+            SelectorSource::ExplicitFlag,
+            None,
+            Some(&matchers),
+            &mut completeness,
+        );
+        assert!(completeness.is_complete());
+        assert_eq!(reference.trusted_path_outcome(relevant), Some(true));
+        assert_eq!(reference.path_match_outcomes.as_slice().len(), 1);
+    }
+
+    #[test]
+    fn path_probe_origin_uses_effective_default_port() {
+        let id = RpcPathMatcherId::new(150);
+        let matcher = TrustedRpcPathPrefix::for_origin(
+            id,
+            "/private",
+            "https",
+            "rpc.example",
+            Some(443),
+            false,
+        )
+        .unwrap();
+        for url in [
+            "https://rpc.example/private",
+            "https://rpc.example:443/private",
+        ] {
+            let mut completeness = Completeness::complete();
+            let reference = rpc_reference(
+                url,
+                SelectorSource::ExplicitFlag,
+                None,
+                Some(std::slice::from_ref(&matcher)),
+                &mut completeness,
+            );
+            assert!(completeness.is_complete());
+            assert_eq!(reference.trusted_path_outcome(id), Some(true));
+        }
+    }
+
+    #[test]
+    fn duplicate_and_over_retained_relevant_path_probes_fail_closed() {
+        let duplicate_a = RpcPathMatcherId::new(201);
+        let duplicate_b = RpcPathMatcherId::new(202);
+        let duplicate = [duplicate_a, duplicate_b]
+            .into_iter()
+            .map(|id| {
+                TrustedRpcPathPrefix::for_origin(
+                    id,
+                    "/private",
+                    "https",
+                    "rpc.example",
+                    None,
+                    false,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut complete = Completeness::complete();
+        let reference = rpc_reference(
+            "https://rpc.example/private",
+            SelectorSource::ExplicitFlag,
+            None,
+            Some(&duplicate),
+            &mut complete,
+        );
+        assert_eq!(reference.trusted_path_outcome(duplicate_a), Some(true));
+        assert_eq!(reference.trusted_path_outcome(duplicate_b), Some(true));
+
+        let same_id = vec![
+            TrustedRpcPathPrefix::for_origin(
+                RpcPathMatcherId::new(250),
+                "/private",
+                "https",
+                "rpc.example",
+                None,
+                false,
+            )
+            .unwrap(),
+            TrustedRpcPathPrefix::for_origin(
+                RpcPathMatcherId::new(250),
+                "/other",
+                "https",
+                "rpc.example",
+                None,
+                false,
+            )
+            .unwrap(),
+        ];
+        let mut duplicate_id = Completeness::complete();
+        let reference = rpc_reference(
+            "https://rpc.example/private",
+            SelectorSource::ExplicitFlag,
+            None,
+            Some(&same_id),
+            &mut duplicate_id,
+        );
+        assert!(reference.path_match_outcomes.as_slice().is_empty());
+        assert!(duplicate_id
+            .gaps()
+            .any(|gap| gap == IncompleteReason::RpcPathMatcherInvalid));
+
+        let relevant = (0..=MAX_RETAINED_RPC_PATH_MATCH_OUTCOMES)
+            .map(|index| {
+                TrustedRpcPathPrefix::for_origin(
+                    RpcPathMatcherId::new(300 + index as u64),
+                    "/private",
+                    "https",
+                    "rpc.example",
+                    None,
+                    false,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut incomplete = Completeness::complete();
+        let reference = rpc_reference(
+            "https://rpc.example/private",
+            SelectorSource::ExplicitFlag,
+            None,
+            Some(&relevant),
+            &mut incomplete,
+        );
+        assert_eq!(
+            reference.path_match_outcomes.as_slice().len(),
+            MAX_RETAINED_RPC_PATH_MATCH_OUTCOMES
+        );
+        assert!(incomplete
+            .gaps()
+            .any(|gap| gap == IncompleteReason::RpcPathMatcherBudgetExceeded));
+    }
+
+    #[test]
+    fn path_prefixes_are_segment_bounded() {
+        let id = RpcPathMatcherId::new(500);
+        let matcher =
+            TrustedRpcPathPrefix::for_origin(id, "/rpc", "https", "rpc.example", None, false)
+                .unwrap();
+        for (url, matched) in [
+            ("https://rpc.example/rpc", true),
+            ("https://rpc.example/rpc/v1", true),
+            ("https://rpc.example/rpc2", false),
+        ] {
+            let mut completeness = Completeness::complete();
+            let reference = rpc_reference(
+                url,
+                SelectorSource::ExplicitFlag,
+                None,
+                Some(std::slice::from_ref(&matcher)),
+                &mut completeness,
+            );
+            assert!(completeness.is_complete());
+            assert_eq!(reference.trusted_path_outcome(id), Some(matched));
+        }
     }
 
     #[test]

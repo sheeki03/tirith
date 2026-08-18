@@ -20,9 +20,9 @@ use std::path::Path;
 use tirith_core::effects::{BoundaryCapability, CommandEffectKind};
 use tirith_core::policy::Policy;
 use tirith_core::task::{
-    assign_provenance, decide, decision_projection, parse_envelope, rejection_token,
-    validate_envelope, EnvelopeRejection, IngressAdapter, TaskDecision, TaskEnvelopeInput,
-    MAX_INLINE_BYTES,
+    assign_provenance, decide_document, document_decision_projection, parse_envelope_document,
+    rejection_token, validate_envelope, EnvelopeRejection, IngressAdapter, TaskDecision,
+    MAX_TASK_DOCUMENT_BYTES,
 };
 
 /// Exit codes, matching the repository's existing convention: 0 clean, 1 a
@@ -36,7 +36,7 @@ const EXIT_INPUT: i32 = 2;
 /// The cap is applied to the READ, not after it, so an oversized file cannot
 /// be materialized in full just to be rejected.
 fn read_envelope(path: Option<&Path>) -> Result<String, String> {
-    let cap = MAX_INLINE_BYTES.saturating_mul(2);
+    let cap = MAX_TASK_DOCUMENT_BYTES;
     let mut buffer = String::new();
     match path {
         Some(path) => {
@@ -103,8 +103,24 @@ fn effect_token(effect: CommandEffectKind) -> &'static str {
 // single renderer makes that structural instead of something a test has to keep
 // re-proving. The human rendering below is presentation only.
 
-fn print_human(decision: &TaskDecision, rejections: &[EnvelopeRejection]) {
+fn print_human(
+    document: &tirith_core::task_envelope::TaskEnvelopeDocument,
+    decision: &TaskDecision,
+    rejections: &[EnvelopeRejection],
+) {
     println!("tirith task check (diagnostic — nothing was executed)");
+    println!("  envelope:       schema v{}", document.version);
+    if document
+        .envelope
+        .actions
+        .iter()
+        .any(|action| matches!(action, tirith_core::task::ProposedAction::Shell { .. }))
+    {
+        println!(
+            "  shell claims:   {:?} (diagnostic only)",
+            document.shell_claims
+        );
+    }
     println!("  gate mode:      {:?}", decision.mode);
     println!(
         "  assessment:     {}",
@@ -172,8 +188,8 @@ pub fn run(path: Option<&Path>, adapter: Option<&str>, json: bool) -> i32 {
         }
     };
 
-    let envelope: TaskEnvelopeInput = match parse_envelope(&raw) {
-        Ok(envelope) => envelope,
+    let document = match parse_envelope_document(&raw) {
+        Ok(document) => document,
         Err(rejection) => {
             let token = rejection_token(&rejection);
             if json {
@@ -192,7 +208,8 @@ pub fn run(path: Option<&Path>, adapter: Option<&str>, json: bool) -> i32 {
         }
     };
 
-    let rejections = validate_envelope(&envelope);
+    let envelope = &document.envelope;
+    let rejections = validate_envelope(envelope);
 
     // Local discovery only. A diagnostic must not reach the network, so this
     // deliberately uses the offline policy path.
@@ -207,17 +224,21 @@ pub fn run(path: Option<&Path>, adapter: Option<&str>, json: bool) -> i32 {
     // A CLI run is advisory: it reports what WOULD happen, and cannot itself
     // stop anything, so it declares observe-only rather than claiming an
     // enforcement capability it does not have.
-    let decision = decide(
-        &envelope,
+    let decision = decide_document(
+        &document,
         provenance,
         &policy.task_gate,
         BoundaryCapability::ObserveOnly,
+        None,
     );
 
     if json {
-        println!("{}", decision_projection(&decision, &rejections));
+        println!(
+            "{}",
+            document_decision_projection(&document, &decision, &rejections)
+        );
     } else {
-        print_human(&decision, &rejections);
+        print_human(&document, &decision, &rejections);
     }
 
     // Exit 1 when something was refused or the picture is incomplete, so a

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod agent_origin;
 pub mod aliases;
 pub mod approval;
@@ -56,6 +58,7 @@ pub mod normalize;
 pub mod npm_command;
 pub mod osv_correlation;
 pub mod output;
+pub mod package_approval;
 pub mod package_risk;
 pub mod parse;
 pub mod path_audit;
@@ -91,7 +94,9 @@ pub mod sudo_session;
 pub mod suppression;
 pub mod taint;
 pub mod task;
+pub mod task_analysis;
 pub mod task_boundary;
+pub mod task_envelope;
 pub mod text_confusables;
 pub mod threatdb;
 pub mod threatdb_api;

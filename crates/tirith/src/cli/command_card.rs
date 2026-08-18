@@ -9,8 +9,10 @@ use std::io::Write;
 use std::path::Path;
 
 use tirith_core::command_card::{
-    self, Card, CardError, CardSignature, VerifyFailure, SECRET_KEY_LEN,
+    self, key_id_for_secret_key, Card, CardError, CardSignature, VerifyFailure, CARD_SCHEMA_V2,
+    CARD_SCHEMA_V3, SECRET_KEY_LEN,
 };
+use tirith_core::tokenize::ShellType;
 use tirith_core::util::{read_regular_capped, OpenRegularError};
 
 /// Read cap for a card JSON file in `sign`/`verify`. Matches the engine
@@ -45,12 +47,99 @@ fn describe_open_error(what: &str, path: &str, cap: u64, e: &OpenRegularError) -
     }
 }
 
+/// Derive exact Web3 bindings through the same parser/policy compiler used by
+/// enforcement. This is intentionally local-only and uses the fully resolved
+/// policy for the current working directory.
+fn derive_exact_web3_bindings(
+    command: &str,
+    approval_key_id: &str,
+    shell: ShellType,
+) -> Result<Option<tirith_core::command_card::Web3CardBindings>, String> {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string());
+    let policy = tirith_core::policy::Policy::discover(cwd.as_deref());
+    if policy.web3_guard.command_card_key_ids.is_empty() {
+        return Ok(None);
+    }
+    let policy_identity = policy.enforcement_projection_hash();
+    let bindings = tirith_core::rules::web3_gate::command_card_bindings_for_command(
+        command,
+        shell,
+        cwd.as_deref(),
+        &policy.web3_guard,
+        &policy_identity,
+        Some(approval_key_id),
+    )
+    .map_err(|error| format!("derive exact Web3 bindings: {error}"))?;
+    if bindings.is_some()
+        && !policy
+            .web3_guard
+            .command_card_key_ids
+            .contains(approval_key_id)
+    {
+        return Err(format!(
+            "signing key {approval_key_id} is not listed in web3_guard.command_card_key_ids"
+        ));
+    }
+    Ok(bindings)
+}
+
+fn configured_web3_approval_keys() -> Vec<String> {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string());
+    let policy = tirith_core::policy::Policy::discover(cwd.as_deref());
+    policy
+        .web3_guard
+        .command_card_key_ids
+        .iter()
+        .cloned()
+        .collect()
+}
+
+fn shell_binding_token(shell: ShellType) -> &'static str {
+    match shell {
+        ShellType::Posix => "posix",
+        ShellType::Fish => "fish",
+        ShellType::PowerShell => "powershell",
+        ShellType::Cmd => "cmd",
+    }
+}
+
+fn safe_card_command_binding(card: &Card) -> (Option<String>, Option<&str>) {
+    let digest = card.command_sha256.as_deref().and_then(|digest| {
+        (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| digest.to_ascii_lowercase())
+    });
+    let shell = card
+        .command_shell
+        .as_deref()
+        .filter(|shell| matches!(*shell, "posix" | "fish" | "powershell" | "cmd"));
+    (digest, shell)
+}
+
+/// A legacy unsigned schema-v2 card can be migrated using the parser dialect
+/// selected by the signing invocation. Existing bindings are never rewritten:
+/// a different `--shell` requires regenerating and reviewing the card rather
+/// than silently changing its meaning.
+fn migrate_missing_web3_shell_binding(card: &mut Card, shell: ShellType) {
+    if card.schema_version == CARD_SCHEMA_V2 {
+        if let Some(bindings) = card.web3.as_mut() {
+            if bindings.shell.is_none() {
+                bindings.shell = Some(shell_binding_token(shell).to_string());
+            }
+        }
+    }
+}
+
 /// `tirith command-card create` — build an unsigned card and print it as JSON.
 ///
 /// Flag-driven when `--command` is supplied; otherwise prompts on the TTY.
 #[allow(clippy::too_many_arguments)]
 pub fn create(
     command: Option<String>,
+    shell: ShellType,
     expected_domains: Vec<String>,
     script_sha256: Option<String>,
     writes: Vec<String>,
@@ -79,6 +168,17 @@ pub fn create(
         );
         return 2;
     }
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string());
+    if let Err(error) = tirith_core::rules::web3_gate::refuse_command_card_secret_material(
+        &command,
+        shell,
+        cwd.as_deref(),
+    ) {
+        let _ = emit_error(json, "tirith command-card create", &error.to_string());
+        return 1;
+    }
 
     // Default expiry: 90 days out (usable but not forever).
     let expires = expires.unwrap_or_else(|| {
@@ -101,14 +201,53 @@ pub fn create(
         return 2;
     }
 
-    let card = Card::new(
-        command,
+    let mut card = match Card::new_privacy_preserving(
+        &command,
+        shell_binding_token(shell),
         expected_domains,
         script_sha256,
         writes,
         requires_sudo,
         expires,
-    );
+    ) {
+        Ok(card) => card,
+        Err(error) => {
+            let _ = emit_error(json, "tirith command-card create", &error.to_string());
+            return 1;
+        }
+    };
+
+    // When policy names one approval key, `create` can emit the complete
+    // unsigned schema-v2 template immediately. With several configured keys the
+    // subsequent `sign --key ...` step derives the same template using the key
+    // actually selected by the operator.
+    let configured_web3_keys = configured_web3_approval_keys();
+    if let Some(key_id) = configured_web3_keys.first() {
+        match derive_exact_web3_bindings(&command, key_id, shell) {
+            Ok(Some(bindings)) if configured_web3_keys.len() == 1 => {
+                match card.with_web3_bindings(bindings) {
+                    Ok(promoted) => card = promoted,
+                    Err(error) => {
+                        let _ = emit_error(
+                            json,
+                            "tirith command-card create",
+                            &format!("build exact Web3 template: {error}"),
+                        );
+                        return 1;
+                    }
+                }
+            }
+            // With several configured keys, this call is a fail-closed
+            // authoring preflight only: `sign --key` derives the template with
+            // the key the operator actually selected.
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(error) => {
+                let _ = emit_error(json, "tirith command-card create", &error);
+                return 1;
+            }
+        }
+    }
 
     match card.to_json_pretty() {
         Ok(s) => {
@@ -134,7 +273,13 @@ pub fn create(
 
 /// `tirith command-card sign --key <ed25519-priv.bin> <card.json>` — sign a
 /// card in place (rewrites the file with the `signature` block populated).
-pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
+pub fn sign(
+    key_path: &str,
+    card_path: &str,
+    reviewed_command: Option<&str>,
+    shell: ShellType,
+    json: bool,
+) -> i32 {
     // Every fatal branch below: a broken-pipe JSON write → 2, otherwise 1.
     let secret = match read_secret_key(Path::new(key_path)) {
         Ok(k) => k,
@@ -173,6 +318,111 @@ pub fn sign(key_path: &str, card_path: &str, json: bool) -> i32 {
             return 1;
         }
     };
+
+    let reviewed_command = if card.schema_version == CARD_SCHEMA_V3 {
+        let Some(command) = reviewed_command else {
+            if !emit_error(
+                json,
+                "tirith command-card sign",
+                "--command is required to verify a privacy-safe card digest before signing",
+            ) {
+                return 2;
+            }
+            return 1;
+        };
+        if !card.command_matches_for_shell(command, shell_binding_token(shell)) {
+            if !emit_error(
+                json,
+                "tirith command-card sign",
+                "the reviewed command does not match the card digest",
+            ) {
+                return 2;
+            }
+            return 1;
+        }
+        command
+    } else {
+        let command = reviewed_command.unwrap_or(&card.command);
+        if command.is_empty()
+            || !card.command_matches_for_shell(command, shell_binding_token(shell))
+        {
+            if !emit_error(
+                json,
+                "tirith command-card sign",
+                "the reviewed command does not match the legacy card",
+            ) {
+                return 2;
+            }
+            return 1;
+        }
+        command
+    };
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string());
+    if let Err(error) = tirith_core::rules::web3_gate::refuse_command_card_secret_material(
+        reviewed_command,
+        shell,
+        cwd.as_deref(),
+    ) {
+        if !emit_error(json, "tirith command-card sign", &error.to_string()) {
+            return 2;
+        }
+        return 1;
+    }
+
+    if card.schema_version == 1 && card.web3.is_none() {
+        let key_id = key_id_for_secret_key(&secret);
+        match derive_exact_web3_bindings(&card.command, &key_id, shell) {
+            Ok(Some(bindings)) => match card.with_web3_bindings(bindings) {
+                Ok(promoted) => card = promoted,
+                Err(error) => {
+                    if !emit_error(
+                        json,
+                        "tirith command-card sign",
+                        &format!("build exact Web3 template: {error}"),
+                    ) {
+                        return 2;
+                    }
+                    return 1;
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                if !emit_error(json, "tirith command-card sign", &error) {
+                    return 2;
+                }
+                return 1;
+            }
+        }
+    }
+
+    migrate_missing_web3_shell_binding(&mut card, shell);
+
+    if card.schema_version != CARD_SCHEMA_V3 {
+        let selected_shell = shell_binding_token(shell);
+        if card
+            .web3
+            .as_ref()
+            .and_then(|bindings| bindings.shell.as_deref())
+            .is_some_and(|bound| bound != selected_shell)
+        {
+            if !emit_error(
+                json,
+                "tirith command-card sign",
+                "the selected shell differs from the reviewed legacy Web3 binding",
+            ) {
+                return 2;
+            }
+            return 1;
+        }
+        if let Err(error) = card.migrate_command_privacy(selected_shell) {
+            if !emit_error(json, "tirith command-card sign", &error.to_string()) {
+                return 2;
+            }
+            return 1;
+        }
+    }
 
     if let Err(e) = card.sign(&secret) {
         if !emit_error(json, "tirith command-card sign", &e.to_string()) {
@@ -279,11 +529,17 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
 
     let verified = result.is_ok();
     let reason = result.as_ref().err().map(VerifyFailure::reason);
+    let (safe_command_sha256, safe_command_shell) = safe_card_command_binding(&card);
+    let web3_authorization_capable = card.is_privacy_safe() && card.web3.is_some();
 
     if json {
         let v = serde_json::json!({
             "verified": verified,
-            "command": card.command,
+            "schema_version": card.schema_version,
+            "command_sha256": safe_command_sha256,
+            "command_shell": safe_command_shell,
+            "legacy_command_redacted": !card.command.is_empty(),
+            "web3_authorization_capable": web3_authorization_capable,
             "expires": card.expires,
             "key_id": card.signature.as_ref().map(|s: &CardSignature| s.key_id.clone()),
             "reason": reason,
@@ -300,12 +556,23 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
         // Cards are untrusted even when verification succeeds: the signer may
         // intentionally attest to a command containing terminal-control or
         // deceptive Unicode. Never render card fields before sanitizing them.
-        let display_command = human_display_field(&card.command);
+        let display_command = safe_command_sha256
+            .as_deref()
+            .map(|digest| format!("sha256:{digest}"))
+            .unwrap_or_else(|| "<legacy command redacted>".to_string());
         let display_expiry = human_display_field(&card.expires);
         if verified {
             println!("VERIFIED: card is signed by a trusted key and has not expired.");
             println!("  command: {display_command}");
             println!("  expires: {display_expiry}");
+            println!(
+                "  mode: {}",
+                if web3_authorization_capable {
+                    "privacy-safe exact Web3 binding"
+                } else {
+                    "diagnostic-only"
+                }
+            );
         } else {
             let display_reason = human_display_field(reason.as_deref().unwrap_or("unknown reason"));
             let display_trusted_dir = human_display_field(&trusted_dir.display().to_string());
@@ -330,7 +597,7 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
 ///
 /// PRIVACY: an explicit fetch reveals the user's IP + timestamp to the
 /// maintainer's domain (documented in `--help`). UNIX-ONLY (v1): reuses the
-/// hardened `#[cfg(unix)]` `runner::download_to_path`; on Windows the no-network
+/// hardened typed remote-download transaction; on Windows the no-network
 /// subcommands remain and the user copies the card in manually.
 #[cfg(unix)]
 pub fn fetch(url: &str, json: bool) -> i32 {
@@ -348,110 +615,36 @@ pub fn fetch(url: &str, json: bool) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-        if !emit_error(
-            json,
-            "tirith command-card fetch",
-            &format!("create {}: {e}", cache_dir.display()),
-        ) {
-            return 2;
-        }
-        return 1;
-    }
-
-    // Download to a temp file, validate it parses, then move to <sha256>.json.
-    // The content hash names the file, so the dest is unknown until downloaded.
-    let tmp = match tempfile::NamedTempFile::new_in(&cache_dir) {
-        Ok(t) => t,
-        Err(e) => {
-            if !emit_error(
-                json,
-                "tirith command-card fetch",
-                &format!("temp file: {e}"),
-            ) {
+    // Pure URL/cache binding and policy evaluation happen before the cache root
+    // or any temp file exists. Domain DNS remains inside the runner, after the
+    // pending authorization is consumed.
+    let (binding, pending) = match prepare_command_card_fetch(url, &cache_dir) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if !emit_error(json, "tirith command-card fetch", &error) {
                 return 2;
             }
             return 1;
         }
     };
-    let dl = match tirith_core::runner::download_to_path(url, tmp.path(), None) {
-        Ok(r) => r,
-        Err(e) => {
-            if !emit_error(json, "tirith command-card fetch", &e) {
+    let operation = binding.operation();
+    let dl = match tirith_core::runner::download_and_cache_command_card_authorized(
+        url,
+        &cache_dir,
+        CARD_READ_CAP,
+        pending,
+        &operation,
+    ) {
+        Ok(downloaded) => downloaded,
+        Err(error) => {
+            if !emit_error(json, "tirith command-card fetch", &error) {
                 return 2;
             }
             return 1;
         }
     };
-
-    // Reject an oversized download before reading it: every card READ refuses
-    // bodies above `CARD_READ_CAP`, so a larger card would cache but never read
-    // back (a dead cache entry). Gating here drops the temp, never writing it.
-    if dl.size > CARD_READ_CAP {
-        if !emit_error(
-            json,
-            "tirith command-card fetch",
-            &format!(
-                "downloaded card is {} bytes, exceeding the {CARD_READ_CAP}-byte read cap; \
-                 not caching (it could never be read back)",
-                dl.size
-            ),
-        ) {
-            return 2;
-        }
-        return 1;
-    }
-
-    let bytes = match std::fs::read(tmp.path()) {
-        Ok(b) => b,
-        Err(e) => {
-            if !emit_error(
-                json,
-                "tirith command-card fetch",
-                &format!("read download: {e}"),
-            ) {
-                return 2;
-            }
-            return 1;
-        }
-    };
-    // Validate it is a card before caching — refuse arbitrary content.
-    if Card::from_json(&bytes).is_err() {
-        if !emit_error(
-            json,
-            "tirith command-card fetch",
-            "downloaded content is not a valid command card (JSON parse failed)",
-        ) {
-            return 2;
-        }
-        return 1;
-    }
-
-    let sha = command_card::sha256_hex(&bytes);
-    let dest = cache_dir.join(format!("{sha}.json"));
-    // Persist atomically. The cache is content-addressed, so a refetch is
-    // idempotent; as belt-and-suspenders, treat "dest already holds these exact
-    // bytes" as a cache hit rather than an error.
-    if let Err(e) = tmp.persist(&dest) {
-        let already_cached = e.error.kind() == std::io::ErrorKind::AlreadyExists
-            && std::fs::read(&dest)
-                .map(|existing| existing == bytes)
-                .unwrap_or(false);
-        if !already_cached {
-            if !emit_error(
-                json,
-                "tirith command-card fetch",
-                &format!("persist {}: {}", dest.display(), e.error),
-            ) {
-                return 2;
-            }
-            return 1;
-        }
-        // Cache hit: identical bytes already at `dest`. Report it as success.
-    }
-    // Rename durability: fsync the parent dir so the cached card's entry survives
-    // a crash (the verify hot path reads it back). LOGGED, not propagated.
-    tirith_core::util::fsync_parent_dir_logged(&dest, "cached card");
+    let dest = dl.path;
+    let sha = dl.sha256;
 
     if json {
         let v = serde_json::json!({
@@ -477,6 +670,51 @@ pub fn fetch(url: &str, json: bool) -> i32 {
     0
 }
 
+#[cfg(unix)]
+fn prepare_command_card_fetch(
+    url: &str,
+    cache_dir: &Path,
+) -> Result<
+    (
+        tirith_core::runner::RemoteRunBoundaryBinding,
+        tirith_core::task_boundary::PendingBoundaryAuthorization<
+            tirith_core::task_boundary::RemoteScriptRunBoundary,
+        >,
+    ),
+    String,
+> {
+    let binding = tirith_core::runner::remote_command_card_cache_boundary_binding(
+        url,
+        cache_dir,
+        CARD_READ_CAP,
+    )?;
+    let operation = binding.operation();
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    let policy = tirith_core::policy::Policy::discover(cwd.as_deref());
+    let pending = tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<
+        tirith_core::task_boundary::RemoteScriptRunBoundary,
+    >(
+        &operation,
+        &policy.task_gate,
+        &tirith_core::task_analysis::TaskAnalysisContext::default(),
+    );
+    let assessment = match &pending {
+        Ok(pending) => Some(pending.assessment()),
+        Err(error) => error.assessment(),
+    };
+    if let Some(assessment) = assessment {
+        if let Err(error) = tirith_core::audit::log_task_boundary_assessment(assessment) {
+            tirith_core::audit::audit_diagnostic(format!(
+                "task-boundary audit append failed: {error}"
+            ));
+        }
+    }
+    let pending = pending.map_err(|error| error.to_string())?;
+    Ok((binding, pending))
+}
+
 /// Read a 32-byte ed25519 secret key (raw 32 bytes, hex, or base64).
 fn read_secret_key(path: &Path) -> Result<[u8; SECRET_KEY_LEN], CardError> {
     // Hardened, capped read of the operator-supplied `--key` path. Map open
@@ -484,25 +722,26 @@ fn read_secret_key(path: &Path) -> Result<[u8; SECRET_KEY_LEN], CardError> {
     // `BadKey` (not a usable key file regardless of why the read refused).
     let raw = match read_regular_capped(path, SECRET_KEY_READ_CAP) {
         Ok(b) => b,
-        Err(OpenRegularError::Io(e)) => return Err(CardError::Io(e)),
+        Err(OpenRegularError::Io(_)) => {
+            return Err(CardError::Io(std::io::Error::other(
+                "command-card signing key could not be read",
+            )))
+        }
         Err(OpenRegularError::NotFound) => {
             return Err(CardError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("{}: no such key file", path.display()),
+                "command-card signing key file was not found",
             )))
         }
         Err(OpenRegularError::NotRegularFile) => {
-            return Err(CardError::BadKey(format!(
-                "key file {} is not a regular file (refusing a FIFO/device/socket)",
-                path.display()
-            )))
+            return Err(CardError::BadKey(
+                "command-card signing key is not a regular file".to_string(),
+            ))
         }
         Err(OpenRegularError::TooLarge) => {
-            return Err(CardError::BadKey(format!(
-                "key file {} exceeds the {SECRET_KEY_READ_CAP}-byte cap; \
-                 expected a 32-byte ed25519 key (raw, hex, or base64)",
-                path.display()
-            )))
+            return Err(CardError::BadKey(
+                "command-card signing key exceeds the bounded key-file size limit".to_string(),
+            ))
         }
     };
     if raw.len() == SECRET_KEY_LEN {
@@ -529,10 +768,9 @@ fn read_secret_key(path: &Path) -> Result<[u8; SECRET_KEY_LEN], CardError> {
             }
         }
     }
-    Err(CardError::BadKey(format!(
-        "key file must contain a 32-byte ed25519 private key (raw, hex, or base64); got {} bytes",
-        raw.len()
-    )))
+    Err(CardError::BadKey(
+        "command-card signing key has an unsupported encoding or length".to_string(),
+    ))
 }
 
 /// Write `contents` to `path` atomically (temp-in-same-dir, flushed, renamed)
@@ -585,7 +823,10 @@ fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{emit_error, human_display_field, write_card_atomic};
+    use super::{
+        emit_error, human_display_field, migrate_missing_web3_shell_binding, read_secret_key,
+        write_card_atomic, CARD_READ_CAP, SECRET_KEY_READ_CAP,
+    };
 
     #[test]
     fn card_human_fields_strip_terminal_and_line_injection() {
@@ -621,6 +862,89 @@ mod tests {
     }
 
     #[test]
+    fn signing_key_read_errors_are_categorical_and_path_free() {
+        let root = tempfile::tempdir().unwrap();
+        let canary = "C04-private-signing-key-path";
+        let missing = root.path().join(canary);
+        let missing_error = read_secret_key(&missing).unwrap_err().to_string();
+        assert_eq!(missing_error, "command-card signing key file was not found");
+
+        let malformed = root.path().join(format!("{canary}-malformed"));
+        std::fs::write(&malformed, b"not-a-key").unwrap();
+        let malformed_error = read_secret_key(&malformed).unwrap_err().to_string();
+        assert_eq!(
+            malformed_error,
+            "command-card signing key has an unsupported encoding or length"
+        );
+
+        let oversized = root.path().join(format!("{canary}-oversized"));
+        std::fs::write(&oversized, vec![0u8; SECRET_KEY_READ_CAP as usize + 1]).unwrap();
+        let oversized_error = read_secret_key(&oversized).unwrap_err().to_string();
+        assert_eq!(
+            oversized_error,
+            "command-card signing key exceeds the bounded key-file size limit"
+        );
+
+        for rendered in [missing_error, malformed_error, oversized_error] {
+            assert!(!rendered.contains(canary));
+            assert!(!rendered.contains(root.path().to_string_lossy().as_ref()));
+        }
+
+        #[cfg(unix)]
+        {
+            let directory_error = read_secret_key(root.path()).unwrap_err().to_string();
+            assert_eq!(
+                directory_error,
+                "command-card signing key is not a regular file"
+            );
+            assert!(!directory_error.contains(root.path().to_string_lossy().as_ref()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_command_card_fetch_creates_no_cache_or_temp_file() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cards");
+        let binding = tirith_core::runner::remote_command_card_cache_boundary_binding(
+            "https://1.1.1.1/card.json",
+            &cache,
+            CARD_READ_CAP,
+        )
+        .unwrap();
+        let operation = binding.operation();
+        assert!(operation
+            .boundary_effects
+            .contains(&tirith_core::effects::CommandEffectKind::NetworkEgress));
+        assert!(operation
+            .boundary_effects
+            .contains(&tirith_core::effects::CommandEffectKind::FilesystemWrite));
+        assert!(operation
+            .boundary_effects
+            .contains(&tirith_core::effects::CommandEffectKind::PersistenceChange));
+        let gate = tirith_core::web3_policy::TaskGatePolicy {
+            mode: tirith_core::web3_policy::TaskGateMode::Enforce,
+            effects_denied_for_untrusted_sources: [
+                tirith_core::effects::CommandEffectKind::NetworkEgress,
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        let result = tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<
+            tirith_core::task_boundary::RemoteScriptRunBoundary,
+        >(
+            &operation,
+            &gate,
+            &tirith_core::task_analysis::TaskAnalysisContext::default(),
+        );
+        assert!(result.is_err());
+        assert!(!cache.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn write_card_atomic_writes_and_replaces_without_leaving_temp() {
         // F3: the write lands exactly, an overwrite fully replaces, and no temp
         // file is left behind. (The pre-rename `sync_all()` is exercised here —
@@ -651,6 +975,53 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1, "no temp file left behind: {entries:?}");
         assert_eq!(entries[0], path);
+    }
+
+    #[test]
+    fn signing_migrates_only_a_missing_v2_shell_binding() {
+        let mut card = tirith_core::command_card::Card::new(
+            "cast send 0xdead".into(),
+            vec![],
+            None,
+            vec![],
+            false,
+            "2099-01-01".into(),
+        );
+        card.schema_version = tirith_core::command_card::CARD_SCHEMA_V2;
+        card.web3 = Some(tirith_core::command_card::Web3CardBindings {
+            shell: None,
+            network_policy_id: "prod".into(),
+            family: "evm".into(),
+            chain_or_genesis: "1".into(),
+            signer_kind: "hardware_wallet".into(),
+            signers: vec![tirith_core::command_card::Web3CardSignerBinding {
+                role: "default".into(),
+                kind: "hardware_wallet".into(),
+                reference_sha256: None,
+            }],
+            destinations: vec!["0xdead".into()],
+            artifact_sha256: vec![],
+            policy_identity: "policy".into(),
+            operations: vec!["send".into()],
+            approval_key_id: "0123456789abcdef".into(),
+        });
+
+        migrate_missing_web3_shell_binding(&mut card, tirith_core::tokenize::ShellType::PowerShell);
+        assert_eq!(
+            card.web3
+                .as_ref()
+                .and_then(|bindings| bindings.shell.as_deref()),
+            Some("powershell")
+        );
+
+        migrate_missing_web3_shell_binding(&mut card, tirith_core::tokenize::ShellType::Cmd);
+        assert_eq!(
+            card.web3
+                .as_ref()
+                .and_then(|bindings| bindings.shell.as_deref()),
+            Some("powershell"),
+            "an existing reviewed shell binding must not be rewritten"
+        );
     }
 
     /// Signing a SYMLINKED card must update the link's TARGET, not clobber the
