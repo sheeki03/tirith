@@ -902,24 +902,26 @@ mod tests {
             .unwrap();
         drop(operation);
 
-        let checks = AtomicUsize::new(0);
-        let expires_after_dns = || {
-            let now = if checks.fetch_add(1, Ordering::SeqCst) == 0 {
-                before_deadline.clone()
-            } else {
-                deadline.clone()
-            };
-            lease
-                .authorize_effect_at(&binding.operation(), now)
-                .map_err(|error| format!("cloaking task authorization refused: {error}"))
-        };
+        let checks = std::sync::Arc::new(AtomicUsize::new(0));
+        let authorization_checks = std::sync::Arc::clone(&checks);
+        let expires_after_dns: std::sync::Arc<CloakingEffectAuthorizer> =
+            std::sync::Arc::new(move || {
+                let now = if authorization_checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                    before_deadline
+                } else {
+                    deadline
+                };
+                lease
+                    .authorize_effect_at(&binding.operation(), now)
+                    .map_err(|error| format!("cloaking task authorization refused: {error}"))
+            });
         let dns_calls = std::cell::Cell::new(0usize);
         let socket_calls = std::cell::Cell::new(0usize);
 
-        let dns = authorize_immediately_before(&expires_after_dns, || {
+        let dns = authorize_immediately_before(&*expires_after_dns, || {
             dns_calls.set(dns_calls.get() + 1);
         });
-        let socket = authorize_immediately_before(&expires_after_dns, || {
+        let socket = authorize_immediately_before(&*expires_after_dns, || {
             socket_calls.set(socket_calls.get() + 1);
         });
 
