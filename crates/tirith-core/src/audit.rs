@@ -3280,29 +3280,19 @@ mod tests {
 
     #[test]
     fn trust_change_propagates_audit_append_failure() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let directory = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("TIRITH_LOG", "1");
-            std::env::set_var("XDG_DATA_HOME", directory.path());
-            std::env::set_var("APPDATA", directory.path());
-            std::env::remove_var("TIRITH_SERVER_URL");
-            std::env::remove_var("TIRITH_API_KEY");
-        }
+        global_state.set_env("TIRITH_LOG", "1");
+        global_state.set_env("XDG_DATA_HOME", directory.path());
+        global_state.set_env("APPDATA", directory.path());
+        global_state.remove_env("TIRITH_SERVER_URL");
+        global_state.remove_env("TIRITH_API_KEY");
         let log_path = audit_log_path().expect("isolated audit path");
         std::fs::create_dir_all(&log_path).unwrap();
 
         let error = log_trust_change("npm:*", None, "add", None, "user")
             .expect_err("directory-as-log must surface the append failure");
         assert!(error.contains("cannot open"), "{error}");
-
-        unsafe {
-            std::env::remove_var("TIRITH_LOG");
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("APPDATA");
-        }
     }
 
     /// `agent_origin` must flow through into the audit entry and survive the JSON round-trip.

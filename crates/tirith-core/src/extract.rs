@@ -2352,6 +2352,18 @@ fn command_base_name_for_shell(raw: &str, shell: ShellType) -> String {
     crate::rules::command::normalize_cmd_base(raw, shell)
 }
 
+/// Whether the POSIX wrapper chain exhausts the canonical bounded resolver.
+///
+/// Kept as the legacy extractor entry point, but deliberately delegates to the
+/// command resolver so option-value roles cannot drift between resolution and
+/// the independent fail-closed depth check.
+pub fn wrapper_chain_exceeds_depth(segment: &Segment) -> bool {
+    matches!(
+        crate::rules::command::resolve_effective_segment(segment, ShellType::Posix),
+        Err(crate::rules::command::EffectiveCommandError::WrapperChainTooDeep)
+    )
+}
+
 fn resolve_segment_command_for_shell(
     segment: &Segment,
     shell: ShellType,

@@ -10520,7 +10520,8 @@ fn check_data_exfiltration_depth(
         } else {
             FlowProof::Clean
         };
-        pipe_sensitive_path_list = !stdout_is_redirected(seg, shell) && emits_sensitive_path_list;
+        pipe_sensitive_path_list =
+            routing.stdout == FdDestination::ParentStdout && emits_sensitive_path_list;
         let (parent_stdout, parent_stderr) = route_flow(produced_flow, produced_stderr, routing);
         summary.pipe_complete &= routing.complete;
         pipe_flow = accumulate_segment_output(
