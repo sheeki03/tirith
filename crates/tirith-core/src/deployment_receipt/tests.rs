@@ -941,6 +941,27 @@ fn a_fresh_deployment_receipt_is_content_addressed_and_valid() {
 }
 
 #[test]
+fn deployment_receipt_parsing_rejects_duplicate_members_before_validation() {
+    let receipt = assembled_receipt(vec![outcome(RouteState::Match)], true);
+    let duplicate = receipt.to_json().replacen(
+        "\"receipt_id\":",
+        "\"receipt_id\": \"attacker-selected\", \"receipt_id\":",
+        1,
+    );
+
+    let error = DeploymentReceipt::parse(&duplicate).expect_err("duplicate keys must be refused");
+    assert!(error.to_string().contains("duplicate JSON object key"));
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("receipt.json");
+    std::fs::write(&path, duplicate).expect("write duplicate-key receipt");
+    assert!(DeploymentReceipt::load_unvalidated(&path)
+        .expect_err("the public file loader must use the same strict parser")
+        .to_string()
+        .contains("duplicate JSON object key"));
+}
+
+#[test]
 fn every_field_is_bound_by_the_content_address() {
     let receipt = assembled_receipt(vec![outcome(RouteState::Match)], true);
     for mutate in [

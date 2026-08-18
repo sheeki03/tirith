@@ -810,6 +810,28 @@ fn the_receipt_round_trips_and_every_field_is_bound_by_the_content_address() {
 }
 
 #[test]
+fn build_receipt_parsing_rejects_duplicate_members_before_validation() {
+    let (_root, receipt) = clean_receipt();
+    let json = receipt.to_json();
+    let duplicate = json.replacen(
+        "\"receipt_id\":",
+        "\"receipt_id\": \"attacker-selected\", \"receipt_id\":",
+        1,
+    );
+
+    let error = BuildReceipt::parse(&duplicate).expect_err("duplicate keys must be refused");
+    assert!(error.to_string().contains("duplicate JSON object key"));
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("receipt.json");
+    std::fs::write(&path, duplicate).expect("write duplicate-key receipt");
+    assert!(BuildReceipt::load_unvalidated(&path)
+        .expect_err("the public file loader must use the same strict parser")
+        .to_string()
+        .contains("duplicate JSON object key"));
+}
+
+#[test]
 fn stripping_the_signature_fails_verification_instead_of_reading_as_unsigned() {
     let (_root, mut receipt) = clean_receipt();
     // Sign the way the audit chain would, then re-stamp the content address so
@@ -1015,6 +1037,25 @@ fn capsule_fixture() -> (tempfile::TempDir, CapsuleRunReceipt, Option<String>) {
     let capsule = capsule_for(root.path(), &output);
     let inventory = capsule_source_inventory(root.path());
     (root, capsule, inventory)
+}
+
+#[test]
+fn capsule_receipt_loader_rejects_duplicate_members() {
+    let (_root, capsule, _inventory) = capsule_fixture();
+    let duplicate = serde_json::to_string_pretty(&capsule)
+        .expect("serialize capsule receipt")
+        .replacen(
+            "\"receipt_id\":",
+            "\"receipt_id\": \"attacker-selected\", \"receipt_id\":",
+            1,
+        );
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("capsule.json");
+    std::fs::write(&path, duplicate).expect("write duplicate-key capsule receipt");
+
+    assert!(load_capsule_receipt(&path)
+        .expect_err("duplicate keys must not reach the execution-link verifier")
+        .contains("duplicate JSON object key"));
 }
 
 #[test]

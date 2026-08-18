@@ -1358,7 +1358,17 @@ pub fn load_capsule_receipt(
         crate::capsule_receipt::MAX_CAPSULE_RECEIPT_BYTES as u64,
     )
     .map_err(|error| format!("the capsule receipt could not be read: {error:?}"))?;
-    serde_json::from_slice(&bytes)
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("the capsule receipt is not UTF-8: {error}"))?;
+    let value = crate::mcp_lock::parse_json_no_duplicates(text).map_err(|error| match error {
+        crate::mcp_lock::StrictJsonError::Malformed => {
+            "the capsule receipt is not valid JSON".to_string()
+        }
+        crate::mcp_lock::StrictJsonError::DuplicateObjectKey => {
+            "the capsule receipt contains a duplicate JSON object key".to_string()
+        }
+    })?;
+    serde_json::from_value(value)
         .map_err(|error| format!("the capsule receipt is not a capsule run receipt: {error}"))
 }
 
@@ -1693,8 +1703,7 @@ impl BuildReceipt {
 
     /// Parse and validate a build receipt document.
     pub fn parse(text: &str) -> Result<Self, BuildReceiptError> {
-        let receipt: Self = serde_json::from_str(text)
-            .map_err(|error| BuildReceiptError::Malformed(error.to_string()))?;
+        let receipt = parse_build_receipt_document(text)?;
         receipt.validate()?;
         Ok(receipt)
     }
@@ -1715,8 +1724,9 @@ impl BuildReceipt {
     pub fn load_unvalidated(path: &Path) -> Result<Self, BuildReceiptError> {
         let bytes = crate::util::read_text_no_follow_capped(path, MAX_BUILD_RECEIPT_BYTES)
             .map_err(|error| BuildReceiptError::Malformed(format!("{error:?}")))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|error| BuildReceiptError::Malformed(error.to_string()))
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| BuildReceiptError::Malformed(error.to_string()))?;
+        parse_build_receipt_document(text)
     }
 
     /// Validate, then write the receipt atomically at mode 0600.
@@ -1725,6 +1735,21 @@ impl BuildReceipt {
         crate::util::write_file_atomic_0600(path, self.to_json().as_bytes())
             .map_err(BuildReceiptError::Io)
     }
+}
+
+/// Receipts are security evidence, so their wire interpretation must be
+/// singular. `serde_json` otherwise accepts duplicate members with last-value
+/// wins semantics, which lets another verifier or renderer authenticate a
+/// different document from the one Tirith consumed.
+fn parse_build_receipt_document(text: &str) -> Result<BuildReceipt, BuildReceiptError> {
+    let value = crate::mcp_lock::parse_json_no_duplicates(text).map_err(|error| {
+        let reason = match error {
+            crate::mcp_lock::StrictJsonError::Malformed => "malformed JSON",
+            crate::mcp_lock::StrictJsonError::DuplicateObjectKey => "duplicate JSON object key",
+        };
+        BuildReceiptError::Malformed(reason.to_string())
+    })?;
+    serde_json::from_value(value).map_err(|error| BuildReceiptError::Malformed(error.to_string()))
 }
 
 // ---------------------------------------------------------------------------

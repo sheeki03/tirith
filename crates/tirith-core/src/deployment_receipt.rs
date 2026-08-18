@@ -1084,8 +1084,7 @@ impl DeploymentReceipt {
 
     /// Parse and validate a deployment receipt document.
     pub fn parse(text: &str) -> Result<Self, DeploymentReceiptError> {
-        let receipt: Self = serde_json::from_str(text)
-            .map_err(|error| DeploymentReceiptError::Malformed(error.to_string()))?;
+        let receipt = parse_deployment_receipt_document(text)?;
         receipt.validate()?;
         Ok(receipt)
     }
@@ -1102,8 +1101,9 @@ impl DeploymentReceipt {
     pub fn load_unvalidated(path: &std::path::Path) -> Result<Self, DeploymentReceiptError> {
         let bytes = crate::util::read_text_no_follow_capped(path, MAX_DEPLOYMENT_RECEIPT_BYTES)
             .map_err(|error| DeploymentReceiptError::Malformed(format!("{error:?}")))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|error| DeploymentReceiptError::Malformed(error.to_string()))
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| DeploymentReceiptError::Malformed(error.to_string()))?;
+        parse_deployment_receipt_document(text)
     }
 
     /// Validate, then write the receipt atomically at mode 0600.
@@ -1112,6 +1112,22 @@ impl DeploymentReceipt {
         crate::util::write_file_atomic_0600(path, self.to_json().as_bytes())
             .map_err(DeploymentReceiptError::Io)
     }
+}
+
+/// Reject duplicate members before Serde can collapse them. A receipt must have
+/// one interpretation for Tirith, external verifiers, and the canonical hash.
+fn parse_deployment_receipt_document(
+    text: &str,
+) -> Result<DeploymentReceipt, DeploymentReceiptError> {
+    let value = crate::mcp_lock::parse_json_no_duplicates(text).map_err(|error| {
+        let reason = match error {
+            crate::mcp_lock::StrictJsonError::Malformed => "malformed JSON",
+            crate::mcp_lock::StrictJsonError::DuplicateObjectKey => "duplicate JSON object key",
+        };
+        DeploymentReceiptError::Malformed(reason.to_string())
+    })?;
+    serde_json::from_value(value)
+        .map_err(|error| DeploymentReceiptError::Malformed(error.to_string()))
 }
 
 /// Count the route states. Returned as a tuple in
