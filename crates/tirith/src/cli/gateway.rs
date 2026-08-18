@@ -7688,7 +7688,7 @@ fn complete_known_zero_execution_rollback(
             Ok(()) => break,
             Err(error) => {
                 attempts = attempts.saturating_add(1);
-                if attempts == 1 || attempts.is_multiple_of(20) {
+                if attempts == 1 || attempts % 20 == 0 {
                     eprintln!(
                         "tirith gateway: known-zero strict rollback is still pending after \
                          {attempts} attempt(s): {error}; forwarding remains stopped"
@@ -7713,7 +7713,7 @@ fn complete_known_zero_replay_rollback(
             Ok(()) => break,
             Err(rollback_error) => {
                 attempts = attempts.saturating_add(1);
-                if attempts == 1 || attempts.is_multiple_of(20) {
+                if attempts == 1 || attempts % 20 == 0 {
                     eprintln!(
                         "tirith gateway: known-zero replay rollback is still pending after \
                          {attempts} attempt(s): {rollback_error}; forwarding remains stopped"

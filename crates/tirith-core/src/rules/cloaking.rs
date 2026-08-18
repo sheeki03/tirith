@@ -896,9 +896,9 @@ mod tests {
         let before_deadline = deadline - chrono::TimeDelta::milliseconds(1);
         let permit = crate::task_boundary::TaskBoundaryPermit::<
             crate::task_boundary::FetchCloakingBoundary,
-        >::for_test_with_deadline(&operation, deadline.clone());
+        >::for_test_with_deadline(&operation, deadline);
         let lease = permit
-            .into_effect_lease_at(&operation, before_deadline.clone())
+            .into_effect_lease_at(&operation, before_deadline)
             .unwrap();
         drop(operation);
 

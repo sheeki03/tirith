@@ -90,7 +90,7 @@ fn spool_event_locked(path: &std::path::Path, event_json: &str) -> std::io::Resu
             ));
         }
     }
-    let mut file = opts.open(&path)?;
+    let mut file = opts.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other(
             "refusing to append to a non-regular audit spool",
