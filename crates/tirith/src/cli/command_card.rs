@@ -119,6 +119,59 @@ fn safe_card_command_binding(card: &Card) -> (Option<String>, Option<&str>) {
     (digest, shell)
 }
 
+fn prepare_card_for_signing_with<F>(
+    mut card: Card,
+    reviewed_command: &str,
+    approval_key_id: &str,
+    shell: ShellType,
+    derive_bindings: F,
+) -> Result<Card, String>
+where
+    F: FnOnce(
+        &str,
+        &str,
+        ShellType,
+    ) -> Result<Option<tirith_core::command_card::Web3CardBindings>, String>,
+{
+    // A freshly-created privacy-safe card deliberately has no raw command. When
+    // more than one approval key is configured, `create` cannot know which key
+    // the operator will select, so `sign` must derive the exact binding now.
+    // Legacy v1 cards retain the same migration behavior. Existing reviewed
+    // bindings are never replaced.
+    if card.web3.is_none() && matches!(card.schema_version, 1 | CARD_SCHEMA_V3) {
+        if let Some(bindings) = derive_bindings(reviewed_command, approval_key_id, shell)? {
+            card = card
+                .with_web3_bindings(bindings)
+                .map_err(|error| format!("build exact Web3 template: {error}"))?;
+        }
+    }
+    Ok(card)
+}
+
+fn command_card_verification_json(
+    card: &Card,
+    verified: bool,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let (safe_command_sha256, safe_command_shell) = safe_card_command_binding(card);
+    let web3_bindings_present = card.is_privacy_safe() && card.web3.is_some();
+    // Compatibility field retained, but it must never claim capability for a
+    // card that failed trust, signature, expiry, or schema verification.
+    let web3_authorization_capable = verified && web3_bindings_present;
+    serde_json::json!({
+        "verified": verified,
+        "schema_version": card.schema_version,
+        "command_sha256": safe_command_sha256,
+        "command_shell": safe_command_shell,
+        "legacy_command_redacted": !card.command.is_empty(),
+        "web3_bindings_present": web3_bindings_present,
+        "web3_authorization_capable": web3_authorization_capable,
+        "expires": card.expires.as_str(),
+        "key_id": card.signature.as_ref().map(|signature: &CardSignature| signature.key_id.as_str()),
+        "reason": reason,
+    })
+}
+
 /// A legacy unsigned schema-v2 card can be migrated using the parser dialect
 /// selected by the signing invocation. Existing bindings are never rewritten:
 /// a different `--shell` requires regenerating and reviewing the card rather
@@ -218,7 +271,7 @@ pub fn create(
     };
 
     // When policy names one approval key, `create` can emit the complete
-    // unsigned schema-v2 template immediately. With several configured keys the
+    // unsigned exact Web3 template immediately. With several configured keys the
     // subsequent `sign --key ...` step derives the same template using the key
     // actually selected by the operator.
     let configured_web3_keys = configured_web3_approval_keys();
@@ -340,7 +393,7 @@ pub fn sign(
             }
             return 1;
         }
-        command
+        command.to_string()
     } else {
         let command = reviewed_command.unwrap_or(&card.command);
         if command.is_empty()
@@ -355,13 +408,13 @@ pub fn sign(
             }
             return 1;
         }
-        command
+        command.to_string()
     };
     let cwd = std::env::current_dir()
         .ok()
         .map(|path| path.display().to_string());
     if let Err(error) = tirith_core::rules::web3_gate::refuse_command_card_secret_material(
-        reviewed_command,
+        &reviewed_command,
         shell,
         cwd.as_deref(),
     ) {
@@ -371,29 +424,20 @@ pub fn sign(
         return 1;
     }
 
-    if card.schema_version == 1 && card.web3.is_none() {
-        let key_id = key_id_for_secret_key(&secret);
-        match derive_exact_web3_bindings(&card.command, &key_id, shell) {
-            Ok(Some(bindings)) => match card.with_web3_bindings(bindings) {
-                Ok(promoted) => card = promoted,
-                Err(error) => {
-                    if !emit_error(
-                        json,
-                        "tirith command-card sign",
-                        &format!("build exact Web3 template: {error}"),
-                    ) {
-                        return 2;
-                    }
-                    return 1;
-                }
-            },
-            Ok(None) => {}
-            Err(error) => {
-                if !emit_error(json, "tirith command-card sign", &error) {
-                    return 2;
-                }
-                return 1;
+    let key_id = key_id_for_secret_key(&secret);
+    match prepare_card_for_signing_with(
+        card,
+        &reviewed_command,
+        &key_id,
+        shell,
+        derive_exact_web3_bindings,
+    ) {
+        Ok(prepared) => card = prepared,
+        Err(error) => {
+            if !emit_error(json, "tirith command-card sign", &error) {
+                return 2;
             }
+            return 1;
         }
     }
 
@@ -529,21 +573,10 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
 
     let verified = result.is_ok();
     let reason = result.as_ref().err().map(VerifyFailure::reason);
-    let (safe_command_sha256, safe_command_shell) = safe_card_command_binding(&card);
-    let web3_authorization_capable = card.is_privacy_safe() && card.web3.is_some();
+    let web3_bindings_present = card.is_privacy_safe() && card.web3.is_some();
 
     if json {
-        let v = serde_json::json!({
-            "verified": verified,
-            "schema_version": card.schema_version,
-            "command_sha256": safe_command_sha256,
-            "command_shell": safe_command_shell,
-            "legacy_command_redacted": !card.command.is_empty(),
-            "web3_authorization_capable": web3_authorization_capable,
-            "expires": card.expires,
-            "key_id": card.signature.as_ref().map(|s: &CardSignature| s.key_id.clone()),
-            "reason": reason,
-        });
+        let v = command_card_verification_json(&card, verified, reason.as_deref());
         // A failed JSON write must exit non-zero even for a verified card; exit 2
         // is distinct from the "not verified" exit 1.
         if !super::write_json_stdout(
@@ -553,6 +586,7 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
             return 2;
         }
     } else {
+        let (safe_command_sha256, _) = safe_card_command_binding(&card);
         // Cards are untrusted even when verification succeeds: the signer may
         // intentionally attest to a command containing terminal-control or
         // deceptive Unicode. Never render card fields before sanitizing them.
@@ -567,7 +601,7 @@ pub fn verify(card_path: &str, json: bool) -> i32 {
             println!("  expires: {display_expiry}");
             println!(
                 "  mode: {}",
-                if web3_authorization_capable {
+                if web3_bindings_present {
                     "privacy-safe exact Web3 binding"
                 } else {
                     "diagnostic-only"
@@ -824,9 +858,132 @@ fn emit_error(json: bool, ctx: &str, msg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_error, human_display_field, migrate_missing_web3_shell_binding, read_secret_key,
+        command_card_verification_json, emit_error, human_display_field,
+        migrate_missing_web3_shell_binding, prepare_card_for_signing_with, read_secret_key,
         write_card_atomic, CARD_READ_CAP, SECRET_KEY_READ_CAP,
     };
+
+    fn exact_web3_bindings(approval_key_id: &str) -> tirith_core::command_card::Web3CardBindings {
+        tirith_core::command_card::Web3CardBindings {
+            shell: Some("posix".into()),
+            network_policy_id: "production".into(),
+            family: "evm".into(),
+            chain_or_genesis: "1".into(),
+            signer_kind: "hardware_wallet".into(),
+            signers: vec![tirith_core::command_card::Web3CardSignerBinding {
+                role: "default".into(),
+                kind: "hardware_wallet".into(),
+                reference_sha256: None,
+            }],
+            destinations: vec!["0xdead".into()],
+            artifact_sha256: vec![],
+            policy_identity: "policy-projection-v1".into(),
+            operations: vec!["send".into()],
+            approval_key_id: approval_key_id.into(),
+        }
+    }
+
+    #[test]
+    fn schema_v3_multikey_sign_preparation_derives_binding_for_selected_key() {
+        let command = "cast send 0xdead --rpc-url https://rpc.test --ledger";
+        let secret = [17u8; tirith_core::command_card::SECRET_KEY_LEN];
+        let selected_key_id = tirith_core::command_card::key_id_for_secret_key(&secret);
+        let card = tirith_core::command_card::Card::new_privacy_preserving(
+            command,
+            "posix",
+            vec![],
+            None,
+            vec![],
+            false,
+            "2099-01-01".into(),
+        )
+        .unwrap();
+        assert!(
+            card.web3.is_none(),
+            "multi-key create leaves selection to sign"
+        );
+
+        let mut derive_called = false;
+        let mut prepared = prepare_card_for_signing_with(
+            card,
+            command,
+            &selected_key_id,
+            tirith_core::tokenize::ShellType::Posix,
+            |observed_command, observed_key_id, observed_shell| {
+                derive_called = true;
+                assert_eq!(observed_command, command);
+                assert_eq!(observed_key_id, selected_key_id);
+                assert_eq!(observed_shell, tirith_core::tokenize::ShellType::Posix);
+                Ok(Some(exact_web3_bindings(observed_key_id)))
+            },
+        )
+        .unwrap();
+
+        assert!(
+            derive_called,
+            "an unbound schema-v3 card must be derived at sign time"
+        );
+        assert_eq!(
+            prepared
+                .web3
+                .as_ref()
+                .map(|bindings| bindings.approval_key_id.as_str()),
+            Some(selected_key_id.as_str())
+        );
+        assert!(
+            prepared.command.is_empty(),
+            "sign preparation must not restore raw command"
+        );
+        assert!(prepared.command_matches_for_shell(command, "posix"));
+        prepared.sign(&secret).unwrap();
+        assert_eq!(
+            prepared
+                .signature
+                .as_ref()
+                .map(|signature| signature.key_id.as_str()),
+            Some(selected_key_id.as_str()),
+            "the exact binding and signature must use the same selected key"
+        );
+    }
+
+    #[test]
+    fn verify_json_separates_binding_presence_from_verified_authorization() {
+        let command = "cast send 0xdead --rpc-url https://rpc.test --ledger";
+        let secret = [29u8; tirith_core::command_card::SECRET_KEY_LEN];
+        let key_id = tirith_core::command_card::key_id_for_secret_key(&secret);
+        let mut card = tirith_core::command_card::Card::new_privacy_preserving(
+            command,
+            "posix",
+            vec![],
+            None,
+            vec![],
+            false,
+            "2099-01-01".into(),
+        )
+        .unwrap()
+        .with_web3_bindings(exact_web3_bindings(&key_id))
+        .unwrap();
+        card.sign(&secret).unwrap();
+
+        let untrusted = command_card_verification_json(
+            &card,
+            false,
+            Some("card signature is from an untrusted key"),
+        );
+        assert_eq!(untrusted["verified"].as_bool(), Some(false));
+        assert_eq!(untrusted["web3_bindings_present"].as_bool(), Some(true));
+        assert_eq!(
+            untrusted["web3_authorization_capable"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(untrusted["command_shell"], "posix");
+        assert!(!untrusted.to_string().contains(command));
+
+        let verified = command_card_verification_json(&card, true, None);
+        assert_eq!(verified["verified"].as_bool(), Some(true));
+        assert_eq!(verified["web3_bindings_present"].as_bool(), Some(true));
+        assert_eq!(verified["web3_authorization_capable"].as_bool(), Some(true));
+    }
 
     #[test]
     fn card_human_fields_strip_terminal_and_line_injection() {
