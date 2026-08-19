@@ -1066,4 +1066,4 @@ Third-party data attributions in [NOTICE](NOTICE).
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=sheeki03/tirith&type=Date)](https://star-history.com/#sheeki03/tirith&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=sheeki03/tirith&type=Date)](https://star-history.dera.page/#sheeki03/tirith&Date)
