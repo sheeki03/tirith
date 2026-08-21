@@ -89,7 +89,7 @@ runs:
         tirith scan "$INPUT_PATH" --ci --fail-on "$INPUT_FAIL_ON" "${IGNORE_ARGS[@]}"
     - name: Upload SARIF
       if: always() && inputs.sarif == 'true'
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@f3712979fa5f215279b101dd0a2e3bdfb4353324 # v3.37.7
       with:
         sarif_file: results.sarif
       continue-on-error: true
