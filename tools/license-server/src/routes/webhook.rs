@@ -46,6 +46,13 @@ pub async fn webhook(
 
     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+    // Enforce the ordering prerequisite at the dispatcher as well as inside
+    // each state-changing handler. That keeps a newly added subscription event
+    // from accidentally bypassing the fail-closed timestamp contract.
+    if event_type.starts_with("subscription.") {
+        let _ = required_event_created_at(&event)?;
+    }
+
     // Polar does not include event_id in the body; the webhook-id header
     // is the authoritative identifier.
     let event_id = msg_id.to_string();
@@ -115,10 +122,7 @@ async fn handle_order_paid(
     let checkout_id = json_str(data, "checkout_id")
         .ok_or_else(|| AppError::BadWebhook("missing checkout_id".into()))?;
 
-    let created_at = event
-        .get("created_at")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let created_at = required_event_created_at(event)?;
 
     let product_id = json_str(data, "product_id")
         .ok_or_else(|| AppError::BadWebhook("missing product_id".into()))?;
@@ -149,7 +153,7 @@ async fn handle_order_paid(
         email,
         tier,
         product_id,
-        occurred_at: created_at,
+        occurred_at: Some(created_at),
         // order.paid always carries a checkout_id (enforced above).
         checkout_id: Some(checkout_id),
         key_hash: creds.key_hash,
@@ -189,10 +193,7 @@ async fn handle_sub_active(
     let product_id = json_str(data, "product_id");
     let checkout_id = json_str(data, "checkout_id");
 
-    let created_at = event
-        .get("created_at")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let created_at = required_event_created_at(event)?;
 
     let (tier, tier_unknown) = resolve_tier(
         state,
@@ -200,7 +201,7 @@ async fn handle_sub_active(
         product_id.as_deref(),
         event_id,
         "subscription.active",
-        &created_at,
+        &Some(created_at.clone()),
         event,
     )
     .await;
@@ -218,7 +219,7 @@ async fn handle_sub_active(
             email: Some(email),
             tier: tier.clone(),
             product_id: product_id.clone(),
-            occurred_at: created_at,
+            occurred_at: Some(created_at),
             resolved_tier: tier.clone(),
             tier_unknown,
         };
@@ -265,7 +266,7 @@ async fn handle_sub_active(
                         subscription_id: Some(sub_id.clone()),
                         event_type: "subscription.active".to_string(),
                         reason: "unresolvable_product".to_string(),
-                        occurred_at: created_at.clone(),
+                        occurred_at: Some(created_at.clone()),
                         payload: redact_event(event),
                     })
                     .await;
@@ -283,7 +284,7 @@ async fn handle_sub_active(
             email,
             tier: tier_str,
             product_id: product_id.unwrap_or_default(),
-            occurred_at: created_at,
+            occurred_at: Some(created_at),
             // None for checkout-less subscriptions — process_subscription_created
             // then skips the pending_receipts row instead of keying it by a
             // guessable id that /receipt/lookup could race.
@@ -336,10 +337,7 @@ async fn handle_sub_canceled(
         }
     };
 
-    let created_at = event
-        .get("created_at")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let created_at = required_event_created_at(event)?;
 
     let customer_id = json_str(data, "customer_id");
     let email = data
@@ -358,7 +356,7 @@ async fn handle_sub_canceled(
         email,
         tier,
         product_id,
-        occurred_at: created_at,
+        occurred_at: Some(created_at),
     };
 
     let processed = state
@@ -406,10 +404,7 @@ async fn handle_sub_revoked(
         }
     };
 
-    let created_at = event
-        .get("created_at")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let created_at = required_event_created_at(event)?;
 
     let customer_id = json_str(data, "customer_id");
     let email = data
@@ -428,7 +423,7 @@ async fn handle_sub_revoked(
         email,
         tier,
         product_id,
-        occurred_at: created_at,
+        occurred_at: Some(created_at),
     };
 
     let processed = state.db.process_subscription_revoked(revoked_data).await?;
@@ -459,10 +454,7 @@ async fn handle_sub_past_due(
         }
     };
 
-    let created_at = event
-        .get("created_at")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let created_at = required_event_created_at(event)?;
 
     let product_id = json_str(data, "product_id");
     let (tier, tier_unknown) = resolve_tier(
@@ -471,7 +463,7 @@ async fn handle_sub_past_due(
         product_id.as_deref(),
         event_id,
         "subscription.past_due",
-        &created_at,
+        &Some(created_at.clone()),
         event,
     )
     .await;
@@ -488,7 +480,7 @@ async fn handle_sub_past_due(
             .map(|s| s.to_string()),
         tier: tier.clone(),
         product_id,
-        occurred_at: created_at,
+        occurred_at: Some(created_at),
         resolved_tier: tier,
         tier_unknown,
     };
@@ -534,10 +526,7 @@ async fn handle_sub_uncanceled(
         }
     };
 
-    let created_at = event
-        .get("created_at")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let created_at = required_event_created_at(event)?;
 
     let product_id = json_str(data, "product_id");
     let (tier, tier_unknown) = resolve_tier(
@@ -546,7 +535,7 @@ async fn handle_sub_uncanceled(
         product_id.as_deref(),
         event_id,
         "subscription.uncanceled",
-        &created_at,
+        &Some(created_at.clone()),
         event,
     )
     .await;
@@ -563,7 +552,7 @@ async fn handle_sub_uncanceled(
             .map(|s| s.to_string()),
         tier: tier.clone(),
         product_id,
-        occurred_at: created_at,
+        occurred_at: Some(created_at),
         resolved_tier: tier,
         tier_unknown,
     };
@@ -602,6 +591,25 @@ fn json_str(val: &serde_json::Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// Lifecycle ordering is only safe when Polar supplies a parseable event
+/// creation instant. The signed delivery timestamp proves freshness of the
+/// HTTP message, not ordering of the underlying subscription event, so it
+/// cannot substitute for this payload field.
+fn required_event_created_at(event: &serde_json::Value) -> Result<String, AppError> {
+    let raw = event
+        .get("created_at")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadWebhook("missing created_at".into()))?;
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|timestamp| {
+            timestamp
+                .to_utc()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        })
+        .map_err(|_| AppError::BadWebhook("invalid created_at".into()))
 }
 
 /// Resolve product_id → tier. On unknown product, insert dead-letter and return None.
@@ -755,4 +763,36 @@ fn redact_event(event: &serde_json::Value) -> String {
     }
 
     serde_json::to_string(&redacted).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_timestamp_is_required_and_must_be_rfc3339() {
+        for event in [
+            serde_json::json!({"type": "subscription.active"}),
+            serde_json::json!({"type": "subscription.active", "created_at": null}),
+            serde_json::json!({"type": "subscription.active", "created_at": ""}),
+            serde_json::json!({"type": "subscription.active", "created_at": "not-a-time"}),
+        ] {
+            assert!(matches!(
+                required_event_created_at(&event),
+                Err(AppError::BadWebhook(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn lifecycle_timestamp_is_normalized_to_one_utc_encoding() {
+        let event = serde_json::json!({
+            "type": "subscription.active",
+            "created_at": "2024-03-01T13:30:00+02:00"
+        });
+        assert_eq!(
+            required_event_created_at(&event).unwrap(),
+            "2024-03-01T11:30:00.000Z"
+        );
+    }
 }

@@ -393,7 +393,7 @@ fn policy_summary_error(path: String, error: String) -> PolicySummary {
 fn build_threatdb_summary() -> ThreatDbSummary {
     use crate::threatdb::ThreatDb;
 
-    let db_path = ThreatDb::default_path();
+    let db_path = ThreatDb::resolve_primary_path();
     let path_str = db_path.as_ref().map(|p| p.display().to_string());
 
     let exists = db_path.as_ref().map(|p| p.exists()).unwrap_or(false);
@@ -838,13 +838,14 @@ mod tests {
     /// Every env var that influences where `build_policy_summary` resolves
     /// config from (XDG / %APPDATA% / %LOCALAPPDATA% / HOME / USERPROFILE /
     /// TIRITH_*). A hermetic test must pin and restore EVERY one across OSes.
-    const ENV_KEYS: [&str; 8] = [
+    const ENV_KEYS: [&str; 9] = [
         "XDG_CONFIG_HOME",
         "APPDATA",
         "LOCALAPPDATA",
         "HOME",
         "USERPROFILE",
         "TIRITH_POLICY_ROOT",
+        "TIRITH_THREATDB_PATH",
         "TIRITH_SERVER_URL",
         "TIRITH_API_KEY",
     ];
@@ -1229,6 +1230,27 @@ mod tests {
             }
             other => panic!("isolated cwd with no policy file must be NoFile, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn threatdb_summary_reports_the_effective_v2_sibling() {
+        let state = tempfile::tempdir().unwrap();
+        let v1_path = state.path().join("primary.dat");
+        let v2_path = state.path().join("primary-v2.dat");
+        std::fs::write(
+            &v2_path,
+            include_bytes!("../../../tests/fixtures/test-threatdb.dat"),
+        )
+        .unwrap();
+        assert!(!v1_path.exists(), "the legacy path must remain absent");
+
+        let _env = dashboard_environment(&[("TIRITH_THREATDB_PATH", Some(v1_path.as_os_str()))]);
+        let summary = build_threatdb_summary();
+
+        assert!(summary.installed);
+        assert_eq!(summary.path.as_deref(), v2_path.to_str());
+        assert_eq!(summary.signature_valid, Some(true));
+        assert_eq!(summary.build_sequence, Some(42));
     }
 
     #[test]

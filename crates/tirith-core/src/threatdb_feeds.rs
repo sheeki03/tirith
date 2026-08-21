@@ -1,7 +1,151 @@
-use std::io::{Read, Seek};
+use std::collections::BTreeSet;
+use std::io::{BufRead, Read, Seek};
 use std::net::Ipv4Addr;
 
 use crate::threatdb::BehaviorTag;
+
+/// Hard decoded-input ceiling for one remotely sourced threat-intelligence feed.
+/// Parsers enforce this while reading, so a missing or false Content-Length does
+/// not turn a feed into an unbounded allocation.
+pub const MAX_FEED_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum logical records consumed from one feed.
+pub const MAX_FEED_RECORDS: usize = 1_000_000;
+/// Maximum columns accepted in one CSV record.
+pub const MAX_FEED_FIELDS: usize = 128;
+/// Maximum UTF-8 bytes accepted in one field/line.
+pub const MAX_FEED_FIELD_BYTES: usize = 16 * 1024;
+/// Maximum unique host/IP indicators returned by one parser or accumulated into
+/// the supplemental overlay.
+pub const MAX_FEED_ENTRIES: usize = 250_000;
+const MAX_FEED_ARCHIVE_MEMBERS: usize = 128;
+
+#[derive(Clone, Copy)]
+struct FeedLimits {
+    input_bytes: u64,
+    records: usize,
+    fields: usize,
+    field_bytes: usize,
+    entries: usize,
+}
+
+const DEFAULT_FEED_LIMITS: FeedLimits = FeedLimits {
+    input_bytes: MAX_FEED_INPUT_BYTES,
+    records: MAX_FEED_RECORDS,
+    fields: MAX_FEED_FIELDS,
+    field_bytes: MAX_FEED_FIELD_BYTES,
+    entries: MAX_FEED_ENTRIES,
+};
+
+/// Reader that permits at most `remaining` bytes and probes once at the
+/// boundary. Unlike `Read::take`, excess input is an error rather than a
+/// successful truncated EOF.
+struct CappedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> CappedReader<R> {
+    fn new(inner: R, remaining: u64) -> Self {
+        Self { inner, remaining }
+    }
+}
+
+impl<R: Read> Read for CappedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "threat-intelligence feed exceeds decoded input limit",
+                )),
+            };
+        }
+        let allowed = usize::try_from(self.remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let read = self.inner.read(&mut buf[..allowed])?;
+        self.remaining = self.remaining.saturating_sub(read as u64);
+        Ok(read)
+    }
+}
+
+#[derive(Default)]
+struct FeedAccumulator {
+    hostnames: BTreeSet<String>,
+    ips: BTreeSet<Ipv4Addr>,
+}
+
+impl FeedAccumulator {
+    fn len(&self) -> usize {
+        self.hostnames.len() + self.ips.len()
+    }
+
+    fn add_hostname(
+        &mut self,
+        hostname: String,
+        feed: &str,
+        limits: FeedLimits,
+    ) -> Result<(), String> {
+        if !self.hostnames.contains(&hostname) && self.len() >= limits.entries {
+            return Err(format!(
+                "{feed} exceeds the unique-indicator limit of {}",
+                limits.entries
+            ));
+        }
+        self.hostnames.insert(hostname);
+        Ok(())
+    }
+
+    fn add_ip(&mut self, ip: Ipv4Addr, feed: &str, limits: FeedLimits) -> Result<(), String> {
+        if !self.ips.contains(&ip) && self.len() >= limits.entries {
+            return Err(format!(
+                "{feed} exceeds the unique-indicator limit of {}",
+                limits.entries
+            ));
+        }
+        self.ips.insert(ip);
+        Ok(())
+    }
+
+    fn finish(self) -> FeedEntries {
+        FeedEntries {
+            hostnames: self.hostnames.into_iter().collect(),
+            ips: self.ips.into_iter().collect(),
+        }
+    }
+}
+
+fn validate_record(
+    feed: &str,
+    record_number: usize,
+    record: &csv::StringRecord,
+    limits: FeedLimits,
+) -> Result<(), String> {
+    if record_number > limits.records {
+        return Err(format!(
+            "{feed} exceeds the record limit of {}",
+            limits.records
+        ));
+    }
+    if record.len() > limits.fields {
+        return Err(format!(
+            "{feed} record {record_number} has {} fields (max {})",
+            record.len(),
+            limits.fields
+        ));
+    }
+    if let Some(field) = record.iter().find(|field| field.len() > limits.field_bytes) {
+        return Err(format!(
+            "{feed} record {record_number} has a {}-byte field (max {})",
+            field.len(),
+            limits.field_bytes
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FeedEntries {
@@ -24,54 +168,71 @@ pub fn extract_hostname_from_url(raw: &str) -> Option<String> {
 }
 
 pub fn parse_urlhaus_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
+    parse_urlhaus_csv_with_limits(reader, DEFAULT_FEED_LIMITS)
+}
+
+fn parse_urlhaus_csv_with_limits<R: Read>(
+    reader: R,
+    limits: FeedLimits,
+) -> Result<FeedEntries, String> {
     let mut csv = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(false)
-        .from_reader(reader);
+        .from_reader(CappedReader::new(reader, limits.input_bytes));
     let headers = csv
         .headers()
         .map_err(|e| format!("URLhaus headers: {e}"))?
         .clone();
+    validate_record("URLhaus", 0, &headers, limits)?;
 
     let url_idx = headers
         .iter()
         .position(|header| matches!(header, "url" | "urlhaus_link"))
         .ok_or_else(|| format!("URLhaus schema error: no 'url' column in headers {headers:?}"))?;
 
-    let mut entries = FeedEntries::default();
-    for record in csv.records() {
+    let mut entries = FeedAccumulator::default();
+    for (index, record) in csv.records().enumerate() {
         let record = record.map_err(|e| format!("URLhaus record error: {e}"))?;
+        validate_record("URLhaus", index + 1, &record, limits)?;
         let raw = record.get(url_idx).or_else(|| {
             record
                 .iter()
                 .find(|value| value.starts_with("http://") || value.starts_with("https://"))
         });
         if let Some(host) = raw.and_then(extract_hostname_from_url) {
-            entries.hostnames.push(host);
+            entries.add_hostname(host, "URLhaus", limits)?;
         }
     }
-    entries.sort_and_dedup();
-    Ok(entries)
+    Ok(entries.finish())
 }
 
 pub fn parse_threatfox_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
+    parse_threatfox_csv_with_limits(reader, DEFAULT_FEED_LIMITS)
+}
+
+fn parse_threatfox_csv_with_limits<R: Read>(
+    reader: R,
+    limits: FeedLimits,
+) -> Result<FeedEntries, String> {
     let mut csv = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(false)
-        .from_reader(reader);
+        .from_reader(CappedReader::new(reader, limits.input_bytes));
     let headers = csv
         .headers()
         .map_err(|e| format!("ThreatFox headers: {e}"))?
         .clone();
+    validate_record("ThreatFox", 0, &headers, limits)?;
 
     let ioc_idx = headers.iter().position(|header| header == "ioc");
     let ioc_type_idx = headers.iter().position(|header| header == "ioc_type");
     let ioc_idx = ioc_idx
         .ok_or_else(|| format!("ThreatFox schema error: no 'ioc' column in headers {headers:?}"))?;
 
-    let mut entries = FeedEntries::default();
-    for record in csv.records() {
+    let mut entries = FeedAccumulator::default();
+    for (index, record) in csv.records().enumerate() {
         let record = record.map_err(|e| format!("ThreatFox record error: {e}"))?;
+        validate_record("ThreatFox", index + 1, &record, limits)?;
 
         let raw_ioc = record.get(ioc_idx).or_else(|| {
             record.iter().find(|value| {
@@ -90,7 +251,7 @@ pub fn parse_threatfox_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
 
         if raw_ioc.starts_with("http://") || raw_ioc.starts_with("https://") {
             if let Some(host) = extract_hostname_from_url(raw_ioc) {
-                entries.hostnames.push(host);
+                entries.add_hostname(host, "ThreatFox", limits)?;
             }
             continue;
         }
@@ -98,79 +259,86 @@ pub fn parse_threatfox_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
         if matches!(ioc_type.as_str(), "ip:port" | "ip_port") {
             let ip_part = raw_ioc.split(':').next().unwrap_or(raw_ioc);
             if let Ok(ip) = ip_part.parse::<Ipv4Addr>() {
-                entries.ips.push(ip);
+                entries.add_ip(ip, "ThreatFox", limits)?;
             }
             continue;
         }
 
         if let Ok(ip) = raw_ioc.parse::<Ipv4Addr>() {
-            entries.ips.push(ip);
+            entries.add_ip(ip, "ThreatFox", limits)?;
             continue;
         }
 
         if !raw_ioc.contains('/') && raw_ioc.contains('.') {
-            entries.hostnames.push(raw_ioc.to_ascii_lowercase());
+            entries.add_hostname(raw_ioc.to_ascii_lowercase(), "ThreatFox", limits)?;
         }
     }
 
-    entries.sort_and_dedup();
-    Ok(entries)
+    Ok(entries.finish())
 }
 
 pub fn parse_threatfox_zip<R: Read + Seek>(reader: R) -> Result<FeedEntries, String> {
     let mut archive =
         zip::ZipArchive::new(reader).map_err(|e| format!("ThreatFox ZIP open failed: {e}"))?;
+    if archive.len() > MAX_FEED_ARCHIVE_MEMBERS {
+        return Err(format!(
+            "ThreatFox ZIP contains {} members (max {MAX_FEED_ARCHIVE_MEMBERS})",
+            archive.len()
+        ));
+    }
     for idx in 0..archive.len() {
-        let mut file = archive
+        let file = archive
             .by_index(idx)
             .map_err(|e| format!("ThreatFox ZIP read failed: {e}"))?;
         if !file.name().ends_with(".csv") {
             continue;
         }
 
-        // Cap decompressed size to prevent zip bombs.
-        const MAX_DECOMPRESSED: u64 = 512 * 1024 * 1024;
-        let mut csv_bytes = Vec::new();
-        file.by_ref()
-            .take(MAX_DECOMPRESSED + 1)
-            .read_to_end(&mut csv_bytes)
-            .map_err(|e| format!("ThreatFox ZIP extraction failed: {e}"))?;
-        if csv_bytes.len() as u64 > MAX_DECOMPRESSED {
+        // Stream the decompressed member directly into the bounded CSV parser;
+        // never materialize a second 512 MiB buffer.
+        if file.size() > MAX_FEED_INPUT_BYTES {
             return Err(format!(
                 "ThreatFox CSV exceeds {} MiB decompressed size limit",
-                MAX_DECOMPRESSED / (1024 * 1024)
+                MAX_FEED_INPUT_BYTES / (1024 * 1024)
             ));
         }
-        return parse_threatfox_csv(std::io::Cursor::new(csv_bytes))
-            .map_err(|e| format!("ThreatFox CSV parse failed: {e}"));
+        return parse_threatfox_csv(file).map_err(|e| format!("ThreatFox CSV parse failed: {e}"));
     }
 
     Err("ThreatFox ZIP did not contain a CSV payload".to_string())
 }
 
 pub fn parse_phishtank_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
+    parse_phishtank_csv_with_limits(reader, DEFAULT_FEED_LIMITS)
+}
+
+fn parse_phishtank_csv_with_limits<R: Read>(
+    reader: R,
+    limits: FeedLimits,
+) -> Result<FeedEntries, String> {
     let mut csv = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(false)
-        .from_reader(reader);
+        .from_reader(CappedReader::new(reader, limits.input_bytes));
     let headers = csv
         .headers()
         .map_err(|e| format!("PhishTank headers: {e}"))?
         .clone();
+    validate_record("PhishTank", 0, &headers, limits)?;
     let url_idx = headers
         .iter()
         .position(|header| header == "url")
         .ok_or_else(|| format!("PhishTank schema error: no 'url' column in headers {headers:?}"))?;
 
-    let mut entries = FeedEntries::default();
-    for record in csv.records() {
+    let mut entries = FeedAccumulator::default();
+    for (index, record) in csv.records().enumerate() {
         let record = record.map_err(|e| format!("PhishTank record error: {e}"))?;
+        validate_record("PhishTank", index + 1, &record, limits)?;
         if let Some(host) = record.get(url_idx).and_then(extract_hostname_from_url) {
-            entries.hostnames.push(host);
+            entries.add_hostname(host, "PhishTank", limits)?;
         }
     }
-    entries.sort_and_dedup();
-    Ok(entries)
+    Ok(entries.finish())
 }
 
 /// Parse a DigitalSide Threat-Intel MISP-style CSV export.
@@ -199,13 +367,20 @@ pub fn parse_phishtank_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
 /// plus IPv4; file-hash ingestion is deferred to a follow-up (the
 /// `CuratedFileHashes` path).
 pub fn parse_digitalside_csv<R: Read>(reader: R) -> Result<FeedEntries, String> {
+    parse_digitalside_csv_with_limits(reader, DEFAULT_FEED_LIMITS)
+}
+
+fn parse_digitalside_csv_with_limits<R: Read>(
+    reader: R,
+    limits: FeedLimits,
+) -> Result<FeedEntries, String> {
     // has_headers(false) so we detect the header ourselves. has_headers(true)
     // would consume the first row of a headerless export as the header and drop
     // that indicator.
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(false)
-        .from_reader(reader);
+        .from_reader(CappedReader::new(reader, limits.input_bytes));
     let mut records = rdr.records();
 
     let first = match records.next() {
@@ -213,6 +388,7 @@ pub fn parse_digitalside_csv<R: Read>(reader: R) -> Result<FeedEntries, String> 
         Some(Err(e)) => return Err(format!("DigitalSide first record: {e}")),
         None => return Ok(FeedEntries::default()),
     };
+    validate_record("DigitalSide", 1, &first, limits)?;
     let has_header = first.iter().any(|field| field == "type")
         && first.iter().any(|field| field == "value")
         && first.iter().any(|field| field == "to_ids");
@@ -234,9 +410,13 @@ pub fn parse_digitalside_csv<R: Read>(reader: R) -> Result<FeedEntries, String> 
     // row is a real indicator and is ingested with the rest.
     let leading = if has_header { None } else { Some(Ok(first)) };
 
-    let mut entries = FeedEntries::default();
-    for record in leading.into_iter().chain(records) {
+    let mut entries = FeedAccumulator::default();
+    for (index, record) in leading.into_iter().chain(records).enumerate() {
         let record = record.map_err(|e| format!("DigitalSide record error: {e}"))?;
+        // `index == 0` may be the already-validated leading record for a
+        // headerless export; validating it twice is harmless and keeps the
+        // logical-record budget uniform.
+        validate_record("DigitalSide", index + 1, &record, limits)?;
 
         // MISP `to_ids` gate: ingest only analyst-flagged detectable indicators.
         if record.get(to_ids_idx).map(str::trim) != Some("1") {
@@ -258,17 +438,17 @@ pub fn parse_digitalside_csv<R: Read>(reader: R) -> Result<FeedEntries, String> 
         match ioc_type.as_str() {
             "url" => {
                 if let Some(host) = extract_hostname_from_url(value) {
-                    entries.hostnames.push(host);
+                    entries.add_hostname(host, "DigitalSide", limits)?;
                 }
             }
             // A domain/hostname attribute is a bare host; the guard rejects a
             // stray URL sneaking into the field before it is stored.
             "domain" | "hostname" if !value.contains('/') => {
-                entries.hostnames.push(value.to_ascii_lowercase());
+                entries.add_hostname(value.to_ascii_lowercase(), "DigitalSide", limits)?;
             }
             "ip-src" | "ip-dst" => {
                 if let Ok(ip) = value.parse::<Ipv4Addr>() {
-                    entries.ips.push(ip);
+                    entries.add_ip(ip, "DigitalSide", limits)?;
                 }
             }
             // filename, md5/sha*, mime-type, comment, and every other type are
@@ -277,8 +457,7 @@ pub fn parse_digitalside_csv<R: Read>(reader: R) -> Result<FeedEntries, String> 
         }
     }
 
-    entries.sort_and_dedup();
-    Ok(entries)
+    Ok(entries.finish())
 }
 
 pub fn parse_domain_blocklist(contents: &str) -> FeedEntries {
@@ -307,6 +486,57 @@ pub fn parse_domain_blocklist(contents: &str) -> FeedEntries {
     }
     entries.sort_and_dedup();
     entries
+}
+
+/// Streaming, fail-closed form of [`parse_domain_blocklist`] for remote feeds.
+/// The compatibility wrapper above remains infallible for curated local files;
+/// network consumers must use this entry point so excess records/fields/input
+/// preserve the last-known-good overlay instead of publishing a prefix.
+pub fn parse_domain_blocklist_reader<R: Read>(reader: R) -> Result<FeedEntries, String> {
+    parse_domain_blocklist_reader_with_limits(reader, DEFAULT_FEED_LIMITS)
+}
+
+fn parse_domain_blocklist_reader_with_limits<R: Read>(
+    reader: R,
+    limits: FeedLimits,
+) -> Result<FeedEntries, String> {
+    let reader = std::io::BufReader::new(CappedReader::new(reader, limits.input_bytes));
+    let mut entries = FeedAccumulator::default();
+    for (index, line) in reader.split(b'\n').enumerate() {
+        let line = line.map_err(|error| format!("domain blocklist read failed: {error}"))?;
+        let record_number = index + 1;
+        if record_number > limits.records {
+            return Err(format!(
+                "domain blocklist exceeds the record limit of {}",
+                limits.records
+            ));
+        }
+        if line.len() > limits.field_bytes {
+            return Err(format!(
+                "domain blocklist record {record_number} has a {}-byte field (max {})",
+                line.len(),
+                limits.field_bytes
+            ));
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|error| format!("domain blocklist is not UTF-8: {error}"))?
+            .trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let token = line
+            .split_whitespace()
+            .take_while(|value| !value.starts_with('#'))
+            .last()
+            .unwrap_or(line);
+        if token.eq_ignore_ascii_case("localhost") || token.starts_with("127.") {
+            continue;
+        }
+        if token.contains('.') && !token.contains('/') {
+            entries.add_hostname(token.to_ascii_lowercase(), "domain blocklist", limits)?;
+        }
+    }
+    Ok(entries.finish())
 }
 
 /// Parse a curated exfiltration-endpoint / webhook-catcher hostname list.
@@ -479,6 +709,46 @@ pub fn parse_tor_exit_list(contents: &str) -> FeedEntries {
     }
     entries.sort_and_dedup();
     entries
+}
+
+/// Streaming, bounded Tor-exit parser for remote supplemental updates.
+pub fn parse_tor_exit_list_reader<R: Read>(reader: R) -> Result<FeedEntries, String> {
+    parse_tor_exit_list_reader_with_limits(reader, DEFAULT_FEED_LIMITS)
+}
+
+fn parse_tor_exit_list_reader_with_limits<R: Read>(
+    reader: R,
+    limits: FeedLimits,
+) -> Result<FeedEntries, String> {
+    let reader = std::io::BufReader::new(CappedReader::new(reader, limits.input_bytes));
+    let mut entries = FeedAccumulator::default();
+    for (index, line) in reader.split(b'\n').enumerate() {
+        let line = line.map_err(|error| format!("Tor exit feed read failed: {error}"))?;
+        let record_number = index + 1;
+        if record_number > limits.records {
+            return Err(format!(
+                "Tor exit feed exceeds the record limit of {}",
+                limits.records
+            ));
+        }
+        if line.len() > limits.field_bytes {
+            return Err(format!(
+                "Tor exit record {record_number} has a {}-byte field (max {})",
+                line.len(),
+                limits.field_bytes
+            ));
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|error| format!("Tor exit feed is not UTF-8: {error}"))?
+            .trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Ok(ip) = line.parse::<Ipv4Addr>() {
+            entries.add_ip(ip, "Tor exit feed", limits)?;
+        }
+    }
+    Ok(entries.finish())
 }
 
 #[cfg(test)]
@@ -771,5 +1041,104 @@ mod tests {
 
         let csv = "ioc,ioc_type\nbad.example,domain\n\"unclosed,domain\n";
         assert!(parse_threatfox_csv(csv.as_bytes()).is_err());
+    }
+
+    fn tiny_limits() -> FeedLimits {
+        FeedLimits {
+            input_bytes: 1024,
+            records: 2,
+            fields: 4,
+            field_bytes: 64,
+            entries: 2,
+        }
+    }
+
+    #[test]
+    fn csv_limits_fail_closed_for_records_fields_and_aggregate_entries() {
+        let mut limits = tiny_limits();
+        limits.records = 1;
+        let two_rows = "url\nhttps://one.example/\nhttps://two.example/\n";
+        let error = parse_urlhaus_csv_with_limits(two_rows.as_bytes(), limits).unwrap_err();
+        assert!(error.contains("record limit"), "{error}");
+
+        let mut limits = tiny_limits();
+        limits.field_bytes = 8;
+        let wide = "url\nhttps://wide.example/\n";
+        let error = parse_urlhaus_csv_with_limits(wide.as_bytes(), limits).unwrap_err();
+        assert!(error.contains("byte field"), "{error}");
+
+        let mut limits = tiny_limits();
+        limits.fields = 1;
+        let wide_record = "url,other\nhttps://one.example/,x\n";
+        let error = parse_urlhaus_csv_with_limits(wide_record.as_bytes(), limits).unwrap_err();
+        assert!(error.contains("fields"), "{error}");
+
+        let mut limits = tiny_limits();
+        limits.entries = 1;
+        let two_unique = "url\nhttps://one.example/\nhttps://two.example/\n";
+        let error = parse_urlhaus_csv_with_limits(two_unique.as_bytes(), limits).unwrap_err();
+        assert!(error.contains("unique-indicator limit"), "{error}");
+
+        let duplicate = "url\nhttps://one.example/\nhttps://one.example/\n";
+        let parsed = parse_urlhaus_csv_with_limits(duplicate.as_bytes(), limits).unwrap();
+        assert_eq!(parsed.hostnames, vec!["one.example"]);
+    }
+
+    #[test]
+    fn decoded_input_cap_is_enforced_during_streaming_read() {
+        let mut limits = tiny_limits();
+        limits.input_bytes = 24;
+        let input = "url\nhttps://one.example/\n";
+        let error = parse_urlhaus_csv_with_limits(input.as_bytes(), limits).unwrap_err();
+        assert!(error.contains("decoded input limit"), "{error}");
+
+        limits.input_bytes = input.len() as u64;
+        let parsed = parse_urlhaus_csv_with_limits(input.as_bytes(), limits).unwrap();
+        assert_eq!(parsed.hostnames, vec!["one.example"]);
+    }
+
+    #[test]
+    fn streaming_line_feeds_refuse_partial_prefixes_at_every_budget() {
+        let mut limits = tiny_limits();
+        limits.records = 1;
+        let error = parse_domain_blocklist_reader_with_limits(
+            "one.example\ntwo.example\n".as_bytes(),
+            limits,
+        )
+        .unwrap_err();
+        assert!(error.contains("record limit"), "{error}");
+
+        let mut limits = tiny_limits();
+        limits.field_bytes = 4;
+        let error = parse_domain_blocklist_reader_with_limits("wide.example\n".as_bytes(), limits)
+            .unwrap_err();
+        assert!(error.contains("byte field"), "{error}");
+
+        let mut limits = tiny_limits();
+        limits.entries = 1;
+        let error =
+            parse_tor_exit_list_reader_with_limits("203.0.113.1\n203.0.113.2\n".as_bytes(), limits)
+                .unwrap_err();
+        assert!(error.contains("unique-indicator limit"), "{error}");
+    }
+
+    #[test]
+    fn threatfox_zip_rejects_excess_member_table() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            for index in 0..=MAX_FEED_ARCHIVE_MEMBERS {
+                zip.start_file(
+                    format!("member-{index}.txt"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+                zip.write_all(b"x").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        cursor.set_position(0);
+        let error = parse_threatfox_zip(cursor).unwrap_err();
+        assert!(error.contains("members"), "{error}");
     }
 }

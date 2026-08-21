@@ -250,6 +250,12 @@ pub fn enrich_command(
         // (repo-0348).
         let mut candidates: Vec<String> = Vec::new();
         let mut candidate_set: HashSet<String> = HashSet::new();
+        let dns_resolver = crate::network::SystemDnsResolver::new().ok();
+        // DNS classification shares the enrichment deadline and one lookup per
+        // candidate at most. If system DNS is unavailable or time is exhausted,
+        // dotted hostnames fail closed and are not disclosed to Google.
+        let mut dns_budget =
+            crate::network::DnsRequestBudget::new(deadline, MAX_ENRICH_URLS, MAX_ENRICH_URLS);
         // Same ordering as the package budget: the cap counts candidates that
         // will actually be looked up, so repeats cannot displace a distinct URL.
         for url_info in urls {
@@ -258,7 +264,14 @@ pub fn enrich_command(
                 url_budget_truncated = true;
                 break;
             }
-            if let Some(url) = safe_browsing_candidate_url(&url_info.parsed, &url_info.raw) {
+            if let Some(url) = safe_browsing_candidate_url(
+                &url_info.parsed,
+                &url_info.raw,
+                dns_resolver
+                    .as_ref()
+                    .map(|resolver| resolver as &dyn crate::network::DnsResolver),
+                &mut dns_budget,
+            ) {
                 if candidate_set.insert(url.clone()) {
                     candidates.push(url);
                 }
@@ -756,26 +769,54 @@ fn query_safe_browsing_batch(
     else {
         return out;
     };
-    let Some(mut parsed) = read_json_bounded::<SafeBrowsingResponse>(response, MAX_RESPONSE_BYTES)
+    let Some(parsed) = read_json_bounded::<SafeBrowsingResponse>(response, MAX_RESPONSE_BYTES)
     else {
         return out;
     };
+    out.extend(cache_successful_safe_browsing_batch(&missing, parsed));
+    out
+}
+
+/// Persist every outcome from one successfully parsed Safe Browsing response.
+/// The API omits clean entries, so each requested URL not present in a complete,
+/// fully mappable `matches` response receives an authenticated empty cache
+/// envelope. Transport, status, parse, truncation, or response-mapping failures
+/// are never cached as clean.
+fn cache_successful_safe_browsing_batch(
+    requested: &[&str],
+    mut parsed: SafeBrowsingResponse,
+) -> Vec<(String, String)> {
+    // If the decoded match list exceeds our cap, omitted entries are unknown,
+    // not confirmed clean. Positive entries within the cap remain actionable,
+    // but no negative cache entry may be synthesized from an incomplete view.
+    let response_complete = parsed.matches.len() <= MAX_DECODED_ITEMS;
     parsed.matches.truncate(MAX_DECODED_ITEMS);
-    // Cache the per-URL outcome (positive match or confirmed-clean empty
-    // response) so repeated scans of the same URL stay offline.
-    for m in parsed.matches.drain(..) {
-        let url = m.threat_entry.url.clone();
-        if url.is_empty() {
-            continue;
+    let requested_set: HashSet<&str> = requested.iter().copied().collect();
+    let mut by_url: std::collections::HashMap<String, Vec<SafeBrowsingMatch>> =
+        std::collections::HashMap::new();
+    let mut response_mappable = true;
+    for matched in parsed.matches {
+        let url = matched.threat_entry.url.clone();
+        // A compromised/malformed response cannot plant cache entries for URLs
+        // that were absent from this authenticated request batch.
+        if requested_set.contains(url.as_str()) {
+            by_url.entry(url).or_default().push(matched);
+        } else {
+            response_mappable = false;
         }
+    }
+
+    let mut out = Vec::new();
+    for &url in requested {
         let single = SafeBrowsingResponse {
-            matches: vec![SafeBrowsingMatch {
-                threat_type: m.threat_type.clone(),
-                threat_entry: m.threat_entry.clone(),
-            }],
+            matches: by_url.remove(url).unwrap_or_default(),
         };
-        store_cache("safe-browsing", &url, &single);
-        out.push((url, m.threat_type));
+        if let Some(matched) = single.matches.first() {
+            out.push((url.to_string(), matched.threat_type.clone()));
+            store_cache("safe-browsing", url, &single);
+        } else if response_complete && response_mappable {
+            store_cache("safe-browsing", url, &single);
+        }
     }
     out
 }
@@ -946,7 +987,12 @@ fn parse_rfc3339_secs(raw: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
-fn safe_browsing_candidate_url(parsed: &UrlLike, raw: &str) -> Option<String> {
+fn safe_browsing_candidate_url(
+    parsed: &UrlLike,
+    raw: &str,
+    resolver: Option<&dyn crate::network::DnsResolver>,
+    dns_budget: &mut crate::network::DnsRequestBudget,
+) -> Option<String> {
     let candidate = match parsed {
         UrlLike::Standard { parsed, .. } if matches!(parsed.scheme(), "http" | "https") => {
             parsed.as_str()
@@ -956,19 +1002,24 @@ fn safe_browsing_candidate_url(parsed: &UrlLike, raw: &str) -> Option<String> {
         }
         _ => return None,
     };
-    privacy_scrub_url(candidate)
+    privacy_scrub_url(candidate, resolver, dns_budget)
 }
 
 /// Reduce a URL to the minimum form Safe Browsing can evaluate, and refuse
 /// URLs that must never leave the machine (repo-0346):
 ///
-///  * userinfo, query string, and fragment are stripped — presigned URLs,
-///    password-reset links, and bearer tokens must not be transmitted to a
-///    third party (or persisted in the on-disk cache);
+///  * userinfo, path, query string, and fragment are stripped — presigned URLs,
+///    password-reset links, route identifiers, and bearer tokens must not be
+///    transmitted to a third party (or persisted in the on-disk cache);
 ///  * private, loopback, link-local, and otherwise non-public destinations
-///    are excluded entirely via the server-URL validator;
+///    are excluded, including dotted split-DNS names that resolve to any
+///    non-public address;
 ///  * anything that does not parse as an http(s) URL is excluded.
-fn privacy_scrub_url(raw: &str) -> Option<String> {
+fn privacy_scrub_url(
+    raw: &str,
+    resolver: Option<&dyn crate::network::DnsResolver>,
+    dns_budget: &mut crate::network::DnsRequestBudget,
+) -> Option<String> {
     let mut parsed = url::Url::parse(raw).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
@@ -998,7 +1049,7 @@ fn privacy_scrub_url(raw: &str) -> Option<String> {
             }
         }
         url::Host::Domain(domain) => {
-            let lower = domain.to_ascii_lowercase();
+            let lower = domain.trim_end_matches('.').to_ascii_lowercase();
             let intranet = !lower.contains('.')
                 || lower == "localhost"
                 || lower.ends_with(".local")
@@ -1008,8 +1059,19 @@ fn privacy_scrub_url(raw: &str) -> Option<String> {
             if intranet {
                 return None;
             }
+            let addresses = dns_budget.resolve_subject(resolver?, &lower)?;
+            if addresses.is_empty()
+                || addresses.iter().any(|address| {
+                    !crate::url_validate::is_public_addr(&std::net::SocketAddr::new(*address, 0))
+                })
+            {
+                return None;
+            }
         }
     }
+    // Keep only the origin. Secrets embedded in path segments are as sensitive
+    // as query tokens, and Safe Browsing does not justify disclosing them.
+    parsed.set_path("/");
     Some(parsed.into())
 }
 
@@ -1098,17 +1160,70 @@ fn ecosystems_registry_name(ecosystem: Ecosystem) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::sync::Mutex;
     use url::Url;
+
+    #[derive(Default)]
+    struct FakeDns {
+        answers: HashMap<String, Option<Vec<IpAddr>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeDns {
+        fn public_for(names: &[&str]) -> Self {
+            let answers = names
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_string(),
+                        Some(vec!["93.184.216.34".parse().expect("public IP")]),
+                    )
+                })
+                .collect();
+            Self {
+                answers,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_answer(mut self, name: &str, addresses: Option<Vec<IpAddr>>) -> Self {
+            self.answers.insert(name.to_string(), addresses);
+            self
+        }
+    }
+
+    impl crate::network::DnsResolver for FakeDns {
+        fn lookup_ips(&self, name: &str, _deadline: Instant) -> Option<Vec<IpAddr>> {
+            self.calls
+                .lock()
+                .expect("DNS calls lock")
+                .push(name.to_string());
+            self.answers.get(name).cloned().flatten()
+        }
+    }
+
+    fn dns_budget() -> crate::network::DnsRequestBudget {
+        crate::network::DnsRequestBudget::new(Instant::now() + Duration::from_secs(1), 64, 64)
+    }
 
     #[test]
     fn safe_browsing_filter_only_accepts_http_urls() {
+        let resolver = FakeDns::public_for(&["example.com", "phish.example"]);
+        let mut budget = dns_budget();
         let parsed = UrlLike::Standard {
             parsed: Url::parse("https://example.com/login").expect("url"),
             raw_host: "example.com".to_string(),
         };
         assert_eq!(
-            safe_browsing_candidate_url(&parsed, "https://example.com/login"),
-            Some("https://example.com/login".to_string())
+            safe_browsing_candidate_url(
+                &parsed,
+                "https://example.com/login",
+                Some(&resolver),
+                &mut budget,
+            ),
+            Some("https://example.com/".to_string())
         );
 
         let unparsed = UrlLike::Unparsed {
@@ -1117,7 +1232,12 @@ mod tests {
             raw_path: None,
         };
         assert_eq!(
-            safe_browsing_candidate_url(&unparsed, "http://phish.example"),
+            safe_browsing_candidate_url(
+                &unparsed,
+                "http://phish.example",
+                Some(&resolver),
+                &mut budget,
+            ),
             // The scrubber parses and re-serializes; an empty path normalizes
             // to `/`.
             Some("http://phish.example/".to_string())
@@ -1130,7 +1250,12 @@ mod tests {
             digest: None,
         };
         assert_eq!(
-            safe_browsing_candidate_url(&docker, "ghcr.io/owner/image"),
+            safe_browsing_candidate_url(
+                &docker,
+                "ghcr.io/owner/image",
+                Some(&resolver),
+                &mut budget,
+            ),
             None
         );
 
@@ -1140,23 +1265,37 @@ mod tests {
             path: "owner/repo.git".to_string(),
         };
         assert_eq!(
-            safe_browsing_candidate_url(&scp, "git@github.com:owner/repo.git"),
+            safe_browsing_candidate_url(
+                &scp,
+                "git@github.com:owner/repo.git",
+                Some(&resolver),
+                &mut budget,
+            ),
             None
         );
     }
 
     #[test]
     fn privacy_scrub_strips_secrets_and_rejects_internal_urls() {
-        // Userinfo, query, and fragment are removed before transmission.
+        let resolver =
+            FakeDns::public_for(&["example.com", "storage.example", "downloads.example.com"]);
+        let mut budget = dns_budget();
+        // Userinfo, path, query, and fragment are removed before transmission.
         assert_eq!(
-            privacy_scrub_url("https://user:pass@example.com/reset?token=secret123#frag"),
-            Some("https://example.com/reset".to_string())
+            privacy_scrub_url(
+                "https://user:pass@example.com/reset/secret123?token=secret123#frag",
+                Some(&resolver),
+                &mut budget,
+            ),
+            Some("https://example.com/".to_string())
         );
         assert_eq!(
             privacy_scrub_url(
-                "https://storage.example/x.tar.gz?X-Amz-Signature=abc&X-Amz-Expires=60"
+                "https://storage.example/x.tar.gz?X-Amz-Signature=abc&X-Amz-Expires=60",
+                Some(&resolver),
+                &mut budget,
             ),
-            Some("https://storage.example/x.tar.gz".to_string())
+            Some("https://storage.example/".to_string())
         );
         // Private / loopback / link-local literals and intranet names never leave.
         for raw in [
@@ -1169,12 +1308,124 @@ mod tests {
             "http://metadata.google.internal/computeMetadata/v1/",
             "http://intranet/hr",
         ] {
-            assert_eq!(privacy_scrub_url(raw), None, "must not transmit: {raw}");
+            assert_eq!(
+                privacy_scrub_url(raw, Some(&resolver), &mut budget),
+                None,
+                "must not transmit: {raw}"
+            );
         }
-        // Public destinations survive (with scheme/host intact).
+        // Public destinations survive as origins only.
         assert_eq!(
-            privacy_scrub_url("https://downloads.example.com/pkg.tar.gz"),
-            Some("https://downloads.example.com/pkg.tar.gz".to_string())
+            privacy_scrub_url(
+                "https://downloads.example.com/pkg.tar.gz",
+                Some(&resolver),
+                &mut budget,
+            ),
+            Some("https://downloads.example.com/".to_string())
+        );
+    }
+
+    #[test]
+    fn privacy_scrub_rejects_private_mixed_and_unresolved_dotted_names() {
+        let resolver = FakeDns::default()
+            .with_answer(
+                "private.example.com",
+                Some(vec!["10.0.0.7".parse().unwrap()]),
+            )
+            .with_answer(
+                "mixed.example.com",
+                Some(vec![
+                    "93.184.216.34".parse().unwrap(),
+                    "192.168.1.9".parse().unwrap(),
+                ]),
+            )
+            .with_answer("missing.example.com", None)
+            .with_answer(
+                "public.example.com",
+                Some(vec!["93.184.216.34".parse().unwrap()]),
+            );
+        let mut budget = dns_budget();
+
+        assert_eq!(
+            privacy_scrub_url(
+                "https://unclassified.example.com/private/path",
+                None,
+                &mut budget,
+            ),
+            None,
+            "a dotted hostname must not be disclosed when DNS classification is unavailable"
+        );
+
+        for host in [
+            "private.example.com",
+            "mixed.example.com",
+            "missing.example.com",
+        ] {
+            let raw = format!("https://{host}/internal/reset-token");
+            assert_eq!(
+                privacy_scrub_url(&raw, Some(&resolver), &mut budget),
+                None,
+                "must not disclose {host}"
+            );
+        }
+        assert_eq!(
+            privacy_scrub_url(
+                "https://public.example.com/private/path",
+                Some(&resolver),
+                &mut budget,
+            ),
+            Some("https://public.example.com/".to_string())
+        );
+        assert_eq!(
+            privacy_scrub_url("https://93.184.216.34/private/path", None, &mut budget),
+            Some("https://93.184.216.34/".to_string())
+        );
+    }
+
+    #[test]
+    fn successful_safe_browsing_batch_caches_clean_and_matched_results() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        let clean = "https://clean.example/";
+        let matched = "https://matched.example/";
+        let extraneous = "https://not-requested.example/";
+        let parsed = SafeBrowsingResponse {
+            matches: vec![SafeBrowsingMatch {
+                threat_type: "MALWARE".to_string(),
+                threat_entry: SafeBrowsingThreatEntry {
+                    url: matched.to_string(),
+                },
+            }],
+        };
+
+        let out = cache_successful_safe_browsing_batch(&[clean, matched], parsed);
+        assert_eq!(out, vec![(matched.to_string(), "MALWARE".to_string())]);
+
+        let clean_cache: SafeBrowsingResponse =
+            load_cache("safe-browsing", clean, CACHE_TTL_SECS).expect("clean cache entry");
+        assert!(clean_cache.matches.is_empty());
+        let matched_cache: SafeBrowsingResponse =
+            load_cache("safe-browsing", matched, CACHE_TTL_SECS).expect("matched cache entry");
+        assert_eq!(matched_cache.matches.len(), 1);
+
+        let ambiguous_clean = "https://ambiguous-clean.example/";
+        let malformed = SafeBrowsingResponse {
+            matches: vec![SafeBrowsingMatch {
+                threat_type: "SOCIAL_ENGINEERING".to_string(),
+                threat_entry: SafeBrowsingThreatEntry {
+                    url: extraneous.to_string(),
+                },
+            }],
+        };
+        assert!(cache_successful_safe_browsing_batch(&[ambiguous_clean], malformed).is_empty());
+        assert!(load_cache::<SafeBrowsingResponse>(
+            "safe-browsing",
+            ambiguous_clean,
+            CACHE_TTL_SECS
+        )
+        .is_none());
+        assert!(
+            load_cache::<SafeBrowsingResponse>("safe-browsing", extraneous, CACHE_TTL_SECS)
+                .is_none()
         );
     }
 
