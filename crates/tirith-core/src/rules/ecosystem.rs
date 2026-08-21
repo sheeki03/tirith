@@ -108,35 +108,49 @@ fn check_npm_url_install(url: &UrlLike, findings: &mut Vec<Finding>) {
 }
 
 fn check_web3_rpc(url: &UrlLike, findings: &mut Vec<Finding>) {
-    if let Some(path) = url.path() {
-        if path.contains("/v1/") || path.contains("/rpc") || path.contains("/jsonrpc") {
-            if let Some(host) = url.host() {
-                let web3_indicators = [
-                    "infura.io",
-                    "alchemy.com",
-                    "moralis.io",
-                    "chainstack.com",
-                    "getblock.io",
-                ];
-                if web3_indicators.iter().any(|ind| host.contains(ind)) {
-                    findings.push(Finding {
-                        rule_id: RuleId::Web3RpcEndpoint,
-                        severity: Severity::Low,
-                        title: "Web3 RPC endpoint detected".to_string(),
-                        description: format!("URL appears to be a Web3 RPC endpoint on '{host}'"),
-                        evidence: vec![Evidence::Url { raw: url.raw_str() }],
-                        human_view: None,
-                        agent_view: None,
-                        mitre_id: None,
-                        custom_rule_id: None,
-                    });
-                }
-            }
-        }
+    let Some(host) = url.host().map(str::to_ascii_lowercase) else {
+        return;
+    };
+    let providers = [
+        "infura.io",
+        "alchemy.com",
+        "moralis.io",
+        "chainstack.com",
+        "getblock.io",
+        "quiknode.pro",
+        "quicknode.com",
+    ];
+    let Some(provider) = providers
+        .iter()
+        .find(|provider| host == **provider || host.ends_with(&format!(".{provider}")))
+    else {
+        return;
+    };
+    let path = url.path().unwrap_or_default();
+    let has_rpc_segment = path.split('/').any(|segment| {
+        matches!(
+            segment.to_ascii_lowercase().as_str(),
+            "v1" | "v2" | "v3" | "rpc" | "jsonrpc"
+        )
+    });
+    let quicknode_form = matches!(*provider, "quiknode.pro" | "quicknode.com");
+    if has_rpc_segment || quicknode_form {
+        findings.push(Finding {
+            rule_id: RuleId::Web3RpcEndpoint,
+            severity: Severity::Low,
+            title: "Web3 RPC endpoint detected".to_string(),
+            description: format!("URL appears to be a Web3 RPC endpoint on '{host}'"),
+            evidence: vec![Evidence::Url { raw: url.raw_str() }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
     }
 }
 
-static ETH_ADDRESS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"0x[0-9a-fA-F]{40}").unwrap());
+static ETH_ADDRESS_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)(?:^|[^0-9a-f])0x[0-9a-f]{40}(?:$|[^0-9a-f])").unwrap());
 
 fn check_web3_address_in_url(url: &UrlLike, findings: &mut Vec<Finding>) {
     let raw = url.raw_str();
@@ -199,5 +213,57 @@ fn check_git_typosquat(url: &UrlLike, findings: &mut Vec<Finding>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::parse_url;
+
+    fn has_rule(raw: &str, rule: RuleId) -> bool {
+        check(&parse_url(raw))
+            .iter()
+            .any(|finding| finding.rule_id == rule)
+    }
+
+    #[test]
+    fn web3_rpc_provider_hosts_use_exact_or_dot_suffix_boundaries() {
+        for url in [
+            "https://infura.io/v3/token",
+            "https://mainnet.infura.io/v3/token",
+            "https://eth-mainnet.g.alchemy.com/v2/token",
+            "https://rpc.chainstack.com/v1/token",
+            "https://snowy-white-lake.solana-mainnet.quiknode.pro/token",
+            "https://node.quicknode.com/anything",
+        ] {
+            assert!(has_rule(url, RuleId::Web3RpcEndpoint), "{url}");
+        }
+        for url in [
+            "https://evilinfura.io/v3/token",
+            "https://infura.io.evil.example/v3/token",
+            "https://alchemy.com.evil.example/v2/token",
+            "https://example.com/v3/token",
+            "https://infura.io/not-v3/token",
+        ] {
+            assert!(!has_rule(url, RuleId::Web3RpcEndpoint), "{url}");
+        }
+    }
+
+    #[test]
+    fn web3_address_requires_hex_token_boundaries() {
+        let address = "0x1111111111111111111111111111111111111111";
+        assert!(has_rule(
+            &format!("https://example.com/address/{address}?chain=1"),
+            RuleId::Web3AddressInUrl
+        ));
+        assert!(!has_rule(
+            &format!("https://example.com/0{address}"),
+            RuleId::Web3AddressInUrl
+        ));
+        assert!(!has_rule(
+            &format!("https://example.com/{address}f"),
+            RuleId::Web3AddressInUrl
+        ));
     }
 }

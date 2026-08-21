@@ -50,6 +50,28 @@ fn check_segment(
 ) -> Vec<Finding> {
     let effective = match crate::rules::command::resolve_effective_segment(seg, shell) {
         Ok(effective) => effective,
+        Err(crate::rules::command::EffectiveCommandError::WorkBudgetExceeded) => {
+            return vec![Finding {
+                rule_id: RuleId::AnalysisIncomplete,
+                severity: Severity::High,
+                title: "SSH command analysis exceeded its work budget".to_string(),
+                description: "The SSH command exceeded Tirith's bounded token-normalization budget while SSH host labels are active. The omitted token suffix is blocked instead of being treated as a non-SSH command."
+                    .to_string(),
+                evidence: vec![Evidence::CommandPattern {
+                    pattern: "ssh command work budget exhausted".to_string(),
+                    matched: "input or token suffix omitted before command normalization"
+                        .to_string(),
+                }],
+                human_view: Some(
+                    "SSH context guard stopped at its command-analysis budget.".to_string(),
+                ),
+                agent_view: Some(
+                    "tirith refused: SSH command analysis incomplete.".to_string(),
+                ),
+                mitre_id: None,
+                custom_rule_id: None,
+            }];
+        }
         Err(_) => {
             if seg
                 .raw

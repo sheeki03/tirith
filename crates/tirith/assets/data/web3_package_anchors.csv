@@ -1,0 +1,17 @@
+ecosystem,name
+npm,ethers
+npm,web3
+npm,viem
+npm,wagmi
+npm,@solana/kit
+npm,@solana/web3.js
+npm,hardhat
+npm,@openzeppelin/contracts
+npm,@openzeppelin/contracts-upgradeable
+npm,@openzeppelin/hardhat-upgrades
+npm,@openzeppelin/upgrades-core
+npm,@ledgerhq/hw-app-eth
+npm,@ledgerhq/hw-transport
+npm,@ledgerhq/hw-transport-node-hid
+npm,@ledgerhq/hw-transport-webhid
+npm,@ledgerhq/hw-transport-webusb

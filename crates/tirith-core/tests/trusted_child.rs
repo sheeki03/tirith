@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 use std::time::Instant;
@@ -14,6 +15,9 @@ use tirith_core::trusted_child::{
     resolve_system_helper_on_path, run, sanitized_path, CaptureStream, ChildLimits, ChildOutcome,
     ChildSpec, TrustedExecutable,
 };
+
+const SIGCHLD_HELPER_MODE: &str = "TIRITH_TRUSTED_CHILD_SIGCHLD_HELPER_MODE";
+const SIGCHLD_HELPER_MARKER: &str = "TIRITH_TRUSTED_CHILD_SIGCHLD_HELPER_MARKER";
 
 fn make_executable(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
@@ -38,6 +42,90 @@ fn shell() -> TrustedExecutable {
             }
         })
         .expect("a system shell must be available")
+}
+
+#[test]
+#[ignore = "subprocess helper for process-wide SIGCHLD contract tests"]
+fn sigchld_contract_subprocess_helper() {
+    let Ok(mode) = std::env::var(SIGCHLD_HELPER_MODE) else {
+        return;
+    };
+    let marker = std::path::PathBuf::from(
+        std::env::var_os(SIGCHLD_HELPER_MARKER).expect("helper marker path"),
+    );
+
+    // SAFETY: the subprocess owns its process-wide signal disposition and exits
+    // immediately after this one supervision attempt.
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = if mode == "ignored" {
+        libc::SIG_IGN
+    } else {
+        libc::SIG_DFL
+    };
+    action.sa_flags = if mode == "no-cldwait" {
+        libc::SA_NOCLDWAIT
+    } else {
+        0
+    };
+    assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) },
+        0,
+        "install helper SIGCHLD disposition: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let args = [
+        OsStr::new("-c"),
+        OsStr::new("printf spawned > \"$TIRITH_TRUSTED_CHILD_SIGCHLD_HELPER_MARKER\""),
+    ];
+    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(1), 64, 64))
+        .env(SIGCHLD_HELPER_MARKER, marker.as_os_str());
+    let outcome = run(&shell(), &spec);
+    let expected: &[&str] = if mode == "ignored" {
+        // Darwin normalizes explicit SIG_IGN into an effective
+        // SA_NOCLDWAIT disposition when read back through sigaction.
+        &["SIGCHLD is ignored", "SA_NOCLDWAIT"]
+    } else {
+        &["SA_NOCLDWAIT"]
+    };
+    match outcome {
+        ChildOutcome::SpawnError(reason) => assert!(
+            expected.iter().any(|needle| reason.contains(needle)),
+            "unexpected contract refusal for {mode}: {reason}"
+        ),
+        other => panic!("unsafe SIGCHLD embedding was not refused for {mode}: {other:?}"),
+    }
+    assert!(
+        !marker.exists(),
+        "the supervised command ran despite the invalid SIGCHLD contract"
+    );
+}
+
+#[test]
+fn supervisor_refuses_auto_reaping_sigchld_dispositions_before_spawn() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    for mode in ["ignored", "no-cldwait"] {
+        let marker = temp.path().join(format!("{mode}.marker"));
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "sigchld_contract_subprocess_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(SIGCHLD_HELPER_MODE, mode)
+            .env(SIGCHLD_HELPER_MARKER, &marker)
+            .output()
+            .expect("launch isolated SIGCHLD helper");
+        assert!(
+            output.status.success(),
+            "SIGCHLD helper failed for {mode}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!marker.exists(), "helper command ran for mode {mode}");
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -930,51 +1018,79 @@ fn supervisor_cleans_up_a_descendant_after_the_parent_completed() {
 
 #[test]
 fn parallel_supervisors_do_not_signal_unrelated_process_groups() {
-    const WORKERS: usize = 12;
-    let barrier = Arc::new(Barrier::new(WORKERS));
-    let mut workers = Vec::with_capacity(WORKERS);
+    exercise_parallel_supervisor_matrix(12, 8, Duration::from_millis(100));
+}
 
-    for index in 0..WORKERS {
+#[test]
+#[ignore = "manual process-group race stress; run explicitly on Unix CI hosts"]
+fn stress_short_lived_parallel_supervisors() {
+    exercise_parallel_supervisor_matrix(24, 200, Duration::from_millis(25));
+}
+
+fn exercise_parallel_supervisor_matrix(worker_count: usize, rounds: usize, timeout: Duration) {
+    let barrier = Arc::new(Barrier::new(worker_count));
+    let mut workers = Vec::with_capacity(worker_count);
+
+    for index in 0..worker_count {
         let barrier = Arc::clone(&barrier);
         workers.push(std::thread::spawn(move || {
             barrier.wait();
-            match index % 3 {
-                0 => {
-                    let expected = format!("worker-{index}");
-                    let command = format!("printf {expected}");
-                    let args = [OsStr::new("-c"), OsStr::new(&command)];
-                    let spec =
-                        ChildSpec::new(args, ChildLimits::new(Duration::from_secs(3), 64, 64));
-                    match run(&shell(), &spec) {
-                        ChildOutcome::Completed {
-                            status,
-                            stdout,
-                            stderr,
-                        } => {
-                            assert!(status.success(), "worker {index} was signalled: {status}");
-                            assert_eq!(stdout, expected.as_bytes());
-                            assert!(stderr.is_empty());
+            for round in 0..rounds {
+                match index % 3 {
+                    0 => {
+                        let expected = format!("worker-{index}-round-{round}");
+                        let command = format!("printf {expected}");
+                        let args = [OsStr::new("-c"), OsStr::new(&command)];
+                        let spec =
+                            ChildSpec::new(args, ChildLimits::new(Duration::from_secs(3), 64, 64));
+                        match run(&shell(), &spec) {
+                            ChildOutcome::Completed {
+                                status,
+                                stdout,
+                                stderr,
+                            } => {
+                                assert!(
+                                    status.success(),
+                                    "worker {index} round {round} was signalled: {status}"
+                                );
+                                assert_eq!(stdout, expected.as_bytes());
+                                assert!(stderr.is_empty());
+                            }
+                            other => panic!(
+                                "worker {index} round {round} had unexpected outcome: {other:?}"
+                            ),
                         }
-                        other => panic!("worker {index} had unexpected outcome: {other:?}"),
                     }
-                }
-                1 => {
-                    let args = [OsStr::new("-c"), OsStr::new("printf 12345")];
-                    let spec =
-                        ChildSpec::new(args, ChildLimits::new(Duration::from_secs(3), 4, 64));
-                    assert!(matches!(
-                        run(&shell(), &spec),
-                        ChildOutcome::OutputLimitExceeded {
-                            stream: CaptureStream::Stdout,
-                            ..
-                        }
-                    ));
-                }
-                _ => {
-                    let args = [OsStr::new("-c"), OsStr::new("sleep 5")];
-                    let spec =
-                        ChildSpec::new(args, ChildLimits::new(Duration::from_millis(100), 64, 64));
-                    assert!(matches!(run(&shell(), &spec), ChildOutcome::Timeout { .. }));
+                    1 => {
+                        let args = [OsStr::new("-c"), OsStr::new("printf 12345")];
+                        let spec =
+                            ChildSpec::new(args, ChildLimits::new(Duration::from_secs(3), 4, 64));
+                        let outcome = run(&shell(), &spec);
+                        assert!(
+                            matches!(
+                                &outcome,
+                                ChildOutcome::OutputLimitExceeded {
+                                    stream: CaptureStream::Stdout,
+                                    cleanup_succeeded: true,
+                                }
+                            ),
+                            "worker {index} round {round} output-cap outcome: {outcome:?}"
+                        );
+                    }
+                    _ => {
+                        let args = [OsStr::new("-c"), OsStr::new("sleep 5")];
+                        let spec = ChildSpec::new(args, ChildLimits::new(timeout, 64, 64));
+                        let outcome = run(&shell(), &spec);
+                        assert!(
+                            matches!(
+                                &outcome,
+                                ChildOutcome::Timeout {
+                                    cleanup_succeeded: true,
+                                }
+                            ),
+                            "worker {index} round {round} timeout outcome: {outcome:?}"
+                        );
+                    }
                 }
             }
         }));

@@ -1108,6 +1108,807 @@ pub fn upgraded_action_from_findings(findings: &[Finding], current: Action) -> A
     }
 }
 
+pub const MAX_PRESENTED_FINDINGS: usize = 128;
+pub const MAX_EVIDENCE_PER_FINDING: usize = 16;
+pub const MAX_EVIDENCE_TEXT_BYTES: usize = 64 * 1024;
+const EVIDENCE_OMISSION_MARKER_RESERVE: usize = 64;
+/// Hard presentation budget for a single machine-readable or text subject.
+/// Enforcement and audit always use the complete pre-presentation result.
+pub const MAX_PRESENTATION_BYTES: usize = 256 * 1024;
+const MAX_JSON_PRESENTATION_BYTES: usize = MAX_PRESENTATION_BYTES - 1;
+const MAX_PRIORITY_FINDINGS_IN_FALLBACK: usize = 32;
+
+/// Measure serialized JSON without allocating a second attacker-sized buffer.
+pub fn serialized_json_size(value: &impl serde::Serialize) -> Option<usize> {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter(0);
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.0)
+}
+
+/// Measure pretty-printed JSON without allocating a second serialized buffer.
+/// CLI JSON and SARIF sinks use pretty output, so their budget checks must
+/// measure that exact representation.
+pub fn serialized_json_pretty_size(value: &impl serde::Serialize) -> Option<usize> {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter(0);
+    let formatter = serde_json::ser::PrettyFormatter::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut writer, formatter);
+    value.serialize(&mut serializer).ok()?;
+    Some(writer.0)
+}
+
+/// Bound a redacted presentation without changing the decision that was made
+/// over the complete internal finding set. Callers must redact first so
+/// truncation cannot split a secret and defeat a redaction pattern.
+pub fn bound_findings_for_output(findings: &mut Vec<Finding>) {
+    let decision = action_from_findings(findings);
+    let mut dropped_findings = 0usize;
+
+    if findings.len() > MAX_PRESENTED_FINDINGS {
+        let original = std::mem::take(findings);
+        let retained_indices = retained_finding_indices_for_output(&original);
+        let mut selected = vec![false; original.len()];
+        for index in retained_indices {
+            selected[index] = true;
+        }
+        let selected_count = selected.iter().filter(|chosen| **chosen).count();
+        dropped_findings = original.len().saturating_sub(selected_count);
+        findings.extend(
+            original
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, finding)| selected[index].then_some(finding)),
+        );
+        findings.push(Finding {
+            rule_id: RuleId::AnalysisIncomplete,
+            severity: match decision {
+                Action::Block => Severity::High,
+                Action::Warn | Action::WarnAck => Severity::Medium,
+                Action::Allow => Severity::Info,
+            },
+            title: "Additional findings omitted from presentation".to_string(),
+            description: format!(
+                "{dropped_findings} finding(s) were omitted after the {MAX_PRESENTED_FINDINGS}-finding output budget; policy and action were evaluated before presentation bounding"
+            ),
+            evidence: vec![Evidence::Text {
+                detail: format!("omitted_findings={dropped_findings}"),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
+    let mut evidence_bytes = 0usize;
+    let mut omitted_evidence = 0usize;
+    for finding in findings.iter_mut() {
+        truncate_output_field(&mut finding.title, 128);
+        truncate_output_field(&mut finding.description, 512);
+        if let Some(value) = finding.human_view.as_mut() {
+            truncate_output_field(value, 128);
+        }
+        if let Some(value) = finding.agent_view.as_mut() {
+            truncate_output_field(value, 128);
+        }
+        if let Some(value) = finding.mitre_id.as_mut() {
+            truncate_output_field(value, 64);
+        }
+        if let Some(value) = finding.custom_rule_id.as_mut() {
+            truncate_output_field(value, 64);
+        }
+
+        if finding.evidence.len() > MAX_EVIDENCE_PER_FINDING {
+            omitted_evidence += finding.evidence.len() - MAX_EVIDENCE_PER_FINDING;
+            finding.evidence.truncate(MAX_EVIDENCE_PER_FINDING);
+        }
+        let mut retained = Vec::with_capacity(finding.evidence.len());
+        for mut evidence in std::mem::take(&mut finding.evidence) {
+            truncate_evidence_fields(&mut evidence);
+            let size = evidence_text_bytes(&evidence);
+            if evidence_bytes.saturating_add(size)
+                > MAX_EVIDENCE_TEXT_BYTES.saturating_sub(EVIDENCE_OMISSION_MARKER_RESERVE)
+            {
+                omitted_evidence += 1;
+            } else {
+                evidence_bytes += size;
+                retained.push(evidence);
+            }
+        }
+        finding.evidence = retained;
+    }
+
+    if omitted_evidence > 0 {
+        if let Some(first) = findings.first_mut() {
+            // The omission receipt is mandatory presentation state, not optional
+            // detail. Reserve its slot even when the first finding already used
+            // all 16 evidence items; the displaced item is itself now omitted.
+            if first.evidence.len() >= MAX_EVIDENCE_PER_FINDING && first.evidence.pop().is_some() {
+                omitted_evidence = omitted_evidence.saturating_add(1);
+            }
+            first.evidence.push(Evidence::Text {
+                detail: format!("omitted_evidence_items={omitted_evidence}"),
+            });
+        }
+    }
+
+    debug_assert_eq!(decision, action_from_findings(findings));
+    let _ = dropped_findings;
+}
+
+/// Return the original finding indices that survive presentation bounding.
+/// Consumers which must pair a bounded display finding with its exact raw
+/// source (for example trust advisories) use this selection before redaction.
+pub fn retained_finding_indices_for_output(findings: &[Finding]) -> Vec<usize> {
+    if findings.len() <= MAX_PRESENTED_FINDINGS {
+        return (0..findings.len()).collect();
+    }
+
+    let retain_slots = MAX_PRESENTED_FINDINGS.saturating_sub(1);
+    let mut selected = vec![false; findings.len()];
+    let mut selected_count = 0usize;
+    for priority in [0u8, 1u8] {
+        for (index, finding) in findings.iter().enumerate() {
+            if selected_count == retain_slots {
+                break;
+            }
+            let matches_priority = match priority {
+                0 => finding.severity == Severity::Critical,
+                _ => {
+                    finding.severity == Severity::High
+                        || finding.rule_id == RuleId::AnalysisIncomplete
+                }
+            };
+            if matches_priority && !selected[index] {
+                selected[index] = true;
+                selected_count += 1;
+            }
+        }
+    }
+    for chosen in &mut selected {
+        if selected_count == retain_slots {
+            break;
+        }
+        if !*chosen {
+            *chosen = true;
+            selected_count += 1;
+        }
+    }
+    selected
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, chosen)| chosen.then_some(index))
+        .collect()
+}
+
+pub fn bound_verdict_for_output(verdict: &mut Verdict) {
+    let action = verdict.action;
+    bound_findings_for_output(&mut verdict.findings);
+    // `action` may include policy/escalation state stronger than raw findings.
+    verdict.action = action;
+}
+
+/// Bound an already-redacted JSON projection. Ordinary projections pass
+/// through unchanged. Oversized aggregate projections become a compact,
+/// machine-readable omission envelope that preserves decision/count metadata
+/// and a bounded sample of high-priority findings.
+pub fn bound_json_value_for_output(value: serde_json::Value) -> serde_json::Value {
+    // Measure the larger pretty form because the CLI JSON writer uses it; this
+    // also guarantees the compact MCP/resource serialization stays within cap.
+    let original_bytes = serialized_json_pretty_size(&value).unwrap_or(usize::MAX);
+    if original_bytes <= MAX_JSON_PRESENTATION_BYTES {
+        return value;
+    }
+
+    let mut summary = serde_json::Map::new();
+    if let Some(object) = value.as_object() {
+        for key in [
+            "action",
+            "status",
+            "kind",
+            "event",
+            "name",
+            "schema_version",
+            "running",
+            "refused",
+            "executed",
+            "exit_code",
+            "analysis_complete",
+            "runner_error",
+            "execution_policy",
+            "error",
+            "scanned_count",
+            "skipped_count",
+            "total_findings",
+            "findings_count",
+            "original_findings_count",
+            "presented_findings_count",
+            "dropped_findings_count",
+            "panic_count",
+            "truncated",
+            "truncation_reason",
+            "analysis_incomplete",
+            "scan_analysis_incomplete",
+            "dlp_redaction_incomplete",
+            "completeness_policy_violated",
+            "policy_diagnostics_count",
+        ] {
+            if let Some(candidate) = object.get(key) {
+                if candidate.is_boolean() || candidate.is_number() || candidate.is_null() {
+                    summary.insert(key.to_string(), candidate.clone());
+                } else if let Some(text) = candidate.as_str() {
+                    summary.insert(
+                        key.to_string(),
+                        serde_json::Value::String(truncated_json_text(text, 128)),
+                    );
+                }
+            }
+        }
+    }
+
+    // The fallback itself is an incomplete presentation even when the scan was
+    // complete. Keep that signal separate from the summarized scan status.
+    let mut priority = Vec::new();
+    let mut priority_count = 0usize;
+    collect_priority_findings(&value, None, 0, &mut priority, &mut priority_count);
+    collect_priority_findings(&value, None, 1, &mut priority, &mut priority_count);
+    let policy_diagnostics_total = value
+        .get("policy_diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let policy_diagnostics = value
+        .get("policy_diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .take(8)
+        .map(|diagnostic| serde_json::Value::String(truncated_json_text(diagnostic, 256)))
+        .collect::<Vec<_>>();
+    let mut fallback = serde_json::json!({
+        "presentation_truncated": true,
+        "analysis_incomplete": true,
+        "original_serialized_bytes": original_bytes,
+        "max_presentation_bytes": MAX_PRESENTATION_BYTES,
+        "summary": summary.clone(),
+        "priority_findings": priority,
+        "priority_findings_omitted": priority_count.saturating_sub(MAX_PRIORITY_FINDINGS_IN_FALLBACK),
+    });
+    // Retain common top-level fields for existing machine consumers while also
+    // collecting them under `summary` for generic clients.
+    if let Some(object) = fallback.as_object_mut() {
+        if policy_diagnostics_total > 0 {
+            object.insert(
+                "policy_diagnostics".to_string(),
+                serde_json::Value::Array(policy_diagnostics),
+            );
+            object.insert(
+                "policy_diagnostics_omitted".to_string(),
+                serde_json::json!(policy_diagnostics_total.saturating_sub(8)),
+            );
+        }
+        object.extend(
+            summary
+                .into_iter()
+                .filter(|(key, _)| key != "analysis_incomplete"),
+        );
+    }
+
+    // Defensive guarantee if a future compact-finding field grows: retain the
+    // envelope and counts, dropping samples until the hard ceiling is met.
+    while serialized_json_pretty_size(&fallback).unwrap_or(usize::MAX) > MAX_JSON_PRESENTATION_BYTES
+    {
+        let Some(findings) = fallback
+            .get_mut("priority_findings")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            break;
+        };
+        if findings.pop().is_none() {
+            break;
+        }
+        if let Some(omitted) = fallback
+            .get_mut("priority_findings_omitted")
+            .and_then(|value| value.as_u64())
+        {
+            fallback["priority_findings_omitted"] = serde_json::json!(omitted + 1);
+        }
+    }
+    fallback
+}
+
+/// Bound display text without splitting UTF-8 and report the exact number of
+/// original bytes omitted. Callers must sanitize/redact before this step.
+pub fn bound_text_for_output(mut text: String) -> String {
+    if text.len() <= MAX_PRESENTATION_BYTES {
+        return text;
+    }
+
+    let original_bytes = text.len();
+    // Reserve enough space for the fixed marker and a decimal usize count.
+    let mut end = MAX_PRESENTATION_BYTES.saturating_sub(128).min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    // A trusted colorizer may have inserted ANSI around otherwise-sanitized
+    // text. If the byte cut landed inside that sequence, scrub the truncated
+    // prefix as a whole so the omission marker cannot inherit terminal state.
+    text = crate::mcp::output_filter::sanitize_text_str(&text);
+    let omitted = original_bytes.saturating_sub(text.len());
+    text.push_str(&format!(
+        "\n[presentation truncated: omitted_bytes={omitted}, original_bytes={original_bytes}]\n"
+    ));
+    debug_assert!(text.len() <= MAX_PRESENTATION_BYTES);
+    text
+}
+
+/// Incremental text projection that never retains more than the presentation
+/// budget. Once full, later chunks are counted but not materialized.
+pub struct BoundedTextBuilder {
+    text: String,
+    source_bytes: usize,
+    truncated: bool,
+}
+
+impl BoundedTextBuilder {
+    const MARKER_RESERVE: usize = 160;
+
+    pub fn new() -> Self {
+        Self {
+            text: String::new(),
+            source_bytes: 0,
+            truncated: false,
+        }
+    }
+
+    pub fn push_str(&mut self, chunk: &str) {
+        self.source_bytes = self.source_bytes.saturating_add(chunk.len());
+        if self.truncated {
+            return;
+        }
+        let limit = MAX_PRESENTATION_BYTES.saturating_sub(Self::MARKER_RESERVE);
+        let available = limit.saturating_sub(self.text.len());
+        if chunk.len() <= available {
+            self.text.push_str(chunk);
+            return;
+        }
+
+        let mut end = available.min(chunk.len());
+        while end > 0 && !chunk.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&chunk[..end]);
+        // Neutralize a trusted ANSI sequence if the byte boundary bisected it.
+        self.text = crate::mcp::output_filter::sanitize_text_str(&self.text);
+        self.truncated = true;
+    }
+
+    pub fn finish(mut self) -> String {
+        if self.truncated {
+            let omitted_bytes = self.source_bytes.saturating_sub(self.text.len());
+            self.text.push_str(&format!(
+                "\n[presentation truncated: omitted_bytes={omitted_bytes}]\n"
+            ));
+        }
+        debug_assert!(self.text.len() <= MAX_PRESENTATION_BYTES);
+        self.text
+    }
+}
+
+impl Default for BoundedTextBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Incrementally builds a JSON object with bounded arrays. Oversized items are
+/// counted and skipped independently; later higher-value/smaller items are
+/// still considered instead of being hidden behind a file-level early stop.
+pub struct BoundedJsonProjection {
+    root: serde_json::Map<String, serde_json::Value>,
+    omitted: std::collections::BTreeMap<String, (usize, usize)>,
+    truncated: bool,
+    estimated_bytes: usize,
+}
+
+/// Schema error returned when a caller tries to append to a projection field
+/// that already exists with a non-array value. Public input must never turn a
+/// presentation helper into a panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedJsonProjectionError {
+    NonArrayKey { key: String },
+}
+
+impl std::fmt::Display for BoundedJsonProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonArrayKey { key } => {
+                write!(
+                    formatter,
+                    "bounded projection field '{key}' is not an array"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoundedJsonProjectionError {}
+
+impl BoundedJsonProjection {
+    const OMISSION_RESERVE: usize = 2048;
+
+    pub fn new(base: serde_json::Value) -> Self {
+        let root = base.as_object().cloned().unwrap_or_default();
+        let estimated_bytes = serialized_json_pretty_size(&root).unwrap_or(usize::MAX);
+        Self {
+            root,
+            omitted: std::collections::BTreeMap::new(),
+            truncated: false,
+            estimated_bytes,
+        }
+    }
+
+    /// `units` is the caller's semantic count (for example findings in a file),
+    /// reported separately from the exact omitted item count.
+    pub fn push_array_item(
+        &mut self,
+        key: &str,
+        item: serde_json::Value,
+        units: usize,
+    ) -> Result<bool, BoundedJsonProjectionError> {
+        if self.root.get(key).is_some_and(|value| !value.is_array()) {
+            return Err(BoundedJsonProjectionError::NonArrayKey {
+                key: key.to_string(),
+            });
+        }
+        // Measure only the candidate item. Re-serializing the growing root for
+        // every item makes an attacker-controlled projection quadratic in CPU.
+        // The fixed overhead conservatively covers commas, indentation, and a
+        // newly inserted array key; `finish` still enforces the exact cap once.
+        let item_bytes = serialized_json_pretty_size(&item).unwrap_or(usize::MAX);
+        let overhead = key.len().saturating_add(64);
+        let projected = self
+            .estimated_bytes
+            .saturating_add(item_bytes)
+            .saturating_add(overhead);
+        if projected > MAX_JSON_PRESENTATION_BYTES.saturating_sub(Self::OMISSION_RESERVE) {
+            self.truncated = true;
+            self.record_omission(key, units);
+            return Ok(false);
+        }
+
+        let value = self
+            .root
+            .entry(key.to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        let Some(array) = value.as_array_mut() else {
+            // The pre-check and exclusive `&mut self` make this unreachable,
+            // but keep the public boundary panic-free if the implementation is
+            // refactored later.
+            return Err(BoundedJsonProjectionError::NonArrayKey {
+                key: key.to_string(),
+            });
+        };
+        array.push(item);
+        self.estimated_bytes = projected;
+        Ok(true)
+    }
+
+    pub fn finish(mut self) -> serde_json::Value {
+        if self.truncated {
+            let omitted = self
+                .omitted
+                .into_iter()
+                .map(|(key, (items, units))| {
+                    (key, serde_json::json!({ "items": items, "units": units }))
+                })
+                .collect::<serde_json::Map<_, _>>();
+            self.root.insert(
+                "presentation_truncated".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            self.root.insert(
+                "analysis_incomplete".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            self.root.insert(
+                "presentation_omitted".to_string(),
+                serde_json::Value::Object(omitted),
+            );
+        }
+        bound_json_value_for_output(serde_json::Value::Object(self.root))
+    }
+
+    fn record_omission(&mut self, key: &str, units: usize) {
+        let omitted = self.omitted.entry(key.to_string()).or_insert((0, 0));
+        omitted.0 = omitted.0.saturating_add(1);
+        omitted.1 = omitted.1.saturating_add(units);
+    }
+}
+
+/// Restore the schema-v5 one-entry-per-file shape after findings have been
+/// selected individually under the global output budget. Selection happens
+/// first so a large early file cannot starve later critical findings.
+pub fn regroup_file_finding_projection(value: &mut serde_json::Value) {
+    let Some(files) = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("files"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let original = std::mem::take(files);
+    let mut grouped: Vec<serde_json::Value> = Vec::new();
+    let mut positions = std::collections::HashMap::<(String, bool), usize>::new();
+    for mut item in original {
+        let Some(object) = item.as_object_mut() else {
+            grouped.push(item);
+            continue;
+        };
+        // Internal grouping detail, never part of the public projection. Take it
+        // before any branch below can carry the item out with the key intact:
+        // an item that has the id but no `path` used to leave through the early
+        // return and reach the output with it.
+        let projection_file_id = object
+            .remove("_projection_file_id")
+            .as_ref()
+            .and_then(serde_json::Value::as_u64);
+        let Some(path) = object
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            grouped.push(item);
+            continue;
+        };
+        let is_config = object
+            .get("is_config_file")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let findings = object
+            .get("findings")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let grouping_path = projection_file_id
+            .map(|id| format!("internal:{id}"))
+            .unwrap_or(path);
+        let key = (grouping_path, is_config);
+        if let Some(index) = positions.get(&key).copied() {
+            if let Some(existing) = grouped[index]
+                .get_mut("findings")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                existing.extend(findings);
+            }
+        } else {
+            positions.insert(key, grouped.len());
+            grouped.push(item);
+        }
+    }
+    *files = grouped;
+}
+
+fn collect_priority_findings(
+    value: &serde_json::Value,
+    inherited_path: Option<&str>,
+    priority: u8,
+    retained: &mut Vec<serde_json::Value>,
+    total: &mut usize,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let path = object
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .or(inherited_path);
+            let severity = object.get("severity").and_then(serde_json::Value::as_str);
+            let rule_id = object.get("rule_id").and_then(serde_json::Value::as_str);
+            let matches_priority = match priority {
+                0 => matches!(severity, Some("critical" | "CRITICAL")),
+                _ => {
+                    !matches!(severity, Some("critical" | "CRITICAL"))
+                        && (matches!(severity, Some("high" | "HIGH"))
+                            || rule_id == Some("analysis_incomplete"))
+                }
+            };
+            if matches_priority {
+                *total = total.saturating_add(1);
+                if retained.len() < MAX_PRIORITY_FINDINGS_IN_FALLBACK {
+                    retained.push(compact_priority_finding(object, path));
+                }
+                return;
+            }
+            for child in object.values() {
+                collect_priority_findings(child, path, priority, retained, total);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_priority_findings(child, inherited_path, priority, retained, total);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn compact_priority_finding(
+    finding: &serde_json::Map<String, serde_json::Value>,
+    path: Option<&str>,
+) -> serde_json::Value {
+    let mut compact = serde_json::Map::new();
+    if let Some(path) = path {
+        compact.insert(
+            "path".to_string(),
+            serde_json::Value::String(truncated_json_text(path, 512)),
+        );
+    }
+    for (key, cap) in [
+        ("rule_id", 64),
+        ("severity", 16),
+        ("title", 128),
+        ("description", 512),
+    ] {
+        if let Some(text) = finding.get(key).and_then(serde_json::Value::as_str) {
+            compact.insert(
+                key.to_string(),
+                serde_json::Value::String(truncated_json_text(text, cap)),
+            );
+        }
+    }
+    serde_json::Value::Object(compact)
+}
+
+fn truncated_json_text(value: &str, cap: usize) -> String {
+    if value.len() <= cap {
+        return value.to_string();
+    }
+    let mut end = cap;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = value[..end].to_string();
+    truncated.push('…');
+    truncated
+}
+
+fn truncate_output_field(value: &mut String, cap: usize) {
+    if value.len() <= cap {
+        return;
+    }
+    let mut end = cap;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push('…');
+}
+
+fn truncate_evidence_fields(evidence: &mut Evidence) {
+    let truncate = |value: &mut String| truncate_output_field(value, 1024);
+    match evidence {
+        Evidence::Url { raw } => truncate(raw),
+        Evidence::HostComparison {
+            raw_host,
+            similar_to,
+        } => {
+            truncate(raw_host);
+            truncate(similar_to);
+        }
+        Evidence::CommandPattern { pattern, matched } => {
+            truncate(pattern);
+            truncate(matched);
+        }
+        Evidence::ByteSequence {
+            hex, description, ..
+        } => {
+            truncate(hex);
+            truncate(description);
+        }
+        Evidence::EnvVar {
+            name,
+            value_preview,
+        } => {
+            truncate(name);
+            truncate(value_preview);
+        }
+        Evidence::Text { detail } => truncate(detail),
+        Evidence::ThreatIntel {
+            source,
+            threat_type,
+            reference,
+            ..
+        } => {
+            truncate(source);
+            truncate(threat_type);
+            if let Some(reference) = reference {
+                truncate(reference);
+            }
+        }
+        Evidence::HomoglyphAnalysis {
+            raw,
+            escaped,
+            suspicious_chars,
+        } => {
+            truncate(raw);
+            truncate(escaped);
+            suspicious_chars.truncate(64);
+            for suspicious in suspicious_chars {
+                truncate(&mut suspicious.codepoint);
+                truncate(&mut suspicious.description);
+                truncate(&mut suspicious.hex_bytes);
+            }
+        }
+    }
+}
+
+fn evidence_text_bytes(evidence: &Evidence) -> usize {
+    match evidence {
+        Evidence::Url { raw } => raw.len(),
+        Evidence::HostComparison {
+            raw_host,
+            similar_to,
+        } => raw_host.len() + similar_to.len(),
+        Evidence::CommandPattern { pattern, matched } => pattern.len() + matched.len(),
+        Evidence::ByteSequence {
+            hex, description, ..
+        } => hex.len() + description.len(),
+        Evidence::EnvVar {
+            name,
+            value_preview,
+        } => name.len() + value_preview.len(),
+        Evidence::Text { detail } => detail.len(),
+        Evidence::ThreatIntel {
+            source,
+            threat_type,
+            reference,
+            ..
+        } => source.len() + threat_type.len() + reference.as_ref().map_or(0, String::len),
+        Evidence::HomoglyphAnalysis {
+            raw,
+            escaped,
+            suspicious_chars,
+        } => {
+            raw.len()
+                + escaped.len()
+                + suspicious_chars
+                    .iter()
+                    .map(|item| {
+                        item.character.len_utf8()
+                            + item.codepoint.len()
+                            + item.description.len()
+                            + item.hex_bytes.len()
+                    })
+                    .sum::<usize>()
+        }
+    }
+}
+
 /// Complete analysis verdict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Verdict {
@@ -1293,6 +2094,321 @@ mod tests {
             upgraded_action_from_findings(&findings, Action::Block),
             Action::Block
         );
+    }
+
+    #[test]
+    fn presentation_bounds_preserve_decision_and_compact_json() {
+        let mut findings = (0..200)
+            .map(|index| Finding {
+                rule_id: if index == 190 {
+                    RuleId::AnalysisIncomplete
+                } else if index == 199 {
+                    RuleId::ThreatMaliciousPackage
+                } else {
+                    RuleId::ConfigSuspiciousIndicator
+                },
+                severity: if index == 199 {
+                    Severity::Critical
+                } else if index == 190 {
+                    Severity::High
+                } else {
+                    Severity::Medium
+                },
+                title: "t".repeat(2_000),
+                description: "d".repeat(8_000),
+                evidence: (0..40)
+                    .map(|_| Evidence::Text {
+                        detail: "e".repeat(4_000),
+                    })
+                    .collect(),
+                human_view: Some("h".repeat(2_000)),
+                agent_view: Some("a".repeat(2_000)),
+                mitre_id: None,
+                custom_rule_id: None,
+            })
+            .collect::<Vec<_>>();
+        let action = action_from_findings(&findings);
+
+        bound_findings_for_output(&mut findings);
+
+        assert_eq!(findings.len(), MAX_PRESENTED_FINDINGS);
+        assert_eq!(action_from_findings(&findings), action);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.severity == Severity::Critical));
+        assert!(findings
+            .iter()
+            .all(|finding| finding.evidence.len() <= MAX_EVIDENCE_PER_FINDING));
+        let bytes = serde_json::to_vec(&findings).unwrap();
+        assert!(
+            bytes.len() <= 256 * 1024,
+            "bounded single-subject JSON was {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn full_first_evidence_list_reserves_an_exact_omission_receipt() {
+        let mut findings = vec![Finding {
+            rule_id: RuleId::ConfigSuspiciousIndicator,
+            severity: Severity::Medium,
+            title: "bounded evidence".into(),
+            description: "bounded evidence".into(),
+            evidence: (0..=MAX_EVIDENCE_PER_FINDING)
+                .map(|index| Evidence::Text {
+                    detail: format!("evidence-{index}"),
+                })
+                .collect(),
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }];
+
+        bound_findings_for_output(&mut findings);
+
+        assert_eq!(findings[0].evidence.len(), MAX_EVIDENCE_PER_FINDING);
+        assert!(matches!(
+            findings[0].evidence.last(),
+            Some(Evidence::Text { detail }) if detail == "omitted_evidence_items=2"
+        ));
+    }
+
+    #[test]
+    fn redaction_precedes_presentation_truncation() {
+        let canary = "C02_RAW_SECRET_CANARY_abcdefghijklmnopqrstuvwxyz";
+        let mut findings = vec![Finding {
+            rule_id: RuleId::CredentialInText,
+            severity: Severity::High,
+            title: canary.repeat(100),
+            description: canary.repeat(100),
+            evidence: vec![Evidence::Text {
+                detail: canary.repeat(100),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }];
+
+        crate::redact::redact_findings(&mut findings, &[regex::escape(canary)]);
+        bound_findings_for_output(&mut findings);
+
+        assert!(!serde_json::to_string(&findings).unwrap().contains(canary));
+    }
+
+    #[test]
+    fn aggregate_json_cap_preserves_summary_and_priority_findings() {
+        let files = (0..1_000)
+            .map(|index| {
+                serde_json::json!({
+                    "path": format!("/project/{index}/{}", "p".repeat(1_000)),
+                    "findings": [{
+                        "rule_id": if index == 999 { "analysis_incomplete" } else { "config_injection" },
+                        "severity": if index == 999 { "high" } else { "medium" },
+                        "title": "t".repeat(1_000),
+                        "description": "d".repeat(4_000),
+                    }],
+                })
+            })
+            .collect::<Vec<_>>();
+        let bounded = bound_json_value_for_output(serde_json::json!({
+            "scanned_count": 1_000,
+            "skipped_count": 7,
+            "total_findings": 1_000,
+            "analysis_incomplete": false,
+            "files": files,
+        }));
+        let serialized = serde_json::to_vec(&bounded).unwrap();
+
+        assert!(serialized.len() <= MAX_PRESENTATION_BYTES);
+        assert_eq!(bounded["presentation_truncated"], true);
+        assert_eq!(bounded["summary"]["scanned_count"], 1_000);
+        assert_eq!(bounded["summary"]["total_findings"], 1_000);
+        assert!(bounded["priority_findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["rule_id"] == "analysis_incomplete"));
+    }
+
+    #[test]
+    fn generic_json_fallback_prioritizes_late_critical_over_early_highs() {
+        let mut findings = (0..MAX_PRIORITY_FINDINGS_IN_FALLBACK)
+            .map(|index| {
+                serde_json::json!({
+                    "rule_id": format!("high_{index}"),
+                    "severity": "high",
+                    "description": "h".repeat(16_000),
+                })
+            })
+            .collect::<Vec<_>>();
+        findings.push(serde_json::json!({
+            "rule_id": "late_critical",
+            "severity": "critical",
+            "description": "critical",
+        }));
+        let bounded = bound_json_value_for_output(serde_json::json!({
+            "total_findings": findings.len(),
+            "findings": findings,
+        }));
+        assert_eq!(bounded["priority_findings"][0]["rule_id"], "late_critical");
+    }
+
+    #[test]
+    fn text_cap_reports_exact_omitted_bytes_without_splitting_utf8() {
+        let input = "界".repeat(MAX_PRESENTATION_BYTES);
+        let original_bytes = input.len();
+        let bounded = bound_text_for_output(input);
+
+        assert!(bounded.len() <= MAX_PRESENTATION_BYTES);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(bounded.contains(&format!("original_bytes={original_bytes}")));
+        let retained_bytes = bounded
+            .find("\n[presentation truncated:")
+            .expect("omission marker");
+        assert!(bounded.contains(&format!(
+            "omitted_bytes={}",
+            original_bytes - retained_bytes
+        )));
+    }
+
+    #[test]
+    fn incremental_text_builder_caps_without_retaining_later_chunks() {
+        let first = "界".repeat(MAX_PRESENTATION_BYTES / 3);
+        let later = "z".repeat(MAX_PRESENTATION_BYTES * 2);
+        let source_bytes = first.len() + later.len();
+        let mut builder = BoundedTextBuilder::new();
+        builder.push_str(&first);
+        builder.push_str(&later);
+        let output = builder.finish();
+
+        assert!(output.len() <= MAX_PRESENTATION_BYTES);
+        assert!(output.is_char_boundary(output.len()));
+        let marker_start = output.find("\n[presentation truncated:").unwrap();
+        assert!(output.contains(&format!("omitted_bytes={}", source_bytes - marker_start)));
+    }
+
+    #[test]
+    fn incremental_json_projection_reports_exact_omitted_items_and_units() {
+        let mut projection = BoundedJsonProjection::new(serde_json::json!({
+            "total_findings": 2_000,
+            "files": [],
+        }));
+        for index in 0..1_000 {
+            projection
+                .push_array_item(
+                    "files",
+                    serde_json::json!({
+                        "path": format!("/project/{index}"),
+                        "findings": [{ "description": "d".repeat(2_000) }],
+                    }),
+                    2,
+                )
+                .expect("test projection schema keeps files as an array");
+        }
+        let output = projection.finish();
+        let retained = output["files"].as_array().unwrap().len();
+        let omitted_items = output["presentation_omitted"]["files"]["items"]
+            .as_u64()
+            .unwrap() as usize;
+        let omitted_units = output["presentation_omitted"]["files"]["units"]
+            .as_u64()
+            .unwrap() as usize;
+
+        assert!(serialized_json_pretty_size(&output).unwrap() <= MAX_JSON_PRESENTATION_BYTES);
+        assert_eq!(retained + omitted_items, 1_000);
+        assert_eq!(omitted_units, omitted_items * 2);
+        assert_eq!(output["total_findings"], 2_000);
+        assert_eq!(output["presentation_truncated"], true);
+    }
+
+    #[test]
+    fn incremental_json_projection_skips_oversized_low_and_keeps_later_critical() {
+        let mut projection = BoundedJsonProjection::new(serde_json::json!({
+            "total_findings": 2,
+            "files": [],
+        }));
+        projection
+            .push_array_item(
+                "files",
+                serde_json::json!({
+                    "path": "low",
+                    "findings": [{
+                        "severity": "low",
+                        "description": "x".repeat(MAX_JSON_PRESENTATION_BYTES),
+                    }],
+                }),
+                1,
+            )
+            .expect("test projection schema keeps files as an array");
+        projection
+            .push_array_item(
+                "files",
+                serde_json::json!({
+                    "path": "critical",
+                    "findings": [{
+                        "severity": "critical",
+                        "rule_id": "bidi_controls",
+                        "description": "retained",
+                    }],
+                }),
+                1,
+            )
+            .expect("test projection schema keeps files as an array");
+        let output = projection.finish();
+        let serialized = serde_json::to_string(&output).unwrap();
+        assert!(serialized.contains("bidi_controls"));
+        assert!(!serialized.contains(&"x".repeat(1024)));
+        assert_eq!(output["presentation_omitted"]["files"]["items"], 1);
+    }
+
+    #[test]
+    fn incremental_json_projection_returns_typed_error_for_non_array_key() {
+        let mut projection = BoundedJsonProjection::new(serde_json::json!({
+            "files": "not-an-array",
+        }));
+
+        let error = projection
+            .push_array_item("files", serde_json::json!({ "path": "x" }), 1)
+            .expect_err("public input must not panic for a non-array key");
+
+        assert_eq!(
+            error,
+            BoundedJsonProjectionError::NonArrayKey {
+                key: "files".to_string(),
+            }
+        );
+        assert_eq!(projection.finish()["files"], "not-an-array");
+    }
+
+    #[test]
+    fn directory_projection_regroups_selected_findings_by_file_schema_v5() {
+        let mut projection = BoundedJsonProjection::new(serde_json::json!({
+            "schema_version": 5,
+            "files": [],
+        }));
+        for rule_id in ["critical_one", "high_two"] {
+            projection
+                .push_array_item(
+                    "files",
+                    serde_json::json!({
+                        "path": "/project/CLAUDE.md",
+                        "is_config_file": true,
+                        "findings": [{ "rule_id": rule_id, "severity": "high" }],
+                    }),
+                    1,
+                )
+                .expect("test projection schema keeps files as an array");
+        }
+        let mut output = projection.finish();
+        regroup_file_finding_projection(&mut output);
+        assert_eq!(output["schema_version"], 5);
+        assert_eq!(output["files"].as_array().unwrap().len(), 1);
+        assert_eq!(output["files"][0]["findings"].as_array().unwrap().len(), 2);
     }
 
     #[test]

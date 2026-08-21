@@ -16,3 +16,56 @@ Mozilla Foundation — Public Suffix List
   Source: https://publicsuffix.org/
   License: Mozilla Public License 2.0 (MPL-2.0)
   Used for: Registrable domain extraction (eTLD+1)
+
+---
+
+OpenSSF — malicious-packages
+  Source: https://github.com/ossf/malicious-packages
+  Pinned revision: 1ea2762d5fb415aef003a244d5aa83c5fc48cc6e
+  License: Creative Commons Attribution 4.0 (CC-BY-4.0)
+  Used for: Confirmed malicious package, artifact, and network records
+
+---
+
+Datadog Security Labs — malicious-software-packages-dataset
+  Source: https://github.com/DataDog/malicious-software-packages-dataset
+  Pinned revision: ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc
+  License: Apache License 2.0 (Apache-2.0)
+  Used for: Human-triaged npm and PyPI malicious package manifests
+
+---
+
+ecosyste.ms — typosquatting-dataset
+  Source: https://github.com/ecosyste-ms/typosquatting-dataset
+  Pinned revision: fd0bde98d200efe5c282a07edc4c68fba13252c6
+  License: CC0 1.0 Universal (CC0-1.0)
+  Used for: Confirmed package-to-target typosquat mappings
+
+---
+
+abuse.ch — Feodo Tracker IP Blocklist
+  Source: https://feodotracker.abuse.ch/downloads/ipblocklist.txt
+  License basis: abuse.ch Terms of Service (LicenseRef-abuse-ch-terms)
+  Used for: Runtime-fetched botnet command-and-control IPv4 indicators
+
+---
+
+Cybersecurity and Infrastructure Security Agency — Known Exploited Vulnerabilities
+  Source: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+  License basis: United States Government work (LicenseRef-US-Government-Work)
+  Used for: Runtime-fetched exploited-vulnerability correlation metadata
+
+---
+
+npm Registry and Python Package Index — package version metadata
+  Sources: https://registry.npmjs.org/ and https://pypi.org/pypi/
+  License basis: factual registry metadata (LicenseRef-Registry-Metadata)
+  Used for: Build-time exact-version materialization of bounded OpenSSF ranges
+
+---
+
+Tirith Web3 package comparison anchors
+  Sources: exact registry URLs recorded in
+           crates/tirith/assets/data/web3_package_anchors.SOURCE.md
+  License basis: factual package identifiers (LicenseRef-Package-Name-Facts)
+  Used for: Non-authoritative package-name similarity comparison

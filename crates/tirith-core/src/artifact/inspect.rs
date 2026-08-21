@@ -163,20 +163,11 @@ enum ArtifactMagic {
 /// Sniff the leading bytes for the artifact magic. Safe and bounded (reads the
 /// first 4 bytes only). A wheel/zip starts `PK`; gzip starts `\x1f\x8b`.
 fn sniff_magic(bytes: &[u8]) -> ArtifactMagic {
-    if bytes.len() >= 4
-        && bytes[0] == b'P'
-        && bytes[1] == b'K'
-        && matches!(
-            (bytes[2], bytes[3]),
-            (0x03, 0x04) | (0x05, 0x06) | (0x07, 0x08)
-        )
-    {
-        return ArtifactMagic::Zip;
+    match crate::content_kind::classify_archive_prefix(bytes) {
+        crate::content_kind::ArchiveMagic::Zip => ArtifactMagic::Zip,
+        crate::content_kind::ArchiveMagic::Gzip => ArtifactMagic::Gzip,
+        crate::content_kind::ArchiveMagic::Unknown => ArtifactMagic::Unknown,
     }
-    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
-        return ArtifactMagic::Gzip;
-    }
-    ArtifactMagic::Unknown
 }
 
 /// Read the leading magic bytes from an open `Read + Seek` handle and classify
@@ -206,11 +197,9 @@ fn sniff_head<R: std::io::Read + std::io::Seek>(
 /// [`ArtifactInspectError`] the caller maps to a coverage gap. NEVER panics and
 /// NEVER follows a symlinked final component.
 pub fn inspect_artifact_file(path: &Path) -> Result<InspectedArtifact, ArtifactInspectError> {
-    use std::io::{Seek as _, SeekFrom};
-
     // Open no-follow with a wheel-appropriate ceiling ONCE. The opener fstat's the
     // open fd, so an oversized or non-regular file is rejected before any read.
-    let mut archive_file = match util::open_read_no_follow_capped(path, ARTIFACT_MAX_FILE_SIZE) {
+    let archive_file = match util::open_read_no_follow_capped(path, ARTIFACT_MAX_FILE_SIZE) {
         Ok(f) => f,
         Err(OpenRegularError::NotFound) | Err(OpenRegularError::NotRegularFile) => {
             return Err(ArtifactInspectError::Unreadable)
@@ -218,6 +207,32 @@ pub fn inspect_artifact_file(path: &Path) -> Result<InspectedArtifact, ArtifactI
         Err(OpenRegularError::TooLarge) => return Err(ArtifactInspectError::TooLarge),
         Err(OpenRegularError::Io(_)) => return Err(ArtifactInspectError::Unreadable),
     };
+    inspect_artifact_handle(path, archive_file)
+}
+
+/// Inspect an artifact through an already-open no-follow regular-file handle.
+///
+/// The generic scanner uses this seam after byte-first classification so suffix
+/// routing cannot force a second path open (and therefore cannot swap the inode
+/// between classification and artifact analysis). The handle is rewound before
+/// hashing because a classifier may already have consumed a bounded prefix or
+/// the complete small file.
+pub(crate) fn inspect_artifact_handle(
+    path: &Path,
+    mut archive_file: std::fs::File,
+) -> Result<InspectedArtifact, ArtifactInspectError> {
+    use std::io::{Seek as _, SeekFrom};
+
+    let size = archive_file
+        .metadata()
+        .map_err(|_| ArtifactInspectError::Unreadable)?
+        .len();
+    if size > ARTIFACT_MAX_FILE_SIZE {
+        return Err(ArtifactInspectError::TooLarge);
+    }
+    archive_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ArtifactInspectError::Unreadable)?;
 
     // Whole-file SHA-256 over THIS open file description (the artifact identity).
     // We never re-open the path: a `try_clone` (dup(2)) shares the SAME open file
@@ -240,9 +255,9 @@ pub fn inspect_artifact_file(path: &Path) -> Result<InspectedArtifact, ArtifactI
     // to 0 so the archive reader sees the whole file. The hash above may have left
     // the clone's cursor at EOF, but the clone shares this fd's file offset, so we
     // seek to 0 here unconditionally before the sniff read.
-    if archive_file.seek(SeekFrom::Start(0)).is_err() {
-        return Err(ArtifactInspectError::Unreadable);
-    }
+    archive_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ArtifactInspectError::Unreadable)?;
     let magic = sniff_head(&mut archive_file)?;
 
     let outer_name = path

@@ -5,6 +5,156 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_origin::AgentOrigin;
 
+std::thread_local! {
+    static POLICY_DIAGNOSTIC_CAPTURES: std::cell::RefCell<Vec<PolicyDiagnosticCaptureState>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Default)]
+struct PolicyDiagnosticCaptureState {
+    messages: Vec<String>,
+    frozen_dlp_custom_patterns: Option<Vec<String>>,
+}
+
+/// A thread-scoped diagnostic sink for policy discovery/loading. JSON protocol
+/// boundaries keep this guard alive while policy-dependent work runs, drain the
+/// messages into their one structured response, and therefore never leak a raw
+/// attacker-controlled path or parser diagnostic to stderr.
+pub struct PolicyDiagnosticCapture {
+    active: bool,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl PolicyDiagnosticCapture {
+    pub fn start() -> Self {
+        POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
+            captures
+                .borrow_mut()
+                .push(PolicyDiagnosticCaptureState::default())
+        });
+        Self {
+            active: true,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// Drain messages accumulated by the innermost active capture without
+    /// ending it. Later policy loads in the same invocation remain captured.
+    pub fn drain(&self) -> Vec<String> {
+        if !self.active {
+            return Vec::new();
+        }
+        drain_captured_policy_diagnostics()
+    }
+}
+
+/// Drain the innermost active policy diagnostic capture, or return an empty
+/// list when the caller is not inside a captured JSON invocation.
+pub fn drain_captured_policy_diagnostics() -> Vec<String> {
+    POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
+        captures
+            .borrow_mut()
+            .last_mut()
+            .map(|capture| std::mem::take(&mut capture.messages))
+            .unwrap_or_default()
+    })
+}
+
+/// Add a fully resolved custom-DLP plan to the active invocation. Plans are
+/// merged monotonically: later policy rediscovery can strengthen the output
+/// boundary but can never remove a pattern that protected an earlier field.
+pub fn freeze_captured_policy_dlp_patterns(patterns: &[String]) {
+    POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
+        if let Some(capture) = captures.borrow_mut().last_mut() {
+            let frozen = capture
+                .frozen_dlp_custom_patterns
+                .get_or_insert_with(Vec::new);
+            for pattern in patterns {
+                if !frozen.contains(pattern) {
+                    frozen.push(pattern.clone());
+                }
+            }
+        }
+    });
+}
+
+/// Return the invocation's monotonic DLP-plan union, falling back to the
+/// supplied plan when no capture is active. CLI boundaries call this after a
+/// nested runner has completed policy discovery so body-derived receipt and
+/// error fields use every policy snapshot observed by the transaction.
+pub fn captured_policy_dlp_patterns_or(fallback: &[String]) -> Vec<String> {
+    POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
+        captures
+            .borrow()
+            .last()
+            .and_then(|capture| capture.frozen_dlp_custom_patterns.clone())
+            .unwrap_or_else(|| fallback.to_vec())
+    })
+}
+
+/// Drain and terminal-safely redact captured diagnostics with the invocation's
+/// frozen policy plan. `fallback` is used only outside a commands capture or if
+/// a caller deliberately drains before freezing a plan.
+pub fn drain_captured_policy_diagnostics_for_output(
+    fallback: &crate::redact::CompiledCustomPatterns,
+) -> Vec<String> {
+    let (messages, frozen_patterns) = POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
+        let mut captures = captures.borrow_mut();
+        let Some(capture) = captures.last_mut() else {
+            return (Vec::new(), None);
+        };
+        (
+            std::mem::take(&mut capture.messages),
+            capture.frozen_dlp_custom_patterns.clone(),
+        )
+    });
+    let frozen_compiled = frozen_patterns
+        .as_deref()
+        .map(crate::redact::CompiledCustomPatterns::new_silent);
+    let compiled = frozen_compiled.as_ref().unwrap_or(fallback);
+    messages
+        .into_iter()
+        .map(|message| crate::redact::redact_sanitize_redact_with_compiled(&message, compiled))
+        .collect()
+}
+
+impl Drop for PolicyDiagnosticCapture {
+    fn drop(&mut self) {
+        if self.active {
+            POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
+                captures.borrow_mut().pop();
+            });
+            self.active = false;
+        }
+    }
+}
+
+fn emit_policy_diagnostic(arguments: std::fmt::Arguments<'_>) {
+    let message = arguments.to_string();
+    let captured = POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
+        let mut captures = captures.borrow_mut();
+        if let Some(active) = captures.last_mut() {
+            active.messages.push(message.clone());
+            true
+        } else {
+            false
+        }
+    });
+    if !captured {
+        // Callers that have not established an explicit capture still get a
+        // built-in-DLP, terminal-safe single physical line. Custom patterns
+        // require a captured, frozen invocation plan and are handled above.
+        let message = crate::output::sanitize_human_field(&message, &[]);
+        eprintln!("{message}");
+    }
+}
+
+macro_rules! policy_diagnostic {
+    ($($argument:tt)*) => {
+        emit_policy_diagnostic(format_args!($($argument)*))
+    };
+}
+
 /// A named scan profile for reusable filter configurations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanProfile {
@@ -894,7 +1044,8 @@ impl ScanPolicyConfig {
     /// assembly independently floors enumeration failures at Warn. A `Panicked`,
     /// `Truncated`, `HashBudgetExceeded`, or
     /// any archive coverage-limit gap (`EntryCountCapped`, `TotalBytesCapped`,
-    /// `CompressionRatioExceeded`, `MemberTooLarge`, `NativeTruncated`) has no
+    /// `CompressionRatioExceeded`, `MemberTooLarge`, `NativeTruncated`) and
+    /// `PdfAnalyzerIncomplete` have no
     /// dedicated key; it is treated as an oversized-class gap (the most
     /// conservative of the three configurable buckets) so the strictest configured
     /// coverage action still governs it. An undecodable-compression member maps to
@@ -911,7 +1062,8 @@ impl ScanPolicyConfig {
             | K::TotalBytesCapped
             | K::CompressionRatioExceeded
             | K::MemberTooLarge
-            | K::NativeTruncated => self.oversized_action(),
+            | K::NativeTruncated
+            | K::PdfAnalyzerIncomplete => self.oversized_action(),
             K::Unreadable | K::EnumerationFailed => self.unreadable_action(),
             K::Unsupported | K::UnsupportedCompression => self.unsupported_action(),
         }
@@ -1393,7 +1545,7 @@ impl Policy {
             (Some(url), Some(key)) => (url, key),
             // Never reuse a file credential after an ambient origin change.
             (Some(_), None) => {
-                eprintln!(
+                policy_diagnostic!(
                     "tirith: warning: TIRITH_SERVER_URL requires a paired TIRITH_API_KEY; refusing to reuse a stored policy credential"
                 );
                 return local;
@@ -1403,7 +1555,7 @@ impl Policy {
             // sanitized; retain this explicit belt-and-suspenders check.
             (None, Some(key)) => {
                 if local.scope == PolicyScope::Repo {
-                    eprintln!(
+                    policy_diagnostic!(
                         "tirith: warning: refusing to send ambient TIRITH_API_KEY to a repo-scoped policy_server_url; using local policy"
                     );
                     return local;
@@ -1435,7 +1587,7 @@ impl Policy {
                         // bytes. The envelope is also bound to this exact
                         // endpoint/credential identity.
                         if let Err(error) = cache_remote_policy(&server_url, &api_key, &yaml) {
-                            eprintln!(
+                            policy_diagnostic!(
                                 "tirith: warning: could not cache validated remote policy: {error}"
                             );
                         }
@@ -1454,19 +1606,19 @@ impl Policy {
                     }
                     Err(e) => match fail_mode {
                         "closed" => {
-                            eprintln!(
+                            policy_diagnostic!(
                                 "tirith: error: remote policy parse error ({e}), failing closed"
                             );
                             Self::fail_closed_policy()
                         }
                         "cached" => {
-                            eprintln!(
+                            policy_diagnostic!(
                                 "tirith: warning: remote policy parse error ({e}), trying cache"
                             );
                             match load_cached_remote_policy(&server_url, &api_key) {
                                 Some(p) => p,
                                 None => {
-                                    eprintln!(
+                                    policy_diagnostic!(
                                         "tirith: warning: no cached remote policy, using local"
                                     );
                                     local
@@ -1474,7 +1626,7 @@ impl Policy {
                             }
                         }
                         _ => {
-                            eprintln!("tirith: warning: remote policy parse error: {e}");
+                            policy_diagnostic!("tirith: warning: remote policy parse error: {e}");
                             local
                         }
                     },
@@ -1482,26 +1634,34 @@ impl Policy {
             }
             Err(crate::policy_client::PolicyFetchError::AuthError(code)) => {
                 // Auth errors always fail closed regardless of fail_mode.
-                eprintln!("tirith: error: policy server auth failed (HTTP {code}), failing closed");
+                policy_diagnostic!(
+                    "tirith: error: policy server auth failed (HTTP {code}), failing closed"
+                );
                 Self::fail_closed_policy()
             }
             Err(e) => match fail_mode {
                 "closed" => {
-                    eprintln!("tirith: error: remote policy fetch failed ({e}), failing closed");
+                    policy_diagnostic!(
+                        "tirith: error: remote policy fetch failed ({e}), failing closed"
+                    );
                     Self::fail_closed_policy()
                 }
                 "cached" => {
-                    eprintln!("tirith: warning: remote policy fetch failed ({e}), trying cache");
+                    policy_diagnostic!(
+                        "tirith: warning: remote policy fetch failed ({e}), trying cache"
+                    );
                     match load_cached_remote_policy(&server_url, &api_key) {
                         Some(p) => p,
                         None => {
-                            eprintln!("tirith: warning: no cached remote policy, using local");
+                            policy_diagnostic!(
+                                "tirith: warning: no cached remote policy, using local"
+                            );
                             local
                         }
                     }
                 }
                 _ => {
-                    eprintln!(
+                    policy_diagnostic!(
                         "tirith: warning: remote policy fetch failed ({e}), using local policy"
                     );
                     local
@@ -2292,7 +2452,7 @@ impl Policy {
         let bytes = match crate::util::read_text_no_follow_capped(path, POLICY_FILE_READ_CAP) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!(
+                policy_diagnostic!(
                     "tirith: warning: cannot read policy at {}: {e:?}",
                     path.display()
                 );
@@ -2302,7 +2462,7 @@ impl Policy {
         let content = match String::from_utf8(bytes) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
+                policy_diagnostic!(
                     "tirith: warning: policy at {} is not valid UTF-8: {e}",
                     path.display()
                 );
@@ -2324,7 +2484,7 @@ impl Policy {
                 (policy, RepoPolicyDocument::parsed(migrated))
             }
             Err(e) => {
-                eprintln!("tirith: warning: policy load failed at {source}: {e}");
+                policy_diagnostic!("tirith: warning: policy load failed at {source}: {e}");
                 // Same logic: a parse failure on a named policy file hides the
                 // operator's config — fail closed, don't silently revert to open.
                 (Self::fail_closed_policy(), RepoPolicyDocument::failed())
@@ -2371,7 +2531,7 @@ impl Policy {
                 p
             }
             Err(e) => {
-                eprintln!(
+                policy_diagnostic!(
                     "tirith: warning: policy load failed{}: {e}",
                     source.map(|s| format!(" at {s}")).unwrap_or_default(),
                 );
@@ -2659,7 +2819,7 @@ impl Policy {
             // F9 — repo allowlist (suppression) is intentionally NOT loaded.
             let allowlist_path = org_dir.join("allowlist");
             if allowlist_path.exists() {
-                eprintln!(
+                policy_diagnostic!(
                     "tirith: ignoring repo-scoped allowlist at {} (repo policy may tighten but not suppress)",
                     allowlist_path.display()
                 );
@@ -2673,7 +2833,7 @@ impl Policy {
             {
                 Ok(bytes) => {
                     let content = String::from_utf8_lossy(&bytes);
-                    eprintln!(
+                    policy_diagnostic!(
                         "tirith: loading repo-scoped blocklist from {}",
                         blocklist_path.display()
                     );
@@ -2684,7 +2844,7 @@ impl Policy {
                             continue;
                         }
                         if entries >= REPO_BLOCKLIST_MAX_ENTRIES {
-                            eprintln!(
+                            policy_diagnostic!(
                                 "tirith: warning: repo blocklist exceeds {REPO_BLOCKLIST_MAX_ENTRIES} entries; remaining entries ignored"
                             );
                             break;
@@ -2703,7 +2863,7 @@ impl Policy {
                         crate::util::OpenRegularError::Io(io) => io.to_string(),
                         crate::util::OpenRegularError::NotFound => unreachable!(),
                     };
-                    eprintln!(
+                    policy_diagnostic!(
                         "tirith: warning: refusing to load repo blocklist at {} ({reason}); file must be a regular, non-symlink file within {} bytes",
                         blocklist_path.display(),
                         REPO_BLOCKLIST_READ_CAP
@@ -3304,7 +3464,7 @@ fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>, mode: 
             // Surface non-NotFound failures (symlink/special-file refusal,
             // oversize, I/O) so the operator knows labels were skipped
             // (PR-127 review #13).
-            eprintln!(
+            policy_diagnostic!(
                 "tirith: warning: context-labels file at {} read error: {e:?}",
                 path.display(),
             );
@@ -3323,7 +3483,7 @@ fn merge_context_label_bytes(
     let content = match String::from_utf8(bytes) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
+            policy_diagnostic!(
                 "tirith: warning: context-labels file at {} is not valid UTF-8: {e}",
                 path.display(),
             );
@@ -3336,7 +3496,7 @@ fn merge_context_label_bytes(
     let value: serde_yaml::Value = match serde_yaml::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            policy_diagnostic!(
                 "tirith: warning: context-labels file at {} parse error: {e}",
                 path.display(),
             );
@@ -3347,7 +3507,7 @@ fn merge_context_label_bytes(
         serde_yaml::Value::Mapping(m) => m,
         serde_yaml::Value::Null => return,
         _ => {
-            eprintln!(
+            policy_diagnostic!(
                 "tirith: warning: context-labels file at {} must be a YAML mapping",
                 path.display(),
             );
@@ -3538,7 +3698,7 @@ fn load_cached_remote_policy(server_url: &str, api_key: &str) -> Option<Policy> 
     let bytes = match crate::util::read_text_no_follow_capped(&path, REMOTE_POLICY_CACHE_READ_CAP) {
         Ok(bytes) => bytes,
         Err(error) => {
-            eprintln!(
+            policy_diagnostic!(
                 "tirith: warning: cached remote policy read error at {}: {error:?}",
                 path.display()
             );
@@ -3548,7 +3708,9 @@ fn load_cached_remote_policy(server_url: &str, api_key: &str) -> Option<Policy> 
     let envelope: RemotePolicyCacheEnvelope = match serde_json::from_slice(&bytes) {
         Ok(envelope) => envelope,
         Err(error) => {
-            eprintln!("tirith: warning: cached remote policy envelope parse error: {error}");
+            policy_diagnostic!(
+                "tirith: warning: cached remote policy envelope parse error: {error}"
+            );
             return None;
         }
     };
@@ -3556,7 +3718,7 @@ fn load_cached_remote_policy(server_url: &str, api_key: &str) -> Option<Policy> 
         || envelope.origin_credential_fingerprint
             != remote_policy_cache_fingerprint(server_url, api_key)
     {
-        eprintln!(
+        policy_diagnostic!(
             "tirith: warning: cached remote policy belongs to a different endpoint or credential; ignoring it"
         );
         return None;
@@ -3576,7 +3738,7 @@ fn load_cached_remote_policy(server_url: &str, api_key: &str) -> Option<Policy> 
             Some(p)
         }
         Err(e) => {
-            eprintln!("tirith: warning: cached remote policy parse error: {e}");
+            policy_diagnostic!("tirith: warning: cached remote policy parse error: {e}");
             None
         }
     }
@@ -3585,6 +3747,44 @@ fn load_cached_remote_policy(server_url: &str, api_key: &str) -> Option<Policy> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_diagnostic_capture_drains_without_ending_the_sink() {
+        let capture = PolicyDiagnosticCapture::start();
+        policy_diagnostic!("first diagnostic {}", "attacker-path");
+        assert_eq!(
+            capture.drain(),
+            vec!["first diagnostic attacker-path".to_string()]
+        );
+        assert!(capture.drain().is_empty());
+
+        policy_diagnostic!("second diagnostic");
+        assert_eq!(capture.drain(), vec!["second diagnostic".to_string()]);
+    }
+
+    #[test]
+    fn policy_diagnostic_capture_monotonically_unions_frozen_dlp_plans() {
+        let first = "C02_FIRST_POLICY_DIAGNOSTIC_CANARY";
+        let second = "C02_SECOND_POLICY_DIAGNOSTIC_CANARY";
+        let _capture = PolicyDiagnosticCapture::start();
+        freeze_captured_policy_dlp_patterns(&[regex::escape(first)]);
+        freeze_captured_policy_dlp_patterns(&[regex::escape(second)]);
+        policy_diagnostic!(
+            "{}\u{200b}{} {}\u{200b}{}",
+            &first[..14],
+            &first[14..],
+            &second[..15],
+            &second[15..]
+        );
+        let fallback = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+
+        let diagnostics = drain_captured_policy_diagnostics_for_output(&fallback);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].contains(first));
+        assert!(!diagnostics[0].contains(second));
+        assert_eq!(diagnostics[0].matches("[REDACTED:custom]").count(), 2);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -6010,5 +6210,19 @@ custom_rules:
         let projection = serde_json::to_string(&base.security_projection()).unwrap();
         assert!(!projection.contains("PATTERN-A"));
         assert!(!projection.contains("trusted-a.example"));
+    }
+
+    #[test]
+    fn pdf_analyzer_incomplete_uses_conservative_coverage_action() {
+        let scan = ScanPolicyConfig {
+            oversized_file_action: Some(GapAction::Fail),
+            unreadable_file_action: Some(GapAction::Ignore),
+            unsupported_artifact_action: Some(GapAction::Ignore),
+            ..ScanPolicyConfig::default()
+        };
+        assert_eq!(
+            scan.action_for_gap_kind(crate::scan::CoverageGapKind::PdfAnalyzerIncomplete),
+            GapAction::Fail
+        );
     }
 }

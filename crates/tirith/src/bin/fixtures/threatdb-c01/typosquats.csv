@@ -1,0 +1,3 @@
+malicious_package,target_package,ecosystem,registry,classification,source
+reqeusts,requests,pypi,https://pypi.org,transposition,fixture
+loadsh,lodash,npm,https://npmjs.com,omission,fixture

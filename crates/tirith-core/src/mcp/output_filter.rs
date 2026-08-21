@@ -64,19 +64,34 @@ pub struct OutputFilterContext {
 }
 
 impl OutputFilterContext {
-    /// Build a context from a discovered [`crate::policy::Policy`]: compile the
-    /// operator's `injection_seeds_custom` and read `mcp_redact_injection`. Returns
-    /// the context PLUS the bad-seed list `(pattern, error)` so the long-lived
-    /// server/gateway seams can surface each bad pattern ONCE at init instead of
-    /// silently dropping it (a seed that passes `policy validate` but somehow fails
-    /// the real compile would otherwise disappear with no signal). This is init,
-    /// not the per-call hot path, so surfacing the list here is free.
+    /// Build a context and retain the legacy bad-seed `(pattern, error)` return
+    /// shape for downstream source compatibility. New Tirith-owned output
+    /// boundaries must use [`Self::from_policy_with_diagnostics`] so an invalid
+    /// pattern is never echoed into a log or response.
+    pub fn from_policy(policy: &crate::policy::Policy) -> (Self, Vec<(String, regex::Error)>) {
+        let (custom_seeds, bad) = prompt_injection::compile_seeds(&policy.injection_seeds_custom);
+        (
+            Self {
+                custom_seeds,
+                redact_injection: policy.mcp_redact_injection,
+            },
+            bad,
+        )
+    }
+
+    /// Build a context and return safe indexed/categorical diagnostics for any
+    /// rejected custom seed. This additive API lets the server/gateway surface
+    /// each rejection once without exposing the attacker-controlled pattern or
+    /// a `regex::Error` that may echo it.
     ///
     /// The caller is expected to have discovered the policy OFFLINE
     /// ([`crate::policy::Policy::discover_local_only`]), which neutralizes a
     /// repo-scoped `mcp_redact_injection` so a repo cannot weaken a Block.
-    pub fn from_policy(policy: &crate::policy::Policy) -> (Self, Vec<(String, regex::Error)>) {
-        let (custom_seeds, bad) = prompt_injection::compile_seeds(&policy.injection_seeds_custom);
+    pub fn from_policy_with_diagnostics(
+        policy: &crate::policy::Policy,
+    ) -> (Self, Vec<prompt_injection::InvalidSeedDiagnostic>) {
+        let (custom_seeds, bad) =
+            prompt_injection::compile_seeds_with_safe_diagnostics(&policy.injection_seeds_custom);
         (
             Self {
                 custom_seeds,
@@ -100,10 +115,8 @@ pub struct FilterOutcome {
     pub max_severity: Option<Severity>,
     /// Wall time spent scanning the response.
     pub elapsed_ms: f64,
-    /// Retained for serde/audit stability. Always `false` since C2: the response
-    /// is streamed through the engine in full (no scan-cap truncation); the
-    /// gateway's `max_message_bytes` transport cap bounds oversized responses
-    /// upstream instead.
+    /// Whether the fully scanned result had to be compacted for presentation
+    /// after sanitization. This never means the security scan was truncated.
     pub truncated: bool,
     /// Retained for serde/audit stability. Always `false` since C2 (the scan-cap
     /// fail-closed path it tracked no longer exists; oversized responses fail
@@ -198,6 +211,106 @@ pub fn filter_tool_result(
     // upstream. Keep the argument for the public fail-mode contract.
     let _ = fail_mode_closed;
     build_filter_outcome(final_action, event_id, &findings, start.elapsed())
+}
+
+/// Final post-sanitization cap across `content` and `structuredContent`. Size is
+/// measured with a counting writer, so enforcing the cap never allocates a
+/// second attacker-sized serialization.
+pub fn bound_tool_result_for_output(result: &mut ToolCallResult) -> bool {
+    const JSON_RPC_ENVELOPE_RESERVE: usize = 8 * 1024;
+    let limit = crate::verdict::MAX_PRESENTATION_BYTES - JSON_RPC_ENVELOPE_RESERVE;
+    let original_bytes = crate::verdict::serialized_json_size(result).unwrap_or(usize::MAX);
+    if original_bytes <= limit {
+        return false;
+    }
+
+    let mut summary = serde_json::Map::new();
+    if let Some(object) = result
+        .structured_content
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    {
+        for key in [
+            "action",
+            "status",
+            "scanned_count",
+            "skipped_count",
+            "total_findings",
+            "findings_count",
+            "analysis_incomplete",
+            "presentation_truncated",
+        ] {
+            let Some(value) = object.get(key) else {
+                continue;
+            };
+            if value.is_boolean() || value.is_number() || value.is_null() {
+                summary.insert(key.to_string(), value.clone());
+            } else if let Some(text) = value.as_str() {
+                summary.insert(
+                    key.to_string(),
+                    serde_json::Value::String(text.chars().take(128).collect()),
+                );
+            }
+        }
+    }
+
+    let omitted_content_items = result.content.len();
+    let structured_content_omitted = result.structured_content.is_some();
+    result.content = vec![ContentItem {
+        content_type: "text".to_string(),
+        text: "Tirith bounded an oversized tool result; compact metadata is available in structuredContent."
+            .to_string(),
+    }];
+    result.structured_content = Some(serde_json::json!({
+        "presentation_truncated": true,
+        "analysis_incomplete": true,
+        "original_serialized_bytes": original_bytes,
+        "max_tool_result_bytes": limit,
+        "omitted_content_items": omitted_content_items,
+        "structured_content_omitted": structured_content_omitted,
+        "summary": summary,
+    }));
+    debug_assert!(crate::verdict::serialized_json_size(result).is_some_and(|size| size <= limit));
+    true
+}
+
+/// Final cap for a losslessly reassembled MCP tool-result JSON value. This is
+/// used by the gateway, whose typed result may include image/audio/resource
+/// blocks that cannot be represented by [`ToolCallResult`].
+pub fn bound_tool_result_value_for_output(result: &mut serde_json::Value) -> bool {
+    const JSON_RPC_ENVELOPE_RESERVE: usize = 8 * 1024;
+    let limit = crate::verdict::MAX_PRESENTATION_BYTES - JSON_RPC_ENVELOPE_RESERVE;
+    let original_bytes = crate::verdict::serialized_json_size(result).unwrap_or(usize::MAX);
+    if original_bytes <= limit {
+        return false;
+    }
+
+    let is_error = result
+        .get("isError")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let omitted_content_items = result
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let structured_content_omitted = result.get("structuredContent").is_some();
+    *result = serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": "Tirith bounded an oversized tool result; compact metadata is available in structuredContent."
+        }],
+        "isError": is_error,
+        "structuredContent": {
+            "presentation_truncated": true,
+            "analysis_incomplete": true,
+            "original_serialized_bytes": original_bytes,
+            "max_tool_result_bytes": limit,
+            "omitted_content_items": omitted_content_items,
+            "structured_content_omitted": structured_content_omitted,
+        }
+    });
+    debug_assert!(crate::verdict::serialized_json_size(result).is_some_and(|size| size <= limit));
+    true
 }
 
 fn scan_tool_result(result: &ToolCallResult, ctx: &OutputFilterContext) -> crate::verdict::Verdict {
@@ -1015,6 +1128,26 @@ fn is_strippable_zero_width(ch: char) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn from_policy_preserves_legacy_error_shape_and_offers_safe_diagnostics() {
+        let raw = "C02_OUTPUT_FILTER_LEGACY_CANARY(";
+        let policy = crate::policy::Policy {
+            injection_seeds_custom: vec![raw.to_string()],
+            ..Default::default()
+        };
+
+        let (_legacy_context, legacy_bad): (_, Vec<(String, regex::Error)>) =
+            OutputFilterContext::from_policy(&policy);
+        assert_eq!(legacy_bad.len(), 1);
+        assert_eq!(legacy_bad[0].0, raw);
+
+        let (_safe_context, safe_bad) = OutputFilterContext::from_policy_with_diagnostics(&policy);
+        assert_eq!(safe_bad.len(), 1);
+        let safe = format!("{safe_bad:?}");
+        assert!(!safe.contains(raw));
+        assert!(safe.contains("index"));
+    }
+
     fn text_item(s: &str) -> ContentItem {
         ContentItem {
             content_type: "text".to_string(),
@@ -1083,7 +1216,12 @@ mod tests {
         };
         let before = result.content[0].text.clone();
         let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
-        assert_eq!(outcome.action, Action::Allow);
+        assert_eq!(
+            outcome.action,
+            Action::Allow,
+            "benign cap fixture unexpectedly fired {:?}",
+            outcome.rule_ids
+        );
         assert!(!result.is_error);
         assert_eq!(result.content[0].text, before);
     }
@@ -1166,9 +1304,10 @@ mod tests {
     const FORMER_SCAN_CAP: usize = 1_048_576;
 
     #[test]
-    fn large_benign_response_is_scanned_in_full_not_truncated() {
+    fn large_benign_response_is_scanned_in_full_then_presentation_bounded() {
         // C2: a benign response above the former 1 MiB scan cap is now scanned in
-        // full and allowed, with NO scan-cap truncation, under BOTH fail modes.
+        // full and allowed under BOTH fail modes. The independent presentation
+        // cap compacts the already-scanned response before forwarding it.
         let huge = "x".repeat(FORMER_SCAN_CAP + 4096);
         for fail_mode_closed in [true, false] {
             let mut result = ToolCallResult {
@@ -1186,13 +1325,84 @@ mod tests {
                 Action::Allow,
                 "benign oversized content must pass (fail_mode_closed={fail_mode_closed})",
             );
-            assert!(
-                !outcome.truncated,
-                "C2 removed the scan cap: no truncation flag"
-            );
+            assert!(!outcome.truncated, "the security scan itself is complete");
             assert!(!outcome.fail_mode_triggered);
             assert!(!result.is_error);
+            assert!(bound_tool_result_for_output(&mut result));
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["presentation_truncated"],
+                true
+            );
         }
+    }
+
+    #[test]
+    fn combined_content_and_structured_result_has_a_final_cap() {
+        let canary = "C02_TOOL_RESULT_RAW_CANARY";
+        let mut result = ToolCallResult {
+            content: vec![text_item(&format!(
+                "{canary}\n{}",
+                "ordinary line.\n".repeat(11_000)
+            ))],
+            is_error: true,
+            structured_content: Some(serde_json::json!({
+                "status": "failed",
+                "blob": format!("{canary}\n{}", "benign note;\n".repeat(12_000)),
+            })),
+        };
+
+        let pre = scan_tool_result(&result, &OutputFilterContext::default());
+        assert_eq!(
+            pre.action,
+            Action::Allow,
+            "fixture must be policy-clean before bounding: {:?}",
+            pre.findings
+        );
+
+        let outcome = filter_tool_result(&mut result, false, &OutputFilterContext::default());
+        let truncated = bound_tool_result_for_output(&mut result);
+        let serialized = serde_json::to_vec(&result).unwrap();
+
+        assert_eq!(
+            outcome.action,
+            Action::Allow,
+            "benign combined cap fixture unexpectedly fired {:?}",
+            outcome.rule_ids
+        );
+        assert!(!outcome.truncated);
+        assert!(truncated);
+        assert!(
+            result.is_error,
+            "presentation bounding must preserve isError"
+        );
+        assert!(serialized.len() <= crate::verdict::MAX_PRESENTATION_BYTES - 8 * 1024);
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["presentation_truncated"],
+            true
+        );
+        assert!(!String::from_utf8(serialized).unwrap().contains(canary));
+    }
+
+    #[test]
+    fn lossless_typed_result_value_is_compacted_after_reassembly() {
+        let canary = "C02_TYPED_RESULT_RAW_CANARY";
+        let mut result = serde_json::json!({
+            "content": [{
+                "type": "image",
+                "data": format!("{canary}{}", "x".repeat(crate::verdict::MAX_PRESENTATION_BYTES)),
+                "annotations": { "label": canary },
+            }],
+            "isError": true,
+            "structuredContent": { "blob": "y".repeat(64 * 1024) },
+            "vendorExtension": canary,
+        });
+
+        assert!(bound_tool_result_value_for_output(&mut result));
+        let serialized = serde_json::to_vec(&result).unwrap();
+        assert!(serialized.len() <= crate::verdict::MAX_PRESENTATION_BYTES - 8 * 1024);
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["presentation_truncated"], true);
+        assert!(!String::from_utf8(serialized).unwrap().contains(canary));
     }
 
     #[test]

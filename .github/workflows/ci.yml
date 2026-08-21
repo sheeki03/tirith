@@ -62,9 +62,14 @@ jobs:
   test:
     name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    # The full workspace test suite completes well under this locally; fail
-    # runner wedges instead of leaving CI stuck in-progress for an hour.
-    timeout-minutes: 20
+    # A wedge detector, not a capacity budget. The suite has grown past what
+    # this comment used to assume: `Test (Linux)` measures 10min on the base of
+    # this stack and 19min at its head, so a 20min cap left about a minute of
+    # headroom and tipped over on any cold `rust-cache` restore or slow runner.
+    # GitHub records a timed-out job as CANCELLED, so it read as an unexplained
+    # red check rather than a timeout. A genuine wedge runs indefinitely and is
+    # still caught well inside this.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -102,7 +107,7 @@ jobs:
     name: MSRV (1.83)
     runs-on: ubuntu-latest
     # Match the main test job: treat prolonged runner hangs as failures.
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -126,6 +131,19 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo install cargo-deny --locked
       - run: cargo deny check
+      # `fuzz/` declares its own `[workspace]`, so the root check above never
+      # resolves libfuzzer-sys or anything under it -- the NCSA entry in
+      # deny.toml's allow-list was allowing a license for a tree nothing audited.
+      # The fuzz targets are built and run by CI, so a fuzz-only advisory is a
+      # real exposure. Reuses the root deny.toml deliberately: one allow-list.
+      # (tools/rustsec-probe is also detached but is a one-off research probe
+      # that never enters the product build, so it stays uncovered.)
+      # No `--config`: it defaults to <cwd>/deny.toml, which is the root config
+      # this deliberately reuses. Do NOT pass the flag explicitly -- it moved
+      # from the `check` subcommand (0.19) to global scope (0.20), so either
+      # spelling breaks on the other version, and the step above installs
+      # whatever cargo-deny is newest.
+      - run: cargo deny --manifest-path fuzz/Cargo.toml check
 
   install-script:
     name: Install script (${{ matrix.name }})

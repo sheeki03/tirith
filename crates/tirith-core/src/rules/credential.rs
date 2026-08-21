@@ -104,15 +104,16 @@ static GENERIC_SECRET_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("GENERIC_SECRET_RE compile")
 });
 
-/// Check text for credential leaks. Exec + paste only (not file-scan).
+/// Check text for credential leaks. Known provider/private-key patterns are
+/// deterministic and safe in every context; generic entropy remains Paste-only.
 pub fn check(input: &str, shell: ShellType, context: ScanContext) -> Vec<Finding> {
-    if matches!(context, ScanContext::FileScan) {
-        return Vec::new();
-    }
-
     let mut findings = Vec::new();
 
-    findings.extend(check_known_patterns(input, shell));
+    findings.extend(check_known_patterns(
+        input,
+        shell,
+        !matches!(context, ScanContext::FileScan),
+    ));
     findings.extend(check_private_keys(input));
 
     if matches!(context, ScanContext::Paste) {
@@ -122,11 +123,11 @@ pub fn check(input: &str, shell: ShellType, context: ScanContext) -> Vec<Finding
     findings
 }
 
-fn check_known_patterns(input: &str, shell: ShellType) -> Vec<Finding> {
+fn check_known_patterns(input: &str, shell: ShellType, suppress_env_export: bool) -> Vec<Finding> {
     let mut findings = Vec::new();
     for pat in KNOWN_PATTERNS.iter() {
         for m in pat.regex.find_iter(input) {
-            if is_covered_by_env_export(input, &m, shell) {
+            if suppress_env_export && is_covered_by_env_export(input, &m, shell) {
                 continue;
             }
             // AWS access keys legitimately appear in SigV4 pre-signed URLs /
@@ -800,6 +801,16 @@ mod tests {
     }
 
     #[test]
+    fn file_scan_does_not_suppress_a_credential_inside_an_export() {
+        let input = "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
+        let findings = check(input, ShellType::Posix, ScanContext::FileScan);
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::CredentialInText));
+    }
+
+    #[test]
     fn test_env_aws_key_suppressed() {
         let input = "env AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE ./run.sh";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
@@ -1281,13 +1292,11 @@ mod tests {
     }
 
     #[test]
-    fn test_file_scan_skipped() {
+    fn file_scan_known_credential_is_detected_once() {
         let input = "AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Posix, ScanContext::FileScan);
-        assert!(
-            findings.is_empty(),
-            "file scan context should produce no findings"
-        );
+        assert_eq!(findings.len(), 1, "FileScan owns credential scanning once");
+        assert_eq!(findings[0].rule_id, RuleId::CredentialInText);
     }
 
     #[test]

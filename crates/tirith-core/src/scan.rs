@@ -6,7 +6,7 @@ use crate::engine::{self, AnalysisContext};
 use crate::extract::ScanContext;
 use crate::location::SubjectLocation;
 use crate::tokenize::ShellType;
-use crate::verdict::{Finding, Severity};
+use crate::verdict::{Finding, RuleId, Severity};
 
 /// Configuration for a file scan operation.
 pub struct ScanConfig {
@@ -51,8 +51,25 @@ pub struct FileScanResult {
     pub path: PathBuf,
     pub findings: Vec<Finding>,
     pub is_config_file: bool,
+    /// Analyzer-originated coverage gaps for this otherwise-scanned subject.
+    /// Kept on the file result so single-file callers do not have to discard
+    /// either the findings or the typed incompleteness state.
+    pub coverage_gaps: Vec<CoverageGap>,
 }
 
+impl FileScanResult {
+    /// Analyzer-originated incompleteness is part of the scan result even when
+    /// the filesystem driver itself produced no coverage gap.
+    pub fn has_analysis_incomplete_finding(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete)
+    }
+
+    pub fn analysis_incomplete(&self) -> bool {
+        !self.coverage_gaps.is_empty() || self.has_analysis_incomplete_finding()
+    }
+}
 /// The outcome of attempting to scan one file: it was analyzed, or it was
 /// skipped with a recorded reason (a [`CoverageGap`]). Replaces the lossy
 /// `Option<FileScanResult>` so a skip can never be silently read as "clean".
@@ -72,6 +89,20 @@ pub enum GuardedScanOutcome {
     /// The scan ran to completion (it may itself be a `Skipped` outcome).
     Completed(ScanFileOutcome),
     /// A rule panicked; the file was not fully analyzed.
+    RulePanic(CoverageGap),
+}
+
+/// Internal many-result form used by the directory driver. A byte-classified
+/// wheel can produce member-qualified results plus coverage gaps, while an
+/// ordinary unknown media file is an intentional ignore rather than a gap.
+struct CandidateScanResult {
+    file_results: Vec<FileScanResult>,
+    coverage_gaps: Vec<CoverageGap>,
+    intentionally_ignored: bool,
+}
+
+enum GuardedCandidateOutcome {
+    Completed(CandidateScanResult),
     RulePanic(CoverageGap),
 }
 
@@ -133,13 +164,16 @@ pub enum CoverageGapKind {
     /// random-access buffer, because it exceeds the native-parse cap; the deep
     /// native analysis is therefore truncated. A coverage limit.
     NativeTruncated,
+    /// The PDF analyzer accepted ownership of the bytes but reported a typed
+    /// parser/structure/coverage reason that prevented a complete analysis.
+    PdfAnalyzerIncomplete,
 }
 
 impl CoverageGapKind {
     /// Every typed coverage-gap reason. Security-enforcing consumers use this in
     /// exhaustive contract tests so a gap kind cannot be silently omitted from
     /// fail-closed install behavior.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Oversized,
         Self::Unreadable,
         Self::EnumerationFailed,
@@ -153,6 +187,7 @@ impl CoverageGapKind {
         Self::MemberTooLarge,
         Self::UnsupportedCompression,
         Self::NativeTruncated,
+        Self::PdfAnalyzerIncomplete,
     ];
 
     /// A short stable wire token for JSON/SARIF.
@@ -171,6 +206,7 @@ impl CoverageGapKind {
             CoverageGapKind::MemberTooLarge => "member_too_large",
             CoverageGapKind::UnsupportedCompression => "unsupported_compression",
             CoverageGapKind::NativeTruncated => "native_truncated",
+            CoverageGapKind::PdfAnalyzerIncomplete => "pdf_analyzer_incomplete",
         }
     }
 }
@@ -232,13 +268,18 @@ const PRIORITY_PARENT_DIRS: &[&str] = &[
 /// Detection is always free (ADR-13). `max_files` is a caller-provided safety
 /// cap (e.g. for resource-constrained CI), not a license gate.
 pub fn scan(config: &ScanConfig) -> ScanResult {
-    let collected = collect_files(
+    let diagnostics = ScanDiagnosticCapture::start(Some(&config.path));
+    let collected = collect_files_for_scan(
         &config.path,
         config.recursive,
         &config.ignore_patterns,
         &config.include_patterns,
         &config.exclude_patterns,
+        config.max_files,
     );
+    let candidate_total = collected.candidate_total;
+    let collection_work_exhausted = collected.collection_work_exhausted;
+    let collection_unclassified_entries = collected.collection_unclassified_entries;
     let mut candidates = Vec::with_capacity(
         collected.text_candidates.len()
             + collected.linked_text_candidates.len()
@@ -268,7 +309,11 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
         collected
             .artifact_candidates
             .into_iter()
-            .map(ScanCandidate::Artifact),
+            .map(|path| ScanCandidate::Text {
+                logical_path: path.clone(),
+                read_path: path,
+                expected_identity: None,
+            }),
     );
     candidates.sort_by(|a, b| {
         let a_priority = is_priority_file(a.logical_path());
@@ -284,14 +329,19 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     // the candidate is text or an artifact. Collection failures already represent
     // attempts that could not be made, so they are skips but do not consume this
     // analysis-attempt budget.
-    let candidate_total = candidates.len();
+    let retained_candidate_count = candidates.len();
     let max_candidates = config.max_files.unwrap_or(usize::MAX);
-    let budget_skipped = candidate_total.saturating_sub(max_candidates);
+    let budget_skipped = candidate_total.saturating_sub(retained_candidate_count);
     candidates.truncate(max_candidates);
 
     let mut coverage_gaps = collected.coverage_gaps;
     let mut file_results = Vec::new();
-    let mut skipped_count = coverage_gaps.len() + budget_skipped;
+    let collection_skipped = if collection_work_exhausted {
+        collection_unclassified_entries.max(1)
+    } else {
+        0
+    };
+    let mut skipped_count = coverage_gaps.len() + budget_skipped + collection_skipped;
     let mut scanned_count = 0usize;
     let mut panic_files = Vec::new();
 
@@ -303,46 +353,55 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
     let artifact_threat_db = crate::threatdb::ThreatDb::cached();
     for candidate in candidates {
         match candidate {
-            ScanCandidate::Artifact(path) => {
-                let (mut results, gaps) =
-                    inspect_artifact_candidate(&path, artifact_threat_db.as_deref());
-                if gaps.is_empty() {
-                    scanned_count += 1;
-                } else {
-                    // Candidate-level counter: one partially/uninspected artifact
-                    // counts as one skipped candidate, while `coverage_gaps` keeps
-                    // every member-level reason.
-                    skipped_count += 1;
-                    coverage_gaps.extend(gaps);
-                }
-                file_results.append(&mut results);
-            }
             ScanCandidate::Text {
                 read_path,
                 logical_path,
                 expected_identity,
-            } => match scan_single_file_guarded_at(&read_path, &logical_path, expected_identity) {
-                GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(result)) => {
-                    scanned_count += 1;
-                    file_results.push(result)
+            } => match scan_candidate_guarded_at(
+                &read_path,
+                &logical_path,
+                expected_identity,
+                artifact_threat_db.as_deref(),
+            ) {
+                GuardedCandidateOutcome::Completed(mut result) => {
+                    if result.intentionally_ignored {
+                        continue;
+                    }
+                    if result.coverage_gaps.is_empty() {
+                        scanned_count += 1;
+                    } else {
+                        // Candidate-level counter: one partially/uninspected
+                        // subject counts once, while the typed list retains every
+                        // member-level reason.
+                        skipped_count += 1;
+                        coverage_gaps.append(&mut result.coverage_gaps);
+                    }
+                    file_results.append(&mut result.file_results);
                 }
-                GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => {
-                    skipped_count += 1;
-                    coverage_gaps.push(gap);
-                }
-                GuardedScanOutcome::RulePanic(gap) => {
+                GuardedCandidateOutcome::RulePanic(gap) => {
                     skipped_count += 1;
                     panic_files.push(logical_path);
                     coverage_gaps.push(gap);
                 }
             },
         }
+        // Policy discovery occurs inside each candidate analysis. Drain its
+        // captured raw diagnostics immediately so an unbounded file set cannot
+        // accumulate an unbounded pre-redaction diagnostic vector.
+        diagnostics.drain_policy_diagnostics();
     }
 
-    let truncated = budget_skipped > 0;
+    let truncated = budget_skipped > 0 || collection_work_exhausted;
     let truncation_reason = config.max_files.and_then(|max| {
-        truncated
-            .then(|| format!("Scan capped at {max} files/artifacts ({budget_skipped} skipped)."))
+        if collection_work_exhausted {
+            Some(format!(
+                "Scan capped at {max} files/artifacts ({budget_skipped} matched candidate(s) omitted; collection work budget exhausted with {collection_skipped} additional directory entry/entries left unclassified)."
+            ))
+        } else {
+            truncated.then(|| {
+                format!("Scan capped at {max} files/artifacts ({budget_skipped} skipped).")
+            })
+        }
     });
 
     ScanResult {
@@ -369,13 +428,15 @@ pub fn scan(config: &ScanConfig) -> ScanResult {
 /// `evaluate_inspected_artifact` so a strict integrity policy's `action_overrides`
 /// are honored on this path too (the verdict's findings carry the overridden
 /// severities).
-fn inspect_artifact_candidate(
+fn inspect_artifact_candidate_from_handle(
     path: &Path,
+    file: std::fs::File,
+    fallback_sha256: Option<String>,
     threat_db: Option<&crate::threatdb::ThreatDb>,
 ) -> (Vec<FileScanResult>, Vec<CoverageGap>) {
-    use crate::artifact::inspect::{inspect_artifact_file, InspectedArtifact};
+    use crate::artifact::inspect::{inspect_artifact_handle, InspectedArtifact};
 
-    let inspected: InspectedArtifact = match inspect_artifact_file(path) {
+    let inspected: InspectedArtifact = match inspect_artifact_handle(path, file) {
         Ok(i) => i,
         Err(e) => {
             // Not inspectable as a wheel: record a coverage gap (best-effort hash
@@ -385,7 +446,7 @@ fn inspect_artifact_candidate(
                 vec![CoverageGap {
                     location: SubjectLocation::from_path(path.to_path_buf()),
                     kind: e.gap_kind(),
-                    sha256: hash_path_within_budget(path),
+                    sha256: fallback_sha256,
                 }],
             );
         }
@@ -429,6 +490,7 @@ fn inspect_artifact_candidate(
             path: loc,
             findings: vec![finding],
             is_config_file: false,
+            coverage_gaps: Vec::new(),
         });
     }
 
@@ -444,7 +506,9 @@ fn inspect_artifact_candidate(
         coverage_gaps.push(CoverageGap {
             location: SubjectLocation::from_path(path.to_path_buf()),
             kind: CoverageGapKind::Unsupported,
-            sha256: hash_path_within_budget(path),
+            // The accepted inspection is already bound to the supplied handle.
+            // Do not reopen the pathname merely to enrich this secondary gap.
+            sha256: None,
         });
     }
 
@@ -455,6 +519,7 @@ fn inspect_artifact_candidate(
             path: path.to_path_buf(),
             findings: Vec::new(),
             is_config_file: false,
+            coverage_gaps: Vec::new(),
         });
     }
 
@@ -540,22 +605,118 @@ fn oversized_gap_kind(size: u64, hash_budget: u64) -> CoverageGapKind {
     }
 }
 
-/// Open `path` no-follow and stream a SHA-256 within [`MAX_COVERAGE_HASH_BYTES`],
-/// returning the lowercase-hex digest or `None` on ANY failure (open/read error)
-/// or if the file exceeds the budget. Best-effort: a gap with no hash is still a
-/// recorded gap. One open + stream from the SAME handle (no stat-then-reopen).
-fn hash_path_within_budget(path: &Path) -> Option<String> {
-    let file = crate::util::open_read_no_follow_capped(path, u64::MAX).ok()?;
-    match crate::util::sha256_from_handle(file, MAX_COVERAGE_HASH_BYTES) {
-        Ok(crate::util::HashOutcome::Digest(hex)) => Some(hex),
-        Ok(crate::util::HashOutcome::BudgetExceeded) | Err(_) => None,
+std::thread_local! {
+    static SCAN_DIAGNOSTIC_CONTEXTS: std::cell::RefCell<Vec<ScanDiagnosticState>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct ScanDiagnosticState {
+    compiled: crate::redact::CompiledCustomPatterns,
+    output: crate::verdict::BoundedTextBuilder,
+}
+
+/// One invocation-wide boundary for core scan diagnostics. Policy discovery is
+/// captured before its DLP plan is known; once frozen, every diagnostic goes
+/// through redact-sanitize-redact, physical-line confinement, and one shared
+/// 256-KiB presentation envelope. This applies equally when a JSON CLI caller
+/// leaves stderr visible.
+struct ScanDiagnosticCapture {
+    policy_capture: Option<crate::policy::PolicyDiagnosticCapture>,
+    active: bool,
+}
+
+impl ScanDiagnosticCapture {
+    fn start(path: Option<&Path>) -> Self {
+        let policy_capture = crate::policy::PolicyDiagnosticCapture::start();
+        let policy_dir = path.and_then(|path| {
+            if path.is_dir() {
+                Some(path)
+            } else {
+                path.parent()
+            }
+        });
+        let policy_dir = policy_dir
+            .map(|path| path.to_string_lossy().into_owned())
+            .filter(|path| !path.is_empty());
+        let policy = crate::policy::Policy::discover(policy_dir.as_deref());
+        crate::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
+        SCAN_DIAGNOSTIC_CONTEXTS.with(|contexts| {
+            contexts.borrow_mut().push(ScanDiagnosticState {
+                compiled: crate::redact::CompiledCustomPatterns::new_silent(
+                    &policy.dlp_custom_patterns,
+                ),
+                output: crate::verdict::BoundedTextBuilder::new(),
+            });
+        });
+        for diagnostic in policy_capture.drain() {
+            emit_scan_diagnostic(format_args!(
+                "tirith: scan: policy diagnostic: {diagnostic}"
+            ));
+        }
+        Self {
+            policy_capture: Some(policy_capture),
+            active: true,
+        }
+    }
+
+    fn drain_policy_diagnostics(&self) {
+        if let Some(capture) = self.policy_capture.as_ref() {
+            for diagnostic in capture.drain() {
+                emit_scan_diagnostic(format_args!(
+                    "tirith: scan: policy diagnostic: {diagnostic}"
+                ));
+            }
+        }
     }
 }
 
-/// repo-0422: path text in diagnostics comes from the scanned tree and can
-/// contain ANSI/OSC control bytes — sanitize before writing to stderr.
-fn sanitized_display(path: &Path) -> String {
-    crate::mcp::output_filter::sanitize_for_display(&path.display().to_string())
+impl Drop for ScanDiagnosticCapture {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.drain_policy_diagnostics();
+        let output = SCAN_DIAGNOSTIC_CONTEXTS.with(|contexts| {
+            contexts
+                .borrow_mut()
+                .pop()
+                .map(|state| state.output.finish())
+        });
+        if let Some(output) = output {
+            use std::io::Write as _;
+            let mut stderr = std::io::stderr().lock();
+            let _ = stderr.write_all(output.as_bytes());
+            let _ = stderr.flush();
+        }
+        self.policy_capture.take();
+        self.active = false;
+    }
+}
+
+fn sanitize_scan_diagnostic_with_compiled(
+    diagnostic: &str,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> String {
+    crate::output::sanitize_human_field_with_compiled(diagnostic, compiled)
+}
+
+fn emit_scan_diagnostic(arguments: std::fmt::Arguments<'_>) {
+    let diagnostic = arguments.to_string();
+    let captured = SCAN_DIAGNOSTIC_CONTEXTS.with(|contexts| {
+        let mut contexts = contexts.borrow_mut();
+        let Some(context) = contexts.last_mut() else {
+            return false;
+        };
+        let diagnostic = sanitize_scan_diagnostic_with_compiled(&diagnostic, &context.compiled);
+        context.output.push_str(&diagnostic);
+        context.output.push_str("\n");
+        true
+    });
+    if !captured {
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        let diagnostic = sanitize_scan_diagnostic_with_compiled(&diagnostic, &compiled);
+        eprintln!("{}", crate::verdict::bound_text_for_output(diagnostic));
+    }
 }
 
 /// Scan a single file and return its [`ScanFileOutcome`].
@@ -568,6 +729,7 @@ fn sanitized_display(path: &Path) -> String {
 /// `HashBudgetExceeded`, `Unreadable`, `Unsupported`) rather than a silent skip,
 /// so a skip can never be read as "clean".
 pub fn scan_single_file(file_path: &Path) -> ScanFileOutcome {
+    let _diagnostics = ScanDiagnosticCapture::start(Some(file_path));
     // No rebinding: the read path IS the caller's path, so there is no earlier
     // validation for a later open to drift away from.
     scan_single_file_at(file_path, file_path, None)
@@ -578,15 +740,76 @@ fn scan_single_file_at(
     logical_path: &Path,
     expected_identity: Option<FileIdentity>,
 ) -> ScanFileOutcome {
-    let location = SubjectLocation::from_path(logical_path.to_path_buf());
+    let mut candidate = scan_candidate_at(read_path, logical_path, expected_identity, None, false);
+    let trailing_result = candidate.file_results.pop();
+    if trailing_result
+        .as_ref()
+        .is_some_and(|result| !result.coverage_gaps.is_empty())
+    {
+        return ScanFileOutcome::Scanned(trailing_result.expect("file result was checked above"));
+    }
+    if let Some(gap) = candidate.coverage_gaps.into_iter().next() {
+        return ScanFileOutcome::Skipped(gap);
+    }
+    if let Some(result) = trailing_result {
+        return ScanFileOutcome::Scanned(result);
+    }
+    // A genuine unknown media file was byte-classified and intentionally
+    // excluded. Preserve the source-compatible two-variant result without
+    // inventing a coverage gap or claiming findings.
+    ScanFileOutcome::Scanned(FileScanResult {
+        path: logical_path.to_path_buf(),
+        findings: Vec::new(),
+        is_config_file: false,
+        coverage_gaps: Vec::new(),
+    })
+}
 
-    // An artifact candidate (`.so`/`.whl`/...) has no analyzer yet, so it is an
-    // `Unsupported` coverage gap even on the DIRECT `scan --file`/single-file path.
-    // It must never be read as text. Classified by extension up front (robust to a
-    // non-UTF-8 filename) and hashed from the SAME open handle below, never a path
-    // reopen, so the recorded digest is exactly the inode we opened.
-    let is_artifact_candidate =
-        classify_collected_path(logical_path) == CollectedFileKind::ArtifactCandidate;
+impl CandidateScanResult {
+    fn scanned(result: FileScanResult) -> Self {
+        let coverage_gaps = result.coverage_gaps.clone();
+        Self {
+            file_results: vec![result],
+            coverage_gaps,
+            intentionally_ignored: false,
+        }
+    }
+
+    fn skipped(gap: CoverageGap) -> Self {
+        Self {
+            file_results: Vec::new(),
+            coverage_gaps: vec![gap],
+            intentionally_ignored: false,
+        }
+    }
+
+    fn ignored() -> Self {
+        Self {
+            file_results: Vec::new(),
+            coverage_gaps: Vec::new(),
+            intentionally_ignored: true,
+        }
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Open exactly once, classify the opened bytes, then dispatch. Filename
+/// suffixes never select the analyzer before this point: they only distinguish
+/// an intentional unknown-media exclusion from a malformed/unsupported subject,
+/// or identify a package format (for example a ZIP named `*.whl`) after magic
+/// has already proved the content family.
+fn scan_candidate_at(
+    read_path: &Path,
+    logical_path: &Path,
+    expected_identity: Option<FileIdentity>,
+    threat_db: Option<&crate::threatdb::ThreatDb>,
+    inspect_artifacts: bool,
+) -> CandidateScanResult {
+    let location = SubjectLocation::from_path(logical_path.to_path_buf());
 
     // Open no-follow with NO byte cap so we get the handle even for an oversized
     // file (we want to classify + hash it, not reject it outright). `open` reads
@@ -594,22 +817,22 @@ fn scan_single_file_at(
     let file = match crate::util::open_read_no_follow_capped(read_path, u64::MAX) {
         Ok(f) => f,
         Err(crate::util::OpenRegularError::NotFound) => {
-            eprintln!(
+            emit_scan_diagnostic(format_args!(
                 "tirith: scan: cannot read {} (not found)",
-                sanitized_display(logical_path)
-            );
-            return ScanFileOutcome::Skipped(CoverageGap {
+                logical_path.display()
+            ));
+            return CandidateScanResult::skipped(CoverageGap {
                 location,
                 kind: CoverageGapKind::Unreadable,
                 sha256: None,
             });
         }
         Err(crate::util::OpenRegularError::NotRegularFile) => {
-            eprintln!(
+            emit_scan_diagnostic(format_args!(
                 "tirith: scan: skipping {} (symlink or non-regular file)",
-                sanitized_display(logical_path)
-            );
-            return ScanFileOutcome::Skipped(CoverageGap {
+                logical_path.display()
+            ));
+            return CandidateScanResult::skipped(CoverageGap {
                 location,
                 kind: CoverageGapKind::Unreadable,
                 sha256: None,
@@ -619,11 +842,11 @@ fn scan_single_file_at(
         // unreadable for totality rather than panicking.
         Err(crate::util::OpenRegularError::TooLarge)
         | Err(crate::util::OpenRegularError::Io(_)) => {
-            eprintln!(
+            emit_scan_diagnostic(format_args!(
                 "tirith: scan: cannot read {}",
-                sanitized_display(logical_path)
-            );
-            return ScanFileOutcome::Skipped(CoverageGap {
+                logical_path.display()
+            ));
+            return CandidateScanResult::skipped(CoverageGap {
                 location,
                 kind: CoverageGapKind::Unreadable,
                 sha256: None,
@@ -639,11 +862,11 @@ fn scan_single_file_at(
     // cannot read — as a coverage gap rather than scanning an unvalidated file.
     if let Some(expected) = expected_identity {
         if FileIdentity::of(&file) != Some(expected) {
-            eprintln!(
+            emit_scan_diagnostic(format_args!(
                 "tirith: scan: {} no longer resolves to the file that passed containment",
-                sanitized_display(logical_path)
-            );
-            return ScanFileOutcome::Skipped(CoverageGap {
+                logical_path.display()
+            ));
+            return CandidateScanResult::skipped(CoverageGap {
                 location,
                 kind: CoverageGapKind::Unreadable,
                 sha256: None,
@@ -651,29 +874,15 @@ fn scan_single_file_at(
         }
     }
 
-    // Artifact candidate: an `Unsupported` coverage gap, hashed from THIS handle
-    // (never a path reopen) so the recorded digest is exactly the inode we opened.
-    if is_artifact_candidate {
-        let sha256 = match crate::util::sha256_from_handle(file, MAX_COVERAGE_HASH_BYTES) {
-            Ok(crate::util::HashOutcome::Digest(hex)) => Some(hex),
-            Ok(crate::util::HashOutcome::BudgetExceeded) | Err(_) => None,
-        };
-        return ScanFileOutcome::Skipped(CoverageGap {
-            location,
-            kind: CoverageGapKind::Unsupported,
-            sha256,
-        });
-    }
-
     // Size from the OPEN fd (the inode we will read), not a fresh path stat.
     let size = match file.metadata() {
         Ok(m) => m.len(),
         Err(e) => {
-            eprintln!(
+            emit_scan_diagnostic(format_args!(
                 "tirith: scan: cannot stat {}: {e}",
-                sanitized_display(logical_path)
-            );
-            return ScanFileOutcome::Skipped(CoverageGap {
+                logical_path.display()
+            ));
+            return CandidateScanResult::skipped(CoverageGap {
                 location,
                 kind: CoverageGapKind::Unreadable,
                 sha256: None,
@@ -681,10 +890,47 @@ fn scan_single_file_at(
         }
     };
 
-    // Too large to analyze: record a coverage gap (Oversized, hashed within the
-    // budget; or HashBudgetExceeded with no hash for a giant file). Stream the
-    // hash from THIS handle so the bytes hashed are exactly the inode we opened.
+    // A large artifact can still use the bounded streaming artifact analyzer.
+    // Read only the classifier prefix from this same handle before consulting
+    // the suffix as a package-format hint.
     if size > MAX_FILE_SIZE {
+        use std::io::{Read as _, Seek as _};
+        let mut prefix = Vec::with_capacity(crate::content_kind::MAGIC_PREFIX_BYTES);
+        let prefix_read = (&file)
+            .take(crate::content_kind::MAGIC_PREFIX_BYTES as u64)
+            .read_to_end(&mut prefix);
+        if prefix_read.is_err() || (&file).seek(std::io::SeekFrom::Start(0)).is_err() {
+            return CandidateScanResult::skipped(CoverageGap {
+                location,
+                kind: CoverageGapKind::Unreadable,
+                sha256: None,
+            });
+        }
+        let classification = crate::content_kind::classify_with_ambiguity(&prefix);
+        if inspect_artifacts
+            && classify_collected_path(logical_path) == CollectedFileKind::ArtifactCandidate
+            && matches!(
+                classification.kind,
+                crate::content_kind::ContentKind::Zip
+                    | crate::content_kind::ContentKind::Gzip
+                    | crate::content_kind::ContentKind::Elf
+                    | crate::content_kind::ContentKind::MachO
+                    | crate::content_kind::ContentKind::Pe
+                    | crate::content_kind::ContentKind::Wasm
+            )
+            && size <= crate::artifact::inspect::ARTIFACT_MAX_FILE_SIZE
+        {
+            let (file_results, coverage_gaps) =
+                inspect_artifact_candidate_from_handle(logical_path, file, None, threat_db);
+            return CandidateScanResult {
+                file_results,
+                coverage_gaps,
+                intentionally_ignored: false,
+            };
+        }
+
+        // Too large for text/PDF analysis (or for the available artifact
+        // analyzer): record a bounded hash gap from the same handle.
         let kind = oversized_gap_kind(size, MAX_COVERAGE_HASH_BYTES);
         let sha256 = match kind {
             CoverageGapKind::HashBudgetExceeded => None,
@@ -693,13 +939,13 @@ fn scan_single_file_at(
                 Ok(crate::util::HashOutcome::BudgetExceeded) | Err(_) => None,
             },
         };
-        eprintln!(
+        emit_scan_diagnostic(format_args!(
             "tirith: scan: skipping {} (exceeds {}B analysis limit: {})",
-            sanitized_display(logical_path),
+            logical_path.display(),
             MAX_FILE_SIZE,
             kind.as_str()
-        );
-        return ScanFileOutcome::Skipped(CoverageGap {
+        ));
+        return CandidateScanResult::skipped(CoverageGap {
             location,
             kind,
             sha256,
@@ -742,12 +988,12 @@ fn scan_single_file_at(
                     },
                     Err(_) => (None, CoverageGapKind::Oversized),
                 };
-                eprintln!(
+                emit_scan_diagnostic(format_args!(
                     "tirith: scan: skipping {} (grew past {}B analysis limit during read)",
-                    sanitized_display(logical_path),
+                    logical_path.display(),
                     MAX_FILE_SIZE
-                );
-                return ScanFileOutcome::Skipped(CoverageGap {
+                ));
+                return CandidateScanResult::skipped(CoverageGap {
                     location,
                     kind,
                     sha256,
@@ -755,11 +1001,11 @@ fn scan_single_file_at(
             }
             Ok(_) => buf,
             Err(e) => {
-                eprintln!(
+                emit_scan_diagnostic(format_args!(
                     "tirith: scan: cannot read {}: {e}",
-                    sanitized_display(logical_path)
-                );
-                return ScanFileOutcome::Skipped(CoverageGap {
+                    logical_path.display()
+                ));
+                return CandidateScanResult::skipped(CoverageGap {
                     location,
                     kind: CoverageGapKind::Unreadable,
                     sha256: None,
@@ -767,6 +1013,74 @@ fn scan_single_file_at(
             }
         }
     };
+
+    let classification = crate::content_kind::classify_with_ambiguity(&raw_bytes);
+    if classification.kind == crate::content_kind::ContentKind::Pdf
+        && classification.ambiguous_pdf_ownership
+    {
+        // A structurally coherent trailing ZIP (including ZIP64) means the PDF
+        // analyzer cannot claim exclusive ownership. Recursive/polyglot archive
+        // dispatch is intentionally bounded elsewhere, so fail closed with an
+        // explicit coverage gap instead of scanning only the PDF projection and
+        // silently declaring the appended archive clean.
+        return CandidateScanResult::skipped(CoverageGap {
+            location,
+            kind: CoverageGapKind::Unsupported,
+            sha256: Some(sha256_bytes(&raw_bytes)),
+        });
+    }
+    match classification.kind {
+        crate::content_kind::ContentKind::Text | crate::content_kind::ContentKind::Pdf => {}
+        crate::content_kind::ContentKind::UnknownBinary => {
+            if classify_collected_path(logical_path) == CollectedFileKind::BinaryIgnored {
+                return CandidateScanResult::ignored();
+            }
+            return CandidateScanResult::skipped(CoverageGap {
+                location,
+                kind: CoverageGapKind::Unsupported,
+                sha256: Some(sha256_bytes(&raw_bytes)),
+            });
+        }
+        crate::content_kind::ContentKind::Zip
+        | crate::content_kind::ContentKind::Gzip
+        | crate::content_kind::ContentKind::Elf
+        | crate::content_kind::ContentKind::MachO
+        | crate::content_kind::ContentKind::Pe
+        | crate::content_kind::ContentKind::Wasm => {
+            if inspect_artifacts
+                && classify_collected_path(logical_path) == CollectedFileKind::ArtifactCandidate
+            {
+                use std::io::Seek as _;
+                if (&file).seek(std::io::SeekFrom::Start(0)).is_err() {
+                    return CandidateScanResult::skipped(CoverageGap {
+                        location,
+                        kind: CoverageGapKind::Unreadable,
+                        sha256: None,
+                    });
+                }
+                let fallback_sha256 = Some(sha256_bytes(&raw_bytes));
+                let (file_results, coverage_gaps) = inspect_artifact_candidate_from_handle(
+                    logical_path,
+                    file,
+                    fallback_sha256,
+                    threat_db,
+                );
+                return CandidateScanResult {
+                    file_results,
+                    coverage_gaps,
+                    intentionally_ignored: false,
+                };
+            }
+            return CandidateScanResult::skipped(CoverageGap {
+                location,
+                kind: CoverageGapKind::Unsupported,
+                sha256: Some(sha256_bytes(&raw_bytes)),
+            });
+        }
+    }
+
+    // Text and PDF both enter FileScan. The engine's rendered-content stage owns
+    // PDF extraction; valid UTF-8 wins over a misleading media/native suffix.
     let content = String::from_utf8_lossy(&raw_bytes).into_owned();
 
     let is_config = is_priority_file(logical_path);
@@ -790,16 +1104,40 @@ fn scan_single_file_at(
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
     };
 
-    let verdict = engine::analyze(&ctx);
+    let (verdict, pdf_coverage) = engine::analyze_file_with_pdf_coverage(&ctx);
+    let coverage_gaps = pdf_analyzer_coverage_gap(
+        SubjectLocation::from_path(logical_path.to_path_buf()),
+        ctx.raw_bytes.as_deref().unwrap_or_default(),
+        &pdf_coverage,
+    )
+    .into_iter()
+    .collect();
 
     let policy = crate::policy::Policy::discover(cwd.as_deref());
     let mut findings = verdict.findings;
     engine::filter_findings_by_paranoia_vec(&mut findings, policy.paranoia);
 
-    ScanFileOutcome::Scanned(FileScanResult {
+    CandidateScanResult::scanned(FileScanResult {
         path: logical_path.to_path_buf(),
         findings,
         is_config_file: is_config,
+        coverage_gaps,
+    })
+}
+
+/// The scan dispatch is the single seam that turns parser-local typed PDF
+/// coverage into a path-qualified, serializable coverage gap. The individual
+/// reasons remain represented by the analyzer's `AnalysisIncomplete` finding;
+/// one gap per file avoids multiplying identical UI/exit-state rows.
+fn pdf_analyzer_coverage_gap(
+    location: SubjectLocation,
+    raw_bytes: &[u8],
+    reasons: &[String],
+) -> Option<CoverageGap> {
+    (!reasons.is_empty()).then(|| CoverageGap {
+        location,
+        kind: CoverageGapKind::PdfAnalyzerIncomplete,
+        sha256: Some(sha256_bytes(raw_bytes)),
     })
 }
 
@@ -812,10 +1150,10 @@ fn catch_panic_scanning<T>(file_path: &Path, f: impl FnOnce() -> T) -> Option<T>
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => Some(v),
         Err(_) => {
-            eprintln!(
+            emit_scan_diagnostic(format_args!(
                 "tirith: scan: internal error scanning {} (skipped — see panic message above)",
-                sanitized_display(file_path)
-            );
+                file_path.display()
+            ));
             None
         }
     }
@@ -842,7 +1180,26 @@ pub struct RulePanic;
 /// directly; the directory walk routes through here so a per-file panic becomes a
 /// recorded gap rather than a process crash.
 pub fn scan_single_file_guarded(file_path: &Path) -> GuardedScanOutcome {
+    let _diagnostics = ScanDiagnosticCapture::start(Some(file_path));
     scan_single_file_guarded_at(file_path, file_path, None)
+}
+
+fn scan_candidate_guarded_at(
+    read_path: &Path,
+    logical_path: &Path,
+    expected_identity: Option<FileIdentity>,
+    threat_db: Option<&crate::threatdb::ThreatDb>,
+) -> GuardedCandidateOutcome {
+    match catch_panic_scanning(logical_path, || {
+        scan_candidate_at(read_path, logical_path, expected_identity, threat_db, true)
+    }) {
+        Some(outcome) => GuardedCandidateOutcome::Completed(outcome),
+        None => GuardedCandidateOutcome::RulePanic(CoverageGap {
+            location: SubjectLocation::from_path(logical_path.to_path_buf()),
+            kind: CoverageGapKind::Panicked,
+            sha256: None,
+        }),
+    }
 }
 
 fn scan_single_file_guarded_at(
@@ -864,9 +1221,9 @@ fn scan_single_file_guarded_at(
 
 /// Scan content from stdin (no file path).
 pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
+    let current_dir = std::env::current_dir().ok();
+    let _diagnostics = ScanDiagnosticCapture::start(current_dir.as_deref());
+    let cwd = current_dir.map(|p| p.display().to_string());
     let ctx = AnalysisContext {
         input: content.to_string(),
         shell: ShellType::Posix,
@@ -882,7 +1239,14 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
     };
 
-    let verdict = engine::analyze(&ctx);
+    let (verdict, pdf_coverage) = engine::analyze_file_with_pdf_coverage(&ctx);
+    let coverage_gaps = pdf_analyzer_coverage_gap(
+        SubjectLocation::from_path(PathBuf::from("<stdin>")),
+        raw_bytes,
+        &pdf_coverage,
+    )
+    .into_iter()
+    .collect();
 
     let policy = crate::policy::Policy::discover(cwd.as_deref());
     let mut findings = verdict.findings;
@@ -892,6 +1256,7 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
         path: PathBuf::from("<stdin>"),
         findings,
         is_config_file: false,
+        coverage_gaps,
     }
 }
 
@@ -914,19 +1279,17 @@ fn is_priority_file(path: &Path) -> bool {
 }
 
 /// How the directory walk classifies one regular-file entry during collection.
-/// Pulled here from B8 so coverage can SEE files that were previously dropped:
-/// an `ArtifactCandidate` (a native/packaging blob with no analyzer yet) becomes
-/// an `Unsupported` coverage gap instead of a silent drop, while ordinary media
-/// stays a non-gap `BinaryIgnored`.
+/// These are suffix HINTS only. Collection retains every matching regular file;
+/// the opened bytes decide whether it is text/PDF, a supported artifact, or an
+/// unknown binary. `BinaryIgnored` becomes a non-gap only in that last branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectedFileKind {
-    /// Text-like content to scan normally.
+    /// Filename has no binary/artifact hint.
     TextCandidate,
     /// A native/packaging artifact (`.so`/`.dylib`/`.node`/`.wasm`/`.whl`) with
-    /// no analyzer yet — a coverage gap (B8 adds magic dispatch), not a drop.
+    /// a package/native scheduling hint after byte classification.
     ArtifactCandidate,
-    /// Ordinary media (image/audio/video/compiled-bytecode/jar) that is NOT a
-    /// security artifact; intentionally ignored and never a coverage gap.
+    /// Ordinary media hint; valid UTF-8 or known magic still overrides it.
     BinaryIgnored,
 }
 
@@ -937,8 +1300,21 @@ struct CollectedFiles {
     linked_text_candidates: Vec<LinkedTextCandidate>,
     artifact_candidates: Vec<PathBuf>,
     coverage_gaps: Vec<CoverageGap>,
+    /// Complete count of matching candidates classified within the collection
+    /// work budget. In bounded mode this can exceed the number retained below.
+    candidate_total: usize,
+    candidate_limit: Option<usize>,
+    bounded_candidates: std::collections::BinaryHeap<CollectedCandidate>,
+    collection_work_remaining: Option<usize>,
+    /// Cheap `ReadDir` results may be examined beyond the metadata/work heap so
+    /// filesystem order cannot hide a priority file just past the work limit.
+    /// This separate global ceiling still makes adversarial traversal finite.
+    collection_enumeration_remaining: Option<usize>,
+    collection_work_exhausted: bool,
+    collection_unclassified_entries: usize,
 }
 
+#[derive(Debug)]
 struct LinkedTextCandidate {
     /// The resolved, regular in-root file opened with no-follow semantics.
     read_path: PathBuf,
@@ -947,6 +1323,149 @@ struct LinkedTextCandidate {
     /// Identity of the file that passed containment, so the later open can
     /// prove it reached the same file.
     identity: Option<FileIdentity>,
+}
+
+#[derive(Debug)]
+enum CollectedCandidate {
+    Text(PathBuf),
+    Linked(LinkedTextCandidate),
+    Artifact(PathBuf),
+}
+
+impl CollectedCandidate {
+    fn logical_path(&self) -> &Path {
+        match self {
+            Self::Text(path) | Self::Artifact(path) => path,
+            Self::Linked(candidate) => &candidate.logical_path,
+        }
+    }
+
+    fn read_path(&self) -> &Path {
+        match self {
+            Self::Text(path) | Self::Artifact(path) => path,
+            Self::Linked(candidate) => &candidate.read_path,
+        }
+    }
+
+    const fn kind_rank(&self) -> u8 {
+        match self {
+            Self::Text(_) => 0,
+            Self::Linked(_) => 1,
+            Self::Artifact(_) => 2,
+        }
+    }
+}
+
+fn collected_candidate_cmp(a: &CollectedCandidate, b: &CollectedCandidate) -> std::cmp::Ordering {
+    // Priority candidates sort first, followed by the logical path and stable
+    // tie-breakers. This is a total order, so bounded retention is independent
+    // of filesystem enumeration order.
+    is_priority_file(b.logical_path())
+        .cmp(&is_priority_file(a.logical_path()))
+        .then_with(|| a.logical_path().cmp(b.logical_path()))
+        .then_with(|| a.kind_rank().cmp(&b.kind_rank()))
+        .then_with(|| a.read_path().cmp(b.read_path()))
+}
+
+impl PartialEq for CollectedCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        collected_candidate_cmp(self, other).is_eq()
+    }
+}
+
+impl Eq for CollectedCandidate {}
+
+impl PartialOrd for CollectedCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CollectedCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        collected_candidate_cmp(self, other)
+    }
+}
+
+impl CollectedFiles {
+    #[cfg(test)]
+    fn unbounded() -> Self {
+        Self::with_limits(None, None)
+    }
+
+    fn with_limits(candidate_limit: Option<usize>, collection_work: Option<usize>) -> Self {
+        Self {
+            text_candidates: Vec::new(),
+            linked_text_candidates: Vec::new(),
+            artifact_candidates: Vec::new(),
+            coverage_gaps: Vec::new(),
+            candidate_total: 0,
+            candidate_limit,
+            bounded_candidates: std::collections::BinaryHeap::new(),
+            collection_work_remaining: collection_work,
+            collection_enumeration_remaining: collection_work
+                .map(|_| COLLECTION_ENUMERATION_CEILING),
+            collection_work_exhausted: false,
+            collection_unclassified_entries: 0,
+        }
+    }
+
+    fn push_candidate(&mut self, candidate: CollectedCandidate) {
+        self.candidate_total = self.candidate_total.saturating_add(1);
+        let Some(limit) = self.candidate_limit else {
+            self.distribute_candidate(candidate);
+            return;
+        };
+        if limit == 0 {
+            return;
+        }
+        if self.bounded_candidates.len() < limit {
+            self.bounded_candidates.push(candidate);
+        } else if self
+            .bounded_candidates
+            .peek()
+            .is_some_and(|worst| collected_candidate_cmp(&candidate, worst).is_lt())
+        {
+            self.bounded_candidates.pop();
+            self.bounded_candidates.push(candidate);
+        }
+    }
+
+    fn push_text(&mut self, path: PathBuf) {
+        self.push_candidate(CollectedCandidate::Text(path));
+    }
+
+    fn push_linked(&mut self, candidate: LinkedTextCandidate) {
+        self.push_candidate(CollectedCandidate::Linked(candidate));
+    }
+
+    fn push_artifact(&mut self, path: PathBuf) {
+        self.push_candidate(CollectedCandidate::Artifact(path));
+    }
+
+    fn distribute_candidate(&mut self, candidate: CollectedCandidate) {
+        match candidate {
+            CollectedCandidate::Text(path) => self.text_candidates.push(path),
+            CollectedCandidate::Linked(candidate) => self.linked_text_candidates.push(candidate),
+            CollectedCandidate::Artifact(path) => self.artifact_candidates.push(path),
+        }
+    }
+
+    fn finish_bounded_candidates(&mut self) {
+        let candidates = std::mem::take(&mut self.bounded_candidates).into_sorted_vec();
+        for candidate in candidates {
+            self.distribute_candidate(candidate);
+        }
+    }
+
+    fn note_unclassified_entries(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.collection_work_exhausted = true;
+        self.collection_unclassified_entries =
+            self.collection_unclassified_entries.saturating_add(count);
+    }
 }
 
 /// The identity of a file on disk, taken from an OPEN handle so it names the
@@ -1011,14 +1530,12 @@ enum ScanCandidate {
         /// walked path and needs no rebinding.
         expected_identity: Option<FileIdentity>,
     },
-    Artifact(PathBuf),
 }
 
 impl ScanCandidate {
     fn logical_path(&self) -> &Path {
         match self {
             ScanCandidate::Text { logical_path, .. } => logical_path,
-            ScanCandidate::Artifact(path) => path,
         }
     }
 }
@@ -1031,6 +1548,58 @@ fn collect_files(
     include_patterns: &[String],
     exclude_patterns: &[String],
 ) -> CollectedFiles {
+    collect_files_with_limits(
+        path,
+        recursive,
+        ignore_patterns,
+        include_patterns,
+        exclude_patterns,
+        None,
+        None,
+    )
+}
+
+const COLLECTION_WORK_FLOOR: usize = 1_024;
+const COLLECTION_WORK_PER_RETAINED_CANDIDATE: usize = 32;
+const COLLECTION_WORK_CEILING: usize = 1_000_000;
+const COLLECTION_ENUMERATION_CEILING: usize = 1_000_000;
+
+fn collection_work_limit(max_files: usize) -> usize {
+    max_files
+        .saturating_mul(COLLECTION_WORK_PER_RETAINED_CANDIDATE)
+        .clamp(COLLECTION_WORK_FLOOR, COLLECTION_WORK_CEILING)
+}
+
+fn collect_files_for_scan(
+    path: &Path,
+    recursive: bool,
+    ignore_patterns: &[String],
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    max_files: Option<usize>,
+) -> CollectedFiles {
+    collect_files_with_limits(
+        path,
+        recursive,
+        ignore_patterns,
+        include_patterns,
+        exclude_patterns,
+        max_files,
+        max_files.map(collection_work_limit),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_files_with_limits(
+    path: &Path,
+    recursive: bool,
+    ignore_patterns: &[String],
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    candidate_limit: Option<usize>,
+    collection_work: Option<usize>,
+) -> CollectedFiles {
+    let mut collected = CollectedFiles::with_limits(candidate_limit, collection_work);
     // Preserve absence as an ordinary unreadable optional-path outcome for core
     // discovery callers, but do not let a root metadata failure collapse into
     // `Path::is_file`/`is_dir`'s lossy `false`: that failure means we could not
@@ -1041,73 +1610,47 @@ fn collect_files(
         Ok(metadata) => metadata,
         Err(error) => {
             let gap = if error.kind() == std::io::ErrorKind::NotFound {
-                eprintln!(
+                emit_scan_diagnostic(format_args!(
                     "tirith: scan: path does not exist: {}",
-                    sanitized_display(path)
-                );
+                    path.display()
+                ));
                 unreadable_gap(path)
             } else {
-                eprintln!(
+                emit_scan_diagnostic(format_args!(
                     "tirith: scan: cannot inspect requested path {}: {error}",
-                    sanitized_display(path)
-                );
+                    path.display()
+                ));
                 enumeration_gap(path)
             };
-            return CollectedFiles {
-                text_candidates: Vec::new(),
-                linked_text_candidates: Vec::new(),
-                artifact_candidates: Vec::new(),
-                coverage_gaps: vec![gap],
-            };
+            collected.coverage_gaps.push(gap);
+            return collected;
         }
     };
 
     if metadata.is_file() {
-        // A directly-named single file is classified too, so pointing the walk at
-        // a `.so` surfaces it as an artifact candidate rather than scanning it as
-        // text. (The `scan --file` / `scan <file>` CLI paths handle a directly
-        // named file separately; this branch is the directory-collection helper.)
-        return match classify_collected_path(path) {
-            CollectedFileKind::TextCandidate => CollectedFiles {
-                text_candidates: vec![path.to_path_buf()],
-                linked_text_candidates: Vec::new(),
-                artifact_candidates: Vec::new(),
-                coverage_gaps: Vec::new(),
-            },
-            CollectedFileKind::ArtifactCandidate => CollectedFiles {
-                text_candidates: Vec::new(),
-                linked_text_candidates: Vec::new(),
-                artifact_candidates: vec![path.to_path_buf()],
-                coverage_gaps: Vec::new(),
-            },
-            CollectedFileKind::BinaryIgnored => CollectedFiles {
-                text_candidates: Vec::new(),
-                linked_text_candidates: Vec::new(),
-                artifact_candidates: Vec::new(),
-                coverage_gaps: Vec::new(),
-            },
-        };
+        // Suffix classification is only a scheduling hint. Every regular file
+        // reaches the byte-first dispatcher, including ordinary media: a UTF-8
+        // attack payload named `.png` must scan as text, while genuine binary
+        // media is intentionally ignored only after its bytes are classified.
+        match classify_collected_path(path) {
+            CollectedFileKind::TextCandidate | CollectedFileKind::BinaryIgnored => {
+                collected.push_text(path.to_path_buf())
+            }
+            CollectedFileKind::ArtifactCandidate => collected.push_artifact(path.to_path_buf()),
+        }
+        collected.finish_bounded_candidates();
+        return collected;
     }
 
     if !metadata.is_dir() {
-        eprintln!(
+        emit_scan_diagnostic(format_args!(
             "tirith: scan: path is not a regular file or directory: {}",
-            sanitized_display(path)
-        );
-        return CollectedFiles {
-            text_candidates: Vec::new(),
-            linked_text_candidates: Vec::new(),
-            artifact_candidates: Vec::new(),
-            coverage_gaps: vec![unreadable_gap(path)],
-        };
+            path.display()
+        ));
+        collected.coverage_gaps.push(unreadable_gap(path));
+        return collected;
     }
 
-    let mut collected = CollectedFiles {
-        text_candidates: Vec::new(),
-        linked_text_candidates: Vec::new(),
-        artifact_candidates: Vec::new(),
-        coverage_gaps: Vec::new(),
-    };
     collect_files_recursive(
         path,
         path,
@@ -1117,6 +1660,7 @@ fn collect_files(
         exclude_patterns,
         &mut collected,
     );
+    collected.finish_bounded_candidates();
     collected
 }
 
@@ -1130,6 +1674,7 @@ fn collect_files(
 /// A single file `root` that is itself an AI-config file yields just that file.
 /// AI-config files are always text, including safe linked text candidates.
 pub fn collect_ai_config_files(root: &Path) -> Vec<PathBuf> {
+    let _diagnostics = ScanDiagnosticCapture::start(Some(root));
     let collected = collect_files(root, true, &[], &[], &[]);
     let mut files = collected.text_candidates;
     files.extend(
@@ -1156,115 +1701,274 @@ fn collect_files_recursive(
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!(
+            emit_scan_diagnostic(format_args!(
                 "tirith: scan: cannot read directory {}: {e}",
-                sanitized_display(dir)
-            );
+                dir.display()
+            ));
             collected.coverage_gaps.push(enumeration_gap(dir));
             return;
         }
     };
 
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!(
-                    "tirith: scan: error reading entry in {}: {e}",
-                    sanitized_display(dir)
-                );
-                collected.coverage_gaps.push(enumeration_gap(dir));
-                continue;
-            }
-        };
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-        // Classify the entry WITHOUT following symlinks (`entry.file_type()` reports
-        // the link itself, not its target). Generic symlinks are skipped so traversal
-        // cannot escape the tree. Security-config links are handled explicitly below:
-        // safe in-root file targets retain the link's logical identity; every other
-        // config link becomes an unreadable coverage gap.
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!(
-                    "tirith: scan: cannot stat entry {}: {e} (skipped)",
-                    sanitized_display(&path)
-                );
-                collected.coverage_gaps.push(enumeration_gap(&path));
-                continue;
-            }
-        };
-        if file_type.is_symlink() {
-            collect_config_symlink(
-                root,
-                &path,
-                ignore_patterns,
-                include_patterns,
-                exclude_patterns,
-                collected,
-            );
-            continue;
-        }
-
-        if file_type.is_dir() {
-            if should_skip_dir(name) && !is_known_config_dir(name) {
-                continue;
-            }
-            if recursive || is_known_config_dir(name) {
-                collect_files_recursive(
+    if collected.collection_work_remaining.is_none() {
+        for entry in entries {
+            match entry {
+                Ok(entry) => collect_one_entry(
                     root,
-                    &path,
+                    entry,
                     recursive,
                     ignore_patterns,
                     include_patterns,
                     exclude_patterns,
                     collected,
-                );
+                ),
+                Err(e) => {
+                    emit_scan_diagnostic(format_args!(
+                        "tirith: scan: error reading entry in {}: {e}",
+                        dir.display()
+                    ));
+                    collected.coverage_gaps.push(enumeration_gap(dir));
+                }
             }
-            continue;
         }
+        return;
+    }
 
-        // Classify the file. Ordinary media (`BinaryIgnored`) is dropped here,
-        // BEFORE the pattern filters — it is never a coverage gap regardless of
-        // include/exclude. A `TextCandidate` or `ArtifactCandidate` falls through
-        // the pattern filters; only one that PASSES every filter is collected (an
-        // ignore/exclude/include miss is an INTENTIONAL exclusion, not a gap).
-        let kind = classify_collected_path(&path);
-        if kind == CollectedFileKind::BinaryIgnored {
-            continue;
+    let entries = retain_deterministic_directory_work(entries, dir, collected);
+    let selected_count = entries.len();
+    for (index, entry) in entries.into_iter().enumerate() {
+        if collected.collection_work_remaining == Some(0) {
+            // A higher-ranked selected directory may have spent the remaining
+            // budget on its own priority children. Account for every parent
+            // entry that can no longer receive metadata work.
+            collected.note_unclassified_entries(selected_count.saturating_sub(index));
+            break;
         }
+        if let Some(remaining) = collected.collection_work_remaining.as_mut() {
+            *remaining -= 1;
+        }
+        collect_one_entry(
+            root,
+            entry,
+            recursive,
+            ignore_patterns,
+            include_patterns,
+            exclude_patterns,
+            collected,
+        );
+    }
+}
 
-        if !candidate_matches_patterns(
+#[derive(Debug)]
+struct RankedDirectoryEntry {
+    path: PathBuf,
+    entry: std::fs::DirEntry,
+}
+
+fn ranked_directory_entry_cmp(
+    a: &RankedDirectoryEntry,
+    b: &RankedDirectoryEntry,
+) -> std::cmp::Ordering {
+    let known_config_dir = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_known_config_dir)
+    };
+    // Desired order is priority files, known config directories, then lexical
+    // path. Return the inverse priority flags so BinaryHeap::peek is the worst
+    // retained entry and can be replaced by a better later entry.
+    is_priority_file(b.path.as_path())
+        .cmp(&is_priority_file(a.path.as_path()))
+        .then_with(|| known_config_dir(&b.path).cmp(&known_config_dir(&a.path)))
+        .then_with(|| a.path.cmp(&b.path))
+}
+
+impl PartialEq for RankedDirectoryEntry {
+    fn eq(&self, other: &Self) -> bool {
+        ranked_directory_entry_cmp(self, other).is_eq()
+    }
+}
+
+impl Eq for RankedDirectoryEntry {}
+
+impl PartialOrd for RankedDirectoryEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedDirectoryEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        ranked_directory_entry_cmp(self, other)
+    }
+}
+
+/// Stream cheap directory names through a deterministic priority/path top-K
+/// heap before spending the global metadata/recursion work budget. This avoids
+/// the old arbitrary `ReadDir::take(work)` prefix: a `CLAUDE.md` encountered
+/// after 1,024 benign names still displaces the worst benign entry. Raw
+/// enumeration has its own much larger global ceiling, so both memory and
+/// traversal remain operationally bounded.
+fn retain_deterministic_directory_work(
+    entries: std::fs::ReadDir,
+    dir: &Path,
+    collected: &mut CollectedFiles,
+) -> Vec<std::fs::DirEntry> {
+    let work_limit = collected.collection_work_remaining.unwrap_or(usize::MAX);
+    let enumeration_limit = collected
+        .collection_enumeration_remaining
+        .unwrap_or(usize::MAX);
+    if work_limit == 0 || enumeration_limit == 0 {
+        collected.note_unclassified_entries(1);
+        return Vec::new();
+    }
+
+    let mut selected = std::collections::BinaryHeap::new();
+    let mut enumerated_entries = 0usize;
+    let mut dropped_entries = 0usize;
+    let mut read_error_recorded = false;
+    for entry in entries {
+        if enumerated_entries >= enumeration_limit {
+            // Fetching this one-entry lookahead proves a tail exists without
+            // doing metadata work or walking the remainder.
+            collected.note_unclassified_entries(1);
+            break;
+        }
+        enumerated_entries = enumerated_entries.saturating_add(1);
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if !read_error_recorded {
+                    emit_scan_diagnostic(format_args!(
+                        "tirith: scan: error reading entry in {}: {error}",
+                        dir.display()
+                    ));
+                    collected.coverage_gaps.push(enumeration_gap(dir));
+                    read_error_recorded = true;
+                }
+                continue;
+            }
+        };
+        let ranked = RankedDirectoryEntry {
+            path: entry.path(),
+            entry,
+        };
+        if selected.len() < work_limit {
+            selected.push(ranked);
+        } else if selected
+            .peek()
+            .is_some_and(|worst| ranked_directory_entry_cmp(&ranked, worst).is_lt())
+        {
+            selected.pop();
+            selected.push(ranked);
+            dropped_entries = dropped_entries.saturating_add(1);
+        } else {
+            dropped_entries = dropped_entries.saturating_add(1);
+        }
+    }
+    if let Some(remaining) = collected.collection_enumeration_remaining.as_mut() {
+        *remaining = remaining.saturating_sub(enumerated_entries);
+    }
+    collected.note_unclassified_entries(dropped_entries);
+    selected
+        .into_sorted_vec()
+        .into_iter()
+        .map(|ranked| ranked.entry)
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_one_entry(
+    root: &Path,
+    entry: std::fs::DirEntry,
+    recursive: bool,
+    ignore_patterns: &[String],
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    collected: &mut CollectedFiles,
+) {
+    let path = entry.path();
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+    // Classify the entry WITHOUT following symlinks (`entry.file_type()` reports
+    // the link itself, not its target). Generic symlinks are skipped so traversal
+    // cannot escape the tree. Security-config links are handled explicitly below:
+    // safe in-root file targets retain the link's logical identity; every other
+    // config link becomes an unreadable coverage gap.
+    let file_type = match entry.file_type() {
+        Ok(t) => t,
+        Err(e) => {
+            emit_scan_diagnostic(format_args!(
+                "tirith: scan: cannot stat entry {}: {e} (skipped)",
+                path.display()
+            ));
+            collected.coverage_gaps.push(enumeration_gap(&path));
+            return;
+        }
+    };
+    if file_type.is_symlink() {
+        collect_config_symlink(
             root,
             &path,
             ignore_patterns,
             include_patterns,
             exclude_patterns,
-        ) {
-            continue;
-        }
+            collected,
+        );
+        return;
+    }
 
-        // Final containment gate: the file's REAL location (resolving every
-        // intermediate directory) must stay inside the selected scan root. The
-        // per-entry symlink skip above stops a symlinked leaf or directory, but an
-        // intermediate-directory symlink planted higher in the walk could still let
-        // a regular leaf resolve outside `root`; `canonical_within` (fail-closed)
-        // rejects that.
-        if !crate::util::canonical_within(&path, root) {
-            collected.coverage_gaps.push(unreadable_gap(&path));
-            continue;
+    if file_type.is_dir() {
+        if should_skip_dir(name) && !is_known_config_dir(name) {
+            return;
         }
+        if recursive || is_known_config_dir(name) {
+            collect_files_recursive(
+                root,
+                &path,
+                recursive,
+                ignore_patterns,
+                include_patterns,
+                exclude_patterns,
+                collected,
+            );
+        }
+        return;
+    }
 
-        // Route by kind: a passing artifact candidate becomes an `Unsupported`
-        // coverage gap (handled by the driver); a passing text candidate is
-        // scanned.
-        match kind {
-            CollectedFileKind::ArtifactCandidate => collected.artifact_candidates.push(path),
-            CollectedFileKind::TextCandidate => collected.text_candidates.push(path),
-            // Filtered out above.
-            CollectedFileKind::BinaryIgnored => {}
+    // The suffix kind is a scheduling hint only. Pattern filters remain an
+    // intentional pre-analysis exclusion, but no matching regular file is
+    // dropped merely because its name looks binary.
+    let kind = classify_collected_path(&path);
+
+    if !candidate_matches_patterns(
+        root,
+        &path,
+        ignore_patterns,
+        include_patterns,
+        exclude_patterns,
+    ) {
+        return;
+    }
+
+    // Final containment gate: the file's REAL location (resolving every
+    // intermediate directory) must stay inside the selected scan root. The
+    // per-entry symlink skip above stops a symlinked leaf or directory, but an
+    // intermediate-directory symlink planted higher in the walk could still let
+    // a regular leaf resolve outside `root`; `canonical_within` (fail-closed)
+    // rejects that.
+    if !crate::util::canonical_within(&path, root) {
+        collected.coverage_gaps.push(unreadable_gap(&path));
+        return;
+    }
+
+    // Route by kind: a passing artifact candidate becomes an `Unsupported`
+    // coverage gap (handled by the driver); a passing text candidate is
+    // scanned.
+    match kind {
+        CollectedFileKind::ArtifactCandidate => collected.push_artifact(path),
+        CollectedFileKind::TextCandidate | CollectedFileKind::BinaryIgnored => {
+            collected.push_text(path)
         }
     }
 }
@@ -1329,10 +2033,10 @@ fn collect_config_symlink(
     let resolved = match std::fs::canonicalize(logical_path) {
         Ok(path) => path,
         Err(e) => {
-            eprintln!(
+            emit_scan_diagnostic(format_args!(
                 "tirith: scan: cannot resolve config symlink {}: {e}",
-                sanitized_display(logical_path)
-            );
+                logical_path.display()
+            ));
             collected.coverage_gaps.push(unreadable_gap(logical_path));
             return;
         }
@@ -1358,7 +2062,7 @@ fn collect_config_symlink(
     match std::fs::metadata(&resolved) {
         Ok(metadata) if metadata.is_file() => {
             if classify_collected_path(logical_path) == CollectedFileKind::TextCandidate {
-                collected.linked_text_candidates.push(LinkedTextCandidate {
+                collected.push_linked(LinkedTextCandidate {
                     read_path: resolved,
                     logical_path: logical_path.to_path_buf(),
                     identity,
@@ -1455,8 +2159,8 @@ const ARTIFACT_EXTENSIONS: &[&str] = &[
     ".so", ".dylib", ".node", ".wasm", ".whl", ".exe", ".dll", ".jar", ".class",
 ];
 
-/// Ordinary media / compiled-bytecode / generic-archive extensions that are NOT
-/// a security artifact and are intentionally ignored (never a coverage gap).
+/// Ordinary media / compiled-bytecode / generic-archive suffix hints. These are
+/// intentionally ignored only when byte classification returns UnknownBinary.
 /// `.svg` is deliberately NOT here: an SVG is XML text and can carry an active
 /// payload (`<script>`, an `on*` event handler) or an external reference — the
 /// `aifile` rules scan it for hidden / smuggled content. `.exe`/`.dll`/`.jar`/
@@ -1467,10 +2171,8 @@ const IGNORED_BINARY_EXTENSIONS: &[&str] = &[
     ".mov", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".o", ".a", ".pyc",
 ];
 
-/// Classify a filename for collection: an artifact candidate (a native/packaging
-/// blob → `Unsupported` gap), ordinary media (`BinaryIgnored`, dropped silently),
-/// or text to scan. Artifact extensions are checked FIRST so a `.so` is never
-/// mistaken for ignorable media.
+/// Classify a filename into a scheduling hint. No return value authorizes a
+/// pre-read drop; byte-first dispatch owns the actual content decision.
 fn classify_collected_file(name: &str) -> CollectedFileKind {
     let name_lower = name.to_lowercase();
     if ARTIFACT_EXTENSIONS
@@ -1490,9 +2192,8 @@ fn classify_collected_file(name: &str) -> CollectedFileKind {
 
 /// Classify a path, robust to a non-UTF-8 filename. `classify_collected_file`
 /// needs a `&str`, so a `to_str().unwrap_or("")` on a non-UTF-8 name would drop it
-/// to `TextCandidate` and let a `.so`/`.whl` be read as text. Here a non-UTF-8 name
-/// falls back to an extension-only check (the extension is almost always ASCII), so
-/// an artifact is still surfaced as a coverage gap instead of silently scanned.
+/// to `TextCandidate`. Here a non-UTF-8 name falls back to an extension-only hint
+/// (the extension is almost always ASCII); opened bytes still own dispatch.
 fn classify_collected_path(path: &Path) -> CollectedFileKind {
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         return classify_collected_file(name);
@@ -1561,6 +2262,21 @@ impl ScanResult {
     /// Total number of findings across all files.
     pub fn total_findings(&self) -> usize {
         self.file_results.iter().map(|r| r.findings.len()).sum()
+    }
+    pub fn has_analysis_incomplete_finding(&self) -> bool {
+        self.file_results
+            .iter()
+            .any(FileScanResult::has_analysis_incomplete_finding)
+    }
+
+    /// Objective completeness before presentation redaction/bounding.
+    pub fn analysis_incomplete(&self) -> bool {
+        self.truncated
+            || !self.coverage_gaps.is_empty()
+            || self
+                .file_results
+                .iter()
+                .any(FileScanResult::analysis_incomplete)
     }
 }
 
@@ -1757,7 +2473,9 @@ pub fn gap_is_security_relevant(gap: &CoverageGap) -> bool {
     // relevant no matter what the visible path is named.
     if matches!(
         gap.kind,
-        CoverageGapKind::HashBudgetExceeded | CoverageGapKind::EnumerationFailed
+        CoverageGapKind::HashBudgetExceeded
+            | CoverageGapKind::EnumerationFailed
+            | CoverageGapKind::PdfAnalyzerIncomplete
     ) {
         return true;
     }
@@ -1791,6 +2509,36 @@ pub fn gap_is_security_relevant(gap: &CoverageGap) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn broken_symlink_diagnostic_is_rsr_single_line_and_bounded() {
+        let custom_secret = "CUSTOM-SCAN-4829";
+        let compiled =
+            crate::redact::CompiledCustomPatterns::new_silent(&[regex::escape(custom_secret)]);
+        let pat = format!("ghp_{}", "A".repeat(36));
+        let split_pat = pat.replacen("ghp_", "ghp_\u{1b}[31m", 1);
+        let raw = format!(
+            "tirith: scan: cannot resolve config symlink /tmp/{split_pat}\n{custom_secret}\tbad"
+        );
+        let projected = sanitize_scan_diagnostic_with_compiled(&raw, &compiled);
+
+        assert!(!projected.contains(&pat));
+        assert!(!projected.contains(custom_secret));
+        assert!(!projected.contains('\u{1b}'));
+        assert!(!projected.contains('\n'));
+        assert!(!projected.contains('\t'));
+        assert!(projected.contains("\\n"));
+        assert!(projected.contains("\\t"));
+
+        let mut envelope = crate::verdict::BoundedTextBuilder::new();
+        for _ in 0..crate::verdict::MAX_PRESENTATION_BYTES {
+            envelope.push_str(&projected);
+            envelope.push_str("\n");
+        }
+        let envelope = envelope.finish();
+        assert!(envelope.len() <= crate::verdict::MAX_PRESENTATION_BYTES);
+        assert!(envelope.contains("presentation truncated"));
+    }
+
     fn scan_tree(path: &Path, max_files: Option<usize>) -> ScanResult {
         scan(&ScanConfig {
             path: path.to_path_buf(),
@@ -1801,6 +2549,55 @@ mod tests {
             exclude_patterns: Vec::new(),
             max_files,
         })
+    }
+
+    /// Small but structurally coherent PE32+ DLL: DOS header/e_lfanew, PE/COFF
+    /// header, optional header, one executable `.text` section, and one `ret`
+    /// instruction. This is binary content rather than an ASCII string that
+    /// merely starts with `MZ`.
+    fn minimal_pe_dll_image() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x400];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+
+        let coff = 0x84;
+        bytes[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes());
+        bytes[coff + 16..coff + 18].copy_from_slice(&0x00f0u16.to_le_bytes());
+        bytes[coff + 18..coff + 20].copy_from_slice(&0x2022u16.to_le_bytes());
+
+        let optional = coff + 20;
+        bytes[optional..optional + 2].copy_from_slice(&0x020bu16.to_le_bytes());
+        bytes[optional + 2] = 14;
+        bytes[optional + 4..optional + 8].copy_from_slice(&0x0200u32.to_le_bytes());
+        bytes[optional + 16..optional + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[optional + 20..optional + 24].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[optional + 24..optional + 32]
+            .copy_from_slice(&0x0000_0001_8000_0000u64.to_le_bytes());
+        bytes[optional + 32..optional + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[optional + 36..optional + 40].copy_from_slice(&0x0200u32.to_le_bytes());
+        bytes[optional + 40..optional + 42].copy_from_slice(&6u16.to_le_bytes());
+        bytes[optional + 48..optional + 50].copy_from_slice(&6u16.to_le_bytes());
+        bytes[optional + 56..optional + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        bytes[optional + 60..optional + 64].copy_from_slice(&0x0200u32.to_le_bytes());
+        bytes[optional + 68..optional + 70].copy_from_slice(&3u16.to_le_bytes());
+        bytes[optional + 70..optional + 72].copy_from_slice(&0x8160u16.to_le_bytes());
+        bytes[optional + 72..optional + 80].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        bytes[optional + 80..optional + 88].copy_from_slice(&0x1000u64.to_le_bytes());
+        bytes[optional + 88..optional + 96].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        bytes[optional + 96..optional + 104].copy_from_slice(&0x1000u64.to_le_bytes());
+        bytes[optional + 108..optional + 112].copy_from_slice(&16u32.to_le_bytes());
+
+        let section = optional + 0x00f0;
+        bytes[section..section + 5].copy_from_slice(b".text");
+        bytes[section + 8..section + 12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[section + 12..section + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[section + 16..section + 20].copy_from_slice(&0x0200u32.to_le_bytes());
+        bytes[section + 20..section + 24].copy_from_slice(&0x0200u32.to_le_bytes());
+        bytes[section + 36..section + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        bytes[0x200] = 0xc3;
+        bytes
     }
 
     #[test]
@@ -1826,12 +2623,7 @@ mod tests {
         let ordinary_named_path = root.path().join("ordinary-not-a-directory");
         std::fs::write(&ordinary_named_path, "not a directory").unwrap();
 
-        let mut collected = CollectedFiles {
-            text_candidates: Vec::new(),
-            linked_text_candidates: Vec::new(),
-            artifact_candidates: Vec::new(),
-            coverage_gaps: Vec::new(),
-        };
+        let mut collected = CollectedFiles::unbounded();
         collect_files_recursive(
             root.path(),
             &ordinary_named_path,
@@ -1950,12 +2742,7 @@ mod tests {
         std::fs::write(&validated, "validated instructions").unwrap();
         std::os::unix::fs::symlink("validated.txt", &logical).unwrap();
 
-        let mut collected = CollectedFiles {
-            text_candidates: Vec::new(),
-            linked_text_candidates: Vec::new(),
-            artifact_candidates: Vec::new(),
-            coverage_gaps: Vec::new(),
-        };
+        let mut collected = CollectedFiles::unbounded();
         collect_config_symlink(root.path(), &logical, &[], &[], &[], &mut collected);
         let candidate = collected
             .linked_text_candidates
@@ -2070,6 +2857,58 @@ mod tests {
             gap.kind == CoverageGapKind::Unsupported
                 && gap.primary_path() == Some(artifact.as_path())
         }));
+    }
+
+    #[test]
+    fn bounded_collection_retains_deterministic_priority_top_k_during_collection() {
+        let mut collected = CollectedFiles::with_limits(Some(2), None);
+        // Deliberately insert in the opposite order from the desired result.
+        collected.push_text(PathBuf::from("z-last.md"));
+        collected.push_artifact(PathBuf::from("middle.so"));
+        collected.push_text(PathBuf::from("CLAUDE.md"));
+        collected.finish_bounded_candidates();
+
+        assert_eq!(collected.candidate_total, 3);
+        assert_eq!(collected.text_candidates, vec![PathBuf::from("CLAUDE.md")]);
+        assert_eq!(
+            collected.artifact_candidates,
+            vec![PathBuf::from("middle.so")]
+        );
+    }
+
+    #[test]
+    fn bounded_collection_work_is_operational_and_reports_unclassified_entries() {
+        let root = tempfile::tempdir().expect("create scan root");
+        for name in ["f.md", "e.md", "d.md", "c.md", "b.md", "a.md"] {
+            std::fs::write(root.path().join(name), "safe").unwrap();
+        }
+
+        let collected =
+            collect_files_with_limits(root.path(), true, &[], &[], &[], Some(2), Some(3));
+        assert_eq!(collected.candidate_total, 3);
+        assert!(collected.text_candidates.len() <= 2);
+        assert!(collected.collection_work_exhausted);
+        assert_eq!(collected.collection_unclassified_entries, 3);
+    }
+
+    #[test]
+    fn priority_file_after_work_limit_still_wins_deterministic_collection() {
+        let root = tempfile::tempdir().expect("create scan root");
+        for index in 0..=COLLECTION_WORK_FLOOR {
+            std::fs::write(root.path().join(format!("benign-{index:04}.md")), "safe").unwrap();
+        }
+        let config_dir = root.path().join(".claude");
+        std::fs::create_dir(&config_dir).unwrap();
+        let priority = config_dir.join("CLAUDE.md");
+        // Create the priority directory and file last to exercise filesystems
+        // whose ReadDir order follows insertion order. Correctness does not
+        // rely on that, and the directory's child shares the global work cap.
+        std::fs::write(&priority, "priority instructions").unwrap();
+
+        let collected = collect_files_for_scan(root.path(), true, &[], &[], &[], Some(1));
+        assert_eq!(collected.text_candidates, vec![priority]);
+        assert!(collected.collection_work_exhausted);
+        assert_eq!(collected.collection_unclassified_entries, 3);
     }
 
     #[test]
@@ -2893,8 +3732,49 @@ mod tests {
         assert_eq!(gap.sha256.as_deref(), Some(expected.as_str()));
     }
 
+    #[test]
+    fn utf8_attack_payloads_with_png_and_so_suffixes_are_scanned_directly_and_in_walks() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let payload = "visible\u{202e}hidden";
+        let paths = [
+            tmp.path().join("payload.png"),
+            tmp.path().join("payload.so"),
+        ];
+        for path in &paths {
+            std::fs::write(path, payload).unwrap();
+            let result = match scan_single_file(path) {
+                ScanFileOutcome::Scanned(result) => result,
+                ScanFileOutcome::Skipped(gap) => {
+                    panic!("valid UTF-8 must beat a misleading suffix: {:?}", gap.kind)
+                }
+            };
+            assert!(result
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == crate::verdict::RuleId::BidiControls));
+        }
+
+        let walked = scan_tree(tmp.path(), None);
+        for path in &paths {
+            let result = walked
+                .file_results
+                .iter()
+                .find(|result| result.path.as_path() == path.as_path())
+                .expect("the directory walk must analyze UTF-8 regardless of suffix");
+            assert!(result
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == crate::verdict::RuleId::BidiControls));
+            assert!(walked
+                .coverage_gaps
+                .iter()
+                .all(|gap| gap.primary_path() != Some(path.as_path())));
+        }
+    }
+
     /// A directly-named single `.so` file passed to the collection helper is
-    /// classified as an artifact candidate (not scanned as text).
+    /// still queued through the artifact scheduling bucket, but the driver will
+    /// byte-classify it before choosing an analyzer.
     #[test]
     fn directly_named_artifact_file_is_artifact_candidate() {
         let tmp = tempfile::tempdir().expect("create temp dir");
@@ -2928,6 +3808,110 @@ mod tests {
         assert!(
             gap_is_security_relevant(&gap),
             "a .whl gap must be security-relevant"
+        );
+    }
+
+    #[test]
+    fn pdf_first_large_zip64_polyglot_is_never_scanned_as_exclusive_pdf() {
+        const EXTENSIBLE_BYTES: usize = 1024 * 1024 + 1;
+        let mut bytes = b"%PDF-1.7\n%%EOF\n".to_vec();
+        let mut record = vec![0u8; 56 + EXTENSIBLE_BYTES];
+        record[..4].copy_from_slice(b"PK\x06\x06");
+        record[4..12].copy_from_slice(&(44u64 + EXTENSIBLE_BYTES as u64).to_le_bytes());
+        record[12..14].copy_from_slice(&45u16.to_le_bytes());
+        record[14..16].copy_from_slice(&45u16.to_le_bytes());
+        bytes.extend_from_slice(&record);
+
+        let mut locator = [0u8; 20];
+        locator[..4].copy_from_slice(b"PK\x06\x07");
+        locator[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&locator);
+        let mut eocd = [0u8; 22];
+        eocd[..4].copy_from_slice(b"PK\x05\x06");
+        eocd[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        eocd[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        eocd[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        eocd[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&eocd);
+
+        let classification = crate::content_kind::classify_with_ambiguity(&bytes);
+        assert_eq!(classification.kind, crate::content_kind::ContentKind::Pdf);
+        assert!(classification.ambiguous_pdf_ownership);
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let path = tmp.path().join("polyglot-1.0-py3-none-any.whl");
+        std::fs::write(&path, &bytes).unwrap();
+        let gap = match scan_single_file(&path) {
+            ScanFileOutcome::Skipped(gap) => gap,
+            ScanFileOutcome::Scanned(_) => {
+                panic!("PDF-first ZIP64 polyglot must not enter exclusive PDF analysis")
+            }
+        };
+        assert_eq!(gap.kind, CoverageGapKind::Unsupported);
+        assert!(gap.sha256.is_some());
+        assert!(gap_is_security_relevant(&gap));
+
+        let mut policy = crate::policy::Policy::default();
+        policy.scan.unsupported_artifact_action = Some(crate::policy::GapAction::Fail);
+        let findings = build_analysis_incomplete_findings(&[gap], &policy);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete));
+    }
+
+    #[test]
+    fn malformed_exclusive_pdf_retains_findings_and_typed_coverage_gap() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let path = tmp.path().join("malformed.pdf");
+        let bytes = b"%PDF-1.7\nnot a complete PDF\n%%EOF\n";
+        std::fs::write(&path, bytes).unwrap();
+
+        let file = match scan_single_file(&path) {
+            ScanFileOutcome::Scanned(file) => file,
+            ScanFileOutcome::Skipped(gap) => {
+                panic!("owned PDF analysis must retain its file result: {gap:?}")
+            }
+        };
+        assert!(file.has_analysis_incomplete_finding());
+        assert!(file.analysis_incomplete());
+        assert_eq!(file.coverage_gaps.len(), 1);
+        assert_eq!(
+            file.coverage_gaps[0].kind,
+            CoverageGapKind::PdfAnalyzerIncomplete
+        );
+        assert_eq!(file.coverage_gaps[0].primary_path(), Some(path.as_path()));
+        assert!(file.coverage_gaps[0].sha256.is_some());
+        assert!(gap_is_security_relevant(&file.coverage_gaps[0]));
+
+        let aggregate = scan(&ScanConfig {
+            path: tmp.path().to_path_buf(),
+            recursive: true,
+            fail_on: Severity::Critical,
+            ignore_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            max_files: None,
+        });
+        assert!(aggregate.analysis_incomplete());
+        assert!(aggregate.coverage_gaps.iter().any(|gap| {
+            gap.kind == CoverageGapKind::PdfAnalyzerIncomplete
+                && gap.primary_path() == Some(path.as_path())
+        }));
+    }
+
+    #[test]
+    fn malformed_pdf_stdin_has_typed_analyzer_coverage() {
+        let bytes = b"%PDF-1.7\nnot a complete PDF\n%%EOF\n";
+        let result = scan_stdin(&String::from_utf8_lossy(bytes), bytes);
+        assert!(result.analysis_incomplete());
+        assert_eq!(result.coverage_gaps.len(), 1);
+        assert_eq!(
+            result.coverage_gaps[0].kind,
+            CoverageGapKind::PdfAnalyzerIncomplete
+        );
+        assert_eq!(
+            result.coverage_gaps[0].primary_path(),
+            Some(Path::new("<stdin>"))
         );
     }
 
@@ -2999,10 +3983,17 @@ mod tests {
             );
         }
 
-        // A directory tree containing `evil.dll` surfaces an Unsupported gap.
+        // A directory tree containing a structurally coherent PE DLL surfaces
+        // an Unsupported gap. An ASCII sentence beginning with `MZ` is valid
+        // UTF-8 text and deliberately does not prove binary identity.
         let tmp = tempfile::tempdir().expect("create temp dir");
         std::fs::write(tmp.path().join("readme.md"), "hi").unwrap();
-        std::fs::write(tmp.path().join("evil.dll"), b"MZ native bytes").unwrap();
+        let pe = minimal_pe_dll_image();
+        assert_eq!(
+            crate::content_kind::classify(&pe),
+            crate::content_kind::ContentKind::Pe
+        );
+        std::fs::write(tmp.path().join("evil.dll"), pe).unwrap();
 
         let config = ScanConfig {
             path: tmp.path().to_path_buf(),
@@ -3043,6 +4034,42 @@ mod tests {
                     && f.severity == Severity::High),
             "the .dll gap must yield a High AnalysisIncomplete finding under require_complete"
         );
+    }
+
+    #[test]
+    fn utf8_dll_suffix_is_scanned_byte_first_not_reported_unsupported() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let path = tmp.path().join("instructions.dll");
+        std::fs::write(&path, "visible\u{202e}hidden").unwrap();
+
+        let direct = match scan_single_file(&path) {
+            ScanFileOutcome::Scanned(result) => result,
+            ScanFileOutcome::Skipped(gap) => {
+                panic!(
+                    "valid UTF-8 must beat a .dll scheduling hint: {:?}",
+                    gap.kind
+                )
+            }
+        };
+        assert!(direct
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::BidiControls));
+
+        let walked = scan_tree(tmp.path(), None);
+        let result = walked
+            .file_results
+            .iter()
+            .find(|result| result.path.as_path() == path.as_path())
+            .expect("directory collection must retain and analyze a UTF-8 .dll");
+        assert!(result
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::BidiControls));
+        assert!(walked
+            .coverage_gaps
+            .iter()
+            .all(|gap| gap.primary_path() != Some(path.as_path())));
     }
 
     /// T2.8: the grow-during-read recovery hashes from the ALREADY-OPEN handle

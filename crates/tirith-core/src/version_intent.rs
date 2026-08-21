@@ -451,6 +451,111 @@ fn valid_semver_identifiers(raw: &str, reject_numeric_leading_zero: bool) -> boo
     count > 0
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SemverPrecedenceIdentifier {
+    Numeric(String),
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemverPrecedence {
+    release: [String; 3],
+    prerelease: Option<Vec<SemverPrecedenceIdentifier>>,
+}
+
+fn parse_semver_precedence(raw: &str) -> Option<SemverPrecedence> {
+    let canonical = canonical_semver(raw, SemverPrefix::OptionalV)?;
+    let (release, prerelease) = canonical
+        .split_once('-')
+        .map_or((canonical.as_str(), None), |(release, pre)| {
+            (release, Some(pre))
+        });
+    let mut release = release.split('.').map(str::to_string);
+    let release = [release.next()?, release.next()?, release.next()?];
+    if release
+        .iter()
+        .any(|part| part.len() > 1 && part.starts_with('0'))
+    {
+        return None;
+    }
+    let prerelease = prerelease.map(|value| {
+        value
+            .split('.')
+            .map(|part| {
+                if part.bytes().all(|byte| byte.is_ascii_digit()) {
+                    SemverPrecedenceIdentifier::Numeric(part.to_string())
+                } else {
+                    // SemVer 2.0.0 compares ASCII identifiers lexically and
+                    // case-sensitively. Preserve the source spelling exactly.
+                    SemverPrecedenceIdentifier::Text(part.to_string())
+                }
+            })
+            .collect()
+    });
+    Some(SemverPrecedence {
+        release,
+        prerelease,
+    })
+}
+
+fn compare_canonical_decimal(left: &str, right: &str) -> std::cmp::Ordering {
+    left.len()
+        .cmp(&right.len())
+        .then_with(|| left.as_bytes().cmp(right.as_bytes()))
+}
+
+/// Compare two concrete npm/SemVer public versions by SemVer 2.0.0
+/// precedence. Build metadata is ignored and prerelease text is deliberately
+/// ASCII case-sensitive. Returns `None` for aliases, ranges, malformed values,
+/// or versions outside Tirith's bounded concrete-version grammar.
+pub fn compare_semver_public_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let left = parse_semver_precedence(left)?;
+    let right = parse_semver_precedence(right)?;
+    for (left, right) in left.release.iter().zip(right.release.iter()) {
+        match compare_canonical_decimal(left, right) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return Some(ordering),
+        }
+    }
+    match (&left.prerelease, &right.prerelease) {
+        (None, None) => Some(std::cmp::Ordering::Equal),
+        (None, Some(_)) => Some(std::cmp::Ordering::Greater),
+        (Some(_), None) => Some(std::cmp::Ordering::Less),
+        (Some(left), Some(right)) => {
+            for index in 0..left.len().max(right.len()) {
+                match (left.get(index), right.get(index)) {
+                    (None, None) => return Some(std::cmp::Ordering::Equal),
+                    (None, Some(_)) => return Some(std::cmp::Ordering::Less),
+                    (Some(_), None) => return Some(std::cmp::Ordering::Greater),
+                    (
+                        Some(SemverPrecedenceIdentifier::Numeric(left)),
+                        Some(SemverPrecedenceIdentifier::Numeric(right)),
+                    ) => match compare_canonical_decimal(left, right) {
+                        std::cmp::Ordering::Equal => {}
+                        ordering => return Some(ordering),
+                    },
+                    (
+                        Some(SemverPrecedenceIdentifier::Numeric(_)),
+                        Some(SemverPrecedenceIdentifier::Text(_)),
+                    ) => return Some(std::cmp::Ordering::Less),
+                    (
+                        Some(SemverPrecedenceIdentifier::Text(_)),
+                        Some(SemverPrecedenceIdentifier::Numeric(_)),
+                    ) => return Some(std::cmp::Ordering::Greater),
+                    (
+                        Some(SemverPrecedenceIdentifier::Text(left)),
+                        Some(SemverPrecedenceIdentifier::Text(right)),
+                    ) => match left.as_bytes().cmp(right.as_bytes()) {
+                        std::cmp::Ordering::Equal => {}
+                        ordering => return Some(ordering),
+                    },
+                }
+            }
+            Some(std::cmp::Ordering::Equal)
+        }
+    }
+}
+
 /// Canonicalize a concrete NuGet version. NuGet compares prerelease labels
 /// case-insensitively, ignores build metadata, and treats missing/trailing zero
 /// release components as equivalent. Floating (`*`) and range syntax never
@@ -784,6 +889,169 @@ pub(crate) fn canonical_pep440_version(raw: &str) -> Option<CanonicalPep440Versi
     Some(CanonicalPep440Version { public, local })
 }
 
+/// Compare two concrete PyPI versions by their PEP 440 public precedence.
+///
+/// Local labels are deliberately ignored, matching ordered PEP 440 specifier
+/// semantics: `1.0+vendor.1` compares equal to the public boundary `1.0` for
+/// `<`, `<=`, `>`, and `>=` range projection. The parser is the same bounded
+/// grammar used by [`canonical_pep440_version`], including epochs, pre-releases,
+/// post-releases, and development releases.
+pub fn compare_pep440_public_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    Some(Pep440PrecedenceKey::parse(left)?.cmp(&Pep440PrecedenceKey::parse(right)?))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pep440PrecedenceKey {
+    epoch: String,
+    release: Vec<String>,
+    pre: Pep440Pre,
+    post: Pep440OptionalNumber,
+    dev: Pep440Dev,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Pep440Pre {
+    NegativeInfinity,
+    Value(u8, NumericString),
+    Infinity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Pep440OptionalNumber {
+    NegativeInfinity,
+    Value(NumericString),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Pep440Dev {
+    Value(NumericString),
+    Infinity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NumericString(String);
+
+impl NumericString {
+    fn new(raw: &str) -> Self {
+        Self(normalize_decimal(raw))
+    }
+}
+
+impl PartialOrd for NumericString {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NumericString {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .len()
+            .cmp(&other.0.len())
+            .then_with(|| self.0.cmp(&other.0))
+    }
+}
+
+impl Pep440PrecedenceKey {
+    fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.len() > MAX_EXACT_VERSION_BYTES || !raw.is_ascii() {
+            return None;
+        }
+        let captures = PEP440_VERSION_RE.captures(raw)?;
+        let release = captures
+            .name("release")?
+            .as_str()
+            .split('.')
+            .map(normalize_decimal)
+            .collect::<Vec<_>>();
+        if release.len() > MAX_VERSION_PARTS {
+            return None;
+        }
+        let epoch = captures
+            .name("epoch")
+            .map(|value| normalize_decimal(value.as_str()))
+            .unwrap_or_else(|| "0".to_string());
+        let post_number = captures
+            .name("post_n1")
+            .map(|value| value.as_str().trim_start_matches('-'))
+            .or_else(|| captures.name("post_n2").map(|value| value.as_str()));
+        let post = if captures.name("post_n1").is_some() || captures.name("post_l").is_some() {
+            Pep440OptionalNumber::Value(NumericString::new(post_number.unwrap_or("0")))
+        } else {
+            Pep440OptionalNumber::NegativeInfinity
+        };
+        let dev = if captures.name("dev_l").is_some() {
+            Pep440Dev::Value(NumericString::new(
+                captures
+                    .name("dev_n")
+                    .map(|value| value.as_str())
+                    .unwrap_or("0"),
+            ))
+        } else {
+            Pep440Dev::Infinity
+        };
+        let pre = if let Some(label) = captures.name("pre_l") {
+            let rank = match label.as_str().to_ascii_lowercase().as_str() {
+                "alpha" | "a" => 0,
+                "beta" | "b" => 1,
+                "preview" | "pre" | "c" | "rc" => 2,
+                _ => return None,
+            };
+            Pep440Pre::Value(
+                rank,
+                NumericString::new(
+                    captures
+                        .name("pre_n")
+                        .map(|value| value.as_str())
+                        .unwrap_or("0"),
+                ),
+            )
+        } else if matches!(post, Pep440OptionalNumber::NegativeInfinity)
+            && !matches!(dev, Pep440Dev::Infinity)
+        {
+            Pep440Pre::NegativeInfinity
+        } else {
+            Pep440Pre::Infinity
+        };
+        Some(Self {
+            epoch,
+            release,
+            pre,
+            post,
+            dev,
+        })
+    }
+}
+
+impl PartialOrd for Pep440PrecedenceKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Pep440PrecedenceKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match NumericString(self.epoch.clone()).cmp(&NumericString(other.epoch.clone())) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+        let release_len = self.release.len().max(other.release.len());
+        for index in 0..release_len {
+            let left = self.release.get(index).map(String::as_str).unwrap_or("0");
+            let right = other.release.get(index).map(String::as_str).unwrap_or("0");
+            match NumericString::new(left).cmp(&NumericString::new(right)) {
+                std::cmp::Ordering::Equal => {}
+                ordering => return ordering,
+            }
+        }
+        self.pre
+            .cmp(&other.pre)
+            .then_with(|| self.post.cmp(&other.post))
+            .then_with(|| self.dev.cmp(&other.dev))
+    }
+}
+
 fn normalize_decimal(raw: &str) -> String {
     let normalized = raw.trim_start_matches('0');
     if normalized.is_empty() {
@@ -1080,6 +1348,75 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn pep440_public_precedence_covers_dev_pre_final_and_post() {
+        let ordered = [
+            "1.0.dev1",
+            "1.0a1.dev1",
+            "1.0a1",
+            "1.0b1",
+            "1.0rc1",
+            "1.0",
+            "1.0.post1.dev1",
+            "1.0.post1",
+        ];
+        for pair in ordered.windows(2) {
+            assert_eq!(
+                compare_pep440_public_versions(pair[0], pair[1]),
+                Some(std::cmp::Ordering::Less),
+                "{} must sort before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn pep440_public_precedence_handles_epoch_release_padding_and_local_labels() {
+        assert_eq!(
+            compare_pep440_public_versions("1.0+vendor.1", "1.0"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_pep440_public_versions("1.0.0", "1.0"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_pep440_public_versions("1!0.1", "2.0"),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(compare_pep440_public_versions("not-a-version", "1.0"), None);
+    }
+
+    #[test]
+    fn semver_public_precedence_preserves_ascii_prerelease_case() {
+        assert_eq!(
+            compare_semver_public_versions("1.0.0-RC.1", "1.0.0-rc.1"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_semver_public_versions("1.0.0-rc.1", "1.0.0-RC.1"),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_semver_public_versions("1.0.0+BUILD", "1.0.0+build"),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn semver_public_precedence_is_numeric_and_rejects_nonconcrete_values() {
+        assert_eq!(
+            compare_semver_public_versions("1.9.0", "1.10.0"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_semver_public_versions("1.0.0-9", "1.0.0-10"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(compare_semver_public_versions("^1.0.0", "1.0.0"), None);
     }
 
     #[test]

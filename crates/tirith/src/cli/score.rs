@@ -1,3 +1,4 @@
+use std::io::Write;
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::ScanContext;
 use tirith_core::output;
@@ -24,7 +25,7 @@ pub fn run(url: &str, json: bool, explain: bool) -> i32 {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
 
-    let verdict = engine::analyze(&ctx);
+    let (verdict, policy) = engine::analyze_returning_policy(&ctx);
     let breakdown = scoring::score_verdict(&verdict);
     // Defence in depth: assert the factors-sum-to-score invariant in debug.
     debug_assert!(
@@ -33,9 +34,21 @@ pub fn run(url: &str, json: bool, explain: bool) -> i32 {
     );
 
     if json {
-        print_json(url, &verdict, &breakdown, explain);
+        print_json(
+            url,
+            &verdict,
+            &breakdown,
+            explain,
+            &policy.dlp_custom_patterns,
+        );
     } else {
-        print_human(url, &verdict, &breakdown, explain);
+        print_human(
+            url,
+            &verdict,
+            &breakdown,
+            explain,
+            &policy.dlp_custom_patterns,
+        );
     }
 
     0
@@ -46,29 +59,65 @@ fn print_json(
     verdict: &tirith_core::verdict::Verdict,
     breakdown: &ScoreBreakdown,
     explain: bool,
+    custom_patterns: &[String],
 ) {
+    let value = build_json_value(url, verdict, breakdown, explain, custom_patterns);
+    super::write_json_stdout(&value, "tirith: failed to write JSON output");
+}
+
+fn build_json_value(
+    url: &str,
+    verdict: &tirith_core::verdict::Verdict,
+    breakdown: &ScoreBreakdown,
+    explain: bool,
+    custom_patterns: &[String],
+) -> serde_json::Value {
     #[derive(serde::Serialize)]
     struct ScoreOutput<'a> {
-        url: &'a str,
+        url: String,
         score: u32,
         risk_level: &'a str,
         findings: &'a [tirith_core::verdict::Finding],
         /// Full factor breakdown — only with `--explain`.
         #[serde(skip_serializing_if = "Option::is_none")]
         score_breakdown: Option<&'a ScoreBreakdown>,
+        dlp_redaction_incomplete: bool,
     }
 
+    let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(custom_patterns);
+    let mut display = verdict.clone();
+    tirith_core::redact::redact_verdict_with_compiled(&mut display, &compiled);
+    tirith_core::verdict::bound_verdict_for_output(&mut display);
+    let mut safe_breakdown = breakdown.clone();
+    for factor in &mut safe_breakdown.factors {
+        factor.label =
+            tirith_core::redact::redact_sanitize_redact_with_compiled(&factor.label, &compiled);
+        factor.detail =
+            tirith_core::redact::redact_sanitize_redact_with_compiled(&factor.detail, &compiled);
+    }
     let out = ScoreOutput {
-        url,
+        // `url` and the finding evidence are raw observations, not executable
+        // suggestions. Preserve their schema only through a projected RSR-safe
+        // value; score JSON has no executable field to rewrite or retain.
+        url: tirith_core::redact::redact_sanitize_redact_with_compiled(url, &compiled),
         score: breakdown.score,
         risk_level: breakdown.risk_level,
-        findings: &verdict.findings,
-        score_breakdown: if explain { Some(breakdown) } else { None },
+        findings: &display.findings,
+        score_breakdown: if explain { Some(&safe_breakdown) } else { None },
+        dlp_redaction_incomplete: compiled.incomplete_reason().is_some(),
     };
-    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-        eprintln!("tirith: failed to write JSON output");
-    }
-    println!();
+    let mut value = serde_json::to_value(out).unwrap_or_else(|_| {
+        serde_json::json!({
+            "presentation_truncated": true,
+            "analysis_incomplete": true,
+            "error": "score serialization failed"
+        })
+    });
+    // Apply the recursive boundary to the completed projection before its
+    // presentation bound. This covers nested evidence and protects against a
+    // control/invisible separator whose removal reconstitutes a custom secret.
+    tirith_core::redact::redact_json_strings(&mut value, &compiled);
+    tirith_core::verdict::bound_json_value_for_output(value)
 }
 
 fn print_human(
@@ -76,40 +125,52 @@ fn print_human(
     verdict: &tirith_core::verdict::Verdict,
     breakdown: &ScoreBreakdown,
     explain: bool,
+    custom_patterns: &[String],
 ) {
+    let mut invocation = output::HumanInvocationWriter::new(
+        std::io::stderr().lock(),
+        tirith_core::style::use_color_for(tirith_core::style::Stream::Stderr),
+    );
+    let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(custom_patterns);
+    if let Some(reason) = compiled.incomplete_reason() {
+        let _ = writeln!(
+            invocation,
+            "tirith score: WARNING: DLP redaction plan is incomplete ({reason}); dynamic output fields were fully redacted."
+        );
+    }
+    let safe_url = output::sanitize_human_field_with_compiled(url, &compiled);
     if verdict.findings.is_empty() {
         // repo-0423: the inspected URL is untrusted — sanitize before rendering.
-        eprintln!(
+        let _ = writeln!(
+            invocation,
             "tirith: {} — no issues found (score: 0/100)",
-            super::sanitize_for_human_output(url, false)
+            safe_url
         );
     } else {
-        eprintln!(
+        let _ = writeln!(
+            invocation,
             "tirith: {} — risk score: {}/100 ({})",
-            super::sanitize_for_human_output(url, false),
-            breakdown.score,
-            breakdown.risk_level
+            safe_url, breakdown.score, breakdown.risk_level
         );
-        if output::write_human_auto(verdict, false).is_err() {
-            eprintln!("tirith: failed to write output");
-        }
+        let _ = output::write_human_to_invocation_with_compiled(
+            verdict,
+            false,
+            &compiled,
+            &mut invocation,
+        );
     }
 
     if explain {
-        print_breakdown_human(breakdown);
+        let _ = write_breakdown_human(breakdown, &compiled, &mut invocation);
     }
+    let _ = invocation.finish();
 }
 
-/// Render the factor breakdown to stderr so the reader can reproduce the score
-/// by hand. Formatting lives in [`write_breakdown_human`] for testability.
-fn print_breakdown_human(breakdown: &ScoreBreakdown) {
-    let _ = write_breakdown_human(breakdown, &mut std::io::stderr().lock());
-}
-
-/// Write the factor breakdown to `w`. Separated from [`print_breakdown_human`]
-/// so tests can capture the rendered text; output is identical.
+/// Write the factor breakdown to `w` so tests and the bounded invocation
+/// renderer share identical output.
 fn write_breakdown_human(
     breakdown: &ScoreBreakdown,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
     w: &mut impl std::io::Write,
 ) -> std::io::Result<()> {
     writeln!(w)?;
@@ -126,12 +187,12 @@ fn write_breakdown_human(
             w,
             "    {sign}{:<4} {}  (running total: {running})",
             factor.points,
-            super::sanitize_for_human_output(&factor.label, false)
+            output::sanitize_human_field_with_compiled(&factor.label, compiled)
         )?;
         writeln!(
             w,
             "           {}",
-            super::sanitize_for_human_output(&factor.detail, true)
+            output::sanitize_human_field_with_compiled(&factor.detail, compiled)
         )?;
     }
     writeln!(
@@ -147,11 +208,13 @@ fn write_breakdown_human(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tirith_core::verdict::{Evidence, Finding, RuleId, Severity};
+    use tirith_core::scoring::ScoreFactor;
+    use tirith_core::verdict::{Evidence, Finding, RuleId, Severity, Timings, Verdict};
 
     fn render(breakdown: &ScoreBreakdown) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        write_breakdown_human(breakdown, &mut buf).expect("write to Vec never fails");
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        write_breakdown_human(breakdown, &compiled, &mut buf).expect("write to Vec never fails");
         String::from_utf8(buf).expect("breakdown output is valid UTF-8")
     }
 
@@ -236,5 +299,56 @@ mod tests {
             out.contains("(critical)"),
             "a 100 score is the 'critical' risk bucket: {out}"
         );
+    }
+
+    #[test]
+    fn score_json_recursively_redacts_zero_width_split_custom_secret() {
+        let secret = "C02_SCORE_CUSTOM_RECONSTITUTION_CANARY";
+        let split = format!("{}\u{200b}{}", &secret[..15], &secret[15..]);
+        let patterns = vec![regex::escape(secret)];
+        let finding = Finding {
+            rule_id: RuleId::NonAsciiHostname,
+            severity: Severity::Low,
+            title: split.clone(),
+            description: format!("nested {split}"),
+            evidence: vec![Evidence::Url { raw: split.clone() }],
+            human_view: Some(split.clone()),
+            agent_view: Some(split.clone()),
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let verdict = Verdict::from_findings(vec![finding], 3, Timings::default());
+        let mut breakdown = scoring::score_verdict(&verdict);
+        breakdown.factors.push(ScoreFactor {
+            id: "projection_regression",
+            label: split.clone(),
+            points: 0,
+            detail: format!("factor {split}"),
+        });
+        assert!(breakdown.verify());
+
+        let value = build_json_value(
+            &format!("https://example.test/{split}"),
+            &verdict,
+            &breakdown,
+            true,
+            &patterns,
+        );
+        let rendered = serde_json::to_string(&value).unwrap();
+
+        assert!(!rendered.contains(secret), "{rendered}");
+        assert!(!rendered.contains('\u{200b}'), "{rendered}");
+        assert!(rendered.matches("[REDACTED:custom]").count() >= 5);
+        assert!(value["url"]
+            .as_str()
+            .is_some_and(|url| url.contains("[REDACTED:custom]")));
+        assert!(value["findings"][0]["evidence"][0]["raw"]
+            .as_str()
+            .is_some_and(|raw| raw.contains("[REDACTED:custom]")));
+        assert!(value["score_breakdown"]["factors"]
+            .as_array()
+            .is_some_and(|factors| factors.iter().any(|factor| factor["label"]
+                .as_str()
+                .is_some_and(|label| label.contains("[REDACTED:custom]")))));
     }
 }

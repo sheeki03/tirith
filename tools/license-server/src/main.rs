@@ -377,26 +377,29 @@ async fn upload_to_r2(
     backup_path: &str,
     date_str: &str,
 ) {
-    use s3::creds::Credentials;
-    use s3::Bucket;
-    use s3::Region;
+    use std::time::Duration;
 
-    let region = Region::Custom {
-        region: "auto".to_string(),
-        endpoint: endpoint.to_string(),
-    };
-    let credentials = match Credentials::new(Some(access_key), Some(secret_key), None, None, None) {
-        Ok(c) => c,
+    use rusty_s3::{Bucket, Credentials, S3Action as _, UrlStyle};
+
+    let endpoint = match endpoint.parse() {
+        Ok(endpoint) => endpoint,
         Err(e) => {
-            error!("R2 credentials error: {e}");
+            error!("R2 endpoint error: {e}");
             return;
         }
     };
-
-    let bucket = match Bucket::new(bucket_name, region, credentials) {
-        Ok(b) => b,
+    let bucket = match Bucket::new(endpoint, UrlStyle::Path, bucket_name.to_owned(), "auto") {
+        Ok(bucket) => bucket,
         Err(e) => {
             error!("R2 bucket init error: {e}");
+            return;
+        }
+    };
+    let credentials = Credentials::new(access_key, secret_key);
+    let client = match r2_http_client() {
+        Ok(client) => client,
+        Err(_) => {
+            error!("R2 HTTP client initialization failed");
             return;
         }
     };
@@ -410,23 +413,156 @@ async fn upload_to_r2(
     };
 
     let key = format!("backups/tirith-license-{date_str}.db");
-    match bucket.put_object(&key, &data).await {
-        Ok(resp) if resp.status_code() < 300 => {
+    let upload = bucket
+        .put_object(Some(&credentials), &key)
+        .sign(Duration::from_secs(300));
+    let database_uploaded = match client.put(upload).body(data).send().await {
+        Ok(response) if response.status().is_success() => {
             info!(key = %key, "backup uploaded to R2");
+            true
         }
-        Ok(resp) => {
-            error!(status = resp.status_code(), "R2 upload returned error");
+        Ok(response) => {
+            error!(status = %response.status(), "R2 upload returned error");
+            false
         }
-        Err(e) => {
-            error!("R2 upload failed: {e}");
+        Err(_) => {
+            // reqwest errors can retain the presigned bearer URL. Never render
+            // them into durable logs.
+            error!("R2 upload request failed");
+            false
         }
+    };
+
+    // A `.sha256` object with no `.db` beside it is not a partial success: a
+    // restore or verification job reads a digest it cannot resolve.
+    if !database_uploaded {
+        return;
     }
 
     let checksum_path = format!("{backup_path}.sha256");
     if let Ok(checksum_data) = tokio::fs::read(&checksum_path).await {
         let checksum_key = format!("backups/tirith-license-{date_str}.db.sha256");
-        if let Err(e) = bucket.put_object(&checksum_key, &checksum_data).await {
-            error!("R2 checksum upload failed: {e}");
+        let checksum_upload = bucket
+            .put_object(Some(&credentials), &checksum_key)
+            .sign(Duration::from_secs(300));
+        match client.put(checksum_upload).body(checksum_data).send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                error!(status = %response.status(), "R2 checksum upload returned error");
+            }
+            Err(_) => {
+                error!("R2 checksum upload request failed");
+            }
         }
+    }
+}
+
+/// Matches the tirith-core runner download client so a stalled R2 PUT cannot
+/// hang the sequential backup loop forever.
+const R2_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn r2_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    r2_http_client_with_timeout(R2_HTTP_TIMEOUT)
+}
+
+fn r2_http_client_with_timeout(
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    // A presigned URL is a bearer credential and PUT bodies are the private
+    // database backup. Never replay either to a redirect-selected origin.
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+}
+
+#[cfg(test)]
+mod r2_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn backup_client_never_replays_a_presigned_put_across_redirects() {
+        let redirect_target = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+        redirect_target
+            .set_nonblocking(true)
+            .expect("make redirect target observable");
+        let target_address = redirect_target.local_addr().expect("target address");
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        let target_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                match redirect_target.accept() {
+                    Ok(_) => {
+                        let _ = observed_sender.send(true);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+            let _ = observed_sender.send(false);
+        });
+
+        let origin = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+        let origin_address = origin.local_addr().expect("origin address");
+        let origin_thread = std::thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("accept initial PUT");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).expect("read initial PUT");
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_address}/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write redirect");
+        });
+
+        let response = super::r2_http_client()
+            .expect("build R2 client")
+            .put(format!(
+                "http://{origin_address}/backup?X-Amz-Signature=secret"
+            ))
+            .body("private database bytes")
+            .send()
+            .await
+            .expect("receive the redirect response");
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(!observed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("redirect observer result"));
+        origin_thread.join().expect("origin thread");
+        target_thread.join().expect("target thread");
+    }
+
+    #[tokio::test]
+    async fn backup_client_times_out_instead_of_hanging() {
+        assert_eq!(super::R2_HTTP_TIMEOUT, Duration::from_secs(30));
+
+        let stall = TcpListener::bind("127.0.0.1:0").expect("bind stall listener");
+        let stall_address = stall.local_addr().expect("stall address");
+        let stall_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = stall.accept() {
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+
+        let error = super::r2_http_client_with_timeout(Duration::from_millis(200))
+            .expect("build R2 client")
+            .put(format!("http://{stall_address}/backup"))
+            .body("private database bytes")
+            .send()
+            .await
+            .expect_err("a stalled R2 PUT must time out");
+        assert!(
+            error.is_timeout(),
+            "expected a request timeout, got: {error:?}"
+        );
+        let _ = stall_thread.join();
     }
 }

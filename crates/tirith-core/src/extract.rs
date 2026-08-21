@@ -84,50 +84,188 @@ pub struct ByteFinding {
 }
 
 impl ByteScanResult {
-    /// Return a filtered view dropping findings whose offset falls inside
-    /// `ignore`, with `has_*` flags re-derived from the survivors so tier-1/
-    /// tier-3 gates stay consistent. Used by the inspection-subcommand carveout
-    /// (inert arg span of `tirith diff/score/why/...`). `has_invalid_utf8` is a
-    /// whole-input property and is left unchanged.
+    pub const MAX_RETAINED_DETAILS: usize = 256;
+    pub const MAX_RETAINED_DETAILS_PER_CLASS: usize = 16;
+    const OMITTED_DETAIL_DESCRIPTION: &'static str =
+        "analysis incomplete: additional byte findings were omitted";
+
+    pub fn has_omitted_details(&self) -> bool {
+        self.details.iter().any(Self::is_omission_metadata)
+    }
+
+    fn is_omission_metadata(detail: &ByteFinding) -> bool {
+        detail.offset == usize::MAX
+            && detail.byte == 0
+            && detail.codepoint.is_none()
+            && detail
+                .description
+                .starts_with(Self::OMITTED_DETAIL_DESCRIPTION)
+    }
+
+    fn dropped_detail_class_mask(&self) -> u16 {
+        self.details
+            .iter()
+            .find(|detail| Self::is_omission_metadata(detail))
+            .and_then(|detail| detail.description.rsplit_once("dropped_class_mask="))
+            .and_then(|(_, mask)| mask.parse::<u16>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Back-compatible single-range filter retained for 0.3.3 callers that
+    /// construct a `ByteScanResult` and then carve out an inert argument span.
     pub fn with_ignored_range(mut self, ignore: &std::ops::Range<usize>) -> Self {
-        self.details.retain(|d| !ignore.contains(&d.offset));
-        // Re-derive flags from surviving details, matched on the description
-        // prefixes that correspond to each branch in `scan_bytes`.
-        self.has_ansi_escapes = false;
-        self.has_control_chars = false;
-        self.has_bidi_controls = false;
-        self.has_zero_width = false;
-        self.has_unicode_tags = false;
-        self.has_variation_selectors = false;
-        self.has_invisible_math_operators = false;
-        self.has_invisible_whitespace = false;
-        self.has_hangul_fillers = false;
-        self.has_confusable_text = false;
-        for d in &self.details {
-            let desc = d.description.as_str();
-            if desc.ends_with("escape sequence") || desc == "trailing escape byte" {
+        // Omission risk is class-local and must use ACTUAL drop state. Merely
+        // retaining exactly sixteen details does not prove a seventeenth ever
+        // existed, while a dropped detail may be the only signal outside the
+        // ignored range.
+        let dropped_detail_class_mask = self.dropped_detail_class_mask();
+        let class_was_lossy =
+            |class: PublicByteFindingClass| dropped_detail_class_mask & class.bit() != 0;
+        self.details.retain(|detail| {
+            Self::is_omission_metadata(detail) || !ignore.contains(&detail.offset)
+        });
+        // A lossy class may have an unretained detail outside the ignored range,
+        // so its complete-scan flag remains conservative. Lossless classes are
+        // rebuilt exactly from the retained, filtered details below.
+        self.has_ansi_escapes &= class_was_lossy(PublicByteFindingClass::Ansi);
+        self.has_control_chars &= class_was_lossy(PublicByteFindingClass::Control);
+        self.has_bidi_controls &= class_was_lossy(PublicByteFindingClass::Bidi);
+        self.has_zero_width &= class_was_lossy(PublicByteFindingClass::ZeroWidth);
+        self.has_unicode_tags &= class_was_lossy(PublicByteFindingClass::UnicodeTag);
+        self.has_variation_selectors &= class_was_lossy(PublicByteFindingClass::VariationSelector);
+        self.has_invisible_math_operators &= class_was_lossy(PublicByteFindingClass::InvisibleMath);
+        self.has_invisible_whitespace &=
+            class_was_lossy(PublicByteFindingClass::InvisibleWhitespace);
+        self.has_hangul_fillers &= class_was_lossy(PublicByteFindingClass::HangulFiller);
+        self.has_confusable_text &= class_was_lossy(PublicByteFindingClass::Confusable);
+        for detail in &self.details {
+            let description = detail.description.as_str();
+            if description.ends_with("escape sequence") || description == "trailing escape byte" {
                 self.has_ansi_escapes = true;
-            } else if desc.starts_with("control character") {
+            } else if description.starts_with("control character") {
                 self.has_control_chars = true;
-            } else if desc.starts_with("bidi control") {
+            } else if description.starts_with("bidi control") {
                 self.has_bidi_controls = true;
-            } else if desc.starts_with("zero-width character") {
+            } else if description.starts_with("zero-width character") {
                 self.has_zero_width = true;
-            } else if desc.starts_with("unicode tag") {
+            } else if description.starts_with("unicode tag") {
                 self.has_unicode_tags = true;
-            } else if desc.starts_with("variation selector") {
+            } else if description.starts_with("variation selector") {
                 self.has_variation_selectors = true;
-            } else if desc.starts_with("invisible math operator") {
+            } else if description.starts_with("invisible math operator") {
                 self.has_invisible_math_operators = true;
-            } else if desc.starts_with("invisible whitespace") {
+            } else if description.starts_with("invisible whitespace") {
                 self.has_invisible_whitespace = true;
-            } else if desc.starts_with("hangul filler") {
+            } else if description.starts_with("hangul filler") {
                 self.has_hangul_fillers = true;
-            } else if desc.starts_with("confusable") || desc.starts_with("text confusable") {
+            } else if description.starts_with("confusable")
+                || description.starts_with("text confusable")
+            {
                 self.has_confusable_text = true;
             }
         }
         self
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PublicByteFindingClass {
+    Ansi,
+    Control,
+    Bidi,
+    ZeroWidth,
+    UnicodeTag,
+    VariationSelector,
+    InvisibleMath,
+    InvisibleWhitespace,
+    HangulFiller,
+    Confusable,
+}
+
+impl PublicByteFindingClass {
+    const fn bit(self) -> u16 {
+        1u16 << (self as u16)
+    }
+}
+
+/// Pattern-aware scan metadata lives outside `ByteScanResult` so the public
+/// 0.3.3 result remains externally constructible with its original fields.
+pub struct ByteScanReport {
+    pub result: ByteScanResult,
+    pub dropped_details: usize,
+    /// Bitset of public classes for which retention actually dropped at least
+    /// one detail. Unlike a retained-count heuristic, an exactly-full class is
+    /// still known to be lossless.
+    #[doc(hidden)]
+    pub dropped_detail_class_mask: u16,
+}
+
+struct ByteScanAccumulator {
+    result: ByteScanResult,
+    dropped_details: usize,
+    dropped_detail_class_mask: u16,
+    detail_counts: [usize; BYTE_FINDING_CLASS_COUNT],
+}
+
+impl ByteScanAccumulator {
+    fn push_detail(&mut self, class: ByteFindingClass, detail: ByteFinding) {
+        let class_index = class as usize;
+        if self.detail_counts[class_index] < Self::MAX_RETAINED_DETAILS_PER_CLASS
+            && self.result.details.len() < ByteScanResult::MAX_RETAINED_DETAILS
+        {
+            self.detail_counts[class_index] += 1;
+            self.result.details.push(detail);
+        } else {
+            self.dropped_details = self.dropped_details.saturating_add(1);
+            self.dropped_detail_class_mask |= class.public_class().bit();
+        }
+    }
+
+    const MAX_RETAINED_DETAILS_PER_CLASS: usize = ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS;
+
+    fn finish(self) -> ByteScanReport {
+        ByteScanReport {
+            result: self.result,
+            dropped_details: self.dropped_details,
+            dropped_detail_class_mask: self.dropped_detail_class_mask,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ByteFindingClass {
+    Ansi,
+    Control,
+    Bidi,
+    ZeroWidthBenign,
+    ZeroWidthSuspicious,
+    UnicodeTag,
+    VariationSelector,
+    InvisibleMath,
+    InvisibleWhitespace,
+    HangulFiller,
+    ConfusableBenign,
+    ConfusableSuspicious,
+}
+
+const BYTE_FINDING_CLASS_COUNT: usize = 12;
+
+impl ByteFindingClass {
+    const fn public_class(self) -> PublicByteFindingClass {
+        match self {
+            Self::Ansi => PublicByteFindingClass::Ansi,
+            Self::Control => PublicByteFindingClass::Control,
+            Self::Bidi => PublicByteFindingClass::Bidi,
+            Self::ZeroWidthBenign | Self::ZeroWidthSuspicious => PublicByteFindingClass::ZeroWidth,
+            Self::UnicodeTag => PublicByteFindingClass::UnicodeTag,
+            Self::VariationSelector => PublicByteFindingClass::VariationSelector,
+            Self::InvisibleMath => PublicByteFindingClass::InvisibleMath,
+            Self::InvisibleWhitespace => PublicByteFindingClass::InvisibleWhitespace,
+            Self::HangulFiller => PublicByteFindingClass::HangulFiller,
+            Self::ConfusableBenign | Self::ConfusableSuspicious => {
+                PublicByteFindingClass::Confusable
+            }
+        }
     }
 }
 
@@ -173,96 +311,161 @@ fn decode_utf8_scalar_prefix(input: &[u8]) -> Option<char> {
 
 /// Scan raw bytes for control characters (paste-time, Tier 1 step 1).
 pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
-    let mut result = ByteScanResult {
-        has_ansi_escapes: false,
-        has_control_chars: false,
-        has_bidi_controls: false,
-        has_zero_width: false,
-        has_invalid_utf8: false,
-        has_unicode_tags: false,
-        has_variation_selectors: false,
-        has_invisible_math_operators: false,
-        has_invisible_whitespace: false,
-        has_hangul_fillers: false,
-        has_confusable_text: false,
-        details: Vec::new(),
+    compatibility_byte_scan_result(scan_bytes_with_ignored_ranges(input, &[]))
+}
+
+/// Scan while excluding inert byte ranges during the complete pass. Applying
+/// exclusions before bounded detail retention prevents an ignored prefix from
+/// consuming all detail slots and hiding a later out-of-range signal.
+pub fn scan_bytes_excluding(
+    input: &[u8],
+    ignored_ranges: &[std::ops::Range<usize>],
+) -> ByteScanResult {
+    compatibility_byte_scan_result(scan_bytes_with_ignored_ranges(input, ignored_ranges))
+}
+
+fn compatibility_byte_scan_result(report: ByteScanReport) -> ByteScanResult {
+    let ByteScanReport {
+        mut result,
+        dropped_details,
+        dropped_detail_class_mask,
+    } = report;
+    if dropped_details > 0 {
+        if result.details.len() == ByteScanResult::MAX_RETAINED_DETAILS {
+            result.details.pop();
+        }
+        result.details.push(ByteFinding {
+            offset: usize::MAX,
+            byte: 0,
+            codepoint: None,
+            description: format!(
+                "{}: omitted_details={dropped_details}; dropped_class_mask={dropped_detail_class_mask}",
+                ByteScanResult::OMITTED_DETAIL_DESCRIPTION
+            ),
+        });
+    }
+    result
+}
+
+/// Scan while excluding inert ranges and return explicit bounded-detail
+/// metadata. New callers should use this name; `scan_bytes` and
+/// `scan_bytes_excluding` remain compatibility wrappers returning 0.3.3's
+/// externally constructible `ByteScanResult`.
+pub fn scan_bytes_with_ignored_ranges(
+    input: &[u8],
+    ignored_ranges: &[std::ops::Range<usize>],
+) -> ByteScanReport {
+    let mut accumulator = ByteScanAccumulator {
+        result: ByteScanResult {
+            has_ansi_escapes: false,
+            has_control_chars: false,
+            has_bidi_controls: false,
+            has_zero_width: false,
+            has_invalid_utf8: false,
+            has_unicode_tags: false,
+            has_variation_selectors: false,
+            has_invisible_math_operators: false,
+            has_invisible_whitespace: false,
+            has_hangul_fillers: false,
+            has_confusable_text: false,
+            details: Vec::new(),
+        },
+        dropped_details: 0,
+        dropped_detail_class_mask: 0,
+        detail_counts: [0; BYTE_FINDING_CLASS_COUNT],
     };
 
     // Check for invalid UTF-8
     if std::str::from_utf8(input).is_err() {
-        result.has_invalid_utf8 = true;
+        accumulator.result.has_invalid_utf8 = true;
     }
 
     let len = input.len();
     let mut i = 0;
     while i < len {
         let b = input[i];
+        let ignored = ignored_ranges.iter().any(|range| range.contains(&i));
 
-        if b == 0x1b {
+        if b == 0x1b && !ignored {
             // CSI (\e[), OSC (\e]), APC (\e_), DCS (\eP): escape-sequence
             // introducers used for terminal injection attacks.
             if i + 1 < len {
                 let next = input[i + 1];
                 if next == b'[' || next == b']' || next == b'_' || next == b'P' {
-                    result.has_ansi_escapes = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: None,
-                        description: match next {
-                            b'[' => "CSI escape sequence",
-                            b']' => "OSC escape sequence",
-                            b'_' => "APC escape sequence",
-                            b'P' => "DCS escape sequence",
-                            _ => "escape sequence",
-                        }
-                        .to_string(),
-                    });
+                    accumulator.result.has_ansi_escapes = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::Ansi,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: None,
+                            description: match next {
+                                b'[' => "CSI escape sequence",
+                                b']' => "OSC escape sequence",
+                                b'_' => "APC escape sequence",
+                                b'P' => "DCS escape sequence",
+                                _ => "escape sequence",
+                            }
+                            .to_string(),
+                        },
+                    );
                     i += 2;
                     continue;
                 }
             } else {
-                result.has_ansi_escapes = true;
-                result.details.push(ByteFinding {
-                    offset: i,
-                    byte: b,
-                    codepoint: None,
-                    description: "trailing escape byte".to_string(),
-                });
+                accumulator.result.has_ansi_escapes = true;
+                accumulator.push_detail(
+                    ByteFindingClass::Ansi,
+                    ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: None,
+                        description: "trailing escape byte".to_string(),
+                    },
+                );
             }
         }
 
         // CR: only flag mid-stream CRs (display-overwriting attacks). Trailing
         // CR and CRLF (Windows line endings) are benign clipboard artifacts.
-        if b == b'\r' {
+        if b == b'\r' && !ignored {
             let is_attack_cr = i + 1 < len && input[i + 1] != b'\n';
             if is_attack_cr {
-                result.has_control_chars = true;
-                result.details.push(ByteFinding {
+                accumulator.result.has_control_chars = true;
+                accumulator.push_detail(
+                    ByteFindingClass::Control,
+                    ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: None,
+                        description: format!("control character 0x{b:02x}"),
+                    },
+                );
+            }
+        } else if !ignored && b < 0x20 && b != b'\n' && b != b'\t' && b != 0x1b {
+            accumulator.result.has_control_chars = true;
+            accumulator.push_detail(
+                ByteFindingClass::Control,
+                ByteFinding {
                     offset: i,
                     byte: b,
                     codepoint: None,
                     description: format!("control character 0x{b:02x}"),
-                });
-            }
-        } else if b < 0x20 && b != b'\n' && b != b'\t' && b != 0x1b {
-            result.has_control_chars = true;
-            result.details.push(ByteFinding {
-                offset: i,
-                byte: b,
-                codepoint: None,
-                description: format!("control character 0x{b:02x}"),
-            });
+                },
+            );
         }
 
-        if b == 0x7F {
-            result.has_control_chars = true;
-            result.details.push(ByteFinding {
-                offset: i,
-                byte: b,
-                codepoint: None,
-                description: "control character 0x7f (DEL)".to_string(),
-            });
+        if b == 0x7F && !ignored {
+            accumulator.result.has_control_chars = true;
+            accumulator.push_detail(
+                ByteFindingClass::Control,
+                ByteFinding {
+                    offset: i,
+                    byte: b,
+                    codepoint: None,
+                    description: "control character 0x7f (DEL)".to_string(),
+                },
+            );
         }
 
         // UTF-8 continuation byte? Decode the char and check it against every
@@ -270,98 +473,144 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
         if b >= 0xc0 {
             let remaining = &input[i..];
             if let Some(ch) = decode_utf8_scalar_prefix(remaining) {
-                if is_bidi_control(ch) {
-                    result.has_bidi_controls = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("bidi control U+{:04X}", ch as u32),
-                    });
+                if is_bidi_control(ch) && !ignored {
+                    accumulator.result.has_bidi_controls = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::Bidi,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("bidi control U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // ZWSP, ZWNJ, ZWJ, BOM, CGJ, Soft Hyphen, Word Joiner.
                 // BOM (U+FEFF) at offset 0 is a file-encoding artifact, not an attack.
-                if is_zero_width(ch) && !(ch == '\u{FEFF}' && i == 0) {
-                    result.has_zero_width = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("zero-width character U+{:04X}", ch as u32),
-                    });
+                if is_zero_width(ch) && !(ch == '\u{FEFF}' && i == 0) && !ignored {
+                    accumulator.result.has_zero_width = true;
+                    let class = if matches!(ch, '\u{200c}' | '\u{200d}')
+                        && crate::rules::terminal::is_joining_script_context(input, i)
+                    {
+                        ByteFindingClass::ZeroWidthBenign
+                    } else {
+                        ByteFindingClass::ZeroWidthSuspicious
+                    };
+                    accumulator.push_detail(
+                        class,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("zero-width character U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // Unicode Tags U+E0000–U+E007F (hidden-ASCII encoding).
-                if is_unicode_tag(ch) {
-                    result.has_unicode_tags = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("unicode tag U+{:04X}", ch as u32),
-                    });
+                if is_unicode_tag(ch) && !ignored {
+                    accumulator.result.has_unicode_tags = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::UnicodeTag,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("unicode tag U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // U+FE00–U+FE0F and U+E0100–U+E01EF.
-                if is_variation_selector(ch) {
-                    result.has_variation_selectors = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("variation selector U+{:04X}", ch as u32),
-                    });
+                if is_variation_selector(ch) && !ignored {
+                    accumulator.result.has_variation_selectors = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::VariationSelector,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("variation selector U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // U+2061–U+2064.
-                if is_invisible_math_operator(ch) {
-                    result.has_invisible_math_operators = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("invisible math operator U+{:04X}", ch as u32),
-                    });
+                if is_invisible_math_operator(ch) && !ignored {
+                    accumulator.result.has_invisible_math_operators = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::InvisibleMath,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("invisible math operator U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // Invisible whitespace (stealth-encoded spaces).
-                if is_invisible_whitespace(ch) {
-                    result.has_invisible_whitespace = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("invisible whitespace U+{:04X}", ch as u32),
-                    });
+                if is_invisible_whitespace(ch) && !ignored {
+                    accumulator.result.has_invisible_whitespace = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::InvisibleWhitespace,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("invisible whitespace U+{:04X}", ch as u32),
+                        },
+                    );
                 }
-                if is_hangul_filler(ch) {
-                    result.has_hangul_fillers = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!("hangul filler U+{:04X}", ch as u32),
-                    });
+                if is_hangul_filler(ch) && !ignored {
+                    accumulator.result.has_hangul_fillers = true;
+                    accumulator.push_detail(
+                        ByteFindingClass::HangulFiller,
+                        ByteFinding {
+                            offset: i,
+                            byte: b,
+                            codepoint: Some(ch as u32),
+                            description: format!("hangul filler U+{:04X}", ch as u32),
+                        },
+                    );
                 }
                 // Math alphanumerics + hostname confusables.
-                if let Some(target) = crate::text_confusables::is_text_confusable(ch) {
-                    result.has_confusable_text = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!(
-                            "text confusable U+{:04X} (looks like '{target}')",
-                            ch as u32
-                        ),
-                    });
-                } else if let Some(target) = crate::confusables::is_confusable(ch) {
-                    result.has_confusable_text = true;
-                    result.details.push(ByteFinding {
-                        offset: i,
-                        byte: b,
-                        codepoint: Some(ch as u32),
-                        description: format!(
-                            "confusable U+{:04X} (looks like '{target}')",
-                            ch as u32
-                        ),
-                    });
+                if !ignored {
+                    if let Some(target) = crate::text_confusables::is_text_confusable(ch) {
+                        accumulator.result.has_confusable_text = true;
+                        let class = if crate::rules::terminal::is_ascii_nearby(input, i) {
+                            ByteFindingClass::ConfusableSuspicious
+                        } else {
+                            ByteFindingClass::ConfusableBenign
+                        };
+                        accumulator.push_detail(
+                            class,
+                            ByteFinding {
+                                offset: i,
+                                byte: b,
+                                codepoint: Some(ch as u32),
+                                description: format!(
+                                    "text confusable U+{:04X} (looks like '{target}')",
+                                    ch as u32
+                                ),
+                            },
+                        );
+                    } else if let Some(target) = crate::confusables::is_confusable(ch) {
+                        accumulator.result.has_confusable_text = true;
+                        let class = if crate::rules::terminal::is_same_word_as_ascii(input, i) {
+                            ByteFindingClass::ConfusableSuspicious
+                        } else {
+                            ByteFindingClass::ConfusableBenign
+                        };
+                        accumulator.push_detail(
+                            class,
+                            ByteFinding {
+                                offset: i,
+                                byte: b,
+                                codepoint: Some(ch as u32),
+                                description: format!(
+                                    "confusable U+{:04X} (looks like '{target}')",
+                                    ch as u32
+                                ),
+                            },
+                        );
+                    }
                 }
                 i += ch.len_utf8();
                 continue;
@@ -371,7 +620,7 @@ pub fn scan_bytes(input: &[u8]) -> ByteScanResult {
         i += 1;
     }
 
-    result
+    accumulator.finish()
 }
 
 // Output-stream byte scanning (M7 ch1): a streaming scanner for terminal
@@ -3059,6 +3308,10 @@ pub(crate) enum ShellExecutionGap {
     /// An active POSIX/Fish/Cmd group or substitution was opened but could not
     /// be closed within the bounded lexical parser.
     IncompleteExecutableBody,
+    /// Executable-body discovery exhausted its global input, lexical-candidate,
+    /// or retained-body budget. Bodies recovered before the boundary remain
+    /// available, but the unexamined suffix must fail closed.
+    WorkBudgetExceeded,
 }
 
 /// A statically recovered command body together with the shell that will parse
@@ -3080,6 +3333,13 @@ pub(crate) struct ExecutableSubstitutionScan {
 const MAX_HEREDOCS: usize = 32;
 const MAX_HEREDOC_DELIMITER_BYTES: usize = 256;
 const MAX_HEREDOC_BODY_BYTES: usize = 256 * 1024;
+// Keep the root ceiling above every supported single-body decoder/rewrite
+// ceiling (currently 256 KiB), while preventing the 10 MiB file/LSP ceiling
+// from reaching the allocation-heavy shell parsers in one pass.
+pub(crate) const MAX_EXECUTABLE_SCAN_INPUT_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_EXECUTABLE_SCAN_CANDIDATES: usize = 256;
+const MAX_EXECUTABLE_SCAN_BODIES: usize = 64;
+const MAX_EXECUTABLE_SCAN_BODY_BYTES: usize = 512 * 1024;
 
 #[derive(Debug)]
 struct PosixHeredocSpec {
@@ -3582,6 +3842,196 @@ pub(crate) fn shell_execution_view<'a>(
     }
 }
 
+fn bounded_executable_input(raw: &str) -> (&str, bool) {
+    if raw.len() <= MAX_EXECUTABLE_SCAN_INPUT_BYTES {
+        return (raw, false);
+    }
+
+    let mut end = MAX_EXECUTABLE_SCAN_INPUT_BYTES;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    (raw.get(..end).unwrap_or_default(), true)
+}
+
+/// Bound the amount of lexical shell structure handed to the expensive body
+/// parsers. This pass is linear and uses only the existing bounded delimiter
+/// stack. It counts ordinary shell words plus active substitution/group
+/// openers, while ignoring comments and single-quoted data. Nested bodies are
+/// counted again when recursively analyzed, so one outer `$(` cannot smuggle
+/// an unbounded child workload.
+fn bounded_executable_candidates(raw: &str, shell: ShellType) -> (&str, bool) {
+    let bytes = raw.as_bytes();
+    let mut quote = ShellLexQuote::Normal;
+    let mut word_start = true;
+    let mut candidates = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            ShellLexQuote::Single => {
+                if byte == b'\'' {
+                    if shell == ShellType::PowerShell && bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                        continue;
+                    }
+                    quote = ShellLexQuote::Normal;
+                }
+                index += 1;
+                continue;
+            }
+            ShellLexQuote::Double => {
+                if byte == shell_escape_byte(shell) && index + 1 < bytes.len() {
+                    index += 2;
+                    continue;
+                }
+                if byte == b'"' {
+                    quote = ShellLexQuote::Normal;
+                    index += 1;
+                    continue;
+                }
+                let active_substitution =
+                    shell != ShellType::Cmd && byte == b'$' && bytes.get(index + 1) == Some(&b'(');
+                let active_backtick = shell == ShellType::Posix && byte == b'`';
+                if active_substitution || active_backtick {
+                    if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                        return (raw.get(..index).unwrap_or_default(), true);
+                    }
+                    candidates += 1;
+                    index = if active_substitution {
+                        find_shell_delimiter_close(raw, index + 1, shell)
+                            .map_or(bytes.len(), |close| close + 1)
+                    } else {
+                        find_backtick_close(raw, index).map_or(bytes.len(), |close| close + 1)
+                    };
+                    continue;
+                }
+                index += 1;
+                continue;
+            }
+            ShellLexQuote::Normal => {}
+        }
+
+        if starts_shell_line_comment(bytes, index, shell, word_start) {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            word_start = true;
+            continue;
+        }
+
+        if byte == shell_escape_byte(shell) && index + 1 < bytes.len() {
+            if word_start {
+                if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                    return (raw.get(..index).unwrap_or_default(), true);
+                }
+                candidates += 1;
+            }
+            word_start = false;
+            index += 2;
+            continue;
+        }
+
+        if byte == b'\'' && shell != ShellType::Cmd {
+            if word_start {
+                if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                    return (raw.get(..index).unwrap_or_default(), true);
+                }
+                candidates += 1;
+            }
+            word_start = false;
+            quote = ShellLexQuote::Single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            if word_start {
+                if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                    return (raw.get(..index).unwrap_or_default(), true);
+                }
+                candidates += 1;
+            }
+            word_start = false;
+            quote = ShellLexQuote::Double;
+            index += 1;
+            continue;
+        }
+
+        if byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b')' | b'}') {
+            word_start = true;
+            index += 1;
+            continue;
+        }
+
+        let active_substitution = shell != ShellType::Cmd
+            && byte == b'$'
+            && matches!(bytes.get(index + 1).copied(), Some(b'(' | b'{'));
+        let active_backtick = shell == ShellType::Posix && byte == b'`';
+        let active_group = byte == b'(' || (byte == b'{' && word_start);
+        if active_substitution || active_backtick || active_group {
+            if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                return (raw.get(..index).unwrap_or_default(), true);
+            }
+            candidates += 1;
+            let open = if active_substitution {
+                index + 1
+            } else {
+                index
+            };
+            index = if active_backtick {
+                find_backtick_close(raw, index).map_or(bytes.len(), |close| close + 1)
+            } else {
+                find_shell_delimiter_close(raw, open, shell).map_or(bytes.len(), |close| close + 1)
+            };
+            word_start = false;
+            continue;
+        }
+
+        if word_start {
+            if candidates >= MAX_EXECUTABLE_SCAN_CANDIDATES {
+                return (raw.get(..index).unwrap_or_default(), true);
+            }
+            candidates += 1;
+            word_start = false;
+        }
+        index += 1;
+    }
+
+    (raw, false)
+}
+
+fn bound_executable_bodies(scan: &mut ExecutableSubstitutionScan) -> bool {
+    let mut seen = std::collections::HashSet::<(ShellType, &str)>::new();
+    let mut keep = Vec::with_capacity(scan.bodies.len());
+    let mut retained_bodies = 0usize;
+    let mut retained_bytes = 0usize;
+    let mut exhausted = false;
+
+    for body in &scan.bodies {
+        if !seen.insert((body.shell, body.input.as_str())) {
+            keep.push(false);
+            continue;
+        }
+        let next_bytes = retained_bytes.saturating_add(body.input.len());
+        if retained_bodies >= MAX_EXECUTABLE_SCAN_BODIES
+            || next_bytes > MAX_EXECUTABLE_SCAN_BODY_BYTES
+        {
+            exhausted = true;
+            keep.push(false);
+            continue;
+        }
+        retained_bodies += 1;
+        retained_bytes = next_bytes;
+        keep.push(true);
+    }
+
+    drop(seen);
+    let mut keep = keep.into_iter();
+    scan.bodies.retain(|_| keep.next().unwrap_or(false));
+    exhausted
+}
+
 /// Structured executable-body scan.  Most callers only need the recovered
 /// bodies and use [`executable_substitutions`]; enforcement callers also retain
 /// `gap` so ambiguous PowerShell invocation never collapses to "no body".
@@ -3589,6 +4039,7 @@ pub(crate) fn executable_substitution_scan(
     raw: &str,
     shell: ShellType,
 ) -> ExecutableSubstitutionScan {
+    let (raw, input_budget_exhausted) = bounded_executable_input(raw);
     let (scan_input, mut heredoc_bodies, heredoc_gap) = if shell == ShellType::Posix {
         let recovery = recover_posix_heredocs(raw);
         (
@@ -3599,7 +4050,8 @@ pub(crate) fn executable_substitution_scan(
     } else {
         (std::borrow::Cow::Borrowed(raw), Vec::new(), None)
     };
-    let scan_input = scan_input.as_ref();
+    let (scan_input, candidate_budget_exhausted) =
+        bounded_executable_candidates(scan_input.as_ref(), shell);
     let mut scan = if shell == ShellType::PowerShell {
         powershell_executable_substitution_scan(scan_input)
     } else {
@@ -3647,9 +4099,10 @@ pub(crate) fn executable_substitution_scan(
     if matches!(shell, ShellType::Posix | ShellType::Fish) {
         scan_literal_posix_aliases(scan_input, shell, &mut scan);
     }
-    let mut seen = std::collections::HashSet::new();
-    scan.bodies
-        .retain(|body| seen.insert((body.shell, body.input.clone())));
+    let body_budget_exhausted = bound_executable_bodies(&mut scan);
+    if input_budget_exhausted || candidate_budget_exhausted || body_budget_exhausted {
+        scan.gap = Some(ShellExecutionGap::WorkBudgetExceeded);
+    }
     scan
 }
 
@@ -6021,8 +6474,11 @@ fn posix_body_calls_parent_function(
             return true;
         }
 
-        let (nested_bodies, nested_gap) =
-            lexical_executable_substitutions(&segment.raw, ShellType::Posix);
+        let (nested_bodies, nested_gap) = lexical_executable_substitutions_bounded(
+            &segment.raw,
+            ShellType::Posix,
+            remaining_bodies,
+        );
         if nested_gap.is_some() && !function_names.is_empty() {
             return true;
         }
@@ -6749,9 +7205,31 @@ fn posix_reserved_time_word_at(
         })
 }
 
+/// Arm a fresh dispatch-scan budget for a top-level scan.
 fn lexical_executable_substitutions(
     raw: &str,
     shell: ShellType,
+) -> (Vec<String>, Option<ShellExecutionGap>) {
+    let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+    lexical_executable_substitutions_bounded(raw, shell, &mut remaining_bodies)
+}
+
+/// As above, drawing from a caller-owned budget.
+///
+/// This scan and `posix_body_calls_parent_function` call each other, and each
+/// used to arm its own counter, so every nesting level paid the full budget
+/// again and the total cost doubled per level. A line of unmatched `(`
+/// characters therefore took the Web3 parser exponential — 8 of them cost 73ms
+/// and 20 cost 266s, and the `web3_command` fuzz target found it as an OOM.
+/// Threading one budget through the cycle makes the total linear in it.
+///
+/// Exhaustion is fail-closed at every consumer: the scans answer "this body may
+/// reach the parent's dispatch state", and running out returns that answer, so a
+/// tighter effective budget can only widen the reported gap, never narrow it.
+fn lexical_executable_substitutions_bounded(
+    raw: &str,
+    shell: ShellType,
+    remaining_bodies: &mut usize,
 ) -> (Vec<String>, Option<ShellExecutionGap>) {
     let bytes = raw.as_bytes();
     let mut bodies = Vec::new();
@@ -7219,10 +7697,9 @@ fn lexical_executable_substitutions(
             .keys()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
-        let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
         if invoked_function_needs_context
             || bodies.iter().any(|body| {
-                posix_body_calls_parent_function(body, &function_names, 0, &mut remaining_bodies)
+                posix_body_calls_parent_function(body, &function_names, 0, remaining_bodies)
             })
             || function_body_indices.iter().any(|index| {
                 bodies
@@ -11525,6 +12002,97 @@ mod tests {
     }
 
     #[test]
+    fn byte_scan_result_remains_externally_constructible_and_filterable() {
+        let result = ByteScanResult {
+            has_ansi_escapes: false,
+            has_control_chars: false,
+            has_bidi_controls: true,
+            has_zero_width: false,
+            has_invalid_utf8: false,
+            has_unicode_tags: false,
+            has_variation_selectors: false,
+            has_invisible_math_operators: false,
+            has_invisible_whitespace: false,
+            has_hangul_fillers: false,
+            has_confusable_text: false,
+            details: vec![ByteFinding {
+                offset: 2,
+                byte: 0xe2,
+                codepoint: Some(0x202e),
+                description: "bidi control U+202E".to_string(),
+            }],
+        };
+        let filtered = result.with_ignored_range(&(1..5));
+        assert!(!filtered.has_bidi_controls);
+        assert!(filtered.details.is_empty());
+    }
+
+    #[test]
+    fn public_omission_metadata_carries_actual_class_loss() {
+        let bidi = "\u{202e}".as_bytes();
+        let mut input = Vec::new();
+        for _ in 0..(ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS + 1) {
+            input.extend_from_slice(bidi);
+        }
+        let ignored_end = input.len();
+        input.extend_from_slice(b"visible");
+        input.extend_from_slice(bidi);
+
+        let result = scan_bytes(&input);
+        assert!(result.has_omitted_details());
+        let filtered = result.with_ignored_range(&(0..ignored_end));
+        assert!(
+            filtered.has_bidi_controls,
+            "lossy retained details cannot prove the out-of-range bidi signal absent"
+        );
+        assert!(filtered.has_omitted_details());
+
+        let report = scan_bytes_with_ignored_ranges(&input, &[]);
+        assert!(report.dropped_details > 0);
+        assert_ne!(
+            report.dropped_detail_class_mask & PublicByteFindingClass::Bidi.bit(),
+            0
+        );
+    }
+
+    #[test]
+    fn ignored_range_filter_uses_class_local_not_total_detail_saturation() {
+        let bidi_prefix = "\u{202e}".repeat(8);
+        let mut input = bidi_prefix.as_bytes().to_vec();
+        input.extend(std::iter::repeat_n(0x01, 8));
+
+        let result = scan_bytes(&input);
+        assert_eq!(result.details.len(), 16);
+        assert!(result.has_bidi_controls);
+        assert!(result.has_control_chars);
+
+        let filtered = result.with_ignored_range(&(0..bidi_prefix.len()));
+        assert!(!filtered.has_bidi_controls);
+        assert!(filtered.has_control_chars);
+        assert_eq!(filtered.details.len(), 8);
+        assert!(filtered
+            .details
+            .iter()
+            .all(|detail| detail.description.starts_with("control character")));
+    }
+
+    #[test]
+    fn exact_class_cap_without_an_actual_drop_does_not_stick_after_ignore() {
+        let input = "\u{202e}".repeat(ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS);
+        let result = scan_bytes(input.as_bytes());
+
+        assert_eq!(
+            result.details.len(),
+            ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS
+        );
+        assert!(!result.has_omitted_details());
+
+        let filtered = result.with_ignored_range(&(0..input.len()));
+        assert!(!filtered.has_bidi_controls);
+        assert!(filtered.details.is_empty());
+    }
+
+    #[test]
     fn test_byte_scan_control_chars() {
         let input = b"hello\rworld";
         let result = scan_bytes(input);
@@ -11536,6 +12104,25 @@ mod tests {
         let input = "hello\u{202E}dlrow".as_bytes();
         let result = scan_bytes(input);
         assert!(result.has_bidi_controls);
+    }
+
+    #[test]
+    fn ignored_detail_overflow_cannot_hide_later_bidi() {
+        let ignored_prefix = "\u{200b}".repeat(ByteScanResult::MAX_RETAINED_DETAILS);
+        let input = format!("{ignored_prefix}\u{202e}visible");
+
+        let ignored_range = 0..ignored_prefix.len();
+        let report =
+            scan_bytes_with_ignored_ranges(input.as_bytes(), std::slice::from_ref(&ignored_range));
+        let result = report.result;
+
+        assert!(result.has_bidi_controls);
+        assert!(!result.has_zero_width);
+        assert!(result
+            .details
+            .iter()
+            .any(|detail| detail.description.starts_with("bidi control")));
+        assert_eq!(report.dropped_details, 0);
     }
 
     #[test]
@@ -12609,6 +13196,90 @@ mod tests {
             );
             assert!(scan.gap.is_none(), "quoted data became ambiguous: {scan:?}");
         }
+    }
+
+    #[test]
+    fn executable_scan_input_budget_is_exact_and_preserves_prefix_bodies() {
+        let exact = "x".repeat(MAX_EXECUTABLE_SCAN_INPUT_BYTES);
+        let exact_scan = executable_substitution_scan(&exact, ShellType::Posix);
+        assert!(
+            exact_scan.gap.is_none(),
+            "exact budget failed: {exact_scan:?}"
+        );
+        assert!(exact_scan.bodies.is_empty(), "{exact_scan:?}");
+
+        let prefix = "echo $(printf substitution-detected)\n\
+                      sink(){ printf function-detected; }\n\
+                      sink\n";
+        let mut over = prefix.to_string();
+        over.push_str(&"x".repeat(MAX_EXECUTABLE_SCAN_INPUT_BYTES + 1 - over.len()));
+        let over_scan = executable_substitution_scan(&over, ShellType::Posix);
+        assert_eq!(
+            over_scan.gap,
+            Some(ShellExecutionGap::WorkBudgetExceeded),
+            "{over_scan:?}"
+        );
+        for expected in ["substitution-detected", "function-detected"] {
+            assert!(
+                over_scan
+                    .bodies
+                    .iter()
+                    .any(|body| body.input.contains(expected)),
+                "body before the input boundary was lost: {expected:?} -> {over_scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_scan_candidate_budget_is_exact_and_fails_closed_at_plus_one() {
+        let exact = "true;".repeat(MAX_EXECUTABLE_SCAN_CANDIDATES);
+        let exact_scan = executable_substitution_scan(&exact, ShellType::Posix);
+        assert!(
+            exact_scan.gap.is_none(),
+            "exact budget failed: {exact_scan:?}"
+        );
+
+        let plus_one = format!("{exact}true");
+        let plus_one_scan = executable_substitution_scan(&plus_one, ShellType::Posix);
+        assert_eq!(
+            plus_one_scan.gap,
+            Some(ShellExecutionGap::WorkBudgetExceeded),
+            "{plus_one_scan:?}"
+        );
+    }
+
+    #[test]
+    fn executable_scan_body_budget_keeps_the_exact_prefix_and_marks_omission() {
+        let body_input = |count: usize| {
+            let mut input = String::from("echo ");
+            for spaces in 1..=count {
+                input.push('`');
+                input.push(':');
+                input.push_str(&" ".repeat(spaces));
+                input.push('`');
+            }
+            input
+        };
+
+        let exact =
+            executable_substitution_scan(&body_input(MAX_EXECUTABLE_SCAN_BODIES), ShellType::Posix);
+        assert_eq!(exact.bodies.len(), MAX_EXECUTABLE_SCAN_BODIES, "{exact:?}");
+        assert!(exact.gap.is_none(), "exact body budget failed: {exact:?}");
+
+        let plus_one = executable_substitution_scan(
+            &body_input(MAX_EXECUTABLE_SCAN_BODIES + 1),
+            ShellType::Posix,
+        );
+        assert_eq!(
+            plus_one.bodies.len(),
+            MAX_EXECUTABLE_SCAN_BODIES,
+            "{plus_one:?}"
+        );
+        assert_eq!(
+            plus_one.gap,
+            Some(ShellExecutionGap::WorkBudgetExceeded),
+            "{plus_one:?}"
+        );
     }
 
     #[test]
@@ -14551,5 +15222,42 @@ mod tests {
                 "finalize must report the wedged terminal for {introducer:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_scan_budget_tests {
+    use super::{lexical_executable_substitutions, ShellExecutionGap, ShellType};
+
+    /// The scan and `posix_body_calls_parent_function` call each other. While
+    /// each re-armed its own budget, every nesting level paid the full budget
+    /// again and the cost doubled per level: 8 unmatched `(` characters cost
+    /// 73ms and 20 cost 266s, which the `web3_command` fuzz target found as an
+    /// out-of-memory. One shared budget makes it flat.
+    #[test]
+    fn a_deep_unmatched_group_run_does_not_blow_up() {
+        let deep = format!(
+            "{}cast send 0x111a-keysre .-/vallet.json --rpc-urlscales://rpc.example\n",
+            "(".repeat(49)
+        );
+        let started = std::time::Instant::now();
+        let _ = lexical_executable_substitutions(&deep, ShellType::Posix);
+        let elapsed = started.elapsed();
+        // Generous next to the old curve, which could not finish this input at
+        // all, and still far below anything an exponential could reach.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "nested-group scan took {elapsed:?}; the shared budget is not holding"
+        );
+    }
+
+    /// Exhausting the budget must not quietly turn into "nothing to see": the
+    /// scans answer "this body may reach the parent's dispatch state", so
+    /// running out has to keep reporting the gap.
+    #[test]
+    fn an_ordinary_dispatch_body_is_still_reported() {
+        let (_, gap) =
+            lexical_executable_substitutions("f() { alias ls=rm; }; f", ShellType::Posix);
+        assert_eq!(gap, Some(ShellExecutionGap::AmbiguousExecutableBody));
     }
 }

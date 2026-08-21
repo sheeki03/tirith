@@ -3,6 +3,10 @@ name = "tirith-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
+# This is a separate workspace, so it does not inherit `license.workspace`.
+# Declared explicitly (matching tools/rustsec-probe) so `cargo deny` can audit
+# the fuzz dependency tree instead of failing the whole run as unlicensed.
+license = "AGPL-3.0-only"
 
 [package.metadata]
 cargo-fuzz = true

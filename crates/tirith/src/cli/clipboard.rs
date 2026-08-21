@@ -74,7 +74,7 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
     // A local file being copied is NOT a recorded web paste, so forbid the sidecar read
     // (`AbsentOrInvalid`) — else a hash-match against `clipboard_source.json` could
     // spuriously fire `PasteSourceMismatch`.
-    let verdict = analyze_as_paste(
+    let (verdict, custom_patterns) = analyze_as_paste_with_patterns(
         &input,
         tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
     );
@@ -96,9 +96,10 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
             "blocking content detected; clipboard write refused"
         };
         if json {
+            let display = clipboard_display_verdict(&verdict, &custom_patterns);
             let env = ScanEnvelope {
                 status: "refused",
-                verdict: Some(&verdict),
+                verdict: Some(&display),
                 error: Some(refusal),
             };
             write_json_or_complain(&env);
@@ -125,16 +126,23 @@ pub fn copy(path: &Path, redact: bool, audience: Option<&str>, json: bool) -> i3
             // --redact without --audience defaults to `generic` (the M7 ch2 safe default).
             None => ShareAudience::Generic,
         };
-        match prepare_redacted_copy(&input, aud) {
+        match prepare_redacted_copy(&input, aud, &custom_patterns) {
             Ok((content, summary)) => {
                 redact_summary = Some(summary);
                 to_copy = content;
             }
-            Err(post_redaction_verdict) => {
+            Err(refusal) => {
                 if json {
+                    // Reuse the exact policy snapshot returned with the
+                    // post-redaction analysis. Never rediscover policy merely
+                    // to render the refusal.
+                    let display = clipboard_display_verdict(
+                        refusal.verdict.as_ref(),
+                        &refusal.custom_patterns,
+                    );
                     let env = ScanEnvelope {
                         status: "refused",
-                        verdict: Some(post_redaction_verdict.as_ref()),
+                        verdict: Some(&display),
                         error: Some("blocking content remains after redaction"),
                     };
                     write_json_or_complain(&env);
@@ -202,16 +210,18 @@ fn has_blocking_findings(verdict: &tirith_core::verdict::Verdict) -> bool {
 fn prepare_redacted_copy(
     input: &str,
     audience: ShareAudience,
-) -> Result<(String, String), Box<tirith_core::verdict::Verdict>> {
-    // Skip the repo-specific customer-ID policy lookup here (off-hot-path);
-    // `tirith share` is the documented policy-aware redaction surface.
-    let report = redact_for_audience_with_custom(input, audience, &[]);
-    let post_redaction_verdict = analyze_as_paste(
+    custom_patterns: &[String],
+) -> Result<(String, String), RedactedCopyRefusal> {
+    let report = redact_for_audience_with_custom(input, audience, custom_patterns);
+    let (post_redaction_verdict, post_redaction_patterns) = analyze_as_paste_with_patterns(
         &report.redacted_content,
         tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
     );
     if has_blocking_findings(&post_redaction_verdict) {
-        return Err(Box::new(post_redaction_verdict));
+        return Err(RedactedCopyRefusal {
+            verdict: Box::new(post_redaction_verdict),
+            custom_patterns: post_redaction_patterns,
+        });
     }
 
     let summary = if report.redactions.is_empty() {
@@ -227,6 +237,11 @@ fn prepare_redacted_copy(
     Ok((report.redacted_content, summary))
 }
 
+struct RedactedCopyRefusal {
+    verdict: Box<tirith_core::verdict::Verdict>,
+    custom_patterns: Vec<String>,
+}
+
 /// Read the current clipboard, run the paste pipeline, print the verdict. Exit codes
 /// match `tirith paste` (0 Allow, 1 Block, 2 Warn); the `--json` `status` field
 /// distinguishes the no-backend / empty paths from a real verdict.
@@ -235,16 +250,21 @@ pub fn scan(json: bool) -> i32 {
         Ok(Some(text)) if !text.is_empty() => {
             // Actual clipboard content: the sidecar legitimately describes it, so `Unread`
             // lets the engine consult `clipboard_source.json` for attribution.
-            let verdict =
-                analyze_as_paste(&text, tirith_core::clipboard::ClipboardSourceState::Unread);
+            let (verdict, custom_patterns) = analyze_as_paste_with_patterns(
+                &text,
+                tirith_core::clipboard::ClipboardSourceState::Unread,
+            );
+            let display = clipboard_display_verdict(&verdict, &custom_patterns);
             if json {
                 let env = ScanEnvelope {
                     status: "ok",
-                    verdict: Some(&verdict),
+                    verdict: Some(&display),
                     error: None,
                 };
                 write_json_or_complain(&env);
-            } else if output::write_human_auto(&verdict, false).is_err() {
+            } else if output::write_human_auto_with_patterns(&verdict, false, &custom_patterns)
+                .is_err()
+            {
                 eprintln!("tirith clipboard scan: failed to write output");
             }
             verdict.action.exit_code()
@@ -569,7 +589,10 @@ pub fn daemon_foreground(json: bool) -> i32 {
 
         // Actual clipboard content (like `scan`): `Unread` lets the engine consult
         // `clipboard_source.json` for attribution.
-        let verdict = analyze_as_paste(&text, tirith_core::clipboard::ClipboardSourceState::Unread);
+        let (verdict, custom_patterns) = analyze_as_paste_with_patterns(
+            &text,
+            tirith_core::clipboard::ClipboardSourceState::Unread,
+        );
         let has_high = verdict
             .findings
             .iter()
@@ -582,13 +605,16 @@ pub fn daemon_foreground(json: bool) -> i32 {
         // Audit + stderr warn. Silent-failure fix: a swallowed audit-write failure left
         // `tirith last-trigger <event_id>` empty, so match the result and warn on failure.
         let event_id = uuid::Uuid::new_v4().to_string();
-        // repo-0368: redact with the ACTIVE policy's custom patterns, not an
-        // empty list — otherwise dlp_custom_patterns values persist (and may be
-        // uploaded) in audit evidence.
-        let dlp = tirith_core::policy::Policy::discover_partial(None).dlp_custom_patterns;
-        if let Err(e) =
-            tirith_core::audit::log_verdict(&verdict, &text, None, Some(event_id.clone()), &dlp)
-        {
+        // Audit with the exact custom-DLP plan returned by the same analysis;
+        // rediscovery here would split decision and persistence across policy
+        // snapshots.
+        if let Err(e) = tirith_core::audit::log_verdict(
+            &verdict,
+            &text,
+            None,
+            Some(event_id.clone()),
+            &custom_patterns,
+        ) {
             eprintln!("tirith clipboard daemon: audit log write failed (event_id={event_id}): {e}");
         }
 
@@ -626,23 +652,22 @@ pub fn watch(json: bool) -> i32 {
         eprintln!("tirith clipboard watch: cannot resolve the tirith state directory");
         return 1;
     };
+    // One policy discovery and one compiled custom-DLP plan for the entire
+    // watcher lifetime. Start metadata and every later provenance record use
+    // this same frozen plan rather than silently changing projection policy
+    // between events.
+    let provenance_dlp = discover_watch_dlp_with(|| tirith_core::policy::Policy::discover(None));
 
     if json {
-        let env = serde_json::json!({
-            "event": "watch_start",
-            "source_file": source_path.display().to_string(),
-            "poll_interval_ms": POLL_INTERVAL.as_millis() as u64,
-        });
+        let env = watch_start_json(&source_path, &provenance_dlp);
         // Broken pipe (no reader): exit cleanly rather than poll forever. Same below.
         if println_json(&env).is_err() {
             return 0;
         }
-    } else {
-        eprintln!(
-            "tirith clipboard watch: watching {} (polling every {}s); attributes the clipboard to its browser source",
-            source_path.display(),
-            POLL_INTERVAL.as_secs()
-        );
+    } else if write_watch_start_human(std::io::stderr().lock(), &source_path, &provenance_dlp)
+        .is_err()
+    {
+        return 0;
     }
 
     // Last record mtime acted on, so we report once per extension write, not per poll.
@@ -690,29 +715,99 @@ pub fn watch(json: bool) -> i32 {
         }
 
         if json {
-            let env = serde_json::json!({
-                "event": "clipboard_source",
-                "source_url": record.source_url,
-                "source_title": record.source_title,
-                "hidden_text_detected": record.hidden_text_detected,
-            });
+            let env = watch_source_json(&record, &provenance_dlp);
             // Broken pipe → no consumer; exit cleanly (mirrors watch_start).
             if println_json(&env).is_err() {
                 return 0;
             }
         } else {
-            // Human mode: broken pipe → reader gone, stop.
-            if writeln!(
-                std::io::stdout(),
-                "tirith clipboard watch: clipboard source: {}",
-                record.source_url
-            )
-            .is_err()
+            // Human mode: broken pipe → reader gone, stop. One invocation-level
+            // writer owns the full record and its truncation marker.
+            if write_watch_source_human(std::io::stdout().lock(), &record, &provenance_dlp).is_err()
             {
                 return 0;
             }
         }
     }
+}
+
+fn discover_watch_dlp_with(
+    discover: impl FnOnce() -> tirith_core::policy::Policy,
+) -> tirith_core::redact::CompiledCustomPatterns {
+    // `Policy::discover` is authoritative: remote replacement policy and
+    // runtime overrides are included. The injectable closure makes the
+    // exactly-once/final-pattern contract testable without network access.
+    let policy = discover();
+    tirith_core::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns)
+}
+
+fn watch_start_json(
+    source_path: &Path,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> serde_json::Value {
+    let source_file = crate::cli::sanitize_provenance_text_with_compiled(
+        &source_path.display().to_string(),
+        compiled,
+    );
+    tirith_core::verdict::bound_json_value_for_output(serde_json::json!({
+        "event": "watch_start",
+        "source_file": source_file,
+        "poll_interval_ms": POLL_INTERVAL.as_millis() as u64,
+    }))
+}
+
+fn watch_source_json(
+    record: &tirith_core::clipboard::ClipboardSourceRecord,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> serde_json::Value {
+    tirith_core::verdict::bound_json_value_for_output(serde_json::json!({
+        "event": "clipboard_source",
+        "source_url": crate::cli::sanitize_provenance_url_with_compiled(&record.source_url, compiled),
+        "source_title": crate::cli::sanitize_provenance_text_with_compiled(&record.source_title, compiled),
+        "hidden_text_detected": record.hidden_text_detected,
+    }))
+}
+
+fn write_watch_start_human(
+    writer: impl Write,
+    source_path: &Path,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> std::io::Result<()> {
+    let mut output = output::HumanInvocationWriter::new(writer, false);
+    let source_file = crate::cli::sanitize_provenance_text_with_compiled(
+        &source_path.display().to_string(),
+        compiled,
+    );
+    writeln!(
+        output,
+        "tirith clipboard watch: watching {source_file} (polling every {}s); attributes the clipboard to its browser source",
+        POLL_INTERVAL.as_secs()
+    )?;
+    output.finish()
+}
+
+fn write_watch_source_human(
+    writer: impl Write,
+    record: &tirith_core::clipboard::ClipboardSourceRecord,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> std::io::Result<()> {
+    let mut output = output::HumanInvocationWriter::new(writer, false);
+    let source_url =
+        crate::cli::sanitize_provenance_url_with_compiled(&record.source_url, compiled);
+    let source_title =
+        crate::cli::sanitize_provenance_text_with_compiled(&record.source_title, compiled);
+    write!(
+        output,
+        "tirith clipboard watch: clipboard source: {source_url}"
+    )?;
+    if !source_title.is_empty() {
+        write!(output, " — {source_title}")?;
+    }
+    if record.hidden_text_detected {
+        write!(output, " [hidden text detected]")?;
+    }
+    writeln!(output)?;
+    output.finish()
 }
 
 /// Run the engine in paste context over `input` (used by `copy`, `scan`, `daemon`).
@@ -722,10 +817,18 @@ pub fn watch(json: bool) -> i32 {
 /// `Unread` (the sidecar describes the clipboard); `copy` analyzes a LOCAL FILE and passes
 /// `AbsentOrInvalid` to forbid the read, else a hash-match would spuriously fire
 /// `PasteSourceMismatch`.
+#[cfg(test)]
 fn analyze_as_paste(
     input: &str,
     clipboard_source: tirith_core::clipboard::ClipboardSourceState,
 ) -> tirith_core::verdict::Verdict {
+    analyze_as_paste_with_patterns(input, clipboard_source).0
+}
+
+fn analyze_as_paste_with_patterns(
+    input: &str,
+    clipboard_source: tirith_core::clipboard::ClipboardSourceState,
+) -> (tirith_core::verdict::Verdict, Vec<String>) {
     let raw_bytes = input.as_bytes().to_vec();
     let ctx = AnalysisContext {
         input: input.to_string(),
@@ -743,17 +846,23 @@ fn analyze_as_paste(
         card_ref: None,
         clipboard_source,
     };
-    let mut verdict = engine::analyze(&ctx);
-    // Paranoia-filter against the active policy so the clipboard honors the same
-    // threshold as `tirith paste`. A fresh snapshot is fine (clipboard analysis is rare).
-    let policy = tirith_core::policy::Policy::discover_partial(None);
+    let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
+    // Paranoia-filter against the exact policy snapshot used by analysis so the
+    // clipboard path cannot mix two policy revisions.
     engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
-    // repo-0368: every consumer of this verdict (the ScanEnvelope JSON surface
-    // and the audit path) serializes it directly, so DLP redaction must happen
-    // HERE with the active policy's custom patterns — not with an empty
-    // pattern list at the sink.
-    tirith_core::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
-    verdict
+    // Keep the complete raw verdict for decisions and audit. External surfaces
+    // derive an independently redacted and bounded clone below.
+    (verdict, policy.dlp_custom_patterns)
+}
+
+fn clipboard_display_verdict(
+    verdict: &tirith_core::verdict::Verdict,
+    custom_patterns: &[String],
+) -> tirith_core::verdict::Verdict {
+    let mut display = verdict.clone();
+    tirith_core::redact::redact_verdict(&mut display, custom_patterns);
+    tirith_core::verdict::bound_verdict_for_output(&mut display);
+    display
 }
 
 /// Read a file with a hard byte cap. Errors map to a CLI exit code.
@@ -815,15 +924,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Serialize `value` as a single line of JSON to stdout, followed by `\n`.
 /// Used by the daemon's per-event emitter. Returns `Ok(())` on success.
 fn println_json<T: serde::Serialize>(value: &T) -> std::io::Result<()> {
+    let value = serde_json::to_value(value)?;
+    let value = tirith_core::verdict::bound_json_value_for_output(value);
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, value)?;
+    serde_json::to_writer(&mut stdout, &value)?;
     writeln!(stdout)
 }
 
 /// Pretty-print JSON to stdout. Drops the error to stderr — callers key on the exit code.
 fn write_json_or_complain<T: serde::Serialize>(value: &T) {
     let mut stdout = std::io::stdout().lock();
-    if serde_json::to_writer_pretty(&mut stdout, value).is_err() || writeln!(stdout).is_err() {
+    let value = serde_json::to_value(value).map(tirith_core::verdict::bound_json_value_for_output);
+    if value
+        .as_ref()
+        .map_err(|_| ())
+        .and_then(|value| serde_json::to_writer_pretty(&mut stdout, value).map_err(|_| ()))
+        .is_err()
+        || writeln!(stdout).is_err()
+    {
         eprintln!("tirith clipboard: failed to write JSON output");
     }
 }
@@ -1171,21 +1289,159 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_display_bounding_does_not_mutate_raw_audit_verdict() {
+        let findings = (0..(tirith_core::verdict::MAX_PRESENTED_FINDINGS + 20))
+            .map(|index| tirith_core::verdict::Finding {
+                rule_id: tirith_core::verdict::RuleId::CredentialInText,
+                severity: tirith_core::verdict::Severity::High,
+                title: format!("secret {index}"),
+                description: "raw forensic finding".to_string(),
+                evidence: Vec::new(),
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            })
+            .collect::<Vec<_>>();
+        let raw = tirith_core::verdict::Verdict::from_findings(
+            findings,
+            3,
+            tirith_core::verdict::Timings::default(),
+        );
+        let raw_count = raw.findings.len();
+        let display = clipboard_display_verdict(&raw, &[]);
+
+        assert_eq!(raw.findings.len(), raw_count);
+        assert_eq!(
+            display.findings.len(),
+            tirith_core::verdict::MAX_PRESENTED_FINDINGS
+        );
+        assert!(display.findings.iter().any(|finding| {
+            finding.rule_id == tirith_core::verdict::RuleId::AnalysisIncomplete
+                && finding.title == "Additional findings omitted from presentation"
+        }));
+    }
+
+    #[test]
     fn redact_override_refuses_non_secret_blocking_content() {
         let input = "curl https://example.com/install.sh | bash";
-        let verdict = prepare_redacted_copy(input, ShareAudience::Generic)
+        let verdict = prepare_redacted_copy(input, ShareAudience::Generic, &[])
             .expect_err("credential redaction must not waive a pipe-to-shell verdict");
-        assert!(has_blocking_findings(&verdict));
+        assert!(has_blocking_findings(&verdict.verdict));
     }
 
     #[test]
     fn redact_override_allows_content_after_secret_is_removed() {
         let key = "AKIAIOSFODNN7EXAMPLE";
-        let (redacted, summary) =
-            prepare_redacted_copy(&format!("AWS_ACCESS_KEY_ID={key}"), ShareAudience::Generic)
-                .expect("a fully removed credential should be safe to copy");
+        let (redacted, summary) = prepare_redacted_copy(
+            &format!("AWS_ACCESS_KEY_ID={key}"),
+            ShareAudience::Generic,
+            &[],
+        )
+        .unwrap_or_else(|_| panic!("a fully removed credential should be safe to copy"));
         assert!(!redacted.contains(key));
         assert!(summary.contains("aws_access_key"), "got: {summary}");
+    }
+
+    #[test]
+    fn watch_json_and_human_provenance_share_frozen_dlp_and_bounds() {
+        let canary = "C02_WATCH_CUSTOM_CANARY";
+        let provider_token = "provider-path-token-0123456789";
+        let built_in = "AKIAIOSFODNN7EXAMPLE";
+        let patterns = vec![regex::escape(canary)];
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let record = tirith_core::clipboard::ClipboardSourceRecord {
+            updated_at: "2026-08-09T00:00:00Z".to_string(),
+            content_sha256: "0".repeat(64),
+            source_url: format!(
+                "https://user:password@mainnet.infura.io/v3/{provider_token}?token={built_in}#fragment"
+            ),
+            source_title: format!(
+                "title {canary} {built_in}\u{1b}[31m\n{}",
+                "oversize ".repeat(tirith_core::verdict::MAX_PRESENTATION_BYTES)
+            ),
+            hidden_text_detected: true,
+        };
+
+        let json = watch_source_json(&record, &compiled);
+        let serialized = serde_json::to_vec(&json).unwrap();
+        assert!(serialized.len() <= tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        let serialized_text = String::from_utf8(serialized).unwrap();
+        for secret in [canary, provider_token, built_in, "user:password"] {
+            assert!(!serialized_text.contains(secret), "JSON leaked {secret}");
+        }
+        assert!(serialized_text.contains("[REDACTED:custom]"));
+        assert!(!serialized_text.contains("\\u001b"));
+        assert!(!json["source_title"].as_str().unwrap().contains('\n'));
+        assert!(
+            json["source_title"].as_str().unwrap().chars().count()
+                <= crate::cli::PROVENANCE_MAX_CHARS + 1
+        );
+
+        let mut human = Vec::new();
+        write_watch_source_human(&mut human, &record, &compiled).unwrap();
+        assert!(human.len() <= tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        let human = String::from_utf8(human).unwrap();
+        for secret in [canary, provider_token, built_in, "user:password"] {
+            assert!(!human.contains(secret), "human output leaked {secret}");
+        }
+        assert!(human.contains("[REDACTED:custom]"));
+        assert!(!human.contains('\u{1b}'));
+        assert_eq!(
+            human.lines().count(),
+            1,
+            "untrusted newline escaped: {human:?}"
+        );
+        assert!(human.contains("[hidden text detected]"));
+
+        let hostile_path = PathBuf::from(format!(
+            "/tmp/{canary}/{built_in}\u{1b}[2J\n{}",
+            "p".repeat(tirith_core::verdict::MAX_PRESENTATION_BYTES)
+        ));
+        let start_json = watch_start_json(&hostile_path, &compiled);
+        let start_serialized = serde_json::to_vec(&start_json).unwrap();
+        assert!(start_serialized.len() <= tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        let start_text = String::from_utf8(start_serialized).unwrap();
+        assert!(!start_text.contains(canary));
+        assert!(!start_text.contains(built_in));
+        assert!(!start_text.contains("\\u001b"));
+        assert!(start_text.contains("[REDACTED:custom]"));
+
+        let mut start_human = Vec::new();
+        write_watch_start_human(&mut start_human, &hostile_path, &compiled).unwrap();
+        assert!(start_human.len() <= tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        let start_human = String::from_utf8(start_human).unwrap();
+        assert!(!start_human.contains(canary));
+        assert!(!start_human.contains(built_in));
+        assert!(!start_human.contains('\u{1b}'));
+        assert!(start_human.contains("[REDACTED:custom]"));
+        assert_eq!(start_human.lines().count(), 1);
+    }
+
+    #[test]
+    fn watch_discovery_is_injected_once_and_uses_remote_replacement_dlp() {
+        let calls = std::cell::Cell::new(0usize);
+        let canary = "C02_REMOTE_REPLACEMENT_CANARY";
+        let compiled = discover_watch_dlp_with(|| {
+            calls.set(calls.get() + 1);
+            let mut policy = tirith_core::policy::Policy::default();
+            policy.scope = tirith_core::policy::PolicyScope::Remote;
+            policy.dlp_custom_patterns = vec![regex::escape(canary)];
+            policy
+        });
+
+        let sanitized = crate::cli::sanitize_provenance_text_with_compiled(
+            &format!("remote title {canary}"),
+            &compiled,
+        );
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "watch policy discovery must run exactly once"
+        );
+        assert!(!sanitized.contains(canary));
+        assert!(sanitized.contains("[REDACTED:custom]"));
     }
 
     /// `render_service_unit` returns a non-empty payload on supported platforms.

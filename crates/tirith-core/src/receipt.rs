@@ -158,6 +158,51 @@ impl Receipt {
             git_branch: self.git_branch.clone(),
         }
     }
+
+    /// Clone this receipt for a public DTO using one frozen analysis DLP plan.
+    /// Stored receipts retain full local fidelity; the returned clone removes
+    /// cwd and structurally strips URL credentials/query/fragment/provider
+    /// tokens while DLP-redacting and bounding every free-text path field.
+    pub fn presentation_clone_with_compiled(
+        &self,
+        compiled: &crate::redact::CompiledCustomPatterns,
+    ) -> Self {
+        let text =
+            |value: &str| crate::redact::sanitize_provenance_text_with_compiled(value, compiled);
+        let url =
+            |value: &str| crate::redact::sanitize_provenance_url_with_compiled(value, compiled);
+        Self {
+            url: url(&self.url),
+            final_url: self.final_url.as_deref().map(&url),
+            redirects: self.redirects.iter().map(|value| url(value)).collect(),
+            sha256: self.sha256.clone(),
+            size: self.size,
+            domains_referenced: self
+                .domains_referenced
+                .iter()
+                .map(|value| text(value))
+                .collect(),
+            paths_referenced: self
+                .paths_referenced
+                .iter()
+                .map(|value| text(value))
+                .collect(),
+            // `analysis_method` keeps the DLP pass: it embeds an incomplete-reason
+            // string from the runner, so it is not a closed vocabulary.
+            analysis_method: text(&self.analysis_method),
+            // `privilege` and `timestamp` are program-generated, never derived
+            // from analysed input: privilege is one of "normal"/"elevated"/"user"
+            // and timestamp is `Utc::now().to_rfc3339()`. Running operator DLP
+            // over them could only ever corrupt them -- a custom pattern as
+            // ordinary as `\d{4}` rewrites the year and breaks the receipt for
+            // the downstream verifier that parses it. There is nothing to redact.
+            privilege: self.privilege.clone(),
+            timestamp: self.timestamp.clone(),
+            cwd: None,
+            git_repo: self.git_repo.as_deref().map(url),
+            git_branch: self.git_branch.as_deref().map(text),
+        }
+    }
 }
 
 /// Redact the userinfo component (`user:password@`) of an absolute URL while
@@ -1124,6 +1169,95 @@ mod tests {
         let blob = v.to_string();
         assert!(!blob.contains("pat-token-123"), "{blob}");
         assert!(!blob.contains("secret-project"), "{blob}");
+    }
+
+    #[test]
+    fn presentation_clone_uses_frozen_dlp_and_shared_url_sanitizer() {
+        let canary = "C02_RECEIPT_PRESENTATION_CANARY";
+        let provider_token = "provider-token-0123456789";
+        let patterns = vec![regex::escape(canary)];
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&patterns);
+        let mut receipt = script_receipt("a".repeat(64));
+        receipt.url = format!(
+            "https://user:password@mainnet.infura.io/v3/{provider_token}?token={canary}#fragment"
+        );
+        receipt.final_url = Some(format!(
+            "https://eth-mainnet.g.alchemy.com/v2/{provider_token}?token={canary}"
+        ));
+        receipt.redirects = vec![format!(
+            "https://rpc.ankr.com/eth/{provider_token}?token={canary}"
+        )];
+        receipt.paths_referenced = vec![format!("/private/{canary}/wallet.json")];
+        receipt.git_repo = Some(format!(
+            "https://user:password@github.com/org/repo?token={canary}#fragment"
+        ));
+        receipt.git_branch = Some(format!("branch-{canary}"));
+
+        let projected = receipt.presentation_clone_with_compiled(&compiled);
+        let serialized = serde_json::to_string(&projected).unwrap();
+
+        for secret in [
+            canary,
+            provider_token,
+            "user:password",
+            "token=",
+            "#fragment",
+        ] {
+            assert!(!serialized.contains(secret), "receipt leaked {secret}");
+        }
+        assert!(serialized.contains("[REDACTED:custom]"));
+        assert!(projected.cwd.is_none());
+        assert!(
+            receipt.url.contains(canary),
+            "raw receipt must remain intact"
+        );
+        assert!(
+            receipt.cwd.is_some(),
+            "stored receipt must retain local cwd"
+        );
+    }
+
+    /// `privilege` and `timestamp` are produced by tirith itself, never derived
+    /// from the analysed subject, so there is nothing in them to redact. Running
+    /// the operator's custom DLP patterns over them could only ever corrupt them,
+    /// and an operator pattern broad enough to hit a bare 4-digit run is entirely
+    /// ordinary. A mangled timestamp breaks the downstream verifier that parses
+    /// the receipt, so this is a data-integrity bug, not a cosmetic one.
+    #[test]
+    fn a_broad_operator_dlp_pattern_cannot_corrupt_program_generated_receipt_fields() {
+        // Matches the year in any RFC 3339 timestamp, and "user"/"normal".
+        let patterns = vec![r"\d{4}".to_string(), r"user|normal".to_string()];
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&patterns);
+
+        let mut receipt = script_receipt("b".repeat(64));
+        receipt.timestamp = "2026-01-01T00:00:00Z".to_string();
+        receipt.privilege = "user".to_string();
+
+        let projected = receipt.presentation_clone_with_compiled(&compiled);
+
+        assert_eq!(
+            projected.timestamp, "2026-01-01T00:00:00Z",
+            "a program-generated timestamp must survive operator DLP verbatim"
+        );
+        assert_eq!(
+            projected.privilege, "user",
+            "a closed-vocabulary privilege must survive operator DLP verbatim"
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&projected.timestamp).is_ok(),
+            "the projected timestamp must still parse as RFC 3339"
+        );
+
+        // The same pattern set must still redact genuinely attacker-influenced
+        // free text, so this is a scoping fix and not a hole in the DLP pass.
+        let mut tainted = script_receipt("c".repeat(64));
+        tainted.analysis_method = "static-incomplete:normal".to_string();
+        let tainted = tainted.presentation_clone_with_compiled(&compiled);
+        assert!(
+            tainted.analysis_method.contains("[REDACTED:custom]"),
+            "analysis_method still carries subject-derived text: {}",
+            tainted.analysis_method
+        );
     }
 
     #[test]

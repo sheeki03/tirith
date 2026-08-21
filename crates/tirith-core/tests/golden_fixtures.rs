@@ -24,12 +24,37 @@ struct Fixture {
     shell: String,
     expected_action: String,
     expected_rules: Vec<String>,
+    /// Require exact equality of the unique RuleId projection, rather than the
+    /// legacy subset assertion used by older broad fixtures.
+    #[serde(default)]
+    exact_rules: bool,
     /// Rule IDs that MUST NOT appear — pins double-fire boundaries the
     /// positive-only `expected_rules` list would silently accept.
     #[serde(default)]
     forbidden_rules: Vec<String>,
     #[serde(default)]
     raw_bytes: Vec<u8>,
+    /// Build a real PDF containing this text and use its bytes as the FileScan
+    /// input. Keeps PDF fixtures readable while exercising byte dispatch and the
+    /// real lopdf extraction seam.
+    #[serde(default)]
+    pdf_text: Option<String>,
+    #[serde(default)]
+    pdf_fragments: Vec<String>,
+    #[serde(default)]
+    pdf_tj_fragments: Vec<String>,
+    #[serde(default)]
+    pdf_encoded_text: Option<String>,
+    #[serde(default)]
+    pdf_unsupported_encoding: bool,
+    #[serde(default)]
+    pdf_actual_text: Option<String>,
+    #[serde(default)]
+    pdf_type3_d0: bool,
+    #[serde(default)]
+    pdf_embedded_empty_glyph: bool,
+    #[serde(default)]
+    pdf_hidden: bool,
     /// File path for file-scan context fixtures.
     #[serde(default)]
     file_path: Option<String>,
@@ -37,6 +62,237 @@ struct Fixture {
 
 fn default_shell() -> String {
     "posix".to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_pdf_fixture(
+    text_fragments: &[String],
+    tj_fragments: &[String],
+    encoded_text: Option<&str>,
+    actual_text: Option<&str>,
+    hidden: bool,
+    unsupported_encoding: bool,
+    type3_d0: bool,
+    embedded_empty_glyph: bool,
+) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{Dictionary, Document, Object, Stream};
+
+    let mut operations = if let Some(actual_text) = actual_text {
+        let mut property = Dictionary::new();
+        property.set("ActualText", Object::string_literal(actual_text));
+        vec![
+            Operation::new(
+                "BDC",
+                vec![Object::Name(b"Span".to_vec()), Object::Dictionary(property)],
+            ),
+            Operation::new("EMC", vec![]),
+        ]
+    } else {
+        vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), if hidden { 0 } else { 12 }.into()]),
+        ]
+    };
+    let mut cmap_entries = Vec::new();
+    if actual_text.is_some() {
+        // ActualText is an extraction replacement and is not itself painted.
+    } else if let Some(encoded_text) = encoded_text {
+        let mut shown = Vec::new();
+        for (index, character) in encoded_text.encode_utf16().enumerate() {
+            let code = u16::try_from(index + 1).expect("fixture text is bounded");
+            shown.extend_from_slice(&code.to_be_bytes());
+            cmap_entries.push((code, character));
+        }
+        operations.push(Operation::new(
+            "Tj",
+            vec![Object::String(shown, lopdf::StringFormat::Hexadecimal)],
+        ));
+    } else if !tj_fragments.is_empty() {
+        let mut items = Vec::new();
+        for (index, text) in tj_fragments.iter().enumerate() {
+            if index > 0 {
+                items.push((-500).into());
+            }
+            items.push(Object::string_literal(text.as_str()));
+        }
+        operations.push(Operation::new("TJ", vec![Object::Array(items)]));
+    } else {
+        operations.extend(
+            text_fragments
+                .iter()
+                .map(|text| Operation::new("Tj", vec![Object::string_literal(text.as_str())])),
+        );
+    }
+    if actual_text.is_none() {
+        operations.push(Operation::new("ET", vec![]));
+    }
+    let content = Content { operations }.encode().expect("encode fixture PDF");
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let mut font = Dictionary::new();
+    font.set("Type", "Font");
+    font.set(
+        "Subtype",
+        if type3_d0 {
+            "Type3"
+        } else if encoded_text.is_some() || unsupported_encoding {
+            "Type0"
+        } else {
+            "Type1"
+        },
+    );
+    font.set("BaseFont", "Helvetica");
+    if type3_d0 {
+        let mut char_procs = Dictionary::new();
+        let char_proc_id = doc.add_object(Stream::new(Dictionary::new(), b"600 0 d0".to_vec()));
+        char_procs.set("A", char_proc_id);
+        let mut encoding = Dictionary::new();
+        encoding.set(
+            "Differences",
+            vec![Object::Integer(65), Object::Name(b"A".to_vec())],
+        );
+        font.set("FontBBox", vec![0.into(), 0.into(), 0.into(), 0.into()]);
+        font.set(
+            "FontMatrix",
+            vec![
+                Object::Real(0.001),
+                0.into(),
+                0.into(),
+                Object::Real(0.001),
+                0.into(),
+                0.into(),
+            ],
+        );
+        font.set("CharProcs", char_procs);
+        font.set("Encoding", encoding);
+        font.set("FirstChar", 65);
+        font.set("LastChar", 65);
+        font.set("Widths", vec![Object::Integer(600)]);
+    } else if encoded_text.is_some() || unsupported_encoding {
+        let mut cid_system_info = Dictionary::new();
+        cid_system_info.set("Registry", Object::string_literal("Adobe"));
+        cid_system_info.set("Ordering", Object::string_literal("Identity"));
+        cid_system_info.set("Supplement", 0);
+        let mut descendant = Dictionary::new();
+        descendant.set("Type", "Font");
+        descendant.set("Subtype", "CIDFontType2");
+        descendant.set("BaseFont", "Helvetica");
+        descendant.set("CIDSystemInfo", cid_system_info);
+        descendant.set("DW", 600);
+        let descendant_id = doc.add_object(descendant);
+        font.set("DescendantFonts", vec![Object::Reference(descendant_id)]);
+        font.set(
+            "Encoding",
+            if unsupported_encoding {
+                "Unsupported-CMap"
+            } else {
+                "Identity-H"
+            },
+        );
+    } else {
+        font.set("FirstChar", 0);
+        font.set("LastChar", 255);
+        font.set(
+            "Widths",
+            (0..=255).map(|_| Object::Integer(600)).collect::<Vec<_>>(),
+        );
+    }
+    if encoded_text.is_some() && !unsupported_encoding {
+        let mut cmap = String::from(
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapType 2 def\n",
+        );
+        cmap.push_str(&format!("{} beginbfchar\n", cmap_entries.len()));
+        for (code, character) in &cmap_entries {
+            cmap.push_str(&format!("<{code:04X}> <{character:04X}>\n"));
+        }
+        cmap.push_str("endbfchar\nendcmap\nend\nend\n");
+        let cmap_id = doc.add_object(Stream::new(Dictionary::new(), cmap.into_bytes()));
+        font.set("ToUnicode", cmap_id);
+    }
+    if embedded_empty_glyph {
+        let font_file_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+        let mut descriptor = Dictionary::new();
+        descriptor.set("Type", "FontDescriptor");
+        descriptor.set("FontName", "Helvetica");
+        descriptor.set("FontFile", font_file_id);
+        font.set("FontDescriptor", doc.add_object(descriptor));
+    }
+    let font_id = doc.add_object(font);
+    let mut fonts = Dictionary::new();
+    fonts.set("F1", font_id);
+    let mut resources = Dictionary::new();
+    resources.set("Font", fonts);
+    let resources_id = doc.add_object(resources);
+    let content_id = doc.add_object(Stream::new(Dictionary::new(), content));
+    let mut page = Dictionary::new();
+    page.set("Type", "Page");
+    page.set("Parent", pages_id);
+    page.set("Contents", content_id);
+    let page_id = doc.add_object(page);
+    let mut pages = Dictionary::new();
+    pages.set("Type", "Pages");
+    pages.set("Kids", vec![Object::Reference(page_id)]);
+    pages.set("Count", 1);
+    pages.set("Resources", resources_id);
+    pages.set("MediaBox", vec![0.into(), 0.into(), 595.into(), 842.into()]);
+    doc.objects.insert(pages_id, Object::Dictionary(pages));
+    let mut catalog = Dictionary::new();
+    catalog.set("Type", "Catalog");
+    catalog.set("Pages", pages_id);
+    let catalog_id = doc.add_object(catalog);
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("save fixture PDF");
+    bytes
+}
+
+fn fixture_raw_bytes(fixture: &Fixture, context: ScanContext) -> Option<Vec<u8>> {
+    if !fixture.pdf_fragments.is_empty() || !fixture.pdf_tj_fragments.is_empty() {
+        Some(build_pdf_fixture(
+            &fixture.pdf_fragments,
+            &fixture.pdf_tj_fragments,
+            fixture.pdf_encoded_text.as_deref(),
+            fixture.pdf_actual_text.as_deref(),
+            fixture.pdf_hidden,
+            fixture.pdf_unsupported_encoding,
+            fixture.pdf_type3_d0,
+            fixture.pdf_embedded_empty_glyph,
+        ))
+    } else if let Some(text) = fixture.pdf_text.as_ref() {
+        Some(build_pdf_fixture(
+            std::slice::from_ref(text),
+            &[],
+            fixture.pdf_encoded_text.as_deref(),
+            fixture.pdf_actual_text.as_deref(),
+            fixture.pdf_hidden,
+            fixture.pdf_unsupported_encoding,
+            fixture.pdf_type3_d0,
+            fixture.pdf_embedded_empty_glyph,
+        ))
+    } else if fixture.pdf_encoded_text.is_some()
+        || fixture.pdf_unsupported_encoding
+        || fixture.pdf_actual_text.is_some()
+        || fixture.pdf_type3_d0
+        || fixture.pdf_embedded_empty_glyph
+    {
+        Some(build_pdf_fixture(
+            &[],
+            &[],
+            fixture.pdf_encoded_text.as_deref(),
+            fixture.pdf_actual_text.as_deref(),
+            fixture.pdf_hidden,
+            fixture.pdf_unsupported_encoding,
+            fixture.pdf_type3_d0,
+            fixture.pdf_embedded_empty_glyph,
+        ))
+    } else if !fixture.raw_bytes.is_empty() {
+        Some(fixture.raw_bytes.clone())
+    } else if matches!(context, ScanContext::Paste | ScanContext::FileScan) {
+        Some(fixture.input.as_bytes().to_vec())
+    } else {
+        None
+    }
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -71,13 +327,7 @@ fn run_fixture(fixture: &Fixture) {
         _ => panic!("Unknown context: {}", fixture.context),
     };
 
-    let raw_bytes = if !fixture.raw_bytes.is_empty() {
-        Some(fixture.raw_bytes.clone())
-    } else if scan_context == ScanContext::Paste || scan_context == ScanContext::FileScan {
-        Some(fixture.input.as_bytes().to_vec())
-    } else {
-        None
-    };
+    let raw_bytes = fixture_raw_bytes(fixture, scan_context);
 
     let file_path = fixture.file_path.as_ref().map(std::path::PathBuf::from);
 
@@ -130,14 +380,28 @@ fn run_fixture(fixture: &Fixture) {
         .map(|f| f.rule_id.to_string())
         .collect();
 
-    for expected_rule in &fixture.expected_rules {
-        assert!(
-            found_rules.contains(expected_rule),
-            "Fixture '{}': expected rule '{}' not found. Found rules: {:?}",
-            fixture.name,
-            expected_rule,
-            found_rules
+    if fixture.exact_rules {
+        let mut actual = found_rules.clone();
+        actual.sort();
+        actual.dedup();
+        let mut expected = fixture.expected_rules.clone();
+        expected.sort();
+        expected.dedup();
+        assert_eq!(
+            actual, expected,
+            "Fixture '{}': exact RuleId projection differs",
+            fixture.name
         );
+    } else {
+        for expected_rule in &fixture.expected_rules {
+            assert!(
+                found_rules.contains(expected_rule),
+                "Fixture '{}': expected rule '{}' not found. Found rules: {:?}",
+                fixture.name,
+                expected_rule,
+                found_rules
+            );
+        }
     }
 
     for forbidden in &fixture.forbidden_rules {
@@ -1632,13 +1896,7 @@ fn test_tier1_does_not_gate_findings() {
             _ => continue,
         };
 
-        let raw_bytes = if !fixture.raw_bytes.is_empty() {
-            Some(fixture.raw_bytes.clone())
-        } else if scan_context == ScanContext::Paste || scan_context == ScanContext::FileScan {
-            Some(fixture.input.as_bytes().to_vec())
-        } else {
-            None
-        };
+        let raw_bytes = fixture_raw_bytes(fixture, scan_context);
 
         let file_path = fixture.file_path.as_ref().map(std::path::PathBuf::from);
 

@@ -40,6 +40,20 @@ pub fn run_with_options(
 ) -> i32 {
     let mut state = State::AwaitingInit;
 
+    // The JSON-RPC dispatcher is itself a public output boundary. Freeze one
+    // local policy DLP plan for the whole session and capture every later
+    // policy diagnostic so malformed-policy text can never bypass the protocol
+    // through raw stderr.
+    let _policy_diagnostic_capture = crate::policy::PolicyDiagnosticCapture::start();
+    let policy_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|path| path.to_str().map(String::from));
+    let output_policy = crate::policy::Policy::discover_local_only(policy_cwd.as_deref());
+    crate::policy::freeze_captured_policy_dlp_patterns(&output_policy.dlp_custom_patterns);
+    let output_dlp =
+        crate::redact::CompiledCustomPatterns::new_silent(&output_policy.dlp_custom_patterns);
+    drain_policy_diagnostics_to_log(&mut log, &output_dlp);
+
     // C3a — MCP policy seam. The dispatcher holds no core `Policy`, so discover
     // one ONCE at server init (OFFLINE: no network, and `discover_local_only`
     // neutralizes a repo-scoped `mcp_redact_injection`), compile the operator's
@@ -51,19 +65,9 @@ pub fn run_with_options(
     // than silently dropped: a seed that passes `policy validate` but fails the
     // real compile would otherwise vanish with no signal.
     let filter_ctx: output_filter::OutputFilterContext = if options.sanitize_tool_output {
-        let policy = crate::policy::Policy::discover_local_only(
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .as_deref(),
-        );
-        let (ctx, bad) = output_filter::OutputFilterContext::from_policy(&policy);
-        for (pattern, error) in &bad {
-            let _ = writeln!(
-                log,
-                "tirith mcp-server: warning: invalid injection_seeds_custom regex {pattern:?}: {error}"
-            );
-        }
+        let (ctx, bad) =
+            output_filter::OutputFilterContext::from_policy_with_diagnostics(&output_policy);
+        write_invalid_seed_diagnostics_to_log(&mut log, &bad, &output_dlp);
         ctx
     } else {
         output_filter::OutputFilterContext::default()
@@ -282,9 +286,15 @@ pub fn run_with_options(
                         // highest-privilege consumer of these results. C3a — pass
                         // the once-discovered policy seam (custom seeds + redact
                         // flag).
-                        let outcome =
+                        let mut outcome =
                             output_filter::filter_tool_result(&mut result, true, &filter_ctx);
+                        resources::redact_tool_result_strings(&mut result, &output_dlp);
+                        outcome.truncated |=
+                            output_filter::bound_tool_result_for_output(&mut result);
                         write_filter_audit(&mut log, &outcome);
+                    } else {
+                        resources::redact_tool_result_strings(&mut result, &output_dlp);
+                        output_filter::bound_tool_result_for_output(&mut result);
                     }
                     match serde_json::to_value(result) {
                         Ok(v) => JsonRpcResponse::ok(id, v),
@@ -302,7 +312,7 @@ pub fn run_with_options(
                     let resources = resources::list();
                     JsonRpcResponse::ok(id, json!({ "resources": resources }))
                 }
-                "resources/read" => handle_resources_read(id, &params),
+                "resources/read" => handle_resources_read(id, &params, &output_dlp),
                 _ => JsonRpcResponse::err(
                     id,
                     JsonRpcError {
@@ -314,6 +324,9 @@ pub fn run_with_options(
             },
         };
 
+        let mut response = response;
+        sanitize_json_rpc_response(&mut response, &output_dlp);
+        drain_policy_diagnostics_to_log(&mut log, &output_dlp);
         if !write_response(&mut output, &response) {
             let _ = writeln!(log, "tirith mcp-server: output broken, exiting");
             return 1;
@@ -401,7 +414,11 @@ fn handle_tools_call(params: &Option<Value>) -> ToolCallResult {
     tools::call(&call_params.name, &call_params.arguments)
 }
 
-fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
+fn handle_resources_read(
+    id: Value,
+    params: &Option<Value>,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> JsonRpcResponse {
     let uri = params
         .as_ref()
         .and_then(|p| p.get("uri"))
@@ -422,7 +439,7 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
     };
 
     match resources::read_content(uri) {
-        Ok(contents) => JsonRpcResponse::ok(id, json!({ "contents": contents })),
+        Ok(contents) => bounded_resources_read_response(id, uri, contents, compiled),
         Err(msg) => JsonRpcResponse::err(
             id,
             JsonRpcError {
@@ -432,6 +449,104 @@ fn handle_resources_read(id: Value, params: &Option<Value>) -> JsonRpcResponse {
             },
         ),
     }
+}
+
+/// Bound the final JSON-RPC representation, not merely the resource's inner
+/// text. JSON escaping can make a resource that fits its text budget exceed the
+/// transport budget. The compact fallback deliberately preserves the MCP
+/// resources/read schema (`result.contents[]`).
+fn bounded_resources_read_response(
+    id: Value,
+    uri: &str,
+    mut contents: Vec<ResourceContent>,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> JsonRpcResponse {
+    for content in &mut contents {
+        content.uri = crate::redact::redact_sanitize_redact_with_compiled(&content.uri, compiled);
+        content.mime_type =
+            crate::redact::redact_sanitize_redact_with_compiled(&content.mime_type, compiled);
+        content.text = crate::redact::redact_sanitize_redact_with_compiled(&content.text, compiled);
+    }
+    let response = JsonRpcResponse::ok(id.clone(), json!({ "contents": contents }));
+    let original_bytes = crate::verdict::serialized_json_size(&response);
+    if original_bytes.is_some_and(|bytes| bytes < crate::verdict::MAX_PRESENTATION_BYTES) {
+        return response;
+    }
+
+    let compact_text = serde_json::to_string(&json!({
+        "presentation_truncated": true,
+        "analysis_incomplete": true,
+        "original_serialized_bytes": original_bytes,
+        "max_jsonrpc_bytes": crate::verdict::MAX_PRESENTATION_BYTES,
+        "resource_contents_omitted": true,
+    }))
+    .unwrap_or_else(|_| {
+        "{\"presentation_truncated\":true,\"analysis_incomplete\":true}".to_string()
+    });
+    let safe_uri: String = crate::redact::redact_sanitize_redact_with_compiled(uri, compiled)
+        .chars()
+        .take(512)
+        .collect();
+    let compact_result = json!({
+        "contents": [{
+            "uri": safe_uri,
+            "mimeType": "application/json",
+            "text": compact_text,
+        }]
+    });
+    let with_original_id = JsonRpcResponse::ok(id, compact_result.clone());
+    if crate::verdict::serialized_json_size(&with_original_id)
+        .is_some_and(|bytes| bytes < crate::verdict::MAX_PRESENTATION_BYTES)
+    {
+        with_original_id
+    } else {
+        JsonRpcResponse::ok(Value::Null, compact_result)
+    }
+}
+
+fn sanitize_json_rpc_response(
+    response: &mut JsonRpcResponse,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) {
+    if let Some(result) = response.result.as_mut() {
+        crate::redact::redact_json_strings(result, compiled);
+    }
+    if let Some(error) = response.error.as_mut() {
+        error.message =
+            crate::redact::redact_sanitize_redact_with_compiled(&error.message, compiled);
+        if let Some(data) = error.data.as_mut() {
+            crate::redact::redact_json_strings(data, compiled);
+        }
+    }
+}
+
+fn drain_policy_diagnostics_to_log(
+    log: &mut impl Write,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) {
+    for diagnostic in crate::policy::drain_captured_policy_diagnostics_for_output(compiled) {
+        let diagnostic = crate::output::sanitize_human_field_with_compiled(&diagnostic, compiled);
+        let _ = writeln!(log, "tirith mcp-server: policy diagnostic: {diagnostic}");
+    }
+}
+
+fn write_invalid_seed_diagnostics_to_log(
+    log: &mut impl Write,
+    diagnostics: &[crate::rules::prompt_injection::InvalidSeedDiagnostic],
+    compiled: &crate::redact::CompiledCustomPatterns,
+) {
+    let mut output = crate::verdict::BoundedTextBuilder::new();
+    for diagnostic in diagnostics {
+        let message = format!(
+            "tirith mcp-server: warning: injection_seeds_custom[{}] was rejected ({})",
+            diagnostic.index,
+            diagnostic.category.as_str()
+        );
+        let message = crate::output::sanitize_human_field_with_compiled(&message, compiled);
+        output.push_str(&message);
+        output.push_str("\n");
+    }
+    let _ = log.write_all(output.finish().as_bytes());
 }
 
 /// Emit a best-effort JSONL audit line for an output-filter pass to `log`
@@ -465,28 +580,89 @@ fn write_filter_audit(log: &mut impl Write, outcome: &output_filter::FilterOutco
 
 /// Write a JSON-RPC response. Returns false if the output is broken (caller should exit).
 fn write_response(output: &mut impl Write, resp: &JsonRpcResponse) -> bool {
-    match serde_json::to_string(resp) {
-        Ok(json) => {
-            if writeln!(output, "{json}").is_err() || output.flush().is_err() {
-                return false;
-            }
-            true
-        }
-        Err(_) => {
-            // Should not happen with well-formed types; send a fallback so the
-            // client isn't left hanging.
-            let fallback = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal serialization error"}}"#;
-            let _ = writeln!(output, "{fallback}");
-            let _ = output.flush();
-            true
-        }
+    let original_bytes = crate::verdict::serialized_json_size(resp);
+    let fallback;
+    let response =
+        if original_bytes.is_some_and(|bytes| bytes < crate::verdict::MAX_PRESENTATION_BYTES) {
+            resp
+        } else {
+            let build_fallback = |id| {
+                if let Some(error) = resp.error.as_ref() {
+                    JsonRpcResponse::err(
+                        id,
+                        JsonRpcError {
+                            code: error.code,
+                            message: crate::mcp::output_filter::sanitize_text_str(&error.message)
+                                .chars()
+                                .take(128)
+                                .collect(),
+                            data: Some(json!({
+                                "presentation_truncated": true,
+                                "analysis_incomplete": true,
+                                "original_serialized_bytes": original_bytes,
+                            })),
+                        },
+                    )
+                } else {
+                    JsonRpcResponse::ok(
+                        id,
+                        json!({
+                            "presentation_truncated": true,
+                            "analysis_incomplete": true,
+                            "original_serialized_bytes": original_bytes,
+                            "max_jsonrpc_bytes": crate::verdict::MAX_PRESENTATION_BYTES,
+                            "result_omitted": true,
+                        }),
+                    )
+                }
+            };
+            let with_original_id = build_fallback(resp.id.clone());
+            fallback = if crate::verdict::serialized_json_size(&with_original_id)
+                .is_some_and(|bytes| bytes < crate::verdict::MAX_PRESENTATION_BYTES)
+            {
+                with_original_id
+            } else {
+                build_fallback(serde_json::Value::Null)
+            };
+            &fallback
+        };
+
+    if serde_json::to_writer(&mut *output, response).is_err()
+        || writeln!(output).is_err()
+        || output.flush().is_err()
+    {
+        return false;
     }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    #[test]
+    fn invalid_custom_seed_log_is_indexed_categorical_and_never_echoes_pattern() {
+        let pat = "ghp_".to_string() + &"A".repeat(36);
+        let raw_pattern = format!("(?P<{pat}>\n");
+        let policy = crate::policy::Policy {
+            injection_seeds_custom: vec![raw_pattern.clone()],
+            ..Default::default()
+        };
+        let (_context, diagnostics) =
+            output_filter::OutputFilterContext::from_policy_with_diagnostics(&policy);
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        let mut log = Vec::new();
+
+        write_invalid_seed_diagnostics_to_log(&mut log, &diagnostics, &compiled);
+        let log = String::from_utf8(log).unwrap();
+        assert!(log.contains("injection_seeds_custom[0]"));
+        assert!(log.contains("regex_rejected"));
+        assert!(!log.contains(&raw_pattern));
+        assert!(!log.contains(&pat));
+        assert_eq!(log.lines().count(), 1);
+        assert!(log.len() <= crate::verdict::MAX_PRESENTATION_BYTES);
+    }
 
     /// Drive a full dispatcher session over an in-memory transport. Acquires the
     /// origin-store serial lock for the session (an `initialize` writes
@@ -889,5 +1065,69 @@ mod tests {
     #[test]
     fn extract_client_info_returns_none_for_none_params() {
         assert!(extract_client_info(&None).is_none());
+    }
+
+    #[test]
+    fn oversized_jsonrpc_response_is_compact_valid_and_bounded() {
+        let response = JsonRpcResponse::ok(
+            json!("request-7"),
+            json!({ "blob": "x".repeat(crate::verdict::MAX_PRESENTATION_BYTES * 2) }),
+        );
+        let mut output = Vec::new();
+
+        assert!(write_response(&mut output, &response));
+        assert!(output.len() <= crate::verdict::MAX_PRESENTATION_BYTES);
+        assert_eq!(output.last(), Some(&b'\n'));
+
+        let decoded: Value = serde_json::from_slice(&output).expect("valid JSON-RPC fallback");
+        assert_eq!(decoded["jsonrpc"], "2.0");
+        assert_eq!(decoded["id"], "request-7");
+        assert_eq!(decoded["result"]["presentation_truncated"], true);
+        assert_eq!(decoded["result"]["result_omitted"], true);
+    }
+
+    #[test]
+    fn compact_fallback_retains_large_id_when_complete_envelope_fits() {
+        let id = "request-id-".repeat(700);
+        assert!(id.len() > 1024);
+        let response = JsonRpcResponse::ok(
+            json!(id.clone()),
+            json!({ "blob": "x".repeat(crate::verdict::MAX_PRESENTATION_BYTES * 2) }),
+        );
+        let mut output = Vec::new();
+        assert!(write_response(&mut output, &response));
+        let decoded: Value = serde_json::from_slice(&output).expect("valid compact fallback");
+        assert_eq!(decoded["id"], id);
+        assert_eq!(decoded["result"]["presentation_truncated"], true);
+    }
+
+    #[test]
+    fn oversized_resource_read_preserves_compact_contents_schema_after_escaping() {
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        let response = bounded_resources_read_response(
+            json!("request".repeat(crate::verdict::MAX_PRESENTATION_BYTES)),
+            "tirith://project-safety",
+            vec![ResourceContent {
+                uri: "tirith://project-safety".to_string(),
+                mime_type: "application/json".to_string(),
+                // Backslashes and quotes expand under JSON escaping; the bound
+                // must apply to the final JSON-RPC bytes, not this inner length.
+                text: "\\\"".repeat(crate::verdict::MAX_PRESENTATION_BYTES),
+            }],
+            &compiled,
+        );
+        let mut output = Vec::new();
+        assert!(write_response(&mut output, &response));
+        assert!(output.len() <= crate::verdict::MAX_PRESENTATION_BYTES);
+        let decoded: Value = serde_json::from_slice(&output).expect("valid JSON-RPC response");
+        assert!(decoded["id"].is_null());
+        let contents = decoded["result"]["contents"]
+            .as_array()
+            .expect("resources/read fallback must retain contents[]");
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["mimeType"], "application/json");
+        let compact: Value = serde_json::from_str(contents[0]["text"].as_str().unwrap())
+            .expect("compact resource text remains JSON");
+        assert_eq!(compact["presentation_truncated"], true);
     }
 }

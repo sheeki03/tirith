@@ -459,8 +459,22 @@ mod tests {
         let provenance = provenance_of(&inspected);
         assert!(provenance.exists);
         if Path::new("/usr/bin/file").is_file() || Path::new("/bin/file").is_file() {
+            // `file_brief` yields None both when the shadow is refused and when
+            // the real utility misses its SHELL_TIMEOUT budget, and a loaded
+            // runner does the latter often enough to redden CI. Retry so a
+            // scheduling stall is not read as the shadow having won. The marker
+            // assertion below still runs against every attempt, so a retry
+            // cannot hide a shadow that did execute.
+            let mut detail = provenance.file_type.clone();
+            for _ in 0..5 {
+                if detail.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                detail = provenance_of(&inspected).file_type;
+            }
             assert!(
-                provenance.file_type.is_some(),
+                detail.is_some(),
                 "the fixed root-managed file utility should preserve provenance detail"
             );
         }

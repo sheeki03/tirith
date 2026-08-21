@@ -41,12 +41,10 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
         .map(|p| p.display().to_string());
     let policy = tirith_core::policy::Policy::discover_local_only(seed_cwd.as_deref());
     let (custom_seeds, bad_seeds) =
-        tirith_core::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
-    for (pattern, error) in &bad_seeds {
-        eprintln!(
-            "tirith view: warning: invalid injection_seeds_custom regex {pattern:?}: {error}"
+        tirith_core::rules::prompt_injection::compile_seeds_with_safe_diagnostics(
+            &policy.injection_seeds_custom,
         );
-    }
+    crate::cli::warn_invalid_injection_seed_diagnostics("tirith view", &bad_seeds, &policy);
 
     let mut state = OutputAnalyzerState::with_custom_seeds(custom_seeds);
     let mut display_sanitizer = StreamingDisplaySanitizer::default();

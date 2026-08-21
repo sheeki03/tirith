@@ -5,3 +5,4 @@
 # byte-identical-to-shipping guarantee for the policy templates.
 crates/tirith/assets/policy_templates/*.yaml text eol=lf
 crates/tirith-core/assets/dashboard/template.html text eol=lf
+docs/capability-manifest.toml text eol=lf

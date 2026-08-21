@@ -155,14 +155,15 @@ fn collect_executable_segments(
             .into_iter()
             .map(|segment| (segment, shell)),
     );
-    let nested = crate::extract::executable_substitution_scan(input, shell).bodies;
+    let nested_scan = crate::extract::executable_substitution_scan(input, shell);
+    let mut incomplete = nested_scan.gap.is_some();
+    let nested = nested_scan.bodies;
     if nested.is_empty() {
-        return false;
+        return incomplete;
     }
     if depth >= MAX_NESTED_COMMAND_DEPTH {
         return true;
     }
-    let mut incomplete = false;
     for body in nested {
         // Do not use `Iterator::any`: traversing every sibling is required to
         // collect all executable segments even after an earlier depth gap.
@@ -197,12 +198,12 @@ pub fn cheap_check(
         findings.push(finding(
             RuleId::AnalysisIncomplete,
             Severity::High,
-            "nested command analysis exceeded its depth limit",
-            "A destructive command may be hidden in nested shell execution syntax deeper than \
-             Tirith's bounded parser can safely resolve.",
+            "nested command analysis was incomplete",
+            "A destructive command may be hidden beyond Tirith's bounded nested-shell depth, \
+             lexical-candidate, input, or retained-body budget.",
             Evidence::CommandPattern {
-                pattern: "over-deep nested shell execution".to_string(),
-                matched: input.to_string(),
+                pattern: "nested shell execution coverage gap".to_string(),
+                matched: "nested body suffix omitted by bounded analysis".to_string(),
             },
         ));
     }
@@ -211,6 +212,22 @@ pub fn cheap_check(
         let parsed = match parse_fs_op(seg, *segment_shell) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => continue,
+            Err(crate::rules::command::EffectiveCommandError::WorkBudgetExceeded) => {
+                findings.push(finding(
+                    RuleId::AnalysisIncomplete,
+                    Severity::High,
+                    "destructive command analysis exceeded its work budget",
+                    "The command exceeded Tirith's bounded token-normalization budget. A \
+                     destructive operation may remain in the omitted suffix, so it is blocked \
+                     instead of being treated as absent.",
+                    Evidence::CommandPattern {
+                        pattern: "destructive command work budget exhausted".to_string(),
+                        matched: "input or token suffix omitted before command normalization"
+                            .to_string(),
+                    },
+                ));
+                continue;
+            }
             Err(_) => {
                 if segment_has_destructive_marker(seg, *segment_shell) {
                     findings.push(finding(
@@ -411,12 +428,19 @@ fn simulate_with_work_limit(
     if nested_incomplete {
         report.walk_errors += 1;
         report.walk_truncated = true;
+        report.classification_incomplete = true;
     }
 
     for (seg, segment_shell) in &segments {
         let parsed = match parse_fs_op(seg, *segment_shell) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => continue,
+            Err(crate::rules::command::EffectiveCommandError::WorkBudgetExceeded) => {
+                report.walk_errors += 1;
+                report.walk_truncated = true;
+                report.classification_incomplete = true;
+                continue;
+            }
             Err(_) => {
                 if segment_has_destructive_marker(seg, *segment_shell) {
                     report.walk_errors += 1;
@@ -2046,6 +2070,33 @@ mod tests {
                 "shell-specific group/substitution escaped: {input} -> {findings:?}"
             );
         }
+    }
+
+    #[test]
+    fn cheap_check_retains_executable_scan_budget_exhaustion() {
+        let exact = format!("{}echo $(rm -rf /)", "true;".repeat(254));
+        let exact_findings = cheap_check(&exact, ShellType::Posix, &empty_env());
+        assert!(
+            exact_findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
+            "the exact-cap body must remain visible: {exact_findings:?}"
+        );
+        assert!(
+            exact_findings
+                .iter()
+                .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+            "the exact-cap control must remain complete: {exact_findings:?}"
+        );
+
+        let plus_one = format!("{}echo $(rm -rf /)", "true;".repeat(255));
+        let findings = cheap_check(&plus_one, ShellType::Posix, &empty_env());
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete && finding.severity == Severity::High
+            }),
+            "the executable-substitution work gap must fail closed: {findings:?}"
+        );
     }
 
     #[test]

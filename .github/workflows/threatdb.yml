@@ -16,13 +16,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pinned upstream threat-intel source revisions (repo-0241), consumed by
-  # .github/scripts/fetch-threatdb-sources.sh. Branch-name pins: replace with
-  # full 40-hex commit SHAs after an upstream review to make fetches immutable.
-  # The resolved commit SHA of every fetch is recorded in the job log and in
-  # /tmp/tirith-threatdb-source-pins.json.
-  THREATDB_OSSF_MP_REF: main
-  THREATDB_DD_MP_REF: main
+  # Reviewed immutable source revisions consumed and verified by the atomic
+  # fetch transaction. Updating any pin is a source-review event.
+  THREATDB_OSSF_MP_REF: 1ea2762d5fb415aef003a244d5aa83c5fc48cc6e
+  THREATDB_DD_MP_REF: ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc
+  THREATDB_TYPOSQUAT_REF: fd0bde98d200efe5c282a07edc4c68fba13252c6
 
 jobs:
   build-threatdb:
@@ -459,6 +457,7 @@ jobs:
             GENERATION_ARGS+=(
               --generation-manifest threatdb-index-v2.json
               --generation-base-url https://github.com/sheeki03/tirith/releases/download/threatdb-latest
+              --source-integrity-manifest "threatdb-source-integrity-${RUN_ID}-${RUN_ATTEMPT}.json"
             )
           fi
           BASELINE_ARGS=()
@@ -474,11 +473,27 @@ jobs:
           if [ "${ENABLE_THREATDB_V2}" = "true" ] && [ -n "${BASELINE_V2_PATH:-}" ]; then
             BASELINE_ARGS+=(--baseline-v2 "$BASELINE_V2_PATH")
           fi
+          SOURCE_PROVENANCE="threatdb-source-provenance-${RUN_ID}-${RUN_ATTEMPT}.json"
+          RAW_SOURCE_PROVENANCE=/tmp/tirith-threatdb-sources/source-provenance.json
+          COMPILER_METADATA="threatdb-compiler-metadata-${RUN_ID}-${RUN_ATTEMPT}.json"
+          jq -e \
+            '(.schema_version == 2) and
+             (.compiler_version | type == "string") and
+             (.retrieved_at | type == "string") and
+             (.ossf_malicious_packages.commit | test("^[0-9a-f]{40}$")) and
+             (.datadog_malicious_software_packages.commit | test("^[0-9a-f]{40}$")) and
+             (.ecosystems_typosquatting_dataset.commit | test("^[0-9a-f]{40}$")) and
+             (.registry_version_snapshot.sha256 | test("^[0-9a-f]{64}$"))' \
+            "$RAW_SOURCE_PROVENANCE" >/dev/null
           ./target/release/tirith-threatdb-compile \
             --ossf /tmp/tirith-threatdb-sources/ossf-mp \
+            --registry-snapshots /tmp/tirith-threatdb-sources/registry-versions.json \
+            --source-provenance "$RAW_SOURCE_PROVENANCE" \
+            --compiler-metadata "$COMPILER_METADATA" \
             --datadog /tmp/tirith-threatdb-sources/dd-mp \
             --feodo /tmp/tirith-threatdb-sources/feodo.txt \
             --cisa-kev /tmp/tirith-threatdb-sources/cisa-kev.json \
+            --typosquats /tmp/tirith-threatdb-sources/typosquats/typosquats.csv \
             "${EXFIL_ARGS[@]}" \
             --sequence "${BUILD_SEQUENCE}" \
             --sign-key-env TIRITH_THREATDB_SIGNING_KEY \
@@ -486,6 +501,63 @@ jobs:
             "${BASELINE_ARGS[@]}" \
             "${V2_ARGS[@]}" \
             "${GENERATION_ARGS[@]}"
+
+          SOURCE_TRANSACTION_SHA=$(sha256sum "$RAW_SOURCE_PROVENANCE" | cut -d' ' -f1)
+          COMPILER_METADATA_SHA=$(sha256sum "$COMPILER_METADATA" | cut -d' ' -f1)
+          REGISTRY_SNAPSHOT_SHA=$(jq -er '.registry_version_snapshot.sha256' "$RAW_SOURCE_PROVENANCE")
+          SOURCE_INTEGRITY_MANIFEST="threatdb-source-integrity-${RUN_ID}-${RUN_ATTEMPT}.json"
+          SOURCE_INTEGRITY_MANIFEST_SHA=""
+          if [ "${ENABLE_THREATDB_V2}" = "true" ]; then
+            SOURCE_INTEGRITY_MANIFEST_SHA=$(sha256sum "$SOURCE_INTEGRITY_MANIFEST" | cut -d' ' -f1)
+          fi
+          jq -n \
+            --slurpfile source "$RAW_SOURCE_PROVENANCE" \
+            --slurpfile compiler "$COMPILER_METADATA" \
+            --arg source_sha "$SOURCE_TRANSACTION_SHA" \
+            --arg compiler_sha "$COMPILER_METADATA_SHA" \
+            --arg registry_sha "$REGISTRY_SNAPSHOT_SHA" \
+            --arg integrity_manifest_sha "$SOURCE_INTEGRITY_MANIFEST_SHA" \
+            '$source[0] + {
+              compiler_parse: $compiler[0],
+              integrity_bindings: {
+                source_transaction_sha256: $source_sha,
+                registry_snapshot_sha256: $registry_sha,
+                compiler_metadata_sha256: $compiler_sha,
+                source_integrity_manifest_sha256: $integrity_manifest_sha
+              }
+            }' > "$SOURCE_PROVENANCE"
+          jq -e \
+            --arg source_sha "$SOURCE_TRANSACTION_SHA" \
+            --arg compiler_sha "$COMPILER_METADATA_SHA" \
+            --arg registry_sha "$REGISTRY_SNAPSHOT_SHA" \
+            --arg integrity_manifest_sha "$SOURCE_INTEGRITY_MANIFEST_SHA" \
+            '(.schema_version == 2) and
+             (.compiler_parse.schema_version == 1) and
+             (.compiler_parse.compiler_version == .compiler_version) and
+             (.compiler_parse.sources.ossf_malicious_packages.accepted | type == "number") and
+             (.compiler_parse.sources.ossf_malicious_packages.rejected | type == "number") and
+             (.compiler_parse.sources.datadog_malicious_software_packages.accepted | type == "number") and
+             (.compiler_parse.sources.ecosystems_typosquatting_dataset.accepted | type == "number") and
+             (.integrity_bindings.source_transaction_sha256 == $source_sha) and
+             (.integrity_bindings.registry_snapshot_sha256 == $registry_sha) and
+             (.integrity_bindings.compiler_metadata_sha256 == $compiler_sha) and
+             (.integrity_bindings.source_integrity_manifest_sha256 == $integrity_manifest_sha) and
+             (.compiler_parse.source_transaction_sha256 == $source_sha) and
+             (.compiler_parse.registry_snapshot_sha256 == $registry_sha)' \
+            "$SOURCE_PROVENANCE" >/dev/null
+          RECONSTRUCTED_SOURCE_SHA=$(
+            jq -cS 'del(.compiler_parse, .integrity_bindings)' "$SOURCE_PROVENANCE" \
+              | sha256sum | cut -d' ' -f1
+          )
+          RECONSTRUCTED_COMPILER_SHA=$(
+            printf '%s' "$(jq -cS '.compiler_parse' "$SOURCE_PROVENANCE")" \
+              | sha256sum | cut -d' ' -f1
+          )
+          if [ "$RECONSTRUCTED_SOURCE_SHA" != "$SOURCE_TRANSACTION_SHA" ] ||
+             [ "$RECONSTRUCTED_COMPILER_SHA" != "$COMPILER_METADATA_SHA" ]; then
+            echo "::error::merged release provenance cannot reconstruct its bound source/compiler metadata digests"
+            exit 1
+          fi
 
       - name: Remove compiler input state
         if: ${{ always() }}
@@ -548,6 +620,7 @@ jobs:
           body: "Auto-updated threat-intelligence database (prerelease channel). Not a versioned download; tirith resolves it via the signed manifest. See #140."
           files: |
             tirith-threatdb-${{ github.run_id }}-${{ github.run_attempt }}.dat
+            threatdb-source-provenance-${{ github.run_id }}-${{ github.run_attempt }}.json
             threatdb-manifest.json
 
       # Commit the legacy manifest's raw `main` copy UNCONDITIONALLY and BEFORE the v2
@@ -674,6 +747,10 @@ jobs:
           V2_SIZE=$(stat -c%s "$V2_ASSET")
           V1_URL="https://github.com/sheeki03/tirith/releases/download/threatdb-latest/${V1_ASSET}"
           V2_URL="https://github.com/sheeki03/tirith/releases/download/threatdb-latest/${V2_ASSET}"
+          SOURCE_PROVENANCE="threatdb-source-provenance-${RUN_ID}-${RUN_ATTEMPT}.json"
+          SOURCE_TRANSACTION_SHA=$(jq -er '.integrity_bindings.source_transaction_sha256' "$SOURCE_PROVENANCE")
+          REGISTRY_SNAPSHOT_SHA=$(jq -er '.integrity_bindings.registry_snapshot_sha256' "$SOURCE_PROVENANCE")
+          COMPILER_METADATA_SHA=$(jq -er '.integrity_bindings.compiler_metadata_sha256' "$SOURCE_PROVENANCE")
           # The minimum Tirith version that ships the v2-capable reader. A client
           # older than this skips the v2 asset and stays on v1 via the legacy
           # manifest. This is the floor introduced with DB-B/DB-C. It MUST equal
@@ -712,12 +789,40 @@ jobs:
             --arg v2_url "$V2_URL" \
             --arg min "$V2_MIN_VERSION" \
             '(.manifest_version == 2) and (.sequence == $sequence) and
+             ((keys | sort) == ["assets", "manifest_version", "sequence", "signature"]) and
              (.assets | length == 2) and
              ([.assets[].filename] | unique | length == 2) and
              ([.assets[].url] | unique | length == 2) and
              ([.assets[] | select(.format == 1 and .filename == $v1 and .url == $v1_url and (.min_tirith_version | not))] | length == 1) and
              ([.assets[] | select(.format == 2 and .filename == $v2 and .url == $v2_url and .min_tirith_version == $min)] | length == 1)' \
             threatdb-index-v2.json >/dev/null
+
+          SOURCE_INTEGRITY="threatdb-source-integrity-${RUN_ID}-${RUN_ATTEMPT}.json"
+          INTEGRITY_PAYLOAD=$(jq -cS 'del(.signature)' "$SOURCE_INTEGRITY")
+          INTEGRITY_SIG=$(jq -er '.signature' "$SOURCE_INTEGRITY")
+          EXPECTED_INTEGRITY_SIG=$(./target/release/tirith-threatdb-compile sign-payload \
+            --payload "$INTEGRITY_PAYLOAD" --key-env TIRITH_THREATDB_SIGNING_KEY)
+          if [ "$INTEGRITY_SIG" != "$EXPECTED_INTEGRITY_SIG" ]; then
+            echo "::error::source-integrity sidecar has an invalid signature"
+            exit 1
+          fi
+          SOURCE_TRANSACTION_SHA=$(jq -er '.integrity_bindings.source_transaction_sha256' "$SOURCE_PROVENANCE")
+          REGISTRY_SNAPSHOT_SHA=$(jq -er '.integrity_bindings.registry_snapshot_sha256' "$SOURCE_PROVENANCE")
+          COMPILER_METADATA_SHA=$(jq -er '.integrity_bindings.compiler_metadata_sha256' "$SOURCE_PROVENANCE")
+          jq -e \
+            --argjson sequence "${BUILD_SEQUENCE}" \
+            --arg v1 "$V1_ASSET" --arg v2 "$V2_ASSET" \
+            --arg v1_sha "$V1_SHA" --arg v2_sha "$V2_SHA" \
+            --arg source_sha "$SOURCE_TRANSACTION_SHA" \
+            --arg registry_sha "$REGISTRY_SNAPSHOT_SHA" \
+            --arg compiler_sha "$COMPILER_METADATA_SHA" \
+            '(.manifest_version == 1) and (.sequence == $sequence) and
+             (.v1_filename == $v1) and (.v1_sha256 == $v1_sha) and
+             (.v2_filename == $v2) and (.v2_sha256 == $v2_sha) and
+             (.source_transaction_sha256 == $source_sha) and
+             (.registry_snapshot_sha256 == $registry_sha) and
+             (.compiler_metadata_sha256 == $compiler_sha)' \
+            "$SOURCE_INTEGRITY" >/dev/null
 
           # Self-check 1 (signed-region integrity): strip only the signature from
           # the PUBLISHED file and re-canonicalize; it must equal the PAYLOAD we
@@ -787,6 +892,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             tirith-threatdb-v2-${{ github.run_id }}-${{ github.run_attempt }}.dat
+            threatdb-source-integrity-${{ github.run_id }}-${{ github.run_attempt }}.json
 
       # Persist the last authenticated complete v2 generation under a filename
       # clients never fetch. Publishing this before the discovery pointer means a
@@ -1034,34 +1140,26 @@ jobs:
               "main v2 index"
           fi
 
-          # v1 assets: tirith-threatdb-<run_id>-<attempt>.dat (no -v2- infix).
-          # RUN_ID is field 3, attempt is field 4.
-          mapfile -t STALE_V1 < <(
-            jq -r '.assets[].name | select(test("^tirith-threatdb-[0-9]+-[0-9]+\\.dat$"))' \
-              "$ASSETS_JSON" \
-            | sort -t- -k3,3nr -k4,4nr \
-            | tail -n +"$((KEEP + 1))"
-          )
-
-          # v2 assets: tirith-threatdb-v2-<run_id>-<attempt>.dat. The literal `v2`
-          # is field 3, so RUN_ID is field 4 and attempt is field 5.
-          mapfile -t STALE_V2 < <(
-            jq -r '.assets[].name | select(test("^tirith-threatdb-v2-[0-9]+-[0-9]+\\.dat$"))' \
-              "$ASSETS_JSON" \
-            | sort -t- -k4,4nr -k5,5nr \
-            | tail -n +"$((KEEP + 1))"
-          )
-
-          STALE=("${STALE_V1[@]}" "${STALE_V2[@]}")
+          # Select v1/v2 databases by their independent retention groups, then
+          # delete a generation's source provenance only when neither database
+          # format from that exact run+attempt remains. Discovery-protected DBs
+          # therefore retain their provenance even when older than KEEP.
+          if ! STALE_OUTPUT=$(
+            .github/scripts/select-threatdb-prune-assets.sh \
+              "$ASSETS_JSON" "$KEEP" "${!PROTECTED_ASSETS[@]}"
+          ); then
+            echo "::error::prune: failed to select stale DB/provenance assets"
+            exit 1
+          fi
+          STALE=()
+          if [ -n "$STALE_OUTPUT" ]; then
+            mapfile -t STALE <<< "$STALE_OUTPUT"
+          fi
           if [ "${#STALE[@]}" -eq 0 ]; then
             echo "Prune: nothing to delete."
             exit 0
           fi
           for asset in "${STALE[@]}"; do
-            if [[ -n "${PROTECTED_ASSETS[$asset]+present}" ]]; then
-              echo "Preserving discovery-referenced asset: $asset"
-              continue
-            fi
             echo "Pruning stale asset: $asset"
             gh release delete-asset threatdb-latest "$asset" \
               --repo "${{ github.repository }}" --yes

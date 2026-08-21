@@ -15,6 +15,7 @@ pub mod clipboard;
 pub mod command_card;
 pub mod commands_manifest;
 pub mod confusables;
+pub mod content_kind;
 pub mod context_detect;
 pub mod custom_rule_dsl;
 pub mod dashboard;

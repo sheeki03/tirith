@@ -69,6 +69,31 @@ impl CompiledSeeds {
     }
 }
 
+/// Safe boundary-facing description of one rejected custom seed. It carries
+/// only the source-list index and a categorical reason; the attacker-controlled
+/// regex and `regex::Error` text (which can echo that regex) never need to cross
+/// a CLI or MCP diagnostic boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSeedDiagnostic {
+    pub index: usize,
+    pub category: InvalidSeedCategory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidSeedCategory {
+    BudgetExceeded,
+    RegexRejected,
+}
+
+impl InvalidSeedCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::RegexRejected => "regex_rejected",
+        }
+    }
+}
+
 /// Compile each pattern in `patterns` into a seed using the same
 /// placeholder-substitution + [`classify`] logic as the built-in corpus. Good
 /// seeds go into the returned [`CompiledSeeds`]; each pattern that fails to
@@ -78,6 +103,18 @@ impl CompiledSeeds {
 /// caller surfaces the bad-list (policy validation is the primary gate, so bad
 /// seeds normally never reach here). A blank/`#`-comment line is skipped silently.
 pub fn compile_seeds(patterns: &[String]) -> (CompiledSeeds, Vec<(String, regex::Error)>) {
+    let (compiled, bad) = compile_seeds_indexed(patterns);
+    (
+        compiled,
+        bad.into_iter()
+            .map(|(_index, pattern, error)| (pattern, error))
+            .collect(),
+    )
+}
+
+fn compile_seeds_indexed(
+    patterns: &[String],
+) -> (CompiledSeeds, Vec<(usize, String, regex::Error)>) {
     let mut good = Vec::new();
     let mut bad = Vec::new();
     // repo-0330: each seed has an independent 1 MiB program/DFA allowance, so
@@ -87,7 +124,7 @@ pub fn compile_seeds(patterns: &[String]) -> (CompiledSeeds, Vec<(String, regex:
     // rejected into the bad-list (visible, fail-closed), never silently dropped.
     let mut accepted = 0usize;
     let mut accepted_source_bytes = 0usize;
-    for pattern in patterns {
+    for (index, pattern) in patterns.iter().enumerate() {
         let trimmed = pattern.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -96,6 +133,7 @@ pub fn compile_seeds(patterns: &[String]) -> (CompiledSeeds, Vec<(String, regex:
             || accepted_source_bytes + trimmed.len() > MAX_CUSTOM_SEED_SOURCE_BYTES
         {
             bad.push((
+                index,
                 pattern.clone(),
                 regex::Error::Syntax(
                     "custom seed budget exceeded (too many/too large patterns)".to_string(),
@@ -114,10 +152,40 @@ pub fn compile_seeds(patterns: &[String]) -> (CompiledSeeds, Vec<(String, regex:
                 accepted += 1;
                 accepted_source_bytes += trimmed.len();
             }
-            Err(e) => bad.push((pattern.clone(), e)),
+            Err(error) => bad.push((index, pattern.clone(), error)),
         }
     }
     (CompiledSeeds(good), bad)
+}
+
+/// Compile custom seeds while projecting failures into safe indexed categories
+/// suitable for public diagnostics. The legacy [`compile_seeds`] return stays
+/// source-compatible for internal consumers and tests that need the raw error.
+pub fn compile_seeds_with_safe_diagnostics(
+    patterns: &[String],
+) -> (CompiledSeeds, Vec<InvalidSeedDiagnostic>) {
+    let (compiled, bad) = compile_seeds_indexed(patterns);
+    let diagnostics = bad
+        .iter()
+        .map(|(index, _bad_pattern, error)| {
+            let category = match error {
+                regex::Error::Syntax(message)
+                    if message.starts_with("custom seed budget exceeded") =>
+                {
+                    InvalidSeedCategory::BudgetExceeded
+                }
+                regex::Error::Syntax(_) | regex::Error::CompiledTooBig(_) => {
+                    InvalidSeedCategory::RegexRejected
+                }
+                _ => InvalidSeedCategory::RegexRejected,
+            };
+            InvalidSeedDiagnostic {
+                index: *index,
+                category,
+            }
+        })
+        .collect();
+    (compiled, diagnostics)
 }
 
 /// Decide which RuleId a seed line routes to, via a small explicit keyword table.
@@ -934,6 +1002,16 @@ mod tests {
         );
         // The built-in `check` (no extra seeds) must NOT fire on it.
         assert!(check("the log says my-secret-phrase here").is_empty());
+    }
+
+    #[test]
+    fn safe_seed_diagnostic_keeps_exact_index_for_duplicate_budget_rejection() {
+        let patterns = vec!["duplicate-seed".to_string(); MAX_CUSTOM_SEEDS + 1];
+        let (_compiled, diagnostics) = compile_seeds_with_safe_diagnostics(&patterns);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].index, MAX_CUSTOM_SEEDS);
+        assert_eq!(diagnostics[0].category, InvalidSeedCategory::BudgetExceeded);
     }
 
     #[test]

