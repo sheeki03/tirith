@@ -1144,6 +1144,8 @@ const SUB_CONTAINERS_AND_OBJECTS_INHERIT: u32 = 0x3;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+    use std::path::Path;
     use tirith_core::capsule::windows::windows_launch_plan;
     use tirith_core::capsule::CapsuleSpec;
 
@@ -1172,10 +1174,11 @@ mod tests {
 
     #[test]
     fn environment_block_strips_sensitive_and_double_nul_terminates() {
+        let _global = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _benign = EnvGuard::set("TIRITH_TEST_BENIGN", Path::new("ok"));
+        let _secret = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Path::new("shh"));
         // Build a block from a policy that inherits the parent env but strips
         // sensitive names; assert a sensitive var is absent and the block ends in NUL.
-        std::env::set_var("TIRITH_TEST_BENIGN", "ok");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "shh");
         let policy = EnvironmentPolicy {
             inherit: true,
             allow: Vec::new(),
@@ -1191,13 +1194,12 @@ mod tests {
             "sensitive var must be stripped from the child env block"
         );
         assert_eq!(*block.last().unwrap(), 0, "block must end with a NUL");
-        std::env::remove_var("TIRITH_TEST_BENIGN");
-        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
     }
 
     #[test]
     fn environment_block_overrides_home_under_temporary_home() {
-        std::env::set_var("USERPROFILE", "C:/Users/real");
+        let _global = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _profile = EnvGuard::set("USERPROFILE", Path::new("C:/Users/real"));
         let policy = EnvironmentPolicy {
             inherit: true,
             allow: Vec::new(),
@@ -1212,7 +1214,6 @@ mod tests {
             "real USERPROFILE must be replaced under temporary_home"
         );
         assert!(decoded.contains("USERPROFILE="));
-        std::env::remove_var("USERPROFILE");
     }
 
     #[test]

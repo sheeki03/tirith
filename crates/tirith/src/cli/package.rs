@@ -1622,6 +1622,12 @@ mod tests {
 
     use tirith_core::registry_api::{FetchError, RegistryMetadata};
 
+    fn isolate_registry_state() -> tirith_test_support::GlobalStateGuard {
+        crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     /// A fixture-fed [`RegistryClient`].
     struct FakeClient {
         result: Result<RegistryMetadata, FetchError>,
@@ -1643,6 +1649,7 @@ mod tests {
 
     #[test]
     fn gather_api_offline_flag_skips_network() {
+        let _global = isolate_registry_state();
         // CR12: `--offline` must short-circuit without calling `fetch` (the
         // exploding client would panic) and report NotComputed, not Unavailable.
         let sig = gather_api(&ExplodingClient, Ecosystem::Npm, "react", None, true);
@@ -1656,6 +1663,7 @@ mod tests {
 
     #[test]
     fn gather_api_success_returns_available() {
+        let _global = isolate_registry_state();
         let meta = RegistryMetadata {
             source: "npm".to_string(),
             package_name: Some("react".to_string()),
@@ -1669,6 +1677,7 @@ mod tests {
 
     #[test]
     fn gather_api_failure_degrades_to_unavailable() {
+        let _global = isolate_registry_state();
         let client = FakeClient {
             result: Err(FetchError::Network("connection refused".to_string())),
         };
@@ -1678,6 +1687,7 @@ mod tests {
 
     #[test]
     fn online_run_offline_flag_still_exits_zero_without_network() {
+        let _global = isolate_registry_state();
         // `--online --offline` scores offline and exits 0 with no network call,
         // exercising the public `run` end-to-end.
         let code = run(

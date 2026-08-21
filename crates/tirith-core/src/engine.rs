@@ -4668,12 +4668,9 @@ mod tests {
         // — DSL regexes use `/`, so a Windows `C:\repo\.env` must normalize to `/`
         // before the regex runs, else every Windows path is silently missed.
         //
-        // Skip when `TIRITH_POLICY_ROOT` is set (it wins over cwd discovery and
-        // would race other tests if mutated) — same guard as the env-sensitive
-        // tests below. CI (var unset) runs it fully.
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        // Serialize policy discovery with every other process-global test and
+        // remove the ambient override instead of silently passing without assertions.
+        let _state = isolate_state();
 
         let dir = tempfile::tempdir().unwrap();
         // `.git` marks the repo root so `Policy::discover` stops walking here.
@@ -4756,9 +4753,6 @@ mod tests {
     /// precondition asserting the same input fast-exits without the rule.
     #[test]
     fn dsl_command_cwd_in_rule_forces_past_fast_exit_exec_ctx() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -4830,9 +4824,6 @@ mod tests {
     /// Exec-only.
     #[test]
     fn dsl_command_cwd_in_rule_forces_past_fast_exit_paste_ctx() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -4898,9 +4889,6 @@ mod tests {
     /// built-in-only precondition below.
     #[test]
     fn paste_path_uses_policy_injection_seeds_custom() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -4960,9 +4948,6 @@ mod tests {
     /// keyword gate; this one proves the force-past itself.
     #[test]
     fn paste_custom_seed_without_builtin_keyword_forces_past_fast_exit() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -5020,9 +5005,6 @@ mod tests {
     /// `check_with` never runs, silently gating out the attack.
     #[test]
     fn paste_base64_encoded_seed_forces_past_fast_exit() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
         use base64::Engine as _;
@@ -5071,9 +5053,6 @@ mod tests {
     /// deobfuscation pass in `check_with` never runs (the false-negative this closes).
     #[test]
     fn paste_leetspeak_seed_forces_past_fast_exit() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -5119,9 +5098,6 @@ mod tests {
     /// the `deobf_candidate_triggered` force-past it fast-exits at tier 1.
     #[test]
     fn paste_character_spaced_seed_forces_past_fast_exit() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -5170,9 +5146,6 @@ mod tests {
     /// then the tier-3 reach and the firing rule.
     #[test]
     fn paste_leet_token_seed_forces_past_and_fires() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -5218,9 +5191,6 @@ mod tests {
     /// contract (not a tier), proving the broadened gate is harmless.
     #[test]
     fn paste_benign_leet_no_false_finding() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
 
         let dir = tempfile::tempdir().unwrap();
@@ -5245,9 +5215,7 @@ mod tests {
     /// end through the real pipeline for the file predicate the finding called out.
     #[test]
     fn dsl_file_path_matches_rule_reaches_evaluation_filescan_ctx() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::RuleId;
 
         let dir = tempfile::tempdir().unwrap();
@@ -5303,9 +5271,6 @@ mod tests {
     /// not impose work or create a false finding.
     #[test]
     fn effective_custom_rules_gate_the_tier1_fast_exit() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         let input = "whoami";
 
@@ -5368,9 +5333,6 @@ mod tests {
 
     #[test]
     fn custom_regex_and_dsl_rules_receive_nested_executable_bodies() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
         let _state = isolate_state();
         use crate::verdict::RuleId;
 
@@ -6233,32 +6195,13 @@ mod tests {
     }
 
     struct HermeticTier1Environment {
-        _directory: tempfile::TempDir,
-        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
-        previous_cwd: std::path::PathBuf,
+        _global: tirith_test_support::GlobalStateGuard,
     }
 
     impl HermeticTier1Environment {
         fn new() -> Self {
-            let directory = tempfile::tempdir().expect("Tier-1 isolated state directory");
-            let previous_cwd = std::env::current_dir().expect("Tier-1 original cwd");
-            let mut previous = Vec::new();
-            for name in [
-                "HOME",
-                "USERPROFILE",
-                "XDG_CONFIG_HOME",
-                "XDG_DATA_HOME",
-                "XDG_STATE_HOME",
-                "XDG_CACHE_HOME",
-                "APPDATA",
-                "LOCALAPPDATA",
-                "TIRITH_POLICY_ROOT",
-            ] {
-                previous.push((name, std::env::var_os(name)));
-                // SAFETY: every equivalence test holds `TEST_ENV_LOCK` for the
-                // complete lifetime of this guard.
-                unsafe { std::env::set_var(name, directory.path()) };
-            }
+            let mut global = tirith_test_support::GlobalStateGuard::new()
+                .expect("isolate process-global Tier-1 state");
             for name in [
                 "TIRITH_SERVER_URL",
                 "TIRITH_API_KEY",
@@ -6276,49 +6219,19 @@ mod tests {
                 "NO_PROXY",
                 "no_proxy",
             ] {
-                previous.push((name, std::env::var_os(name)));
-                // SAFETY: every equivalence test holds `TEST_ENV_LOCK` for the
-                // complete lifetime of this guard.
-                unsafe { std::env::remove_var(name) };
+                global.remove_env(name);
             }
-            std::env::set_current_dir(directory.path()).expect("Tier-1 isolated cwd");
-            Self {
-                _directory: directory,
-                previous,
-                previous_cwd,
-            }
+            Self { _global: global }
         }
     }
 
-    impl Drop for HermeticTier1Environment {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.previous_cwd);
-            for (name, value) in self.previous.drain(..).rev() {
-                // SAFETY: the owning test still holds `TEST_ENV_LOCK` while the
-                // original process environment is restored.
-                unsafe {
-                    if let Some(value) = value {
-                        std::env::set_var(name, value);
-                    } else {
-                        std::env::remove_var(name);
-                    }
-                }
-            }
-        }
-    }
-
-    fn hermetic_tier1_environment() -> (std::sync::MutexGuard<'static, ()>, HermeticTier1Environment)
-    {
-        let lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let environment = HermeticTier1Environment::new();
-        (lock, environment)
+    fn hermetic_tier1_environment() -> HermeticTier1Environment {
+        HermeticTier1Environment::new()
     }
 
     #[test]
     fn clean_fast_and_full_representations_are_hermetically_equivalent() {
-        let (_lock, _environment) = hermetic_tier1_environment();
+        let _environment = hermetic_tier1_environment();
         for name in [
             "HTTP_PROXY",
             "http_proxy",
@@ -6494,7 +6407,7 @@ mod tests {
 
     #[test]
     fn sensitive_registry_fast_and_full_paths_are_equivalent_in_every_context() {
-        let (_lock, _environment) = hermetic_tier1_environment();
+        let _environment = hermetic_tier1_environment();
         let scalar = format!("0x{}1", "0".repeat(63));
         let signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
         let mut keypair = vec![11u8; 32];
@@ -6560,9 +6473,81 @@ mod tests {
         "posix".to_string()
     }
 
+    /// A TOML fixture family under `tests/fixtures/` that is intentionally
+    /// consumed by a public surface other than [`analyze`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ForeignFixtureFamily {
+        OutputPipeline,
+        TaskProvenance,
+    }
+
+    /// Known top-level TOML fixtures that are not engine goldens. Keep this
+    /// mapping explicit: treating an arbitrary TOML parse error as evidence that
+    /// a file belongs to another fixture family would silently drop a malformed
+    /// engine golden from the equivalence gate.
+    const FOREIGN_FIXTURE_FILES: &[(&str, ForeignFixtureFamily)] = &[
+        ("output.toml", ForeignFixtureFamily::OutputPipeline),
+        ("task_provenance.toml", ForeignFixtureFamily::TaskProvenance),
+    ];
+
+    fn foreign_fixture_family(path: &std::path::Path) -> Option<ForeignFixtureFamily> {
+        let file_name = path.file_name()?.to_str()?;
+        FOREIGN_FIXTURE_FILES
+            .iter()
+            .find_map(|(known_name, family)| (*known_name == file_name).then_some(*family))
+    }
+
+    /// Parse an engine golden or explicitly route a known foreign fixture.
+    /// Unknown names are always treated as engine fixtures, so their parse
+    /// failures remain errors instead of becoming an accidental skip path.
+    fn parse_engine_fixture_file(
+        path: &std::path::Path,
+        source: &str,
+    ) -> Result<Option<Tier1FixtureFile>, toml::de::Error> {
+        if foreign_fixture_family(path).is_some() {
+            Ok(None)
+        } else {
+            toml::from_str(source).map(Some)
+        }
+    }
+
+    #[test]
+    fn tier1_fixture_routing_is_explicit_and_parse_failures_stay_fail_closed() {
+        use std::path::Path;
+
+        assert_eq!(
+            foreign_fixture_family(Path::new("output.toml")),
+            Some(ForeignFixtureFamily::OutputPipeline)
+        );
+        assert_eq!(
+            foreign_fixture_family(Path::new("task_provenance.toml")),
+            Some(ForeignFixtureFamily::TaskProvenance)
+        );
+        assert_eq!(foreign_fixture_family(Path::new("command.toml")), None);
+        assert_eq!(
+            foreign_fixture_family(Path::new("new_engine_family.toml")),
+            None,
+            "unknown TOML fixture names must default to the engine route"
+        );
+
+        let malformed = "[[fixture]\nname =";
+        assert!(
+            parse_engine_fixture_file(Path::new("command.toml"), malformed).is_err(),
+            "a malformed known engine fixture must remain a parse failure"
+        );
+        assert!(
+            parse_engine_fixture_file(Path::new("new_engine_family.toml"), malformed).is_err(),
+            "a malformed unknown fixture must not be silently reclassified"
+        );
+        assert!(matches!(
+            parse_engine_fixture_file(Path::new("task_provenance.toml"), malformed),
+            Ok(None)
+        ));
+    }
+
     #[test]
     fn every_exec_and_paste_golden_has_full_security_projection_equivalence() {
-        let (_lock, _environment) = hermetic_tier1_environment();
+        let _environment = hermetic_tier1_environment();
         let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("workspace crates directory")
@@ -6582,11 +6567,13 @@ mod tests {
 
         let mut checked = 0usize;
         for path in paths {
-            let document: Tier1FixtureFile = toml::from_str(
-                &std::fs::read_to_string(&path)
-                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
-            )
-            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let Some(document) = parse_engine_fixture_file(&path, &source)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+            else {
+                continue;
+            };
             for fixture in document.fixture {
                 let scan_context = match fixture.context.as_str() {
                     "exec" => ScanContext::Exec,
@@ -6637,7 +6624,7 @@ mod tests {
 
     #[test]
     fn bounded_generated_inputs_preserve_fast_full_security_projection() {
-        let (_lock, _environment) = hermetic_tier1_environment();
+        let _environment = hermetic_tier1_environment();
         const FRAGMENTS: &[&str] = &[
             "printf safe",
             "curl http://example.test",
@@ -7061,22 +7048,8 @@ mod tests {
     }
 
     struct IsolatedState {
-        _tmp: tempfile::TempDir,
-        previous_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-    impl Drop for IsolatedState {
-        fn drop(&mut self) {
-            // SAFETY: serialized by TEST_ENV_LOCK held in this guard.
-            unsafe {
-                for (name, previous) in self.previous_env.iter().rev() {
-                    match previous {
-                        Some(value) => std::env::set_var(name, value),
-                        None => std::env::remove_var(name),
-                    }
-                }
-            }
-        }
+        root: std::path::PathBuf,
+        global: tirith_test_support::GlobalStateGuard,
     }
     /// Clear every ambient package-manager context variable for a test's
     /// lifetime, restoring them on drop.
@@ -7091,20 +7064,19 @@ mod tests {
     /// lowercase and the predicate uppercases before matching.
     struct AmbientPackageEnv {
         previous: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _global: tirith_test_support::GlobalStateGuard,
     }
     impl AmbientPackageEnv {
         fn cleared() -> Self {
-            let lock = crate::TEST_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let global = tirith_test_support::GlobalStateGuard::new()
+                .expect("isolate process-global package environment");
             let previous: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
                 .filter(|(name, _)| {
                     name.to_str()
                         .is_some_and(is_package_context_environment_name)
                 })
                 .collect();
-            // SAFETY: serialized by TEST_ENV_LOCK held in this guard.
+            // SAFETY: serialized by GlobalStateGuard held in this guard.
             unsafe {
                 for (name, _) in &previous {
                     std::env::remove_var(name);
@@ -7112,13 +7084,13 @@ mod tests {
             }
             Self {
                 previous,
-                _lock: lock,
+                _global: global,
             }
         }
     }
     impl Drop for AmbientPackageEnv {
         fn drop(&mut self) {
-            // SAFETY: serialized by TEST_ENV_LOCK held in this guard.
+            // SAFETY: serialized by GlobalStateGuard held in this guard.
             unsafe {
                 for (name, value) in &self.previous {
                     std::env::set_var(name, value);
@@ -7127,29 +7099,14 @@ mod tests {
         }
     }
 
-    /// Isolate every XDG directory and HOME under TEST_ENV_LOCK, and disable
+    /// Isolate every XDG directory and HOME under GlobalStateGuard, and disable
     /// ambient org/remote-policy overrides. This keeps the analysis fixtures from
     /// reading a developer's real policy, lists, trust store, state, or cache.
     /// Restores every prior value on drop.
     fn isolate_state() -> IsolatedState {
-        let lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let isolated = [
-            ("HOME", tmp.path().join("home")),
-            ("XDG_STATE_HOME", tmp.path().join("state")),
-            ("XDG_CONFIG_HOME", tmp.path().join("config")),
-            ("XDG_DATA_HOME", tmp.path().join("data")),
-            ("XDG_CACHE_HOME", tmp.path().join("cache")),
-        ];
-        for (_, path) in &isolated {
-            std::fs::create_dir_all(path).unwrap();
-        }
-        let mut previous_env = isolated
-            .iter()
-            .map(|(name, _)| (*name, std::env::var_os(name)))
-            .collect::<Vec<_>>();
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global engine state");
+        let root = global.roots().root.clone();
         for name in [
             "TIRITH_POLICY_ROOT",
             "TIRITH_SERVER_URL",
@@ -7157,34 +7114,19 @@ mod tests {
             "TIRITH_ALLOW_HTTP",
             "TIRITH",
         ] {
-            previous_env.push((name, std::env::var_os(name)));
+            global.remove_env(name);
         }
-        // SAFETY: serialized by TEST_ENV_LOCK held above.
-        unsafe {
-            for (name, path) in &isolated {
-                std::env::set_var(name, path);
-            }
-            for name in [
-                "TIRITH_POLICY_ROOT",
-                "TIRITH_SERVER_URL",
-                "TIRITH_API_KEY",
-                "TIRITH_ALLOW_HTTP",
-                "TIRITH",
-            ] {
-                std::env::remove_var(name);
-            }
-        }
-        IsolatedState {
-            _tmp: tmp,
-            previous_env,
-            _lock: lock,
-        }
+        assert!(
+            std::env::var_os("TIRITH_POLICY_ROOT").is_none(),
+            "engine policy-discovery tests must execute with the ambient override removed"
+        );
+        IsolatedState { root, global }
     }
 
     #[test]
     fn clean_and_bypass_paths_honor_effective_policy_failure_mode() {
-        let isolated = isolate_state();
-        let org_root = isolated._tmp.path().join("org-policy");
+        let mut isolated = isolate_state();
+        let org_root = isolated.root.join("org-policy");
         std::fs::create_dir_all(org_root.join(".tirith")).unwrap();
         std::fs::write(
             org_root.join(".tirith/policy.yaml"),
@@ -7196,20 +7138,18 @@ mod tests {
         .unwrap();
         // The literal loopback destination is rejected by URL policy before any
         // socket is opened, so this exercises remote failure hermetically.
-        unsafe {
-            std::env::set_var("TIRITH_POLICY_ROOT", &org_root);
-            std::env::set_var("TIRITH_ALLOW_HTTP", "1");
-        }
+        isolated.global.set_env("TIRITH_POLICY_ROOT", &org_root);
+        isolated.global.set_env("TIRITH_ALLOW_HTTP", "1");
 
-        let clean = analyze(&exec_ctx_in("whoami", isolated._tmp.path()));
+        let clean = analyze(&exec_ctx_in("whoami", &isolated.root));
         assert_eq!(clean.action, crate::verdict::Action::Block);
         assert!(clean.findings.iter().any(|finding| {
             finding.rule_id == crate::verdict::RuleId::CustomRuleMatch
                 && finding.custom_rule_id.as_deref() == Some("tirith-effective-policy-unavailable")
         }));
 
-        unsafe { std::env::set_var("TIRITH", "0") };
-        let bypass = analyze(&exec_ctx_in("whoami", isolated._tmp.path()));
+        isolated.global.set_env("TIRITH", "0");
+        let bypass = analyze(&exec_ctx_in("whoami", &isolated.root));
         assert!(bypass.bypass_requested);
         assert!(!bypass.bypass_honored);
         assert_eq!(bypass.action, crate::verdict::Action::Block);
@@ -7223,7 +7163,7 @@ mod tests {
     #[test]
     fn honored_interactive_bypass_retains_available_evidence_for_execution_drafts() {
         let isolated = isolate_state();
-        let context = exec_ctx_in("TIRITH=0 true", isolated._tmp.path());
+        let context = exec_ctx_in("TIRITH=0 true", &isolated.root);
 
         let (verdict, _partial_policy) = analyze_returning_policy(&context);
 
@@ -7460,11 +7400,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exec_guard_on_fires_exec_in_tmp_off_fast_exits() {
-        // A TIRITH_POLICY_ROOT in the environment would override the cwd-based
-        // discovery this test relies on; skip rather than assert falsely.
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::RuleId;
 
         // A leader resolving under /tmp. An absolute path is used as-is by
@@ -7525,9 +7461,7 @@ mod tests {
     /// BLOCKS, and the allowed name appears only in audit context.
     #[test]
     fn manifest_allowed_cannot_weaken_high_pipe_to_interpreter() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7584,9 +7518,7 @@ mod tests {
     /// at High severity, which maps to the Block action.)
     #[test]
     fn manifest_dangerous_pattern_elevates_to_block() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId, Severity};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7611,9 +7543,7 @@ mod tests {
 
     #[test]
     fn manifest_dangerous_pattern_applies_to_nested_executable_body() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId, Severity};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7640,9 +7570,7 @@ mod tests {
     /// `RepoCommandUnknown` does NOT fire (it matched an allowed entry).
     #[test]
     fn manifest_allowed_clean_command_allows_without_unknown() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7668,9 +7596,7 @@ mod tests {
     /// (Allow — Info never raises it).
     #[test]
     fn manifest_uncatalogued_command_emits_unknown_info() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId, Severity};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7695,9 +7621,7 @@ mod tests {
     /// audit-context field stays None.
     #[test]
     fn manifest_absent_no_manifest_rules_fire() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::RuleId;
 
         // A repo boundary but NO .tirith/commands.yaml.
@@ -7720,9 +7644,7 @@ mod tests {
     /// rules aren't applied), not silently ignored. Info never raises the action.
     #[test]
     fn manifest_unloadable_surfaces_info_not_silence() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId, Severity};
 
         let dir = tempfile::tempdir().unwrap();
@@ -7758,9 +7680,7 @@ mod tests {
     /// glob could BLOCK arbitrary text). Same input blocks in Exec, untouched in Paste.
     #[test]
     fn manifest_does_not_run_in_paste_context() {
-        if std::env::var_os("TIRITH_POLICY_ROOT").is_some() {
-            return;
-        }
+        let _state = isolate_state();
         use crate::verdict::{Action, RuleId};
 
         let dir = tempfile::tempdir().unwrap();

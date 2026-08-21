@@ -1,9 +1,9 @@
 # Command reference
 
-tirith ships 74 commands. `tirith --help` prints this same list grouped by
-category, and `tirith <command> --help` documents any one in detail. The groups
-below mirror that built-in grouping. The [README](../README.md) covers the
-everyday subset; this is the complete reference.
+tirith ships 78 top-level commands. `tirith --help` prints this same list
+grouped by category, and `tirith <command> --help` documents any one in detail.
+The groups below mirror that built-in grouping. The [README](../README.md)
+covers the everyday subset; this is the complete reference.
 
 ## Scan & analyze
 
@@ -24,6 +24,7 @@ everyday subset; this is the complete reference.
 | `tirith capsule run --preset untrusted-project --project <dir> -- <cmd>` | Copy an untrusted project into a held ephemeral directory and run an exact argv inside a fail-closed OS capsule, emitting a signed receipt. Enforceable on x86_64 Linux only; every other host refuses before anything is copied or spawned, and there is no degraded fallback |
 | `tirith taint {list,explain,clear}` | Track files downloaded from risky sources; executing or sourcing a tainted file fires a finding |
 | `tirith intend "<intent>" -- <cmd>` | Flag high-impact behavior the stated intent does not justify (advisory) |
+| `tirith task check` | Preview. Diagnostically assess an untrusted task envelope (issue body, PDF, web page) and report which effects it would be allowed. Executes nothing, fetches nothing, resolves no package, writes nothing, and declares `enforceability: observe_only` (`--file`, `--adapter`, `--format json`) |
 | `tirith lab` | Run the detection engine against a curated adversarial corpus to see what it catches (`--filter`, `--score`) |
 | `tirith explain --rule <id>` | Rule docs, examples, remediation, and MITRE mapping (`--fix`, `--list --category`) |
 | `tirith why` | Explain the last rule that triggered |
@@ -93,6 +94,21 @@ everyday subset; this is the complete reference.
 | `tirith secret {triage,rotate,revoke}` | Guidance-only secret-rotation assistant for 11 providers (no network) |
 | `tirith command-card {create,sign,verify,fetch}` | Ed25519-signed attestations that a known-good command is what it claims |
 | `tirith commands {init,list,run,check}` | Repo command manifest (`.tirith/commands.yaml`): a bounded allowlist plus an elevation-only `dangerous[]` list |
+| `tirith attest {build,verify-build,deployment,verify-deployment}` | Bind one source tree, one output tree, and one set of deployed routes into content-addressed point-in-time receipts, signed when this installation has an audit key. Not a reproducible-build claim and not continuous monitoring; `verify-deployment` re-checks the document and makes no network request |
+
+## Package firewall
+
+| Command | What it does |
+|---------|-------------|
+| `tirith pkg approve <backend> <spec>` | Resolve and inspect a requirement set and approve its install plan, printing the plan digest the approval binds to. Does not install |
+| `tirith pkg install <backend> <spec>` | Resolve, inspect, and install only the verified hash-pinned bytes inside the containment capsule, with a tamper-evident receipt. Enforcing execution is x86_64 Linux-only; every other platform fails closed before pip starts |
+| `tirith pkg verify-env` | Verify an already-installed environment's RECORD integrity without installing anything |
+| `tirith pkg trust-tool` | Enroll a fully static native Linux `uv` executable by canonical path and SHA-256 |
+| `tirith pkg graph` | Compose a provenance graph (ownership / execution / payload) over a wheel set or an installed environment. Read model only |
+| `tirith pkg diff <old> <new>` | Release differential between two wheels of the same distribution, flagging execution-shape changes |
+| `tirith pkg attest <wheel>` | Fetch a wheel's PyPI publish attestation and bind the attested subject digest to the wheel's SHA-256. Evidence only, never an auto-allow |
+| `tirith pkg attest-npm` | Ask the project's own npm to verify its installed packages' registry signatures and provenance attestations, bound to the exact `package-lock.json` and `node_modules` inventory, and emit a signed receipt. Tirith does not download, inspect, or bind the tarball bytes npm installs (`--project`, `--require-provenance`, `--out`, `--format json`) |
+| `tirith pkg receipt {list,last,show}` | List or show the package-firewall tamper-evident receipts |
 
 ## AI-agent integrations
 

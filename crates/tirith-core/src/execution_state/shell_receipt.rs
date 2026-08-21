@@ -3396,38 +3396,12 @@ pub fn consume_shell_execution_receipt(
 mod tests {
     use super::*;
     use crate::verdict::{Evidence, Finding, RuleId, Severity, Timings, Verdict};
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsString;
     use std::os::unix::fs::{symlink, PermissionsExt as _};
+    use tirith_test_support::GlobalStateGuard;
 
     const OTHER_HOOK_INSTANCE: &str =
         "2222222222222222222222222222222222222222222222222222222222222222";
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: every caller holds the crate-wide test environment lock
-            // until this guard restores the previous process environment.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds TEST_ENV_LOCK.
-            unsafe {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
 
     struct ReceiptCreationTestCheckpointGuard;
 
@@ -3439,26 +3413,40 @@ mod tests {
         }
     }
 
-    fn isolated_unregistered_state(test: impl FnOnce(&tempfile::TempDir, &str)) {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn isolated_unregistered_state_with_guard(
+        test: impl FnOnce(&tempfile::TempDir, &str, &mut GlobalStateGuard),
+    ) {
+        let mut environment = GlobalStateGuard::new().expect("isolate shell receipt state");
         let temporary = tempfile::tempdir().expect("isolated shell receipt state");
-        let _state_home = EnvVarGuard::set("XDG_STATE_HOME", temporary.path());
+        environment.set_env("XDG_STATE_HOME", temporary.path());
         let session_id = crate::session::resolve_session_id();
         assert!(crate::session_warnings::session_state_path(&session_id).is_some());
-        test(&temporary, &session_id);
+        test(&temporary, &session_id, &mut environment);
     }
 
-    fn isolated_state(test: impl FnOnce(&tempfile::TempDir, &str)) {
-        isolated_unregistered_state(|temporary, session_id| {
+    fn isolated_unregistered_state(test: impl FnOnce(&tempfile::TempDir, &str)) {
+        isolated_unregistered_state_with_guard(|temporary, session_id, _| {
+            test(temporary, session_id);
+        });
+    }
+
+    fn isolated_state_with_guard(
+        test: impl FnOnce(&tempfile::TempDir, &str, &mut GlobalStateGuard),
+    ) {
+        isolated_unregistered_state_with_guard(|temporary, session_id, environment| {
             let shell_pid = unsafe { libc::getppid() } as u32;
             let hook_instance =
                 register_shell_hook_instance(shell_pid, ShellHookFamily::Zsh, session_id)
                     .expect("register isolated shell hook capability");
-            let _hook_instance = EnvVarGuard::set("_TIRITH_RECEIPT_INSTANCE", &hook_instance);
-            let _shell_pid = EnvVarGuard::set("_TIRITH_RECEIPT_SHELL_PID", shell_pid.to_string());
-            let _family = EnvVarGuard::set("_TIRITH_RECEIPT_FAMILY", "zsh");
+            environment.set_env("_TIRITH_RECEIPT_INSTANCE", &hook_instance);
+            environment.set_env("_TIRITH_RECEIPT_SHELL_PID", shell_pid.to_string());
+            environment.set_env("_TIRITH_RECEIPT_FAMILY", "zsh");
+            test(temporary, session_id, environment);
+        });
+    }
+
+    fn isolated_state(test: impl FnOnce(&tempfile::TempDir, &str)) {
+        isolated_state_with_guard(|temporary, session_id, _| {
             test(temporary, session_id);
         });
     }
@@ -4534,19 +4522,20 @@ mod tests {
 
     #[test]
     fn receipt_is_bound_to_channel_hook_instance_and_exact_command() {
-        isolated_state(|_, session_id| {
+        isolated_state_with_guard(|_, session_id, environment| {
             let command = "printf receipt-boundary";
             let policy = Policy::default();
             let verdict = allow_verdict();
             let token = create(&verdict, &policy, command, session_id, false);
+            let hook_instance = std::env::var_os("_TIRITH_RECEIPT_INSTANCE")
+                .expect("active hook instance was installed");
 
             assert!(
                 shell_execution_receipt_context(&token, ShellReceiptChannel::BashPreexec,).is_err()
             );
-            {
-                let _other_hook = EnvVarGuard::set("_TIRITH_RECEIPT_INSTANCE", OTHER_HOOK_INSTANCE);
-                assert!(shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh).is_err());
-            }
+            environment.set_env("_TIRITH_RECEIPT_INSTANCE", OTHER_HOOK_INSTANCE);
+            assert!(shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh).is_err());
+            environment.set_env("_TIRITH_RECEIPT_INSTANCE", hook_instance);
 
             arm_allow(&token);
             let changed_command = "printf receipt-boundary-changed";

@@ -932,17 +932,10 @@ fn expand_known_path(
 /// above root; the result has no trailing slash except bare root, which stays
 /// `/`.
 fn posix_lexical(path: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    format!("/{}", out.join("/"))
+    let rooted = format!("/{}", path.trim_start_matches('/'));
+    crate::lexical_path::LexicalPath::parse(&rooted, crate::lexical_path::PathDialect::Posix)
+        .map(|path| path.to_slash_string())
+        .unwrap_or(rooted)
 }
 
 /// The POSIX parent of a `/`-rooted path: everything up to the last `/`, or `/`
@@ -2035,6 +2028,23 @@ mod tests {
         assert!(control
             .iter()
             .all(|finding| finding.rule_id != RuleId::BlastWritesSystemPath));
+    }
+
+    #[test]
+    fn string_posix_normalizer_uses_shared_lexical_contract() {
+        assert_eq!(
+            posix_lexical("/tmp/../etc//apt/./sources.list"),
+            "/etc/apt/sources.list"
+        );
+        assert_eq!(posix_lexical("/../../etc/passwd"), "/etc/passwd");
+        assert_eq!(posix_lexical("var/log/../etc"), "/var/etc");
+
+        // This helper has an explicitly POSIX grammar even on Windows hosts;
+        // a Windows-shaped token remains one literal POSIX component.
+        assert_eq!(
+            posix_lexical(r"C:\Windows\System32"),
+            r"/C:\Windows\System32"
+        );
     }
 
     #[test]

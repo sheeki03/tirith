@@ -321,32 +321,22 @@ mod tests {
         );
     }
 
-    /// RAII current-dir guard. `tirith preview` resolves globs / repo root from
-    /// the process cwd, so these tests must chdir. The crate-wide env lock keeps
-    /// concurrent cwd-mutating tests from racing.
+    /// Compatibility wrapper for tests that need a specific cwd. The shared
+    /// process-global guard serializes both cwd and environment mutation and
+    /// restores their exact prior values on drop.
     pub(crate) struct CwdGuard {
-        prev: PathBuf,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _global: tirith_test_support::GlobalStateGuard,
     }
 
     impl CwdGuard {
         pub(crate) fn enter(to: &std::path::Path) -> Self {
-            // A process-global lock so cwd-mutating tests in this module never
-            // run concurrently (cwd is process-global, like std::env).
-            static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::current_dir().unwrap();
+            let global = tirith_test_support::GlobalStateGuard::new()
+                .expect("isolate process-global preview test state");
             // Canonicalize so macOS `/var` → `/private/var` symlink does not
             // make the repo-root `starts_with` check fail.
             let to = to.canonicalize().unwrap_or_else(|_| to.to_path_buf());
             std::env::set_current_dir(&to).unwrap();
-            CwdGuard { prev, _lock: lock }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.prev);
+            CwdGuard { _global: global }
         }
     }
 }

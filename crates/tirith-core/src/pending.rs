@@ -407,34 +407,13 @@ pub fn list_unresolved() -> Result<Vec<PendingDecision>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tirith_test_support::GlobalStateGuard;
 
-    /// RAII guard that sets `XDG_STATE_HOME` to a test path and restores the prior
-    /// value (or unsets it) in `drop`. Using a Drop guard rather than an
-    /// immediately-invoked closure means the restore still runs when a panicking
-    /// `assert!`/`unwrap()` unwinds the test (a closure-and-`return` pattern would
-    /// unwind PAST the restore and LEAK the override into later tests).
-    struct XdgStateGuard {
-        prev: Option<String>,
-    }
-
-    impl XdgStateGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let prev = std::env::var("XDG_STATE_HOME").ok();
-            // SAFETY: serialized by crate::TEST_ENV_LOCK across all modules; the
-            // caller holds that lock for the lifetime of this guard.
-            unsafe { std::env::set_var("XDG_STATE_HOME", path) };
-            Self { prev }
-        }
-    }
-
-    impl Drop for XdgStateGuard {
-        fn drop(&mut self) {
-            // SAFETY: still under crate::TEST_ENV_LOCK (held by the test body).
-            match self.prev.take() {
-                Some(val) => unsafe { std::env::set_var("XDG_STATE_HOME", val) },
-                None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
-            }
-        }
+    fn isolated_state() -> (GlobalStateGuard, tempfile::TempDir) {
+        let mut environment = GlobalStateGuard::new().expect("isolate pending state");
+        let temporary = tempfile::tempdir().expect("create pending state root");
+        environment.set_env("XDG_STATE_HOME", temporary.path());
+        (environment, temporary)
     }
 
     /// Build a minimal pending decision for tests.
@@ -456,13 +435,7 @@ mod tests {
 
     #[test]
     fn register_load_resolve_export_roundtrip() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let tmp = tempfile::tempdir().unwrap();
-        // Restores XDG_STATE_HOME on drop even if an assertion below panics.
-        let _xdg = XdgStateGuard::set(tmp.path());
+        let (_environment, _tmp) = isolated_state();
 
         // register generates an id and creation timestamp.
         let id = register(sample(PendingSource::Restore, "high")).unwrap();
@@ -514,12 +487,7 @@ mod tests {
         // entry. With the lock held across load/modify/save, every entry lands.
         // fs2 uses flock() on Unix, which serialises distinct file handles even
         // within one process, so threads here genuinely contend on the lock.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let tmp = tempfile::tempdir().unwrap();
-        let _xdg = XdgStateGuard::set(tmp.path());
+        let (_environment, _tmp) = isolated_state();
 
         const THREADS: usize = 8;
         const PER_THREAD: usize = 3;
@@ -547,12 +515,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_empty_and_expiry_marks_expired() {
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let tmp = tempfile::tempdir().unwrap();
-        let _xdg = XdgStateGuard::set(tmp.path());
+        let (_environment, _tmp) = isolated_state();
 
         // No file yet: every reader tolerates the missing store (Ok(empty)).
         assert!(load_all().unwrap().is_empty());
@@ -586,12 +549,7 @@ mod tests {
         // A10: an unparseable `pending.json` must make a mutating op (register)
         // return Err and must NOT be overwritten with an empty snapshot. Read-only
         // callers (load_all/list_unresolved) must surface the error too.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let tmp = tempfile::tempdir().unwrap();
-        let _xdg = XdgStateGuard::set(tmp.path());
+        let (_environment, _tmp) = isolated_state();
 
         // Plant a corrupt store at the exact path load_map() reads.
         let path = store_path().expect("store path under XDG_STATE_HOME");
@@ -627,12 +585,7 @@ mod tests {
         // Ok(empty). It must fail closed exactly like the unparseable case so the
         // next save does not overwrite the truncated store. (A missing file is the
         // ONLY empty-Ok path; this is the regression that distinguishes them.)
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let tmp = tempfile::tempdir().unwrap();
-        let _xdg = XdgStateGuard::set(tmp.path());
+        let (_environment, _tmp) = isolated_state();
 
         let path = store_path().expect("store path under XDG_STATE_HOME");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -666,12 +619,7 @@ mod tests {
         // id must return `Ok(false)` without writing. (Previously every locked op
         // saved unconditionally, materialising the store during a pure list and
         // turning a read-only path into an error for a logically no-op resolve.)
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let tmp = tempfile::tempdir().unwrap();
-        let _xdg = XdgStateGuard::set(tmp.path());
+        let (_environment, _tmp) = isolated_state();
 
         let path = store_path().expect("store path under XDG_STATE_HOME");
         assert!(!path.exists(), "precondition: no store file yet");
@@ -725,12 +673,7 @@ mod tests {
         // must return Err and must NOT clobber the existing entry (which would
         // destroy its resolution history). The empty-id auto-generation path is
         // unaffected and exercised elsewhere.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let tmp = tempfile::tempdir().unwrap();
-        let _xdg = XdgStateGuard::set(tmp.path());
+        let (_environment, _tmp) = isolated_state();
 
         // Seed an entry under a fixed id, then resolve it so it carries history.
         let mut first = sample(PendingSource::Restore, "high");
@@ -777,12 +720,7 @@ mod tests {
         // stored key and the dup-check, so `"fixed001 "` and `"fixed001"` are the
         // SAME entry: the second register collides (fails closed) instead of
         // inserting an ambiguous duplicate.
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let tmp = tempfile::tempdir().unwrap();
-        let _xdg = XdgStateGuard::set(tmp.path());
+        let (_environment, _tmp) = isolated_state();
 
         // Register with surrounding whitespace; the stored id must be trimmed.
         let mut first = sample(PendingSource::Restore, "high");

@@ -31,6 +31,15 @@ jobs:
           set -o pipefail
           cargo bench --bench perf -- --output-format bencher | tee bench-output.txt
 
+      # C19: the ABSOLUTE gate. The relative alert below reports but does not
+      # fail, so on its own it can only answer "slower than last week" and never
+      # "fast enough": a sequence of sub-threshold regressions passes it
+      # indefinitely. These ceilings are generous enough that runner noise
+      # cannot trip them and tight enough to catch an order-of-magnitude
+      # regression. Derivation is written down in benches/budgets.txt.
+      - name: Enforce absolute benchmark budgets
+        run: ./scripts/check-bench-budgets.sh bench-output.txt
+
       - name: Store benchmark result
         uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
         # repo-0452: only store results when the benchmark step succeeded;

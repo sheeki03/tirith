@@ -75,7 +75,7 @@ use tirith_core::receipt::{
 };
 use tirith_core::task_boundary::{
     BoundaryOperation, PackageInstallPreparationBoundary, PackageOperationBinding,
-    PackageTargetIdentity, TaskBoundaryPermit,
+    PackageTargetIdentity, TaskBoundaryEffectLease, TaskBoundaryPermit,
 };
 
 use crate::cli::capsule::{self, BoundLaunchArg, BoundLaunchDirectory, BoundLaunchInput};
@@ -298,7 +298,7 @@ pub struct EnvironmentCheckpoint {
     #[cfg(target_os = "linux")]
     _lock: File,
     private_target: PathBuf,
-    task_authorization: Option<TaskBoundaryPermit<PackageInstallPreparationBoundary>>,
+    task_authorization: Option<TaskBoundaryEffectLease<PackageInstallPreparationBoundary>>,
     task_envelope: Option<tirith_core::task::TaskEnvelopeInput>,
     #[cfg(target_os = "linux")]
     state: CheckpointState,
@@ -323,7 +323,7 @@ impl std::fmt::Debug for EnvironmentCheckpoint {
 pub struct AuthorizedInstallLaunch {
     target_install_path: PathBuf,
     target_handle: File,
-    task_authorization: TaskBoundaryPermit<PackageInstallPreparationBoundary>,
+    task_authorization: TaskBoundaryEffectLease<PackageInstallPreparationBoundary>,
     task_envelope: tirith_core::task::TaskEnvelopeInput,
 }
 
@@ -510,14 +510,16 @@ impl EnvironmentCheckpoint {
             adapter: tirith_core::task::IngressAdapter::Unattributed,
             boundary_effects: Default::default(),
         };
-        if !permit.binds_operation(&operation) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "task boundary permit does not bind this exact install-preparation operation",
-            ));
-        }
+        let lease = permit
+            .into_effect_lease_at(&operation, chrono::Utc::now())
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("install-preparation authorization expired or changed: {error}"),
+                )
+            })?;
         let mut checkpoint = Self::begin(binding)?;
-        checkpoint.task_authorization = Some(permit);
+        checkpoint.task_authorization = Some(lease);
         checkpoint.task_envelope = Some(envelope);
         Ok(checkpoint)
     }
@@ -1339,6 +1341,35 @@ pub struct ContainedInstallOutcome {
     pub post_install: Option<PostInstallIntegrity>,
 }
 
+/// A completed contained install that still owns the exact, non-cloneable task
+/// authorization. The caller must keep this transaction alive and recheck it at
+/// each receipt/publication seam; extracting only the reportable outcome cannot
+/// authorize any further side effect.
+pub struct AuthorizedContainedInstallOutcome {
+    outcome: ContainedInstallOutcome,
+    authorization: TaskBoundaryEffectLease<PackageInstallPreparationBoundary>,
+    task_envelope: tirith_core::task::TaskEnvelopeInput,
+}
+
+impl AuthorizedContainedInstallOutcome {
+    pub fn outcome(&self) -> &ContainedInstallOutcome {
+        &self.outcome
+    }
+
+    pub fn authorize_effect_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), tirith_core::task_boundary::BoundaryAuthorizationError> {
+        let operation = BoundaryOperation {
+            boundary: tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+            envelope: &self.task_envelope,
+            adapter: tirith_core::task::IngressAdapter::Unattributed,
+            boundary_effects: Default::default(),
+        };
+        self.authorization.authorize_effect_at(&operation, now)
+    }
+}
+
 /// Why a contained install-from-digest could not run. Distinct from
 /// [`tirith_core::artifact::install::InstallError`] (which is the planning/re-bind
 /// failure surfaced before this module runs): this is a failure of the side-effect
@@ -1482,7 +1513,7 @@ pub fn run_contained_install(
     policy: &Policy,
     suppress_child_output: bool,
     task_denied_effects: &std::collections::BTreeSet<tirith_core::effects::CommandEffectKind>,
-) -> Result<ContainedInstallOutcome, ContainedInstallError> {
+) -> Result<AuthorizedContainedInstallOutcome, ContainedInstallError> {
     let AuthorizedInstallLaunch {
         target_install_path,
         target_handle,
@@ -1514,6 +1545,19 @@ pub fn run_contained_install(
     //    lexical path check is not authority: an ancestor could be renamed after a
     //    check. The transaction helper writes + renames relative to the held
     //    directory and returns the public absolute path only for reporting.
+    let control_operation = BoundaryOperation {
+        boundary: tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
+        envelope: &task_envelope,
+        adapter: tirith_core::task::IngressAdapter::Unattributed,
+        boundary_effects: Default::default(),
+    };
+    task_authorization
+        .authorize_effect_at(&control_operation, chrono::Utc::now())
+        .map_err(|error| {
+            ContainedInstallError::ToolBinding(format!(
+                "package install authorization expired before control-file publication: {error}"
+            ))
+        })?;
     let approved_path = transaction.write_control_file_atomic_0600(
         APPROVED_REQUIREMENTS_FILE,
         plan.approved_requirements.as_bytes(),
@@ -1621,8 +1665,8 @@ pub fn run_contained_install(
     #[cfg(test)]
     invoke_pre_bound_launch_test_hook();
     let outcome = run_authorized_install_capsule(
-        task_authorization,
-        task_envelope,
+        &task_authorization,
+        &task_envelope,
         &plan.spec,
         tools.python(),
         &args,
@@ -1660,22 +1704,26 @@ pub fn run_contained_install(
         None
     };
 
-    Ok(ContainedInstallOutcome {
-        exit_code: outcome.exit_code,
-        backend_id: outcome.backend_id,
-        coverage_summary: outcome.coverage_summary(),
-        coverage: outcome.coverage,
-        termination: outcome.termination,
-        bound_db_sequence: plan.bound_db_sequence,
-        approved_requirements_path: approved_path,
-        post_install,
+    Ok(AuthorizedContainedInstallOutcome {
+        outcome: ContainedInstallOutcome {
+            exit_code: outcome.exit_code,
+            backend_id: outcome.backend_id,
+            coverage_summary: outcome.coverage_summary(),
+            coverage: outcome.coverage,
+            termination: outcome.termination,
+            bound_db_sequence: plan.bound_db_sequence,
+            approved_requirements_path: approved_path,
+            post_install,
+        },
+        authorization: task_authorization,
+        task_envelope,
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_authorized_install_capsule(
-    task_authorization: TaskBoundaryPermit<PackageInstallPreparationBoundary>,
-    task_envelope: tirith_core::task::TaskEnvelopeInput,
+    task_authorization: &TaskBoundaryEffectLease<PackageInstallPreparationBoundary>,
+    task_envelope: &tirith_core::task::TaskEnvelopeInput,
     spec: &tirith_core::capsule::CapsuleSpec,
     program: &tirith_core::trusted_child::TrustedExecutable,
     args: &[BoundLaunchArg],
@@ -1686,7 +1734,7 @@ fn run_authorized_install_capsule(
 ) -> Result<capsule::CapsuleExecutionOutcome, capsule::CapsuleExecutionError> {
     let operation = BoundaryOperation {
         boundary: tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
-        envelope: &task_envelope,
+        envelope: task_envelope,
         adapter: tirith_core::task::IngressAdapter::Unattributed,
         boundary_effects: Default::default(),
     };
@@ -2639,7 +2687,7 @@ mod tests {
             EnvGuard::set("HOME", root.path()),
             EnvGuard::set("USERPROFILE", root.path()),
         ];
-        std::env::set_var("TIRITH_LOG", "1");
+        let _log = EnvGuard::set("TIRITH_LOG", std::path::Path::new("1"));
 
         // A policy carrying a secret that must NOT reach the receipt's policy hash.
         let policy = Policy {
@@ -2680,8 +2728,6 @@ mod tests {
             !json.contains("ghp_SECRET_TOKEN_42"),
             "the receipt must never serialize the policy server API key: {json}"
         );
-
-        std::env::remove_var("TIRITH_LOG");
     }
 
     #[test]
@@ -2696,7 +2742,7 @@ mod tests {
             EnvGuard::set("HOME", root.path()),
             EnvGuard::set("USERPROFILE", root.path()),
         ];
-        std::env::set_var("TIRITH_LOG", "1");
+        let _log = EnvGuard::set("TIRITH_LOG", std::path::Path::new("1"));
 
         let mut outcome = ok_outcome();
         outcome.exit_code = 1;
@@ -2717,7 +2763,5 @@ mod tests {
             json.contains("\"post_install_record\": null"),
             "a failed install records no post-install RECORD summary: {json}"
         );
-
-        std::env::remove_var("TIRITH_LOG");
     }
 }

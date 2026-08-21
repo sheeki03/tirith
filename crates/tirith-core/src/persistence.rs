@@ -832,36 +832,7 @@ pub fn save_snapshot(path: &Path, snapshot: &PersistenceSnapshot) -> std::io::Re
 mod tests {
     use super::*;
     use tempfile::tempdir;
-
-    #[cfg(unix)]
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(name);
-            // SAFETY: every caller holds TEST_ENV_LOCK until Drop restores the
-            // previous value.
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds TEST_ENV_LOCK.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.name, value),
-                    None => std::env::remove_var(self.name),
-                }
-            }
-        }
-    }
+    use tirith_test_support::GlobalStateGuard;
 
     #[cfg(unix)]
     fn write_marker_executable(path: &Path, marker: &Path) {
@@ -884,9 +855,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistence_inventory_ignores_path_shadowed_crontab_and_osascript() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut environment = GlobalStateGuard::new().expect("isolate persistence environment");
         let temporary = tempdir().unwrap();
         let shadow_bin = temporary.path().join("shadow-bin");
         std::fs::create_dir(&shadow_bin).unwrap();
@@ -898,7 +867,7 @@ mod tests {
         let inherited = std::env::var_os("PATH").unwrap_or_default();
         let mut path_entries = vec![shadow_bin];
         path_entries.extend(std::env::split_paths(&inherited));
-        let _path = EnvVarGuard::set("PATH", std::env::join_paths(path_entries).unwrap());
+        environment.set_env("PATH", std::env::join_paths(path_entries).unwrap());
 
         let crontab = crontab_entry();
         let login_items = login_items_entry();

@@ -164,6 +164,7 @@ toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+tirith-test-support = { workspace = true }
 toml = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

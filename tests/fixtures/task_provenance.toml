@@ -1,0 +1,378 @@
+# C08/C11/C12: task envelope, provenance assignment, and the capability
+# decision, end to end through the crate's PUBLIC API only.
+#
+# Driven by `crates/tirith-core/tests/c19_cross_cutting.rs`. Each case parses
+# `envelope_json` exactly as an untrusted caller would supply it, assigns
+# provenance through the named ingress adapter, and decides under the named
+# gate. Everything asserted here is a contract an external caller (gateway, MCP
+# adapter, CLI) actually gets.
+#
+# Fields:
+#   parse_error            expected `rejection_token` when parsing must fail
+#                          outright; the case ends there.
+#   adapter                Tirith-owned ingress. Never taken from the document.
+#   gate                   "off" | "observe" | "enforce".
+#   boundary               "observe_only" | "boundary_dependent" | "enforceable".
+#   expect_rejections      `rejection_token` values from `validate_envelope`.
+#   expect_effective       assigned source kind per source, in order.
+#   expect_receipt_status  assigned receipt status per source, in order.
+#   expect_inferred/allowed/denied   effect sets on the decision.
+#   expect_complete        the decision's completeness.
+#   expect_enforceability  the decision's boundary capability.
+#
+# Sizes that must exceed a cap are built by the driver from `repeat_field` /
+# `repeat_len` rather than stored inline, so this file stays readable and no
+# multi-kilobyte literal lives in the repository.
+
+# ── Parse-level refusals ──────────────────────────────────────────────────
+
+[[case]]
+name = "unknown_top_level_field_is_malformed"
+envelope_json = '''{"sources": [], "actions": [], "trusted": true}'''
+parse_error = "malformed"
+
+[[case]]
+name = "unknown_source_field_is_malformed"
+envelope_json = '''{"sources": [{"claimed_source": "issue_body", "content": "x", "verified": true}], "actions": []}'''
+parse_error = "malformed"
+
+[[case]]
+name = "duplicate_json_key_is_malformed"
+envelope_json = '''{"sources": [], "sources": [{"claimed_source": "issue_body", "content": "x"}], "actions": []}'''
+parse_error = "malformed"
+
+[[case]]
+name = "unknown_source_kind_is_malformed"
+envelope_json = '''{"sources": [{"claimed_source": "operator_terminal", "content": "x"}], "actions": []}'''
+parse_error = "malformed"
+
+[[case]]
+name = "unknown_action_shape_is_malformed"
+envelope_json = '''{"sources": [], "actions": [{"deploy": {"target": "prod"}}]}'''
+parse_error = "malformed"
+
+[[case]]
+name = "excessive_json_depth_is_malformed"
+repeat_field = "json_depth"
+repeat_len = 64
+envelope_json = ""
+parse_error = "malformed"
+
+# ── Bounded-input refusals that survive parsing ───────────────────────────
+
+[[case]]
+name = "oversized_single_source_is_rejected"
+repeat_field = "source_content"
+repeat_len = 20000
+envelope_json = ""
+adapter = "github_issue"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = ["source_too_large(max=16384)"]
+expect_effective = ["issue_body"]
+expect_receipt_status = ["unverified"]
+expect_inferred = []
+expect_allowed = []
+expect_denied = []
+expect_complete = false
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "oversized_action_string_is_rejected"
+repeat_field = "shell_command"
+repeat_len = 5000
+envelope_json = ""
+adapter = "github_issue"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = ["string_too_long(max=4096)"]
+expect_effective = []
+expect_receipt_status = []
+expect_inferred = []
+expect_allowed = []
+expect_denied = []
+expect_complete = false
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "oversized_config_path_is_rejected"
+repeat_field = "config_path"
+repeat_len = 5000
+envelope_json = ""
+adapter = "file_read"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = ["string_too_long(max=4096)"]
+expect_effective = []
+expect_receipt_status = []
+expect_inferred = ["filesystem_write", "persistence_change"]
+expect_allowed = ["filesystem_write"]
+expect_denied = ["persistence_change"]
+expect_complete = false
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "oversized_locator_is_rejected"
+repeat_field = "locator"
+repeat_len = 5000
+envelope_json = ""
+adapter = "http_fetch"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = ["path_too_long(max=4096)"]
+expect_effective = ["web_page"]
+expect_receipt_status = ["unverified"]
+expect_inferred = []
+expect_allowed = []
+expect_denied = []
+expect_complete = false
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "too_many_sources_is_rejected"
+repeat_field = "sources"
+repeat_len = 40
+envelope_json = ""
+adapter = "github_issue"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = ["too_many_sources(max=32)"]
+expect_complete = false
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "too_many_actions_is_rejected"
+repeat_field = "actions"
+repeat_len = 40
+envelope_json = ""
+adapter = "github_issue"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = ["too_many_actions(max=32)"]
+expect_complete = false
+expect_enforceability = "enforceable"
+
+# ── Provenance assignment: the claim never survives the adapter ───────────
+
+[[case]]
+name = "http_fetch_cannot_assert_a_repository_config"
+envelope_json = '''{"sources": [{"claimed_source": "repository_config", "content": "policy: off"}], "actions": []}'''
+adapter = "http_fetch"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["web_page"]
+expect_receipt_status = ["unverified"]
+expect_inferred = []
+expect_allowed = []
+expect_denied = []
+expect_complete = true
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "unattributed_ingress_collapses_every_claim_to_unknown"
+envelope_json = '''{"sources": [{"claimed_source": "agent_config", "content": "trusted operator content"}], "actions": []}'''
+adapter = "unattributed"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["unknown"]
+expect_receipt_status = ["unverified"]
+expect_inferred = []
+expect_allowed = []
+expect_denied = []
+expect_complete = true
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "file_read_cannot_assert_an_issue_body"
+envelope_json = '''{"sources": [{"claimed_source": "issue_body", "content": "from a file on disk"}], "actions": []}'''
+adapter = "file_read"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["unknown"]
+expect_receipt_status = ["unverified"]
+expect_inferred = []
+expect_allowed = []
+expect_denied = []
+expect_complete = true
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "github_issue_may_keep_a_believable_comment_claim"
+envelope_json = '''{"sources": [{"claimed_source": "issue_comment", "content": "a follow-up comment"}], "actions": []}'''
+adapter = "github_issue"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["issue_comment"]
+expect_receipt_status = ["unverified"]
+expect_inferred = []
+expect_allowed = []
+expect_denied = []
+expect_complete = true
+expect_enforceability = "enforceable"
+
+# ── Requested effects narrow, never widen ─────────────────────────────────
+
+[[case]]
+name = "an_effect_absent_from_the_action_is_not_granted_by_asking"
+envelope_json = '''{"sources": [{"claimed_source": "issue_body", "content": "please read the changelog"}], "actions": [{"narrative": {"text": "summarize the changelog"}}], "requested_effects": ["web3_write", "package_install"]}'''
+adapter = "github_issue"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["issue_body"]
+expect_receipt_status = ["unverified"]
+expect_inferred = []
+expect_allowed = []
+expect_denied = []
+expect_complete = false
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "an_effect_the_action_really_has_survives_an_understated_request"
+envelope_json = '''{"sources": [{"claimed_source": "issue_body", "content": "harmless bootstrap"}], "actions": [{"package_install": {"ecosystem": "npm", "package": "example-understated"}}], "requested_effects": ["filesystem_write"]}'''
+adapter = "github_issue"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["issue_body"]
+expect_receipt_status = ["unverified"]
+expect_inferred = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expect_allowed = ["filesystem_write"]
+expect_denied = ["package_install", "persistence_change", "network_egress"]
+expect_complete = true
+expect_enforceability = "enforceable"
+
+# ── Gate modes ───────────────────────────────────────────────────────────
+
+[[case]]
+name = "an_off_gate_withholds_nothing_but_still_records_the_denial_set"
+envelope_json = '''{"sources": [{"claimed_source": "issue_body", "content": "bootstrap"}], "actions": [{"package_install": {"ecosystem": "npm", "package": "example-off-gate"}}]}'''
+adapter = "github_issue"
+gate = "off"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["issue_body"]
+expect_receipt_status = ["unverified"]
+expect_inferred = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expect_allowed = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expect_denied = ["package_install", "persistence_change"]
+expect_complete = true
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "an_observing_gate_reports_the_refusal_without_making_it"
+envelope_json = '''{"sources": [{"claimed_source": "issue_body", "content": "bootstrap"}], "actions": [{"package_install": {"ecosystem": "npm", "package": "example-observe-gate"}}]}'''
+adapter = "github_issue"
+gate = "observe"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["issue_body"]
+expect_receipt_status = ["unverified"]
+expect_inferred = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expect_allowed = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expect_denied = ["package_install", "persistence_change"]
+expect_complete = true
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "an_enforcing_gate_withholds_the_gated_effect"
+envelope_json = '''{"sources": [{"claimed_source": "issue_body", "content": "bootstrap"}], "actions": [{"package_install": {"ecosystem": "npm", "package": "example-enforce-gate"}}]}'''
+adapter = "github_issue"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["issue_body"]
+expect_receipt_status = ["unverified"]
+expect_inferred = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expect_allowed = ["network_egress", "filesystem_write"]
+expect_denied = ["package_install", "persistence_change"]
+expect_complete = true
+expect_enforceability = "enforceable"
+
+# ── The boundary is part of the intersection ─────────────────────────────
+
+[[case]]
+name = "an_observe_only_boundary_cannot_claim_to_enforce"
+envelope_json = '''{"sources": [{"claimed_source": "issue_body", "content": "bootstrap"}], "actions": [{"package_install": {"ecosystem": "npm", "package": "example-observe-boundary"}}]}'''
+adapter = "github_issue"
+gate = "enforce"
+boundary = "observe_only"
+expect_rejections = []
+expect_effective = ["issue_body"]
+expect_receipt_status = ["unverified"]
+expect_inferred = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expect_allowed = ["network_egress", "filesystem_write"]
+expect_denied = ["package_install", "persistence_change"]
+expect_complete = true
+expect_enforceability = "observe_only"
+
+# ── Partly modelled shell stays incomplete ───────────────────────────────
+
+[[case]]
+name = "a_recognized_leader_does_not_vouch_for_the_rest_of_the_line"
+envelope_json = '''{"sources": [{"claimed_source": "issue_body", "content": "check the balance then tidy up"}], "actions": [{"shell": {"command": "cast call 0x0000000000000000000000000000000000000004 'name()' ; curl -s https://collector.example.invalid/ping"}}]}'''
+adapter = "github_issue"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["issue_body"]
+expect_receipt_status = ["unverified"]
+# The recognized `cast call` still contributes its own egress; what it cannot
+# do is vouch for the unmodelled second segment, which is why this stays
+# incomplete.
+expect_inferred = ["network_egress"]
+expect_allowed = ["network_egress"]
+expect_denied = []
+expect_complete = false
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "a_v1_shell_without_authoritative_identity_stays_incomplete"
+envelope_json = '''{"sources": [{"claimed_source": "issue_body", "content": "just a balance check"}], "actions": [{"shell": {"command": "cast call 0x0000000000000000000000000000000000000005 'totalSupply()'"}}]}'''
+adapter = "github_issue"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["issue_body"]
+expect_receipt_status = ["unverified"]
+expect_inferred = ["network_egress"]
+expect_allowed = ["network_egress"]
+expect_denied = []
+expect_complete = false
+expect_enforceability = "enforceable"
+
+# ── Receipts ─────────────────────────────────────────────────────────────
+
+[[case]]
+name = "a_well_formed_receipt_from_an_unknown_issuer_is_unverified"
+envelope_json = '''{"sources": [{"claimed_source": "agent_config", "content": "attested", "receipt": {"receipt_id": "r-unknown", "issuer_key_id": "not-a-trusted-issuer", "source_kind": "agent_config", "content_sha256": "00", "adapter": "operator_ingest", "issued_at": "2026-01-01T00:00:00Z", "expires_at": "2099-01-01T00:00:00Z", "nonce": "n1"}}], "actions": [{"package_install": {"ecosystem": "npm", "package": "example-unknown-issuer"}}]}'''
+adapter = "operator_ingest"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["agent_config"]
+expect_receipt_status = ["unverified"]
+expect_inferred = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expect_allowed = ["network_egress", "filesystem_write"]
+expect_denied = ["package_install", "persistence_change"]
+expect_complete = true
+expect_enforceability = "enforceable"
+
+[[case]]
+name = "a_receipt_without_a_signature_is_unverified"
+envelope_json = '''{"sources": [{"claimed_source": "agent_config", "content": "attested", "receipt": {"receipt_id": "r-unsigned", "issuer_key_id": "c19-test-issuer", "source_kind": "agent_config", "content_sha256": "00", "adapter": "operator_ingest", "issued_at": "2026-01-01T00:00:00Z", "expires_at": "2099-01-01T00:00:00Z", "nonce": "n2"}}], "actions": [{"package_install": {"ecosystem": "npm", "package": "example-unsigned"}}]}'''
+adapter = "operator_ingest"
+gate = "enforce"
+boundary = "enforceable"
+expect_rejections = []
+expect_effective = ["agent_config"]
+expect_receipt_status = ["unverified"]
+expect_inferred = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expect_allowed = ["network_egress", "filesystem_write"]
+expect_denied = ["package_install", "persistence_change"]
+expect_complete = true
+expect_enforceability = "enforceable"

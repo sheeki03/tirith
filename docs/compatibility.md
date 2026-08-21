@@ -41,13 +41,42 @@ what an experimental command must satisfy to move to stable.
 | `license` | Experimental | License status and management. |
 | `mcp-server` | Experimental | MCP server mode (JSON-RPC over stdio). |
 | `lab` | Experimental | Adversarial training corpus runner. Offline. `--filter` narrows by tag; `--score` adds a 0-100 risk score per scenario. |
+| `task check` | Preview | Diagnostic task-envelope assessment. Reports what an envelope would be allowed to do; executes, fetches, resolves, and writes nothing, and declares `enforceability: observe_only`. |
+| `capsule run` | Experimental | Fail-closed contained run of an untrusted project. Enforceable on x86_64 Linux only; every other host refuses before anything is copied or spawned, with no degraded fallback. |
+| `browser audit` | Experimental | Read-only Chromium-family extension integrity audit. Chrome, Chromium, Brave, and Edge; Firefox and XPI are refused by name. |
+| `pkg attest-npm` | Experimental | Point-in-time npm signature and provenance receipt over an installed project. |
+| `attest` | Experimental | Point-in-time build and deployment receipts (`build`, `verify-build`, `deployment`, `verify-deployment`). |
 | `completions` | Experimental | Shell completion generation (hidden). |
 | `manpage` | Experimental | Man page generation (hidden). |
+
+**Preview** is a tier below Experimental: the command is diagnostic, its output
+is advisory rather than an enforcement decision, and its schema may change
+without a deprecation cycle. `task check` is the only command at this tier.
 
 The MCP tools exposed by `mcp-server` (`tirith_check_command`, `tirith_check_url`,
 `tirith_check_paste`, `tirith_scan_file`, `tirith_scan_directory`,
 `tirith_verify_mcp_config`, `tirith_fetch_cloaking`) are also treated as an
 integration-critical surface for graduation purposes.
+
+### The default MCP tool list is a frozen contract
+
+`tools/list` on a default `tirith mcp-server` returns exactly the six tools
+above, plus `tirith_fetch_cloaking` on Unix, in that order. The list is pinned
+by a contract test, because clients cache it and a tool that appears
+unannounced changes what an agent believes it may call.
+
+A new tool therefore cannot simply be added to it. `tirith_check_task` is
+**preview-gated**: it is absent from the default list, and a client that learned
+the name elsewhere and called it anyway is refused BY NAME with
+`tirith_check_task is a preview tool; set TIRITH_MCP_PREVIEW=1 to enable it`.
+
+```bash
+TIRITH_MCP_PREVIEW=1 tirith mcp-server   # advertises the preview tool too
+```
+
+Every object in the preview tool's input schema is
+`additionalProperties: false`, so a client cannot smuggle an unmodelled field
+past the bounded envelope parser.
 
 ## Graduation Criteria
 
@@ -93,6 +122,27 @@ Exit code 3 is the warn-ack hook protocol path used by shell hooks under strict
 warn mode, not the normal direct-CLI contract. Non-hook callers should not
 normally see exit code 3.
 
+### Per-command exit codes are deliberately distinct
+
+The table above is the `tirith check` contract. It is not shared. Commands that
+report evidence rather than a verdict define their own codes, and each says so
+in its own `--help`, so a script must read the contract for the command it
+calls rather than assuming the check ladder.
+
+| Command | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| `task check` | nothing denied, analysis complete | something denied, incomplete, or the envelope was partly rejected | usage or input error | not used |
+| `capsule run` | contained, child exited 0 | a tirith decision: refused before launch, terminated after it, or a receipt that could not be recorded or anchored | usage or input error | contained, but the child exited non-zero |
+| `browser audit` | no drift, and any JSON write succeeded | drift, including partial coverage with a baseline | usage error, or a JSON write failure with no drift | not used |
+| `pkg attest-npm` | `clean` | `mismatch` | usage or input error | `partial` |
+| `attest *` | `clean` | `mismatch` | usage or input error | `partial` |
+
+The `3` for `pkg attest-npm` and `attest` is `partial` (incomplete evidence),
+NOT a warn acknowledgement. Reusing `3` across unrelated meanings would be worse
+than making the codes distinct, because a script that already handles `3` as
+"acknowledge and continue" would treat incomplete evidence as an accepted
+warning.
+
 ## JSON Output
 
 - `schema_version` is emitted in all JSON output (currently version 3)
@@ -114,6 +164,43 @@ normally see exit code 3.
 - Both `policy.yaml` and `policy.yml` extensions are accepted (`.yaml` preferred)
 - Policy format is additive: new keys may appear
 - Existing keys will not change semantics within a major version
+- `web3_guard` and `task_gate` are new top-level sections. Both are optional and
+  both default to inert, so a policy written before they existed loads and
+  behaves identically. See
+  [web3 command guard](security/web3-command-guard.md) and
+  [task envelope](task-envelope.md) for the field references
+- Tirith does not auto-write a schema-upgraded policy file, so rolling a binary
+  back does not strand a user who never enabled the new sections
+
+## Document schemas
+
+Content-addressed documents carry their own schema and format versions, so an
+older binary reading a newer document fails explicitly instead of half-reading
+it.
+
+| Document | Schema field | Notes |
+|---|---|---|
+| Command card | `schema_version` | Defaults to 1 and is SKIPPED when it equals 1, so a v1 card's signing bytes are byte-identical to what they were before schema 2 existed and every checked-in v1 signature still verifies. `web3` is likewise omitted when unset |
+| Browser extension baseline | `schema` plus an independent `format_version` | The hashing rules version is separate so a stale baseline reports one `schema_upgrade_required` entry rather than phantom drift on every extension |
+| npm provenance receipt | `schema` | |
+| Build receipt | `schema` | |
+| Deployment receipt | `schema` | |
+| Capsule run receipt | `schema` | |
+
+All five share an envelope core (`schema`, `receipt_type`, content-addressed
+`receipt_id`, `created_at`, `tirith_version`, `coverage`, `signature`), one
+canonicalizer, and one signing routine. The capsule, npm, build, and deployment
+receipts additionally carry `engine_build_sha`, `policy_projection_hash`,
+`status`, `subject`, and `evidence`; the npm, build, and deployment receipts
+carry `caveats`, which `validate` refuses to let a document drop.
+
+Only the capsule run receipt is ELIGIBLE for anchoring in the audit hash chain,
+because it is the only one written to a tirith-owned store. It is anchored when
+an audit chain is configured, and left unanchored otherwise, including under
+`TIRITH_LOG=0`; the run prints which happened. The other four say
+`audit_chain_anchored: false` and refuse to claim otherwise, because they are
+written to an operator-chosen path that the chain's anchor constructor cannot
+accept.
 
 ## PowerShell parity
 

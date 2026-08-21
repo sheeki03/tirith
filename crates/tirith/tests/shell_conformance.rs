@@ -40,10 +40,34 @@ use pty_support::{
 /// "Output has settled" gap — no new bytes for this long ⇒ the command finished.
 const QUIET: Duration = Duration::from_millis(700);
 /// Hard cap on waiting for one command to settle.
-const SETTLE_MAX: Duration = Duration::from_secs(12);
+///
+/// Raised from 12s on evidence, not theory. `wait_idle` returns as soon as
+/// output goes quiet, so this looks like it should only bound a continuously
+/// streaming command, and reverting it to 12s was tried: the flakes came
+/// straight back (2, 0, then 1 failure over three runs, against 0, 0, 0 at
+/// 60s). Under a 35-binary parallel suite the settle poll itself does not get
+/// scheduled often enough to observe quiet inside 12s, so the cap fires while
+/// the shell is merely descheduled.
+const SETTLE_MAX: Duration = Duration::from_secs(60);
 /// Hard cap on a side-effect-only command's marker file (no terminal output, so
 /// [`PtySession::wait_idle`] can't time it — poll via [`wait_for_marker`]).
-const MARKER_MAX: Duration = Duration::from_secs(15);
+///
+/// This bounds how long a real interactive shell may take to run a hook that
+/// shells out to a DEBUG-build `tirith`, while the whole workspace suite runs
+/// 35 test binaries at once. At its previous 15s it was measuring machine load
+/// rather than shell behaviour: this file failed a varying handful of tests on
+/// each parallel run and passed alone, and the tell was an EMPTY marker, so the
+/// poll had given up before the side effect landed rather than the side effect
+/// being wrong.
+///
+/// It is deliberately NOT split into a shorter "expect absence" variant. Some
+/// callers wait this out precisely to conclude a marker never appears, and for
+/// those a short timeout risks a wrong PASS, which is far worse than a slow
+/// test. The passing path is unaffected either way: it returns the moment the
+/// marker appears. `wait_for_marker` also cannot use the idle deadline that
+/// `expect_within` now uses, because an empty file offers no progress signal to
+/// reset against.
+const MARKER_MAX: Duration = Duration::from_secs(90);
 
 /// Return `(confirmed, unresolved)` from the newest valid fixed-slot ledger.
 /// This independently verifies that a PTY command crossed the durable receipt

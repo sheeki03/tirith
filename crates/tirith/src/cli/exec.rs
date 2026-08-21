@@ -476,6 +476,9 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_appends_and_replaces() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // Real layout: <root>/.tirith/policy.yaml so the grandparent containment
         // root (<root>) exists and is not a symlink — the legit write must pass.
         let dir = tempfile::tempdir().unwrap();

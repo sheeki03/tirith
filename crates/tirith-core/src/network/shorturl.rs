@@ -216,6 +216,21 @@ fn cache_put(url: &str, resolved: &str) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    const AMBIENT_PROXY_PROBE_HOSTS: [&str; 3] = [
+        "http-proxy-bypass.example.test",
+        "https-proxy-bypass.example.test",
+        "all-proxy-bypass.example.test",
+    ];
+
+    #[cfg(unix)]
+    fn is_owned_ambient_proxy_probe(request: &[u8]) -> bool {
+        let request = String::from_utf8_lossy(request);
+        AMBIENT_PROXY_PROBE_HOSTS
+            .iter()
+            .any(|host| request.contains(host))
+    }
+
     #[test]
     fn test_is_shortened_url_known() {
         assert!(is_shortened_url("https://bit.ly/abc123"));
@@ -316,7 +331,6 @@ mod tests {
     #[test]
     fn production_client_ignores_ambient_proxy_environment() {
         use std::error::Error as _;
-        use std::ffi::OsString;
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -335,32 +349,8 @@ mod tests {
             "no_proxy",
         ];
 
-        struct RestoreEnvironment(Vec<(&'static str, Option<OsString>)>);
-
-        impl Drop for RestoreEnvironment {
-            fn drop(&mut self) {
-                // SAFETY: the test holds the crate-wide TEST_ENV_LOCK until this
-                // guard restores every proxy variable.
-                unsafe {
-                    for (name, value) in self.0.drain(..) {
-                        match value {
-                            Some(value) => std::env::set_var(name, value),
-                            None => std::env::remove_var(name),
-                        }
-                    }
-                }
-            }
-        }
-
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = RestoreEnvironment(
-            PROXY_KEYS
-                .iter()
-                .map(|&name| (name, std::env::var_os(name)))
-                .collect(),
-        );
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global short-URL state");
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local proxy trap");
         listener
@@ -379,10 +369,13 @@ mod tests {
             while !worker_stop.load(Ordering::Acquire) && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        worker_hit.store(true, Ordering::Release);
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
                         let mut request = [0u8; 1024];
-                        let _ = stream.read(&mut request);
+                        if let Ok(read) = stream.read(&mut request) {
+                            if is_owned_ambient_proxy_probe(&request[..read]) {
+                                worker_hit.store(true, Ordering::Release);
+                            }
+                        }
                         let _ = stream.write_all(
                             b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         );
@@ -413,14 +406,10 @@ mod tests {
                 "all-proxy-bypass.example.test",
             ),
         ] {
-            // SAFETY: process-environment mutation is serialized by
-            // TEST_ENV_LOCK and restored by RestoreEnvironment on every exit.
-            unsafe {
-                for name in PROXY_KEYS {
-                    std::env::remove_var(name);
-                }
-                std::env::set_var(proxy_key, &proxy_url);
+            for name in PROXY_KEYS {
+                global.remove_env(name);
             }
+            global.set_env(proxy_key, &proxy_url);
 
             let resolver = crate::ssrf_guard::fetch_resolver_with_lookup_for_test(move |host| {
                 if host != expected_host {
@@ -464,6 +453,23 @@ mod tests {
                 "{proxy_key} must not bypass the guarded resolver: {messages:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambient_proxy_fixture_attributes_only_owned_shorturl_requests() {
+        assert!(is_owned_ambient_proxy_probe(
+            b"GET http://http-proxy-bypass.example.test/landing HTTP/1.1\r\n"
+        ));
+        assert!(is_owned_ambient_proxy_probe(
+            b"CONNECT https-proxy-bypass.example.test:443 HTTP/1.1\r\n"
+        ));
+        assert!(is_owned_ambient_proxy_probe(
+            b"GET http://all-proxy-bypass.example.test/landing HTTP/1.1\r\n"
+        ));
+        assert!(!is_owned_ambient_proxy_probe(
+            b"GET http://unrelated-full-suite-fixture.example.test/ HTTP/1.1\r\n"
+        ));
     }
 
     // Redirect control flow remains hermetic via injected closures below.

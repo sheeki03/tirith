@@ -410,6 +410,9 @@ mod tests {
 
     #[test]
     fn update_policy_key_creates_file() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         update_policy_key(&path, "sudo_require_reason", "true").unwrap();

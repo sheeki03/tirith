@@ -87,12 +87,22 @@ terminated after it, or a run whose receipt could not be recorded or could not
 be anchored in the audit chain), 2 (usage or input error), and 3 (contained, but
 the child itself exited non-zero).
 
+An anchor FAILURE downgrades the exit code as described. An anchor SKIP, which
+is what happens when no audit chain is configured at all (including under
+`TIRITH_LOG=0`), is not a failure and does NOT change the exit code. The run
+prints whether the receipt was anchored, so a caller that needs a tamper-evident
+receipt must read that line rather than trusting exit 0.
+
 The preset is enforceable on x86_64 Linux with a usable Landlock ABI and nowhere
 else. Raw-network denial needs seccomp, which is x86_64 Linux only in this
 build; macOS cannot enforce a per-process memory ceiling or a process-count
 ceiling at all; and the parent-owned wall-clock and combined-output supervisor
 is Linux-only. Every other host refuses before anything is copied or spawned,
 naming the exact control it could not deliver.
+
+For the operator workflow this preset exists for, including what to run before
+and after the contained run, see
+[docs/untrusted-projects.md](untrusted-projects.md).
 
 ### Linux reviewed-execution proof
 

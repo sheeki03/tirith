@@ -86,9 +86,9 @@ use crate::task::{
     validate_canonical_acquisition_identity, validate_envelope,
     validate_receipt_context_identifier, verify_authorization_set, AssignedProvenance,
     DurableReplayStore, EnforcementProjectionV1, EnvelopeRejection, IngressAdapter, ProposedAction,
-    ProvenanceReceiptV2, ReceiptStatus, ReceiptV2Error, ReplayOutcome, ReplayReservation,
-    ReplayReservationOutcome, ReplayStore, ReplayStoreError, TaskAuthorizationProjectionV1,
-    TaskDecision, TaskEnvelopeInput, TaskSourceInput,
+    ProvenanceReceiptV2, ReceiptStatus, ReceiptV2Error, ReplayKnownZeroRollback, ReplayOutcome,
+    ReplayReservation, ReplayReservationOutcome, ReplayStore, ReplayStoreError,
+    TaskAuthorizationProjectionV1, TaskDecision, TaskEnvelopeInput, TaskSourceInput,
 };
 use crate::task_analysis::TaskAnalysisContext;
 use crate::task_envelope::{TaskEnvelopeDocument, MAX_AUTHORIZATION_RECEIPTS};
@@ -122,6 +122,12 @@ pub enum OwnedBoundary {
     FetchCloaking,
     /// A Tirith-owned configuration file is about to be published by rename.
     ConfigWrite,
+    /// `tirith verify-self` is about to create private verification state and
+    /// contact the fixed Tirith release origin.
+    VerifySelf,
+    /// `tirith update` is about to contact the fixed release origin and perform
+    /// a retained, paired binary/helper update or rollback transaction.
+    SelfUpdate,
     /// `tirith capsule run --preset untrusted-project` is about to copy an
     /// untrusted project into a held ephemeral directory and launch the
     /// operator's argv inside it. Evaluated before the copy, so a refusal costs
@@ -142,6 +148,8 @@ impl OwnedBoundary {
             Self::RemoteScriptRun => "remote_script_run",
             Self::FetchCloaking => "fetch_cloaking",
             Self::ConfigWrite => "config_write",
+            Self::VerifySelf => "verify_self",
+            Self::SelfUpdate => "self_update",
             Self::CapsulePresetRun => "capsule_preset_run",
         }
     }
@@ -444,6 +452,8 @@ boundary_markers!(
     (RemoteScriptRunBoundary, RemoteScriptRun),
     (FetchCloakingBoundary, FetchCloaking),
     (ConfigWriteBoundary, ConfigWrite),
+    (VerifySelfBoundary, VerifySelf),
+    (SelfUpdateBoundary, SelfUpdate),
 );
 
 mod approval_boundary_sealed {
@@ -945,6 +955,74 @@ pub struct ReservedBoundaryAuthorization<B: BoundaryMarker> {
     marker: PhantomData<fn() -> B>,
 }
 
+/// A final-effect authorization failure that may retain durable replay cleanup
+/// ownership.
+///
+/// The underlying authorization error is safe to render immediately only after
+/// `known_zero_rollback`, when present, has been retried to completion.  Keeping
+/// the rollback opaque prevents callers from forging or reconstructing replay
+/// identities while allowing a zero-byte transport path to restore receipt
+/// reuse after transient publication failures.
+#[must_use = "known-zero replay cleanup must complete before returning from the effect seam"]
+pub struct BoundaryEffectCommitError {
+    error: BoundaryAuthorizationError,
+    known_zero_rollback: Option<Box<ReplayKnownZeroRollback>>,
+}
+
+impl std::fmt::Debug for BoundaryEffectCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundaryEffectCommitError")
+            .field("error", &self.error)
+            .field(
+                "known_zero_rollback_pending",
+                &self.known_zero_rollback.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BoundaryEffectCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for BoundaryEffectCommitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl BoundaryEffectCommitError {
+    fn without_cleanup(error: BoundaryAuthorizationError) -> Self {
+        Self {
+            error,
+            known_zero_rollback: None,
+        }
+    }
+
+    fn with_replay_cleanup(
+        error: BoundaryAuthorizationError,
+        store: DurableReplayStore,
+        reservation: ReplayReservation,
+    ) -> Self {
+        let mut rollback = ReplayKnownZeroRollback::new(store, reservation);
+        let known_zero_rollback = rollback.retry().err().map(|_| Box::new(rollback));
+        Self {
+            error,
+            known_zero_rollback,
+        }
+    }
+
+    pub fn into_parts(self) -> (BoundaryAuthorizationError, Option<ReplayKnownZeroRollback>) {
+        (
+            self.error,
+            self.known_zero_rollback.map(|rollback| *rollback),
+        )
+    }
+}
+
 impl<B: BoundaryMarker> ReservedBoundaryAuthorization<B> {
     pub fn binds_operation(&self, operation: &BoundaryOperation<'_>) -> bool {
         operation.boundary == B::BOUNDARY
@@ -969,35 +1047,66 @@ impl<B: BoundaryMarker> ReservedBoundaryAuthorization<B> {
         self,
         operation: &BoundaryOperation<'_>,
         now: DateTime<Utc>,
-    ) -> Result<TaskBoundaryPermit<B>, BoundaryAuthorizationError> {
+    ) -> Result<TaskBoundaryPermit<B>, BoundaryEffectCommitError> {
         if !self.binds_operation(operation) {
-            self.abort()?;
-            return Err(BoundaryAuthorizationError::EnvelopeMismatch);
+            return Err(match self.replay {
+                ReservedReplayAuthorization::NotRequired => {
+                    BoundaryEffectCommitError::without_cleanup(
+                        BoundaryAuthorizationError::EnvelopeMismatch,
+                    )
+                }
+                ReservedReplayAuthorization::Required { store, reservation } => {
+                    BoundaryEffectCommitError::with_replay_cleanup(
+                        BoundaryAuthorizationError::EnvelopeMismatch,
+                        store,
+                        reservation,
+                    )
+                }
+            });
         }
         if self.not_after.is_some_and(|not_after| now >= not_after) {
-            self.abort()?;
-            return Err(ReplayStoreError::Expired.into());
+            let error = BoundaryAuthorizationError::from(ReplayStoreError::Expired);
+            return Err(match self.replay {
+                ReservedReplayAuthorization::NotRequired => {
+                    BoundaryEffectCommitError::without_cleanup(error)
+                }
+                ReservedReplayAuthorization::Required { store, reservation } => {
+                    BoundaryEffectCommitError::with_replay_cleanup(error, store, reservation)
+                }
+            });
         }
-        if let ReservedReplayAuthorization::Required { store, reservation } = &self.replay {
-            match store.commit_reservation(reservation, now) {
+        let ReservedBoundaryAuthorization {
+            operation_binding_sha256,
+            boundary_operation_sha256,
+            verified_receipts,
+            not_after,
+            replay,
+            marker: _,
+        } = self;
+        if let ReservedReplayAuthorization::Required { store, reservation } = replay {
+            match store.commit_reservation(&reservation, now) {
                 Ok(ReplayOutcome::Recorded) => {}
-                Ok(ReplayOutcome::Replayed) => return Err(BoundaryAuthorizationError::Replayed),
+                Ok(ReplayOutcome::Replayed) => {
+                    return Err(BoundaryEffectCommitError::with_replay_cleanup(
+                        BoundaryAuthorizationError::Replayed,
+                        store,
+                        reservation,
+                    ));
+                }
                 Err(error) => {
-                    // A failed commit did not authorize an effect. Release the
-                    // still-live lease when possible; a crash or cleanup error
-                    // remains recoverable through its bounded expiry.
-                    if let Err(abort_error) = store.abort_reservation(reservation) {
-                        return Err(abort_error.into());
-                    }
-                    return Err(error.into());
+                    return Err(BoundaryEffectCommitError::with_replay_cleanup(
+                        error.into(),
+                        store,
+                        reservation,
+                    ));
                 }
             }
         }
         Ok(TaskBoundaryPermit {
-            operation_binding_sha256: self.operation_binding_sha256,
-            boundary_operation_sha256: self.boundary_operation_sha256,
-            verified_receipts: self.verified_receipts,
-            not_after: self.not_after,
+            operation_binding_sha256,
+            boundary_operation_sha256,
+            verified_receipts,
+            not_after,
             marker: PhantomData,
         })
     }
@@ -1064,7 +1173,7 @@ pub struct TaskBoundaryPermit<B: BoundaryMarker> {
 /// transaction. It preserves the permit's earliest deadline and exact
 /// operation binding so every individual effect can revalidate immediately
 /// before it happens.
-pub(crate) struct TaskBoundaryEffectLease<B: BoundaryMarker> {
+pub struct TaskBoundaryEffectLease<B: BoundaryMarker> {
     operation_binding_sha256: String,
     _boundary_operation_sha256: BTreeSet<String>,
     _verified_receipts: usize,
@@ -1073,7 +1182,7 @@ pub(crate) struct TaskBoundaryEffectLease<B: BoundaryMarker> {
 }
 
 impl<B: BoundaryMarker> TaskBoundaryEffectLease<B> {
-    pub(crate) fn authorize_effect_at(
+    pub fn authorize_effect_at(
         &self,
         operation: &BoundaryOperation<'_>,
         now: DateTime<Utc>,
@@ -1104,6 +1213,20 @@ impl<B: BoundaryMarker> TaskBoundaryPermit<B> {
         &self.boundary_operation_sha256
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test_with_deadline(
+        operation: &BoundaryOperation<'_>,
+        not_after: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            operation_binding_sha256: operation_binding_digest(operation),
+            boundary_operation_sha256: BTreeSet::new(),
+            verified_receipts: 0,
+            not_after: Some(not_after),
+            marker: PhantomData,
+        }
+    }
+
     /// Consume the typed permit at the final effect and reject an operation
     /// swap or a receipt set whose earliest expiry has been reached.
     pub fn authorize_effect_at(
@@ -1114,7 +1237,7 @@ impl<B: BoundaryMarker> TaskBoundaryPermit<B> {
         self.into_effect_lease_at(operation, now).map(|_| ())
     }
 
-    pub(crate) fn into_effect_lease_at(
+    pub fn into_effect_lease_at(
         self,
         operation: &BoundaryOperation<'_>,
         now: DateTime<Utc>,

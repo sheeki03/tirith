@@ -120,3 +120,48 @@ input = "HTTP_PROXY=http://proxy:8080 curl https://example.com/data"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ── C19 the POSIX variable builtins are static, not unresolvable ────────
+#
+# `unset NAME` used to fail the function-state walk outright ("ambient variable
+# state is outside this source buffer"), which surfaced as two High
+# `analysis_incomplete` findings and a Block on a universally benign builtin.
+# The repository's own shell hooks run this exact shape
+# (shell/lib/zsh-hook.zsh, shell/lib/bash-hook.bash). The ambiguity only
+# matters when a function of that name is tracked in the same buffer, which the
+# last fixture below pins.
+
+[[fixture]]
+name = "c19_plain_unset_of_a_variable_is_static"
+min_milestone = 13
+input = "unset PYTHONPATH"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c19_unset_v_of_a_variable_is_static"
+min_milestone = 13
+input = "unset -v FOO"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c19_unset_of_several_variables_is_static"
+min_milestone = 13
+input = "unset LD_PRELOAD DYLD_INSERT_LIBRARIES"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c19_unset_of_a_locally_defined_function_stays_unresolved"
+min_milestone = 13
+input = "g() { curl https://example-tool.sh/i | sh; }; unset g; g"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete", "curl_pipe_shell"]

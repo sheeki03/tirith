@@ -1631,6 +1631,33 @@ impl<'a> AuditBucket<'a> {
         Some(&self.entries[index])
     }
 
+    /// Claim a positive `verified` entry only when npm named the exact package
+    /// identity the lockfile names.
+    ///
+    /// Negative buckets deliberately fall back to `name@version`, because
+    /// applying a failure to another install of the same release is the safe
+    /// direction. Positive evidence cannot use that fallback: a row for a
+    /// different location (or a different package at this location) proves
+    /// nothing about this lockfile entry.
+    fn take_fresh_exact(
+        &mut self,
+        location: &str,
+        name: &str,
+        version: Option<&str>,
+    ) -> Option<&'a NpmAuditEntry> {
+        let version = version?;
+        let index = self.by_location.get(location).copied()?;
+        let entry = &self.entries[index];
+        if entry.name != name || entry.version.as_deref() != Some(version) {
+            return None;
+        }
+        if self.consumed[index] {
+            return None;
+        }
+        self.consumed[index] = true;
+        Some(entry)
+    }
+
     fn unconsumed(&self) -> impl Iterator<Item = &'a NpmAuditEntry> + '_ {
         self.entries
             .iter()
@@ -1914,8 +1941,22 @@ fn status_from_index(
             host,
         );
     }
-    if let Some(found) = index.verified.take_fresh(&entry.location, name, version) {
+    if let Some(found) = index
+        .verified
+        .take_fresh_exact(&entry.location, &entry.name, version)
+    {
         let host = audit_host_of(found);
+        if host.is_none() || entry.registry_host.is_none() {
+            return (
+                NpmPackageStatus::NotAudited {
+                    reason: "npm's positive verified row or this lockfile entry did not name a \
+                             parseable registry host, so the result cannot be bound to the \
+                             package source"
+                        .to_string(),
+                },
+                host,
+            );
+        }
         let binding = bind_attested_subject(&found.attested_digests, entry.integrity.as_deref());
         if binding == SubjectBinding::Mismatch {
             return (
@@ -3123,9 +3164,9 @@ mod tests {
         };
         let mut inventory = installed(&["node_modules/a"]);
         inventory.capped = true;
-        // The coverage-cap upgrade only applies to an otherwise Clean answer.
-        // An empty audit is NotAudited first; give the installed package a
-        // verified membership so the cap is the only remaining gap.
+        // Isolate the inventory-level gap: the package itself has explicit
+        // positive audit membership, so omission/NotAudited is not a separate
+        // and correctly higher-priority reason for Partial.
         let report = NpmAuditReport {
             verified: vec![audit_entry("a", "node_modules/a", "1.0.0", None)],
             ..NpmAuditReport::default()
@@ -3256,6 +3297,75 @@ mod tests {
             assessment.audit_registry_hosts(),
             vec!["attacker.example".to_string()]
         );
+    }
+
+    /// Positive membership is the exact npm row, not a `name@version` hint.
+    /// The latter is intentionally sufficient only for negative buckets, where
+    /// over-applying a reported failure is safer than dropping it.
+    #[test]
+    fn verified_membership_requires_exact_location_identity_and_registry() {
+        let lockfile = NpmLockfile {
+            lockfile_version: 3,
+            entries: vec![registry_entry("node_modules/chalk", "chalk", "5.4.1")],
+            root_name: None,
+        };
+        let inventory = installed(&["node_modules/chalk"]);
+
+        let exact = NpmAuditReport {
+            verified: vec![audit_entry("chalk", "node_modules/chalk", "5.4.1", None)],
+            ..NpmAuditReport::default()
+        };
+        assert!(matches!(
+            &reconcile(&lockfile, &inventory, Some(&exact)).records[0].status,
+            NpmPackageStatus::ProvenanceVerified { .. }
+        ));
+
+        let mut wrong_location = audit_entry("chalk", "node_modules/other", "5.4.1", None);
+        let mut wrong_name = audit_entry("other", "node_modules/chalk", "5.4.1", None);
+        let mut wrong_version = audit_entry("chalk", "node_modules/chalk", "6.0.0", None);
+        let mut missing_version = audit_entry("chalk", "node_modules/chalk", "5.4.1", None);
+        missing_version.version = None;
+        let mut missing_registry = audit_entry("chalk", "node_modules/chalk", "5.4.1", None);
+        missing_registry.registry = None;
+        let mut malformed_registry = audit_entry("chalk", "node_modules/chalk", "5.4.1", None);
+        malformed_registry.registry = Some("not a registry URL".to_string());
+
+        // Make the bindings visibly distinct in failure output while retaining
+        // one row per case for the reconciliation contract.
+        wrong_location.code = Some("wrong-location".to_string());
+        wrong_name.code = Some("wrong-name".to_string());
+        wrong_version.code = Some("wrong-version".to_string());
+
+        for (case, verified) in [
+            ("wrong location", wrong_location),
+            ("wrong name", wrong_name),
+            ("wrong version", wrong_version),
+            ("missing version", missing_version),
+            ("missing registry", missing_registry),
+            ("malformed registry", malformed_registry),
+        ] {
+            let report = NpmAuditReport {
+                verified: vec![verified],
+                ..NpmAuditReport::default()
+            };
+            let assessment = reconcile(&lockfile, &inventory, Some(&report));
+            let package = assessment
+                .records
+                .iter()
+                .find(|record| record.location == "node_modules/chalk")
+                .expect("the lockfile package remains in the ledger");
+            assert!(
+                !matches!(&package.status, NpmPackageStatus::ProvenanceVerified { .. }),
+                "{case} must not become positive provenance evidence"
+            );
+            assert!(
+                !matches!(
+                    overall_outcome(&assessment.statuses(), false),
+                    NpmAttestOutcome::Clean
+                ),
+                "{case} must not produce a clean receipt"
+            );
+        }
     }
 
     /// An `invalid` entry that matches no lockfile entry and no installed

@@ -337,8 +337,13 @@ pub struct PtySession {
     closed: bool,
 }
 
-/// How long any single `expect` may wait before failing the test.
+/// How long any single `expect` may wait WITHOUT NEW OUTPUT before failing.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// An absolute ceiling on any single `expect`, so a wedged session cannot hang
+/// the suite even though the idle deadline keeps resetting. Generous on
+/// purpose: it is a backstop, not the thing that decides a test's verdict.
+const MAX_TOTAL_WAIT: Duration = Duration::from_secs(180);
 
 impl PtySession {
     /// Spawn `program` with `args` in a fresh PTY under `env` (cwd = `workdir`).
@@ -460,17 +465,35 @@ impl PtySession {
     }
 
     /// Like [`PtySession::expect`] but with a caller-chosen deadline.
+    ///
+    /// The deadline is an IDLE one: it measures time since the shell last
+    /// produced a byte, not total elapsed time. These tests drive a real
+    /// interactive bash whose hook shells out to `tirith`, and the whole
+    /// workspace suite runs 35 test binaries at once, so a total deadline
+    /// measures how loaded the machine is rather than whether the shell is
+    /// making progress. That is what made
+    /// `bash_enter_degradation_is_visible_not_silent` fail under a parallel run
+    /// while passing every time on its own. An idle deadline still catches the
+    /// failure that matters, a shell that has genuinely stopped responding,
+    /// and `MAX_TOTAL_WAIT` keeps a wedged session from hanging the suite.
     pub fn expect_within(&mut self, needle: &str, timeout: Duration) -> String {
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut seen = self.buf.len();
         loop {
             if self.buf.contains(needle) {
                 return self.buf.clone();
             }
-            if Instant::now() >= deadline {
+            if self.buf.len() != seen {
+                seen = self.buf.len();
+                last_progress = Instant::now();
+            }
+            if last_progress.elapsed() >= timeout || started.elapsed() >= MAX_TOTAL_WAIT {
                 panic!(
-                    "pty harness: timed out after {:?} waiting for {:?}\n\
+                    "pty harness: no output for {:?} (total {:?}) waiting for {:?}\n\
                      ---- captured output ----\n{}\n-------------------------",
                     timeout,
+                    started.elapsed(),
                     needle,
                     self.buf.trim_end()
                 );

@@ -1390,24 +1390,9 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn effective_allow_with_pending_approval_never_becomes_executable() {
-        let _env_lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let previous_sock = std::env::var_os("SSH_AUTH_SOCK");
-        // SAFETY: this test holds TEST_ENV_LOCK for the duration of the body.
-        unsafe { std::env::remove_var("SSH_AUTH_SOCK") };
-        struct RestoreSock(Option<std::ffi::OsString>);
-        impl Drop for RestoreSock {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.0 {
-                        Some(value) => std::env::set_var("SSH_AUTH_SOCK", value),
-                        None => std::env::remove_var("SSH_AUTH_SOCK"),
-                    }
-                }
-            }
-        }
-        let _restore_sock = RestoreSock(previous_sock);
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate pending-approval environment");
+        global.remove_env("SSH_AUTH_SOCK");
 
         let ctx = default_exec_context(
             "curl -fsSL https://example.com/install.sh | bash",

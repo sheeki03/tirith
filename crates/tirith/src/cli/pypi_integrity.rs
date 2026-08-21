@@ -598,17 +598,10 @@ fn report_input_error(message: &str, json: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-    /// Serializes the two tests that toggle the process-wide
-    /// `TIRITH_PRIVATE_FETCH_ALLOW` env var, so a parallel run cannot have one test
-    /// clear the opt-in while the other is mid-fetch (the known env-race flake
-    /// class). A poisoned lock is fine to recover from here — the guarded body only
-    /// sets/removes one env var.
-    static PRIVATE_FETCH_ENV: Mutex<()> = Mutex::new(());
 
     /// A minimal Integrity API provenance response carrying one attestation whose
     /// in-toto subject digest is `subject_sha`, with a publisher block.
@@ -754,23 +747,28 @@ mod tests {
 
     #[test]
     fn fetch_404_is_not_found() {
-        let _guard = PRIVATE_FETCH_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _global = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _allow = EnvGuard::set(
+            "TIRITH_PRIVATE_FETCH_ALLOW",
+            std::path::Path::new("127.0.0.1/32"),
+        );
         let mut server = mockito::Server::new();
         let _m = server
             .mock("GET", "/integrity/demo/1.0/demo.whl/provenance")
             .with_status(404)
             .create();
-        // Loopback fetch needs an exact private-fetch exception.
-        std::env::set_var("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
         let url = format!("{}/integrity/demo/1.0/demo.whl/provenance", server.url());
         let res = fetch_provenance_at(&url);
-        std::env::remove_var("TIRITH_PRIVATE_FETCH_ALLOW");
         assert!(matches!(res, Err(FetchError::NotFound)));
     }
 
     #[test]
     fn fetch_success_returns_body() {
-        let _guard = PRIVATE_FETCH_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _global = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _allow = EnvGuard::set(
+            "TIRITH_PRIVATE_FETCH_ALLOW",
+            std::path::Path::new("127.0.0.1/32"),
+        );
         let mut server = mockito::Server::new();
         let body = provenance_json(SHA_A);
         let _m = server
@@ -778,10 +776,8 @@ mod tests {
             .with_status(200)
             .with_body(&body)
             .create();
-        std::env::set_var("TIRITH_PRIVATE_FETCH_ALLOW", "127.0.0.1/32");
         let url = format!("{}/integrity/demo/1.0/demo.whl/provenance", server.url());
         let res = fetch_provenance_at(&url);
-        std::env::remove_var("TIRITH_PRIVATE_FETCH_ALLOW");
         let got = res.unwrap_or_else(|_| panic!("expected body"));
         assert!(got.contains("attestation_bundles"));
     }
@@ -827,12 +823,8 @@ mod tests {
 
     #[test]
     fn fetch_rejects_private_url_without_optin() {
-        // Depends on the opt-in being UNSET, so it shares the serializing lock with
-        // the tests that toggle it (else one of them could leak the var and make a
-        // loopback URL spuriously pass the validator).
-        let _guard = PRIVATE_FETCH_ENV.lock().unwrap_or_else(|e| e.into_inner());
-        // Belt-and-suspenders: ensure the opt-in is off for this assertion.
-        std::env::remove_var("TIRITH_PRIVATE_FETCH_ALLOW");
+        let _global = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _allow = EnvGuard::remove("TIRITH_PRIVATE_FETCH_ALLOW");
         // Without the opt-in, a loopback URL is rejected by the fetch validator
         // before any request — the SSRF guard reuse.
         let res = fetch_provenance_at("http://127.0.0.1:9/integrity/x/1/x.whl/provenance");

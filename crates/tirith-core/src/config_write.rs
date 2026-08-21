@@ -346,7 +346,7 @@ impl ConfigWritePermit {
     /// both the filesystem capability and its exact task authorization.
     pub fn commit(self, contents: &[u8]) -> Result<(), ConfigWriteError> {
         self.validate_for_publication(contents)?;
-        self.publish(contents)
+        self.publish(contents, || Ok(()))
     }
 
     /// Publish one Tirith-owned configuration write, consuming both permits.
@@ -365,7 +365,73 @@ impl ConfigWritePermit {
         if !authorization.binds_operation(operation) || !self.binds_operation(operation) {
             return Err(ConfigWriteError::AuthorizationMismatch);
         }
-        self.publish(contents)
+        self.publish(contents, || {
+            authorization
+                .authorize_effect_at(operation, chrono::Utc::now())
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "task authorization expired or no longer binds this configuration write",
+                    )
+                })
+        })
+    }
+
+    /// Delete one Tirith-owned configuration file, consuming both the retained
+    /// filesystem capability and its exact typed authorization.
+    ///
+    /// `delete_binding` is a domain-separated description of the deletion,
+    /// not file content to publish. The permit binds it into the task envelope;
+    /// `expected_contents` is independently checked against the retained
+    /// present preimage and again by the exact-identity remover.
+    #[doc(hidden)]
+    pub fn commit_delete_authorized(
+        self,
+        delete_binding: &[u8],
+        expected_contents: &[u8],
+        authorization: TaskBoundaryPermit<ConfigWriteBoundary>,
+        operation: &BoundaryOperation<'_>,
+    ) -> Result<(), ConfigWriteError> {
+        self.validate_for_publication(delete_binding)?;
+        if !authorization.binds_operation(operation) || !self.binds_operation(operation) {
+            return Err(ConfigWriteError::AuthorizationMismatch);
+        }
+        let expected_len = u64::try_from(expected_contents.len()).unwrap_or(u64::MAX);
+        let expected_sha256 = sha256_hex(expected_contents);
+        if !matches!(
+            self.expected_preimage.as_ref(),
+            Some(ContainedFilePreimage::Present { len, sha256, .. })
+                if *len == expected_len && *sha256 == expected_sha256
+        ) {
+            return Err(ConfigWriteError::ContentMismatch);
+        }
+
+        self.destination
+            .remove_if_observed_checked(expected_contents, || {
+                #[cfg(test)]
+                run_pre_publish_test_hook();
+                authorization
+                    .authorize_effect_at(operation, chrono::Utc::now())
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "task authorization expired or no longer binds this configuration deletion",
+                        )
+                    })
+            })
+            .map_err(ConfigWriteError::Io)?;
+
+        // Success means the operator-visible name is absent beneath the same
+        // retained root/parent identity. A concurrent replacement is preserved
+        // and turns success into a refusal.
+        let visible = self.visible_destination()?;
+        match visible.read_capped(1) {
+            Err(crate::util::OpenRegularError::NotFound) => Ok(()),
+            _ => Err(ConfigWriteError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "configuration deletion failed exact absence validation",
+            ))),
+        }
     }
 
     fn validate_for_publication(&self, contents: &[u8]) -> Result<(), ConfigWriteError> {
@@ -417,16 +483,18 @@ impl ConfigWritePermit {
         )
     }
 
-    fn publish(self, contents: &[u8]) -> Result<(), ConfigWriteError> {
+    fn publish<F>(self, contents: &[u8], authorize_effect: F) -> Result<(), ConfigWriteError>
+    where
+        F: FnOnce() -> std::io::Result<()>,
+    {
         self.destination
             .write_atomic_checked(contents, self.overwrite, || {
                 #[cfg(test)]
                 run_pre_publish_test_hook();
                 self.destination
                     .verify_observed_preimage(&self.expected_preimage)?;
-                self.visible_destination()
-                    .map(|_| ())
-                    .map_err(std::io::Error::from)
+                self.visible_destination().map_err(std::io::Error::from)?;
+                authorize_effect()
             })
             .map_err(ConfigWriteError::Io)?;
 
@@ -533,6 +601,36 @@ mod tests {
             .commit_authorized(b"safe: true\n", boundary_permit, &operation)
             .expect("authorized commit");
         assert_eq!(std::fs::read(&path).expect("read back"), b"safe: true\n");
+    }
+
+    #[test]
+    fn expired_authorization_at_the_final_seam_does_not_publish() {
+        let root = temp_root();
+        let path = root.path().join("policy.yaml");
+        std::fs::write(&path, b"safe: false\n").expect("write original");
+        let write_permit =
+            ConfigWritePermit::prepare(root.path(), &path, b"safe: true\n", true, "policy-id")
+                .expect("prepare write");
+        let envelope = write_permit.operation_envelope();
+        let operation = config_operation(&envelope, write_permit.boundary_effects());
+        let boundary_permit = TaskBoundaryPermit::<ConfigWriteBoundary>::for_test_with_deadline(
+            &operation,
+            chrono::Utc::now() - chrono::TimeDelta::seconds(1),
+        );
+
+        let error = write_permit
+            .commit_authorized(b"safe: true\n", boundary_permit, &operation)
+            .expect_err("expired task authorization must refuse publication");
+
+        assert!(matches!(
+            error,
+            ConfigWriteError::Io(ref inner)
+                if inner.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read original"),
+            b"safe: false\n"
+        );
     }
 
     #[test]

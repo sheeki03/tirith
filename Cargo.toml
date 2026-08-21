@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/tirith-core", "crates/tirith", "tools/sign-license", "tools/license-server"]
+members = [
+    "crates/tirith-core",
+    "crates/tirith",
+    "crates/tirith-test-support",
+    "tools/sign-license",
+    "tools/license-server",
+]
 resolver = "2"
 
 [workspace.package]
@@ -10,6 +16,7 @@ rust-version = "1.83"
 
 [workspace.dependencies]
 tirith-core = { version = "0.3.3", path = "crates/tirith-core" }
+tirith-test-support = { path = "crates/tirith-test-support" }
 clap = { version = "4", features = ["derive"] }
 url = "2"
 regex = "1"

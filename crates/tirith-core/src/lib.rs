@@ -47,6 +47,7 @@ pub mod incident;
 pub mod install_script_analysis;
 pub mod install_txn;
 pub mod intent;
+pub mod lexical_path;
 pub mod license;
 pub mod location;
 pub mod lsp_profiles;
@@ -113,8 +114,3 @@ pub mod webhook;
 #[cfg(unix)]
 pub mod runner;
 pub mod script_analysis;
-
-/// Crate-wide mutex all env-mutating tests MUST hold (`std::env::set_var` is not
-/// thread-safe).
-#[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

@@ -722,14 +722,19 @@ mod open_regular_tests {
 
     #[test]
     fn atomic_write_of_a_relative_filename_stays_in_cwd() {
-        let dir = tempdir().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        let result = write_file_atomic_0600(Path::new("receipt.json"), b"{\"ok\":true}");
-        let _ = std::env::set_current_dir(&previous);
-        result.expect("relative persist must not cross volumes");
+        // The cwd is process-global. Changing it without the shared guard races
+        // every concurrent test that reads it: a guard built inside this window
+        // records this test's temp directory as the cwd to restore, and once
+        // that directory is removed every later `current_dir()` fails. Borrow
+        // the guard's already-isolated cwd instead, which it restores before
+        // removing its own root.
+        let _global =
+            tirith_test_support::GlobalStateGuard::new().expect("isolate process-global cwd state");
+        let cwd = std::env::current_dir().unwrap();
+        write_file_atomic_0600(Path::new("receipt.json"), b"{\"ok\":true}")
+            .expect("relative persist must not cross volumes");
         assert_eq!(
-            std::fs::read(dir.path().join("receipt.json")).unwrap(),
+            std::fs::read(cwd.join("receipt.json")).unwrap(),
             b"{\"ok\":true}"
         );
     }
