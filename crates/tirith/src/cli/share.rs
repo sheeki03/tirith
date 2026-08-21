@@ -51,9 +51,9 @@ pub fn share(
     let report = redact_for_audience_with_custom(&input, target, &customer_patterns);
 
     if json {
-        emit_json(&report, target)
+        emit_json(&report, target, out_path)
     } else {
-        if let Err(code) = write_output(out_path, &report.redacted_content) {
+        if let Err(code) = write_output(out_path, report.redacted_content.as_bytes(), true) {
             return code;
         }
         print_human_summary(&report, target);
@@ -75,9 +75,9 @@ pub fn redact_stdin(audience: ShareAudience, json: bool) -> i32 {
     let report = redact_for_audience_with_custom(&input, audience, &customer_patterns);
 
     if json {
-        emit_json(&report, audience)
+        emit_json(&report, audience, None)
     } else {
-        if let Err(code) = write_output(None, &report.redacted_content) {
+        if let Err(code) = write_output(None, report.redacted_content.as_bytes(), true) {
             return code;
         }
         print_human_summary(&report, audience);
@@ -114,12 +114,18 @@ fn display_label(path: Option<&Path>) -> String {
     }
 }
 
-/// Write `content` to `out_path` if `Some`, else to stdout. Returns
-/// `Err(exit_code)` on write failure.
-fn write_output(out_path: Option<&Path>, content: &str) -> Result<(), i32> {
+/// Write `content` to `out_path` if `Some`, else to stdout. File publication is
+/// same-directory atomic, refuses symlinked or non-regular final components,
+/// and retains the checked parent directory through the rename. Returns
+/// `Err(exit_code)` on any inspection, serialization, or write failure.
+fn write_output(
+    out_path: Option<&Path>,
+    content: &[u8],
+    append_stdout_newline: bool,
+) -> Result<(), i32> {
     match out_path {
         Some(p) => {
-            if let Err(e) = fs::write(p, content) {
+            if let Err(e) = write_output_file(p, content) {
                 eprintln!("tirith share: failed to write {}: {e}", p.display());
                 return Err(1);
             }
@@ -127,32 +133,71 @@ fn write_output(out_path: Option<&Path>, content: &str) -> Result<(), i32> {
         }
         None => {
             let mut stdout = std::io::stdout().lock();
-            if stdout.write_all(content.as_bytes()).is_err() {
+            if stdout.write_all(content).is_err() {
                 eprintln!("tirith share: failed to write to stdout (broken pipe?)");
                 return Err(1);
             }
             // Match `view`: append a newline when missing, so a prompt redraw
             // doesn't clobber the last line.
-            if !content.ends_with('\n') {
-                let _ = writeln!(stdout);
+            if append_stdout_newline && !content.ends_with(b"\n") && writeln!(stdout).is_err() {
+                eprintln!("tirith share: failed to write to stdout (broken pipe?)");
+                return Err(1);
+            }
+            if stdout.flush().is_err() {
+                eprintln!("tirith share: failed to write to stdout (broken pipe?)");
+                return Err(1);
             }
             Ok(())
         }
     }
 }
 
-fn emit_json(report: &RedactReport, audience: ShareAudience) -> i32 {
+fn write_output_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let absolute = std::path::absolute(path)?;
+    let root = absolute.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "share output must name a file",
+        )
+    })?;
+    let destination = tirith_core::util::ContainedAtomicFile::prepare(root, &absolute, false)?;
+
+    // Probe through the retained parent capability. On Unix this uses
+    // O_NONBLOCK|O_NOFOLLOW followed by fstat, so a FIFO cannot hang the CLI
+    // and a device/socket/directory is never treated as an ordinary file.
+    match destination.read_capped(0) {
+        Ok(_) | Err(tirith_core::util::OpenRegularError::TooLarge) => {}
+        Err(tirith_core::util::OpenRegularError::NotFound) => {}
+        Err(tirith_core::util::OpenRegularError::NotRegularFile) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing symlinked or non-regular output destination {}",
+                    path.display()
+                ),
+            ));
+        }
+        Err(tirith_core::util::OpenRegularError::Io(error)) => return Err(error),
+    }
+
+    destination.write_atomic(content, true)
+}
+
+fn emit_json(report: &RedactReport, audience: ShareAudience, out_path: Option<&Path>) -> i32 {
     let _ = audience; // future: include in envelope when the schema rev needs it.
     let out = JsonOut {
         redacted_content: &report.redacted_content,
         redactions: &report.redactions,
     };
-    let mut stdout = std::io::stdout().lock();
-    if serde_json::to_writer_pretty(&mut stdout, &out).is_err() || writeln!(stdout).is_err() {
-        eprintln!("tirith share: failed to write JSON output");
-        return 1;
-    }
-    0
+    let mut encoded = match serde_json::to_vec_pretty(&out) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            eprintln!("tirith share: failed to serialize JSON output: {error}");
+            return 1;
+        }
+    };
+    encoded.push(b'\n');
+    write_output(out_path, &encoded, false).map_or_else(|code| code, |()| 0)
 }
 
 /// Print the per-label summary to stderr (`target=<aud>; removed N <label>, …`).
@@ -236,6 +281,68 @@ mod tests {
         assert_eq!(code, 0);
         let written = fs::read_to_string(&out).unwrap();
         assert!(!written.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn share_json_writes_documented_envelope_to_out_path() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        let out = dir.path().join("out.json");
+        fs::write(&input, "key=AKIAIOSFODNN7EXAMPLE done\n").unwrap();
+        fs::write(&out, "stale output that must be replaced").unwrap();
+
+        let code = share(Some(&input), Some(&out), ShareAudience::Llm, true);
+
+        assert_eq!(code, 0);
+        let bytes = fs::read(&out).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(envelope.get("redacted_content").is_some());
+        assert!(envelope.get("redactions").is_some());
+        assert!(!String::from_utf8_lossy(&bytes).contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn share_refuses_symlinked_output_and_preserves_its_target() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        let victim = dir.path().join("victim.log");
+        let output = dir.path().join("out.log");
+        fs::write(&input, "share-safe input\n").unwrap();
+        fs::write(&victim, "victim sentinel\n").unwrap();
+        std::os::unix::fs::symlink(&victim, &output).unwrap();
+
+        let code = share(Some(&input), Some(&output), ShareAudience::Llm, true);
+
+        assert_eq!(code, 1);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim sentinel\n");
+        assert!(fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn share_refuses_fifo_output_without_blocking_or_replacing_it() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        let output = dir.path().join("out.fifo");
+        fs::write(&input, "share-safe input\n").unwrap();
+        let encoded = CString::new(output.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a live NUL-terminated path and `mkfifo` does not
+        // retain its pointer.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let code = share(Some(&input), Some(&output), ShareAudience::Llm, false);
+
+        assert_eq!(code, 1);
+        assert!(fs::symlink_metadata(&output).unwrap().file_type().is_fifo());
     }
 
     #[test]
