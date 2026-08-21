@@ -890,6 +890,48 @@ fn supervisor_preserves_short_legitimate_output_and_status() {
 }
 
 #[test]
+fn supervisor_refuses_overflowing_deadline_before_child_code_executes() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("overflow-child-ran");
+    let args = [
+        OsStr::new("-c"),
+        OsStr::new("printf spawned > \"$TIRITH_TIMEOUT_MARKER\""),
+    ];
+    let spec = ChildSpec::new(args, ChildLimits::new(Duration::MAX, 64, 64))
+        .env("TIRITH_TIMEOUT_MARKER", marker.as_os_str());
+
+    match run(&shell(), &spec) {
+        ChildOutcome::SpawnError(reason) => {
+            assert!(reason.contains("timeout deadline exceeds"), "{reason}");
+        }
+        other => panic!("overflowing deadline was not refused before spawn: {other:?}"),
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !marker.exists(),
+        "the child executed despite the pre-spawn deadline refusal"
+    );
+}
+
+#[test]
+fn supervisor_executes_with_a_representable_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("normal-child-ran");
+    let args = [
+        OsStr::new("-c"),
+        OsStr::new("printf spawned > \"$TIRITH_TIMEOUT_MARKER\""),
+    ];
+    let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(2), 64, 64))
+        .env("TIRITH_TIMEOUT_MARKER", marker.as_os_str());
+
+    match run(&shell(), &spec) {
+        ChildOutcome::Completed { status, .. } => assert!(status.success()),
+        other => panic!("representable deadline was not executed normally: {other:?}"),
+    }
+    assert_eq!(std::fs::read(marker).unwrap(), b"spawned");
+}
+
+#[test]
 fn supervisor_enforces_the_capture_cap_before_retaining_excess() {
     let args = [OsStr::new("-c"), OsStr::new("printf 12345")];
     let spec = ChildSpec::new(args, ChildLimits::new(Duration::from_secs(2), 4, 64));

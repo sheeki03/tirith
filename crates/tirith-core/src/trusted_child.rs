@@ -2003,6 +2003,9 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 /// bounded output, and a wall-clock deadline.
 #[cfg(windows)]
 pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
+    if checked_timeout_deadline(spec.limits.timeout).is_none() {
+        return timeout_deadline_overflow();
+    }
     if let Err(error) = executable.revalidate() {
         return ChildOutcome::SpawnError(format!(
             "trusted executable failed pre-spawn revalidation: {error}"
@@ -2102,6 +2105,14 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
         ));
     }
 
+    // Validate the caller-controlled duration and retain the exact deadline
+    // before creating the process. `Instant + Duration` panics on overflow; if
+    // that happened after spawn, unwinding would drop the Child handle without
+    // proving termination of its process group.
+    let Some(deadline) = checked_timeout_deadline(spec.limits.timeout) else {
+        return timeout_deadline_overflow();
+    };
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return ChildOutcome::SpawnError(error.to_string()),
@@ -2157,7 +2168,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
         drop(worker);
     }
 
-    let deadline = Instant::now() + spec.limits.timeout;
     #[cfg(unix)]
     let mut direct_exit_observed = process_group_confirmation.direct_exit_observed;
     #[cfg(unix)]
@@ -2318,6 +2328,42 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
             }
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn checked_timeout_deadline(timeout: Duration) -> Option<Instant> {
+    Instant::now().checked_add(timeout)
+}
+
+fn timeout_deadline_overflow() -> ChildOutcome {
+    ChildOutcome::SpawnError(
+        "trusted child refused before spawn: timeout deadline exceeds the monotonic clock range"
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+mod timeout_deadline_tests {
+    use super::{checked_timeout_deadline, timeout_deadline_overflow, ChildOutcome};
+    use std::time::Duration;
+
+    #[test]
+    fn overflowing_timeout_is_rejected_without_spawn() {
+        assert!(
+            checked_timeout_deadline(Duration::MAX).is_none(),
+            "Duration::MAX must not produce a representable Instant deadline"
+        );
+        match timeout_deadline_overflow() {
+            ChildOutcome::SpawnError(reason) => {
+                assert!(reason.contains("timeout deadline exceeds"), "{reason}");
+            }
+            other => panic!("expected spawn-error refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn representable_timeout_produces_a_deadline() {
+        assert!(checked_timeout_deadline(Duration::from_secs(2)).is_some());
     }
 }
 
