@@ -25,13 +25,13 @@
 //!
 //! 2. **`resource_link` / resource URIs.** Every `uri` carried by a content block
 //!    of type `resource_link`, an embedded `resource`, a `resources/list` entry,
-//!    or a `resources/read` content item is run through
-//!    [`crate::url_validate::validate_fetch_url`] — the SAME SSRF screen the
-//!    fetch/runner paths use (scheme allow-list, embedded-credential rejection,
-//!    cloud-metadata host/IP block, and the private/loopback/link-local
-//!    classification). A `file://`/`data:`/non-http URI or one resolving to a
-//!    non-public destination is a violation. `tirith://`-style internal URIs the
-//!    upstream cannot have authored are exempt only when they are not http(s).
+//!    or a `resources/read` content item is run through the SAME canonical SSRF
+//!    policy the fetch/runner paths use (scheme allow-list, embedded-credential
+//!    rejection, cloud-metadata host/IP block, and the private/loopback/link-local
+//!    classification). Resolution is cached per host/port under one response-wide
+//!    deadline, and globally bounded worker leases prevent timed-out blocking OS
+//!    resolvers from growing without limit. A `file://`/`data:`/non-http URI or
+//!    one resolving to a non-public destination is a violation.
 //!
 //! 3. **Declared MIME vs sniffed bytes + size cap.** A `resources/read` content
 //!    item (or embedded resource) carrying an inline `blob` (base64) is decoded
@@ -40,16 +40,22 @@
 //!    (e.g. `text/plain`) is a spoof. A blob whose decoded size exceeds
 //!    [`MAX_INSPECT_BLOB_BYTES`] is refused rather than buffered.
 //!
-//! Non-goal here (handled / deferred elsewhere): `sampling/*`, `elicitation/*`,
-//! and `tasks/*` are SERVER-INITIATED (they travel upstream->client as *requests*,
-//! not as responses to a client request) — they are explicitly NOT in
-//! [`ResponseKind`] and are forwarded by the gateway's non-response passthrough.
-//! [`kind_for_method`] returns `None` for them so the inspection is never wrongly
+//! Non-goal here (handled at the gateway protocol boundary): `sampling/*`,
+//! `elicitation/*`, and `tasks/*` are SERVER-INITIATED requests, not responses to
+//! a client request. They are explicitly NOT in [`ResponseKind`]; the gateway
+//! denies them unless an explicit negotiated capability implements the method.
+//! [`kind_for_method`] returns `None` so response inspection is never wrongly
 //! applied to a request shape.
 
 use serde::Serialize;
 use serde_json::Value;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt;
+use std::net::{IpAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use crate::mcp::output_filter::OutputFilterContext;
 use crate::verdict::{Action, Finding};
@@ -59,6 +65,18 @@ use crate::verdict::{Action, Finding};
 /// whole message; this is a second, tighter bound on a single decoded blob so a
 /// base64 field cannot force a large allocation during sniffing).
 pub const MAX_INSPECT_BLOB_BYTES: usize = 8 * 1024 * 1024;
+
+/// One hostile response may spend at most this long resolving every distinct
+/// HTTP(S) host it carries. Late resolver results are discarded. Because the
+/// platform resolver is a blocking OS API and cannot be force-cancelled, a
+/// separate global worker ceiling below bounds the number of late workers.
+const RESPONSE_DNS_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Global ceiling for blocking OS resolver calls started by MCP response
+/// inspection. A timed-out resolver retains its slot until the OS call returns,
+/// so repeated hostile responses cannot create an orphan-thread storm.
+const MAX_RESPONSE_DNS_WORKERS: usize = 16;
+static ACTIVE_RESPONSE_DNS_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// The listing/reading response families C4 inspects. Each variant is the response
 /// to a client->upstream request of the same method. Server-initiated surfaces
@@ -245,8 +263,9 @@ impl InspectOutcome {
 ///
 /// * Streams every string leaf through the engine output analyzer (custom seeds
 ///   from `ctx`), folding the verdict's action/findings into the outcome.
-/// * Walks the kind-appropriate URI fields and screens each through
-///   [`crate::url_validate::validate_fetch_url`].
+/// * Walks the kind-appropriate URI fields and screens each through the
+///   canonical outbound URL policy under one bounded response-wide DNS
+///   deadline. Duplicate host/port pairs share a cached result.
 /// * For `resources/read` (and embedded resources), decodes any inline `blob`
 ///   (bounded by [`MAX_INSPECT_BLOB_BYTES`]) and checks the declared `mimeType`
 ///   against the sniffed magic bytes.
@@ -259,20 +278,31 @@ pub fn inspect_response(
     kind: ResponseKind,
     ctx: &OutputFilterContext,
 ) -> InspectOutcome {
-    // repo-0296: every http(s) string screened below goes through blocking DNS
-    // validation. Cap the number of resolutions per response so a URL-dense
-    // hostile reply cannot stall the sole upstream-response path; overflowing
-    // URIs are violations (fail-closed), not skips.
-    URI_SCREEN_BUDGET.with(|b| b.set(Some(MAX_URI_SCREENS_PER_RESPONSE)));
-    let outcome = inspect_response_inner(result, kind, ctx);
-    URI_SCREEN_BUDGET.with(|b| b.set(None));
-    outcome
+    inspect_response_with_resolver(
+        result,
+        kind,
+        ctx,
+        RESPONSE_DNS_DEADLINE,
+        Arc::new(resolve_host_blocking),
+    )
+}
+
+fn inspect_response_with_resolver(
+    result: &Value,
+    kind: ResponseKind,
+    ctx: &OutputFilterContext,
+    deadline: Duration,
+    resolver: HostResolver,
+) -> InspectOutcome {
+    let budget = ResponseDnsBudget::new(deadline, resolver);
+    inspect_response_inner(result, kind, ctx, &budget)
 }
 
 fn inspect_response_inner(
     result: &Value,
     kind: ResponseKind,
     ctx: &OutputFilterContext,
+    dns_budget: &ResponseDnsBudget,
 ) -> InspectOutcome {
     // 1. Text scan over every string leaf (keys + values), via the shared
     //    streaming analyzer the C2 tool-result filter uses.
@@ -282,7 +312,7 @@ fn inspect_response_inner(
 
     // 2. URI screen for resource_link / resource / resource-descriptor URIs.
     let mut violations = Vec::new();
-    collect_uri_violations(result, kind, &mut violations);
+    collect_uri_violations(result, kind, &mut violations, dns_budget);
 
     // 3. MIME vs sniffed bytes + size cap for inline blobs. repo-0294: this
     // covers prompts/get too — `walk_for_embedded_blobs` handles the nested
@@ -326,9 +356,14 @@ fn inspect_response_inner(
 /// the tree is screened. Internal non-http(s) URIs (e.g. a `tirith://` or
 /// `ui://` scheme) are not SSRF vectors and are skipped — only http(s) and other
 /// network-capable schemes are validated/rejected.
-fn collect_uri_violations(result: &Value, kind: ResponseKind, out: &mut Vec<ResponseViolation>) {
+fn collect_uri_violations(
+    result: &Value,
+    kind: ResponseKind,
+    out: &mut Vec<ResponseViolation>,
+    dns_budget: &ResponseDnsBudget,
+) {
     // Generic structural walk: catch resource_link / embedded resource anywhere.
-    walk_for_resource_uris(result, out);
+    walk_for_resource_uris(result, out, dns_budget);
 
     // Kind-specific descriptor fields that are not content blocks.
     match kind {
@@ -336,7 +371,7 @@ fn collect_uri_violations(result: &Value, kind: ResponseKind, out: &mut Vec<Resp
             if let Some(arr) = result.get("resources").and_then(Value::as_array) {
                 for entry in arr {
                     if let Some(uri) = entry.get("uri").and_then(Value::as_str) {
-                        screen_uri(uri, "resource_descriptor_ssrf", out);
+                        screen_uri(uri, "resource_descriptor_ssrf", out, dns_budget);
                     }
                 }
             }
@@ -347,7 +382,7 @@ fn collect_uri_violations(result: &Value, kind: ResponseKind, out: &mut Vec<Resp
             if let Some(arr) = result.get("resourceTemplates").and_then(Value::as_array) {
                 for entry in arr {
                     if let Some(t) = entry.get("uriTemplate").and_then(Value::as_str) {
-                        screen_uri_template(t, "resource_template_ssrf", out);
+                        screen_uri_template(t, "resource_template_ssrf", out, dns_budget);
                     }
                 }
             }
@@ -356,7 +391,7 @@ fn collect_uri_violations(result: &Value, kind: ResponseKind, out: &mut Vec<Resp
             if let Some(arr) = result.get("contents").and_then(Value::as_array) {
                 for entry in arr {
                     if let Some(uri) = entry.get("uri").and_then(Value::as_str) {
-                        screen_uri(uri, "resource_content_ssrf", out);
+                        screen_uri(uri, "resource_content_ssrf", out, dns_budget);
                     }
                 }
             }
@@ -381,14 +416,21 @@ fn collect_uri_violations(result: &Value, kind: ResponseKind, out: &mut Vec<Resp
 /// keys, so a `uri` on a non-typed object or in a `tools/list` is no longer
 /// screened by nothing, and `dedup_violations` collapses the canonical+generic
 /// pair for a genuinely typed `uri` so no URL is double-emitted.
-fn walk_for_resource_uris(v: &Value, out: &mut Vec<ResponseViolation>) {
+fn walk_for_resource_uris(
+    v: &Value,
+    out: &mut Vec<ResponseViolation>,
+    dns_budget: &ResponseDnsBudget,
+) {
+    if dns_budget.is_exhausted() {
+        return;
+    }
     match v {
         Value::Object(map) => {
             let ty = map.get("type").and_then(Value::as_str);
             match ty {
                 Some("resource_link") => {
                     if let Some(uri) = map.get("uri").and_then(Value::as_str) {
-                        screen_uri(uri, "resource_link_ssrf", out);
+                        screen_uri(uri, "resource_link_ssrf", out, dns_budget);
                     }
                 }
                 Some("resource") => {
@@ -397,7 +439,7 @@ fn walk_for_resource_uris(v: &Value, out: &mut Vec<ResponseViolation>) {
                         .and_then(|r| r.get("uri"))
                         .and_then(Value::as_str)
                     {
-                        screen_uri(uri, "embedded_resource_ssrf", out);
+                        screen_uri(uri, "embedded_resource_ssrf", out, dns_budget);
                     }
                 }
                 _ => {}
@@ -416,16 +458,16 @@ fn walk_for_resource_uris(v: &Value, out: &mut Vec<ResponseViolation>) {
             // genuinely typed `uri` still yields exactly its canonical violation.
             for child in map.values() {
                 if let Some(s) = child.as_str() {
-                    screen_http_string(s, out);
+                    screen_http_string(s, out, dns_budget);
                 }
             }
             for child in map.values() {
-                walk_for_resource_uris(child, out);
+                walk_for_resource_uris(child, out, dns_budget);
             }
         }
         Value::Array(items) => {
             for item in items {
-                walk_for_resource_uris(item, out);
+                walk_for_resource_uris(item, out, dns_budget);
             }
         }
         _ => {}
@@ -479,16 +521,16 @@ fn dedup_violations(violations: &mut Vec<ResponseViolation>) {
 /// template: its fixed scheme/authority is validated while expansion-controlled
 /// destinations are rejected. This mirrors the kind-specific `uriTemplate` path
 /// without treating braces as a validation exemption.
-fn screen_http_string(s: &str, out: &mut Vec<ResponseViolation>) {
+fn screen_http_string(s: &str, out: &mut Vec<ResponseViolation>, dns_budget: &ResponseDnsBudget) {
     if s.contains('{') || s.contains('}') {
         if matches!(fixed_template_scheme(s).as_deref(), Some("http" | "https")) {
-            screen_uri_template(s, "metadata_uri_ssrf", out);
+            screen_uri_template(s, "metadata_uri_ssrf", out, dns_budget);
         }
         return;
     }
 
     if matches!(normalized_uri_scheme(s).as_deref(), Some("http" | "https")) {
-        screen_uri(s, "metadata_uri_ssrf", out);
+        screen_uri(s, "metadata_uri_ssrf", out, dns_budget);
     }
 }
 
@@ -512,26 +554,162 @@ const FORBIDDEN_URI_SCHEMES: &[&str] = &[
     "jar",
 ];
 
-/// repo-0296: per-response URI-resolution budget (blocking DNS per unique URL).
+/// Count bound within the total response deadline. The deadline prevents a
+/// small number of slow hosts from consuming unbounded wall time; this count
+/// separately refuses a huge set of immediately-resolving hosts.
 const MAX_URI_SCREENS_PER_RESPONSE: usize = 64;
 
-thread_local! {
-    static URI_SCREEN_BUDGET: std::cell::Cell<Option<usize>> = const {
-        std::cell::Cell::new(None)
-    };
+type HostResolver = Arc<dyn Fn(&str, u16) -> Result<Vec<IpAddr>, String> + Send + Sync + 'static>;
+
+struct DnsWorkerLease;
+
+impl Drop for DnsWorkerLease {
+    fn drop(&mut self) {
+        ACTIVE_RESPONSE_DNS_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
-/// Consume one unit of URI-screening budget. Returns `false` when an
-/// `inspect_response` budget is active and exhausted.
-fn take_uri_screen_budget() -> bool {
-    URI_SCREEN_BUDGET.with(|b| match b.get() {
-        Some(0) => false,
-        Some(n) => {
-            b.set(Some(n - 1));
-            true
+fn reserve_dns_worker() -> Option<DnsWorkerLease> {
+    let mut observed = ACTIVE_RESPONSE_DNS_WORKERS.load(Ordering::Acquire);
+    loop {
+        if observed >= MAX_RESPONSE_DNS_WORKERS {
+            return None;
         }
-        None => true, // outside inspect_response (tests, direct callers)
-    })
+        match ACTIVE_RESPONSE_DNS_WORKERS.compare_exchange_weak(
+            observed,
+            observed + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(DnsWorkerLease),
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
+fn resolve_host_blocking(host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| "failed to resolve destination host".to_string())?;
+    let mut ips = Vec::new();
+    for address in addrs {
+        if !ips.contains(&address.ip()) {
+            ips.push(address.ip());
+        }
+    }
+    Ok(ips)
+}
+
+/// Per-response memo of host/port lookups, keyed so a repeated authority in one
+/// response costs a single resolution. Failures are cached too: a host that
+/// already failed must not be retried against the budget.
+type ResolutionCache = RefCell<HashMap<(String, u16), Result<Vec<IpAddr>, String>>>;
+
+struct ResponseDnsBudget {
+    deadline: Instant,
+    screens_remaining: Cell<usize>,
+    exhausted: Cell<bool>,
+    cache: ResolutionCache,
+    last_resolver_error: RefCell<Option<String>>,
+    resolver: HostResolver,
+}
+
+impl ResponseDnsBudget {
+    fn new(total: Duration, resolver: HostResolver) -> Self {
+        Self {
+            deadline: Instant::now()
+                .checked_add(total)
+                .unwrap_or_else(Instant::now),
+            screens_remaining: Cell::new(MAX_URI_SCREENS_PER_RESPONSE),
+            exhausted: Cell::new(false),
+            cache: RefCell::new(HashMap::new()),
+            last_resolver_error: RefCell::new(None),
+            resolver,
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.exhausted.get()
+    }
+
+    fn begin_screen(&self) -> Result<(), String> {
+        if Instant::now() >= self.deadline {
+            self.exhausted.set(true);
+            return Err("response DNS deadline exceeded".to_string());
+        }
+        let remaining = self.screens_remaining.get();
+        if remaining == 0 {
+            self.exhausted.set(true);
+            return Err("too many URIs to validate in one response".to_string());
+        }
+        self.screens_remaining.set(remaining - 1);
+        Ok(())
+    }
+
+    fn validate_fetch_url(&self, url: &str) -> Result<(), String> {
+        self.begin_screen()?;
+        self.last_resolver_error.borrow_mut().take();
+        let result = crate::url_validate::validate_fetch_url_with_resolver(url, &|host, port| {
+            let result = self.resolve(host, port);
+            if let Err(error) = &result {
+                *self.last_resolver_error.borrow_mut() = Some(error.clone());
+            }
+            result
+        });
+        result.map(|_| ()).map_err(|canonical_error| {
+            self.last_resolver_error
+                .borrow_mut()
+                .take()
+                .unwrap_or(canonical_error)
+        })
+    }
+
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+        let key = (host.to_ascii_lowercase(), port);
+        if let Some(cached) = self.cache.borrow().get(&key).cloned() {
+            return cached;
+        }
+
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                self.exhausted.set(true);
+                "response DNS deadline exceeded".to_string()
+            })?;
+        let Some(worker_lease) = reserve_dns_worker() else {
+            self.exhausted.set(true);
+            return Err("response DNS worker capacity exhausted".to_string());
+        };
+
+        let resolver = Arc::clone(&self.resolver);
+        let worker_host = key.0.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("tirith-mcp-response-dns".to_string())
+            .spawn(move || {
+                let _lease = worker_lease;
+                let result = resolver(&worker_host, port);
+                let _ = sender.send(result);
+            });
+        if spawned.is_err() {
+            return Err("response DNS worker unavailable".to_string());
+        }
+
+        let result = match receiver.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.exhausted.set(true);
+                Err("response DNS deadline exceeded".to_string())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("response DNS worker unavailable".to_string())
+            }
+        };
+        self.cache.borrow_mut().insert(key, result.clone());
+        result
+    }
 }
 
 /// Screen one URI through the SSRF fetch validator.
@@ -545,7 +723,12 @@ fn take_uri_screen_budget() -> bool {
 /// * anything else — an opaque/internal scheme the client will not auto-resolve
 ///   over the network (`tirith://`, `ui://`, a custom app scheme, or a bare
 ///   path) — is left alone. Only network-fetchable URIs are SSRF vectors.
-fn screen_uri(uri: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
+fn screen_uri(
+    uri: &str,
+    code: &'static str,
+    out: &mut Vec<ResponseViolation>,
+    dns_budget: &ResponseDnsBudget,
+) {
     let trimmed = uri.trim();
     let scheme = normalized_uri_scheme(trimmed);
 
@@ -569,17 +752,10 @@ fn screen_uri(uri: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
     // network URL and must reach this branch. Reject the ambiguous spelling even
     // if the normalized destination would otherwise be public.
     if matches!(scheme.as_deref(), Some("http" | "https")) {
-        if !take_uri_screen_budget() {
-            out.push(ResponseViolation {
-                code,
-                detail: "too many URIs to validate in one response; refusing to forward an unscreened URL".to_string(),
-            });
-            return;
-        }
         let result = if trimmed.contains('\\') {
             Err("backslashes are not allowed in HTTP(S) resource URLs".to_string())
         } else {
-            crate::url_validate::validate_fetch_url(trimmed).map(|_| ())
+            dns_budget.validate_fetch_url(trimmed)
         };
         if let Err(e) = result {
             out.push(ResponseViolation {
@@ -605,6 +781,12 @@ fn screen_uri(uri: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
 fn categorical_ssrf_detail(reason: &str) -> String {
     let category = if reason.contains("backslash") {
         "backslashes are not allowed"
+    } else if reason.contains("deadline") {
+        "destination resolution deadline exceeded"
+    } else if reason.contains("worker capacity") {
+        "destination resolution capacity exhausted"
+    } else if reason.contains("too many URIs") {
+        "response URI validation budget exhausted"
     } else if reason.contains("embedded credentials") {
         "embedded credentials"
     } else if reason.contains("cloud metadata") {
@@ -689,7 +871,12 @@ struct TemplateExpression {
 /// The template grammar is validated, variables in the scheme or authority are
 /// rejected, and a fixed HTTP(S) authority is passed to the same canonical URL,
 /// hostname, metadata, and address policy as a concrete resource URL.
-fn screen_uri_template(template: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
+fn screen_uri_template(
+    template: &str,
+    code: &'static str,
+    out: &mut Vec<ResponseViolation>,
+    dns_budget: &ResponseDnsBudget,
+) {
     let target = match inspect_uri_template_target(template) {
         Ok(target) => target,
         Err(e) => {
@@ -703,14 +890,7 @@ fn screen_uri_template(template: &str, code: &'static str, out: &mut Vec<Respons
 
     match target {
         UriTemplateTarget::HttpBase(base) => {
-            if !take_uri_screen_budget() {
-                out.push(ResponseViolation {
-                    code,
-                    detail: "too many URIs to validate in one response; refusing to forward an unscreened URL".to_string(),
-                });
-                return;
-            }
-            if let Err(e) = crate::url_validate::validate_fetch_url(&base) {
+            if let Err(e) = dns_budget.validate_fetch_url(&base) {
                 out.push(ResponseViolation {
                     code,
                     detail: categorical_ssrf_detail(&e),
@@ -2067,5 +2247,76 @@ mod tests {
             );
             assert_eq!(outcome.action, Action::Allow);
         }
+    }
+
+    #[test]
+    fn response_dns_uses_one_total_deadline_and_discards_late_results() {
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let resolver: HostResolver = Arc::new(move |_, _| {
+            resolver_calls.fetch_add(1, Ordering::AcqRel);
+            let (lock, wake) = &*worker_release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(vec!["93.184.216.34".parse().unwrap()])
+        });
+        let budget = ResponseDnsBudget::new(Duration::from_millis(250), resolver);
+
+        let start = Instant::now();
+        let first = budget.validate_fetch_url("https://slow-one.example/a");
+        let second = budget.validate_fetch_url("https://slow-two.example/b");
+        let elapsed = start.elapsed();
+
+        assert!(first.unwrap_err().contains("deadline"));
+        assert!(second.unwrap_err().contains("deadline"));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "two hosts exceeded one DNS deadline: {elapsed:?}"
+        );
+
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+    }
+
+    #[test]
+    fn duplicate_hosts_share_one_bounded_resolution() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let resolver: HostResolver = Arc::new(move |_, _| {
+            resolver_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(vec!["93.184.216.34".parse().unwrap()])
+        });
+        let budget = ResponseDnsBudget::new(Duration::from_secs(1), resolver);
+
+        budget.validate_fetch_url("https://same.example/a").unwrap();
+        budget.validate_fetch_url("https://same.example/b").unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn response_dns_screen_count_is_bounded() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let resolver: HostResolver = Arc::new(move |_, _| {
+            resolver_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(vec!["93.184.216.34".parse().unwrap()])
+        });
+        let budget = ResponseDnsBudget::new(Duration::from_secs(30), resolver);
+        for index in 0..MAX_URI_SCREENS_PER_RESPONSE {
+            budget
+                .validate_fetch_url(&format!("https://host-{index}.example/item"))
+                .unwrap();
+        }
+        let error = budget
+            .validate_fetch_url("https://one-too-many.example/item")
+            .unwrap_err();
+
+        assert!(error.contains("too many URIs"));
+        assert_eq!(calls.load(Ordering::Acquire), MAX_URI_SCREENS_PER_RESPONSE);
     }
 }

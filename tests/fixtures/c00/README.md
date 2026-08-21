@@ -25,7 +25,7 @@ Post-r3 source snapshots (computed from `git show 1ff079de:<path>`):
 | `crates/tirith-core/src/command_card.rs` | `f21f45eecf60d14700ced6cf1c3fa265cdae5c3eaa63acd870416e626e36d630` |
 | `crates/tirith-core/src/mcp/tools.rs` | `84588c575daa1126cb5ceef6f5b70f866c2e4698368c0c5f765dd38cd0bde5a1` |
 | `crates/tirith/tests/cli_integration.rs` | `4251e924e393b80a8a233d321d9309e85d4931d163030fd82f0307d3108df0c5` |
-| `docs/capability-manifest.toml` | `adc381012366d995f6c55ca2b1850e3071791d3cea0e6f2d7fd854545b010c65` |
+| `docs/capability-manifest.toml` | `c986da6b353e433b3903314d591088470bc8ed8888dbfef051efac94af64d3ac` |
 
 `contracts.toml` records deterministic byte/hash expectations and the exact
 default MCP tool names. `legacy-policy-v1.yaml` and

@@ -28,6 +28,9 @@ projection_bytes_sha256 = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1
 security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
 
 [capability_manifest]
+# TIRITH-SEC-0083 truthfulness note: the existing `mcp-server` coverage now
+# records the secure-default tool/resource-read output sanitizer. No command,
+# group, inspection level, or policy-completeness value changed.
 # C20 compatibility note: SIX NEW `[[command]]` entries were added for commands
 # this stack shipped that the manifest did not yet describe: `task check` in the
 # existing "Scan & analyze" group, the four `attest build` / `attest
@@ -91,7 +94,7 @@ security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f
 # tirith does not download, inspect, or bind the tarball bytes npm installs. No
 # command was added, removed, renamed, or regrouped, and no `inspected` or
 # `policy_complete` value changed; that was a documentation-truth edit only.
-sha256 = "087e774be63423fea102ff547f652232948541871a25c4e428341d819c4b6007"
+sha256 = "c986da6b353e433b3903314d591088470bc8ed8888dbfef051efac94af64d3ac"
 
 [mcp]
 default_tools = [

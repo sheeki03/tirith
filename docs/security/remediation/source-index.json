@@ -1,0 +1,3494 @@
+{
+  "expected_counts": {
+    "by_report": {
+      "addendum": 1,
+      "additional": 41,
+      "original": 67,
+      "stack": 26
+    },
+    "total": 135
+  },
+  "normalization": "UTF-8; CRLF and CR converted to LF; exactly one terminal LF",
+  "report_order": [
+    "stack",
+    "addendum",
+    "additional",
+    "original"
+  ],
+  "reports": [
+    {
+      "byte_count": 13758,
+      "expected_rows": 26,
+      "line_count": 98,
+      "normalized_sha256": "9458454bb20355c2ff4d6239545378e1db99290b05197ca258e1d42d68ec8d5e",
+      "origin_sha256": "ec0b8361cad4bca54b60df61cb9b5b93c4de2ff0737b9b1121d6fa1debd09abc",
+      "path": "sources/stack-report.md",
+      "report_id": "stack",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "byte_count": 305,
+      "expected_rows": 1,
+      "line_count": 1,
+      "normalized_sha256": "d6c65892df67f0149792ad23f379adfdf8d3f26872436fab90a72b7cf3c876a9",
+      "origin_sha256": "d6c65892df67f0149792ad23f379adfdf8d3f26872436fab90a72b7cf3c876a9",
+      "path": "sources/npm-harness-addendum.md",
+      "report_id": "addendum",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "byte_count": 9319,
+      "expected_rows": 41,
+      "line_count": 101,
+      "normalized_sha256": "03421275563636a3fa538c594362afefd9377e11ee316ee211894b8526a8bfd2",
+      "origin_sha256": "2c513128cce572167cce567164a9c2c36d6e0e70438abe0e1ed94a93ccde60fb",
+      "path": "sources/additional-report.md",
+      "report_id": "additional",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "byte_count": 16695,
+      "expected_rows": 67,
+      "line_count": 120,
+      "normalized_sha256": "2dcc8c7062243c39fb713915b0a3c081b3ead595b0eb7de00c6d2b4c172f7b95",
+      "origin_sha256": "f2da4794ed84586911512ddeba9708b52864dfd972bd326c79a69688a4729b5e",
+      "path": "sources/original-report.md",
+      "report_id": "original",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    }
+  ],
+  "schema_version": 1,
+  "sources": [
+    {
+      "block_sha256": "3411e7d672cabae86014b128045bea909f442a01cae059d455f198177c45b1dd",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 3211,
+          "line_start": 3153,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 1,
+      "normalized_severity": "critical",
+      "report_id": "stack",
+      "report_ordinal": 1,
+      "reported_severity": "Critical",
+      "section": "critical_and_inherited_blockers",
+      "source_id": "STACK-001",
+      "source_locator": {
+        "line_end": 23,
+        "line_start": 23,
+        "path": "sources/stack-report.md"
+      },
+      "title": "MCP clients can bypass enforcement with `TIRITH=0`",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "a075dc63a9cae6ab271f9dd4db4f970c65b9c7ce9778fd0c6041088ab70f2baa",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 3724,
+          "line_start": 3698,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 2,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 2,
+      "reported_severity": "High",
+      "section": "critical_and_inherited_blockers",
+      "source_id": "STACK-002",
+      "source_locator": {
+        "line_end": 25,
+        "line_start": 25,
+        "path": "sources/stack-report.md"
+      },
+      "title": "one command field is inspected while the entire request is forwarded",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "bf82bf55b82fdd797b6abc362b32cdf284d94b74e395ab97254982565af3e442",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 597,
+          "line_start": 569,
+          "path": "crates/tirith-core/src/content_kind.rs"
+        }
+      ],
+      "ledger_ordinal": 3,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 3,
+      "reported_severity": "High",
+      "section": "pr_197_c00_c03",
+      "source_id": "STACK-003",
+      "source_locator": {
+        "line_end": 29,
+        "line_start": 29,
+        "path": "sources/stack-report.md"
+      },
+      "title": "PDF+ZIP polyglot bypass",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "176494a4485d985ca8df04f1fb68567e723e4c02b0ac8987b7f29df1432ebf84",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 6387,
+          "line_start": 6332,
+          "path": "crates/tirith-core/src/rules/rendered.rs"
+        }
+      ],
+      "ledger_ordinal": 4,
+      "normalized_severity": "medium",
+      "report_id": "stack",
+      "report_ordinal": 4,
+      "reported_severity": "Medium",
+      "section": "pr_197_c00_c03",
+      "source_id": "STACK-004",
+      "source_locator": {
+        "line_end": 31,
+        "line_start": 31,
+        "path": "sources/stack-report.md"
+      },
+      "title": "failed PDF analysis reports complete coverage",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "aa71e82913db9bd464793a464f2095819afc2ae33ef3424c4949aa6bda8fc53b",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 31,
+          "line_start": 10,
+          "path": "crates/tirith-core/src/mcp/resources.rs"
+        },
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 462,
+          "line_start": 451,
+          "path": "crates/tirith/src/cli/scan.rs"
+        }
+      ],
+      "ledger_ordinal": 5,
+      "normalized_severity": "medium",
+      "report_id": "stack",
+      "report_ordinal": 5,
+      "reported_severity": "Medium",
+      "section": "pr_197_c00_c03",
+      "source_id": "STACK-005",
+      "source_locator": {
+        "line_end": 33,
+        "line_start": 33,
+        "path": "sources/stack-report.md"
+      },
+      "title": "CLI/MCP completeness contradicts findings",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "7447a7f3e4c894bc82c4370b347a975e506731da3b1082fec11f4bf58a5fd499",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 43,
+          "line_start": 36,
+          "path": "crates/tirith-core/src/rules/web3_gate.rs"
+        },
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 233,
+          "line_start": 195,
+          "path": "crates/tirith-core/src/web3_policy.rs"
+        }
+      ],
+      "ledger_ordinal": 6,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 6,
+      "reported_severity": "High",
+      "section": "pr_198_c04_c12",
+      "source_id": "STACK-006",
+      "source_locator": {
+        "line_end": 37,
+        "line_start": 37,
+        "path": "sources/stack-report.md"
+      },
+      "title": "most `web3_guard` controls are configuration-only",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "c6fcb4dcf3110477c7dc6103e4825042caf4ca46dfe1e89efe1de9b6ee7d391b",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 401,
+          "line_start": 287,
+          "path": "crates/tirith-core/src/rules/web3_gate.rs"
+        }
+      ],
+      "ledger_ordinal": 7,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 7,
+      "reported_severity": "High",
+      "section": "pr_198_c04_c12",
+      "source_id": "STACK-007",
+      "source_locator": {
+        "line_end": 39,
+        "line_start": 39,
+        "path": "sources/stack-report.md"
+      },
+      "title": "signer allowlists are bypassable",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "c5f02f8021f52652a7ba2c5e2ff32429326edb66db25c7c9de2a0637ba287255",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 3072,
+          "line_start": 3056,
+          "path": "crates/tirith-core/src/engine.rs"
+        }
+      ],
+      "ledger_ordinal": 8,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 8,
+      "reported_severity": "High",
+      "section": "pr_198_c04_c12",
+      "source_id": "STACK-008",
+      "source_locator": {
+        "line_end": 41,
+        "line_start": 41,
+        "path": "sources/stack-report.md"
+      },
+      "title": "RPC path denials never match",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "1e3f749105558936bd3c97dfebf29de36236359cf06e00b19b6bf79dd67f5ea7",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 636,
+          "line_start": 626,
+          "path": "crates/tirith-core/src/task.rs"
+        }
+      ],
+      "ledger_ordinal": 9,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 9,
+      "reported_severity": "High",
+      "section": "pr_198_c04_c12",
+      "source_id": "STACK-009",
+      "source_locator": {
+        "line_end": 43,
+        "line_start": 43,
+        "path": "sources/stack-report.md"
+      },
+      "title": "Web3 fact counts can launder an unmodeled shell segment",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "c321d68727d1f1a7752fcf285f0873316dc68cedaf3cf10e0628d1aed4719dac",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 1031,
+          "line_start": 932,
+          "path": "crates/tirith-core/src/rules/command.rs"
+        }
+      ],
+      "ledger_ordinal": 10,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 10,
+      "reported_severity": "High",
+      "section": "pr_198_c04_c12",
+      "source_id": "STACK-010",
+      "source_locator": {
+        "line_end": 46,
+        "line_start": 45,
+        "path": "sources/stack-report.md"
+      },
+      "title": "nested-shell wallet reads do not propagate into outer upload pipelines",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "4852d577308a829aba0500c137a856424adb311f6fdbf6efed4f3fc5d1bf16a5",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 392,
+          "line_start": 262,
+          "path": "crates/tirith-core/src/task.rs"
+        }
+      ],
+      "ledger_ordinal": 11,
+      "normalized_severity": "medium",
+      "report_id": "stack",
+      "report_ordinal": 11,
+      "reported_severity": "Medium",
+      "section": "pr_198_c04_c12",
+      "source_id": "STACK-011",
+      "source_locator": {
+        "line_end": 48,
+        "line_start": 48,
+        "path": "sources/stack-report.md"
+      },
+      "title": "provenance receipts are not verified against their signed task context",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "f228ec15f622ac421de5e7d8109b2948c83a612a872f5df608544e03a53e9859",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 688,
+          "line_start": 455,
+          "path": "crates/tirith-core/src/build_receipt.rs"
+        }
+      ],
+      "ledger_ordinal": 12,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 12,
+      "reported_severity": "P1",
+      "section": "pr_201_c13_c18",
+      "source_id": "STACK-012",
+      "source_locator": {
+        "line_end": 52,
+        "line_start": 52,
+        "path": "sources/stack-report.md"
+      },
+      "title": "build receipts do not represent a coherent tree",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "d2dc8721d18e69dfe22d6c82b5faff4f60086384e9f02734722a7c17f833db89",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 840,
+          "line_start": 820,
+          "path": "crates/tirith-core/src/capsule_project.rs"
+        }
+      ],
+      "ledger_ordinal": 13,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 13,
+      "reported_severity": "P1",
+      "section": "pr_201_c13_c18",
+      "source_id": "STACK-013",
+      "source_locator": {
+        "line_end": 54,
+        "line_start": 54,
+        "path": "sources/stack-report.md"
+      },
+      "title": "capsule copying removes execute permissions",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "56b17e0f0afe63dbfd95cb3bc69a5d77e5afb6a869ed9ec6c8ed360e3162fc31",
+      "evidence": [],
+      "ledger_ordinal": 14,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 14,
+      "reported_severity": "P1",
+      "section": "pr_201_c13_c18",
+      "source_id": "STACK-014",
+      "source_locator": {
+        "line_end": 56,
+        "line_start": 56,
+        "path": "sources/stack-report.md"
+      },
+      "title": "unresolved workflow producers can trigger a risk downgrade",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "dff6f6edd2e47b09761ad8374ec1f66d9dd10939cfba7e9303dbe03d06bdd7ec",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 1254,
+          "line_start": 1188,
+          "path": "crates/tirith-core/src/workflow_artifacts.rs"
+        }
+      ],
+      "ledger_ordinal": 15,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 15,
+      "reported_severity": "P1",
+      "section": "pr_201_c13_c18",
+      "source_id": "STACK-015",
+      "source_locator": {
+        "line_end": 58,
+        "line_start": 58,
+        "path": "sources/stack-report.md"
+      },
+      "title": "`find -exec` is considered inert after artifact download",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "793ef4a70a2c8c269a0340375ad588da58d7c765521b1abba4703268d7d8e384",
+      "evidence": [],
+      "ledger_ordinal": 16,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 16,
+      "reported_severity": "P1",
+      "section": "pr_201_c13_c18",
+      "source_id": "STACK-016",
+      "source_locator": {
+        "line_end": 60,
+        "line_start": 60,
+        "path": "sources/stack-report.md"
+      },
+      "title": "npm subtraction can claim Clean without npm auditing the package",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "b21237d2a1e97855c2475929f1c39e53006049ae8978a1c68f7eb1f2ed4b82e1",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 5871,
+          "line_start": 5802,
+          "path": "crates/tirith-core/src/rules/command.rs"
+        }
+      ],
+      "ledger_ordinal": 17,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 17,
+      "reported_severity": "P1",
+      "section": "pr_201_c13_c18",
+      "source_id": "STACK-017",
+      "source_locator": {
+        "line_end": 62,
+        "line_start": 62,
+        "path": "sources/stack-report.md"
+      },
+      "title": "new `find`/GNU Parallel exfil detection is trivially evaded by options",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "9fb2f7d9c1d0b7daacda14b28f49e6696b7002463b737c087edd5abce28a3a74",
+      "evidence": [],
+      "ledger_ordinal": 18,
+      "normalized_severity": "high",
+      "report_id": "stack",
+      "report_ordinal": 18,
+      "reported_severity": "P1",
+      "section": "pr_201_c13_c18",
+      "source_id": "STACK-018",
+      "source_locator": {
+        "line_end": 64,
+        "line_start": 64,
+        "path": "sources/stack-report.md"
+      },
+      "title": "browser digests can omit concurrent extension changes while remaining Complete",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "a5fd6210387e465aa9086449495e3a54820506491643295386abb7f39829d09d",
+      "evidence": [],
+      "ledger_ordinal": 19,
+      "normalized_severity": "medium",
+      "report_id": "stack",
+      "report_ordinal": 19,
+      "reported_severity": "P2",
+      "section": "pr_201_c13_c18",
+      "source_id": "STACK-019",
+      "source_locator": {
+        "line_end": 66,
+        "line_start": 66,
+        "path": "sources/stack-report.md"
+      },
+      "title": "Linux Chrome beta is skipped whenever stable Chrome exists",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "354045ef3257f3ad10e6453652121b4aa0c6d3312af7cc61909a0d2c82d74b0f",
+      "evidence": [],
+      "ledger_ordinal": 20,
+      "normalized_severity": "medium",
+      "report_id": "stack",
+      "report_ordinal": 20,
+      "reported_severity": "P2",
+      "section": "pr_201_c13_c18",
+      "source_id": "STACK-020",
+      "source_locator": {
+        "line_end": 68,
+        "line_start": 68,
+        "path": "sources/stack-report.md"
+      },
+      "title": "capsule copy/inventory accepts moving trees",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "ba7ed906c016640d20c39dcd6c0c02ab5c6f5a3caddcade2d6a675bf4af06435",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 556,
+          "line_start": 543,
+          "path": "crates/tirith-core/src/task.rs"
+        }
+      ],
+      "ledger_ordinal": 21,
+      "normalized_severity": "medium",
+      "report_id": "stack",
+      "report_ordinal": 21,
+      "reported_severity": "Medium",
+      "section": "pr_199_c19_c20",
+      "source_id": "STACK-021",
+      "source_locator": {
+        "line_end": 72,
+        "line_start": 72,
+        "path": "sources/stack-report.md"
+      },
+      "title": "`PolicyChange` is missed through lexical path aliases",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "68eb132e1a64b5d75e67fdb41cc92fa89dba73e21207da11a9125f82ea4cc6ff",
+      "evidence": [],
+      "ledger_ordinal": 22,
+      "normalized_severity": "medium",
+      "report_id": "stack",
+      "report_ordinal": 22,
+      "reported_severity": "Medium",
+      "section": "pr_199_c19_c20",
+      "source_id": "STACK-022",
+      "source_locator": {
+        "line_end": 74,
+        "line_start": 74,
+        "path": "sources/stack-report.md"
+      },
+      "title": "golden tests still race through process-global environment variables",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "917a66fd4a1e375e637f6854e095044c41f57962a7db78762649789b9c695beb",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 45,
+          "line_start": 41,
+          "path": "fuzz/fuzz_targets/workflow_artifact.rs"
+        }
+      ],
+      "ledger_ordinal": 23,
+      "normalized_severity": "medium",
+      "report_id": "stack",
+      "report_ordinal": 23,
+      "reported_severity": "Medium",
+      "section": "pr_199_c19_c20",
+      "source_id": "STACK-023",
+      "source_locator": {
+        "line_end": 76,
+        "line_start": 76,
+        "path": "sources/stack-report.md"
+      },
+      "title": "workflow truncation fuzz assertion is a no-op",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "a4f0146a5b162aae67f5a684b2eb8ebc4944e5ab633e3e156d5aa1b1eadd5d6f",
+      "evidence": [
+        {
+          "commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d",
+          "line_end": 128,
+          "line_start": 108,
+          "path": "fuzz/fuzz_targets/web3_command.rs"
+        }
+      ],
+      "ledger_ordinal": 24,
+      "normalized_severity": "medium",
+      "report_id": "stack",
+      "report_ordinal": 24,
+      "reported_severity": "Medium",
+      "section": "pr_199_c19_c20",
+      "source_id": "STACK-024",
+      "source_locator": {
+        "line_end": 78,
+        "line_start": 78,
+        "path": "sources/stack-report.md"
+      },
+      "title": "Web3 secret-leak fuzzing misses canonical `0x…` values",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "8b526ff125b86f165fd2fa8981386739a7c9e5f05cbc0c99719faa5936fcdd18",
+      "evidence": [],
+      "ledger_ordinal": 25,
+      "normalized_severity": "low",
+      "report_id": "stack",
+      "report_ordinal": 25,
+      "reported_severity": "Low",
+      "section": "pr_199_c19_c20",
+      "source_id": "STACK-025",
+      "source_locator": {
+        "line_end": 80,
+        "line_start": 80,
+        "path": "sources/stack-report.md"
+      },
+      "title": "“requesting never grants” fuzz property duplicates the preceding subset assertion",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "516609c5380586823ea38467654561e99976b0e63da97a95aefd32a2bfd5e2ee",
+      "evidence": [],
+      "ledger_ordinal": 26,
+      "normalized_severity": "low",
+      "report_id": "stack",
+      "report_ordinal": 26,
+      "reported_severity": "Low",
+      "section": "pr_199_c19_c20",
+      "source_id": "STACK-026",
+      "source_locator": {
+        "line_end": 82,
+        "line_start": 82,
+        "path": "sources/stack-report.md"
+      },
+      "title": "determinism fuzzing compares counts/projections rather than full results",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "d6c65892df67f0149792ad23f379adfdf8d3f26872436fab90a72b7cf3c876a9",
+      "evidence": [],
+      "ledger_ordinal": 27,
+      "normalized_severity": null,
+      "report_id": "addendum",
+      "report_ordinal": 1,
+      "reported_severity": null,
+      "section": "pr_201_npm_regression_harness",
+      "source_id": "ADDENDUM-001",
+      "source_locator": {
+        "line_end": 1,
+        "line_start": 1,
+        "path": "sources/npm-harness-addendum.md"
+      },
+      "title": "npm regression harness conflicts with trusted-child validation",
+      "vulnerable_commit": "e9cf7c602b664da195700d8cca0ca5565e4dec4d"
+    },
+    {
+      "block_sha256": "810330c0b1b83ceef3fad6d32a1440cb8363ee1d6bf9db50e7284050caa011d6",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 799,
+          "line_start": 799,
+          "path": "crates/tirith-core/src/install_txn.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 156,
+          "line_start": 156,
+          "path": "crates/tirith/src/cli/install.rs"
+        }
+      ],
+      "ledger_ordinal": 28,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 1,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-001",
+      "source_locator": {
+        "line_end": 5,
+        "line_start": 5,
+        "path": "sources/additional-report.md"
+      },
+      "title": "`tirith install pip` can report complete coverage and then execute an uninspected malicious sdist build backend",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "3a4e6faf06347da9166c6637597af27b04f1d04be347d8ddddb453176eaea297",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 2915,
+          "line_start": 2915,
+          "path": "crates/tirith-core/src/ecosystem_scan.rs"
+        }
+      ],
+      "ledger_ordinal": 29,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 2,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-002",
+      "source_locator": {
+        "line_end": 7,
+        "line_start": 7,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Malformed JSON/TOML dependency manifests become notes, not coverage failures; scans can exit 0 with zero dependencies",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "a4b1d86cb939b58dd0056f56e8ad0284a1977bd9624bd421ba0b9e74b85a570a",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 458,
+          "line_start": 458,
+          "path": "crates/tirith-core/src/ecosystem_scan.rs"
+        }
+      ],
+      "ledger_ordinal": 30,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 3,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-003",
+      "source_locator": {
+        "line_end": 9,
+        "line_start": 9,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Git, URL, path, and workspace dependencies can be omitted or evaluated as registry packages while the scan remains Allow",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "986d367b67d6705a623c03ab9675211bbf3958e61ead3287aa85c49bd1ef9438",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 86,
+          "line_start": 86,
+          "path": "crates/tirith-core/src/rules/aifile.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1123,
+          "line_start": 1123,
+          "path": "crates/tirith-core/src/scan.rs"
+        }
+      ],
+      "ledger_ordinal": 31,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 4,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-004",
+      "source_locator": {
+        "line_end": 11,
+        "line_start": 11,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Several supported AI instruction directories are absent from AI snapshot/diff and specialized scanning, including `.github/instructions`, `.windsurf/rules`, `.kiro/steering`, and `.opencode/agents`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "cbcbde73ec789c9d26719b246ad59ad8ac158080f4774b82a1f464e1354540db",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 31,
+          "line_start": 31,
+          "path": "crates/tirith-core/src/rules/rendered.rs"
+        }
+      ],
+      "ledger_ordinal": 32,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 5,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-005",
+      "source_locator": {
+        "line_end": 13,
+        "line_start": 13,
+        "path": "sources/additional-report.md"
+      },
+      "title": "CSS comments and escapes bypass hidden-instruction detection, e.g",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "6c7e0f29147979794856da0e49e58e899e90bc984b391dfc7d44490f91ec053d",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1378,
+          "line_start": 1378,
+          "path": "crates/tirith-core/src/rules/aifile.rs"
+        }
+      ],
+      "ledger_ordinal": 33,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 6,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-006",
+      "source_locator": {
+        "line_end": 15,
+        "line_start": 15,
+        "path": "sources/additional-report.md"
+      },
+      "title": "XML character references bypass SVG JavaScript and external-resource detection",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "df11f4fe8a9c9b978a688c39bdfd7b85c48ad29b786eca1c8046e82e6f2056af",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 725,
+          "line_start": 725,
+          "path": "crates/tirith-core/src/rules/aifile.rs"
+        }
+      ],
+      "ledger_ordinal": 34,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 7,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-007",
+      "source_locator": {
+        "line_end": 17,
+        "line_start": 17,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Repeated unmatched hidden HTML tags in `AGENTS.md` cause quadratic work and retained strings, potentially hanging or OOMing scans",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "3964a487288a88d5c3431e0c9199934f9b0bd4e7d1ac726f7b70a49ed9947206",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 364,
+          "line_start": 364,
+          "path": "crates/tirith/src/cli/browser.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 8927,
+          "line_start": 8927,
+          "path": "crates/tirith/src/main.rs"
+        }
+      ],
+      "ledger_ordinal": 35,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 8,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-008",
+      "source_locator": {
+        "line_end": 19,
+        "line_start": 19,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Browser Native Messaging installation is nonfunctional: Chromium launches `tirith` without the required `browser host` arguments",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "61e5ae601e474ab626cfe3a78a3f941ddb5506e05e08014c2757af084c83f9d6",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 419,
+          "line_start": 419,
+          "path": "crates/tirith/src/cli/setup/tools.rs"
+        }
+      ],
+      "ledger_ordinal": 36,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 9,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-009",
+      "source_locator": {
+        "line_end": 21,
+        "line_start": 21,
+        "path": "sources/additional-report.md"
+      },
+      "title": "IDE enforcement hooks trust `PATH` or `TIRITH_BIN`, allowing a repository-controlled shim to bypass Tirith or execute code",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "4c13b4c101d5038aa2d89b8d8e2d804889b6d196d63d14dfab73c5d7bd708c5e",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 460,
+          "line_start": 460,
+          "path": "crates/tirith/src/cli/ssh.rs"
+        }
+      ],
+      "ledger_ordinal": 37,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 10,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-010",
+      "source_locator": {
+        "line_end": 23,
+        "line_start": 23,
+        "path": "sources/additional-report.md"
+      },
+      "title": "`tirith ssh label` runs ambient-PATH `ssh`, enabling executable hijacking",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "4e9aca18ba20843a48ea4740134cb5fb61bc4c865daa90ec538f77de90222555",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 92,
+          "line_start": 92,
+          "path": "action.yml"
+        }
+      ],
+      "ledger_ordinal": 38,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 11,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-011",
+      "source_locator": {
+        "line_end": 25,
+        "line_start": 25,
+        "path": "sources/additional-report.md"
+      },
+      "title": "The composite GitHub Action uses mutable `github/codeql-action/upload-sarif@v3`; pinning Tirith’s action SHA does not pin this nested code",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "68dd124bfd56b30c210f298a2cc8cb08ea51797e1eb4e9982bf944f451e8a76e",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 50,
+          "line_start": 50,
+          "path": ".github/workflows/threatdb.yml"
+        }
+      ],
+      "ledger_ordinal": 39,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 12,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-012",
+      "source_locator": {
+        "line_end": 27,
+        "line_start": 27,
+        "path": "sources/additional-report.md"
+      },
+      "title": "ThreatDB checks freshness only before a long build, then signs and publishes without rechecking; stale compiler/policy code can publish after `main` changes",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "c979991b1716be4060a47e3b7e8f8df196c801b680834bad7356eede0e3174c5",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 27,
+          "line_start": 27,
+          "path": ".github/workflows/release.yml"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1249,
+          "line_start": 1249,
+          "path": "crates/tirith-core/src/license.rs"
+        }
+      ],
+      "ledger_ordinal": 40,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 13,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-013",
+      "source_locator": {
+        "line_end": 29,
+        "line_start": 29,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Release tags are not bound to Cargo/binary versions",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "ab771b33186d78a949895dc8cd36252083ef365b9f138b48af7d742a3dbd6fa9",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 56,
+          "line_start": 56,
+          "path": "crates/tirith/src/cli/lsp.rs"
+        }
+      ],
+      "ledger_ordinal": 41,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 14,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-014",
+      "source_locator": {
+        "line_end": 31,
+        "line_start": 31,
+        "path": "sources/additional-report.md"
+      },
+      "title": "The LSP 10 MiB cap is applied after tower-lsp has already buffered and deserialized an unbounded frame",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "fb912d4a60e5b37bcf6fd08096972a0485a36e1df86623b6231b94422a52295a",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 910,
+          "line_start": 910,
+          "path": "crates/tirith/src/cli/daemon.rs"
+        }
+      ],
+      "ledger_ordinal": 42,
+      "normalized_severity": "high",
+      "report_id": "additional",
+      "report_ordinal": 15,
+      "reported_severity": "High priority",
+      "section": "high_priority",
+      "source_id": "ADDITIONAL-015",
+      "source_locator": {
+        "line_end": 33,
+        "line_start": 33,
+        "path": "sources/additional-report.md"
+      },
+      "title": "`daemon stop` can SIGTERM an unrelated same-user process because socket liveness is not correlated with the PID file",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "285bce0f92682715af4d4dac2fe08fe604e8c721f0d4e3f73be21fc8d07adbd2",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 489,
+          "line_start": 489,
+          "path": "crates/tirith/src/cli/package.rs"
+        }
+      ],
+      "ledger_ordinal": 43,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 16,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-016",
+      "source_locator": {
+        "line_end": 37,
+        "line_start": 37,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Exact-version package risk queries score latest-release metadata",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "08c865d00030e19fecdbeadf0870d52625e64f1199474361c8d72078f327f555",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 2478,
+          "line_start": 2478,
+          "path": "crates/tirith-core/src/ecosystem_scan.rs"
+        }
+      ],
+      "ledger_ordinal": 44,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 17,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-017",
+      "source_locator": {
+        "line_end": 39,
+        "line_start": 39,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Ecosystem metadata is cached by package name, not locked version",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "6491dcd5dff445eabb2ae2e4c7d7670f46405561ffab4795e5a76d547ae0eb14",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 3020,
+          "line_start": 3020,
+          "path": "crates/tirith-core/src/ecosystem_scan.rs"
+        }
+      ],
+      "ledger_ordinal": 45,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 18,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-018",
+      "source_locator": {
+        "line_end": 41,
+        "line_start": 41,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Installed npm scanning skips nested `node_modules`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "2abed03e8d6d88a265ff78d3d7380dab5c47f582b1cba045b0e81d6951e409f6",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 789,
+          "line_start": 789,
+          "path": "crates/tirith/src/cli/package.rs"
+        }
+      ],
+      "ledger_ordinal": 46,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 19,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-019",
+      "source_locator": {
+        "line_end": 43,
+        "line_start": 43,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Binary detection silently ignores walk errors and stops at 20,000 entries, then reports no binary",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "6cc86c5c16e7f443cb31bcdeb8a8afdbaec5f78735f090e75954cd1374589acb",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 91,
+          "line_start": 91,
+          "path": "crates/tirith/src/cli/provenance.rs"
+        }
+      ],
+      "ledger_ordinal": 47,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 20,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-020",
+      "source_locator": {
+        "line_end": 45,
+        "line_start": 45,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Provenance graphs return success for rejected wheels and nonexistent installed environments",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "b4ae4acb9a3bd16a855b0f8189b1e9d6f0c23bef7f96a726b3a335825d0dfc9f",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 539,
+          "line_start": 539,
+          "path": "crates/tirith/src/cli/temp_run.rs"
+        }
+      ],
+      "ledger_ordinal": 48,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 21,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-021",
+      "source_locator": {
+        "line_end": 47,
+        "line_start": 47,
+        "path": "sources/additional-report.md"
+      },
+      "title": "`temp-run` misses deletions and content changes with preserved timestamps",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "58f851bc5d67f2ea3787f7428f7ec65ffc4d39bdf82487203428be171f71f03e",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 493,
+          "line_start": 493,
+          "path": "crates/tirith/src/cli/temp_run.rs"
+        }
+      ],
+      "ledger_ordinal": 49,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 22,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-022",
+      "source_locator": {
+        "line_end": 49,
+        "line_start": 49,
+        "path": "sources/additional-report.md"
+      },
+      "title": "`temp-run` silently truncates copy/inventory at 100,000 files",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "bc9ecc0a54e3df87632d78f01cf84889b93c076fd5c3d500e3be9e3fb01cfb85",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 916,
+          "line_start": 916,
+          "path": "crates/tirith-core/src/scan.rs"
+        }
+      ],
+      "ledger_ordinal": 50,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 23,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-023",
+      "source_locator": {
+        "line_end": 51,
+        "line_start": 51,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Recursive scans silently discard `.pyc`, `.o`, `.a`, ZIP, and compressed archives without a coverage gap",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "a1eb176495aa9292442c1b8f37f203dc845b06b7646d32b1aee9c8102bba410a",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 479,
+          "line_start": 479,
+          "path": "crates/tirith/src/cli/ssh.rs"
+        }
+      ],
+      "ledger_ordinal": 51,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 24,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-024",
+      "source_locator": {
+        "line_end": 53,
+        "line_start": 53,
+        "path": "sources/additional-report.md"
+      },
+      "title": "SSH’s 1.5-second timeout can hang indefinitely while joining a pipe inherited by a descendant",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "61fec9200f98ffd3b3092bed4fdb99587f476f7faf3c6e46109f34e0ae63d6c5",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 39,
+          "line_start": 39,
+          "path": "crates/tirith-core/src/clipboard.rs"
+        }
+      ],
+      "ledger_ordinal": 52,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 25,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-025",
+      "source_locator": {
+        "line_end": 55,
+        "line_start": 55,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Browser clipboard provenance timestamps are neither validated nor expired",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "fd83835afc73ac9e446edf5f582d42f296be4902c771a7a5881c5a79a84428ca",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 888,
+          "line_start": 888,
+          "path": "crates/tirith/src/cli/clipboard.rs"
+        }
+      ],
+      "ledger_ordinal": 53,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 26,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-026",
+      "source_locator": {
+        "line_end": 57,
+        "line_start": 57,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Clipboard service definitions improperly interpolate executable/log paths into plist XML and systemd units",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "8862b5fbe6c2642b5d2102d6b806a96877cca0d91dd19e0ebf7f731dae400766",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 388,
+          "line_start": 388,
+          "path": "crates/tirith/src/cli/clipboard.rs"
+        }
+      ],
+      "ledger_ordinal": 54,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 27,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-027",
+      "source_locator": {
+        "line_end": 59,
+        "line_start": 59,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Clipboard service install/uninstall reports success after service-manager failures",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "08ffd88a824f50d49ea4c46a41016c07f2ce6f1871ebbc6151c17dd74fe67758",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 274,
+          "line_start": 274,
+          "path": "crates/tirith/src/cli/browser.rs"
+        }
+      ],
+      "ledger_ordinal": 55,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 28,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-028",
+      "source_locator": {
+        "line_end": 61,
+        "line_start": 61,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Browser Native Messaging has no uninstall/upgrade lifecycle, leaving stale manifests and registry entries",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "55e75953380939a05b8f3e6b3d75ecb70a0e4aa03283ef6133e75bae5f25ca91",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 18,
+          "line_start": 18,
+          "path": ".github/workflows/fuzz.yml"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 47,
+          "line_start": 47,
+          "path": "fuzz/Cargo.toml"
+        }
+      ],
+      "ledger_ordinal": 56,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 29,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-029",
+      "source_locator": {
+        "line_end": 63,
+        "line_start": 63,
+        "path": "sources/additional-report.md"
+      },
+      "title": "The `artifact_wheel` fuzz target exists but is omitted from the scheduled fuzz matrix",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "ee51f3dba9f9ba263a616b869d011a5df47e87d847dde3fe79db7ce3084c3593",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 38,
+          "line_start": 38,
+          "path": ".github/workflows/fuzz.yml"
+        }
+      ],
+      "ledger_ordinal": 57,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 30,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-030",
+      "source_locator": {
+        "line_end": 65,
+        "line_start": 65,
+        "path": "sources/additional-report.md"
+      },
+      "title": "The tracked fuzz lockfile is stale: `cargo check --manifest-path fuzz/Cargo.toml --locked` fails",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "4be538fc60faf22d1a6cfe4f9ef0ce953120e057485c6d83a3def7eef80f45c8",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 59,
+          "line_start": 59,
+          "path": "tools/license-server/src/routes/refresh.rs"
+        }
+      ],
+      "ledger_ordinal": 58,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 31,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-031",
+      "source_locator": {
+        "line_end": 67,
+        "line_start": 67,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Parallel license refresh requests bypass the 60-second issuance throttle",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "5d0e19caddbe3064da8ffe9f44121b994cc71cbc0e7764ea430aacaa700c20a5",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 396,
+          "line_start": 396,
+          "path": "tools/license-server/src/db.rs"
+        }
+      ],
+      "ledger_ordinal": 59,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 32,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-032",
+      "source_locator": {
+        "line_end": 69,
+        "line_start": 69,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Stale `subscription.revoked` events are applied without event-order checks and become irreversible",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "9b04d00ded0f36ce1e71eb737ecb2226aa20e27138276527910e90f385db8a41",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 192,
+          "line_start": 192,
+          "path": "tools/license-server/src/routes/webhook.rs"
+        }
+      ],
+      "ledger_ordinal": 60,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 33,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-033",
+      "source_locator": {
+        "line_end": 71,
+        "line_start": 71,
+        "path": "sources/additional-report.md"
+      },
+      "title": "An authentic lifecycle event missing `created_at` can re-enable a disabled key",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "9a0ed8d7b529ea429f48ada2f42070e675e7a6dcb2866143ff0f7dc436ec7ed7",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 10,
+          "line_start": 10,
+          "path": "crates/tirith-core/src/network/dns.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 603,
+          "line_start": 603,
+          "path": "crates/tirith/src/cli/daemon.rs"
+        }
+      ],
+      "ledger_ordinal": 61,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 34,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-034",
+      "source_locator": {
+        "line_end": 73,
+        "line_start": 73,
+        "path": "sources/additional-report.md"
+      },
+      "title": "DNS time budgets cannot interrupt synchronous resolver calls; distinct attacker-controlled hosts multiply daemon worker blocking",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "121afbd7ad52cfefc07674377f3f94e0b0f30172a4353b086027c8f3183febe7",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 657,
+          "line_start": 657,
+          "path": "crates/tirith/src/cli/daemon.rs"
+        }
+      ],
+      "ledger_ordinal": 62,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 35,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-035",
+      "source_locator": {
+        "line_end": 75,
+        "line_start": 75,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Concurrent daemon startups can unlink another instance’s live socket/PID files",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "c350fcfdce99f14e7d2ad7bc0871b460d41084572f9bdb36ee29083eca7b0f17",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 388,
+          "line_start": 388,
+          "path": "crates/tirith/src/cli/prompt_status.rs"
+        }
+      ],
+      "ledger_ordinal": 63,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 36,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-036",
+      "source_locator": {
+        "line_end": 77,
+        "line_start": 77,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Prompt-status trusts insecure or symlinked `XDG_RUNTIME_DIR` caches and uses predictable temporary paths",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "1e43d67ed68a89f82630ef4659aa04e259a6b3ef8e85fe6cc8deec5da4008e4a",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 53,
+          "line_start": 53,
+          "path": "crates/tirith/src/cli/share.rs"
+        }
+      ],
+      "ledger_ordinal": 64,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 37,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-037",
+      "source_locator": {
+        "line_end": 79,
+        "line_start": 79,
+        "path": "sources/additional-report.md"
+      },
+      "title": "`share --json --out` ignores `--out`, leaves stale content untouched, and exits 0",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "15ed24f4f2f19c3df4d5ac87e96697342d29ce9ecdc74f5eaf47e9bb0ed9d881",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 119,
+          "line_start": 119,
+          "path": "crates/tirith/src/cli/share.rs"
+        }
+      ],
+      "ledger_ordinal": 65,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 38,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-038",
+      "source_locator": {
+        "line_end": 81,
+        "line_start": 81,
+        "path": "sources/additional-report.md"
+      },
+      "title": "The documented `/tmp/safe.log` share destination follows symlinks and can clobber victim-writable files",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "ae10ebb3c3b7a356caaa8b80174fa9a41c14192d87050cb930594cedd5a3b0b8",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 18,
+          "line_start": 18,
+          "path": "crates/tirith-core/src/webhook.rs"
+        }
+      ],
+      "ledger_ordinal": 66,
+      "normalized_severity": "medium",
+      "report_id": "additional",
+      "report_ordinal": 39,
+      "reported_severity": "Medium priority",
+      "section": "medium_priority",
+      "source_id": "ADDITIONAL-039",
+      "source_locator": {
+        "line_end": 83,
+        "line_start": 83,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Webhook DLP leaks ordinary assignment secrets such as `PASSWORD=...`; it uses the weaker generic redactor",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "0772096f43106cd75a3382bd5aeae8df816abb6480ee0774d69b072d29dcfdae",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1376,
+          "line_start": 1376,
+          "path": "crates/tirith-core/src/audit.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 3,
+          "line_start": 3,
+          "path": "crates/tirith/src/cli/hook_event.rs"
+        }
+      ],
+      "ledger_ordinal": 67,
+      "normalized_severity": "low",
+      "report_id": "additional",
+      "report_ordinal": 40,
+      "reported_severity": "Low priority",
+      "section": "low_priority",
+      "source_id": "ADDITIONAL-040",
+      "source_locator": {
+        "line_end": 87,
+        "line_start": 87,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Hook telemetry stores unredacted, unbounded caller-controlled fields in audit logs",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "901a69997b75634c45b4cf95ab18c11d6195427333ad9286d6cfb418cd9a0748",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 142,
+          "line_start": 142,
+          "path": "crates/tirith/src/cli/lab.rs"
+        }
+      ],
+      "ledger_ordinal": 68,
+      "normalized_severity": "low",
+      "report_id": "additional",
+      "report_ordinal": 41,
+      "reported_severity": "Low priority",
+      "section": "low_priority",
+      "source_id": "ADDITIONAL-041",
+      "source_locator": {
+        "line_end": 89,
+        "line_start": 89,
+        "path": "sources/additional-report.md"
+      },
+      "title": "Raw lab filters and share error paths allow terminal-control/diagnostic injection",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "3853c4010be5b6770fbebe7e37fdc074518693e929aec6e41e1a6c814af38926",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 2612,
+          "line_start": 2612,
+          "path": "crates/tirith-core/src/engine.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1050,
+          "line_start": 1050,
+          "path": "crates/tirith-core/src/policy.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 3066,
+          "line_start": 3066,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 69,
+      "normalized_severity": "critical",
+      "report_id": "original",
+      "report_ordinal": 1,
+      "reported_severity": "Critical",
+      "section": "critical",
+      "source_id": "ORIGINAL-001",
+      "source_locator": {
+        "line_end": 7,
+        "line_start": 7,
+        "path": "sources/original-report.md"
+      },
+      "title": "Autonomous MCP commands can disable Tirith with `TIRITH=0`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "f52afd2526a59f13ebd5bb41a72290fc723d3a2737f1fd03e9d1caa084e48249",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 295,
+          "line_start": 295,
+          "path": "crates/tirith-core/src/artifact/release_diff.rs"
+        }
+      ],
+      "ledger_ordinal": 70,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 2,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-002",
+      "source_locator": {
+        "line_end": 11,
+        "line_start": 11,
+        "path": "sources/original-report.md"
+      },
+      "title": "Release diff can Allow a malicious wheel",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "429fa60741643f50c31228d313cdf671e9abd674cd7416c47d27f886747700fb",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 25,
+          "line_start": 25,
+          "path": "crates/tirith/src/cli/selfupdate.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 146,
+          "line_start": 146,
+          "path": "scripts/install.sh"
+        }
+      ],
+      "ledger_ordinal": 71,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 3,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-003",
+      "source_locator": {
+        "line_end": 13,
+        "line_start": 13,
+        "path": "sources/original-report.md"
+      },
+      "title": "Self-update accepts foreign Sigstore identities",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "ae7195135813ce7c8945b8da389397dc7accde14951c0c54891a380155a252e4",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 905,
+          "line_start": 905,
+          "path": "crates/tirith/src/cli/daemon.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1148,
+          "line_start": 1148,
+          "path": "crates/tirith/src/cli/daemon.rs"
+        }
+      ],
+      "ledger_ordinal": 72,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 4,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-004",
+      "source_locator": {
+        "line_end": 15,
+        "line_start": 15,
+        "path": "sources/original-report.md"
+      },
+      "title": "Malformed daemon PID data can invoke `kill(-1, SIGTERM)`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "0c49131359405951beb81e17d2182f0e8b8ddb680ba929f222292588c6beadce",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 3133,
+          "line_start": 3133,
+          "path": "crates/tirith-core/src/mcp_lock.rs"
+        }
+      ],
+      "ledger_ordinal": 73,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 5,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-005",
+      "source_locator": {
+        "line_end": 17,
+        "line_start": 17,
+        "path": "sources/original-report.md"
+      },
+      "title": "Duplicate MCP server names can erase real lockfile drift",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "931605df0495c51b7a504c6622cfd50d01680ec0fe11bf094ec879d8ae0fee0c",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1577,
+          "line_start": 1577,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 74,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 6,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-006",
+      "source_locator": {
+        "line_end": 19,
+        "line_start": 19,
+        "path": "sources/original-report.md"
+      },
+      "title": "MCP approval does not bind interpreted code",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "e888b840f41b5958dfaa1f935972acc1dd607d3a2e8b6534b2a3600709bcdeeb",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 4419,
+          "line_start": 4419,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 4697,
+          "line_start": 4697,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 75,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 7,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-007",
+      "source_locator": {
+        "line_end": 21,
+        "line_start": 21,
+        "path": "sources/original-report.md"
+      },
+      "title": "Malformed MCP output bypasses enabled filtering",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "d3b2f48f8a737cadfd4f3abf1862abf515005184c4f5e0f4b6763ce622df6996",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 680,
+          "line_start": 680,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 2161,
+          "line_start": 2161,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 76,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 8,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-008",
+      "source_locator": {
+        "line_end": 23,
+        "line_start": 23,
+        "path": "sources/original-report.md"
+      },
+      "title": "Gateway queues and pending maps are attacker-unbounded",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "0233201a8f65d79dc3fb1ad88d7cf04eb60c1d018e7debe9954d0cc048c6bfb8",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 143,
+          "line_start": 143,
+          "path": "crates/tirith-core/src/mcp_lock.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 2288,
+          "line_start": 2288,
+          "path": "crates/tirith-core/src/mcp_lock.rs"
+        }
+      ],
+      "ledger_ordinal": 77,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 9,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-009",
+      "source_locator": {
+        "line_end": 25,
+        "line_start": 25,
+        "path": "sources/original-report.md"
+      },
+      "title": "Bearer credentials can be committed into `mcp.lock`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "dc81ccde202f829fc559e028f704d01910d7a0556e149c93e44cb2ce783670c8",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 489,
+          "line_start": 489,
+          "path": "crates/tirith/src/cli/capsule_windows.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 700,
+          "line_start": 700,
+          "path": "crates/tirith/src/cli/capsule_windows.rs"
+        }
+      ],
+      "ledger_ordinal": 78,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 10,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-010",
+      "source_locator": {
+        "line_end": 27,
+        "line_start": 27,
+        "path": "sources/original-report.md"
+      },
+      "title": "Windows ACL lifecycle is unsafe",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "26b7a296c37d02051c50097059b7cf1db811a1d3659be25e467ecf9ae091dd64",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1466,
+          "line_start": 1466,
+          "path": "crates/tirith/src/cli/selfupdate.rs"
+        }
+      ],
+      "ledger_ordinal": 79,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 11,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-011",
+      "source_locator": {
+        "line_end": 29,
+        "line_start": 29,
+        "path": "sources/original-report.md"
+      },
+      "title": "Windows self-update permits PowerShell injection through `TEMP`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "1ebf23027c6a1f90ac6683d8d531a2e232390c68a09e1d31aeb52ed3a9cfc8f2",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 8,
+          "line_start": 8,
+          "path": ".github/workflows/bench.yml"
+        }
+      ],
+      "ledger_ordinal": 80,
+      "normalized_severity": "high",
+      "report_id": "original",
+      "report_ordinal": 12,
+      "reported_severity": "High severity",
+      "section": "high_severity",
+      "source_id": "ORIGINAL-012",
+      "source_locator": {
+        "line_end": 31,
+        "line_start": 31,
+        "path": "sources/original-report.md"
+      },
+      "title": "Benchmark PR jobs receive repository write permissions",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "2c6b6fcf7615fb2cdc0ac5085ea990bcd405510b41fad4b6fa4b9839397cf346",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 3946,
+          "line_start": 3946,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 81,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 13,
+      "reported_severity": "Medium severity",
+      "section": "medium_mcp_and_policy",
+      "source_id": "ORIGINAL-013",
+      "source_locator": {
+        "line_end": 37,
+        "line_start": 37,
+        "path": "sources/original-report.md"
+      },
+      "title": "Server-originated requests such as `sampling/createMessage` are raw passthrough by default",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "10a8b71bea35bc9f06c2de7da7f7ae3a60c5d47096b58872f6347f12b2bbb409",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 3556,
+          "line_start": 3556,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 82,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 14,
+      "reported_severity": "Medium severity",
+      "section": "medium_mcp_and_policy",
+      "source_id": "ORIGINAL-014",
+      "source_locator": {
+        "line_end": 38,
+        "line_start": 38,
+        "path": "sources/original-report.md"
+      },
+      "title": "Multiple command aliases authorize only the first value but forward the complete request, creating parser-precedence ambiguity",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "6c4aff478094cc19abba54e956a64bc367c7389f09f091849f9b87978c7f75d7",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 31,
+          "line_start": 31,
+          "path": "crates/tirith/assets/configs/tirith-gateway.yaml"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 241,
+          "line_start": 241,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 83,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 15,
+      "reported_severity": "Medium severity",
+      "section": "medium_mcp_and_policy",
+      "source_id": "ORIGINAL-015",
+      "source_locator": {
+        "line_end": 39,
+        "line_start": 39,
+        "path": "sources/original-report.md"
+      },
+      "title": "The Secure profile is only a default, not a minimum; bundled configuration explicitly restores fail-open/warn-forward behavior",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "56aba0ec11f48582ba2c295e53783b6d0128188a3050aafbfc7c88202aaf1a42",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 99,
+          "line_start": 99,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 84,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 16,
+      "reported_severity": "Medium severity",
+      "section": "medium_mcp_and_policy",
+      "source_id": "ORIGINAL-016",
+      "source_locator": {
+        "line_end": 40,
+        "line_start": 40,
+        "path": "sources/original-report.md"
+      },
+      "title": "Unknown YAML fields and invalid shell names silently fall back to weaker defaults",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "b0007bdc9fa115d39dafc536cb65d35c0b39d664c57a24ad2b6af2f9761b983c",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 277,
+          "line_start": 277,
+          "path": "crates/tirith-core/src/mcp/dispatcher.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 7,
+          "line_start": 7,
+          "path": "crates/tirith/src/cli/mcp_server.rs"
+        }
+      ],
+      "ledger_ordinal": 85,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 17,
+      "reported_severity": "Medium severity",
+      "section": "medium_mcp_and_policy",
+      "source_id": "ORIGINAL-017",
+      "source_locator": {
+        "line_end": 41,
+        "line_start": 41,
+        "path": "sources/original-report.md"
+      },
+      "title": "Output sanitization defaults off and omits `resources/read`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "cf1b136ca6921cf9069dd2d940b36cf0c56f6a326de9f921912314437065e05f",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1782,
+          "line_start": 1782,
+          "path": "crates/tirith-core/src/mcp_lock.rs"
+        }
+      ],
+      "ledger_ordinal": 86,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 18,
+      "reported_severity": "Medium severity",
+      "section": "medium_mcp_and_policy",
+      "source_id": "ORIGINAL-018",
+      "source_locator": {
+        "line_end": 42,
+        "line_start": 42,
+        "path": "sources/original-report.md"
+      },
+      "title": "MCP config discovery checks a pathname, then separately follows it and performs an uncapped read, leaving a symlink/growth race",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "600ff1a1b5707546c869f444b748c21ce95f77dd185a01cdfcec591ed98ffa8e",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 168,
+          "line_start": 168,
+          "path": "crates/tirith-core/src/mcp/response_inspect.rs"
+        }
+      ],
+      "ledger_ordinal": 87,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 19,
+      "reported_severity": "Medium severity",
+      "section": "medium_mcp_and_policy",
+      "source_id": "ORIGINAL-019",
+      "source_locator": {
+        "line_end": 43,
+        "line_start": 43,
+        "path": "sources/original-report.md"
+      },
+      "title": "Response inspection performs up to 64 synchronous DNS resolutions without a total deadline",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "d1743cbad66f73b1c235e858464e96cd55d33aeefca748623fdd0f96f123737a",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 333,
+          "line_start": 333,
+          "path": "crates/tirith/src/cli/gateway.rs"
+        }
+      ],
+      "ledger_ordinal": 88,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 20,
+      "reported_severity": "Medium severity",
+      "section": "medium_mcp_and_policy",
+      "source_id": "ORIGINAL-020",
+      "source_locator": {
+        "line_end": 44,
+        "line_start": 44,
+        "path": "sources/original-report.md"
+      },
+      "title": "`fail_mode: open` documentation disagrees with timeout behavior, and `timeout_ms: 0` can create rapid orphan analyzer threads",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "f44877563ab846aff678076f14ba13d10ac2d13be6c00575a6b2158e8b494c27",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 449,
+          "line_start": 449,
+          "path": "crates/tirith-core/src/tokenize.rs"
+        }
+      ],
+      "ledger_ordinal": 89,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 21,
+      "reported_severity": "Medium severity",
+      "section": "medium_mcp_and_policy",
+      "source_id": "ORIGINAL-021",
+      "source_locator": {
+        "line_end": 45,
+        "line_start": 45,
+        "path": "sources/original-report.md"
+      },
+      "title": "Fish single-quote escapes are parsed using POSIX rules",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "e7b3c86191ab1f8901af55bcca75c3bc6d244620247e7776f26f1ac6a27ca597",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1205,
+          "line_start": 1205,
+          "path": "crates/tirith-core/src/aliases.rs"
+        }
+      ],
+      "ledger_ordinal": 90,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 22,
+      "reported_severity": "Medium severity",
+      "section": "medium_mcp_and_policy",
+      "source_id": "ORIGINAL-022",
+      "source_locator": {
+        "line_end": 46,
+        "line_start": 46,
+        "path": "sources/original-report.md"
+      },
+      "title": "Alias/function scanning can miss shell-effective names such as `c\"ur\"l` because classification searches raw substrings",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "8dceef735c13a997e54e0d9fb80adf3faef103b4fd52d79cdd3f280c97d32472",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 642,
+          "line_start": 642,
+          "path": "crates/tirith-core/src/artifact/install.rs"
+        }
+      ],
+      "ledger_ordinal": 91,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 23,
+      "reported_severity": "Medium severity",
+      "section": "medium_artifacts_and_updates",
+      "source_id": "ORIGINAL-023",
+      "source_locator": {
+        "line_end": 50,
+        "line_start": 50,
+        "path": "sources/original-report.md"
+      },
+      "title": "Post-install RECORD completeness ignores missing, corrupt and unverifiable entries, allowing publication when only hash mismatches are counted",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "041f629cc3ac12a0abb87599bf328fbfca31906200497ffd21e07a6b473f9fda",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 369,
+          "line_start": 369,
+          "path": "crates/tirith-core/src/artifact/archive.rs"
+        }
+      ],
+      "ledger_ordinal": 92,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 24,
+      "reported_severity": "Medium severity",
+      "section": "medium_artifacts_and_updates",
+      "source_id": "ORIGINAL-024",
+      "source_locator": {
+        "line_end": 51,
+        "line_start": 51,
+        "path": "sources/original-report.md"
+      },
+      "title": "ZIP entry limits run after `ZipArchive::new` eagerly parses the central directory; millions of entries can exhaust memory first",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "f0d601ec51a5d348d376d204f429b62be6a1d987715a23c41b6ce5410e201b6f",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 208,
+          "line_start": 208,
+          "path": "crates/tirith-core/src/artifact/inspect.rs"
+        }
+      ],
+      "ledger_ordinal": 93,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 25,
+      "reported_severity": "Medium severity",
+      "section": "medium_artifacts_and_updates",
+      "source_id": "ORIGINAL-025",
+      "source_locator": {
+        "line_end": 52,
+        "line_start": 52,
+        "path": "sources/original-report.md"
+      },
+      "title": "Artifact hashing and inspection are separated by a mutable-inode TOCTOU window",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "5cafd77dbc6c460b093050d39fddd6ba2b361bedb22865ab3b82843156e3470a",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1573,
+          "line_start": 1573,
+          "path": "crates/tirith/src/cli/selfupdate.rs"
+        }
+      ],
+      "ledger_ordinal": 94,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 26,
+      "reported_severity": "Medium severity",
+      "section": "medium_artifacts_and_updates",
+      "source_id": "ORIGINAL-026",
+      "source_locator": {
+        "line_end": 53,
+        "line_start": 53,
+        "path": "sources/original-report.md"
+      },
+      "title": "A failed update overwrites the prior rollback binary before the new update is committed",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "786eee27b4c367db7c1373cb14887d97b16859286919861e8582a90397ff27fc",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 625,
+          "line_start": 625,
+          "path": "crates/tirith-core/src/artifact/quarantine.rs"
+        }
+      ],
+      "ledger_ordinal": 95,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 27,
+      "reported_severity": "Medium severity",
+      "section": "medium_artifacts_and_updates",
+      "source_id": "ORIGINAL-027",
+      "source_locator": {
+        "line_end": 54,
+        "line_start": 54,
+        "path": "sources/original-report.md"
+      },
+      "title": "Quarantine paths advertised as streaming buffer entire artifacts up to 512 MiB",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "5f0d88700dbc86068c329bc56017346bc6dc7fb65781860b26b202ba68bf94a0",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 2187,
+          "line_start": 2187,
+          "path": "crates/tirith-core/src/extract.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 206,
+          "line_start": 206,
+          "path": "crates/tirith/src/cli/lsp.rs"
+        }
+      ],
+      "ledger_ordinal": 96,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 28,
+      "reported_severity": "Medium severity",
+      "section": "medium_artifacts_and_updates",
+      "source_id": "ORIGINAL-028",
+      "source_locator": {
+        "line_end": 55,
+        "line_start": 55,
+        "path": "sources/original-report.md"
+      },
+      "title": "An accepted 10 MiB LSP buffer consumed approximately 2.7 GiB RSS and remained in extraction for over five minutes during the repository test",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "7813b542a1b3f4f51a0eec1e0b4e4549fdc37037b8c20227fe1e920fbd929fd7",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 197,
+          "line_start": 197,
+          "path": "crates/tirith-core/src/audit_upload.rs"
+        }
+      ],
+      "ledger_ordinal": 97,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 29,
+      "reported_severity": "Medium severity",
+      "section": "medium_state_secrets_and_integrity",
+      "source_id": "ORIGINAL-029",
+      "source_locator": {
+        "line_end": 59,
+        "line_start": 59,
+        "path": "sources/original-report.md"
+      },
+      "title": "Concurrent audit upload can delete events appended after the upload snapshot",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "4ae4abcd5c01613c49bb045f1fa2fe07e51145adad77251cf65ec1bedb8edd10",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 403,
+          "line_start": 403,
+          "path": "crates/tirith-core/src/redact.rs"
+        }
+      ],
+      "ledger_ordinal": 98,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 30,
+      "reported_severity": "Medium severity",
+      "section": "medium_state_secrets_and_integrity",
+      "source_id": "ORIGINAL-030",
+      "source_locator": {
+        "line_end": 60,
+        "line_start": 60,
+        "path": "sources/original-report.md"
+      },
+      "title": "Redaction covers Bearer but leaks Basic, Digest, custom and Proxy-Authorization credentials",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "b7d8293e88b41ab8b1cbaebdcabbdd62f826f3d139fa9a31ed17ae0114caed22",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 358,
+          "line_start": 358,
+          "path": "crates/tirith-core/src/checkpoint.rs"
+        }
+      ],
+      "ledger_ordinal": 99,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 31,
+      "reported_severity": "Medium severity",
+      "section": "medium_state_secrets_and_integrity",
+      "source_id": "ORIGINAL-031",
+      "source_locator": {
+        "line_end": 61,
+        "line_start": 61,
+        "path": "sources/original-report.md"
+      },
+      "title": "Checkpoint metadata stores complete trigger commands, including inline credentials, in `meta.json`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "23383fb4508365b72d87c43802c669cccfa6aa83dd22aec80f4fcfdda58c06dc",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1751,
+          "line_start": 1751,
+          "path": "crates/tirith-core/src/checkpoint.rs"
+        }
+      ],
+      "ledger_ordinal": 100,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 32,
+      "reported_severity": "Medium severity",
+      "section": "medium_state_secrets_and_integrity",
+      "source_id": "ORIGINAL-032",
+      "source_locator": {
+        "line_end": 62,
+        "line_start": 62,
+        "path": "sources/original-report.md"
+      },
+      "title": "Checkpoint source capture follows top-level symlinks and has stat/open races that can capture out-of-scope secrets with stale permissions",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "18843e566e231916eb23bbc4898c6414a75c27a1ce225167e1558e2ceb3739e2",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1789,
+          "line_start": 1789,
+          "path": "crates/tirith-core/src/checkpoint.rs"
+        }
+      ],
+      "ledger_ordinal": 101,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 33,
+      "reported_severity": "Medium severity",
+      "section": "medium_state_secrets_and_integrity",
+      "source_id": "ORIGINAL-033",
+      "source_locator": {
+        "line_end": 63,
+        "line_start": 63,
+        "path": "sources/original-report.md"
+      },
+      "title": "Checkpoint blobs are published without syncing the file and blob directory before durable metadata",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "e0854a173d1007f6ce27282528de3e4a9fb44f07179d8931aa1d2d650293b2aa",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 710,
+          "line_start": 710,
+          "path": "crates/tirith-core/src/escalation.rs"
+        }
+      ],
+      "ledger_ordinal": 102,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 34,
+      "reported_severity": "Medium severity",
+      "section": "medium_state_secrets_and_integrity",
+      "source_id": "ORIGINAL-034",
+      "source_locator": {
+        "line_end": 64,
+        "line_start": 64,
+        "path": "sources/original-report.md"
+      },
+      "title": "RepeatCount escalation reads history and records the warning in separate transactions; concurrent commands can both avoid escalation",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "5ccfb8c8ed821aead1ae24de1b0a9928f58e03ab29dbe6d456922e3b52711adf",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 318,
+          "line_start": 318,
+          "path": "crates/tirith-core/src/persistence.rs"
+        }
+      ],
+      "ledger_ordinal": 103,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 35,
+      "reported_severity": "Medium severity",
+      "section": "medium_state_secrets_and_integrity",
+      "source_id": "ORIGINAL-035",
+      "source_locator": {
+        "line_end": 65,
+        "line_start": 65,
+        "path": "sources/original-report.md"
+      },
+      "title": "Persistence baselines collapse every symlink, oversized file and I/O error into one reusable “unsafe” digest, permanently blessing an uninspectable surface",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "869ebeb9b86f90015257af34fe2e1a23093702be17cb3299d2a7119eb3b6e519",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 875,
+          "line_start": 875,
+          "path": "crates/tirith-core/src/threatdb_api.rs"
+        }
+      ],
+      "ledger_ordinal": 104,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 36,
+      "reported_severity": "Medium severity",
+      "section": "medium_network_threatdb_and_licensing",
+      "source_id": "ORIGINAL-036",
+      "source_locator": {
+        "line_end": 69,
+        "line_start": 69,
+        "path": "sources/original-report.md"
+      },
+      "title": "Safe Browsing sends full paths and dotted split-DNS internal names to Google, potentially leaking reset tokens and internal URLs",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "ba3ec131606d9ed0f26f075415624275c0b6052af2fbdc1cf98f8be21da8c498",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 393,
+          "line_start": 393,
+          "path": "crates/tirith/src/cli/threatdb_cmd.rs"
+        }
+      ],
+      "ledger_ordinal": 105,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 37,
+      "reported_severity": "Medium severity",
+      "section": "medium_network_threatdb_and_licensing",
+      "source_id": "ORIGINAL-037",
+      "source_locator": {
+        "line_end": 70,
+        "line_start": 70,
+        "path": "sources/original-report.md"
+      },
+      "title": "Supplemental feeds are not reconciled when the primary database is already current; enabling, retrying or disabling feeds can leave stale state active",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "3c8dbc9dc46d1494a4bf7227c628783a3de3956bfe714f481a2d5c87cc969055",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1300,
+          "line_start": 1300,
+          "path": "crates/tirith/src/cli/threatdb_cmd.rs"
+        }
+      ],
+      "ledger_ordinal": 106,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 38,
+      "reported_severity": "Medium severity",
+      "section": "medium_network_threatdb_and_licensing",
+      "source_id": "ORIGINAL-038",
+      "source_locator": {
+        "line_end": 71,
+        "line_start": 71,
+        "path": "sources/original-report.md"
+      },
+      "title": "Legacy manifest selection occurs before authentication, so an invalid primary blocks a valid fallback and an older primary can beat a newer signed fallback",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "6ec13227fb5f7222f54a3c327b79345b94151a5dd7d470ff16f32980527daceb",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 26,
+          "line_start": 26,
+          "path": "crates/tirith-core/src/threatdb_feeds.rs"
+        }
+      ],
+      "ledger_ordinal": 107,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 39,
+      "reported_severity": "Medium severity",
+      "section": "medium_network_threatdb_and_licensing",
+      "source_id": "ORIGINAL-039",
+      "source_locator": {
+        "line_end": 72,
+        "line_start": 72,
+        "path": "sources/original-report.md"
+      },
+      "title": "Supplemental feeds permit 256–512 MiB decoded bodies plus unbounded record vectors and clones, allowing multi-gigabyte amplification",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "c7b0d82e98d7f8ec0feebf8cb25aea9824ac798f39808443b1b2c0456572e347",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 49,
+          "line_start": 49,
+          "path": "crates/tirith-core/build.rs"
+        },
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 6,
+          "line_start": 6,
+          "path": "scripts/update-data.sh"
+        }
+      ],
+      "ledger_ordinal": 108,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 40,
+      "reported_severity": "Medium severity",
+      "section": "medium_network_threatdb_and_licensing",
+      "source_id": "ORIGINAL-040",
+      "source_locator": {
+        "line_end": 73,
+        "line_start": 73,
+        "path": "sources/original-report.md"
+      },
+      "title": "The external-data updater writes files Cargo does not consume and downloads incompatible Unicode data without staging or schema/integrity checks",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "8f585b42a54d1047f00a40a4965cb49e7844188931ed47fd22aca25b237550a7",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 22,
+          "line_start": 22,
+          "path": "tools/license-server/src/routes/receipt.rs"
+        }
+      ],
+      "ledger_ordinal": 109,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 41,
+      "reported_severity": "Medium severity",
+      "section": "medium_network_threatdb_and_licensing",
+      "source_id": "ORIGINAL-041",
+      "source_locator": {
+        "line_end": 74,
+        "line_start": 74,
+        "path": "sources/original-report.md"
+      },
+      "title": "One-time license receipt consumption is a state-changing GET",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "a03e84da1cec9e5c82fa9de132a7d104cc3b0e428ec0f1c3d0034ca886a11afa",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 92,
+          "line_start": 92,
+          "path": "action.yml"
+        }
+      ],
+      "ledger_ordinal": 110,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 42,
+      "reported_severity": "Medium severity",
+      "section": "medium_network_threatdb_and_licensing",
+      "source_id": "ORIGINAL-042",
+      "source_locator": {
+        "line_end": 75,
+        "line_start": 75,
+        "path": "sources/original-report.md"
+      },
+      "title": "The published composite action uses mutable `github/codeql-action/upload-sarif@v3` rather than a commit SHA",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "0771def5c6713b432b9ec9bb8bd1d9b40b81a6b407b39d62734a7c8b3438b1a5",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 540,
+          "line_start": 540,
+          "path": "crates/tirith-core/src/capsule/linux.rs"
+        }
+      ],
+      "ledger_ordinal": 111,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 43,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-043",
+      "source_locator": {
+        "line_end": 79,
+        "line_start": 79,
+        "path": "sources/original-report.md"
+      },
+      "title": "Linux reports `max_processes` enforced using only `RLIMIT_NPROC`, which privileged processes bypass",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "92e9723b11ed25903e7adc8208ad610c9dc7d78eb0dc747a8b5749b07bd530ef",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 563,
+          "line_start": 563,
+          "path": "crates/tirith-core/src/capsule/windows.rs"
+        }
+      ],
+      "ledger_ordinal": 112,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 44,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-044",
+      "source_locator": {
+        "line_end": 80,
+        "line_start": 80,
+        "path": "sources/original-report.md"
+      },
+      "title": "Windows temporary HOME is predictable, reused and never deleted",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "3dccc932a9e5416e246f54907fd74f5f02ba13af478fc3c7c2f137269cba651a",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 5791,
+          "line_start": 5791,
+          "path": "crates/tirith/src/cli/capsule.rs"
+        }
+      ],
+      "ledger_ordinal": 113,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 45,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-045",
+      "source_locator": {
+        "line_end": 81,
+        "line_start": 81,
+        "path": "sources/original-report.md"
+      },
+      "title": "macOS calls `TempDir::keep()` and then drops ownership, leaking every capsule HOME",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "b542c0a0cd317ae205ec50bf5b86c7884fd641eb8ea4303949ff1279c31d284a",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1477,
+          "line_start": 1477,
+          "path": "crates/tirith/src/cli/capsule.rs"
+        }
+      ],
+      "ledger_ordinal": 114,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 46,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-046",
+      "source_locator": {
+        "line_end": 82,
+        "line_start": 82,
+        "path": "sources/original-report.md"
+      },
+      "title": "macOS run-to-completion waits only for the direct child; detached descendants can remain running after success",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "f5c2c91db65d1c01a896432b92d402b8895283bf1abcf39883e5b381d655d81c",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 6033,
+          "line_start": 6033,
+          "path": "crates/tirith/src/cli/capsule.rs"
+        }
+      ],
+      "ledger_ordinal": 115,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 47,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-047",
+      "source_locator": {
+        "line_end": 83,
+        "line_start": 83,
+        "path": "sources/original-report.md"
+      },
+      "title": "macOS reports handle isolation despite ignoring close failures and stopping at FD 1,048,576",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "b82b42ec59734837606de33ecac074f6213c3c9de1545fc78439ed8c6af9e22a",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 672,
+          "line_start": 672,
+          "path": "crates/tirith/src/cli/daemon.rs"
+        }
+      ],
+      "ledger_ordinal": 116,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 48,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-048",
+      "source_locator": {
+        "line_end": 84,
+        "line_start": 84,
+        "path": "sources/original-report.md"
+      },
+      "title": "Daemon startup uses non-atomic existence checks and unconditional cleanup, so concurrent starters can unlink the winner’s state",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "3c615378946e86db301332ce88b0cca21b4fda74687762c0c480b45eac373f78",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 220,
+          "line_start": 220,
+          "path": "shell/lib/powershell-hook.ps1"
+        }
+      ],
+      "ledger_ordinal": 117,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 49,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-049",
+      "source_locator": {
+        "line_end": 85,
+        "line_start": 85,
+        "path": "sources/original-report.md"
+      },
+      "title": "The PowerShell hook fails open on checker errors while still advertising blocking protection",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "bd4d069aaf1321c3ac365a4a104b9accc4c3ecfb17506e4dd9881fcc8b449396",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 594,
+          "line_start": 594,
+          "path": "crates/tirith/src/cli/capsule_windows.rs"
+        }
+      ],
+      "ledger_ordinal": 118,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 50,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-050",
+      "source_locator": {
+        "line_end": 86,
+        "line_start": 86,
+        "path": "sources/original-report.md"
+      },
+      "title": "A SID allocated with `LocalAlloc` is released using the incompatible `FreeSid`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "ce76943146a035ba40aa42e8a7398a7f6634712ebdb5748e8cc2c84d8b94ea27",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 2160,
+          "line_start": 2160,
+          "path": "crates/tirith-core/src/trusted_child.rs"
+        }
+      ],
+      "ledger_ordinal": 119,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 51,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-051",
+      "source_locator": {
+        "line_end": 87,
+        "line_start": 87,
+        "path": "sources/original-report.md"
+      },
+      "title": "`Duration::MAX` can overflow a trusted-child deadline after spawning, panic, and leave the Unix child alive",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "5648b543cd2998bb793844fe943e42e4a9e3f911300fcb265ed820dacc232a58",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 877,
+          "line_start": 877,
+          "path": "crates/tirith/src/cli/capsule_windows.rs"
+        }
+      ],
+      "ledger_ordinal": 120,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 52,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-052",
+      "source_locator": {
+        "line_end": 88,
+        "line_start": 88,
+        "path": "sources/original-report.md"
+      },
+      "title": "Windows environment blocks are neither sorted nor case-insensitively deduplicated",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "7e2c1307d49e440d6cb65c1dd02b0a8fafa97d20ab208073d2a65ddc34736e5f",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 446,
+          "line_start": 446,
+          "path": "crates/tirith-core/src/capsule/windows.rs"
+        }
+      ],
+      "ledger_ordinal": 121,
+      "normalized_severity": "medium",
+      "report_id": "original",
+      "report_ordinal": 53,
+      "reported_severity": "Medium severity",
+      "section": "medium_containment_and_process_lifecycle",
+      "source_id": "ORIGINAL-053",
+      "source_locator": {
+        "line_end": 89,
+        "line_start": 89,
+        "path": "sources/original-report.md"
+      },
+      "title": "Windows CPU enforcement counts user time only while reporting generic CPU-time coverage",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "1fa11f434b1fe7b5a08794e74492603c427f28549b3c5b2756a1aea6873068db",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 391,
+          "line_start": 391,
+          "path": "crates/tirith-core/src/dashboard.rs"
+        }
+      ],
+      "ledger_ordinal": 122,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 54,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-054",
+      "source_locator": {
+        "line_end": 93,
+        "line_start": 93,
+        "path": "sources/original-report.md"
+      },
+      "title": "Dashboard checks the legacy ThreatDB path and reports v2-only installations absent",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "02d447f0209a5fc7d3fbc9271739773bf5236582b6a1110760a0b6a729631485",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 676,
+          "line_start": 676,
+          "path": "crates/tirith-core/src/threatdb_api.rs"
+        }
+      ],
+      "ledger_ordinal": 123,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 55,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-055",
+      "source_locator": {
+        "line_end": 94,
+        "line_start": 94,
+        "path": "sources/original-report.md"
+      },
+      "title": "Clean Safe Browsing results are never cached and are repeatedly disclosed",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "0b7a577c9cb5cc62097d6d89e586376ea28997fbad4ee5d6b48c1b25751ff866",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1311,
+          "line_start": 1311,
+          "path": "crates/tirith-core/src/registry_api.rs"
+        }
+      ],
+      "ledger_ordinal": 124,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 56,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-056",
+      "source_locator": {
+        "line_end": 95,
+        "line_start": 95,
+        "path": "sources/original-report.md"
+      },
+      "title": "Registry cache has no total entry/byte limit",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "45642b11565b45bc8af7e2a7920a7c7837b329d2210e542e937f5fc326f79d61",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 827,
+          "line_start": 827,
+          "path": "crates/tirith/src/cli/selfupdate.rs"
+        }
+      ],
+      "ledger_ordinal": 125,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 57,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-057",
+      "source_locator": {
+        "line_end": 96,
+        "line_start": 96,
+        "path": "sources/original-report.md"
+      },
+      "title": "Self-update never verifies the extracted binary’s embedded version/target",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "56a398954c09c7313c611f3a3e9c7c5d8d4c9b9a28c007a254b30dddecd70430",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 31,
+          "line_start": 31,
+          "path": "crates/tirith-core/src/artifact/resolver_broker.rs"
+        }
+      ],
+      "ledger_ordinal": 126,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 58,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-058",
+      "source_locator": {
+        "line_end": 97,
+        "line_start": 97,
+        "path": "sources/original-report.md"
+      },
+      "title": "Resolver transport permits 256 MiB while artifact handling advertises 512 MiB",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "673c0b791519a92157116c772069e1ae435045efaffbe3ab09a6653e7eeb9bd6",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 20,
+          "line_start": 20,
+          "path": "shell/tirith.sh"
+        }
+      ],
+      "ledger_ordinal": 127,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 59,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-059",
+      "source_locator": {
+        "line_end": 98,
+        "line_start": 98,
+        "path": "sources/original-report.md"
+      },
+      "title": "The documented Bash source loader uses `$0` instead of `BASH_SOURCE[0]`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "c5c4248ad5fa3a016162fd426d74ebeeb43066921daa816eb0ad27d0e2b4ca42",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 218,
+          "line_start": 218,
+          "path": "crates/tirith/src/cli/trust.rs"
+        }
+      ],
+      "ledger_ordinal": 128,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 60,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-060",
+      "source_locator": {
+        "line_end": 99,
+        "line_start": 99,
+        "path": "sources/original-report.md"
+      },
+      "title": "Repo trust locks follow attacker-controlled lock paths",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "f01eb81c2625f2e0dab10af3db072d69d9d0b8a524545c78b7245618d510c6f1",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 230,
+          "line_start": 230,
+          "path": "crates/tirith-core/src/baseline.rs"
+        }
+      ],
+      "ledger_ordinal": 129,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 61,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-061",
+      "source_locator": {
+        "line_end": 100,
+        "line_start": 100,
+        "path": "sources/original-report.md"
+      },
+      "title": "Concurrent corrupt baseline-salt repair can leave live processes using different salts",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "68a2f1b322d0913b4a6ecf25b45397d8d2bd110a44caa16e58fc18a355dbb555",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 345,
+          "line_start": 345,
+          "path": "crates/tirith-core/src/persistence.rs"
+        }
+      ],
+      "ledger_ordinal": 130,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 62,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-062",
+      "source_locator": {
+        "line_end": 101,
+        "line_start": 101,
+        "path": "sources/original-report.md"
+      },
+      "title": "Crontab execution failures are represented as a clean empty crontab",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "735610c85238666c639a10aa53cc0efcaea1a11e7fc93ee5157d91027d56ede6",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 979,
+          "line_start": 979,
+          "path": "crates/tirith-core/src/receipt.rs"
+        }
+      ],
+      "ledger_ordinal": 131,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 63,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-063",
+      "source_locator": {
+        "line_end": 102,
+        "line_start": 102,
+        "path": "sources/original-report.md"
+      },
+      "title": "Receipt query commands do not bind filenames to embedded receipt IDs or fully validate records",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "20ed702afec325b1390ae6087b9d27abd436342d94e2fa01027dd28ed66933c7",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 461,
+          "line_start": 461,
+          "path": "crates/tirith-core/src/audit.rs"
+        }
+      ],
+      "ledger_ordinal": 132,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 64,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-064",
+      "source_locator": {
+        "line_end": 103,
+        "line_start": 103,
+        "path": "sources/original-report.md"
+      },
+      "title": "Audit append/verification permits unbounded line, head and problem-state allocations",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "9457b3e3e777de1455da7f3a5c7eadae4c8854b7fbf62df95facf5cd55498ff4",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 275,
+          "line_start": 275,
+          "path": "crates/tirith-core/src/capsule/windows.rs"
+        }
+      ],
+      "ledger_ordinal": 133,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 65,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-065",
+      "source_locator": {
+        "line_end": 104,
+        "line_start": 104,
+        "path": "sources/original-report.md"
+      },
+      "title": "AppContainer security identity uses a collision-prone 64-bit FNV hash",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "f115ec1f5d948ff364e4a5dea6313877720dffd1036fe6a09f7df545b669d535",
+      "evidence": [],
+      "ledger_ordinal": 134,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 66,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-066",
+      "source_locator": {
+        "line_end": 105,
+        "line_start": 105,
+        "path": "sources/original-report.md"
+      },
+      "title": "The ignored local `threatdb-signing.key` is mode `0644`",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    },
+    {
+      "block_sha256": "a96cddde50a18005309625800a541560252b08c52227369ebaf360d81157c69b",
+      "evidence": [
+        {
+          "commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad",
+          "line_end": 1672,
+          "line_start": 1672,
+          "path": "crates/tirith-core/src/registry_api.rs"
+        }
+      ],
+      "ledger_ordinal": 135,
+      "normalized_severity": null,
+      "report_id": "original",
+      "report_ordinal": 67,
+      "reported_severity": "Lower-priority bugs and hardening",
+      "section": "lower_priority_bugs_and_hardening",
+      "source_id": "ORIGINAL-067",
+      "source_locator": {
+        "line_end": 106,
+        "line_start": 106,
+        "path": "sources/original-report.md"
+      },
+      "title": "The registry redirect test failed once because it assumed concurrent request-record ordering; it passed immediately in isolation",
+      "vulnerable_commit": "d7ce6b3689da539e6e7e11cc4f2ac66bc6bba7ad"
+    }
+  ]
+}

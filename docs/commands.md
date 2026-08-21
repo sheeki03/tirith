@@ -114,7 +114,7 @@ covers the everyday subset; this is the complete reference.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith mcp-server` | Run tirith as an MCP server (7 tools) over JSON-RPC stdio (`--sanitize-tool-output`) |
+| `tirith mcp-server` | Run tirith as an MCP server (7 tools) over JSON-RPC stdio; tool/resource output is sanitized by default (`--unsafe-unsanitized-tool-output` restores legacy pass-through) |
 | `tirith mcp {lock,verify,diff,explain,permissions,policy}` | Inventory and gate a repo's MCP servers into `.tirith/mcp.lock`, with per-server tool and per-capability views |
 | `tirith gateway run` | MCP gateway proxy that intercepts AI-agent shell tool calls (`--filter-output`) |
 | `tirith agent {sessions,explain,current,allow,block,policy}` | Caller-origin (human / agent / MCP / CI / IDE) governance; an `agent_rules.deny` match forces a block |

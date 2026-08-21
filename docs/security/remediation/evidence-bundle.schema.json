@@ -1,0 +1,130 @@
+{
+  "$defs": {
+    "commit": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    }
+  },
+  "$id": "https://tirith.dev/schemas/security-remediation-evidence-bundle-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "base_sha": {
+      "$ref": "#/$defs/commit"
+    },
+    "candidate_sha": {
+      "$ref": "#/$defs/commit"
+    },
+    "checks": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "arch": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "command": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "date": {
+            "format": "date",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "baseline",
+              "focused",
+              "benign",
+              "adversarial",
+              "platform",
+              "performance",
+              "ux",
+              "packaging",
+              "review",
+              "release"
+            ]
+          },
+          "log_or_attestation_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "os": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "os_version": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "result": {
+            "enum": [
+              "passed",
+              "failed",
+              "blocked_native"
+            ]
+          },
+          "toolchain": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "arch",
+          "command",
+          "date",
+          "kind",
+          "log_or_attestation_id",
+          "os",
+          "os_version",
+          "result",
+          "toolchain"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "head_sha": {
+      "$ref": "#/$defs/commit"
+    },
+    "merge_tree_sha": {
+      "$ref": "#/$defs/commit"
+    },
+    "mode": {
+      "enum": [
+        "layer",
+        "release-candidate",
+        "merged-main"
+      ]
+    },
+    "payload_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "subject_tree_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "workflow_sha": {
+      "$ref": "#/$defs/commit"
+    }
+  },
+  "required": [
+    "base_sha",
+    "candidate_sha",
+    "checks",
+    "head_sha",
+    "merge_tree_sha",
+    "mode",
+    "payload_sha256",
+    "schema_version",
+    "subject_tree_hash",
+    "workflow_sha"
+  ],
+  "title": "Tirith external closure evidence bundle",
+  "type": "object"
+}

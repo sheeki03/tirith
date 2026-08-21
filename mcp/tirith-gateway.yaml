@@ -30,15 +30,19 @@ policy:
   #   "deny"    - treat warnings as denials (bundled hardened default)
   warn_action: "deny"
 
-  # What to do when tirith analysis fails (timeout, crash, etc):
-  #   "open"   - compatibility posture for explicitly accepted availability risk
-  #   "closed" - deny the command when analysis cannot complete (bundled default)
+  # Response-path posture after a guarded request was inspected:
+  #   "open"   - compatibility posture for explicitly accepted response risk
+  #   "closed" - deny when a correlated response cannot be inspected (default)
+  # Request-side command extraction, worker, registration, and analysis failures
+  # always deny before forwarding in both modes.
   fail_mode: "closed"
 
   # An autonomous MCP boundary must deny on uncertainty. Operators who deliberately
   # choose compatibility over this guarantee can set `open` in a private config.
 
-  # Maximum time (ms) to wait for tirith analysis before applying fail_mode
+  # Maximum non-zero time (ms) to wait for Tirith command analysis. A timeout
+  # always denies before forwarding; fail_mode does not override request-side
+  # extraction, worker, registration, or analysis failures.
   timeout_ms: 10000
 
   # Maximum bytes per JSON-RPC message line (DoS protection)

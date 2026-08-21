@@ -217,13 +217,16 @@ fn default_shell() -> String {
 pub struct PolicyConfig {
     #[serde(default = "default_warn_action")]
     pub warn_action: String,
-    /// How the gateway behaves when it cannot make a clean security decision.
+    /// Response-path posture after a guarded request has already been inspected.
     ///
     /// I3 — SAFETY: `fail_mode: open` (the default, for back-compat) may forward
-    /// uninspectable correlated responses. Server-initiated requests are always
-    /// denied unless a future explicit capability negotiation implements them;
-    /// they are never made safe merely by selecting open mode. Use
-    /// `fail_mode: closed` (or the `secure` profile) with an untrusted upstream.
+    /// an uninspectable correlated response where the response handler explicitly
+    /// permits that degradation. It never authorizes a guarded request whose
+    /// command extraction, worker registration, or analysis fails or times out:
+    /// those request-side failures always deny before the upstream write.
+    /// Server-initiated requests are likewise always denied unless a future
+    /// capability negotiation explicitly implements them. Use `fail_mode:
+    /// closed` (or the `secure` profile) with an untrusted upstream.
     #[serde(default = "default_fail_mode")]
     pub fail_mode: String,
     #[serde(default = "default_timeout_ms")]
@@ -4191,8 +4194,14 @@ fn handle_guarded_call(
             false,
         );
         let _ = output_tx.send(
-            build_fail_mode_deny(id, "analysis worker capacity exhausted", 0.0, true, false)
-                .into_bytes(),
+            build_guarded_analysis_failure_deny(
+                id,
+                "analysis worker capacity exhausted",
+                0.0,
+                false,
+                &config.policy.fail_mode,
+            )
+            .into_bytes(),
         );
         return Ok(());
     };
@@ -4215,7 +4224,14 @@ fn handle_guarded_call(
     if let Err(error) = spawned {
         eprintln!("tirith gateway: analysis worker could not start: {error}");
         let _ = output_tx.send(
-            build_fail_mode_deny(id, "analysis worker unavailable", 0.0, true, false).into_bytes(),
+            build_guarded_analysis_failure_deny(
+                id,
+                "analysis worker unavailable",
+                0.0,
+                false,
+                &config.policy.fail_mode,
+            )
+            .into_bytes(),
         );
         return Ok(());
     }
@@ -4865,7 +4881,14 @@ fn handle_guarded_call(
                 true,
             );
             let _ = output_tx.send(
-                build_fail_mode_deny(id, "analysis timed out", elapsed, true, true).into_bytes(),
+                build_guarded_analysis_failure_deny(
+                    id,
+                    "analysis timed out",
+                    elapsed,
+                    true,
+                    &config.policy.fail_mode,
+                )
+                .into_bytes(),
             );
             Ok(())
         }
@@ -5176,9 +5199,13 @@ fn build_deny_response(
     serde_json::to_string(&resp).unwrap_or_default()
 }
 
-/// Build a deny response for fail-mode denials (timeout, extraction failure),
-/// using the same MCP tool-result envelope (`isError=true`) as policy denials.
-/// `reason` is a short description; this function adds the "Tirith:" prefix.
+/// Build a deny response for a security boundary that could not produce a safe
+/// decision, using the same MCP tool-result envelope (`isError=true`) as policy
+/// denials. Request-side extraction/worker/analysis failures use this helper in
+/// both configured fail modes; response-side callers reach it only when their
+/// own policy requires fail-closed handling. `reason` is a short description;
+/// this function adds the "Tirith:" prefix without misreporting the configured
+/// mode.
 fn build_fail_mode_deny(
     id: Value,
     reason: &str,
@@ -5189,7 +5216,7 @@ fn build_fail_mode_deny(
     let result = ToolCallResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
-            text: format!("Tirith: {reason} (fail_mode=closed)"),
+            text: format!("Tirith: {reason} (security boundary failed closed)"),
         }],
         is_error: true,
         structured_content: Some(serde_json::json!({
@@ -5200,17 +5227,33 @@ fn build_fail_mode_deny(
             "elapsed_ms": elapsed_ms,
             "fail_mode_triggered": fail_mode_triggered,
             "timeout_triggered": timeout_triggered,
+            "failure_policy": "fail_closed",
         })),
     };
     let resp = JsonRpcResponse::ok(id, serde_json::to_value(&result).unwrap());
     serde_json::to_string(&resp).unwrap_or_default()
 }
 
+/// Request-side command analysis is an authorization prerequisite, not a
+/// response-availability preference. Keep the configured mode in this API so a
+/// future refactor cannot accidentally make `open` authorize an unanalyzed
+/// request; both accepted values intentionally produce the same deny envelope.
+fn build_guarded_analysis_failure_deny(
+    id: Value,
+    reason: &str,
+    elapsed_ms: f64,
+    timeout_triggered: bool,
+    configured_fail_mode: &str,
+) -> String {
+    debug_assert!(matches!(configured_fail_mode, "open" | "closed"));
+    build_fail_mode_deny(id, reason, elapsed_ms, true, timeout_triggered)
+}
+
 /// C12: the response for a guarded call refused by the task gate.
 ///
-/// Distinct from [`build_fail_mode_deny`]: nothing failed and nothing timed out,
-/// so the response must not claim `fail_mode=closed`. The client is told an
-/// enforcing policy refused the call, which is the truth it can act on.
+/// Distinct from [`build_fail_mode_deny`]: nothing failed and nothing timed out.
+/// The client is told an enforcing policy refused the call, which is the truth
+/// it can act on.
 fn build_task_gate_deny(id: Value, reason: &str, elapsed_ms: f64) -> String {
     let result = ToolCallResult {
         content: vec![ContentItem {
@@ -9707,9 +9750,15 @@ policy:
         let resp = build_fail_mode_deny(Value::from(1), "analysis timed out", 42.5, true, true);
         let v: Value = serde_json::from_str(&resp).unwrap();
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
-        // Should be "Tirith: analysis timed out (fail_mode=closed)" — NOT "Tirith: Tirith ..."
+        // This reports the effective boundary decision, not a configured mode.
         assert!(text.starts_with("Tirith: analysis"));
         assert!(!text.contains("Tirith: Tirith"));
+        assert!(text.contains("security boundary failed closed"));
+        assert!(!text.contains("fail_mode=closed"));
+        assert_eq!(
+            v["result"]["structuredContent"]["failure_policy"],
+            "fail_closed"
+        );
     }
 
     #[test]
@@ -9720,6 +9769,30 @@ policy:
             .as_f64()
             .unwrap();
         assert!((elapsed - 42.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn guarded_analysis_timeout_denies_even_when_fail_mode_is_open() {
+        let config: GatewayConfig = serde_yaml::from_str(
+            "guarded_tools: []\npolicy:\n  fail_mode: open\n  timeout_ms: 1\n",
+        )
+        .unwrap();
+        let config = CompiledConfig::from_config(config).unwrap();
+        let resp = build_guarded_analysis_failure_deny(
+            Value::from(1),
+            "analysis timed out",
+            1.0,
+            true,
+            &config.policy.fail_mode,
+        );
+        let value: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(value["result"]["isError"], true);
+        assert_eq!(value["result"]["structuredContent"]["decision"], "deny");
+        assert_eq!(
+            value["result"]["structuredContent"]["timeout_triggered"],
+            true
+        );
+        assert_eq!(config.policy.fail_mode, "open");
     }
 
     #[test]

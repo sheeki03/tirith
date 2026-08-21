@@ -528,7 +528,7 @@ policy_complete = true
 name = "mcp-server"
 group = "AI-agent integrations"
 inspected = "full"
-coverage = "Runs tirith as an MCP server (7 tools) over JSON-RPC stdio; inspects tool inputs and, with --sanitize-tool-output, outputs."
+coverage = "Runs tirith as an MCP server (7 tools) over JSON-RPC stdio; inspects tool inputs and sanitizes tool/resource-read outputs by default."
 policy_complete = true
 
 [[command]]

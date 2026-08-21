@@ -82,6 +82,16 @@ pub fn validate_fetch_url(url: &str) -> Result<url::Url, String> {
     validate_outbound_url_with_resolver(url, UrlValidationMode::Fetch, &resolve_host)
 }
 
+/// Validate a fetch URL with a caller-owned resolver. This keeps the canonical
+/// syntax, private-fetch policy, and address classification in one place while
+/// allowing latency-sensitive callers to impose a bounded resolution budget.
+pub(crate) fn validate_fetch_url_with_resolver(
+    url: &str,
+    resolver: &HostResolver<'_>,
+) -> Result<url::Url, String> {
+    validate_outbound_url_with_resolver(url, UrlValidationMode::Fetch, resolver)
+}
+
 /// Pure fetch-URL preflight used before consuming a one-shot authorization.
 ///
 /// This validates every property available without name resolution: syntax,
