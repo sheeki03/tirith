@@ -84,8 +84,9 @@ pub fn default_devcontainer_json(cwd: &Path) -> PathBuf {
     cwd.join(".devcontainer").join("devcontainer.json")
 }
 
-/// Add the Tirith lifecycle command plus `TIRITH_DEVCONTAINER=1` to an existing
-/// devcontainer.json, or (with `create_if_missing`) write a minimal one.
+/// Compatibility-only devcontainer publisher for external library callers.
+/// Tirith-owned CLI paths render and publish through their typed ConfigWrite
+/// boundary and must not call this legacy publisher.
 ///
 /// `root` is the selected repository root: every read and write is confined
 /// beneath it through a retained, no-follow parent capability, refuses a
@@ -97,6 +98,11 @@ pub fn default_devcontainer_json(cwd: &Path) -> PathBuf {
 /// Existing string and argv lifecycle forms become a multi-command object so
 /// an untrusted setup command cannot prevent Tirith from being launched. A
 /// re-run is a no-op only when the reserved entry contains the exact argv.
+#[doc(hidden)]
+#[deprecated(
+    since = "0.1.0",
+    note = "outside Tirith-owned CLI boundaries; use an authorized ConfigWrite integration"
+)]
 pub fn inject_tirith_hook(path: &Path, root: &Path, create_if_missing: bool) -> InjectOutcome {
     let prepared = match ContainedAtomicFile::prepare(root, path, create_if_missing) {
         Ok(prepared) => prepared,
@@ -107,6 +113,12 @@ pub fn inject_tirith_hook(path: &Path, root: &Path, create_if_missing: bool) -> 
             )
         }
     };
+    if let Err(error) = prepared.lock_parent_for_mutation() {
+        return InjectOutcome::ParseError(
+            path.to_path_buf(),
+            format!("cannot serialize devcontainer mutation: {error}"),
+        );
+    }
     let content_str = match prepared.read_capped(CONFIG_READ_CAP) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(s) => s,
@@ -165,17 +177,23 @@ pub fn inject_tirith_hook(path: &Path, root: &Path, create_if_missing: bool) -> 
     }
 }
 
-/// Idempotently ensure `<cwd>/.gitignore` has a `.tirith/` entry so
-/// per-codespace state never leaks into the repo.
+/// Compatibility-only `.gitignore` publisher for external library callers.
+/// Tirith-owned CLI paths use their typed ConfigWrite boundary.
 ///
 /// The existing file is read through a no-follow, size-capped contained
 /// reader and republished atomically beneath `cwd` (repo-0271). A symlinked
 /// `.gitignore` is an error, and an UNREADABLE file is no longer silently
 /// treated as empty (which would have truncated a non-UTF-8 symlink target
 /// down to just the Tirith stanza).
+#[doc(hidden)]
+#[deprecated(
+    since = "0.1.0",
+    note = "outside Tirith-owned CLI boundaries; use an authorized ConfigWrite integration"
+)]
 pub fn ensure_gitignore_entry(cwd: &Path) -> std::io::Result<bool> {
     let path = cwd.join(".gitignore");
     let prepared = ContainedAtomicFile::prepare(cwd, &path, false)?;
+    prepared.lock_parent_for_mutation()?;
     let existing = match prepared.read_capped(CONFIG_READ_CAP) {
         Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
             std::io::Error::new(
@@ -203,7 +221,7 @@ pub fn ensure_gitignore_entry(cwd: &Path) -> std::io::Result<bool> {
     }
     new_content.push_str("# tirith state directory (devcontainer / codespaces)\n");
     new_content.push_str(".tirith/\n");
-    prepared.write_atomic(new_content.as_bytes(), true)?;
+    prepared.write_atomic_if_observed(new_content.as_bytes(), true)?;
     Ok(true)
 }
 
@@ -294,7 +312,7 @@ fn write_pretty(prepared: &ContainedAtomicFile, value: &Value) -> Result<(), Str
     let mut content = pretty;
     content.push('\n');
     prepared
-        .write_atomic(content.as_bytes(), true)
+        .write_atomic_if_observed(content.as_bytes(), true)
         .map_err(|e| format!("atomic write: {e}"))
 }
 
@@ -407,6 +425,7 @@ pub fn strip_jsonc_comments(input: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use tempfile::tempdir;

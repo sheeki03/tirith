@@ -3,6 +3,13 @@ use crate::rule_explanations;
 use crate::verdict::{Finding, Severity};
 use std::collections::HashMap;
 
+fn project_sarif_text(value: &str) -> String {
+    let share_safe =
+        crate::redact::redact_for_audience(value, crate::redact::ShareAudience::PublicPaste)
+            .redacted_content;
+    crate::redact::redact_blocked_output(&share_safe)
+}
+
 /// Convert scan findings to SARIF 2.1.0 JSON. Severity maps as
 /// CRITICAL/HIGH -> "error", MEDIUM -> "warning", LOW/INFO -> "note".
 pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Value {
@@ -14,11 +21,12 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
         // identity lives in `custom_rule_id`. Key the SARIF rule descriptor
         // by the EFFECTIVE id so distinct custom rules get distinct
         // descriptors and fingerprints.
-        let rule_str = f
+        let raw_rule_str = f
             .finding
             .custom_rule_id
             .clone()
             .unwrap_or_else(|| f.finding.rule_id.to_string());
+        let rule_str = project_sarif_text(&raw_rule_str);
         if !rule_map.contains_key(&rule_str) {
             let idx = rules.len();
             rule_map.insert(rule_str.clone(), idx);
@@ -26,13 +34,13 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
             let mut rule = serde_json::json!({
                 "id": rule_str,
                 "shortDescription": {
-                    "text": f.finding.title
+                    "text": project_sarif_text(&f.finding.title)
                 }
             });
 
-            if let Some(explanation) = rule_explanations::explain(&rule_str) {
+            if let Some(explanation) = rule_explanations::explain(&raw_rule_str) {
                 rule["fullDescription"] = serde_json::json!({
-                    "text": explanation.description
+                    "text": project_sarif_text(explanation.description)
                 });
 
                 let mut tags: Vec<&str> = Vec::new();
@@ -57,20 +65,22 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
     let results: Vec<serde_json::Value> = findings
         .iter()
         .map(|f| {
-            let rule_str = f
-                .finding
-                .custom_rule_id
-                .clone()
-                .unwrap_or_else(|| f.finding.rule_id.to_string());
+            let rule_str = project_sarif_text(
+                &f.finding
+                    .custom_rule_id
+                    .clone()
+                    .unwrap_or_else(|| f.finding.rule_id.to_string()),
+            );
             let rule_index = rule_map[&rule_str];
             let level = severity_to_level(f.finding.severity);
+            let projected_path = f.file_path.as_deref().map(project_sarif_text);
 
             let mut result = serde_json::json!({
                 "ruleId": rule_str,
                 "ruleIndex": rule_index,
                 "level": level,
                 "message": {
-                    "text": f.finding.description
+                    "text": project_sarif_text(&f.finding.description)
                 }
             });
 
@@ -79,11 +89,11 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
             result["fingerprints"] = serde_json::json!({
                 "tirith/v1": format!("{}:{}:{}",
                     rule_id_str,
-                    f.file_path.as_deref().unwrap_or(""),
+                    projected_path.as_deref().unwrap_or(""),
                     f.line_number.unwrap_or(0))
             });
 
-            if let Some(ref path) = f.file_path {
+            if let Some(path) = projected_path {
                 let mut location = serde_json::json!({
                     "physicalLocation": {
                         "artifactLocation": {
@@ -120,7 +130,7 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
             "tool": {
                 "driver": {
                     "name": "tirith",
-                    "version": tool_version,
+                    "version": project_sarif_text(tool_version),
                     "informationUri": "https://tirith.dev",
                     "rules": rules
                 }
@@ -359,6 +369,52 @@ mod tests {
         assert!(
             results[0].get("suppressions").is_none(),
             "suppressions should not be present when not suppressed"
+        );
+    }
+
+    #[test]
+    fn sarif_projects_custom_rule_text_path_and_fingerprint() {
+        let secret = format!("ghp_{}", "S".repeat(36));
+        let mut finding = make_finding(
+            RuleId::CustomRuleMatch,
+            Severity::High,
+            &format!("title {secret}"),
+        );
+        finding.description = format!("description {secret}");
+        finding.custom_rule_id = Some(format!("custom-{secret}"));
+        let findings = vec![SarifFinding {
+            finding: &finding,
+            file_path: Some(format!("/Users/alice/private/{secret}.txt")),
+            line_number: Some(9),
+            suppressed: false,
+        }];
+
+        let sarif = to_sarif(&findings, "0.1.0");
+        let serialized = sarif.to_string();
+        assert!(!serialized.contains(&secret), "{serialized}");
+        assert!(!serialized.contains("/Users/alice"), "{serialized}");
+        assert!(serialized.contains("REDACTED"), "{serialized}");
+    }
+
+    #[test]
+    fn sarif_preserves_benign_relative_locations_and_rule_ids() {
+        let finding = make_finding(RuleId::AnsiEscapes, Severity::High, "ANSI escape");
+        let findings = vec![SarifFinding {
+            finding: &finding,
+            file_path: Some("src/bin/check.rs".to_string()),
+            line_number: Some(7),
+            suppressed: false,
+        }];
+        let sarif = to_sarif(&findings, "0.1.0");
+        let result = &sarif["runs"][0]["results"][0];
+        assert_eq!(result["ruleId"], "ansi_escapes");
+        assert_eq!(
+            result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "src/bin/check.rs"
+        );
+        assert_eq!(
+            result["fingerprints"]["tirith/v1"],
+            "ansi_escapes:src/bin/check.rs:7"
         );
     }
 }

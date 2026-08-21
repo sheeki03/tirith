@@ -28,8 +28,6 @@ struct CredPattern {
     #[allow(dead_code)]
     regex: String,
     #[allow(dead_code)]
-    redact_prefix_len: Option<usize>,
-    #[allow(dead_code)]
     severity: String,
 }
 
@@ -620,7 +618,10 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     PatternEntry {
         id: "env_var_sensitive",
         tier1_exec_fragments: &[
-            r"(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN)\s*=",
+            // Coarse superset of the central sensitive-assets registry. Precise
+            // value-aware RPC and prefix-family classification stays in tier 3.
+            r"(?i:(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_SECURITY_TOKEN|AWS_WEB_IDENTITY_TOKEN_FILE|AWS_CONTAINER_AUTHORIZATION_TOKEN(?:_FILE)?|AZURE_CLIENT_SECRET|GOOGLE_APPLICATION_CREDENTIALS|GOOGLE_API_KEY|GOOGLE_OAUTH_ACCESS_TOKEN|GITHUB_TOKEN|GH_TOKEN|NPM_TOKEN|NODE_AUTH_TOKEN|PYPI_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|STRIPE_API_KEY|DOCKER_PASSWORD|DOCKER_CONFIG|KUBECONFIG|SLACK_TOKEN|SSH_AUTH_SOCK|GPG_AGENT_INFO|PRIVATE_KEY|DEPLOYER_PRIVATE_KEY|WALLET_PRIVATE_KEY|ETH_PRIVATE_KEY|EVM_PRIVATE_KEY|FOUNDRY_PRIVATE_KEY|MNEMONIC|SEED_PHRASE|WALLET_MNEMONIC|SOLANA_KEYPAIR(?:_PATH)?|ANCHOR_WALLET|KEYSTORE_PASSWORD|WALLET_PASSWORD|UV_INDEX_URL|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|TWINE_PASSWORD|TWINE_TOKEN|RPC_API_KEY|JWT_SECRET|RPC_URL|ETH_RPC_URL|SOLANA_RPC_URL|AWS_SECRET_[A-Z0-9_]+|AWS_SESSION_TOKEN_[A-Z0-9_]+|AWS_SECURITY_TOKEN_[A-Z0-9_]+|AZURE_CLIENT_SECRET_[A-Z0-9_]+|GOOGLE_API_KEY_[A-Z0-9_]+|GOOGLE_OAUTH_ACCESS_TOKEN_[A-Z0-9_]+|TWINE_PASSWORD_[A-Z0-9_]+|TWINE_TOKEN_[A-Z0-9_]+))\s*=",
+            r"(?i:(?:--mnemonic\b|\b(?:mnemonic|seed[-_ ]?phrase)\s*[:=]))",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Sensitive API key environment variable exports",
@@ -659,21 +660,34 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Docker/Podman remote daemon with privilege escalation",
     },
     PatternEntry {
+        // C10 — one COARSE gate for the Web3 tool family. Tier-1 only has to
+        // decide whether the precise parser is worth running, so matching the
+        // bare tool token is correct and cheap; `rules::web3` then discards
+        // every benign `cast call` / `forge build` without emitting anything.
+        // Anchored on a word boundary so `forgets` and `castle` do not match.
+        id: "web3_cli",
+        tier1_exec_fragments: &[r"\b(?:cast|forge|hardhat|solana|anchor)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Web3 tool invocations (cast, forge, hardhat, solana, anchor); precise grammar in rules::web3 decides what is actually state-changing",
+    },
+    PatternEntry {
         id: "credential_file_sweep",
         tier1_exec_fragments: &[
-            r"\.ssh/id_",
-            r"\.ssh/authorized_keys",
-            r"\.aws/credentials",
-            r"\.aws/config",
-            r"\.docker/config\.json",
-            r"\.kube/config",
-            r"\.config/gcloud/",
+            r"(?:^|[\\/])\.ssh(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.aws(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.azure(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.docker(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.kube(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.config[\\/](?:gcloud|gh|solana)(?:[\\/]|\b)",
             r"\.npmrc",
             r"\.pypirc",
             r"\.netrc",
-            r"\.gnupg/",
-            r"\.config/gh/",
+            r"(?:^|[\\/])\.gnupg(?:[\\/]|\b)",
             r"\.git-credentials",
+            r"(?:^|[\\/])\.ethereum[\\/]keystore(?:[\\/]|\b)",
+            r"(?:^|[\\/])wallet\.dat(?:\b|[\s'\x22])",
+            r"(?:^|[\\/])(?:solana-keypair|-?[^\\/\s]+-keypair)\.json(?:\b|[\s'\x22])",
+            r"(?:^|[\\/])etc(?:[\\/]|\b)",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Credential file path sweep (multiple sensitive paths in one command)",
@@ -1141,6 +1155,14 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("prompt_injection_obfuscated", "PromptInjectionObfuscated"),
     // C7 — output-side data-exfiltration rule.
     ("output_data_exfiltration", "OutputDataExfiltration"),
+    // C10 — Web3 execution-boundary rules. Exactly three; parser and config
+    // gaps reuse `analysis_incomplete`.
+    ("web3_state_changing_command", "Web3StateChangingCommand"),
+    ("web3_signer_risk", "Web3SignerRisk"),
+    (
+        "web3_network_policy_violation",
+        "Web3NetworkPolicyViolation",
+    ),
     // Operational-context rules (M8 ch1).
     (
         "context_prod_destructive_command",

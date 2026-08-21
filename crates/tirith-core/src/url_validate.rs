@@ -72,7 +72,7 @@ pub fn validate_server_url_with_resolver_for_test(
     url: &str,
     resolver: &TestHostResolver<'_>,
 ) -> Result<(), String> {
-    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let parsed = url::Url::parse(url).map_err(|_| "invalid URL".to_string())?;
     validate_parsed_url_with_resolver(&parsed, UrlValidationMode::Server, resolver, None)
 }
 
@@ -80,6 +80,42 @@ pub fn validate_server_url_with_resolver_for_test(
 /// credentials and non-public destinations (after DNS resolution).
 pub fn validate_fetch_url(url: &str) -> Result<url::Url, String> {
     validate_outbound_url_with_resolver(url, UrlValidationMode::Fetch, &resolve_host)
+}
+
+/// Pure fetch-URL preflight used before consuming a one-shot authorization.
+///
+/// This validates every property available without name resolution: syntax,
+/// scheme, credentials, host/port presence, cloud-metadata hostnames, and
+/// literal-IP policy. Domain names are deliberately not resolved here. The
+/// ordinary [`validate_fetch_url`] call remains mandatory after authorization
+/// and immediately before constructing the network request.
+pub fn validate_fetch_url_syntax(url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(url).map_err(|_| "invalid URL".to_string())?;
+    validate_parsed_url_syntax(&parsed, UrlValidationMode::Fetch)?;
+
+    let host_label = parsed
+        .host_str()
+        .ok_or_else(|| "URL is missing a host".to_string())?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let policy = private_fetch_policy_from_env()?;
+    let literal = match parsed
+        .host()
+        .ok_or_else(|| "URL is missing a host".to_string())?
+    {
+        url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
+        url::Host::Domain(_) => {
+            if is_localhost_host(&host_label) && !policy.approves_host(&host_label) {
+                return Err("refusing to connect to localhost destination".to_string());
+            }
+            None
+        }
+    };
+    if let Some(ip) = literal {
+        validate_resolved_destination(&host_label, &[ip], Some(&policy))?;
+    }
+    Ok(parsed)
 }
 
 /// Hermetic preflight seam for crate tests that need to model the first DNS
@@ -90,7 +126,7 @@ pub fn validate_fetch_url_with_resolver_for_test(
     url: &str,
     resolver: &TestHostResolver<'_>,
 ) -> Result<url::Url, String> {
-    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let parsed = url::Url::parse(url).map_err(|_| "invalid URL".to_string())?;
     let strict_policy = PrivateFetchPolicy::default();
     validate_parsed_url_with_resolver(
         &parsed,
@@ -106,7 +142,7 @@ fn validate_outbound_url_with_resolver(
     mode: UrlValidationMode,
     resolver: &HostResolver<'_>,
 ) -> Result<url::Url, String> {
-    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let parsed = url::Url::parse(url).map_err(|_| "invalid URL".to_string())?;
     validate_parsed_url_with_resolver(&parsed, mode, resolver, None)?;
     Ok(parsed)
 }
@@ -117,11 +153,7 @@ fn validate_parsed_url_with_resolver(
     resolver: &HostResolver<'_>,
     fetch_policy_override: Option<&PrivateFetchPolicy>,
 ) -> Result<(), String> {
-    validate_scheme(parsed, mode)?;
-
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("refusing to connect to URLs with embedded credentials".to_string());
-    }
+    validate_parsed_url_syntax(parsed, mode)?;
 
     let host = parsed
         .host()
@@ -131,14 +163,6 @@ fn validate_parsed_url_with_resolver(
         .ok_or_else(|| "URL is missing a host".to_string())?
         .trim_end_matches('.')
         .to_ascii_lowercase();
-
-    // Reject canonical metadata names before DNS. The connect-time resolver
-    // repeats this exact check so a redirect or rebind cannot bypass it.
-    if is_cloud_metadata_host(&host_label) {
-        return Err(format!(
-            "refusing to connect to cloud metadata endpoint: {host_label}"
-        ));
-    }
 
     let private_policy = match mode {
         UrlValidationMode::Server => None,
@@ -150,7 +174,7 @@ fn validate_parsed_url_with_resolver(
 
     let port = parsed
         .port_or_known_default()
-        .ok_or_else(|| format!("unsupported URL scheme: {}", parsed.scheme()))?;
+        .ok_or_else(|| "unsupported URL scheme".to_string())?;
 
     // Resolve the host (or take the literal IP) once, up front, so the metadata
     // and forbidden-IP screens below see the same address set.
@@ -158,15 +182,35 @@ fn validate_parsed_url_with_resolver(
         url::Host::Ipv4(ip) => vec![IpAddr::V4(ip)],
         url::Host::Ipv6(ip) => vec![IpAddr::V6(ip)],
         url::Host::Domain(domain) => {
-            let resolved = resolver(domain, port)?;
+            let resolved = resolver(domain, port)
+                .map_err(|_| "failed to resolve destination host".to_string())?;
             if resolved.is_empty() {
-                return Err(format!("failed to resolve host: {host_label}"));
+                return Err("failed to resolve destination host".to_string());
             }
             resolved
         }
     };
 
     validate_resolved_destination(&host_label, &addrs, private_policy.as_ref())
+}
+
+fn validate_parsed_url_syntax(parsed: &url::Url, mode: UrlValidationMode) -> Result<(), String> {
+    validate_scheme(parsed, mode)?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("refusing to connect to URLs with embedded credentials".to_string());
+    }
+    let host_label = parsed
+        .host_str()
+        .ok_or_else(|| "URL is missing a host".to_string())?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if is_cloud_metadata_host(&host_label) {
+        return Err("refusing to connect to cloud metadata endpoint".to_string());
+    }
+    parsed
+        .port_or_known_default()
+        .ok_or_else(|| "unsupported URL scheme".to_string())?;
+    Ok(())
 }
 
 fn validate_scheme(parsed: &url::Url, mode: UrlValidationMode) -> Result<(), String> {
@@ -180,19 +224,16 @@ fn validate_scheme(parsed: &url::Url, mode: UrlValidationMode) -> Result<(), Str
                         "tirith: warning: connecting to server over plain HTTP (TIRITH_ALLOW_HTTP=1)"
                     );
                 } else {
-                    return Err(format!(
-                        "server URL must use HTTPS (got {}://). Set TIRITH_ALLOW_HTTP=1 to override.",
-                        parsed.scheme()
-                    ));
+                    return Err(
+                        "server URL must use HTTPS. Set TIRITH_ALLOW_HTTP=1 to override."
+                            .to_string(),
+                    );
                 }
             }
         }
         UrlValidationMode::Fetch => {
             if parsed.scheme() != "http" && parsed.scheme() != "https" {
-                return Err(format!(
-                    "fetch URL must use http:// or https:// (got {}://)",
-                    parsed.scheme()
-                ));
+                return Err("fetch URL must use http:// or https://".to_string());
             }
         }
     }
@@ -203,7 +244,7 @@ fn validate_scheme(parsed: &url::Url, mode: UrlValidationMode) -> Result<(), Str
 fn resolve_host(host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
     let addrs = (host, port)
         .to_socket_addrs()
-        .map_err(|e| format!("failed to resolve host {host}: {e}"))?;
+        .map_err(|_| "failed to resolve destination host".to_string())?;
 
     let mut ips = Vec::new();
     for addr in addrs {
@@ -495,12 +536,10 @@ pub(crate) fn validate_resolved_destination(
 ) -> Result<(), String> {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     if is_cloud_metadata_host(&host) {
-        return Err(format!(
-            "refusing to connect to cloud metadata endpoint: {host}"
-        ));
+        return Err("refusing to connect to cloud metadata endpoint".to_string());
     }
     if addresses.is_empty() {
-        return Err(format!("failed to resolve host: {host}"));
+        return Err("failed to resolve destination host".to_string());
     }
 
     for ip in addresses {
@@ -520,19 +559,15 @@ fn validate_destination_ip(
 
     match scope {
         AddressScope::Global if !is_localhost_host(host) || host_approved => Ok(()),
-        AddressScope::Global => Err(format!(
-            "refusing to connect to localhost destination: {host} -> {ip}"
-        )),
+        AddressScope::Global => Err("refusing to connect to localhost destination".to_string()),
         AddressScope::PrivateUse | AddressScope::Loopback if host_approved || ip_approved => Ok(()),
-        AddressScope::CloudControlPlane => Err(format!(
-            "refusing to connect to cloud metadata endpoint: {host} -> {ip}"
-        )),
-        AddressScope::LinkLocal => Err(format!(
-            "refusing to connect to link-local address: {host} -> {ip}"
-        )),
-        AddressScope::PrivateUse | AddressScope::Loopback | AddressScope::SpecialUse => Err(
-            format!("refusing to connect to non-public address: {host} -> {ip}"),
-        ),
+        AddressScope::CloudControlPlane => {
+            Err("refusing to connect to cloud metadata endpoint".to_string())
+        }
+        AddressScope::LinkLocal => Err("refusing to connect to link-local address".to_string()),
+        AddressScope::PrivateUse | AddressScope::Loopback | AddressScope::SpecialUse => {
+            Err("refusing to connect to non-public address".to_string())
+        }
     }
 }
 
@@ -871,7 +906,10 @@ mod tests {
             &resolver_with("127.0.0.1".parse().unwrap()),
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("127.0.0.1"));
+        let error = result.unwrap_err();
+        assert!(error.contains("non-public"));
+        assert!(!error.contains("127.0.0.1"));
+        assert!(!error.contains("example.com"));
     }
 
     #[test]
@@ -882,7 +920,10 @@ mod tests {
             &resolver_with("203.0.113.10".parse().unwrap()),
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("203.0.113.10"));
+        let error = result.unwrap_err();
+        assert!(error.contains("non-public"));
+        assert!(!error.contains("203.0.113.10"));
+        assert!(!error.contains("example.com"));
     }
 
     #[test]
@@ -893,6 +934,42 @@ mod tests {
             &resolver_with("93.184.216.34".parse().unwrap()),
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fetch_syntax_preflight_accepts_a_domain_without_resolution() {
+        let parsed = validate_fetch_url_syntax("https://does-not-resolve.invalid/script")
+            .expect("pure preflight must not consult DNS for a domain name");
+        assert_eq!(parsed.host_str(), Some("does-not-resolve.invalid"));
+
+        let resolver_called = std::cell::Cell::new(false);
+        let full = validate_outbound_url_with_resolver(
+            parsed.as_str(),
+            UrlValidationMode::Fetch,
+            &|_, _| {
+                resolver_called.set(true);
+                Err("synthetic DNS failure".to_string())
+            },
+        );
+        assert!(full.is_err());
+        assert!(resolver_called.get());
+    }
+
+    #[test]
+    fn fetch_syntax_preflight_rejects_literal_ssrf_and_malformed_inputs() {
+        for input in [
+            "not a URL",
+            "ftp://example.com/script",
+            "https://user:secret@example.com/script",
+            "https://api.localhost/script",
+            "https://169.254.169.254/latest/meta-data",
+            "https://metadata.google.internal/computeMetadata/v1",
+        ] {
+            assert!(
+                validate_fetch_url_syntax(input).is_err(),
+                "accepted {input}"
+            );
+        }
     }
 
     #[test]
@@ -935,7 +1012,9 @@ mod tests {
             &resolver_with("::ffff:169.254.169.254".parse().unwrap()),
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("169.254.169.254"));
+        let error = result.unwrap_err();
+        assert!(error.contains("cloud metadata endpoint"));
+        assert!(!error.contains("169.254.169.254"));
     }
 
     // Adversarial bypass attempts: embedded IPv4 / translated IPv6.

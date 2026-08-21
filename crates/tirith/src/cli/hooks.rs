@@ -219,20 +219,17 @@ const MAX_POLICY_SIZE: u64 = 1024 * 1024;
 /// Symlink-hardened (F16): the policy path is a repo-discovered
 /// `<repo>/.tirith/policy.yaml` (or `<config>/tirith/policy.yaml`), so an attacker
 /// who can plant a symlink there could otherwise redirect this truncating write
-/// onto an arbitrary file. Three layers defend the write:
-///   * `canonical_within` against the GRANDPARENT (`<repo>` / `<config>`)
-///     canonicalizes through the containing `.tirith` directory, so a SYMLINKED
-///     `.tirith` that escapes the repo is rejected before any read or write.
-///   * the read uses `O_NOFOLLOW` + a size cap (refuses a symlinked final
-///     component, bounds a hostile target); and
-///   * the write uses `O_NOFOLLOW` + `0600` (refuses a symlinked final component).
+/// onto an arbitrary file. A retained directory capability traverses from the
+/// trusted grandparent without following repo-controlled symlinks, then owns
+/// both the bounded read and atomic 0600 publication. There is no pathname
+/// re-open between validation and mutation.
 ///
 /// The grandparent is the right containment root because the policy path is always
 /// at least three components deep (`<root>/.tirith/policy.yaml`); passing the
 /// parent (`.tirith`) instead is a tautology for a fixed `policy.yaml` filename and
 /// would NOT catch a symlinked `.tirith`. A malformed path with no grandparent is
 /// rejected rather than written.
-fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     // The containment root is the grandparent: <repo>/.tirith/policy.yaml → <repo>,
     // <config>/tirith/policy.yaml → <config>. A policy path is always at least
     // three components deep; refuse a malformed shallower path rather than guess.
@@ -243,30 +240,24 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         )
     })?;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Containment FIRST: reject a symlinked containing directory (e.g. a planted
-    // `.tirith` symlink) that escapes the trusted root before we read or write
-    // through it. `O_NOFOLLOW` on the final component alone misses this, because
-    // the OS still follows an intermediate-dir symlink during path resolution.
-    // Done after create_dir_all so a legit first-run `.tirith` exists to canonicalize.
-    if !tirith_core::util::canonical_within(path, containment_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to write policy through a symlinked path",
-        ));
-    }
+    let policy = Policy::discover_local_only(containment_root.to_str());
+    let contained = super::prepare_config_destination_permitted(
+        containment_root,
+        path,
+        true,
+        &policy,
+        true,
+        true,
+    )?;
 
     // Read the current contents WITHOUT following a symlinked final component. An
     // absent file is an empty baseline (the key is then appended); any other read
     // failure (symlinked, oversized, I/O) aborts rather than clobbering blind.
-    let existing = match tirith_core::util::read_text_no_follow_capped(path, MAX_POLICY_SIZE) {
+    let existing = match contained.read_capped(MAX_POLICY_SIZE) {
         Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "policy file is not valid UTF-8; refusing to rewrite it",
+                "policy file is not UTF-8; refusing to rewrite it",
             )
         })?,
         Err(tirith_core::util::OpenRegularError::NotFound) => String::new(),
@@ -306,11 +297,17 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     // guard disabled.
     verify_guard_key_effective(&out, enable)?;
 
-    // Atomic publish (temp + fsync + rename, no-follow, 0600): a crash or
-    // full disk mid-write leaves the previous policy intact, never an empty
-    // or partial file (R3 reliability: the truncating in-place write could
-    // destroy security policy on interruption).
-    tirith_core::util::write_file_atomic_0600(path, out.as_bytes())
+    // Atomic publish (temp + fsync + rename) through the retained parent
+    // capability: interruption cannot truncate the previous policy.
+    super::write_prepared_config_file_permitted(
+        containment_root,
+        path,
+        contained,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
 }
 
 /// Parse the candidate policy and require the top-level `hooks_guard_enabled`

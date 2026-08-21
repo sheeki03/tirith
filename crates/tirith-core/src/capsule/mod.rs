@@ -48,6 +48,32 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Stable compatibility constant. Runtime classification queries the typed
+/// registry through [`crate::sensitive_assets`].
+pub const SENSITIVE_ENV_EXACT: &[&str] = &[
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "NPM_TOKEN",
+    "NODE_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "DOCKER_CONFIG",
+    "KUBECONFIG",
+    "SSH_AUTH_SOCK",
+    "GPG_AGENT_INFO",
+];
+
+/// Stable compatibility constant. Runtime classification queries the typed
+/// registry through [`crate::sensitive_assets`].
+pub const SENSITIVE_ENV_PREFIXES: &[&str] = &[
+    "AWS_",
+    "AZURE_",
+    "GOOGLE_",
+    "UV_INDEX",
+    "PIP_INDEX",
+    "TWINE_",
+];
+
 /// Linux runtime-containment backend (Stack E, unit E2): the
 /// `LandlockSeccompCapsule` and the internal-launcher containment primitive that
 /// applies rlimits -> `PR_SET_NO_NEW_PRIVS` -> Landlock -> seccomp -> env cleanup
@@ -82,44 +108,10 @@ pub mod macos;
 /// runtime probe reports support only on the `windows` target.
 pub mod windows;
 
-/// Sensitive environment variables stripped from a contained child whenever
-/// [`EnvironmentPolicy::deny_sensitive`] is set (the default).
-///
-/// These are credential / token / agent-socket variables whose mere presence in
-/// a child process is a supply-chain exfiltration risk: a malicious install hook
-/// or MCP server that inherits `AWS_*` or `GITHUB_TOKEN` can read and beacon them
-/// even under filesystem containment. The list is deliberately a *known sensitive
-/// set*, not "everything", so a contained build still sees benign config it needs
-/// (`PATH`, `HOME` is replaced with a temp dir, locale, etc.).
-///
-/// Matching is by exact name OR, for the prefix families below, by prefix
-/// (`AWS_`, `AZURE_`, `GOOGLE_`, `UV_INDEX`, `PIP_INDEX`, `TWINE_`). The prefix
-/// set is kept separate so [`EnvironmentPolicy::is_sensitive`] can apply both
-/// rules without ambiguity.
-pub const SENSITIVE_ENV_EXACT: &[&str] = &[
-    "GITHUB_TOKEN",
-    "GH_TOKEN",
-    "NPM_TOKEN",
-    "NODE_AUTH_TOKEN",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "DOCKER_CONFIG",
-    "KUBECONFIG",
-    "SSH_AUTH_SOCK",
-    "GPG_AGENT_INFO",
-];
-
-/// Prefix families stripped alongside [`SENSITIVE_ENV_EXACT`]. Any variable whose
-/// name begins with one of these is treated as sensitive (e.g. `AWS_SECRET_ACCESS_KEY`,
-/// `UV_INDEX_URL`, `PIP_INDEX_URL`, `TWINE_PASSWORD`, `AZURE_CLIENT_SECRET`).
-pub const SENSITIVE_ENV_PREFIXES: &[&str] = &[
-    "AWS_",
-    "AZURE_",
-    "GOOGLE_",
-    "UV_INDEX",
-    "PIP_INDEX",
-    "TWINE_",
-];
+// Sensitive environment variables stripped from a contained child whenever
+// `EnvironmentPolicy::deny_sensitive` is set are classified by the typed central
+// exact/prefix registry. Public RPC endpoint names are deliberately not
+// credentials, while token/key/password kinds remain denied.
 
 /// Per-capability containment ledger. **The honesty contract of the whole
 /// capsule layer (cross-cutting invariant 2).**
@@ -562,8 +554,8 @@ pub struct EnvironmentPolicy {
     /// sensitive set, so an allow entry can never re-expose a credential.
     #[serde(default)]
     pub allow: Vec<String>,
-    /// Strip the known sensitive variables ([`SENSITIVE_ENV_EXACT`] +
-    /// [`SENSITIVE_ENV_PREFIXES`]). **Defaults to `true`.**
+    /// Strip variables classified as secret-bearing by the central typed
+    /// registry. **Defaults to `true`.**
     #[serde(default = "default_true")]
     pub deny_sensitive: bool,
     /// Replace HOME / XDG_* / TMPDIR with an isolated temporary directory so the
@@ -585,14 +577,27 @@ impl Default for EnvironmentPolicy {
 
 impl EnvironmentPolicy {
     /// Whether `name` is a sensitive variable that [`Self::deny_sensitive`]
-    /// strips. Matches an exact entry in [`SENSITIVE_ENV_EXACT`] or any prefix in
-    /// [`SENSITIVE_ENV_PREFIXES`]. Case-sensitive: environment variable names are
-    /// conventionally upper-case and these constants are written that way.
+    /// strips. Exact aliases and prefix families use one kind-aware central
+    /// matcher; public RPC endpoint variables are preserved.
     pub fn is_sensitive(name: &str) -> bool {
-        SENSITIVE_ENV_EXACT.contains(&name)
-            || SENSITIVE_ENV_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+        crate::sensitive_assets::is_capsule_sensitive_env_name(name)
+    }
+
+    /// Value-aware form used by real launchers. Public RPC endpoints survive,
+    /// while userinfo/query/fragment/provider-token endpoint values are denied.
+    pub fn is_sensitive_assignment(name: &str, value: &str) -> bool {
+        if crate::sensitive_assets::is_capsule_sensitive_env_name(name) {
+            !value.trim().is_empty()
+        } else {
+            crate::sensitive_assets::is_sensitive_env_assignment(name, value)
+        }
+    }
+
+    /// Whether one concrete assignment may enter a child environment after
+    /// the name-level survivor decision. This is the shared value-aware gate
+    /// used by every OS launcher.
+    pub fn assignment_survives(&self, name: &str, value: &str) -> bool {
+        !self.deny_sensitive || !Self::is_sensitive_assignment(name, value)
     }
 
     /// Compute the variable names that should survive into the child, given the
@@ -927,24 +932,8 @@ pub fn deny_default_paths() -> Vec<PathBuf> {
 pub fn try_deny_default_paths() -> Result<Vec<PathBuf>, FilesystemPolicyError> {
     let home = authenticated_home_dir()?;
     // Known credential / key / token stores. Kept tight on purpose.
-    let relative = [
-        ".aws",
-        ".azure",
-        ".config/gcloud",
-        ".ssh",
-        ".gnupg",
-        ".kube",
-        ".docker/config.json",
-        ".netrc",
-        ".npmrc",
-        ".pypirc",
-        ".git-credentials",
-        ".config/gh",
-        ".cargo/credentials.toml",
-    ];
     canonicalize_root_set(
-        &relative
-            .iter()
+        &crate::sensitive_assets::capsule_deny_relative_paths()
             .map(|relative| home.join(relative))
             .collect::<Vec<_>>(),
         "deny",
@@ -1240,6 +1229,8 @@ mod tests {
                 "GITHUB_TOKEN".to_string(),
                 "AWS_SECRET_ACCESS_KEY".to_string(),
                 "PIP_INDEX_URL".to_string(),
+                "RPC_URL".to_string(),
+                "RPC_API_KEY".to_string(),
                 "LANG".to_string(),
             ],
             deny_sensitive: true,
@@ -1248,9 +1239,69 @@ mod tests {
         let survivors = env.surviving_vars(std::iter::empty());
         assert!(survivors.contains("PATH"));
         assert!(survivors.contains("LANG"));
+        assert!(survivors.contains("RPC_URL"));
         assert!(!survivors.contains("GITHUB_TOKEN"));
         assert!(!survivors.contains("AWS_SECRET_ACCESS_KEY"));
         assert!(!survivors.contains("PIP_INDEX_URL"));
+        assert!(!survivors.contains("RPC_API_KEY"));
+    }
+
+    #[test]
+    fn env_policy_rpc_assignment_gate_is_value_aware() {
+        let env = EnvironmentPolicy::default();
+        assert!(env.assignment_survives("RPC_URL", "https://rpc.example/rpc"));
+        for secret in [
+            "https://user:pass@rpc.example/rpc",
+            "https://rpc.example/rpc?api_key=hunter2",
+            "https://rpc.example/v3/providerToken123456789",
+        ] {
+            assert!(!env.assignment_survives("RPC_URL", secret), "{secret}");
+        }
+        assert!(!env.assignment_survives("RPC_API_KEY", "hunter2"));
+        for alias in [
+            "wallet_private_key",
+            "wallet-private-key",
+            "walletPrivateKey",
+            "WalletPrivateKey",
+        ] {
+            assert!(!env.assignment_survives(alias, "hunter2"), "{alias}");
+        }
+        for alias in ["rpc_url", "rpc-url", "rpcUrl", "RpcUrl"] {
+            assert!(
+                env.assignment_survives(alias, "https://rpc.example/rpc"),
+                "{alias}"
+            );
+            assert!(
+                !env.assignment_survives(alias, "https://rpc.example/v3/providerToken123456789"),
+                "{alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_env_catalog_aliases_keep_original_values() {
+        assert_eq!(SENSITIVE_ENV_EXACT.len(), 10);
+        assert_eq!(SENSITIVE_ENV_EXACT[0], "GITHUB_TOKEN");
+        assert_eq!(SENSITIVE_ENV_EXACT[9], "GPG_AGENT_INFO");
+        assert_eq!(
+            SENSITIVE_ENV_PREFIXES,
+            &[
+                "AWS_",
+                "AZURE_",
+                "GOOGLE_",
+                "UV_INDEX",
+                "PIP_INDEX",
+                "TWINE_"
+            ]
+        );
+        let signature: fn() -> &'static [&'static str] = crate::safe_command::sensitive_env_vars;
+        assert_eq!(signature(), crate::sensitive_assets::secret_env_names());
+        let env_guard_signature: fn() -> &'static [&'static str] =
+            crate::env_guard::sensitive_env_vars;
+        assert_eq!(
+            env_guard_signature(),
+            crate::sensitive_assets::secret_env_names()
+        );
     }
 
     #[test]
@@ -1290,11 +1341,56 @@ mod tests {
         assert!(EnvironmentPolicy::is_sensitive("AWS_SECRET_ACCESS_KEY"));
         assert!(EnvironmentPolicy::is_sensitive("UV_INDEX_URL"));
         assert!(EnvironmentPolicy::is_sensitive("TWINE_USERNAME"));
+        assert!(EnvironmentPolicy::is_sensitive("RPC_API_KEY"));
+        assert!(!EnvironmentPolicy::is_sensitive("RPC_URL"));
         assert!(!EnvironmentPolicy::is_sensitive("PATH"));
         assert!(!EnvironmentPolicy::is_sensitive("HOME"));
         // A var that merely contains a sensitive substring but doesn't match by
         // exact name or prefix is NOT stripped.
         assert!(!EnvironmentPolicy::is_sensitive("MY_GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn capsule_restores_provider_control_and_container_credential_denies() {
+        let env = EnvironmentPolicy {
+            inherit: true,
+            allow: Vec::new(),
+            deny_sensitive: true,
+            temporary_home: true,
+        };
+        let denied = [
+            "AWS_PROFILE",
+            "AWS_REGION",
+            "AWS_CUSTOM_CONTROL",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "DOCKER_AUTH_CONFIG",
+            "AZURE_CONFIG_DIR",
+            "AZURE_CUSTOM_CONTROL",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CUSTOM_CONTROL",
+            "UV_INDEX_CUSTOM",
+            "PIP_INDEX_URL",
+            "PIP_INDEX_CUSTOM",
+            "TWINE_REPOSITORY_URL",
+            "TWINE_CUSTOM_CONTROL",
+        ];
+        for name in denied {
+            assert!(EnvironmentPolicy::is_sensitive(name), "{name}");
+        }
+        let survivors = env.surviving_vars(denied.iter().copied().chain(["PATH", "LANG"]));
+        assert_eq!(
+            survivors,
+            ["LANG".to_string(), "PATH".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert!(
+            crate::sensitive_assets::CAPSULE_SENSITIVE_ENV_EXACT.contains(&"DOCKER_AUTH_CONFIG")
+        );
+        assert!(crate::sensitive_assets::CAPSULE_SENSITIVE_ENV_EXACT.contains(&"AWS_PROFILE"));
     }
 
     #[test]

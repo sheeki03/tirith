@@ -83,7 +83,10 @@ fn check_mixed_script_in_label(raw_host: &str, findings: &mut Vec<Finding>) {
 
     let normalized: String = raw_host.nfc().collect();
     for label in normalized.split('.') {
-        let mut scripts = std::collections::HashSet::new();
+        // Store stable names rather than formatting a randomized HashSet in a
+        // public finding. Deterministic ordering keeps fast/full analysis,
+        // audit output, and repeated runs byte-equivalent.
+        let mut scripts = Vec::new();
         for ch in label.chars() {
             if ch == '-' || ch.is_ascii_digit() {
                 continue;
@@ -92,15 +95,20 @@ fn check_mixed_script_in_label(raw_host: &str, findings: &mut Vec<Finding>) {
             if script == Script::Common || script == Script::Inherited {
                 continue;
             }
-            scripts.insert(script);
+            let script = format!("{script:?}");
+            if !scripts.contains(&script) {
+                scripts.push(script);
+            }
         }
         if scripts.len() > 1 {
+            scripts.sort_unstable();
+            let scripts = format!("{{{}}}", scripts.join(", "));
             findings.push(Finding {
                 rule_id: RuleId::MixedScriptInLabel,
                 severity: Severity::High,
                 title: "Mixed scripts in hostname label".to_string(),
                 description: format!(
-                    "Label '{label}' mixes multiple Unicode scripts ({scripts:?}), potential homograph"
+                    "Label '{label}' mixes multiple Unicode scripts ({scripts}), potential homograph"
                 ),
                 evidence: vec![Evidence::Url {
                     raw: raw_host.to_string(),
@@ -112,6 +120,34 @@ fn check_mixed_script_in_label(raw_host: &str, findings: &mut Vec<Finding>) {
             });
             return;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_script_description_has_deterministic_script_order() {
+        let mut descriptions = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let mut findings = Vec::new();
+            check_mixed_script_in_label("pаypal", &mut findings);
+            let finding = findings
+                .into_iter()
+                .find(|finding| finding.rule_id == RuleId::MixedScriptInLabel)
+                .expect("mixed-script fixture");
+            descriptions.insert(finding.description);
+        }
+        assert_eq!(descriptions.len(), 1, "{descriptions:?}");
+        assert!(
+            descriptions
+                .iter()
+                .next()
+                .is_some_and(|description| description.contains("{Cyrillic, Latin}")),
+            "{descriptions:?}"
+        );
     }
 }
 

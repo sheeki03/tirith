@@ -12,8 +12,20 @@ key_id = "56fae12f77164627"
 signature_hex = "9d4a7e2f0f592613202dd483ff3ab48f72e93dda98505f473a6d29a563affbd05cd21fd250b43dbaeac83dbee7faba457415895eda935e7af2067e0d6564eb07"
 
 [legacy_policy]
-projection_bytes_sha256 = "c29ce960a839859e168f56f2057255e62595865469bb58079c09fa65712b0bc2"
-security_projection_hash = "c29ce960a839859e168f56f2057255e62595865469bb58079c09fa65712b0bc2"
+# Re-frozen for projection_version 3. C04 deliberately bumped the security
+# projection from v2 to v3 so every string is privacy-projected BEFORE it can
+# participate in a durable value or digest; v2 hashed raw free text. The bump
+# is a redaction improvement, and this contract was simply not re-frozen in
+# that commit.
+#
+# Verified before updating, rather than assuming: the projection for this
+# legacy fixture was diffed key-by-key against the C00 baseline. No key was
+# added or removed and no value changed except `projection_version` (2 -> 3),
+# so the freeze is being moved for a declared schema bump, not to paper over
+# a content change. Bisect: passes at 131c3238 (C00), fails from 32e22f61
+# (C04) onward.
+projection_bytes_sha256 = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
+security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
 
 [capability_manifest]
 sha256 = "adc381012366d995f6c55ca2b1850e3071791d3cea0e6f2d7fd854545b010c65"

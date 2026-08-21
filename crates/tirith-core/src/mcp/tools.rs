@@ -166,8 +166,253 @@ pub fn list() -> Vec<ToolDefinition> {
     tools
 }
 
+/// Environment variable an operator sets to opt into preview MCP tools.
+///
+/// The default `tools/list` is a frozen compatibility contract (C00), and
+/// clients cache it, so a new tool cannot simply appear there. It is advertised
+/// only when the operator explicitly asks for preview surface.
+pub const PREVIEW_CAPABILITY_ENV: &str = "TIRITH_MCP_PREVIEW";
+
+/// Is the preview surface enabled for this process?
+pub fn preview_enabled() -> bool {
+    std::env::var(PREVIEW_CAPABILITY_ENV)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn task_authorization_receipt_v2_schema() -> Value {
+    let properties = json!({
+        "schema_version": {"type": "integer", "enum": [2]},
+        "receipt_id": {"type": "string", "maxLength": 256},
+        "issuer_key_id": {"type": "string", "minLength": 16, "maxLength": 16, "pattern": "^[0-9a-f]{16}$"},
+        "task_id": {"type": "string", "maxLength": 1024},
+        "source_id": {"type": "string", "maxLength": 1024},
+        "source_kind": {"type": "string"},
+        "content_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "adapter": {"type": "string"},
+        "acquisition_identity_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "boundary": {"type": "string", "enum": ["gateway_forward", "package_approval", "package_resolve", "package_install_preparation", "package_manager_network", "package_manager_execution", "remote_script_run", "fetch_cloaking", "config_write"]},
+        "action_index": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "action_identity": {"type": "string", "maxLength": 256},
+        "action_projection_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "effects_projection_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "enforcement_projection_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "boundary_operation_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "authorization_projection_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "issued_at": {"type": "string", "maxLength": 64},
+        "expires_at": {"type": "string", "maxLength": 64},
+        "nonce": {"type": "string", "maxLength": 256},
+        "signature": {"type": "string", "minLength": 128, "maxLength": 128, "pattern": "^[0-9a-fA-F]{128}$"}
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": [
+            "schema_version", "receipt_id", "issuer_key_id", "task_id", "source_id",
+            "source_kind", "content_sha256", "adapter", "acquisition_identity_sha256",
+            "boundary", "action_index", "action_identity", "action_projection_sha256",
+            "effects_projection_sha256", "enforcement_projection_sha256",
+            "boundary_operation_sha256", "authorization_projection_sha256", "issued_at",
+            "expires_at", "nonce", "signature"
+        ]
+    })
+}
+
+/// Tools advertised ONLY under the preview capability.
+///
+/// `tirith_check_task` is diagnostic: it reports what an untrusted task
+/// envelope would be allowed to do, and executes, fetches, resolves, and writes
+/// nothing. Every object is `additionalProperties: false` so a client cannot
+/// smuggle an unmodelled field past the bounded envelope parser.
+pub fn preview_tools() -> Vec<ToolDefinition> {
+    let authorization_receipt_schema = task_authorization_receipt_v2_schema();
+    vec![ToolDefinition {
+        name: "tirith_check_task".into(),
+        description: "PREVIEW, DIAGNOSTIC. Assess an untrusted task envelope (issue body, PDF,                       web page, and similar) and report which effects it would be allowed.                       Executes nothing, fetches nothing, resolves no package, and writes                       nothing. The response is advisory and is not an enforcement decision."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "envelope": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "The bounded task envelope to assess.",
+                    "properties": {
+                        "version": {"type": "integer", "enum": [2]},
+                        "task_id": {"type": "string", "maxLength": 4096},
+                        "sources": {
+                            "type": "array",
+                            "maxItems": 32,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "source_id": {"type": "string", "maxLength": 1024},
+                                    "claimed_source": {
+                                        "type": "string",
+                                        "description": "What the document CLAIMS this is. Recorded as a claim; never trusted.",
+                                        "enum": [
+                                            "issue_body", "issue_comment", "pull_request_body",
+                                            "pdf", "web_page", "source_comment",
+                                            "image_alt_text", "repository_config",
+                                            "agent_config", "unknown"
+                                        ]
+                                    },
+                                    "content": {"type": "string", "maxLength": 16384},
+                                    "locator": {"type": "string", "maxLength": 4096},
+                                    "receipt": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "receipt_id": {"type": "string", "maxLength": 4096},
+                                            "issuer_key_id": {"type": "string", "maxLength": 4096},
+                                            "source_kind": {"type": "string"},
+                                            "content_sha256": {"type": "string", "maxLength": 128},
+                                            "adapter": {"type": "string"},
+                                            "acquisition_path": {"type": "string", "maxLength": 4096},
+                                            "task_id": {"type": "string", "maxLength": 4096},
+                                            "policy_identity": {"type": "string", "maxLength": 4096},
+                                            "issued_at": {"type": "string", "maxLength": 64},
+                                            "expires_at": {"type": "string", "maxLength": 64},
+                                            "nonce": {"type": "string", "maxLength": 256},
+                                            "signature": {"type": "string", "maxLength": 512}
+                                        },
+                                        "required": [
+                                            "receipt_id", "issuer_key_id", "source_kind",
+                                            "content_sha256", "adapter", "issued_at",
+                                            "expires_at", "nonce"
+                                        ]
+                                    }
+                                },
+                                "required": ["claimed_source"]
+                            }
+                        },
+                        // One closed object per proposed-action variant, so an
+                        // unmodelled shape is refused at the schema rather than
+                        // reaching the parser as a surprise.
+                        "actions": {
+                            "type": "array",
+                            "maxItems": 32,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "shell": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "command": {"type": "string", "maxLength": 4096},
+                                            "claimed_shell": {
+                                                "type": "string",
+                                                "maxLength": 64,
+                                                "enum": ["posix", "bash", "zsh", "sh", "fish", "powershell", "pwsh", "cmd", "cmd.exe", "unknown"]
+                                            }
+                                        },
+                                        "required": ["command"]
+                                    },
+                                    "package_install": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "ecosystem": {"type": "string", "maxLength": 4096},
+                                            "package": {"type": "string", "maxLength": 4096}
+                                        },
+                                        "required": ["ecosystem", "package"]
+                                    },
+                                    "config_write": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {"path": {"type": "string", "maxLength": 4096}},
+                                        "required": ["path"]
+                                    },
+                                    "narrative": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {"text": {"type": "string", "maxLength": 4096}},
+                                        "required": ["text"]
+                                    }
+                                }
+                            }
+                        },
+                        "requested_effects": {"type": "array", "maxItems": 32, "items": {"type": "string"}},
+                        "authorizations": {
+                            "type": "array",
+                            "maxItems": 1024,
+                            "items": authorization_receipt_schema
+                        }
+                    },
+                    "allOf": [{
+                        "if": {"required": ["version"]},
+                        "then": {
+                            "required": ["version", "task_id"],
+                            "properties": {
+                                "sources": {
+                                    "items": {"required": ["source_id", "claimed_source"]}
+                                }
+                            }
+                        }
+                    }]
+                },
+                "adapter": {
+                    "type": "string",
+                    "description": "Which Tirith-owned ingress adapter obtained the content. Caller-asserted; it selects which claimed kind is believable and confers no trust.",
+                    "enum": [
+                        "operator_ingest", "github_issue", "github_pull_request",
+                        "file_read", "http_fetch", "unattributed"
+                    ]
+                }
+            },
+            "required": ["envelope"]
+        }),
+    }]
+}
+
+/// The tool list for this process: the frozen default set, plus preview tools
+/// when the operator opted in.
+pub fn list_with_preview() -> Vec<ToolDefinition> {
+    let mut tools = list();
+    if preview_enabled() {
+        tools.extend(preview_tools());
+    }
+    tools
+}
+
 /// Dispatch a tool call by name.
 pub fn call(name: &str, arguments: &Value) -> ToolCallResult {
+    #[cfg(unix)]
+    if name == "tirith_fetch_cloaking" {
+        let policy = crate::policy::Policy::discover(None);
+        return call_with_policy(name, arguments, &policy);
+    }
+    // Other legacy direct callers do not use the frozen policy parameter and
+    // retain their previous discovery behavior inside their own handlers.
+    call_with_policy(name, arguments, &crate::policy::Policy::default())
+}
+
+/// Dispatch using the operator policy frozen by the MCP dispatcher.
+///
+/// In particular, the cloaking fetch must not rediscover policy from a
+/// repository-controlled working directory between session initialization and
+/// its first DNS lookup.
+pub fn call_with_policy(
+    name: &str,
+    arguments: &Value,
+    operator_policy: &crate::policy::Policy,
+) -> ToolCallResult {
+    call_with_policy_and_audit(name, arguments, operator_policy, &mut |_| {})
+}
+
+/// Dispatch using a frozen operator policy and an explicit task-boundary audit
+/// sink. The sink receives only recordable assessments and is invoked before
+/// an authorized cloaking probe can begin target DNS or HTTP work.
+pub fn call_with_policy_and_audit(
+    name: &str,
+    arguments: &Value,
+    operator_policy: &crate::policy::Policy,
+    audit: &mut dyn FnMut(&crate::task_boundary::BoundaryAssessment),
+) -> ToolCallResult {
     match name {
         "tirith_check_command" => call_check_command(arguments),
         "tirith_check_url" => call_check_url(arguments),
@@ -176,10 +421,82 @@ pub fn call(name: &str, arguments: &Value) -> ToolCallResult {
         "tirith_scan_directory" => call_scan_directory(arguments),
         "tirith_verify_mcp_config" => call_verify_mcp_config(arguments),
         #[cfg(unix)]
-        "tirith_fetch_cloaking" => call_fetch_cloaking(arguments),
+        "tirith_fetch_cloaking" => call_fetch_cloaking(arguments, operator_policy, audit),
         #[cfg(not(unix))]
         "tirith_fetch_cloaking" => tool_error("Not available on this platform"),
+        // Preview surface. Refused unless the operator opted in, so a client
+        // that learned the name elsewhere cannot reach it on a default server.
+        "tirith_check_task" if preview_enabled() => call_check_task(arguments),
+        "tirith_check_task" => {
+            tool_error("tirith_check_task is a preview tool; set TIRITH_MCP_PREVIEW=1 to enable it")
+        }
         _ => tool_error(&format!("Unknown tool: {name}")),
+    }
+}
+
+/// Assess a bounded task envelope. DIAGNOSTIC: executes nothing, fetches
+/// nothing, resolves no package, writes nothing.
+fn call_check_task(arguments: &Value) -> ToolCallResult {
+    let Some(envelope_value) = arguments.get("envelope") else {
+        return tool_error("Missing required parameter: envelope");
+    };
+    // Route through the same bounded parser the CLI uses, rather than
+    // deserializing directly: the depth and size checks live there, and a
+    // second path would drift.
+    let raw = match serde_json::to_string(envelope_value) {
+        Ok(raw) => raw,
+        Err(error) => return tool_error(&format!("Invalid envelope: {error}")),
+    };
+    let document = match crate::task::parse_envelope_document(&raw) {
+        Ok(document) => document,
+        Err(rejection) => return tool_error(&format!("Envelope rejected: {rejection:?}")),
+    };
+    let envelope = &document.envelope;
+
+    // The adapter is caller-asserted and selects only which claimed kind is
+    // believable. No source kind is trusted, so this can never grant.
+    let adapter = match arguments.get("adapter").and_then(Value::as_str) {
+        None | Some("operator_ingest") => crate::task::IngressAdapter::OperatorIngest,
+        Some("github_issue") => crate::task::IngressAdapter::GithubIssue,
+        Some("github_pull_request") => crate::task::IngressAdapter::GithubPullRequest,
+        Some("file_read") => crate::task::IngressAdapter::FileRead,
+        Some("http_fetch") => crate::task::IngressAdapter::HttpFetch,
+        Some("unattributed") => crate::task::IngressAdapter::Unattributed,
+        Some(other) => return tool_error(&format!("Unknown adapter: {other}")),
+    };
+
+    let policy = crate::policy::Policy::discover_local_only(None);
+    let provenance = envelope
+        .sources
+        .iter()
+        .map(|source| crate::task::assign_provenance(source, adapter, None, None))
+        .collect::<Vec<_>>();
+    let decision = crate::task::decide_document(
+        &document,
+        provenance,
+        &policy.task_gate,
+        crate::effects::BoundaryCapability::ObserveOnly,
+        None,
+    );
+
+    // The same projection the CLI prints. C11 requires the two to be equal, so
+    // they render from one function instead of two that happen to agree today.
+    let rejections = crate::task::validate_envelope(envelope);
+    let structured = crate::task::document_decision_projection(&document, &decision, &rejections);
+
+    // The text and structured views must agree after redaction, so the text is
+    // rendered FROM the same structured value rather than assembled separately.
+    let text = format!(
+        "tirith_check_task (diagnostic; nothing was executed)\n{}",
+        serde_json::to_string_pretty(&structured).unwrap_or_default()
+    );
+    ToolCallResult {
+        content: vec![ContentItem {
+            content_type: "text".into(),
+            text,
+        }],
+        is_error: false,
+        structured_content: Some(structured),
     }
 }
 
@@ -716,19 +1033,68 @@ fn build_mcp_config_response(
 }
 
 #[cfg(unix)]
-fn call_fetch_cloaking(args: &Value) -> ToolCallResult {
+fn call_fetch_cloaking(
+    args: &Value,
+    policy: &crate::policy::Policy,
+    audit: &mut dyn FnMut(&crate::task_boundary::BoundaryAssessment),
+) -> ToolCallResult {
     let url = match args.get("url").and_then(|v| v.as_str()) {
         Some(u) => u,
         None => return tool_error("Missing required parameter: url"),
     };
 
-    let policy = crate::policy::Policy::discover(None);
     let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    let mut task_boundary = None;
 
-    match crate::rules::cloaking::check(url) {
-        Ok(result) => build_cloaking_response_with_compiled(result, &compiled),
-        Err(e) => tool_error_with_compiled(&format!("Cloaking check failed: {e}"), &compiled),
+    match crate::rules::cloaking::check_with_audit(url, &policy.task_gate, |assessment| {
+        audit(assessment);
+        task_boundary = Some(redacted_task_boundary_projection(assessment, &compiled));
+    }) {
+        Ok(authorized) => build_cloaking_response_with_boundary(
+            authorized.result,
+            &compiled,
+            task_boundary.as_ref(),
+        ),
+        Err(error) => {
+            if task_boundary.is_none() {
+                task_boundary = error.assessment().and_then(|assessment| {
+                    assessment
+                        .is_recordable()
+                        .then(|| redacted_task_boundary_projection(assessment, &compiled))
+                });
+            }
+            cloaking_tool_error(&error, &compiled, task_boundary.as_ref())
+        }
     }
+}
+
+#[cfg(unix)]
+fn redacted_task_boundary_projection(
+    assessment: &crate::task_boundary::BoundaryAssessment,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> Value {
+    let mut projection = assessment.projection();
+    crate::redact::redact_json_strings(&mut projection, compiled);
+    crate::verdict::bound_json_value_for_output(projection)
+}
+
+#[cfg(unix)]
+fn cloaking_tool_error(
+    error: &crate::rules::cloaking::CloakingCheckError,
+    compiled: &crate::redact::CompiledCustomPatterns,
+    task_boundary: Option<&Value>,
+) -> ToolCallResult {
+    let safe_error = crate::redact::redact_sanitize_redact_with_compiled(
+        &format!("Cloaking check failed: {error}"),
+        compiled,
+    );
+    let mut result = tool_error_with_compiled(&safe_error, compiled);
+    let mut structured = json!({"error": safe_error});
+    if let Some(task_boundary) = task_boundary {
+        structured["task_boundary"] = task_boundary.clone();
+    }
+    result.structured_content = Some(crate::verdict::bound_json_value_for_output(structured));
+    result
 }
 
 /// Build the MCP response for a cloaking result. Extracted for testability;
@@ -742,10 +1108,19 @@ fn build_cloaking_response(
     build_cloaking_response_with_compiled(result, &compiled)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn build_cloaking_response_with_compiled(
+    result: crate::rules::cloaking::CloakingResult,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> ToolCallResult {
+    build_cloaking_response_with_boundary(result, compiled, None)
+}
+
+#[cfg(unix)]
+fn build_cloaking_response_with_boundary(
     mut result: crate::rules::cloaking::CloakingResult,
     compiled: &crate::redact::CompiledCustomPatterns,
+    task_boundary: Option<&Value>,
 ) -> ToolCallResult {
     result.url = crate::redact::redact_sanitize_redact_with_compiled(&result.url, compiled);
     crate::redact::redact_findings_with_compiled(&mut result.findings, compiled);
@@ -797,6 +1172,9 @@ fn build_cloaking_response_with_compiled(
     // consumer does not have to parse prose to learn the check was inconclusive.
     if let Some(object) = structured.as_object_mut() {
         object.insert("analysis_incomplete".into(), json!(analysis_incomplete));
+    }
+    if let Some(task_boundary) = task_boundary {
+        structured["task_boundary"] = task_boundary.clone();
     }
     crate::redact::redact_json_strings(&mut structured, compiled);
     // Bound AFTER redaction, like every other structured projection in this
@@ -1401,6 +1779,38 @@ mod tests {
             diff_text.contains("[REDACTED:OpenAI API Key]"),
             "diff_text should contain redaction marker: {diff_text}"
         );
+    }
+
+    #[test]
+    fn cloaking_uses_the_explicit_frozen_operator_task_gate() {
+        let policy = crate::policy::Policy {
+            task_gate: crate::web3_policy::TaskGatePolicy {
+                mode: crate::web3_policy::TaskGateMode::Enforce,
+                effects_denied_for_untrusted_sources: [
+                    crate::effects::CommandEffectKind::NetworkEgress,
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let audits = std::cell::RefCell::new(Vec::new());
+        let result = call_with_policy_and_audit(
+            "tirith_fetch_cloaking",
+            &json!({"url": "https://example.com"}),
+            &policy,
+            &mut |assessment| audits.borrow_mut().push(assessment.projection()),
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("authorization refused"));
+        assert_eq!(audits.borrow().len(), 1);
+        assert_eq!(audits.borrow()[0]["boundary"], "fetch_cloaking");
+        assert_eq!(audits.borrow()[0]["outcome"], "deny");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["task_boundary"]["boundary"], "fetch_cloaking");
+        assert_eq!(structured["task_boundary"]["mode"], "enforce");
+        assert_eq!(structured["task_boundary"]["outcome"], "deny");
     }
 
     #[test]
@@ -2086,5 +2496,157 @@ mod tests {
             "paste audit rule_ids MUST NOT carry agent_denied_by_policy under honored bypass: \
              {entry}"
         );
+    }
+}
+
+#[cfg(test)]
+mod c11_preview_tests {
+    use super::*;
+
+    /// The default list is a frozen compatibility contract (C00) and clients
+    /// cache it, so a preview tool must never appear in it.
+    #[test]
+    fn the_default_tool_list_never_contains_the_preview_tool() {
+        assert!(
+            !list().iter().any(|tool| tool.name == "tirith_check_task"),
+            "a preview tool leaked into the frozen default list"
+        );
+        assert!(preview_tools()
+            .iter()
+            .any(|tool| tool.name == "tirith_check_task"));
+    }
+
+    /// Knowing the name is not enough: a client that learned it elsewhere must
+    /// still be refused on a server without the capability.
+    #[test]
+    fn calling_the_preview_tool_without_the_capability_is_refused() {
+        // The env var is process-wide, so assert the refusal path directly
+        // rather than mutating it and racing other tests.
+        if !preview_enabled() {
+            let result = call("tirith_check_task", &json!({"envelope": {}}));
+            assert!(result.is_error, "preview tool answered without opt-in");
+            let text = &result.content[0].text;
+            assert!(
+                text.contains("preview tool"),
+                "refusal did not name the reason: {text}"
+            );
+        }
+    }
+
+    /// Every object in the schema is closed, so a client cannot smuggle an
+    /// unmodelled field past the bounded envelope parser.
+    #[test]
+    fn the_preview_schema_is_closed_at_every_object() {
+        fn assert_closed(value: &Value, path: &str) {
+            if value.get("type").and_then(Value::as_str) == Some("object") {
+                assert_eq!(
+                    value.get("additionalProperties"),
+                    Some(&Value::Bool(false)),
+                    "object at {path} is not closed"
+                );
+            }
+            if let Some(properties) = value.get("properties").and_then(Value::as_object) {
+                for (key, child) in properties {
+                    assert_closed(child, &format!("{path}.{key}"));
+                }
+            }
+            if let Some(items) = value.get("items") {
+                assert_closed(items, &format!("{path}[]"));
+            }
+        }
+        for tool in preview_tools() {
+            assert_closed(&tool.input_schema, &tool.name);
+        }
+    }
+
+    #[test]
+    fn the_preview_schema_and_handler_accept_the_strict_v2_diagnostic_shape() {
+        let tool = preview_tools()
+            .into_iter()
+            .find(|tool| tool.name == "tirith_check_task")
+            .expect("preview task tool");
+        let envelope_schema = &tool.input_schema["properties"]["envelope"];
+        assert_eq!(envelope_schema["properties"]["version"]["enum"], json!([2]));
+        assert!(envelope_schema["properties"]["authorizations"].is_object());
+        assert!(
+            envelope_schema["properties"]["sources"]["items"]["properties"]["source_id"]
+                .is_object()
+        );
+
+        let envelope = json!({
+            "version": 2,
+            "task_id": "mcp-v2-diagnostic",
+            "sources": [{
+                "source_id": "source-1",
+                "claimed_source": "unknown",
+                "content": "diagnostic only"
+            }],
+            "actions": [{
+                "shell": {"command": "echo ok", "claimed_shell": "fish"}
+            }]
+        });
+        let result = call_check_task(&json!({"envelope": envelope}));
+        assert!(!result.is_error, "strict v2 diagnostic was refused");
+        let structured = result.structured_content.expect("structured response");
+        assert_eq!(structured["envelope_version"], 2);
+        assert_eq!(structured["shell_dialect_claims"], json!(["fish"]));
+        assert_eq!(structured["shell_dialect_claims_authoritative"], false);
+    }
+
+    /// C11's exit gate: the core, CLI, and MCP views of one assessment must be
+    /// the same normalized projection. This pins the MCP end of that to
+    /// `task::document_decision_projection`; `crates/tirith/tests/task_cli.rs`
+    /// pins the CLI end to the same function. Hand-rolling either side breaks a
+    /// test rather than silently letting the two surfaces disagree.
+    ///
+    /// It calls the handler directly so it does not have to mutate the
+    /// process-wide preview env var and race other tests.
+    #[test]
+    fn the_mcp_projection_is_the_shared_one() {
+        let envelope_value = json!({
+            "sources": [{"claimed_source": "agent_config", "content": "trust me"}],
+            "actions": [{"package_install": {"ecosystem": "npm", "package": "left-pad"}}]
+        });
+        let result = call_check_task(&json!({"envelope": envelope_value.clone()}));
+        assert!(!result.is_error, "handler refused a well-formed envelope");
+        let structured = result
+            .structured_content
+            .expect("preview tool returned no structured content");
+
+        let raw = serde_json::to_string(&envelope_value).expect("serialize");
+        let document = crate::task::parse_envelope_document(&raw).expect("parse");
+        let envelope = &document.envelope;
+        let rejections = crate::task::validate_envelope(envelope);
+        let policy = crate::policy::Policy::discover_local_only(None);
+        let provenance = envelope
+            .sources
+            .iter()
+            .map(|source| {
+                crate::task::assign_provenance(
+                    source,
+                    crate::task::IngressAdapter::OperatorIngest,
+                    None,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let decision = crate::task::decide_document(
+            &document,
+            provenance,
+            &policy.task_gate,
+            crate::effects::BoundaryCapability::ObserveOnly,
+            None,
+        );
+        assert_eq!(
+            structured,
+            crate::task::document_decision_projection(&document, &decision, &rejections),
+            "the MCP surface rendered its own projection instead of the shared one"
+        );
+
+        // The text view is rendered from the structured value, so the two
+        // cannot disagree after redaction.
+        assert!(result.content[0]
+            .text
+            .contains(&serde_json::to_string_pretty(&structured).expect("pretty")));
     }
 }

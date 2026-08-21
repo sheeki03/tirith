@@ -642,36 +642,18 @@ pub(crate) fn policy_init_for_root(
 
     let yaml_body = render_agent_policy_scaffold_yaml(&scaffold);
 
-    // Bind the destination beneath the repo root through retained directory
-    // capabilities: `prepare` creates `.tirith` when missing WITHOUT following
-    // attacker-controlled symlinks and rejects any symlinked repo-controlled
-    // component (a symlinked `.tirith` escaping the repo, or a symlinked final
-    // component), closing the check/use gap the friendly pre-check above
-    // cannot.
-    let contained =
-        match tirith_core::util::ContainedAtomicFile::prepare(repo_root, &example_path, true) {
-            Ok(c) => c,
-            Err(e) => {
-                report_error(
-                    json,
-                    "tirith agent policy init",
-                    &format!(
-                        "refusing to write {} through a symlinked or escaping path: {e}",
-                        super::sanitize_for_human_output(
-                            &example_path.display().to_string(),
-                            false
-                        )
-                    ),
-                );
-                return 1;
-            }
-        };
-
-    // Atomic same-directory publish that never follows a final-component
-    // symlink; `overwrite = force` preserves no-clobber unless --force, and a
-    // file planted after the pre-check surfaces as AlreadyExists rather than
-    // being silently clobbered.
-    if let Err(e) = contained.write_atomic(yaml_body.as_bytes(), force) {
+    // Decide before parent creation, then retain one filesystem capability
+    // through exact-operation authorization and atomic publication.
+    let policy = policy::Policy::discover_local_only(repo_root.to_str());
+    if let Err(e) = super::write_config_file_permitted_with_parent_creation(
+        repo_root,
+        &example_path,
+        yaml_body.as_bytes(),
+        force,
+        &policy,
+        false,
+        true,
+    ) {
         let message = if e.kind() == std::io::ErrorKind::AlreadyExists {
             format!(
                 "{} already exists (use --force to overwrite)",

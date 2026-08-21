@@ -130,6 +130,11 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::CredentialFileSweep
         | RuleId::Base64DecodeExecute
         | RuleId::DataExfiltration
+        // C10 — Web3 boundary rules are grammar/policy conclusions, not
+        // threat-DB indicator hits.
+        | RuleId::Web3StateChangingCommand
+        | RuleId::Web3SignerRisk
+        | RuleId::Web3NetworkPolicyViolation
         // PR3 — LOTL command-shape heuristics, not threat-DB hits.
         | RuleId::ReverseShell
         | RuleId::InterpreterSuspiciousInlineExec

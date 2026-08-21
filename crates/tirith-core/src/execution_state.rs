@@ -2,8 +2,10 @@
 //!
 //! This module deliberately separates a policy decision prepared before launch
 //! from evidence observed at a real execution boundary. Raw command text is
-//! retained only in memory; durable records carry its SHA-256 digest and a
-//! redacted, bounded preview.
+//! retained only in memory; durable ledgers carry a SHA-256 digest of its
+//! mandatory privacy projection and a redacted, bounded preview. Shell receipts
+//! additionally use a token-keyed exact-command binding whose key is never
+//! persisted, preserving exact authorization without an offline secret oracle.
 
 use std::fmt;
 use std::fs::File;
@@ -37,7 +39,8 @@ pub use shell_receipt::{
     ShellHookFamily, ShellReceiptChannel, ShellReceiptContext,
 };
 
-pub const EXECUTION_LEDGER_SCHEMA_VERSION: u32 = 2;
+pub const EXECUTION_LEDGER_SCHEMA_VERSION: u32 = 3;
+const LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION: u32 = 2;
 pub const MAX_CONFIRMED_EXECUTIONS: usize = 200;
 pub const MAX_UNRESOLVED_EXECUTIONS: usize = 200;
 const MAX_WARNING_EVENTS_PER_EXECUTION: usize = 128;
@@ -45,13 +48,121 @@ const MAX_ESCALATION_EVENTS_PER_EXECUTION: usize = 64;
 pub const DEFAULT_DRAFT_TTL: Duration = Duration::from_secs(30);
 pub const DEFAULT_GATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+// The frame format is unchanged from ledger schema v2. Keep the magic stable so
+// privacy-unsafe v2 payloads remain readable for explicit retirement instead of
+// being misclassified as corruption and left on disk.
 const STRICT_STATE_MAGIC: &[u8; 8] = b"TIRXST02";
 const STRICT_STATE_HEADER_LEN: u64 = 8 + 8 + 32;
 const STRICT_STATE_SLOT_SIZE: u64 = 4 * 1024 * 1024;
 const STRICT_STATE_FILE_SIZE: u64 = STRICT_STATE_SLOT_SIZE * 2;
 const STRICT_STATE_PAYLOAD_CAP: usize = (STRICT_STATE_SLOT_SIZE - STRICT_STATE_HEADER_LEN) as usize;
-const STRICT_ANCHOR_PREFIX: &str = "TIRITH-EXECUTION-ANCHOR-V1 ";
-const STRICT_ANCHOR_CAP: u64 = 256;
+const STRICT_ANCHOR_PREFIX: &str = "TIRITH-EXECUTION-ANCHOR-V2 ";
+const STRICT_RETIRED_ANCHOR_PREFIX: &str = "TIRITH-EXECUTION-RETIRED-V2 ";
+const LEGACY_LOCK_ANCHOR_PREFIX: &str = "TIRITH-EXECUTION-ANCHOR-V1 ";
+const LEGACY_LOCK_RETIRED_PREFIX: &str = "TIRITH-EXECUTION-RETIRED-V1 ";
+const STRICT_ANCHOR_CAP: u64 = 1024;
+
+fn privacy_projected_command_sha256(command: &str) -> String {
+    // No policy-controlled pattern participates in the identity: the mandatory
+    // durable projection is deterministic on every host and never embeds a raw
+    // supported secret, secret prefix, or secret-derived digest. Free-form
+    // command identity is deliberately more conservative than interactive
+    // detection: a bare valid secp256k1 scalar is private-key material even when
+    // the signer flag/name is unknown. Benign assignments and emails remain
+    // identity-bearing.
+    let projected = crate::redact::privacy_project_durable_text(command);
+    sha256_hex(projected.as_bytes())
+}
+
+fn privacy_project_domain(domain: &str) -> String {
+    let redacted = crate::redact::privacy_project_durable_text(domain);
+    let endpoint = format!("https://{redacted}");
+    crate::sensitive_assets::canonicalize_rpc_for_display(&endpoint)
+        .and_then(|origin| origin.strip_prefix("https://").map(str::to_string))
+        .unwrap_or(redacted)
+}
+
+fn privacy_project_event_prototypes(events: &mut [EventPrototype]) {
+    for event in events {
+        event.rule_id = crate::redact::privacy_project_durable_text(&event.rule_id);
+        let mut metadata = std::collections::BTreeMap::new();
+        for (key, value) in std::mem::take(&mut event.metadata) {
+            let (projected_key, projected_value) =
+                crate::redact::privacy_project_durable_pair(&key, &value);
+            let projected_value = if matches!(projected_key.as_str(), "domain" | "host") {
+                privacy_project_domain(&value)
+            } else {
+                projected_value
+            };
+            metadata.insert(projected_key, projected_value);
+        }
+        event.metadata = metadata;
+    }
+}
+
+fn privacy_project_escalation_hits(hits: &mut [crate::escalation::EscalationHit]) {
+    for hit in hits {
+        hit.rule_id = crate::redact::privacy_project_durable_text(&hit.rule_id);
+        if let Some(domain) = &mut hit.domain {
+            *domain = privacy_project_domain(domain);
+        }
+    }
+}
+
+fn privacy_project_agent_origin(
+    mut origin: Option<crate::agent_origin::AgentOrigin>,
+) -> Option<crate::agent_origin::AgentOrigin> {
+    use crate::agent_origin::AgentOrigin;
+
+    let project = |value: &mut String| {
+        *value = crate::redact::privacy_project_durable_text(value);
+    };
+    if let Some(origin) = &mut origin {
+        match origin {
+            AgentOrigin::Agent { tool, version } => {
+                project(tool);
+                if let Some(version) = version {
+                    project(version);
+                }
+            }
+            AgentOrigin::Mcp {
+                client_name,
+                client_version,
+            } => {
+                project(client_name);
+                if let Some(version) = client_version {
+                    project(version);
+                }
+            }
+            AgentOrigin::Ci { provider } => {
+                if let Some(provider) = provider {
+                    project(provider);
+                }
+            }
+            AgentOrigin::Ide { name } => project(name),
+            AgentOrigin::Human { .. } | AgentOrigin::Gateway => {}
+        }
+    }
+    origin
+}
+
+pub(super) fn privacy_projected_verdict_sha256(
+    verdict: &Verdict,
+    include_timings: bool,
+) -> Result<String, String> {
+    let safe_verdict = crate::redact::mandatory_redacted_verdict(verdict);
+    let mut value = serde_json::to_value(&safe_verdict)
+        .map_err(|error| format!("serialize durable verdict identity: {error}"))?;
+    if !include_timings {
+        value
+            .as_object_mut()
+            .ok_or_else(|| "serialized durable verdict identity is not an object".to_string())?
+            .remove("timings_ms");
+    }
+    let canonical = crate::audit::canonical_json_for_hash(&value);
+    let projected = crate::redact::privacy_project_durable_text(&canonical);
+    Ok(sha256_hex(projected.as_bytes()))
+}
 
 /// Quality of the evidence presented when an execution transition is promoted.
 ///
@@ -203,18 +314,16 @@ struct WarningPrototype {
 
 impl PreparedDecision {
     pub(crate) fn from_frozen_basis(verdict: &Verdict, policy: &Policy) -> Result<Self, String> {
-        let verdict_basis = serde_json::to_vec(verdict)
-            .map_err(|error| format!("serialize frozen verdict basis: {error}"))?;
         Ok(Self {
             action: verdict.action,
             requires_approval: verdict.requires_approval == Some(true),
             requires_warn_ack: verdict.action == Action::WarnAck
                 || (verdict.action == Action::Warn && policy.strict_warn),
-            // Bind the exact decision/correlation policy. Only this digest is
-            // durable; rule values, labels, paths, and credentials remain in
-            // memory and cannot collapse to the same count/key projection.
+            // Bind the mandatory non-secret posture projection. The frozen
+            // verdict separately binds every command-specific policy effect;
+            // raw rule text and credentials never become durable verifiers.
             policy_basis_sha256: policy.execution_identity_hash()?,
-            verdict_basis_sha256: sha256_hex(&verdict_basis),
+            verdict_basis_sha256: privacy_projected_verdict_sha256(verdict, true)?,
         })
     }
 
@@ -433,17 +542,17 @@ impl ExecutionLedgerRecord {
 /// executed history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionLedger {
-    #[serde(default = "execution_ledger_schema_version")]
     pub schema_version: u32,
     pub session_id: String,
-    /// Random identity bound into the stable session lock file. If the strict
-    /// file disappears while that anchor remains, Tirith refuses to recreate it
-    /// from mutable presentation JSON.
+    /// Random identity bound into the durable session anchor sidecar. If the
+    /// strict file disappears while that anchor remains, Tirith refuses to
+    /// recreate it from mutable presentation JSON.
     pub instance_id: String,
-    /// SHA-256 of the exact legacy JSON bytes imported at initialization.
+    /// SHA-256 of the mandatory privacy projection imported from legacy JSON.
     /// `None` means the legacy file was absent and the strict history began
-    /// empty. The mutable JSON is never consulted again.
-    legacy_source_sha256: Option<String>,
+    /// empty. Raw legacy bytes and raw-secret-derived digests never enter the
+    /// strict ledger.
+    legacy_projection_sha256: Option<String>,
     legacy_imported_unix_ms: u64,
     #[serde(default)]
     pub generation: u64,
@@ -468,7 +577,7 @@ impl ExecutionLedger {
     fn new(
         session_id: &str,
         legacy: Option<&crate::session_warnings::SessionWarnings>,
-        legacy_source_sha256: Option<String>,
+        legacy_projection_sha256: Option<String>,
     ) -> Result<Self, String> {
         let mut legacy_warning_events = legacy
             .map(|session| session.events.clone())
@@ -494,7 +603,7 @@ impl ExecutionLedger {
             schema_version: EXECUTION_LEDGER_SCHEMA_VERSION,
             session_id: session_id.to_string(),
             instance_id: format!("ledger-{}", uuid::Uuid::new_v4().simple()),
-            legacy_source_sha256,
+            legacy_projection_sha256,
             legacy_imported_unix_ms: unix_time_ms()?,
             generation: 0,
             next_sequence: 1,
@@ -507,10 +616,6 @@ impl ExecutionLedger {
             unresolved: std::collections::VecDeque::new(),
         })
     }
-}
-
-fn execution_ledger_schema_version() -> u32 {
-    EXECUTION_LEDGER_SCHEMA_VERSION
 }
 
 fn first_ledger_sequence() -> u64 {
@@ -531,7 +636,7 @@ fn derive_warning_prototypes(verdict: &Verdict) -> Result<Vec<WarningPrototype>,
     {
         let mut domains = crate::session_warnings::extract_domains_from_evidence(&finding.evidence)
             .into_iter()
-            .map(|domain| domain.to_lowercase())
+            .map(|domain| privacy_project_domain(&domain).to_lowercase())
             .collect::<Vec<_>>();
         domains.sort();
         domains.dedup();
@@ -541,7 +646,10 @@ fn derive_warning_prototypes(verdict: &Verdict) -> Result<Vec<WarningPrototype>,
         prototypes.push(WarningPrototype {
             rule_id: finding.rule_id.to_string(),
             severity: finding.severity.to_string(),
-            title: crate::util::truncate_bytes(&finding.title, 120),
+            title: crate::util::truncate_bytes(
+                &crate::redact::privacy_project_durable_text(&finding.title),
+                120,
+            ),
             domains,
         });
     }
@@ -633,8 +741,8 @@ impl ExecutionDraft {
         policy: &Policy,
         caller: CallerContext,
         shell: ShellType,
-        provisional_events: Vec<EventPrototype>,
-        escalation_hits: Vec<crate::escalation::EscalationHit>,
+        mut provisional_events: Vec<EventPrototype>,
+        mut escalation_hits: Vec<crate::escalation::EscalationHit>,
         ttl: Duration,
     ) -> Result<Self, String> {
         if crate::session_warnings::session_state_path(session_id).is_none() {
@@ -654,21 +762,36 @@ impl ExecutionDraft {
                 "execution decision contains too many strict escalation events".to_string(),
             );
         }
+        privacy_project_event_prototypes(&mut provisional_events);
+        privacy_project_escalation_hits(&mut escalation_hits);
         let warning_prototypes = derive_warning_prototypes(effective_verdict)?;
+        // `origin` is duplicated outside the verdict inside draft/receipt
+        // identities. Store the same mandatory projection used by public
+        // Verdict serialization so an attacker-controlled origin label cannot
+        // become a durable secret-derived hash oracle.
+        let origin = privacy_project_agent_origin(
+            crate::redact::mandatory_redacted_verdict(effective_verdict).agent_origin,
+        );
         let retention_until_unix_ms = now.saturating_add(policy_history_retention_ms(policy));
         let mut draft = Self {
             execution_id: uuid::Uuid::new_v4().simple().to_string(),
             draft_identity_sha256: String::new(),
             session_id: session_id.to_string(),
-            command_sha256: sha256_hex(command.as_bytes()),
-            command_redacted_preview: crate::util::truncate_bytes(&command_redacted_preview, 120),
+            // Compatibility field name retained, but the digest is over the
+            // mandatory privacy projection. Different raw secrets in the same
+            // command shape therefore cannot be tested as a durable hash oracle.
+            command_sha256: privacy_projected_command_sha256(command),
+            command_redacted_preview: crate::util::truncate_bytes(
+                &crate::redact::privacy_project_durable_text(&command_redacted_preview),
+                120,
+            ),
             command: command.to_string(),
             created_unix_ms: now,
             expires_unix_ms,
             expected_generation,
             caller,
             shell,
-            origin: effective_verdict.agent_origin.clone(),
+            origin,
             bypass,
             decision,
             interaction,
@@ -986,15 +1109,7 @@ impl PreparedExecution {
 /// but every field that can alter the warning presented to the user remains in
 /// this identity.
 fn interaction_verdict_sha256(verdict: &Verdict) -> Result<String, String> {
-    let mut value = serde_json::to_value(verdict)
-        .map_err(|error| format!("serialize runner interaction verdict: {error}"))?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| "serialized runner interaction verdict is not an object".to_string())?;
-    object.remove("timings_ms");
-    Ok(sha256_hex(
-        crate::audit::canonical_json_for_hash(&value).as_bytes(),
-    ))
+    privacy_projected_verdict_sha256(verdict, false)
 }
 
 /// Prepare a proof-carrying execution decision from a strict, single-generation
@@ -1048,23 +1163,63 @@ pub fn prepare_execution(
             open_and_lock_secure(&lock_path, deadline).map_err(|error| error.to_string())?;
         let lock_identity = secure_regular_identity(&lock_file, "execution lock")?;
         let strict_candidate = strict_state_path(parent, session_id);
+        if retire_legacy_unsafe_strict_state_if_needed(
+            &lock_file,
+            &lock_path,
+            &strict_candidate,
+            session_id,
+        )? == LegacyStrictStateRetirement::Retired
+        {
+            return Err(legacy_strict_state_retired_error());
+        }
         let strict_missing = match fs::symlink_metadata(&strict_candidate) {
             Ok(_) => false,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
             Err(error) => return Err(format!("inspect strict execution state: {error}")),
         };
-        let existing_anchor = read_strict_anchor(&lock_file)?;
-        if strict_missing && existing_anchor.is_some() {
-            return Err(
-                "strict execution state is missing while its stable deletion anchor remains"
-                    .to_string(),
-            );
+        let existing_anchor = read_strict_anchor(&lock_path)?;
+        let legacy_lock_marker = read_legacy_lock_marker(&lock_file)?;
+        if strict_missing {
+            match (&existing_anchor, &legacy_lock_marker) {
+                (Some(StrictAnchor::PrivacyRetired { .. }), _)
+                | (_, Some(LegacyLockMarker::PrivacyRetired)) => {
+                    return Err(legacy_strict_state_retired_error())
+                }
+                (Some(StrictAnchor::Active { .. }), _)
+                | (_, Some(LegacyLockMarker::Active(_))) => return Err(
+                    "strict execution state is missing while its stable deletion anchor remains"
+                        .to_string(),
+                ),
+                (None, None) => {}
+            }
         }
-        let (legacy_session, legacy_identity, legacy_source_sha256) = if strict_missing {
-            let (mut session, identity, source_sha256) =
-                read_strict_session(&state_path, session_id)?;
+        let (legacy_session, legacy_identity, legacy_projection_sha256) = if strict_missing {
+            let (mut session, identity) = read_strict_session(&state_path, session_id)?;
             validate_session_state(&mut session, session_id)?;
-            (Some(session), identity, source_sha256)
+            let projection = serde_json::to_vec(&session)
+                .map_err(|error| format!("serialize projected legacy session: {error}"))?;
+            let (projected_identity, projection_sha256) = if identity.is_some() {
+                verify_optional_path_identity(
+                    &state_path,
+                    identity,
+                    "legacy execution session state before privacy projection",
+                )?;
+                crate::util::write_file_atomic_0600(&state_path, &projection)
+                    .map_err(|error| format!("persist projected legacy session: {error}"))?;
+                crate::util::fsync_parent_dir(&state_path).map_err(|error| {
+                    format!("durably publish projected legacy session: {error}")
+                })?;
+                (
+                    Some(path_identity(
+                        &state_path,
+                        "projected legacy execution session state",
+                    )?),
+                    Some(sha256_hex(&projection)),
+                )
+            } else {
+                (None, None)
+            };
+            (Some(session), projected_identity, projection_sha256)
         } else {
             (None, None, None)
         };
@@ -1073,10 +1228,10 @@ pub fn prepare_execution(
                 parent,
                 session_id,
                 legacy_session.as_ref(),
-                legacy_source_sha256.as_deref(),
+                legacy_projection_sha256.as_deref(),
             )?;
         validate_execution_ledger(&ledger, session_id)?;
-        bind_strict_anchor(&lock_file, &lock_path, &ledger.instance_id)?;
+        bind_strict_anchor(&lock_file, &lock_path, &ledger)?;
         let (effective, provisional_events, escalation_hits) =
             evaluate_against_session(raw_verdict, policy, command, caller, shell, &ledger)?;
         let redacted = crate::redact::redact_command_text(command, &policy.dlp_custom_patterns);
@@ -1204,6 +1359,40 @@ pub struct GatewayExecutionPermit {
     deferred: DeferredExecution,
 }
 
+/// Retryable ownership of a gateway forward that is proven to have written zero
+/// upstream bytes but whose provisional strict-history record has not yet been
+/// durably erased. The continuation is intentionally non-cloneable; callers must
+/// retain and retry it until [`Self::retry`] succeeds.
+#[must_use = "known-zero rollback ownership must be retried until durable cleanup succeeds"]
+pub struct GatewayKnownZeroRollback {
+    deferred: Option<DeferredExecution>,
+}
+
+impl fmt::Debug for GatewayKnownZeroRollback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayKnownZeroRollback")
+            .field("pending", &self.deferred.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GatewayKnownZeroRollback {
+    /// Retry durable cleanup without surrendering ownership on failure.
+    pub fn retry(&mut self, lock_timeout: Duration) -> Result<(), String> {
+        let Some(deferred) = self.deferred.as_ref() else {
+            return Ok(());
+        };
+        deferred.abort_gateway_known_zero(lock_timeout)?;
+        self.deferred = None;
+        Ok(())
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.deferred.is_none()
+    }
+}
+
 impl fmt::Debug for GatewayExecutionPermit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1261,6 +1450,24 @@ impl GatewayExecutionPermit {
             .promote_gateway_completed(format!("gateway-result-{response_identity}"), lock_timeout)
     }
 
+    /// Remove an unresolved gateway-forward record after the caller proves no
+    /// upstream write was attempted. This is the only rollback transition for
+    /// a pre-write preparation; transport errors must never call it because a
+    /// partial write is commit-unknown and must remain conservative history.
+    pub fn abort_known_zero(self, lock_timeout: Duration) -> Result<(), String> {
+        let mut rollback = self.into_known_zero_rollback();
+        rollback.retry(lock_timeout)
+    }
+
+    /// Convert this permit into retryable known-zero cleanup ownership. Gateway
+    /// transport code uses this form so a transient strict-state failure never
+    /// drops the only capability that can erase the false unresolved record.
+    pub fn into_known_zero_rollback(self) -> GatewayKnownZeroRollback {
+        GatewayKnownZeroRollback {
+            deferred: Some(self.deferred),
+        }
+    }
+
     pub fn completion_window_open(&self) -> bool {
         Instant::now() < self.deferred.upgrade_deadline
     }
@@ -1310,7 +1517,8 @@ fn validate_gateway_success_response(
         return Err("gateway completion response is not an unambiguous success result".to_string());
     }
     let canonical = crate::audit::canonical_json_for_hash(&parsed);
-    Ok(sha256_hex(canonical.as_bytes()))
+    let projected = crate::redact::privacy_project_durable_text(&canonical);
+    Ok(sha256_hex(projected.as_bytes()))
 }
 
 /// Opaque continuation retained only after an unresolved observation was
@@ -1326,6 +1534,106 @@ pub(crate) struct DeferredExecution {
 }
 
 impl DeferredExecution {
+    fn abort_gateway_known_zero(&self, timeout: Duration) -> Result<(), String> {
+        #[cfg(not(unix))]
+        {
+            let _ = (self, timeout);
+            return Err("gateway known-zero rollback is unsupported on this platform".to_string());
+        }
+
+        #[cfg(unix)]
+        {
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| "gateway known-zero rollback deadline overflowed".to_string())?;
+            let state_path =
+                crate::session_warnings::session_state_path(self.draft.session_id())
+                    .ok_or_else(|| "gateway rollback has an invalid session id".to_string())?;
+            let lock_path = crate::session_warnings::session_lock_path(self.draft.session_id())
+                .ok_or_else(|| "gateway rollback has no stable lock path".to_string())?;
+            let parent = state_path
+                .parent()
+                .ok_or_else(|| "gateway rollback session path has no parent".to_string())?;
+            ensure_secure_session_directory(parent)?;
+            let lock_file =
+                open_and_lock_secure(&lock_path, deadline).map_err(|error| error.to_string())?;
+            let lock_identity = secure_regular_identity(&lock_file, "execution rollback lock")?;
+            let strict_candidate = strict_state_path(parent, self.draft.session_id());
+            if retire_legacy_unsafe_strict_state_if_needed(
+                &lock_file,
+                &lock_path,
+                &strict_candidate,
+                self.draft.session_id(),
+            )? == LegacyStrictStateRetirement::Retired
+            {
+                return Err(legacy_strict_state_retired_error());
+            }
+            let (mut strict_file, mut ledger, active_slot, strict_path, strict_identity) =
+                open_or_initialize_strict_state(parent, self.draft.session_id(), None, None)?;
+            validate_execution_ledger(&ledger, self.draft.session_id())?;
+            require_strict_anchor(&lock_file, &lock_path, &ledger)?;
+            let index = ledger
+                .unresolved
+                .iter()
+                .position(|record| {
+                    record.execution_id == self.draft.execution_id()
+                        && record.identity_matches(&self.draft)
+                        && record.evidence_id == self.unresolved_evidence_id
+                        && record.evidence_grade
+                            == ExecutionEvidenceGrade::GatewayForwardedUnresolved
+                        && record.generation == self.unresolved_generation
+                        && record.evidence_history.len() == 1
+                })
+                .or_else(|| {
+                    // A previous attempt may have published the removal but lost
+                    // the acknowledgement while syncing or reopening the strict
+                    // state. Treat an advanced ledger with no record for this
+                    // execution as idempotent success; a conflicting confirmed or
+                    // unresolved record remains a hard invariant failure.
+                    let conflicting = ledger
+                        .confirmed
+                        .iter()
+                        .chain(ledger.unresolved.iter())
+                        .any(|record| record.execution_id == self.draft.execution_id());
+                    if !conflicting && ledger.generation > self.unresolved_generation {
+                        Some(usize::MAX)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    "gateway known-zero rollback lost its exact unresolved record".to_string()
+                })?;
+            if index == usize::MAX {
+                fs2::FileExt::unlock(&lock_file)
+                    .map_err(|error| format!("unlock idempotent gateway rollback: {error}"))?;
+                return Ok(());
+            }
+            ledger.unresolved.remove(index).ok_or_else(|| {
+                "gateway known-zero rollback record disappeared while locked".to_string()
+            })?;
+            let _ = advance_ledger(&mut ledger)?;
+            validate_execution_ledger(&ledger, self.draft.session_id())?;
+            if path_identity(&lock_path, "execution rollback lock")? != lock_identity {
+                return Err("execution rollback lock changed while held".to_string());
+            }
+            write_strict_state(
+                &lock_file,
+                &lock_path,
+                &mut strict_file,
+                &strict_path,
+                strict_identity,
+                active_slot,
+                &ledger,
+                PublishFailureInjection::default(),
+            )
+            .map_err(|error| error.to_string())?;
+            fs2::FileExt::unlock(&lock_file)
+                .map_err(|error| format!("unlock gateway known-zero rollback: {error}"))?;
+            Ok(())
+        }
+    }
+
     pub(crate) fn promote_gateway_completed(
         &mut self,
         evidence_id: impl Into<String>,
@@ -1410,12 +1718,26 @@ impl DeferredExecution {
                 })?;
             let lock_identity = secure_regular_identity(&lock_file, "execution lock")
                 .map_err(GatewayCompletionError::Rejected)?;
+            let strict_candidate = strict_state_path(parent, self.draft.session_id());
+            if retire_legacy_unsafe_strict_state_if_needed(
+                &lock_file,
+                &lock_path,
+                &strict_candidate,
+                self.draft.session_id(),
+            )
+            .map_err(GatewayCompletionError::Rejected)?
+                == LegacyStrictStateRetirement::Retired
+            {
+                return Err(GatewayCompletionError::Rejected(
+                    legacy_strict_state_retired_error(),
+                ));
+            }
             let (mut strict_file, mut ledger, active_slot, strict_path, strict_identity) =
                 open_or_initialize_strict_state(parent, self.draft.session_id(), None, None)
                     .map_err(GatewayCompletionError::Rejected)?;
             validate_execution_ledger(&ledger, self.draft.session_id())
                 .map_err(GatewayCompletionError::Rejected)?;
-            require_strict_anchor(&lock_file, &ledger.instance_id)
+            require_strict_anchor(&lock_file, &lock_path, &ledger)
                 .map_err(GatewayCompletionError::Rejected)?;
             let existing = ledger
                 .unresolved
@@ -1475,6 +1797,8 @@ impl DeferredExecution {
             }
             if !matches!(outcome, PromotionOutcome::Idempotent { .. }) {
                 let publication = write_strict_state(
+                    &lock_file,
+                    &lock_path,
                     &mut strict_file,
                     &strict_path,
                     strict_identity,
@@ -1621,10 +1945,20 @@ impl ExecutionGate {
             let lock_file = open_and_lock_secure(&lock_path, lock_deadline)
                 .map_err(|error| error.to_string())?;
             let lock_identity = secure_regular_identity(&lock_file, "execution lock")?;
+            let strict_candidate = strict_state_path(parent, draft.session_id());
+            if retire_legacy_unsafe_strict_state_if_needed(
+                &lock_file,
+                &lock_path,
+                &strict_candidate,
+                draft.session_id(),
+            )? == LegacyStrictStateRetirement::Retired
+            {
+                return Err(legacy_strict_state_retired_error());
+            }
             let (strict_file, ledger, active_slot, strict_path, strict_identity) =
                 open_or_initialize_strict_state(parent, draft.session_id(), None, None)?;
             validate_execution_ledger(&ledger, draft.session_id())?;
-            require_strict_anchor(&lock_file, &ledger.instance_id)?;
+            require_strict_anchor(&lock_file, &lock_path, &ledger)?;
             if ledger.generation != draft.expected_generation() {
                 return Err(format!(
                     "execution decision is stale: prepared generation {} but current generation is {}",
@@ -1791,7 +2125,7 @@ impl ExecutionGate {
             if path_identity(&self.lock_path, "execution lock")? != self.lock_identity {
                 return Err("execution lock path changed before promotion".to_string());
             }
-            require_strict_anchor(&self.lock_file, &self.ledger.instance_id)?;
+            require_strict_anchor(&self.lock_file, &self.lock_path, &self.ledger)?;
             recheck_under_lock(&self.ledger, &self.draft)?;
 
             let outcome = promote_record(&mut self.ledger, &self.draft, &evidence)?;
@@ -1799,6 +2133,8 @@ impl ExecutionGate {
                 return Ok(outcome);
             }
             self.active_slot = write_strict_state(
+                &self.lock_file,
+                &self.lock_path,
                 &mut self.strict_file,
                 &self.strict_path,
                 self.strict_identity,
@@ -1847,7 +2183,7 @@ fn validate_draft(draft: &ExecutionDraft) -> Result<(), String> {
     if now > draft.expires_unix_ms() {
         return Err("execution decision expired before gate acquisition".to_string());
     }
-    if sha256_hex(draft.command().as_bytes()) != draft.command_sha256() {
+    if privacy_projected_command_sha256(draft.command()) != draft.command_sha256() {
         return Err("execution draft command identity changed".to_string());
     }
     let frozen =
@@ -1868,10 +2204,9 @@ fn compute_draft_identity(draft: &ExecutionDraft) -> Result<String, String> {
         CallerContext::McpServer => "mcp_server",
         CallerContext::Daemon => "daemon",
     };
-    let raw_verdict = serde_json::to_vec(&draft.raw_verdict)
-        .map_err(|error| format!("serialize raw execution verdict identity: {error}"))?;
+    let raw_verdict_sha256 = privacy_projected_verdict_sha256(&draft.raw_verdict, true)?;
     let identity = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "execution_id": draft.execution_id,
         "session_id": draft.session_id,
         "command_sha256": draft.command_sha256,
@@ -1896,7 +2231,7 @@ fn compute_draft_identity(draft: &ExecutionDraft) -> Result<String, String> {
         "warn_ack_proof_sha256": draft.interaction.warn_ack_proof_sha256(),
         "policy_basis_sha256": draft.decision.policy_basis_sha256,
         "verdict_basis_sha256": draft.decision.verdict_basis_sha256,
-        "raw_verdict_sha256": sha256_hex(&raw_verdict),
+        "raw_verdict_sha256": raw_verdict_sha256,
         "provisional_events": draft.provisional_events,
         "warning_prototypes": draft.warning_prototypes,
         "escalation_hits": draft.escalation_hits,
@@ -2041,89 +2376,453 @@ fn open_and_lock_secure(path: &Path, deadline: Instant) -> Result<File, SecureLo
 }
 
 #[cfg(unix)]
-fn read_strict_anchor(lock_file: &File) -> Result<Option<String>, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StrictAnchor {
+    Active {
+        ledger_schema: u32,
+        generation: u64,
+        instance_id: String,
+        ledger_sha256: String,
+    },
+    PrivacyRetired {
+        legacy_schema: u32,
+        generation: u64,
+        instance_id: String,
+        strict_device: u64,
+        strict_inode: u64,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LegacyLockMarker {
+    Active(String),
+    PrivacyRetired,
+}
+
+#[cfg(unix)]
+fn read_legacy_lock_marker(lock_file: &File) -> Result<Option<LegacyLockMarker>, String> {
     let mut reader = lock_file
         .try_clone()
-        .map_err(|error| format!("clone execution lock for anchor read: {error}"))?;
+        .map_err(|error| format!("clone legacy execution lock marker: {error}"))?;
     let length = reader
         .metadata()
-        .map_err(|error| format!("inspect execution lock anchor: {error}"))?
+        .map_err(|error| format!("inspect legacy execution lock marker: {error}"))?
         .len();
     if length == 0 {
         return Ok(None);
     }
     if length > STRICT_ANCHOR_CAP {
-        return Err("execution lock anchor exceeds its size cap".to_string());
+        return Err("legacy execution lock marker exceeds its size cap".to_string());
     }
     reader
         .seek(SeekFrom::Start(0))
-        .map_err(|error| format!("seek execution lock anchor: {error}"))?;
+        .map_err(|error| format!("seek legacy execution lock marker: {error}"))?;
     let mut bytes = Vec::with_capacity(length as usize);
     reader
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("read execution lock anchor: {error}"))?;
+        .map_err(|error| format!("read legacy execution lock marker: {error}"))?;
     let text = std::str::from_utf8(&bytes)
-        .map_err(|_| "execution lock anchor is not UTF-8".to_string())?;
-    let instance_id = text
-        .strip_prefix(STRICT_ANCHOR_PREFIX)
+        .map_err(|_| "legacy execution lock marker is not UTF-8".to_string())?;
+    if let Some(instance_id) = text
+        .strip_prefix(LEGACY_LOCK_ANCHOR_PREFIX)
         .and_then(|value| value.strip_suffix('\n'))
-        .ok_or_else(|| "execution lock anchor has an invalid frame".to_string())?;
-    validate_stable_id("execution ledger instance", instance_id)?;
-    Ok(Some(instance_id.to_string()))
+    {
+        validate_stable_id("legacy execution ledger instance", instance_id)?;
+        return Ok(Some(LegacyLockMarker::Active(instance_id.to_string())));
+    }
+    if let Some(retired) = text
+        .strip_prefix(LEGACY_LOCK_RETIRED_PREFIX)
+        .and_then(|value| value.strip_suffix('\n'))
+    {
+        let (schema, instance_id) = retired
+            .split_once(' ')
+            .ok_or_else(|| "legacy retired lock marker has an invalid frame".to_string())?;
+        if schema.parse::<u32>().ok() != Some(LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION) {
+            return Err("legacy retired lock marker has an unsupported schema".to_string());
+        }
+        validate_stable_id("legacy retired execution instance", instance_id)?;
+        return Ok(Some(LegacyLockMarker::PrivacyRetired));
+    }
+    Err("execution lock contains an unknown legacy marker".to_string())
 }
 
 #[cfg(unix)]
-fn bind_strict_anchor(lock_file: &File, lock_path: &Path, instance_id: &str) -> Result<(), String> {
-    validate_stable_id("execution ledger instance", instance_id)?;
-    match read_strict_anchor(lock_file)? {
-        Some(existing) if existing == instance_id => return Ok(()),
-        Some(_) => {
-            return Err("strict execution state does not match the stable lock anchor".to_string())
+fn strict_anchor_path(reference_path: &Path) -> PathBuf {
+    // Callers naturally hold either `<session>.json.lock` (the stable locking
+    // inode) or `<session>.execution` (the strict two-slot ledger). Both must
+    // resolve to one sidecar; `Path::with_extension` alone would produce two
+    // different names for those inputs and silently split publication from
+    // recovery.
+    let Some(name) = reference_path.file_name().and_then(|name| name.to_str()) else {
+        return reference_path.with_extension("execution.anchor");
+    };
+    let session = name
+        .strip_suffix(".json.lock")
+        .or_else(|| name.strip_suffix(".execution"));
+    session.map_or_else(
+        || reference_path.with_extension("execution.anchor"),
+        |session| reference_path.with_file_name(format!("{session}.execution.anchor")),
+    )
+}
+
+#[cfg(unix)]
+fn strict_anchor_digest_is_valid(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[cfg(unix)]
+fn ledger_anchor_sha256(ledger: &ExecutionLedger) -> Result<String, String> {
+    let value = serde_json::to_value(ledger)
+        .map_err(|error| format!("serialize strict ledger anchor identity: {error}"))?;
+    Ok(sha256_hex(
+        crate::audit::canonical_json_for_hash(&value).as_bytes(),
+    ))
+}
+
+#[cfg(unix)]
+fn active_anchor_for_ledger(ledger: &ExecutionLedger) -> Result<StrictAnchor, String> {
+    Ok(StrictAnchor::Active {
+        ledger_schema: ledger.schema_version,
+        generation: ledger.generation,
+        instance_id: ledger.instance_id.clone(),
+        ledger_sha256: ledger_anchor_sha256(ledger)?,
+    })
+}
+
+#[cfg(unix)]
+fn anchor_matches_ledger(anchor: &StrictAnchor, ledger: &ExecutionLedger) -> Result<bool, String> {
+    let (ledger_schema, generation, instance_id, ledger_sha256) = match anchor {
+        StrictAnchor::Active {
+            ledger_schema,
+            generation,
+            instance_id,
+            ledger_sha256,
+        } => (*ledger_schema, *generation, instance_id, ledger_sha256),
+        StrictAnchor::PrivacyRetired { .. } => return Ok(false),
+    };
+    Ok(ledger.schema_version == ledger_schema
+        && ledger.generation == generation
+        && ledger.instance_id.as_str() == instance_id.as_str()
+        && ledger_anchor_sha256(ledger)?.as_str() == ledger_sha256.as_str())
+}
+
+#[cfg(unix)]
+fn retired_anchor_matches_legacy(
+    anchor: &StrictAnchor,
+    ledger: &ExecutionLedger,
+    strict_identity: FileIdentity,
+) -> bool {
+    matches!(
+        anchor,
+        StrictAnchor::PrivacyRetired {
+            legacy_schema,
+            generation,
+            instance_id,
+            strict_device,
+            strict_inode,
+        } if ledger.schema_version == *legacy_schema
+            && ledger.generation == *generation
+            && ledger.instance_id.as_str() == instance_id.as_str()
+            && strict_identity.device == *strict_device
+            && strict_identity.inode == *strict_inode
+    )
+}
+
+#[cfg(unix)]
+fn parse_strict_anchor_frame(text: &str) -> Result<StrictAnchor, String> {
+    if let Some(body) = text
+        .strip_prefix(STRICT_ANCHOR_PREFIX)
+        .and_then(|value| value.strip_suffix('\n'))
+    {
+        let mut fields = body.split(' ');
+        let ledger_schema = fields
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+            .ok_or_else(|| "strict execution anchor has an invalid schema".to_string())?;
+        let generation = fields
+            .next()
+            .and_then(|field| field.parse::<u64>().ok())
+            .ok_or_else(|| "strict execution anchor has an invalid generation".to_string())?;
+        let instance_id = fields
+            .next()
+            .ok_or_else(|| "strict execution anchor lacks its instance".to_string())?;
+        let ledger_sha256 = fields
+            .next()
+            .ok_or_else(|| "strict execution anchor lacks its ledger digest".to_string())?;
+        if fields.next().is_some() {
+            return Err("strict execution anchor has trailing fields".to_string());
         }
-        None => {}
+        validate_stable_id("execution ledger instance", instance_id)?;
+        if !strict_anchor_digest_is_valid(ledger_sha256) {
+            return Err("strict execution anchor has an invalid ledger digest".to_string());
+        }
+        return Ok(StrictAnchor::Active {
+            ledger_schema,
+            generation,
+            instance_id: instance_id.to_string(),
+            ledger_sha256: ledger_sha256.to_string(),
+        });
     }
-    let frame = format!("{STRICT_ANCHOR_PREFIX}{instance_id}\n");
-    let mut writer = lock_file
-        .try_clone()
-        .map_err(|error| format!("clone execution lock for anchor write: {error}"))?;
-    writer
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| format!("seek execution lock anchor for write: {error}"))?;
-    writer
-        .write_all(frame.as_bytes())
-        .map_err(|error| format!("write execution lock anchor: {error}"))?;
-    writer
-        .set_len(frame.len() as u64)
-        .map_err(|error| format!("size execution lock anchor: {error}"))?;
-    writer
-        .sync_all()
-        .map_err(|error| format!("sync execution lock anchor: {error}"))?;
-    crate::util::fsync_parent_dir(lock_path)
+
+    if let Some(body) = text
+        .strip_prefix(STRICT_RETIRED_ANCHOR_PREFIX)
+        .and_then(|value| value.strip_suffix('\n'))
+    {
+        let mut fields = body.split(' ');
+        let legacy_schema = fields
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+            .ok_or_else(|| "retired execution anchor has an invalid schema".to_string())?;
+        let generation = fields
+            .next()
+            .and_then(|field| field.parse::<u64>().ok())
+            .ok_or_else(|| "retired execution anchor has an invalid generation".to_string())?;
+        let instance_id = fields
+            .next()
+            .ok_or_else(|| "retired execution anchor lacks its instance".to_string())?;
+        let strict_device = fields
+            .next()
+            .and_then(|field| field.parse::<u64>().ok())
+            .ok_or_else(|| "retired execution anchor has an invalid device".to_string())?;
+        let strict_inode = fields
+            .next()
+            .and_then(|field| field.parse::<u64>().ok())
+            .ok_or_else(|| "retired execution anchor has an invalid inode".to_string())?;
+        if fields.next().is_some() {
+            return Err("retired execution anchor has trailing fields".to_string());
+        }
+        validate_stable_id("retired execution ledger instance", instance_id)?;
+        if legacy_schema != LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION {
+            return Err("retired execution anchor has an unsupported schema".to_string());
+        }
+        return Ok(StrictAnchor::PrivacyRetired {
+            legacy_schema,
+            generation,
+            instance_id: instance_id.to_string(),
+            strict_device,
+            strict_inode,
+        });
+    }
+
+    Err("strict execution anchor has an invalid frame".to_string())
+}
+
+#[cfg(unix)]
+fn read_strict_anchor(lock_path: &Path) -> Result<Option<StrictAnchor>, String> {
+    let anchor_path = strict_anchor_path(lock_path);
+    let bytes = match crate::util::read_text_no_follow_capped(&anchor_path, STRICT_ANCHOR_CAP) {
+        Ok(bytes) => bytes,
+        Err(crate::util::OpenRegularError::NotFound) => return Ok(None),
+        Err(error) => return Err(format!("read strict execution anchor: {error:?}")),
+    };
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "strict execution anchor is not UTF-8".to_string())?;
+    parse_strict_anchor_frame(text).map(Some)
+}
+
+#[cfg(unix)]
+fn write_strict_anchor(
+    lock_file: &File,
+    lock_path: &Path,
+    anchor: &StrictAnchor,
+) -> Result<(), String> {
+    let frame = match anchor {
+        StrictAnchor::Active {
+            ledger_schema,
+            generation,
+            instance_id,
+            ledger_sha256,
+        } => {
+            validate_stable_id("execution ledger instance", instance_id)?;
+            if !strict_anchor_digest_is_valid(ledger_sha256) {
+                return Err("cannot write an invalid execution anchor digest".to_string());
+            }
+            format!(
+                "{STRICT_ANCHOR_PREFIX}{ledger_schema} {generation} {instance_id} {ledger_sha256}\n"
+            )
+        }
+        StrictAnchor::PrivacyRetired {
+            legacy_schema,
+            generation,
+            instance_id,
+            strict_device,
+            strict_inode,
+        } => {
+            validate_stable_id("retired execution ledger instance", instance_id)?;
+            if *legacy_schema != LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION {
+                return Err("cannot write an unsupported retired execution schema".to_string());
+            }
+            format!(
+                "{STRICT_RETIRED_ANCHOR_PREFIX}{legacy_schema} {generation} {instance_id} {strict_device} {strict_inode}\n"
+            )
+        }
+    };
+    let lock_identity = secure_regular_identity(lock_file, "execution anchor lock")?;
+    if path_identity(lock_path, "execution anchor lock")? != lock_identity {
+        return Err("execution lock changed before anchor publication".to_string());
+    }
+    let anchor_path = strict_anchor_path(lock_path);
+    crate::util::write_file_atomic_0600(&anchor_path, frame.as_bytes())
+        .map_err(|error| format!("atomically publish execution anchor: {error}"))?;
+    crate::util::fsync_parent_dir(&anchor_path)
         .map_err(|error| format!("durably publish execution lock anchor: {error}"))?;
+    if path_identity(lock_path, "execution anchor lock")? != lock_identity {
+        return Err("execution lock changed during anchor publication".to_string());
+    }
     Ok(())
 }
 
 #[cfg(unix)]
-fn require_strict_anchor(lock_file: &File, instance_id: &str) -> Result<(), String> {
-    match read_strict_anchor(lock_file)? {
-        Some(existing) if existing == instance_id => Ok(()),
-        Some(_) => Err("strict execution state changed ledger instance".to_string()),
+fn bind_strict_anchor(
+    lock_file: &File,
+    lock_path: &Path,
+    ledger: &ExecutionLedger,
+) -> Result<(), String> {
+    let expected = active_anchor_for_ledger(ledger)?;
+    match read_strict_anchor(lock_path)? {
+        Some(existing) if existing == expected => return Ok(()),
+        Some(StrictAnchor::PrivacyRetired { .. }) => {
+            return Err(
+                "legacy execution state was retired for privacy; start a new Tirith session"
+                    .to_string(),
+            )
+        }
+        Some(StrictAnchor::Active { .. }) => {
+            return Err("strict execution state does not match the stable lock anchor".to_string())
+        }
+        None => match read_legacy_lock_marker(lock_file)? {
+            Some(LegacyLockMarker::PrivacyRetired) => {
+                return Err(legacy_strict_state_retired_error())
+            }
+            Some(LegacyLockMarker::Active(instance_id)) if instance_id != ledger.instance_id => {
+                return Err(
+                    "strict execution state does not match its legacy lock marker".to_string(),
+                )
+            }
+            Some(LegacyLockMarker::Active(_)) | None => {}
+        },
+    }
+    write_strict_anchor(lock_file, lock_path, &expected)
+}
+
+#[cfg(unix)]
+fn require_strict_anchor(
+    lock_file: &File,
+    lock_path: &Path,
+    ledger: &ExecutionLedger,
+) -> Result<(), String> {
+    let lock_identity = secure_regular_identity(lock_file, "execution anchor lock")?;
+    if path_identity(lock_path, "execution anchor lock")? != lock_identity {
+        return Err("execution lock changed before anchor validation".to_string());
+    }
+    match read_strict_anchor(lock_path)? {
+        Some(anchor @ StrictAnchor::Active { .. }) if anchor_matches_ledger(&anchor, ledger)? => {
+            Ok(())
+        }
+        Some(StrictAnchor::PrivacyRetired { .. }) => Err(
+            "legacy execution state was retired for privacy; start a new Tirith session"
+                .to_string(),
+        ),
+        Some(StrictAnchor::Active { .. }) => Err(
+            "strict execution state changed its anchored schema, generation, or identity"
+                .to_string(),
+        ),
         None => Err("strict execution state lost its stable deletion anchor".to_string()),
     }
 }
 
 /// Clear the deletion guard only while GC owns the stable session lock.
 #[cfg(unix)]
-fn clear_strict_anchor_for_gc(lock_file: &File) -> Result<(), String> {
-    let writer = lock_file
+fn clear_strict_anchor_for_gc(lock_file: &File, lock_path: &Path) -> Result<(), String> {
+    let lock_identity = secure_regular_identity(lock_file, "execution GC anchor lock")?;
+    if path_identity(lock_path, "execution GC anchor lock")? != lock_identity {
+        return Err("execution lock changed before GC anchor removal".to_string());
+    }
+    let anchor_path = strict_anchor_path(lock_path);
+    match fs::remove_file(&anchor_path) {
+        Ok(()) => crate::util::fsync_parent_dir(&anchor_path)
+            .map_err(|error| format!("sync removed execution anchor: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("remove execution anchor for GC: {error}")),
+    }
+    // Pre-v2 builds stored only a weak deletion marker inside the stable lock.
+    // Once GC has independently authorized full session deletion, clear that
+    // obsolete marker too so it cannot permanently block a later fresh session.
+    let legacy_marker = lock_file
         .try_clone()
-        .map_err(|error| format!("clone execution lock for GC anchor clear: {error}"))?;
-    writer
+        .map_err(|error| format!("clone legacy execution marker for GC: {error}"))?;
+    legacy_marker
         .set_len(0)
-        .map_err(|error| format!("clear execution lock anchor for GC: {error}"))?;
-    writer
+        .map_err(|error| format!("clear legacy execution marker for GC: {error}"))?;
+    legacy_marker
         .sync_all()
-        .map_err(|error| format!("sync cleared execution lock anchor: {error}"))
+        .map_err(|error| format!("sync cleared legacy execution marker: {error}"))
+}
+
+#[cfg(unix)]
+fn gc_privacy_retired_session_locked(
+    lock_file: &File,
+    lock_path: &Path,
+    strict_path: &Path,
+    legacy_json_path: &Path,
+) -> Result<bool, String> {
+    let lock_identity = secure_regular_identity(lock_file, "retired execution GC lock")?;
+    if path_identity(lock_path, "retired execution GC lock")? != lock_identity {
+        return Err("retired execution GC lock changed while held".to_string());
+    }
+    if !matches!(
+        read_strict_anchor(lock_path)?,
+        Some(StrictAnchor::PrivacyRetired { .. })
+    ) {
+        return Err("retired execution GC lost its privacy tombstone".to_string());
+    }
+    match fs::symlink_metadata(strict_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(
+                "privacy-retired strict execution state still exists after retirement".to_string(),
+            )
+        }
+        Err(error) => {
+            return Err(format!(
+                "inspect privacy-retired strict execution state: {error}"
+            ))
+        }
+    }
+    let legacy_identity = match fs::symlink_metadata(legacy_json_path) {
+        Ok(_) => Some(path_identity(
+            legacy_json_path,
+            "legacy execution session state for retired GC",
+        )?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "inspect retired legacy execution session state: {error}"
+            ))
+        }
+    };
+    if path_identity(lock_path, "retired execution GC lock")? != lock_identity {
+        return Err("retired execution GC lock changed before cleanup".to_string());
+    }
+    if let Some(expected) = legacy_identity {
+        if path_identity(
+            legacy_json_path,
+            "legacy execution session state for retired GC",
+        )? != expected
+        {
+            return Err("retired legacy execution session state changed before GC".to_string());
+        }
+        fs::remove_file(legacy_json_path)
+            .map_err(|error| format!("remove retired legacy execution state: {error}"))?;
+        crate::util::fsync_parent_dir(legacy_json_path)
+            .map_err(|error| format!("sync retired legacy-state removal: {error}"))?;
+    }
+    clear_strict_anchor_for_gc(lock_file, lock_path)?;
+    Ok(true)
 }
 
 /// Remove a stale session only after validating the complete strict-state
@@ -2146,10 +2845,25 @@ pub(crate) fn gc_strict_session_locked(
     if path_identity(lock_path, "execution GC lock")? != lock_identity {
         return Err("execution GC lock path changed while locked".to_string());
     }
+    let strict_candidate = strict_state_path(directory, session_id);
+    if retire_legacy_unsafe_strict_state_if_needed(
+        lock_file,
+        lock_path,
+        &strict_candidate,
+        session_id,
+    )? == LegacyStrictStateRetirement::Retired
+    {
+        return gc_privacy_retired_session_locked(
+            lock_file,
+            lock_path,
+            &strict_candidate,
+            legacy_json_path,
+        );
+    }
     let (strict_file, ledger, _, strict_path, strict_identity) =
         open_or_initialize_strict_state(directory, session_id, None, None)?;
     validate_execution_ledger(&ledger, session_id)?;
-    require_strict_anchor(lock_file, &ledger.instance_id)?;
+    require_strict_anchor(lock_file, lock_path, &ledger)?;
 
     let now = unix_time_ms()?;
     let has_live_legacy_history =
@@ -2189,8 +2903,8 @@ pub(crate) fn gc_strict_session_locked(
         }
     }
 
-    clear_strict_anchor_for_gc(lock_file)?;
-    let restore_anchor = || bind_strict_anchor(lock_file, lock_path, &ledger.instance_id);
+    clear_strict_anchor_for_gc(lock_file, lock_path)?;
+    let restore_anchor = || bind_strict_anchor(lock_file, lock_path, &ledger);
     if legacy_identity.is_some() {
         if let Err(error) = fs::remove_file(legacy_json_path) {
             let restore = restore_anchor();
@@ -2225,7 +2939,6 @@ fn read_strict_session(
     (
         crate::session_warnings::SessionWarnings,
         Option<FileIdentity>,
-        Option<String>,
     ),
     String,
 > {
@@ -2237,7 +2950,6 @@ fn read_strict_session(
         Err(crate::util::OpenRegularError::NotFound) => {
             return Ok((
                 crate::session_warnings::SessionWarnings::new(session_id),
-                None,
                 None,
             ));
         }
@@ -2260,7 +2972,7 @@ fn read_strict_session(
     if path_identity(path, "execution session state")? != identity {
         return Err("execution session state path was replaced while reading it".to_string());
     }
-    Ok((session, Some(identity), Some(sha256_hex(&bytes))))
+    Ok((session, Some(identity)))
 }
 
 #[cfg(unix)]
@@ -2282,6 +2994,161 @@ fn verify_optional_path_identity(
     }
 }
 
+/// Prove that a presentation-side legacy id was derived from the event's
+/// CURRENT, already-projected source fields. A merely well-shaped 64-hex value
+/// is insufficient: it could itself be a raw private scalar or a digest oracle.
+fn legacy_typed_event_id_matches_projected_source(
+    session_id: &str,
+    event: &crate::event_buffer::TypedEvent,
+) -> bool {
+    if event.sequence == 0 || event.event_id.is_empty() {
+        return false;
+    }
+    let mut expected = event.clone();
+    expected.event_id.clear();
+    expected.migrate_legacy_identity(session_id, event.sequence);
+    expected.event_id == event.event_id
+}
+
+/// Validate a presentation de-dup signature without trusting any free-form
+/// bytes it carries. Every source part must identify an event still in the
+/// bounded ring; once a source leaves that ring the exact correlation cannot be
+/// re-derived, so dropping its marker is both safe and privacy-preserving.
+fn correlation_signature_references_only_live_events(
+    signature: &str,
+    events: &[crate::event_buffer::TypedEvent],
+) -> bool {
+    const MAX_SIGNATURE_BYTES: usize = 512;
+    const MAX_SOURCE_PARTS: usize = 4;
+
+    if signature.is_empty() || signature.len() > MAX_SIGNATURE_BYTES {
+        return false;
+    }
+    let mut parts = signature.split('|');
+    let Some(rule) = parts.next() else {
+        return false;
+    };
+    if !matches!(
+        rule,
+        "SecretWriteThenNetwork"
+            | "DependencyChangeThenNetwork"
+            | "DeleteThenForcePush"
+            | "MassFileDeletion"
+    ) {
+        return false;
+    }
+
+    let mut source_count = 0usize;
+    for part in parts {
+        source_count += 1;
+        if source_count > MAX_SOURCE_PARTS {
+            return false;
+        }
+        let live = if let Some(encoded) = part.strip_prefix("e:") {
+            let Some((event_id, sequence_text)) = encoded.rsplit_once(':') else {
+                return false;
+            };
+            let Ok(sequence) = sequence_text.parse::<u64>() else {
+                return false;
+            };
+            sequence != 0
+                && sequence_text == sequence.to_string()
+                && events
+                    .iter()
+                    .any(|event| event.event_id == event_id && event.sequence == sequence)
+        } else {
+            let timestamp = part.strip_prefix("t:").unwrap_or(part);
+            timestamp.len() <= 64
+                && chrono::DateTime::parse_from_rfc3339(timestamp).is_ok()
+                && events.iter().any(|event| event.timestamp == timestamp)
+        };
+        if !live {
+            return false;
+        }
+    }
+    source_count > 0
+}
+
+/// Apply the mandatory supported-secret projection to every free-text legacy
+/// session field before validation, identity migration, serialization, or
+/// strict-ledger import. Presentation-side typed-event ids are retained only
+/// when reproducibly derived from the CURRENT projected legacy event. Otherwise
+/// the id and its presentation de-dup markers are reset: retaining an
+/// unverifiable old digest would leave a durable offline oracle.
+fn privacy_project_legacy_session(session: &mut crate::session_warnings::SessionWarnings) {
+    let project = |value: &mut String| {
+        *value = crate::redact::privacy_project_durable_text(value);
+    };
+    let session_id = session.session_id.clone();
+    let mut identity_reset = false;
+
+    project(&mut session.session_start);
+    for event in &mut session.events {
+        project(&mut event.timestamp);
+        project(&mut event.rule_id);
+        project(&mut event.severity);
+        project(&mut event.title);
+        project(&mut event.command_redacted);
+        for domain in &mut event.domains {
+            *domain = privacy_project_domain(domain).to_lowercase();
+        }
+    }
+    for event in &mut session.escalation_events {
+        project(&mut event.timestamp);
+        project(&mut event.rule_id);
+        if let Some(domain) = &mut event.domain {
+            *domain = privacy_project_domain(domain).to_lowercase();
+        }
+    }
+    for event in &mut session.hidden_events {
+        project(&mut event.timestamp);
+        project(&mut event.rule_id);
+        project(&mut event.severity);
+        project(&mut event.title);
+        project(&mut event.command_redacted);
+    }
+
+    let mut projected_cooldowns = std::collections::BTreeMap::new();
+    for (key, mut value) in std::mem::take(&mut session.cooldowns) {
+        let (projected_key, projected_value) =
+            crate::redact::privacy_project_durable_pair(&key, &value);
+        value = projected_value;
+        projected_cooldowns.insert(projected_key, value);
+    }
+    session.cooldowns = projected_cooldowns;
+
+    for event in &mut session.typed_events {
+        project(&mut event.timestamp);
+        project(&mut event.rule_id);
+        let mut metadata = std::collections::BTreeMap::new();
+        for (key, value) in std::mem::take(&mut event.metadata) {
+            let (projected_key, projected_value) =
+                crate::redact::privacy_project_durable_pair(&key, &value);
+            let projected_value = if matches!(projected_key.as_str(), "domain" | "host") {
+                privacy_project_domain(&value)
+            } else {
+                projected_value
+            };
+            metadata.insert(projected_key, projected_value);
+        }
+        event.metadata = metadata;
+        // Presentation JSON is mutable and unauthenticated. Even an id with the
+        // exact `event-<uuid>-<index>-<sequence>` strict-ledger shape proves no
+        // provenance here: its 32-hex segment could be a secret-derived prefix.
+        // Preserve only an identity reproducibly derived from the CURRENT
+        // projected fields; regenerate everything else below.
+        if !legacy_typed_event_id_matches_projected_source(&session_id, event) {
+            event.event_id.clear();
+            identity_reset = true;
+        }
+    }
+    if identity_reset {
+        // These markers embed the reset identities. They are presentation-only
+        // de-dup state and cannot safely survive an identity re-projection.
+        session.surfaced_correlations.clear();
+    }
+}
+
 pub(crate) fn validate_session_state(
     session: &mut crate::session_warnings::SessionWarnings,
     expected_session_id: &str,
@@ -2291,9 +3158,11 @@ pub(crate) fn validate_session_state(
     }
     if session.events.len() > crate::session_warnings::MAX_EVENTS
         || session.typed_events.len() > crate::session_warnings::MAX_TYPED_EVENTS
+        || session.surfaced_correlations.len() > crate::session_warnings::MAX_SURFACED_CORRELATIONS
     {
         return Err("legacy execution session security history exceeds its cap".to_string());
     }
+    privacy_project_legacy_session(session);
     for event in &mut session.events {
         event.domains = event
             .domains
@@ -2327,6 +3196,10 @@ pub(crate) fn validate_session_state(
         }
         max_sequence = max_sequence.max(event.sequence);
     }
+    let live_events = session.typed_events.iter().cloned().collect::<Vec<_>>();
+    session.surfaced_correlations.retain(|signature| {
+        correlation_signature_references_only_live_events(signature, &live_events)
+    });
     if !session.typed_events.is_empty()
         && (session.next_typed_event_sequence == 0
             || session.next_typed_event_sequence <= max_sequence)
@@ -2353,13 +3226,17 @@ fn validate_execution_ledger(
     if ledger.legacy_imported_unix_ms == 0 {
         return Err("strict execution state has an invalid legacy-import timestamp".to_string());
     }
-    if ledger.legacy_source_sha256.as_ref().is_some_and(|digest| {
-        digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    }) {
-        return Err("strict execution state has an invalid legacy-source digest".to_string());
+    if ledger
+        .legacy_projection_sha256
+        .as_ref()
+        .is_some_and(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        return Err("strict execution state has an invalid legacy-projection digest".to_string());
     }
     if ledger.next_sequence == 0 || ledger.next_event_sequence == 0 {
         return Err("strict execution state has a zero next sequence".to_string());
@@ -2806,7 +3683,7 @@ fn recheck_under_lock(ledger: &ExecutionLedger, draft: &ExecutionDraft) -> Resul
     history
         .unresolved
         .retain(|record| record.execution_id != draft.execution_id());
-    let (rechecked, prototypes, escalation_hits) = evaluate_against_session(
+    let (rechecked, mut prototypes, mut escalation_hits) = evaluate_against_session(
         draft.raw_verdict(),
         draft.correlation_policy(),
         draft.command(),
@@ -2814,6 +3691,8 @@ fn recheck_under_lock(ledger: &ExecutionLedger, draft: &ExecutionDraft) -> Resul
         draft.shell(),
         &history,
     )?;
+    privacy_project_event_prototypes(&mut prototypes);
+    privacy_project_escalation_hits(&mut escalation_hits);
     if prototypes != draft.provisional_events {
         return Err("execution gate recheck changed the derived event identity".to_string());
     }
@@ -2881,9 +3760,19 @@ fn recover_shell_receipt_transition(
         ensure_secure_session_directory(parent)?;
         let lock_file =
             open_and_lock_secure(&lock_path, deadline).map_err(|error| error.to_string())?;
+        let strict_candidate = strict_state_path(parent, session_id);
+        if retire_legacy_unsafe_strict_state_if_needed(
+            &lock_file,
+            &lock_path,
+            &strict_candidate,
+            session_id,
+        )? == LegacyStrictStateRetirement::Retired
+        {
+            return Err(legacy_strict_state_retired_error());
+        }
         let (_, ledger, _, _, _) = open_or_initialize_strict_state(parent, session_id, None, None)?;
         validate_execution_ledger(&ledger, session_id)?;
-        require_strict_anchor(&lock_file, &ledger.instance_id)?;
+        require_strict_anchor(&lock_file, &lock_path, &ledger)?;
         let recovery = match ledger
             .confirmed
             .iter()
@@ -3298,6 +4187,205 @@ fn strict_state_path(directory: &Path, session_id: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyStrictStateRetirement {
+    Unchanged,
+    Retired,
+}
+
+#[cfg(unix)]
+fn legacy_strict_state_retired_error() -> String {
+    "legacy execution state was retired for privacy; start a new Tirith session".to_string()
+}
+
+/// Retire a schema-v2 ledger only when an independently stored, atomic anchor
+/// already binds its schema, generation, instance, and canonical ledger digest.
+/// A mutable discriminator plus the slot's unkeyed checksum is never deletion
+/// authority. The sidecar is atomically changed from Active to PrivacyRetired
+/// before unlink, so a crash leaves either the prior active binding or a durable
+/// retryable tombstone—never a torn in-place marker.
+#[cfg(unix)]
+fn retire_legacy_unsafe_strict_state_if_needed(
+    lock_file: &File,
+    lock_path: &Path,
+    strict_path: &Path,
+    expected_session_id: &str,
+) -> Result<LegacyStrictStateRetirement, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let lock_identity = secure_regular_identity(lock_file, "legacy-retirement execution lock")?;
+    if path_identity(lock_path, "legacy-retirement execution lock")? != lock_identity {
+        return Err("execution lock changed before legacy-state retirement".to_string());
+    }
+    let anchor = read_strict_anchor(lock_path)?;
+    let legacy_lock_marker = read_legacy_lock_marker(lock_file)?;
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(strict_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if matches!(anchor, Some(StrictAnchor::PrivacyRetired { .. }))
+                || matches!(legacy_lock_marker, Some(LegacyLockMarker::PrivacyRetired))
+            {
+                Ok(LegacyStrictStateRetirement::Retired)
+            } else {
+                Ok(LegacyStrictStateRetirement::Unchanged)
+            };
+        }
+        Err(error) => {
+            return Err(format!(
+                "open strict execution state for retirement: {error}"
+            ))
+        }
+    };
+    let strict_identity = secure_regular_identity(&file, "legacy strict execution state")?;
+    if path_identity(strict_path, "legacy strict execution state")? != strict_identity {
+        return Err("legacy strict execution state changed while opening it".to_string());
+    }
+    let length = file
+        .metadata()
+        .map_err(|error| format!("inspect legacy strict execution state size: {error}"))?
+        .len();
+    if length != STRICT_STATE_FILE_SIZE {
+        return Err("legacy strict execution state has an invalid fixed-slot size".to_string());
+    }
+
+    let left = read_slot_frame(&mut file, 0)?;
+    let right = read_slot_frame(&mut file, 1)?;
+    let frames = left.iter().chain(right.iter()).collect::<Vec<_>>();
+    if frames.is_empty() {
+        return Err("strict execution state has no authenticated slot to retire".to_string());
+    }
+    if let Some(unsupported) = frames.iter().find(|ledger| {
+        !matches!(
+            ledger.schema_version,
+            EXECUTION_LEDGER_SCHEMA_VERSION | LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION
+        )
+    }) {
+        return Err(format!(
+            "unsupported checksum-valid strict execution schema {}",
+            unsupported.schema_version
+        ));
+    }
+    let has_current = frames
+        .iter()
+        .any(|ledger| ledger.schema_version == EXECUTION_LEDGER_SCHEMA_VERSION);
+    let has_legacy = frames
+        .iter()
+        .any(|ledger| ledger.schema_version == LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION);
+    if has_current && has_legacy {
+        return Err(
+            "strict execution slots mix current and privacy-unsafe schemas; refusing fallback"
+                .to_string(),
+        );
+    }
+    if has_current {
+        if matches!(anchor, Some(StrictAnchor::PrivacyRetired { .. })) {
+            return Err(
+                "current strict execution state exists beneath a retired privacy anchor"
+                    .to_string(),
+            );
+        }
+        return Ok(LegacyStrictStateRetirement::Unchanged);
+    }
+
+    let selected = match (left.as_ref(), right.as_ref()) {
+        (Some(left), Some(right)) if left.generation > right.generation => left,
+        (Some(left), Some(right)) if right.generation > left.generation => right,
+        (Some(left), Some(right)) if left == right => left,
+        (Some(_), Some(_)) => {
+            return Err("privacy-unsafe strict slots disagree at the same generation".to_string())
+        }
+        (Some(ledger), None) | (None, Some(ledger)) => ledger,
+        (None, None) => unreachable!("non-empty retirement frame set checked above"),
+    };
+    validate_stable_id("legacy execution ledger instance", &selected.instance_id)?;
+    if selected.session_id != expected_session_id
+        || frames.iter().any(|ledger| {
+            ledger.session_id != expected_session_id
+                || ledger.instance_id != selected.instance_id
+                || ledger.schema_version != LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION
+        })
+    {
+        return Err(
+            "privacy-unsafe strict execution slots disagree on session or ledger instance"
+                .to_string(),
+        );
+    }
+    let tombstone = match &anchor {
+        Some(active @ StrictAnchor::Active { .. })
+            if anchor_matches_ledger(active, selected)? =>
+        {
+            let StrictAnchor::Active {
+                ledger_schema,
+                generation,
+                instance_id,
+                ..
+            } = active
+            else {
+                unreachable!()
+            };
+            if *ledger_schema != LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION {
+                return Err(
+                    "current schema-3 anchor contradicts a downgraded legacy discriminator; preserving strict history"
+                        .to_string(),
+                );
+            }
+            StrictAnchor::PrivacyRetired {
+                legacy_schema: *ledger_schema,
+                generation: *generation,
+                instance_id: instance_id.clone(),
+                strict_device: strict_identity.device,
+                strict_inode: strict_identity.inode,
+            }
+        }
+        Some(retired @ StrictAnchor::PrivacyRetired { .. })
+            if retired_anchor_matches_legacy(retired, selected, strict_identity) =>
+        {
+            retired.clone()
+        }
+        Some(StrictAnchor::Active { .. }) => {
+            return Err(
+                "strict execution anchor does not authenticate the apparent legacy state; preserving history"
+                    .to_string(),
+            )
+        }
+        Some(StrictAnchor::PrivacyRetired { .. }) => {
+            return Err(
+                "privacy tombstone does not authenticate the remaining strict state; preserving history"
+                    .to_string(),
+            )
+        }
+        None => {
+            return Err(
+                "legacy strict execution state lacks a cryptographic anchor and cannot be retired automatically"
+                    .to_string(),
+            )
+        }
+    };
+    if !matches!(anchor, Some(StrictAnchor::PrivacyRetired { .. })) {
+        write_strict_anchor(lock_file, lock_path, &tombstone)?;
+    }
+    if path_identity(lock_path, "legacy-retirement execution lock")? != lock_identity {
+        return Err("execution lock changed during legacy-state retirement".to_string());
+    }
+    if path_identity(strict_path, "legacy strict execution state")? != strict_identity {
+        return Err(
+            "legacy strict execution state was replaced before privacy retirement".to_string(),
+        );
+    }
+    fs::remove_file(strict_path)
+        .map_err(|error| format!("remove privacy-unsafe strict execution state: {error}"))?;
+    crate::util::fsync_parent_dir(strict_path)
+        .map_err(|error| format!("sync privacy-unsafe strict-state removal: {error}"))?;
+    drop(file);
+    Ok(LegacyStrictStateRetirement::Retired)
+}
+
+#[cfg(unix)]
 fn cleanup_failed_strict_state_initialization(
     path: &Path,
     created: &File,
@@ -3340,7 +4428,7 @@ fn open_or_initialize_strict_state(
     directory: &Path,
     session_id: &str,
     legacy_session: Option<&crate::session_warnings::SessionWarnings>,
-    legacy_source_sha256: Option<&str>,
+    legacy_projection_sha256: Option<&str>,
 ) -> Result<(File, ExecutionLedger, usize, PathBuf, FileIdentity), String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -3360,7 +4448,7 @@ fn open_or_initialize_strict_state(
             let mut ledger = ExecutionLedger::new(
                 session_id,
                 Some(session),
-                legacy_source_sha256.map(str::to_string),
+                legacy_projection_sha256.map(str::to_string),
             )?;
             let after_legacy = session
                 .typed_events
@@ -3437,16 +4525,45 @@ fn open_or_initialize_strict_state(
     }
     let left = left.filter(|ledger| validate_execution_ledger(ledger, session_id).is_ok());
     let right = right.filter(|ledger| validate_execution_ledger(ledger, session_id).is_ok());
-    let (ledger, active_slot) = match (left, right) {
-        (Some(left), Some(right)) if left.generation > right.generation => (left, 0),
-        (Some(left), Some(right)) if right.generation > left.generation => (right, 1),
-        (Some(left), Some(right)) if left == right => (left, 0),
-        (Some(_), Some(_)) => {
-            return Err("strict execution slots disagree at the same generation".to_string())
+    let anchor = read_strict_anchor(&path)?;
+    let (ledger, active_slot) = match anchor {
+        Some(anchor @ StrictAnchor::Active { .. }) => {
+            let left_matches = left
+                .as_ref()
+                .map(|ledger| anchor_matches_ledger(&anchor, ledger))
+                .transpose()?
+                .unwrap_or(false);
+            let right_matches = right
+                .as_ref()
+                .map(|ledger| anchor_matches_ledger(&anchor, ledger))
+                .transpose()?
+                .unwrap_or(false);
+            match (left_matches, right_matches, left, right) {
+                (true, false, Some(ledger), _) => (ledger, 0),
+                (false, true, _, Some(ledger)) => (ledger, 1),
+                (true, true, Some(left), Some(right)) if left == right => (left, 0),
+                _ => {
+                    return Err(
+                        "no strict execution slot matches the atomic schema/generation anchor"
+                            .to_string(),
+                    )
+                }
+            }
         }
-        (Some(ledger), None) => (ledger, 0),
-        (None, Some(ledger)) => (ledger, 1),
-        (None, None) => return Err("both strict execution slots are corrupt".to_string()),
+        Some(StrictAnchor::PrivacyRetired { .. }) => {
+            return Err(legacy_strict_state_retired_error())
+        }
+        None => match (left, right) {
+            (Some(left), Some(right)) if left.generation > right.generation => (left, 0),
+            (Some(left), Some(right)) if right.generation > left.generation => (right, 1),
+            (Some(left), Some(right)) if left == right => (left, 0),
+            (Some(_), Some(_)) => {
+                return Err("strict execution slots disagree at the same generation".to_string())
+            }
+            (Some(ledger), None) => (ledger, 0),
+            (None, Some(ledger)) => (ledger, 1),
+            (None, None) => return Err("both strict execution slots are corrupt".to_string()),
+        },
     };
     if path_identity(&path, "strict execution state")? != identity {
         return Err("strict execution state path was replaced while reading it".to_string());
@@ -3521,7 +4638,10 @@ fn write_slot_frame(file: &mut File, slot: usize, ledger: &ExecutionLedger) -> R
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn write_strict_state(
+    lock_file: &File,
+    lock_path: &Path,
     file: &mut File,
     path: &Path,
     expected_identity: FileIdentity,
@@ -3607,6 +4727,20 @@ fn write_strict_state(
             "published strict execution slot changed identity".to_string(),
         ));
     }
+    let anchor = active_anchor_for_ledger(ledger).map_err(|error| {
+        StrictPublicationError::CommitUnknown(format!(
+            "derive committed strict execution anchor: {error}"
+        ))
+    })?;
+    write_strict_anchor(lock_file, lock_path, &anchor).map_err(|error| {
+        // Slot data is already fsync'd. Atomic sidecar replacement guarantees
+        // readers see either the prior binding or this generation, but a
+        // publication/directory-sync error means this caller cannot know which
+        // is crash-durable and therefore must not authorize launch.
+        StrictPublicationError::CommitUnknown(format!(
+            "publish committed strict execution anchor: {error}"
+        ))
+    })?;
     Ok(target)
 }
 
@@ -3736,19 +4870,106 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_legacy_session(session: &crate::session_warnings::SessionWarnings) -> Vec<u8> {
+    fn write_legacy_session_bytes(session_id: &str, bytes: &[u8]) {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let path = crate::session_warnings::session_state_path(&session.session_id)
-            .expect("legacy session path");
+        let path =
+            crate::session_warnings::session_state_path(session_id).expect("legacy session path");
         let parent = path.parent().expect("legacy session parent");
         fs::create_dir_all(parent).expect("create legacy session parent");
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
             .expect("secure legacy session parent");
-        let bytes = serde_json::to_vec(session).expect("serialize legacy session");
-        fs::write(&path, &bytes).expect("write legacy session");
+        fs::write(&path, bytes).expect("write legacy session");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .expect("secure legacy session");
+    }
+
+    #[cfg(unix)]
+    fn write_legacy_session(session: &crate::session_warnings::SessionWarnings) -> Vec<u8> {
+        let bytes = serde_json::to_vec(session).expect("serialize legacy session");
+        write_legacy_session_bytes(&session.session_id, &bytes);
+        bytes
+    }
+
+    /// Build an intentionally unsafe pre-projection JSON fixture without going
+    /// through the public SessionWarnings/TypedEvent serializers. Those public
+    /// trait boundaries are now mandatory privacy projections; using them here
+    /// would make this migration test tautological instead of proving that old
+    /// raw state is scrubbed during import.
+    #[cfg(unix)]
+    fn write_unprojected_legacy_session_fixture(
+        session: &crate::session_warnings::SessionWarnings,
+    ) -> Vec<u8> {
+        let events = session
+            .events
+            .iter()
+            .map(|event| {
+                serde_json::json!({
+                    "timestamp": event.timestamp,
+                    "rule_id": event.rule_id,
+                    "severity": event.severity,
+                    "title": event.title,
+                    "command_redacted": event.command_redacted,
+                    "domains": event.domains,
+                })
+            })
+            .collect::<Vec<_>>();
+        let escalation_events = session
+            .escalation_events
+            .iter()
+            .map(|event| {
+                serde_json::json!({
+                    "timestamp": event.timestamp,
+                    "rule_id": event.rule_id,
+                    "domain": event.domain,
+                })
+            })
+            .collect::<Vec<_>>();
+        let hidden_events = session
+            .hidden_events
+            .iter()
+            .map(|event| {
+                serde_json::json!({
+                    "timestamp": event.timestamp,
+                    "rule_id": event.rule_id,
+                    "severity": event.severity,
+                    "title": event.title,
+                    "command_redacted": event.command_redacted,
+                })
+            })
+            .collect::<Vec<_>>();
+        let typed_events = session
+            .typed_events
+            .iter()
+            .map(|event| {
+                serde_json::json!({
+                    "event_id": event.event_id,
+                    "sequence": event.sequence,
+                    "provenance": event.provenance,
+                    "timestamp": event.timestamp,
+                    "kind": event.kind,
+                    "rule_id": event.rule_id,
+                    "metadata": event.metadata,
+                })
+            })
+            .collect::<Vec<_>>();
+        let raw = serde_json::json!({
+            "session_id": session.session_id,
+            "session_start": session.session_start,
+            "total_warnings": session.total_warnings,
+            "hidden_findings": session.hidden_findings,
+            "hidden_low": session.hidden_low,
+            "hidden_info": session.hidden_info,
+            "events": events,
+            "escalation_events": escalation_events,
+            "hidden_events": hidden_events,
+            "cooldowns": session.cooldowns,
+            "typed_events": typed_events,
+            "next_typed_event_sequence": session.next_typed_event_sequence,
+            "surfaced_correlations": session.surfaced_correlations,
+        });
+        let bytes = serde_json::to_vec(&raw).expect("serialize raw legacy fixture");
+        write_legacy_session_bytes(&session.session_id, &bytes);
         bytes
     }
 
@@ -4027,6 +5248,42 @@ mod tests {
             assert_eq!(ledger.confirmed.len(), 1);
             assert_eq!(ledger.confirmed[0].warning_events.len(), 1);
         });
+    }
+
+    #[test]
+    fn durable_verdict_identities_do_not_verify_unlabelled_private_scalars() {
+        let verdict_with_title = |byte: &str| {
+            let mut verdict = allow_verdict();
+            verdict.findings.push(Finding {
+                rule_id: RuleId::CredentialInText,
+                severity: Severity::High,
+                title: format!("opaque-0x{}", byte.repeat(32)),
+                description: "fixture".to_string(),
+                evidence: Vec::new(),
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            });
+            verdict
+        };
+        let first = verdict_with_title("11");
+        let second = verdict_with_title("22");
+        assert_eq!(
+            privacy_projected_verdict_sha256(&first, true).expect("first durable identity"),
+            privacy_projected_verdict_sha256(&second, true).expect("second durable identity")
+        );
+        assert_eq!(
+            privacy_projected_verdict_sha256(&first, false).expect("first semantic identity"),
+            privacy_projected_verdict_sha256(&second, false).expect("second semantic identity")
+        );
+
+        let mut changed = second;
+        changed.findings[0].title = "ordinary safe posture change".to_string();
+        assert_ne!(
+            privacy_projected_verdict_sha256(&first, true).expect("first durable identity"),
+            privacy_projected_verdict_sha256(&changed, true).expect("changed durable identity")
+        );
     }
 
     #[cfg(unix)]
@@ -4477,11 +5734,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn gateway_known_zero_abort_removes_unresolved_history() {
+        isolated_state(|_| {
+            let session_id = "gateway_known_zero_abort";
+            let permit = GatewayExecutionPermit::record_forwarded(
+                prepare_gateway("echo safe", session_id),
+                "tirith-0123456789abcdef0123456789abcdef",
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+            )
+            .expect("durable unresolved gateway forward");
+            assert_eq!(read_test_ledger(session_id).unresolved.len(), 1);
+
+            permit
+                .abort_known_zero(Duration::from_secs(1))
+                .expect("known-zero rollback");
+            let ledger = read_test_ledger(session_id);
+            assert!(ledger.unresolved.is_empty());
+            assert!(ledger.confirmed.is_empty());
+            assert_eq!(ledger.generation, 2);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_known_zero_rollback_retains_capability_across_lock_failure() {
+        isolated_state(|_| {
+            let session_id = "gateway_known_zero_retry";
+            let permit = GatewayExecutionPermit::record_forwarded(
+                prepare_gateway("echo safe", session_id),
+                "tirith-1123456789abcdef0123456789abcdef",
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+            )
+            .expect("durable unresolved gateway forward");
+            let lock_path = crate::session_warnings::session_lock_path(session_id).unwrap();
+            let held = open_and_lock_secure(
+                &lock_path,
+                Instant::now().checked_add(Duration::from_secs(1)).unwrap(),
+            )
+            .expect("hold strict state lock");
+            let mut rollback = permit.into_known_zero_rollback();
+
+            assert!(rollback.retry(Duration::from_millis(10)).is_err());
+            assert!(!rollback.is_complete());
+            assert_eq!(read_test_ledger(session_id).unresolved.len(), 1);
+            fs2::FileExt::unlock(&held).unwrap();
+
+            rollback.retry(Duration::from_secs(1)).unwrap();
+            assert!(rollback.is_complete());
+            assert!(read_test_ledger(session_id).unresolved.is_empty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rapid_gateway_completions_compact_only_clean_records_past_the_hard_cap() {
         isolated_state(|_| {
             let session_id = "gateway_clean_compaction";
             let mut security_bearing_execution = None;
             let mut first_clean_execution = None;
+            // This test exercises the 200-record hard cap, not wall-clock
+            // expiration. Keep every record live even when a contended full
+            // suite makes the fsync-heavy loop take longer than the default
+            // two-minute minimum retention window.
+            let retention_policy = Policy {
+                escalation: vec![crate::escalation::EscalationRule::RepeatCount {
+                    rule_ids: vec![RuleId::CurlPipeShell.to_string()],
+                    threshold: u32::MAX,
+                    window_minutes: 24 * 60,
+                    action: crate::escalation::EscalationAction::Block,
+                    domain_scoped: false,
+                    cooldown_minutes: 24 * 60,
+                }],
+                ..Policy::default()
+            };
 
             for index in 0..(MAX_CONFIRMED_EXECUTIONS + 5) {
                 let command = if index == 0 {
@@ -4491,7 +5818,17 @@ mod tests {
                 } else {
                     "echo ok"
                 };
-                let prepared = prepare_gateway(command, session_id);
+                let prepared = prepare_execution(
+                    &allow_verdict(),
+                    &retention_policy,
+                    command,
+                    session_id,
+                    CallerContext::Gateway,
+                    ShellType::Posix,
+                    Duration::from_secs(90),
+                    Duration::from_secs(1),
+                )
+                .expect("strict gateway execution preparation");
                 let execution_id = prepared.draft.execution_id.clone();
                 if index == 0 {
                     security_bearing_execution = Some(execution_id.clone());
@@ -4632,6 +5969,30 @@ mod tests {
         });
     }
 
+    #[test]
+    fn gateway_success_identity_projects_secret_only_result_changes() {
+        let proxy_id = "tirith-abababababababababababababababab";
+        let response = |byte: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": proxy_id,
+                "result": {
+                    "private_key": format!("0x{}", byte.repeat(32)),
+                    "ok": true
+                }
+            }))
+            .expect("response fixture")
+        };
+        let first = response("11");
+        let second = response("22");
+        assert_ne!(sha256_hex(&first), sha256_hex(&second));
+        assert_eq!(
+            validate_gateway_success_response(&first, proxy_id).expect("first identity"),
+            validate_gateway_success_response(&second, proxy_id).expect("second identity"),
+            "a durable gateway evidence id must not verify the returned secret value"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn gateway_completion_errors_distinguish_invalid_rejected_and_commit_unknown() {
@@ -4744,9 +6105,16 @@ mod tests {
             let initialized = prepare("true", session_id);
             assert_eq!(initialized.verdict().action, Action::Allow);
             let imported = read_test_ledger(session_id);
+            let json_path =
+                crate::session_warnings::session_state_path(session_id).expect("legacy JSON path");
+            let projected_bytes = fs::read(&json_path).expect("projected legacy JSON");
             assert_eq!(
-                imported.legacy_source_sha256.as_deref(),
-                Some(sha256_hex(&source_bytes).as_str())
+                imported.legacy_projection_sha256.as_deref(),
+                Some(sha256_hex(&projected_bytes).as_str())
+            );
+            assert_ne!(
+                projected_bytes, source_bytes,
+                "legacy event identity must be regenerated from the privacy projection"
             );
             assert_eq!(imported.legacy_typed_events.len(), 1);
             assert_eq!(
@@ -4754,8 +6122,6 @@ mod tests {
                 crate::event_buffer::EventProvenance::Unresolved
             );
 
-            let json_path =
-                crate::session_warnings::session_state_path(session_id).expect("legacy JSON path");
             fs::write(&json_path, b"corrupt after strict import")
                 .expect("replace presentation JSON");
             let correlated = prepare_execution(
@@ -4775,6 +6141,189 @@ mod tests {
                 .findings
                 .iter()
                 .any(|finding| finding.description.contains("does not assert")));
+        });
+    }
+
+    #[test]
+    fn repeated_session_validation_preserves_current_correlation_identity() {
+        let session_id = "current_correlation_identity";
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let mut session = crate::session_warnings::SessionWarnings::new(session_id);
+        let mut event = crate::event_buffer::TypedEvent::new(
+            &timestamp,
+            crate::event_buffer::EventKind::SecretWrite,
+            "secret_file_write",
+        )
+        .with_meta("path", "safe-fixture.env");
+        event.sequence = 1;
+        event.migrate_legacy_identity(session_id, 1);
+        let event_id = event.event_id.clone();
+        let signature = format!("SecretWriteThenNetwork|e:{event_id}:1");
+        session.typed_events.push_back(event);
+        session.next_typed_event_sequence = 2;
+        session.surfaced_correlations.push_back(signature.clone());
+        let canary = format!("ghp_canary_{}", "A".repeat(30));
+        session
+            .surfaced_correlations
+            .push_back(format!("{canary}|e:{event_id}:1"));
+
+        validate_session_state(&mut session, session_id).expect("first validation");
+        validate_session_state(&mut session, session_id).expect("repeat validation");
+
+        assert_eq!(session.typed_events[0].event_id, event_id);
+        assert_eq!(session.surfaced_correlations.len(), 1);
+        assert_eq!(session.surfaced_correlations[0], signature);
+        assert!(!serde_json::to_string(&session).unwrap().contains(&canary));
+    }
+
+    #[test]
+    fn strict_shaped_presentation_event_id_is_regenerated_from_projected_source() {
+        let session_id = "forged_strict_presentation_identity";
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let secret_digest = sha256_hex(b"test-only private identity fixture");
+        let secret_prefix = &secret_digest[..32];
+        let forged_id = format!("event-{secret_prefix}-0-1");
+        let mut event = crate::event_buffer::TypedEvent::new(
+            &timestamp,
+            crate::event_buffer::EventKind::Network,
+            "network_egress",
+        );
+        event.sequence = 1;
+        event.event_id = forged_id.clone();
+
+        let mut session = crate::session_warnings::SessionWarnings::new(session_id);
+        session.typed_events.push_back(event);
+        session.next_typed_event_sequence = 2;
+        session
+            .surfaced_correlations
+            .push_back(format!("MassFileDeletion|e:{forged_id}:1"));
+
+        validate_session_state(&mut session, session_id).expect("project forged presentation id");
+
+        assert_ne!(session.typed_events[0].event_id, forged_id);
+        assert!(
+            session.typed_events[0].event_id.starts_with("legacy-"),
+            "{}",
+            session.typed_events[0].event_id
+        );
+        assert!(session.surfaced_correlations.is_empty());
+        let persisted = serde_json::to_string(&session).unwrap();
+        assert!(!persisted.contains(&forged_id), "{persisted}");
+        assert!(!persisted.contains(secret_prefix), "{persisted}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_import_projects_every_free_string_before_ids_hashes_and_persistence() {
+        isolated_state(|_| {
+            let session_id = "legacy_privacy_projection";
+            let secret = format!("0x{}1", "0".repeat(63));
+            // Severity is capped at 32 bytes in the historical wire contract, so
+            // use Tirith's short AWS-shaped canary there instead of the 66-byte
+            // EVM fixture. It remains unmistakably sensitive while keeping the
+            // raw legacy record semantically importable.
+            let short_canary = "AKIA00CANARYABCDEFGH";
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let mut legacy = crate::session_warnings::SessionWarnings::new(session_id);
+            legacy
+                .events
+                .push_back(crate::session_warnings::WarningEvent {
+                    timestamp: timestamp.clone(),
+                    rule_id: secret.clone(),
+                    severity: format!("high-{short_canary}"),
+                    title: format!("legacy title {secret}"),
+                    command_redacted: format!("PRIVATE_KEY={secret} cast send"),
+                    domains: vec![format!("rpc-{secret}.example")],
+                });
+            legacy
+                .escalation_events
+                .push_back(crate::session_warnings::EscalationEvent {
+                    timestamp: timestamp.clone(),
+                    rule_id: secret.clone(),
+                    domain: Some(format!("rpc-{secret}.example")),
+                });
+            legacy
+                .hidden_events
+                .push_back(crate::session_warnings::HiddenEvent {
+                    timestamp: timestamp.clone(),
+                    rule_id: secret.clone(),
+                    severity: format!("low-{short_canary}"),
+                    title: format!("hidden {secret}"),
+                    command_redacted: format!("PRIVATE_KEY={secret}"),
+                });
+            legacy
+                .cooldowns
+                .insert(format!("rule-{secret}"), timestamp.clone());
+            legacy
+                .surfaced_correlations
+                .push_back(format!("correlation-{secret}"));
+            let mut typed = crate::event_buffer::TypedEvent::new(
+                &timestamp,
+                crate::event_buffer::EventKind::SecretWrite,
+                &secret,
+            )
+            .with_meta("path", &format!("/tmp/{secret}"))
+            .with_meta(&format!("key-{secret}"), &secret)
+            .with_meta("WALLET_PASSWORD", "hunter2");
+            typed.sequence = 1;
+            typed.event_id = secret.clone();
+            legacy.typed_events.push_back(typed);
+            legacy.next_typed_event_sequence = 2;
+
+            let raw_bytes = write_unprojected_legacy_session_fixture(&legacy);
+            let raw_source_digest = sha256_hex(&raw_bytes);
+            assert!(raw_bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()));
+            assert!(raw_bytes
+                .windows(short_canary.len())
+                .any(|window| window == short_canary.as_bytes()));
+
+            prepare("true", session_id);
+            let json_path =
+                crate::session_warnings::session_state_path(session_id).expect("legacy JSON path");
+            let projected_json = fs::read(&json_path).expect("projected presentation JSON");
+            let strict_path =
+                strict_state_path(json_path.parent().expect("session parent"), session_id);
+            let strict_bytes = fs::read(&strict_path).expect("strict projected ledger");
+            for durable in [&projected_json, &strict_bytes] {
+                assert!(
+                    !durable
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes()),
+                    "raw legacy secret survived durable projection"
+                );
+                assert!(
+                    !durable
+                        .windows(raw_source_digest.len())
+                        .any(|window| window == raw_source_digest.as_bytes()),
+                    "raw legacy JSON digest survived as an oracle"
+                );
+                assert!(
+                    !durable.windows(7).any(|window| window == b"hunter2"),
+                    "contextual legacy secret survived durable projection"
+                );
+                assert!(
+                    !durable
+                        .windows(short_canary.len())
+                        .any(|window| window == short_canary.as_bytes()),
+                    "short legacy canary survived durable projection"
+                );
+            }
+
+            let imported = read_test_ledger(session_id);
+            assert_eq!(
+                imported.legacy_projection_sha256.as_deref(),
+                Some(sha256_hex(&projected_json).as_str())
+            );
+            let event = imported.legacy_typed_events.front().expect("typed event");
+            assert_ne!(event.event_id, secret);
+            assert_ne!(event.event_id, sha256_hex(secret.as_bytes()));
+            assert!(event.event_id.starts_with("legacy-"));
+            assert!(imported
+                .legacy_warning_events
+                .iter()
+                .all(|event| !event.title.contains("0x0000000000000000")));
         });
     }
 
@@ -4916,10 +6465,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_policy_identity_distinguishes_same_count_redacted_projections() {
-        // Two policies differing ONLY in a secret (redacted out of the
-        // projection) share one projection hash but must have distinct exact
-        // execution identities.
+    fn durable_policy_identity_is_not_a_secret_oracle() {
+        // A credential can change threat-intel transport behaviour, but the
+        // command-specific result is already frozen into the verdict basis.
+        // Persisting a distinct unsalted digest here would add only an offline
+        // API-key oracle, so secret-only policy changes share the non-secret
+        // posture identity.
         let left_intel = crate::policy::ThreatIntelConfig {
             abusech_auth_key: Some("key-alpha".to_string()),
             ..Default::default()
@@ -4944,10 +6495,509 @@ mod tests {
             PreparedDecision::from_frozen_basis(&allow_verdict(), &left).expect("left decision");
         let right_decision =
             PreparedDecision::from_frozen_basis(&allow_verdict(), &right).expect("right decision");
-        assert_ne!(
+        assert_eq!(
             left_decision.policy_basis_sha256(),
             right_decision.policy_basis_sha256()
         );
+
+        let stricter = Policy {
+            paranoia: 5,
+            ..Policy::default()
+        };
+        let stricter_decision = PreparedDecision::from_frozen_basis(&allow_verdict(), &stricter)
+            .expect("stricter decision");
+        assert_ne!(
+            left_decision.policy_basis_sha256(),
+            stricter_decision.policy_basis_sha256(),
+            "non-secret posture changes must remain identity-bearing"
+        );
+    }
+
+    #[test]
+    fn command_and_verdict_identities_are_non_oracles_for_supported_secrets() {
+        let first = format!("0x{}1", "0".repeat(63));
+        let second = format!("0x{}2", "0".repeat(63));
+        let first_command = format!("PRIVATE_KEY={first} cast block-number");
+        let second_command = format!("PRIVATE_KEY={second} cast block-number");
+        assert_eq!(
+            privacy_projected_command_sha256(&first_command),
+            privacy_projected_command_sha256(&second_command),
+            "changing only a supported secret must not change a durable command identity"
+        );
+        assert_ne!(
+            privacy_projected_command_sha256("printf alpha"),
+            privacy_projected_command_sha256("printf beta"),
+            "non-secret command meaning remains bound"
+        );
+        assert_ne!(
+            privacy_projected_command_sha256("TARGET=alpha run"),
+            privacy_projected_command_sha256("TARGET=beta run"),
+            "benign assignment values remain identity-bearing"
+        );
+        assert_ne!(
+            privacy_projected_command_sha256("mail first@example.test"),
+            privacy_projected_command_sha256("mail second@example.test"),
+            "non-secret email arguments remain identity-bearing"
+        );
+        let unknown_signer_first = format!("mystery-signer --material {first}");
+        let unknown_signer_second = format!("mystery-signer --material {second}");
+        assert_eq!(
+            privacy_projected_command_sha256(&unknown_signer_first),
+            privacy_projected_command_sha256(&unknown_signer_second),
+            "a bare valid scalar under an unknown signer flag must not create a durable oracle"
+        );
+        let canary_first = format!("run ghp_canary_{}", "A".repeat(30));
+        let canary_second = format!("run ghp_canary_{}", "B".repeat(30));
+        assert_eq!(
+            privacy_projected_command_sha256(&canary_first),
+            privacy_projected_command_sha256(&canary_second),
+            "a Tirith canary must not create a durable command identity oracle"
+        );
+        let raw_unknown_digest = sha256_hex(unknown_signer_first.as_bytes());
+        let unknown_draft = ExecutionDraft::new(
+            "unknown_signer_projection",
+            &unknown_signer_first,
+            unknown_signer_first.clone(),
+            0,
+            &allow_verdict(),
+            &allow_verdict(),
+            &Policy::default(),
+            CallerContext::Cli,
+            ShellType::Posix,
+            Vec::new(),
+            Vec::new(),
+            Duration::from_secs(30),
+        )
+        .expect("unknown signer draft");
+        assert_ne!(unknown_draft.command_sha256(), raw_unknown_digest);
+        assert!(!unknown_draft.redacted_preview().contains(&first));
+
+        let mut first_verdict = warning_verdict(RuleId::CredentialInText);
+        first_verdict.findings[0].title = format!("credential {first}");
+        first_verdict.agent_origin = Some(AgentOrigin::Agent {
+            tool: format!("PRIVATE_KEY={first}"),
+            version: Some(format!("PRIVATE_KEY={first}")),
+        });
+        let mut second_verdict = first_verdict.clone();
+        second_verdict.findings[0].title = format!("credential {second}");
+        second_verdict.agent_origin = Some(AgentOrigin::Agent {
+            tool: format!("PRIVATE_KEY={second}"),
+            version: Some(format!("PRIVATE_KEY={second}")),
+        });
+        let policy = Policy::default();
+        assert_eq!(
+            PreparedDecision::from_frozen_basis(&first_verdict, &policy)
+                .expect("first privacy-projected verdict")
+                .verdict_basis_sha256(),
+            PreparedDecision::from_frozen_basis(&second_verdict, &policy)
+                .expect("second privacy-projected verdict")
+                .verdict_basis_sha256(),
+            "changing only a supported secret must not change a durable verdict identity"
+        );
+
+        let draft = ExecutionDraft::new(
+            "origin_projection",
+            &first_command,
+            crate::redact::redact_command_text(&first_command, &[]),
+            0,
+            &first_verdict,
+            &first_verdict,
+            &policy,
+            CallerContext::Cli,
+            ShellType::Posix,
+            Vec::new(),
+            Vec::new(),
+            Duration::from_secs(30),
+        )
+        .expect("privacy-projected draft");
+        let projected_origin = serde_json::to_string(
+            draft
+                .origin()
+                .expect("privacy fixture must retain its projected agent origin"),
+        )
+        .expect("projected origin");
+        assert!(!projected_origin.contains(&first), "{projected_origin}");
+        assert!(
+            !projected_origin.contains(&first[..18]),
+            "{projected_origin}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_ledger_bytes_never_persist_raw_command_or_its_digest() {
+        isolated_state(|_| {
+            let secret = format!("0x{}1", "0".repeat(63));
+            let command = format!("PRIVATE_KEY={secret} cast block-number");
+            let raw_digest = sha256_hex(command.as_bytes());
+            let prepared = prepare(&command, "privacy_projected_ledger");
+            let draft = prepared.into_authorizable_draft().expect("draft");
+            assert_ne!(draft.command_sha256(), raw_digest);
+            let session = crate::session_warnings::SessionWarnings::new("privacy_projected_ledger");
+            let mut ledger = ExecutionLedger::new("privacy_projected_ledger", Some(&session), None)
+                .expect("ledger");
+            let evidence = draft
+                .shell_boundary_evidence("privacy-evidence")
+                .expect("shell evidence");
+            promote_record(&mut ledger, &draft, &evidence).expect("promote record");
+            let bytes = serde_json::to_string(&ledger).expect("serialize ledger");
+            assert!(!bytes.contains(&secret), "{bytes}");
+            assert!(!bytes.contains(&secret[..18]), "{bytes}");
+            assert!(!bytes.contains(&raw_digest), "{bytes}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_v2_ledger_is_tombstoned_unlinked_and_never_recreated_in_session() {
+        isolated_state(|_| {
+            let session_id = "privacy_retire_schema_v2";
+            let secret = format!("0x{}1", "0".repeat(63));
+            let command = format!("PRIVATE_KEY={secret} cast block-number");
+            let raw_digest = sha256_hex(command.as_bytes());
+            let prepared = prepare(&command, session_id);
+            let draft = prepared.into_authorizable_draft().expect("legacy draft");
+            let state_path =
+                crate::session_warnings::session_state_path(session_id).expect("state");
+            let strict_path =
+                strict_state_path(state_path.parent().expect("state parent"), session_id);
+            let (mut file, mut ledger, _, _, _) = open_or_initialize_strict_state(
+                state_path.parent().expect("state parent"),
+                session_id,
+                None,
+                None,
+            )
+            .expect("current strict state");
+            let evidence = draft
+                .shell_boundary_evidence("legacy-privacy-evidence")
+                .expect("legacy evidence");
+            promote_record(&mut ledger, &draft, &evidence).expect("materialize legacy record");
+            let record = ledger.unresolved.back_mut().expect("legacy record");
+            record.command_sha256 = raw_digest.clone();
+            record.verdict_basis_sha256 = raw_digest.clone();
+            record.draft_identity_sha256 = raw_digest.clone();
+            ledger.schema_version = LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION;
+            let legacy_anchor_digest =
+                ledger_anchor_sha256(&ledger).expect("legacy full-ledger digest fixture");
+            write_slot_frame(&mut file, 0, &ledger).expect("write left legacy slot");
+            write_slot_frame(&mut file, 1, &ledger).expect("write right legacy slot");
+            file.sync_all().expect("sync legacy slots");
+            drop(file);
+            // Historical weak lock markers are intentionally insufficient.
+            // This fixture explicitly supplies the independently persisted
+            // schema/generation/content binding required for safe retirement.
+            let lock_path = crate::session_warnings::session_lock_path(session_id).expect("lock");
+            let lock = open_and_lock_secure(&lock_path, Instant::now() + Duration::from_secs(1))
+                .expect("lock authenticated legacy state");
+            write_strict_anchor(
+                &lock,
+                &lock_path,
+                &active_anchor_for_ledger(&ledger).expect("legacy strong anchor"),
+            )
+            .expect("publish authenticated legacy anchor");
+            drop(lock);
+            let before = fs::read(&strict_path).expect("read legacy strict bytes");
+            assert!(
+                before
+                    .windows(raw_digest.len())
+                    .any(|window| window == raw_digest.as_bytes()),
+                "fixture must contain the privacy-unsafe digest"
+            );
+
+            let error = prepare_execution(
+                &allow_verdict(),
+                &Policy::default(),
+                "printf after-upgrade",
+                session_id,
+                CallerContext::Cli,
+                ShellType::Posix,
+                Duration::from_secs(30),
+                Duration::from_secs(1),
+            )
+            .expect_err("legacy ledger must retire instead of authorizing");
+            assert!(error.contains("retired for privacy"), "{error}");
+            assert!(!strict_path.exists(), "legacy strict file must be unlinked");
+            assert!(matches!(
+                read_strict_anchor(&lock_path).expect("retired anchor"),
+                Some(StrictAnchor::PrivacyRetired {
+                    legacy_schema: LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION,
+                    ..
+                })
+            ));
+            let durable_anchor =
+                fs::read(strict_anchor_path(&lock_path)).expect("read retired anchor bytes");
+            assert!(
+                !durable_anchor
+                    .windows(raw_digest.len())
+                    .any(|window| window == raw_digest.as_bytes()),
+                "retired anchor retained the raw digest"
+            );
+            assert!(
+                !durable_anchor
+                    .windows(legacy_anchor_digest.len())
+                    .any(|window| window == legacy_anchor_digest.as_bytes()),
+                "retired anchor retained a full legacy-ledger verifier"
+            );
+
+            let retry = prepare_execution(
+                &allow_verdict(),
+                &Policy::default(),
+                "printf retry",
+                session_id,
+                CallerContext::Cli,
+                ShellType::Posix,
+                Duration::from_secs(30),
+                Duration::from_secs(1),
+            )
+            .expect_err("retired session must never recreate an empty ledger");
+            assert!(retry.contains("retired for privacy"), "{retry}");
+            assert!(!strict_path.exists(), "retry recreated strict state");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_and_strict_paths_share_one_atomic_anchor_sidecar() {
+        let directory = std::path::Path::new("/tmp/tirith-anchor-path-fixture");
+        let lock_path = directory.join("session.json.lock");
+        let strict_path = directory.join("session.execution");
+        assert_eq!(
+            strict_anchor_path(&lock_path),
+            strict_anchor_path(&strict_path)
+        );
+        assert_eq!(
+            strict_anchor_path(&lock_path),
+            directory.join("session.execution.anchor")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_discriminator_downgrade_cannot_delete_anchored_schema_v3_history() {
+        isolated_state(|_| {
+            let session_id = "schema_downgrade_preserved";
+            prepare("printf anchored-current", session_id);
+            let state_path =
+                crate::session_warnings::session_state_path(session_id).expect("state");
+            let parent = state_path.parent().expect("state parent");
+            let strict_path = strict_state_path(parent, session_id);
+            let lock_path = crate::session_warnings::session_lock_path(session_id).expect("lock");
+            let strong_current_anchor =
+                read_strict_anchor(&lock_path).expect("read current anchor");
+            assert!(matches!(
+                &strong_current_anchor,
+                Some(StrictAnchor::Active {
+                    ledger_schema: EXECUTION_LEDGER_SCHEMA_VERSION,
+                    ..
+                })
+            ));
+
+            let (mut file, mut ledger, _, _, _) =
+                open_or_initialize_strict_state(parent, session_id, None, None)
+                    .expect("current strict state");
+            ledger.schema_version = LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION;
+            write_slot_frame(&mut file, 0, &ledger).expect("write downgraded left slot");
+            write_slot_frame(&mut file, 1, &ledger).expect("write downgraded right slot");
+            file.sync_all().expect("sync downgraded slots");
+            drop(file);
+            let downgraded_bytes = fs::read(&strict_path).expect("downgraded strict bytes");
+
+            let error = prepare_execution(
+                &allow_verdict(),
+                &Policy::default(),
+                "printf must-not-recreate",
+                session_id,
+                CallerContext::Cli,
+                ShellType::Posix,
+                Duration::from_secs(30),
+                Duration::from_secs(1),
+            )
+            .expect_err("downgraded current history must be preserved fail-closed");
+            assert!(error.contains("does not authenticate"), "{error}");
+            assert!(
+                strict_path.exists(),
+                "downgraded current history was deleted"
+            );
+            assert_eq!(
+                fs::read(&strict_path).expect("preserved strict bytes"),
+                downgraded_bytes
+            );
+            assert_eq!(
+                read_strict_anchor(&lock_path).expect("preserved current anchor"),
+                strong_current_anchor
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unanchored_schema_v2_history_is_preserved_for_explicit_recovery() {
+        isolated_state(|_| {
+            let session_id = "unanchored_legacy_preserved";
+            prepare("printf unanchored-legacy", session_id);
+            let state_path =
+                crate::session_warnings::session_state_path(session_id).expect("state");
+            let parent = state_path.parent().expect("state parent");
+            let strict_path = strict_state_path(parent, session_id);
+            let lock_path = crate::session_warnings::session_lock_path(session_id).expect("lock");
+            let (mut file, mut ledger, _, _, _) =
+                open_or_initialize_strict_state(parent, session_id, None, None)
+                    .expect("current strict state");
+            ledger.schema_version = LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION;
+            write_slot_frame(&mut file, 0, &ledger).expect("write legacy left slot");
+            write_slot_frame(&mut file, 1, &ledger).expect("write legacy right slot");
+            file.sync_all().expect("sync legacy slots");
+            drop(file);
+            fs::remove_file(strict_anchor_path(&lock_path)).expect("remove strong anchor fixture");
+            crate::util::fsync_parent_dir(&strict_path).expect("sync unanchored fixture");
+            let before = fs::read(&strict_path).expect("unanchored legacy bytes");
+
+            let error = prepare_execution(
+                &allow_verdict(),
+                &Policy::default(),
+                "printf do-not-delete",
+                session_id,
+                CallerContext::Cli,
+                ShellType::Posix,
+                Duration::from_secs(30),
+                Duration::from_secs(1),
+            )
+            .expect_err("unanchored historical state must require explicit recovery");
+            assert!(error.contains("lacks a cryptographic anchor"), "{error}");
+            assert_eq!(
+                fs::read(&strict_path).expect("preserved unanchored state"),
+                before
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_privacy_tombstone_retry_finishes_only_the_bound_legacy_inode() {
+        isolated_state(|_| {
+            let session_id = "privacy_tombstone_retry";
+            prepare("printf legacy-anchor-fixture", session_id);
+            let state_path =
+                crate::session_warnings::session_state_path(session_id).expect("state");
+            let parent = state_path.parent().expect("state parent");
+            let strict_path = strict_state_path(parent, session_id);
+            let lock_path = crate::session_warnings::session_lock_path(session_id).expect("lock");
+            let (mut file, mut ledger, _, _, _) =
+                open_or_initialize_strict_state(parent, session_id, None, None)
+                    .expect("current strict state");
+            ledger.schema_version = LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION;
+            write_slot_frame(&mut file, 0, &ledger).expect("write legacy left slot");
+            write_slot_frame(&mut file, 1, &ledger).expect("write legacy right slot");
+            file.sync_all().expect("sync legacy slots");
+            drop(file);
+
+            let lock = open_and_lock_secure(&lock_path, Instant::now() + Duration::from_secs(1))
+                .expect("lock tombstone fixture");
+            let active = active_anchor_for_ledger(&ledger).expect("strong legacy anchor");
+            let StrictAnchor::Active {
+                ledger_schema,
+                generation,
+                instance_id,
+                ..
+            } = active
+            else {
+                unreachable!()
+            };
+            let strict_identity =
+                path_identity(&strict_path, "legacy tombstone retry fixture").expect("identity");
+            let tombstone = StrictAnchor::PrivacyRetired {
+                legacy_schema: ledger_schema,
+                generation,
+                instance_id,
+                strict_device: strict_identity.device,
+                strict_inode: strict_identity.inode,
+            };
+            write_strict_anchor(&lock, &lock_path, &tombstone)
+                .expect("atomically publish crash-point tombstone");
+            drop(lock);
+            assert!(strict_path.exists(), "fixture must stop before unlink");
+
+            let error = prepare_execution(
+                &allow_verdict(),
+                &Policy::default(),
+                "printf retry-after-crash",
+                session_id,
+                CallerContext::Cli,
+                ShellType::Posix,
+                Duration::from_secs(30),
+                Duration::from_secs(1),
+            )
+            .expect_err("retry must finish bound legacy retirement, not recreate");
+            assert!(error.contains("retired for privacy"), "{error}");
+            assert!(!strict_path.exists());
+            assert_eq!(
+                read_strict_anchor(&lock_path).expect("durable tombstone"),
+                Some(tombstone)
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn privacy_tombstone_never_deletes_a_replaced_legacy_inode() {
+        isolated_state(|_| {
+            let session_id = "privacy_tombstone_replacement";
+            prepare("printf legacy-replacement-fixture", session_id);
+            let state_path =
+                crate::session_warnings::session_state_path(session_id).expect("state");
+            let parent = state_path.parent().expect("state parent");
+            let strict_path = strict_state_path(parent, session_id);
+            let lock_path = crate::session_warnings::session_lock_path(session_id).expect("lock");
+            let (mut file, mut ledger, _, _, _) =
+                open_or_initialize_strict_state(parent, session_id, None, None)
+                    .expect("current strict state");
+            ledger.schema_version = LEGACY_UNSAFE_EXECUTION_LEDGER_SCHEMA_VERSION;
+            write_slot_frame(&mut file, 0, &ledger).expect("write legacy left slot");
+            write_slot_frame(&mut file, 1, &ledger).expect("write legacy right slot");
+            file.sync_all().expect("sync legacy slots");
+            drop(file);
+
+            let original_identity =
+                path_identity(&strict_path, "legacy replacement fixture").expect("identity");
+            let tombstone = StrictAnchor::PrivacyRetired {
+                legacy_schema: ledger.schema_version,
+                generation: ledger.generation,
+                instance_id: ledger.instance_id.clone(),
+                strict_device: original_identity.device,
+                strict_inode: original_identity.inode,
+            };
+            let lock = open_and_lock_secure(&lock_path, Instant::now() + Duration::from_secs(1))
+                .expect("lock replacement fixture");
+            write_strict_anchor(&lock, &lock_path, &tombstone).expect("publish tombstone");
+            drop(lock);
+
+            let replacement = fs::read(&strict_path).expect("legacy replacement bytes");
+            crate::util::write_file_atomic_0600(&strict_path, &replacement)
+                .expect("replace legacy inode atomically");
+            crate::util::fsync_parent_dir(&strict_path).expect("sync replacement");
+            assert_ne!(
+                path_identity(&strict_path, "replaced legacy fixture").expect("identity"),
+                original_identity
+            );
+
+            let error = prepare_execution(
+                &allow_verdict(),
+                &Policy::default(),
+                "printf never-delete-replacement",
+                session_id,
+                CallerContext::Cli,
+                ShellType::Posix,
+                Duration::from_secs(30),
+                Duration::from_secs(1),
+            )
+            .expect_err("a tombstone must not authenticate a replacement inode");
+            assert!(error.contains("tombstone does not authenticate"), "{error}");
+            assert!(strict_path.exists(), "replacement strict state was deleted");
+            assert_eq!(
+                read_strict_anchor(&lock_path).expect("preserved tombstone"),
+                Some(tombstone)
+            );
+        });
     }
 
     // Strict execution-state preparation is Unix-only (`prepare_execution`

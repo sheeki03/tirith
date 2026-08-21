@@ -162,3 +162,5 @@ jobs:
         run: sh -n scripts/install.sh
       - name: verify_sha256 regression tests
         run: sh tests/install-sh/verify_sha256.sh
+      - name: package-approval helper return-path tests
+        run: sh tests/install-sh/package_approval_helper_returns.sh

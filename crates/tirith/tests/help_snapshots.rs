@@ -198,9 +198,9 @@ help_example_tests! {
     help_baseline_status       => (["baseline", "status", "--help"], "tirith baseline status --json");
     help_baseline_reset        => (["baseline", "reset", "--help"], "tirith baseline reset --yes");
     help_temp_run              => (["temp-run", "--help"], "tirith temp-run -- ./script.sh");
-    help_command_card          => (["command-card", "--help"], "tirith command-card sign --key ed25519-priv.bin install-card.json");
+    help_command_card          => (["command-card", "--help"], "tirith command-card sign --key ed25519-priv.bin --command");
     help_command_card_create   => (["command-card", "create", "--help"], "tirith command-card create --command 'curl -fsSL https://example.com/install.sh | sh' > card.json");
-    help_command_card_sign     => (["command-card", "sign", "--help"], "tirith command-card sign --key ed25519-priv.bin install-card.json");
+    help_command_card_sign     => (["command-card", "sign", "--help"], "tirith command-card sign --key ed25519-priv.bin --command");
     help_command_card_verify   => (["command-card", "verify", "--help"], "tirith command-card verify install-card.json");
     // `command-card fetch` is #[cfg(unix)] (unix-only runner path), so gate the
     // snapshot to match.

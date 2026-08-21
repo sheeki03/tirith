@@ -8,8 +8,9 @@ use std::time::Duration;
 
 mod contained_fs;
 
+pub(crate) use contained_fs::ContainedFilePreimage;
 #[doc(hidden)]
-pub use contained_fs::ContainedAtomicFile;
+pub use contained_fs::{ContainedAtomicFile, ContainedExclusiveLock};
 
 /// Why [`open_regular_capped`] refused to hand back a usable reader.
 #[derive(Debug)]

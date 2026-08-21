@@ -60,6 +60,7 @@ pub fn check_approval(verdict: &Verdict, policy: &Policy) -> Option<ApprovalMeta
         return None;
     }
 
+    let mut combined: Option<ApprovalMetadata> = None;
     for finding in &verdict.findings {
         let finding_rule_str = finding.rule_id.to_string();
         for approval_rule in &policy.approval_rules {
@@ -69,22 +70,82 @@ pub fn check_approval(verdict: &Verdict, policy: &Policy) -> Option<ApprovalMeta
                 } else {
                     finding.description.clone()
                 };
-                return Some(ApprovalMetadata {
+                let candidate = ApprovalMetadata {
                     requires_approval: true,
                     timeout_secs: approval_rule.timeout_secs,
                     fallback: approval_rule.fallback.clone(),
-                    rule_id: finding_rule_str,
+                    rule_id: finding_rule_str.clone(),
                     description: sanitize_description(&description),
-                });
+                };
+                match &mut combined {
+                    None => combined = Some(candidate),
+                    Some(current) => {
+                        let current_rank = fallback_rank(&current.fallback);
+                        let candidate_rank = fallback_rank(&candidate.fallback);
+                        let candidate_has_stricter_timeout = current.timeout_secs != 0
+                            && (candidate.timeout_secs == 0
+                                || candidate.timeout_secs > current.timeout_secs);
+                        if candidate_rank > current_rank
+                            || (candidate_rank == current_rank && candidate_has_stricter_timeout)
+                        {
+                            current.rule_id = candidate.rule_id.clone();
+                            current.description = candidate.description.clone();
+                        }
+                        if candidate_rank > current_rank {
+                            current.fallback = candidate.fallback;
+                        }
+                        current.timeout_secs =
+                            if current.timeout_secs == 0 || candidate.timeout_secs == 0 {
+                                0
+                            } else {
+                                current.timeout_secs.max(candidate.timeout_secs)
+                            };
+                    }
+                }
             }
         }
     }
 
-    None
+    combined
+}
+
+fn fallback_rank(value: &str) -> u8 {
+    match value {
+        "allow" => 0,
+        "warn" => 1,
+        // Unknown values are interpreted fail-closed by the execution surface;
+        // rank them with block so merging cannot replace them with permission.
+        _ => 2,
+    }
 }
 
 /// Apply approval metadata to a verdict (mutates in place).
+///
+/// Approval contracts compose monotonically. In particular, a generic approval
+/// rule must not replace an engine-native Web3 `fallback=block` contract with an
+/// allow/warn fallback merely because its finding was encountered first.
 pub fn apply_approval(verdict: &mut Verdict, metadata: &ApprovalMetadata) {
+    if verdict.requires_approval == Some(true) {
+        let existing_fallback = verdict.approval_fallback.as_deref().unwrap_or("block");
+        let new_is_stricter = fallback_rank(&metadata.fallback) > fallback_rank(existing_fallback);
+        if new_is_stricter {
+            verdict.approval_fallback = Some(metadata.fallback.clone());
+            verdict.approval_rule = Some(metadata.rule_id.clone());
+            verdict.approval_description = Some(metadata.description.clone());
+        }
+
+        // Zero is an unbounded wait and therefore never reaches a permissive
+        // fallback. Otherwise, retaining the longer timeout is monotonic for an
+        // approval gate: it cannot cause execution sooner without approval.
+        let existing_timeout = verdict.approval_timeout_secs.unwrap_or(0);
+        verdict.approval_timeout_secs =
+            Some(if existing_timeout == 0 || metadata.timeout_secs == 0 {
+                0
+            } else {
+                existing_timeout.max(metadata.timeout_secs)
+            });
+        return;
+    }
     verdict.requires_approval = Some(metadata.requires_approval);
     verdict.approval_timeout_secs = Some(metadata.timeout_secs);
     verdict.approval_fallback = Some(metadata.fallback.clone());
@@ -347,6 +408,64 @@ mod tests {
     }
 
     #[test]
+    fn check_approval_composes_all_matches_monotonically() {
+        let mut verdict = make_verdict(RuleId::CurlPipeShell, Severity::High);
+        let mut second = make_verdict(RuleId::DataExfiltration, Severity::Critical);
+        verdict.findings.push(second.findings.remove(0));
+        let mut policy = Policy {
+            approval_rules: vec![
+                ApprovalRule {
+                    rule_ids: vec!["curl_pipe_shell".to_string()],
+                    timeout_secs: 1,
+                    fallback: "allow".to_string(),
+                },
+                ApprovalRule {
+                    rule_ids: vec!["data_exfiltration".to_string()],
+                    timeout_secs: 0,
+                    fallback: "block".to_string(),
+                },
+            ],
+            ..Policy::default()
+        };
+
+        let metadata = check_approval(&verdict, &policy).expect("both rules match");
+        assert_eq!(metadata.fallback, "block");
+        assert_eq!(metadata.timeout_secs, 0);
+        assert_eq!(metadata.rule_id, "data_exfiltration");
+
+        verdict.findings.reverse();
+        policy.approval_rules.reverse();
+        let reordered = check_approval(&verdict, &policy).expect("both rules still match");
+        assert_eq!(reordered.fallback, "block");
+        assert_eq!(reordered.timeout_secs, 0);
+        assert_eq!(reordered.rule_id, "data_exfiltration");
+    }
+
+    #[test]
+    fn check_approval_composes_overlapping_rules_for_one_finding() {
+        let verdict = make_verdict(RuleId::CurlPipeShell, Severity::High);
+        let policy = Policy {
+            approval_rules: vec![
+                ApprovalRule {
+                    rule_ids: vec!["curl_pipe_shell".to_string()],
+                    timeout_secs: 15,
+                    fallback: "warn".to_string(),
+                },
+                ApprovalRule {
+                    rule_ids: vec!["curl_pipe_shell".to_string()],
+                    timeout_secs: 30,
+                    fallback: "block".to_string(),
+                },
+            ],
+            ..Policy::default()
+        };
+
+        let metadata = check_approval(&verdict, &policy).expect("both rules match");
+        assert_eq!(metadata.fallback, "block");
+        assert_eq!(metadata.timeout_secs, 30);
+    }
+
+    #[test]
     fn test_sanitize_description_basic() {
         assert_eq!(
             sanitize_description("Normal text with (parens) and 123"),
@@ -419,6 +538,38 @@ mod tests {
         assert_eq!(verdict.approval_timeout_secs, Some(60));
         assert_eq!(verdict.approval_fallback.as_deref(), Some("warn"));
         assert_eq!(verdict.approval_rule.as_deref(), Some("curl_pipe_shell"));
+    }
+
+    #[test]
+    fn generic_approval_cannot_weaken_engine_native_block_fallback() {
+        let mut verdict = make_verdict(RuleId::Web3NetworkPolicyViolation, Severity::Medium);
+        verdict.requires_approval = Some(true);
+        verdict.approval_timeout_secs = Some(0);
+        verdict.approval_fallback = Some("block".to_string());
+        verdict.approval_rule = Some("web3_network_policy_violation".to_string());
+        verdict.approval_description = Some("Web3 policy approval".to_string());
+
+        apply_approval(
+            &mut verdict,
+            &ApprovalMetadata {
+                requires_approval: true,
+                timeout_secs: 1,
+                fallback: "allow".to_string(),
+                rule_id: "data_exfiltration".to_string(),
+                description: "generic approval".to_string(),
+            },
+        );
+
+        assert_eq!(verdict.approval_timeout_secs, Some(0));
+        assert_eq!(verdict.approval_fallback.as_deref(), Some("block"));
+        assert_eq!(
+            verdict.approval_rule.as_deref(),
+            Some("web3_network_policy_violation")
+        );
+        assert_eq!(
+            verdict.approval_description.as_deref(),
+            Some("Web3 policy approval")
+        );
     }
 
     #[test]

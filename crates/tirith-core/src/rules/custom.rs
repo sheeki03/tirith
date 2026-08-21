@@ -5,6 +5,18 @@ use crate::extract::ScanContext;
 use crate::policy::CustomRule;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
+fn diagnostic_text(value: &str) -> String {
+    let share_safe =
+        crate::redact::redact_for_audience(value, crate::redact::ShareAudience::PublicPaste)
+            .redacted_content;
+    crate::mcp::output_filter::sanitize_for_display(&crate::redact::redact_blocked_output(
+        &share_safe,
+    ))
+    .replace('\r', "\\r")
+    .replace('\n', "\\n")
+    .replace('\t', "\\t")
+}
+
 /// The matcher half of a compiled custom rule: a regex or a `when:` clause
 /// (M13 ch4 DSL). A rule carries exactly one.
 pub enum CompiledMatcher {
@@ -39,9 +51,11 @@ fn parse_contexts(rule: &CustomRule) -> Vec<ScanContext> {
             "paste" => Some(ScanContext::Paste),
             "file" => Some(ScanContext::FileScan),
             other => {
+                let rule_id = diagnostic_text(&rule.id);
+                let other = diagnostic_text(other);
                 eprintln!(
                     "tirith: warning: custom rule '{}' has unknown context: {other}",
-                    rule.id
+                    rule_id
                 );
                 None
             }
@@ -62,8 +76,10 @@ fn parse_contexts(rule: &CustomRule) -> Vec<ScanContext> {
 pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
     let mut compiled = Vec::new();
     for rule in rules {
+        let rule_id = diagnostic_text(&rule.id);
         if let Err(e) = rule.validate_shape() {
-            eprintln!("tirith: warning: custom rule '{}' {e}, skipping", rule.id);
+            let error = diagnostic_text(&e.to_string());
+            eprintln!("tirith: warning: custom rule '{rule_id}' {error}, skipping");
             continue;
         }
 
@@ -76,7 +92,7 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
             if declared.is_empty() {
                 eprintln!(
                     "tirith: warning: custom rule '{}' has no valid contexts, skipping",
-                    rule.id
+                    rule_id
                 );
                 continue;
             }
@@ -85,7 +101,7 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
             if pattern.chars().count() > 1024 {
                 eprintln!(
                     "tirith: custom rule '{}' pattern too long ({} chars), skipping",
-                    rule.id,
+                    rule_id,
                     pattern.chars().count()
                 );
                 continue;
@@ -93,9 +109,9 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
             match Regex::new(pattern) {
                 Ok(r) => (declared, CompiledMatcher::Regex(r)),
                 Err(e) => {
+                    let error = diagnostic_text(&e.to_string());
                     eprintln!(
-                        "tirith: warning: custom rule '{}' has invalid regex: {e}",
-                        rule.id
+                        "tirith: warning: custom rule '{rule_id}' has invalid regex: {error}"
                     );
                     continue;
                 }
@@ -104,9 +120,9 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
             // Validate inner regexes up front so a bad one is a skip, not a
             // per-input recompile failure.
             if let Err(e) = custom_rule_dsl::validate_regexes(when) {
+                let error = diagnostic_text(&e.to_string());
                 eprintln!(
-                    "tirith: warning: custom rule '{}' has invalid when-clause: {e}",
-                    rule.id
+                    "tirith: warning: custom rule '{rule_id}' has invalid when-clause: {error}"
                 );
                 continue;
             }
@@ -115,10 +131,8 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
             // match (CodeRabbit M13 round-8 R8-1). Done before the satisfiability
             // check so it isn't misreported as "unsatisfiable".
             if let Some(reason) = custom_rule_dsl::clause_uses_unsupported_predicate(when) {
-                eprintln!(
-                    "tirith: warning: custom rule '{}' {reason}, skipping",
-                    rule.id
-                );
+                let reason = diagnostic_text(reason);
+                eprintln!("tirith: warning: custom rule '{rule_id}' {reason}, skipping");
                 continue;
             }
             // Per-clause satisfiability + coverage (CodeRabbit M13 round-9 R9-1).
@@ -130,7 +144,7 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
             if satisfiable.is_empty() {
                 eprintln!(
                     "tirith: warning: custom rule '{}' when-clause needs facts from contexts that never co-occur in a single scan (e.g. command + file), skipping",
-                    rule.id
+                    rule_id
                 );
                 continue;
             }
@@ -145,7 +159,7 @@ pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
             if runtime_contexts.is_empty() {
                 eprintln!(
                     "tirith: warning: custom rule '{}' when-clause can only be evaluated in context [{}] not covered by its declared context, skipping",
-                    rule.id,
+                    rule_id,
                     satisfiable.describe()
                 );
                 continue;
@@ -382,6 +396,19 @@ mod tests {
         let rules = vec![make_rule("bad", r"(unclosed", &["exec"])];
         let compiled = compile_rules(&rules);
         assert_eq!(compiled.len(), 0);
+    }
+
+    #[test]
+    fn diagnostic_projection_hides_identifiers_patterns_and_paths() {
+        let secret = format!("ghp_{}", "R".repeat(36));
+        let diagnostic = diagnostic_text(&format!(
+            "rule={secret} path=/Users/alice/private/{secret}.yaml"
+        ));
+        assert!(!diagnostic.contains(&secret), "{diagnostic}");
+        assert!(!diagnostic.contains("/Users/alice"), "{diagnostic}");
+        assert!(diagnostic.contains("REDACTED"), "{diagnostic}");
+
+        assert_eq!(diagnostic_text("ordinary-rule"), "ordinary-rule");
     }
 
     #[test]

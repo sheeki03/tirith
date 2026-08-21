@@ -10,6 +10,7 @@ License:        AGPL-3.0-only
 URL:            https://github.com/sheeki03/tirith
 
 Requires:       ca-certificates
+Requires:       sudo
 
 %description
 Terminal security tool that intercepts commands and pasted text, detects
@@ -18,6 +19,7 @@ patterns before they execute.
 
 %install
 mkdir -p %{buildroot}%{_bindir}
+mkdir -p %{buildroot}%{_libexecdir}
 mkdir -p %{buildroot}%{_datadir}/tirith/shell/lib
 mkdir -p %{buildroot}%{_datadir}/bash-completion/completions
 mkdir -p %{buildroot}%{_datadir}/zsh/site-functions
@@ -26,6 +28,7 @@ mkdir -p %{buildroot}%{_mandir}/man1
 mkdir -p %{buildroot}%{_licensedir}/%{name}
 
 install -m 755 %{_sourcedir}/tirith %{buildroot}%{_bindir}/
+install -m 755 %{_sourcedir}/tirith-package-approval-authority %{buildroot}%{_libexecdir}/
 install -m 644 %{_sourcedir}/shell/tirith.sh %{buildroot}%{_datadir}/tirith/shell/
 install -m 644 %{_sourcedir}/shell/lib/* %{buildroot}%{_datadir}/tirith/shell/lib/
 install -m 644 %{_sourcedir}/completions/tirith.bash %{buildroot}%{_datadir}/bash-completion/completions/tirith
@@ -39,6 +42,7 @@ install -m 644 %{_sourcedir}/LICENSE-COMMERCIAL %{buildroot}%{_licensedir}/%{nam
 %license %{_licensedir}/%{name}/LICENSE-AGPL
 %doc %{_licensedir}/%{name}/LICENSE-COMMERCIAL
 %{_bindir}/tirith
+%{_libexecdir}/tirith-package-approval-authority
 %{_datadir}/tirith/
 %{_datadir}/bash-completion/completions/tirith
 %{_datadir}/zsh/site-functions/_tirith
