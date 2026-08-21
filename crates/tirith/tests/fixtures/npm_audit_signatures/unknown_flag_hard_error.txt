@@ -1,0 +1,5 @@
+Unknown argument: --include-attestations
+
+Usage: npm audit [fix|signatures]
+
+Run "npm help audit" for more info

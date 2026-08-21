@@ -2352,6 +2352,18 @@ fn command_base_name_for_shell(raw: &str, shell: ShellType) -> String {
     crate::rules::command::normalize_cmd_base(raw, shell)
 }
 
+/// Whether the POSIX wrapper chain exhausts the canonical bounded resolver.
+///
+/// Kept as the legacy extractor entry point, but deliberately delegates to the
+/// command resolver so option-value roles cannot drift between resolution and
+/// the independent fail-closed depth check.
+pub fn wrapper_chain_exceeds_depth(segment: &Segment) -> bool {
+    matches!(
+        crate::rules::command::resolve_effective_segment(segment, ShellType::Posix),
+        Err(crate::rules::command::EffectiveCommandError::WrapperChainTooDeep)
+    )
+}
+
 fn resolve_segment_command_for_shell(
     segment: &Segment,
     shell: ShellType,
@@ -4993,6 +5005,15 @@ fn scan_find_exec_bodies(args: &[String], shell: ShellType, scan: &mut Executabl
             index += 1;
             continue;
         };
+        let operand_arity = crate::rules::command::find_non_exec_operand_arity(&primary);
+        if operand_arity > 0 {
+            // A predicate value is data even when it is spelled like an action:
+            // `find . -name -exec -print` searches for the literal name
+            // `-exec`; it does not execute `-print`. Skip every consumed word
+            // before looking for a real action primary.
+            index = index.saturating_add(1 + operand_arity);
+            continue;
+        }
         if !matches!(primary.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
             index += 1;
             continue;
@@ -14275,6 +14296,20 @@ mod tests {
                 }),
                 "{input:?} -> {scan:?}"
             );
+        }
+    }
+
+    #[test]
+    fn find_action_spellings_used_as_predicate_operands_are_not_executed() {
+        for input in [
+            "find . -name -exec -print",
+            "find . -path -execdir -print",
+            "find . -newer -ok -print",
+            "find . -fprintf -okdir -exec -print",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.bodies.is_empty(), "{input:?} -> {scan:?}");
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
         }
     }
 

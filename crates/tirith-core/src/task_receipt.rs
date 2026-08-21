@@ -91,6 +91,7 @@ enum OwnedBoundaryProjectionV1 {
     RemoteScriptRun,
     FetchCloaking,
     ConfigWrite,
+    CapsulePresetRun,
 }
 
 impl From<OwnedBoundary> for OwnedBoundaryProjectionV1 {
@@ -105,6 +106,7 @@ impl From<OwnedBoundary> for OwnedBoundaryProjectionV1 {
             OwnedBoundary::RemoteScriptRun => Self::RemoteScriptRun,
             OwnedBoundary::FetchCloaking => Self::FetchCloaking,
             OwnedBoundary::ConfigWrite => Self::ConfigWrite,
+            OwnedBoundary::CapsulePresetRun => Self::CapsulePresetRun,
         }
     }
 }
@@ -121,6 +123,7 @@ impl From<OwnedBoundaryProjectionV1> for OwnedBoundary {
             OwnedBoundaryProjectionV1::RemoteScriptRun => Self::RemoteScriptRun,
             OwnedBoundaryProjectionV1::FetchCloaking => Self::FetchCloaking,
             OwnedBoundaryProjectionV1::ConfigWrite => Self::ConfigWrite,
+            OwnedBoundaryProjectionV1::CapsulePresetRun => Self::CapsulePresetRun,
         }
     }
 }
@@ -2278,6 +2281,7 @@ mod tests {
             (OwnedBoundary::RemoteScriptRun, "remote_script_run"),
             (OwnedBoundary::FetchCloaking, "fetch_cloaking"),
             (OwnedBoundary::ConfigWrite, "config_write"),
+            (OwnedBoundary::CapsulePresetRun, "capsule_preset_run"),
         ];
         for (boundary, wire_name) in cases {
             let projection = OwnedBoundaryProjectionV1::from(boundary);

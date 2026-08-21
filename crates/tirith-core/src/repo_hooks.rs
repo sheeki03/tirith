@@ -1380,6 +1380,45 @@ fn run_trusted_git(
     run_trusted_git_inner(repo_root, args, stdout_cap, true)
 }
 
+/// What one bounded, hardened Git invocation produced, for callers outside this
+/// module.
+///
+/// A separate type from [`TrustedGitOutput`] so the hook inspector's internal
+/// record stays private and can change shape without becoming a cross-module
+/// contract.
+pub(crate) struct BoundedGitOutput {
+    pub(crate) success: bool,
+    pub(crate) stdout: Vec<u8>,
+}
+
+/// Run one read-only Git command through the SAME hardened envelope the hook
+/// inspector uses, for callers in other modules.
+///
+/// Exposed rather than replicated because rebuilding this envelope inline (the
+/// null hooks path, the disabled system config, the disabled terminal prompt and
+/// credential helper, the fsmonitor and untracked-cache suppression, the time
+/// and output bounds) is a known failure mode in this repository: a caller that
+/// forgets one line runs repository-controlled code from a hook.
+pub(crate) fn run_trusted_git_bounded(
+    repo_root: &Path,
+    args: &[String],
+    stdout_cap: usize,
+) -> Result<BoundedGitOutput, &'static str> {
+    run_trusted_git(repo_root, args, stdout_cap).map(|output| BoundedGitOutput {
+        success: output.success,
+        stdout: output.stdout,
+    })
+}
+
+/// The resolved path of the trusted system Git, when one is available. `None`
+/// means no candidate passed the trusted-executable validator, which callers
+/// must record as an absent identity rather than fabricating one.
+pub(crate) fn trusted_git_path() -> Option<std::path::PathBuf> {
+    trusted_git_executable()
+        .ok()
+        .map(|executable| executable.path().to_path_buf())
+}
+
 /// Resolve Git's own hook path while retaining the repository-local
 /// `core.hooksPath`. The explicit `rev-parse` callers are read-only and cannot
 /// execute hooks; every other trusted Git call keeps hooks redirected to null.
@@ -3608,24 +3647,22 @@ fn collect_hook_command_facts(
             .unwrap_or_default();
         if !command.is_empty() {
             facts.commands.insert(command.clone());
-            let subcommand = effective
-                .args
-                .iter()
-                .map(|arg| crate::rules::command::normalize_shell_token(arg, shell))
-                .find(|arg| !arg.is_empty() && !arg.starts_with('-'));
-            match (command.as_str(), subcommand.as_deref()) {
-                ("npx" | "pnpx" | "bunx", _) => {
-                    facts.package_fetch_runners.insert(command.clone());
+            // Fetch-and-run classification is the shared npm grammar's job, so
+            // a form this scanner recognizes is exactly a form the threat
+            // extractor recognizes. `pnpm exec` / `yarn exec` run something
+            // already on disk and are deliberately not fetches.
+            if let Some(launcher) = crate::npm_command::NpmLauncher::from_basename(&command) {
+                let args: Vec<String> = effective
+                    .args
+                    .iter()
+                    .map(|arg| crate::rules::command::normalize_shell_token(arg, shell))
+                    .collect();
+                let invocation = crate::npm_command::parse_resolved(launcher, &args);
+                if invocation.fetches_remote_package() {
+                    facts
+                        .package_fetch_runners
+                        .insert(invocation.runner_label());
                 }
-                ("pnpm" | "yarn", Some("dlx"))
-                | ("npm", Some("exec" | "x"))
-                | ("bun", Some("x")) => {
-                    facts.package_fetch_runners.insert(format!(
-                        "{command} {}",
-                        subcommand.as_deref().unwrap_or_default()
-                    ));
-                }
-                _ => {}
             }
             if matches!(
                 segment.preceding_separator.as_deref(),

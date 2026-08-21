@@ -17,6 +17,7 @@ tirith itself launches, never to arbitrary shell commands.
 | `tirith temp-run` | `--capsule` | deny-all | best-effort (runs uncontained if no backend, and says so) |
 | `tirith gateway run` | `--capsule` (or the `secure` gateway profile) | deny-all | fail closed |
 | `tirith pkg install` (enforcing execution is x86_64 Linux-only) | always | deny-all | fail closed; every other platform or architecture refuses before pip starts |
+| `tirith capsule run` (enforceable on x86_64 Linux only) | `--preset untrusted-project` | deny-all (no domain allow-listing is offered) | fail closed; every other platform or architecture refuses before anything is copied or spawned |
 
 "Fail closed" means: if this host's backend cannot enforce the containment the
 surface requires, the command refuses to run rather than running the child
@@ -27,6 +28,71 @@ explicitly a filesystem-impact preview rather than a security boundary; with
 The `tirith pkg install` platform limit applies only to the enforcing execution
 step. `tirith pkg approve` remains a non-installing approval flow, and
 `tirith pkg verify-env` verifies an existing environment without launching pip.
+
+### The untrusted-project preset
+
+`tirith capsule run --preset untrusted-project --project . --receipt <path> --
+<argv>` is the recruiter-task surface: you were sent a repository and asked to
+run it. The project is copied into a held ephemeral directory and the argv runs
+there, with write access to the copy and a private temporary HOME and nothing
+else.
+
+The copy is a refusal-based copy, not a best-effort one. A symlink, a hardlink,
+an entry on another filesystem mounted inside the tree, a path that escapes the
+project root, a case or Unicode name collision, a fifo, a socket, a device, or a
+non-UTF-8 name all REFUSE the run. Silently skipping any of them would leave you
+believing the whole project was copied, and a hardlink in particular is a second
+name for content the project root does not contain, which is how a file is
+smuggled out of a denied directory one inode at a time. `.git` is excluded at
+every depth, including a submodule `.git` file, and the copy caps at 100,000
+files, 200,000 entries of every kind, 256 levels of nesting, and 2 GiB.
+
+The walk is depth-first and holds two open descriptors per level, so it needs
+descriptors proportional to the DEPTH of the tree rather than to the width of
+its widest directory. A vendored dependency tree with thousands of sibling
+packages copies on a stock `RLIMIT_NOFILE`.
+
+The copy is handed to the contained child as the DESCRIPTOR the parent has held
+since it created the directory: the launcher enters it with `fchdir` and builds
+the Landlock write rule from that same descriptor. Nothing re-resolves the
+pathname after the parent proved its identity, so a same-UID rename plus symlink
+cannot redirect either the working directory or the write grant.
+
+Resource ceilings are the shared `ResourceLimits::conservative()` values (CPU
+120 s, wall 300 s, memory 2 GiB, 256 processes, 256 open files, 16 MiB combined
+output), tightened further by any `task_gate` policy through the existing
+denied-effect merge. Two of those dimensions, combined output and wall clock,
+are enforced by the PARENT supervisor rather than by any OS backend; the receipt
+names them so a reader never attributes them to the sandbox.
+
+Domain allow-listing is deliberately not offered. `domain_proxy_enforced` is
+`false` in all three OS backends, and a coverage ledger may not claim domain
+egress without raw-socket denial, so an allow-list preset would fail closed on
+every host while implying a capability the product does not have. Dependencies
+must be vendored or installed by a separate trusted transaction; this preset
+performs no network dependency installation.
+
+Every invocation writes one signed, content-addressed receipt, including a
+refusal. It records the argv DIGEST (never the argv), the project input and
+output tree digests, the backend, requested versus achieved coverage, the
+effective limits, the child's exit status separately from Tirith's own decision,
+the termination reason, a bounded file diff, whether an ephemeral copy of the
+project was materialized at all, and cleanup confirmation covering all three
+ephemeral artifacts (the project copy, the process tree, and the temporary
+HOME). Absolute host paths are redacted out of the recorded reason, because the
+receipt is the copy you hand to someone else. A run that was not fully contained
+is recorded as `partial` or `refused`, never as a contained result. Exit codes
+are 0 (contained, child exited 0), 1 (a Tirith decision: refused before launch,
+terminated after it, or a run whose receipt could not be recorded or could not
+be anchored in the audit chain), 2 (usage or input error), and 3 (contained, but
+the child itself exited non-zero).
+
+The preset is enforceable on x86_64 Linux with a usable Landlock ABI and nowhere
+else. Raw-network denial needs seccomp, which is x86_64 Linux only in this
+build; macOS cannot enforce a per-process memory ceiling or a process-count
+ceiling at all; and the parent-owned wall-clock and combined-output supervisor
+is Linux-only. Every other host refuses before anything is copied or spawned,
+naming the exact control it could not deliver.
 
 ### Linux reviewed-execution proof
 

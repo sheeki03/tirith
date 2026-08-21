@@ -58,10 +58,30 @@ fn maven_intent_from_opt_token(token: Option<&str>) -> VersionIntent {
     }
 }
 
+/// The outcome of package extraction, including whether the list is COMPLETE.
+///
+/// The bare `Vec<PackageRef>` has no way to say "there were more". A consumer
+/// that assesses only what it was handed and reports a clean verdict is
+/// asserting something the extractor never promised, so any consumer whose
+/// output is a security decision must read [`Self::truncated`] and disclose it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtractedPackages {
+    pub packages: Vec<PackageRef>,
+    /// True when a per-invocation cap
+    /// ([`crate::npm_command::MAX_PACKAGES_PER_INVOCATION`]) cut the list. The
+    /// retained packages are a deterministic ordered prefix.
+    pub truncated: bool,
+}
+
 /// POSIX compatibility entry point for callers that already tokenize without a
 /// shell parameter.
 pub fn extract_packages(segments: &[Segment]) -> Vec<PackageRef> {
     extract_packages_for_shell(segments, ShellType::Posix)
+}
+
+/// [`extract_packages`] with the completeness flag retained.
+pub fn extract_packages_detail(segments: &[Segment]) -> ExtractedPackages {
+    extract_packages_detail_for_shell(segments, ShellType::Posix)
 }
 
 /// Extract package references from tokenized shell segments. Recognizes
@@ -74,7 +94,17 @@ pub fn extract_packages(segments: &[Segment]) -> Vec<PackageRef> {
 /// `sudo pip ...`, `env npm ...`, Windows paths, and platform launcher suffixes
 /// on the same threat-intelligence path as their bare forms.
 pub fn extract_packages_for_shell(segments: &[Segment], shell: ShellType) -> Vec<PackageRef> {
+    extract_packages_detail_for_shell(segments, shell).packages
+}
+
+/// [`extract_packages_for_shell`] with the completeness flag retained. Use this
+/// wherever the result feeds a verdict.
+pub fn extract_packages_detail_for_shell(
+    segments: &[Segment],
+    shell: ShellType,
+) -> ExtractedPackages {
     let mut packages = Vec::new();
+    let mut truncated = false;
 
     for seg in segments {
         let (resolved_command, resolved_args) =
@@ -89,12 +119,18 @@ pub fn extract_packages_for_shell(segments: &[Segment], shell: ShellType) -> Vec
             .map(|arg| crate::rules::command::normalize_shell_token(arg, shell))
             .collect();
 
+        // The npm family has one grammar for every consumer; this module owns
+        // no private copy of it. See `crate::npm_command`.
+        if let Some(launcher) = crate::npm_command::NpmLauncher::from_basename(&cmd_name) {
+            let invocation = crate::npm_command::parse_resolved(launcher, &args);
+            truncated |= invocation.truncated;
+            packages.extend(invocation.explicit_packages);
+            continue;
+        }
+
         match cmd_name.as_str() {
             "pip" | "pip3" | "uv" => {
                 extract_pip_packages(&args, &mut packages);
-            }
-            "npm" | "npx" | "yarn" | "pnpm" | "bun" => {
-                extract_npm_packages(&cmd_name, &args, &mut packages);
             }
             "cargo" => {
                 extract_cargo_packages(&args, &mut packages);
@@ -118,7 +154,10 @@ pub fn extract_packages_for_shell(segments: &[Segment], shell: ShellType) -> Vec
         }
     }
 
-    packages
+    ExtractedPackages {
+        packages,
+        truncated,
+    }
 }
 
 const MAX_EXECUTABLE_PACKAGE_DEPTH: usize = 8;
@@ -155,24 +194,39 @@ pub(crate) fn extract_packages_from_input(input: &str, shell: ShellType) -> Vec<
     packages
 }
 
-/// Return a normalized package-manager launcher name. Both path separators are
-/// accepted deliberately: commands can arrive from copied cross-platform
-/// snippets, and PowerShell accepts `/` as well as `\` in executable paths.
-/// Windows launcher suffixes are stripped only at the final path component.
-fn package_command_name(command: &str, shell: ShellType) -> String {
-    let normalized = crate::rules::command::normalize_shell_token(command.trim(), shell);
-    let basename = normalized
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(normalized.as_str())
-        .to_ascii_lowercase();
-
-    for suffix in [".exe", ".cmd", ".bat", ".com", ".ps1"] {
-        if let Some(stem) = basename.strip_suffix(suffix) {
-            return stem.to_string();
-        }
+/// The truncation-disclosing finding for a package list that hit the grammar's
+/// cap. Budget exhaustion is surfaced the way the rest of the engine surfaces
+/// it (see [`RuleId::AnalysisIncomplete`] in `rules::command`): the unexamined
+/// remainder is reported, never treated as clean.
+fn truncated_package_list_finding() -> Finding {
+    Finding {
+        rule_id: RuleId::AnalysisIncomplete,
+        severity: Severity::High,
+        title: "Package list exceeded the analysis budget".to_string(),
+        description: format!(
+            "The command names more than {} distinct packages in a single invocation. Tirith \
+             assessed the first {} and cannot vouch for the rest, so the command is reported as \
+             incompletely analyzed instead of clean. Split the install into smaller commands to \
+             have every package assessed.",
+            crate::npm_command::MAX_PACKAGES_PER_INVOCATION,
+            crate::npm_command::MAX_PACKAGES_PER_INVOCATION
+        ),
+        evidence: vec![Evidence::CommandPattern {
+            pattern: "bounded package-extraction budget exhausted".to_string(),
+            matched: "package operands omitted after the extraction cap".to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
     }
-    basename
+}
+
+/// Return a normalized package-manager launcher name. Lives in
+/// [`crate::npm_command`] so the npm family and every other ecosystem strip
+/// wrappers, directories and platform executable suffixes identically.
+fn package_command_name(command: &str, shell: ShellType) -> String {
+    crate::npm_command::launcher_basename(command, shell)
 }
 
 /// Flags for pip that consume the next argument (so it should be skipped).
@@ -330,308 +384,6 @@ fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
 /// ThreatDb indices (PEP 503 separator-run folding included).
 fn normalize_pypi_name(name: &str) -> String {
     threatdb::canonical_package_name(Ecosystem::PyPI, name)
-}
-
-/// Flags for npm/yarn/pnpm that consume the next argument.
-const NPM_ARG_FLAGS: &[&str] = &[
-    "--registry",
-    "--tag",
-    "--scope",
-    "--otp",
-    "--workspace",
-    "-w",
-    "--prefix",
-];
-
-fn extract_npm_packages(cmd_name: &str, args: &[String], packages: &mut Vec<PackageRef>) {
-    let mut iter = args.iter().peekable();
-    let mut found_subcmd = false;
-
-    // npx is special: `npx foo` runs `foo` directly; one or more
-    // `--package`/`-p` options override that inference (then the first
-    // positional is an entry point, not a package). npx requires its own
-    // options before the first positional, so stop option parsing there: a
-    // later `--package=...` belongs to the executed program.
-    if cmd_name == "npx" {
-        let mut has_explicit_package = false;
-        let mut first_positional = None;
-        let mut options_enabled = true;
-        let mut i = 0;
-
-        while i < args.len() {
-            let arg = args[i].as_str();
-
-            if options_enabled && arg == "--" {
-                options_enabled = false;
-                i += 1;
-                continue;
-            }
-
-            if options_enabled {
-                if let Some(spec) = npx_attached_package_spec(arg) {
-                    if let Some(pr) = parse_npx_package_spec(spec) {
-                        packages.push(pr);
-                        has_explicit_package = true;
-                    }
-                    i += 1;
-                    continue;
-                }
-
-                if matches!(arg, "--package" | "-p") {
-                    if let Some(spec) = args.get(i + 1).map(String::as_str) {
-                        if let Some(pr) = parse_npx_package_spec(spec) {
-                            packages.push(pr);
-                            has_explicit_package = true;
-                        }
-                    }
-                    i += 2;
-                    continue;
-                }
-
-                if npx_split_option_takes_value(arg)
-                    || npx_split_option_takes_conditional_value(
-                        arg,
-                        args.get(i + 1).map(String::as_str),
-                    )
-                {
-                    // `--call`, workspace, shell, and legacy npx options carry
-                    // command/config values, never inferred package identity.
-                    i += 2;
-                    continue;
-                }
-
-                if npx_has_attached_non_package_value(arg) || arg.starts_with('-') {
-                    i += 1;
-                    continue;
-                }
-            }
-
-            first_positional = Some(arg);
-            break;
-        }
-
-        if !has_explicit_package {
-            if let Some(pr) = first_positional.and_then(parse_npx_package_spec) {
-                packages.push(pr);
-            }
-        }
-        return;
-    }
-
-    while let Some(arg) = iter.next() {
-        let lower = arg.to_lowercase();
-        if !found_subcmd {
-            if matches!(lower.as_str(), "install" | "i" | "add") {
-                found_subcmd = true;
-            }
-            continue;
-        }
-
-        if arg.starts_with('-') {
-            let lower_ref = lower.as_str();
-            if NPM_ARG_FLAGS.contains(&lower_ref) {
-                let _ = iter.next();
-            }
-            continue;
-        }
-
-        if arg.contains("://") || arg.starts_with('.') || arg.starts_with('/') {
-            continue;
-        }
-
-        if let Some(pr) = parse_npm_package_spec(arg) {
-            packages.push(pr);
-        }
-    }
-}
-
-/// Explicit package forms accepted by the npx executable. `-p` is npx's
-/// package shorthand (unlike `npm exec`, where it means `--parseable`). npm's
-/// option parser accepts both `-p=value` and a short option with an attached
-/// value, so retain both forms.
-fn npx_attached_package_spec(arg: &str) -> Option<&str> {
-    if let Some(spec) = arg.strip_prefix("--package=") {
-        return Some(spec);
-    }
-    let spec = arg.strip_prefix("-p")?;
-    if spec.is_empty() {
-        return None;
-    }
-    Some(spec.strip_prefix('=').unwrap_or(spec))
-}
-
-/// npm allows any config key before an npx positional. Keep the value-taking
-/// keys in one explicit table so their following values cannot be mistaken for
-/// the package/entrypoint. Boolean-only keys are intentionally absent: their
-/// next token remains the inferred package. Array-valued keys consume one token
-/// per occurrence, matching npm's argv parser.
-const NPX_VALUE_LONG_OPTIONS: &[&str] = &[
-    "--_auth",
-    "--access",
-    "--also",
-    "--audit-level",
-    "--auth-type",
-    "--before",
-    "--browser",
-    "--ca",
-    "--cache",
-    "--cache-max",
-    "--cache-min",
-    "--cafile",
-    "--call",
-    "--cert",
-    "--cidr",
-    "--cpu",
-    "--depth",
-    "--diff",
-    "--diff-dst-prefix",
-    "--diff-src-prefix",
-    "--diff-unified",
-    "--editor",
-    "--expect-result-count",
-    "--fetch-retries",
-    "--fetch-retry-factor",
-    "--fetch-retry-maxtimeout",
-    "--fetch-retry-mintimeout",
-    "--fetch-timeout",
-    "--git",
-    "--globalconfig",
-    "--heading",
-    "--https-proxy",
-    "--include",
-    "--init-author-email",
-    "--init-author-name",
-    "--init-author-url",
-    "--init-license",
-    "--init-module",
-    "--init-version",
-    "--init.author.email",
-    "--init.author.name",
-    "--init.author.url",
-    "--init.license",
-    "--init.module",
-    "--init.version",
-    "--install-strategy",
-    "--key",
-    "--libc",
-    "--local-address",
-    "--location",
-    "--lockfile-version",
-    "--loglevel",
-    "--logs-dir",
-    "--logs-max",
-    "--maxsockets",
-    "--message",
-    "--node-arg",
-    "--node-options",
-    "--noproxy",
-    "--npm",
-    "--omit",
-    "--only",
-    "--os",
-    "--otp",
-    "--pack-destination",
-    "--prefix",
-    "--preid",
-    "--provenance-file",
-    "--proxy",
-    "--registry",
-    "--replace-registry-host",
-    "--save-prefix",
-    "--sbom-format",
-    "--sbom-type",
-    "--scope",
-    "--script-shell",
-    "--searchexclude",
-    "--searchlimit",
-    "--searchopts",
-    "--searchstaleness",
-    "--shell",
-    "--tag",
-    "--tag-version-prefix",
-    "--umask",
-    "--user-agent",
-    "--userconfig",
-    "--viewer",
-    "--which",
-    "--workspace",
-];
-
-fn npx_split_option_takes_value(arg: &str) -> bool {
-    NPX_VALUE_LONG_OPTIONS.contains(&arg) || matches!(arg, "-c" | "-w" | "-n" | "-C" | "-L" | "-m")
-}
-
-/// npm's `color` config is a Boolean with one extra enum value. Its following
-/// token is consumed only when it is a Boolean spelling or `always`; an
-/// arbitrary token remains npx's entrypoint/package. Treating every following
-/// token as the option value would hide `npx --color malicious-package`.
-fn npx_split_option_takes_conditional_value(arg: &str, next: Option<&str>) -> bool {
-    arg == "--color"
-        && next.is_some_and(|value| {
-            value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("always")
-        })
-}
-
-fn npx_has_attached_non_package_value(arg: &str) -> bool {
-    if arg.starts_with("--") && arg.contains('=') {
-        return true;
-    }
-
-    ["-c", "-w", "-n", "-C", "-L", "-m"]
-        .iter()
-        .any(|prefix| arg.starts_with(prefix) && arg.len() > prefix.len())
-}
-
-fn parse_npx_package_spec(spec: &str) -> Option<PackageRef> {
-    if spec.is_empty() || spec.starts_with('-') {
-        return None;
-    }
-    parse_npm_package_spec(spec)
-}
-
-/// Parse an npm-style package spec: `@scope/name@version` or `name@version`.
-fn parse_npm_package_spec(spec: &str) -> Option<PackageRef> {
-    // npm accepts the protocol form as the whole spec (`npm:lodash@4.17.21`),
-    // not only as the version half of an alias (`safe@npm:lodash@4.17.21`).
-    // Strip it before splitting the declared name; otherwise the parser would
-    // assess the fictitious package `npm:lodash` and miss `lodash` entirely.
-    if let Some(target_spec) = spec.strip_prefix("npm:") {
-        let (target_name, target_version) =
-            crate::ecosystem_scan::split_npm_name_version(target_spec)?;
-        return Some(PackageRef {
-            ecosystem: Ecosystem::Npm,
-            name: target_name.to_string(),
-            alias: None,
-            version: target_version
-                .map(crate::ecosystem_scan::npm_manifest_intent)
-                .unwrap_or(VersionIntent::Unspecified),
-        });
-    }
-
-    let (declared_name, declared_version) = crate::ecosystem_scan::split_npm_name_version(spec)?;
-    let (name, version, alias) = match declared_version.and_then(|v| v.strip_prefix("npm:")) {
-        Some(target_spec) => {
-            let (target_name, target_version) =
-                crate::ecosystem_scan::split_npm_name_version(target_spec)?;
-            (target_name, target_version, Some(declared_name.to_string()))
-        }
-        None => (declared_name, declared_version, None),
-    };
-
-    Some(PackageRef {
-        ecosystem: Ecosystem::Npm,
-        name: name.to_string(),
-        alias,
-        // npm treats a bare PARTIAL version as an X-range (`lodash@4` == `4.x`), so
-        // classify the CLI spec the same way the manifest path does instead of a bogus
-        // `Exact("4")` that would miss a threat record for the resolved `4.17.21`.
-        version: match version {
-            Some(v) => crate::ecosystem_scan::npm_manifest_intent(v),
-            None => VersionIntent::Unspecified,
-        },
-    })
 }
 
 fn extract_cargo_packages(args: &[String], packages: &mut Vec<PackageRef>) {
@@ -1104,11 +856,18 @@ pub fn check(
     let mut executable_segments = Vec::new();
     collect_executable_segments(input, shell, 0, &mut executable_segments);
     let mut packages = Vec::new();
+    let mut truncated = false;
     for (segment, segment_shell) in &executable_segments {
-        packages.extend(extract_packages_for_shell(
-            std::slice::from_ref(segment),
-            *segment_shell,
-        ));
+        let extracted =
+            extract_packages_detail_for_shell(std::slice::from_ref(segment), *segment_shell);
+        truncated |= extracted.truncated;
+        packages.extend(extracted.packages);
+    }
+    // A partial package list must not read as a complete assessment. Emitted
+    // before the per-package findings so the disclosure survives even when
+    // every retained package is clean.
+    if truncated {
+        findings.push(truncated_package_list_finding());
     }
 
     for pkg in &packages {
@@ -1682,6 +1441,131 @@ mod tests {
         assert!(!clean
             .iter()
             .any(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage));
+    }
+
+    /// Padding a command line with filler names must not push a real operand
+    /// past the extraction cap and out of the assessment. Where the cap does
+    /// bind, the verdict says so rather than reporting a partial assessment as
+    /// a complete one.
+    #[test]
+    fn padding_a_command_line_cannot_hide_a_package_from_assessment() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 91);
+        writer.add_package(
+            Ecosystem::Npm,
+            "knownbad",
+            &[],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            true,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        let padded = |count: usize| {
+            let mut command = String::from("npm install");
+            for index in 0..count {
+                command.push_str(&format!(" tirith-synthetic-filler-{index}"));
+            }
+            command.push_str(" knownbad@1.0.0");
+            command
+        };
+
+        // Just under the cap: the trailing package is assessed as usual.
+        let findings = check(&padded(64), ShellType::Posix, &[], Some(&db));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage),
+            "a 65-package line must still assess its last package"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "nothing was cut, so nothing is disclosed"
+        );
+
+        // Past the cap: the cut is disclosed instead of being silent.
+        let over = check(
+            &padded(crate::npm_command::MAX_PACKAGES_PER_INVOCATION + 10),
+            ShellType::Posix,
+            &[],
+            Some(&db),
+        );
+        assert!(
+            over.iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete
+                    && finding.severity == Severity::High),
+            "a truncated package list must never read as a complete assessment"
+        );
+    }
+
+    /// The threat-intelligence path must see the same install forms the rest of
+    /// the tree already knows are installs.
+    #[test]
+    fn prefix_word_and_alias_installs_reach_the_threat_db() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 92);
+        writer.add_package(
+            Ecosystem::Npm,
+            "knownbad",
+            &[],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            true,
+            None,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+
+        for command in [
+            "yarn add knownbad",
+            "yarn global add knownbad",
+            "yarn workspace web add knownbad",
+            "yarn workspaces foreach add knownbad",
+            "yarn --network-timeout 100000 add knownbad",
+            "npm isntall knownbad",
+            "npm it knownbad",
+            "npm in knownbad",
+        ] {
+            let findings = check(command, ShellType::Posix, &[], Some(&db));
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::ThreatMaliciousPackage),
+                "{command:?} installs a known-malicious package and must be assessed"
+            );
+        }
+    }
+
+    /// A rule that cannot pass the tier-1 gate never runs in exec context, so
+    /// every install form the grammar models needs a fragment in
+    /// `build.rs` PATTERN_TABLE.
+    #[test]
+    fn every_modelled_install_form_passes_the_tier_one_gate() {
+        for command in [
+            "yarn global add evil-pkg",
+            "yarn workspace web add evil-pkg",
+            "yarn workspaces foreach add evil-pkg",
+            "yarn --network-timeout 100000 add evil-pkg",
+            "npm isntall evil-pkg",
+            "npm isntall-clean",
+            "npm in evil-pkg",
+            "npm it evil-pkg",
+            "npm ic",
+            "npm cit",
+            "npm sit",
+        ] {
+            for context in [
+                crate::extract::ScanContext::Exec,
+                crate::extract::ScanContext::Paste,
+            ] {
+                assert!(
+                    crate::extract::tier1_scan_for_shell(command, context, ShellType::Posix),
+                    "{command:?} must reach tier 3 in {context:?}"
+                );
+            }
+        }
     }
 
     #[test]

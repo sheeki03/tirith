@@ -506,18 +506,27 @@ pub const SENSITIVE_PATH_DEFINITIONS: &[SensitivePathDefinition] = &[
 /// than globs. Denying the reviewed browser user-data parents is the smallest
 /// enforceable representation that covers every wallet extension/storage entry
 /// without pretending a basename or extension-ID glob reached the OS boundary.
+///
+/// C16 added the three Microsoft Edge roots. Edge is a Chromium-family browser
+/// that hosts the same wallet extensions and the same `Local Extension Settings`
+/// stores as Chrome, so its absence here was a hole in the capsule deny set: a
+/// contained child could reach an Edge profile's wallet storage. This is a
+/// tightening only; the list is additive and nothing was removed.
 pub const CAPSULE_BROWSER_DATA_ROOTS: &[&str] = &[
     ".config/google-chrome",
     ".config/chromium",
     ".config/BraveSoftware",
+    ".config/microsoft-edge",
     ".mozilla/firefox",
     "Library/Application Support/Google/Chrome",
     "Library/Application Support/Chromium",
     "Library/Application Support/BraveSoftware",
+    "Library/Application Support/Microsoft Edge",
     "Library/Application Support/Firefox/Profiles",
     "AppData/Local/Google/Chrome/User Data",
     "AppData/Local/Chromium/User Data",
     "AppData/Local/BraveSoftware/Brave-Browser/User Data",
+    "AppData/Local/Microsoft/Edge/User Data",
     "AppData/Roaming/Mozilla/Firefox/Profiles",
 ];
 
@@ -3274,6 +3283,9 @@ mod tests {
             ".config/google-chrome",
             "Library/Application Support/Google/Chrome",
             "AppData/Local/Google/Chrome/User Data",
+            ".config/microsoft-edge",
+            "Library/Application Support/Microsoft Edge",
+            "AppData/Local/Microsoft/Edge/User Data",
         ] {
             assert!(capsule_roots.contains(&root), "{root}");
         }

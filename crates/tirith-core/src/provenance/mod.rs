@@ -21,3 +21,22 @@ pub mod graph;
 /// the `tirith` CLI crate; this module is the pure half. Provenance evidence only:
 /// it emits no [`crate::verdict::RuleId`] and is never an auto-allow.
 pub mod pypi_integrity;
+
+/// npm registry package identity and provenance FACTS (C13): the parsed
+/// `dist.integrity` SRI, the legacy shasum status, the registry signature and
+/// attestation states, and the origin-validated tarball URL. Facts only. No
+/// state here can reach `Verified`: npm signs with ECDSA P-256 and this
+/// workspace has no P-256 backend, and the Sigstore closure the attestations
+/// need is off on the workspace MSRV. Tirith also does not download npm
+/// tarballs, so the SRI is never bound to bytes.
+pub mod npm_facts;
+
+/// npm signature / provenance attestation over an INSTALLED project (C17): the
+/// CLOSED, fixture-backed contract table mapping an npm version range to an
+/// exact argv and output schema, the strict parser for npm's own audit answer,
+/// the `package-lock.json` and `node_modules` readers the answer is bound to,
+/// and the content-addressed [`npm::NpmProvenanceReceipt`]. Composition only:
+/// it emits no [`crate::verdict::RuleId`] and adds no detection. The trusted
+/// executable resolution, the bounded spawn, and the rendering live in the
+/// `tirith` CLI crate; this module is the pure half.
+pub mod npm;

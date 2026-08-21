@@ -103,6 +103,33 @@ mod tests {
     }
 
     #[test]
+    fn authored_prose_survives_mandatory_value_redaction() {
+        // A bare alias word followed by a plain-space word ("GITHUB_TOKEN for",
+        // "mnemonic appears") trips the mandatory value redactor, so a finding
+        // rendered from this registry would show `[REDACTED:web3_secret]` in the
+        // middle of Tirith's own sentence. Authored prose must either backtick
+        // the alias or punctuate after it. Examples are attack strings and are
+        // intentionally excluded: they are SUPPOSED to look secret-bearing.
+        for entry in list_all() {
+            for (field, prose) in [
+                ("title", entry.title),
+                ("severity_rationale", entry.severity_rationale),
+                ("description", entry.description),
+                ("false_positive_guidance", entry.false_positive_guidance),
+                ("remediation", entry.remediation),
+            ] {
+                let redacted = crate::sensitive_assets::redact_sensitive_values(prose);
+                assert_eq!(
+                    redacted, prose,
+                    "rule '{}' field '{field}' is mangled by mandatory value redaction; \
+                     backtick the alias or punctuate after it: {prose:?}",
+                    entry.id
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_all_explanation_ids_are_valid_rules() {
         // Every explanation ID must map to a valid RuleId variant.
         // The reverse (every RuleId has an explanation) is enforced at build time

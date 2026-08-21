@@ -277,3 +277,108 @@ shell = "cmd"
 context = "exec"
 expected_action = "block"
 expected_rules = ["threat_malicious_ip"]
+
+# C13: the fetch-and-run half of the npm family. Every form below reaches the
+# same shared grammar (`crate::npm_command`) as `npm install`, so a malicious
+# package named to `npm exec`/`pnpm dlx`/`bunx` is assessed exactly as one named
+# to `npm install`. These are deliberately non-allow fixtures: they are what
+# makes `test_tier1_does_not_gate_findings` prove the build.rs PATTERN_TABLE
+# fragments exist for each new form.
+[[fixture]]
+name = "npm_exec_malicious_package"
+min_milestone = 1
+input = "npm exec evil-package@1.0.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "npm_x_malicious_package"
+min_milestone = 1
+input = "npm x evil-package@1.0.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "pnpm_dlx_malicious_package"
+min_milestone = 1
+input = "pnpm dlx evil-package@1.0.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "pnpx_malicious_package"
+min_milestone = 1
+input = "pnpx evil-package@1.0.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "yarn_dlx_malicious_package"
+min_milestone = 1
+input = "yarn dlx evil-package@1.0.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "bun_x_malicious_package"
+min_milestone = 1
+input = "bun x evil-package@1.0.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+[[fixture]]
+name = "bunx_malicious_package"
+min_milestone = 1
+input = "bunx evil-package@1.0.0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+# The explicit package option is assessed, and the entrypoint that follows it is
+# the child binary, not a second package.
+[[fixture]]
+name = "npx_explicit_package_option_is_assessed"
+min_milestone = 1
+input = "npx --package evil-package@1.0.0 runner"
+context = "exec"
+expected_action = "block"
+expected_rules = ["threat_malicious_package"]
+
+# The runner boundary: once the child entrypoint is located, its arguments
+# belong to it. `--package evil-package` here is `cowsay`'s argument.
+[[fixture]]
+name = "npx_child_arguments_are_not_packages"
+min_milestone = 1
+input = "npx cowsay --package evil-package@1.0.0"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["threat_malicious_package"]
+
+# `pnpm exec` runs a binary already installed in the project; it fetches
+# nothing, so its first positional is not a package name.
+[[fixture]]
+name = "pnpm_exec_names_no_package"
+min_milestone = 1
+input = "pnpm exec evil-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["threat_malicious_package", "threat_unresolved_malicious_package"]
+
+# `npm run <script>` is package.json indirection. A script may be NAMED after a
+# malicious package without being one, and this grammar never reads package.json.
+[[fixture]]
+name = "npm_run_script_names_no_package"
+min_milestone = 1
+input = "npm run evil-package"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["threat_malicious_package", "threat_unresolved_malicious_package"]

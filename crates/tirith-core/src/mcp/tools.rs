@@ -191,7 +191,7 @@ fn task_authorization_receipt_v2_schema() -> Value {
         "content_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
         "adapter": {"type": "string"},
         "acquisition_identity_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
-        "boundary": {"type": "string", "enum": ["gateway_forward", "package_approval", "package_resolve", "package_install_preparation", "package_manager_network", "package_manager_execution", "remote_script_run", "fetch_cloaking", "config_write"]},
+        "boundary": {"type": "string", "enum": ["gateway_forward", "package_approval", "package_resolve", "package_install_preparation", "package_manager_network", "package_manager_execution", "remote_script_run", "fetch_cloaking", "config_write", "capsule_preset_run"]},
         "action_index": {"type": "integer", "minimum": 0, "maximum": 65535},
         "action_identity": {"type": "string", "maxLength": 256},
         "action_projection_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
@@ -2568,6 +2568,13 @@ mod c11_preview_tests {
         let envelope_schema = &tool.input_schema["properties"]["envelope"];
         assert_eq!(envelope_schema["properties"]["version"]["enum"], json!([2]));
         assert!(envelope_schema["properties"]["authorizations"].is_object());
+        assert!(
+            envelope_schema["properties"]["authorizations"]["items"]["properties"]["boundary"]
+                ["enum"]
+                .as_array()
+                .expect("receipt boundary enum")
+                .contains(&json!("capsule_preset_run"))
+        );
         assert!(
             envelope_schema["properties"]["sources"]["items"]["properties"]["source_id"]
                 .is_object()

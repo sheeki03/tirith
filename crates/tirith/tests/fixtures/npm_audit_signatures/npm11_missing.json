@@ -1,0 +1,14 @@
+{
+  "invalid": [],
+  "missing": [
+    {
+      "integrity": "sha512-zgVZuo2WcZgfUEmsn6eO3kINexW8RAE4maiQ8QNs8CtpPCSyMiYsULR3HQYkm3w8FIA3SberyMJMSldGsW+U3w==",
+      "location": "node_modules/chalk",
+      "name": "chalk",
+      "registry": "https://registry.npmjs.org/",
+      "resolved": "https://registry.npmjs.org/chalk/-/chalk-5.4.1.tgz",
+      "version": "5.4.1"
+    }
+  ],
+  "verified": []
+}

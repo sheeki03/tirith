@@ -1,0 +1,8 @@
+{
+  "manifest_version": 2,
+  "name": "Synthetic Legacy",
+  "version": "1.2.3",
+  "description": "Synthetic fixture. Not a real extension.",
+  "permissions": ["storage", "https://legacy.example.invalid/*"],
+  "background": { "scripts": ["bg.js"] }
+}

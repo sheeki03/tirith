@@ -1445,7 +1445,7 @@ fn looks_like_windows_short_name_alias(component: &str) -> bool {
 /// enforces: Unicode NFC, case-insensitive path components, and Win32's removal
 /// of trailing dots/spaces. Alias spellings are rejected separately, but keeping
 /// this canonicalization here makes collision evidence honest as well.
-fn windows_collision_key(path: &str) -> String {
+pub(crate) fn windows_collision_key(path: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
 
     path.split('/')
