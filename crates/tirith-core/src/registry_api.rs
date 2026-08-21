@@ -1624,6 +1624,161 @@ mod tests {
         messages
     }
 
+    #[cfg(unix)]
+    struct PathKeyedRegistryServer {
+        address: std::net::SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<
+            std::thread::JoinHandle<Result<std::collections::BTreeMap<String, usize>, String>>,
+        >,
+    }
+
+    #[cfg(unix)]
+    impl PathKeyedRegistryServer {
+        fn start(routes: Vec<(&'static str, Vec<u8>)>, expected_requests: usize) -> Self {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .expect("bind path-keyed registry fixture");
+            listener
+                .set_nonblocking(true)
+                .expect("make registry fixture listener nonblocking");
+            let address = listener
+                .local_addr()
+                .expect("read registry fixture address");
+            let routes: std::collections::BTreeMap<_, _> = routes.into_iter().collect();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let worker_stop = std::sync::Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                use std::io::{Read as _, Write as _};
+
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut requests = std::collections::BTreeMap::new();
+                for _ in 0..expected_requests {
+                    let mut stream = loop {
+                        if worker_stop.load(Ordering::Acquire) {
+                            return Ok(requests);
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return Err(format!(
+                                "registry fixture received fewer than {expected_requests} requests"
+                            ));
+                        }
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(error) => {
+                                return Err(format!("accept registry fixture request: {error}"));
+                            }
+                        }
+                    };
+                    stream.set_nonblocking(false).map_err(|error| {
+                        format!("make registry fixture stream blocking: {error}")
+                    })?;
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                        .map_err(|error| format!("set registry fixture read timeout: {error}"))?;
+
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        if request.len() >= 16 * 1024 {
+                            return Err(
+                                "registry fixture request headers exceed 16 KiB".to_string()
+                            );
+                        }
+                        let mut chunk = [0u8; 4096];
+                        let read = stream
+                            .read(&mut chunk)
+                            .map_err(|error| format!("read registry fixture request: {error}"))?;
+                        if read == 0 {
+                            return Err(
+                                "registry fixture peer closed before complete headers".to_string()
+                            );
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let request_line = request
+                        .split(|byte| *byte == b'\n')
+                        .next()
+                        .and_then(|line| std::str::from_utf8(line).ok())
+                        .ok_or_else(|| {
+                            "registry fixture received a non-UTF-8 request line".to_string()
+                        })?;
+                    let mut fields = request_line.split_ascii_whitespace();
+                    if fields.next() != Some("GET") {
+                        return Err(format!("registry fixture expected GET: {request_line:?}"));
+                    }
+                    let path = fields
+                        .next()
+                        .ok_or_else(|| "registry fixture request has no path".to_string())?;
+                    let response = routes
+                        .get(path)
+                        .ok_or_else(|| format!("registry fixture has no route for {path:?}"))?;
+                    *requests.entry(path.to_string()).or_insert(0) += 1;
+                    stream
+                        .write_all(response)
+                        .map_err(|error| format!("write registry fixture response: {error}"))?;
+                    stream
+                        .flush()
+                        .map_err(|error| format!("flush registry fixture response: {error}"))?;
+                }
+                Ok(requests)
+            });
+            Self {
+                address,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn address(&self) -> std::net::SocketAddr {
+            self.address
+        }
+
+        fn finish(mut self) -> std::collections::BTreeMap<String, usize> {
+            self.worker
+                .take()
+                .expect("path-keyed registry fixture worker")
+                .join()
+                .expect("join path-keyed registry fixture")
+                .expect("path-keyed registry fixture completed")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathKeyedRegistryServer {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn direct_fixture_get(address: std::net::SocketAddr, path: &str) -> Vec<u8> {
+        use std::io::{Read as _, Write as _};
+
+        let mut stream = std::net::TcpStream::connect(address).expect("connect registry fixture");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("set registry fixture response timeout");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: registry-public.example.test\r\nConnection: close\r\n\r\n"
+        )
+        .expect("send registry fixture request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("read registry fixture response");
+        response
+    }
+
     /// A fixture-fed [`RegistryClient`] — no network.
     struct FakeClient {
         result: Result<RegistryMetadata, FetchError>,
@@ -1921,19 +2076,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn registry_client_ignores_ambient_proxy_and_allows_same_origin_redirect() {
-        use crate::ssrf_guard::test_support::{
-            http_response, EnvironmentRestore, ProxyTrap, ScriptedHttpServer,
-        };
+    fn registry_redirect_fixture_is_path_keyed_and_ignores_ambient_proxy() {
+        use crate::ssrf_guard::test_support::{http_response, EnvironmentRestore, ProxyTrap};
 
-        let fixture = ScriptedHttpServer::start(vec![
-            http_response("302 Found", &[("Location", "/final")], b""),
-            http_response("200 OK", &[("Content-Type", "application/json")], b"{}"),
-        ]);
-        let proxy = ProxyTrap::start();
+        // Take the process-global environment lock BEFORE starting the
+        // fixture. `PathKeyedRegistryServer::start` begins a five-second
+        // aggregate deadline at construction, and blocking on that lock under
+        // parallel contention can burn it before the first request is even
+        // made, which surfaces as a `fixture.finish()` panic that says nothing
+        // about redirect handling.
         let mut restore = EnvironmentRestore::new();
         restore.set("TIRITH_ALLOW_HTTP", Some("1"));
+        let proxy = ProxyTrap::start();
         restore.install_ambient_proxy(&proxy.url());
+
+        let fixture = PathKeyedRegistryServer::start(
+            vec![
+                (
+                    "/package",
+                    http_response("302 Found", &[("Location", "/final")], b""),
+                ),
+                (
+                    "/final",
+                    http_response("200 OK", &[("Content-Type", "application/json")], b"{}"),
+                ),
+            ],
+            3,
+        );
+        // Deliberately request the redirect destination first. A response queue
+        // would now consume the 302 intended for `/package`; a path-keyed
+        // fixture returns the `/final` response regardless of accept order.
+        let early_final = direct_fixture_get(fixture.address(), "/final");
+        assert!(early_final.starts_with(b"HTTP/1.1 200 OK\r\n"));
         let address = fixture.address();
         let url = format!(
             "http://registry-public.example.test:{}/package",
@@ -1957,9 +2131,8 @@ mod tests {
 
         assert_eq!(body, b"{}");
         let requests = fixture.finish();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with(b"GET /package HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with(b"GET /final HTTP/1.1\r\n"));
+        assert_eq!(requests.get("/package"), Some(&1));
+        assert_eq!(requests.get("/final"), Some(&2));
         assert!(
             !proxy.finish(),
             "registry client must take its independently resolved direct route"
