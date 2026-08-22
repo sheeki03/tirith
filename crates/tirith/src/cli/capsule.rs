@@ -1126,20 +1126,31 @@ fn open_cleanup_parent(directory_fd: i32) -> std::io::Result<std::os::fd::OwnedF
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: fstat initialized the structure on success.
-    let stat = unsafe { stat.assume_init() };
+const CLEANUP_STATX_TYPE: u32 = 0x0001;
+#[cfg(target_os = "linux")]
+const CLEANUP_STATX_INO: u32 = 0x0100;
+#[cfg(target_os = "linux")]
+const CLEANUP_STATX_MNT_ID: u32 = 0x1000;
+#[cfg(target_os = "linux")]
+const CLEANUP_STATX_REQUIRED: u32 = CLEANUP_STATX_TYPE | CLEANUP_STATX_INO | CLEANUP_STATX_MNT_ID;
+
+#[cfg(target_os = "linux")]
+struct CleanupStatxEvidence {
+    mask: u32,
+    inode: u64,
+    file_type: libc::mode_t,
+    mount_id: u64,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn cleanup_fd_statx(fd: i32) -> std::io::Result<CleanupStatxEvidence> {
     let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
     if unsafe {
         libc::statx(
             fd,
             c"".as_ptr(),
             libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID,
+            CLEANUP_STATX_REQUIRED,
             statx.as_mut_ptr(),
         )
     } != 0
@@ -1148,10 +1159,97 @@ fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
     }
     // SAFETY: statx initialized the structure on success.
     let statx = unsafe { statx.assume_init() };
-    let required = libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID;
-    if statx.stx_mask & required != required
-        || statx.stx_ino != stat.st_ino
-        || (statx.stx_mode as libc::mode_t) & libc::S_IFMT != stat.st_mode & libc::S_IFMT
+    Ok(CleanupStatxEvidence {
+        mask: statx.stx_mask,
+        inode: statx.stx_ino,
+        file_type: (statx.stx_mode as libc::mode_t) & libc::S_IFMT,
+        mount_id: statx.stx_mnt_id,
+    })
+}
+
+/// Linux's stable 256-byte `struct statx` UAPI layout.
+///
+/// libc 0.2 intentionally hides its musl statx bindings unless callers opt in
+/// to an unstable, global musl-version cfg. The kernel interface itself is
+/// architecture-stable. Keep a private output-only layout for the musl release
+/// target so cleanup retains exact mount-ID evidence instead of weakening to
+/// `st_dev` (which cannot distinguish same-device bind mounts). Any unsupported
+/// syscall or missing result bit propagates as a fail-closed cleanup error.
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[repr(C)]
+struct CleanupKernelStatx {
+    stx_mask: u32,
+    _stx_blksize: u32,
+    _stx_attributes: u64,
+    _stx_nlink: u32,
+    _stx_uid: u32,
+    _stx_gid: u32,
+    stx_mode: u16,
+    _stx_pad1: u16,
+    stx_ino: u64,
+    _stx_size: u64,
+    _stx_blocks: u64,
+    _stx_attributes_mask: u64,
+    _stx_timestamps: [u8; 64],
+    _stx_rdev_major: u32,
+    _stx_rdev_minor: u32,
+    _stx_dev_major: u32,
+    _stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    _stx_dio_mem_align: u32,
+    _stx_dio_offset_align: u32,
+    _stx_spare: [u64; 12],
+}
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const _: [(); 256] = [(); std::mem::size_of::<CleanupKernelStatx>()];
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const _: [(); 0] = [(); std::mem::offset_of!(CleanupKernelStatx, stx_mask)];
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const _: [(); 28] = [(); std::mem::offset_of!(CleanupKernelStatx, stx_mode)];
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const _: [(); 32] = [(); std::mem::offset_of!(CleanupKernelStatx, stx_ino)];
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const _: [(); 144] = [(); std::mem::offset_of!(CleanupKernelStatx, stx_mnt_id)];
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+fn cleanup_fd_statx(fd: i32) -> std::io::Result<CleanupStatxEvidence> {
+    let mut statx = std::mem::MaybeUninit::<CleanupKernelStatx>::zeroed();
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            fd as libc::c_long,
+            c"".as_ptr(),
+            (libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) as libc::c_long,
+            CLEANUP_STATX_REQUIRED as libc::c_long,
+            statx.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful statx syscall initialized the complete UAPI buffer.
+    let statx = unsafe { statx.assume_init() };
+    Ok(CleanupStatxEvidence {
+        mask: statx.stx_mask,
+        inode: statx.stx_ino,
+        file_type: (statx.stx_mode as libc::mode_t) & libc::S_IFMT,
+        mount_id: statx.stx_mnt_id,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstat initialized the structure on success.
+    let stat = unsafe { stat.assume_init() };
+    let statx = cleanup_fd_statx(fd)?;
+    if statx.mask & CLEANUP_STATX_REQUIRED != CLEANUP_STATX_REQUIRED
+        || statx.inode != stat.st_ino
+        || statx.file_type != stat.st_mode & libc::S_IFMT
     {
         return Err(std::io::Error::other(
             "cleanup descriptor identity lacks exact inode/type/mount evidence",
@@ -1161,7 +1259,7 @@ fn cleanup_fd_identity(fd: i32) -> std::io::Result<CleanupIdentity> {
         device: stat.st_dev,
         inode: stat.st_ino,
         file_type: stat.st_mode & libc::S_IFMT,
-        mount_id: statx.stx_mnt_id,
+        mount_id: statx.mount_id,
     })
 }
 
@@ -1173,7 +1271,12 @@ fn cleanup_fd_link_count(fd: i32) -> std::io::Result<u64> {
     }
     // SAFETY: fstat initialized the structure on success.
     let stat = unsafe { stat.assume_init() };
-    Ok(stat.st_nlink)
+    // libc exposes nlink_t as u64 on x86_64 Linux and u32 on aarch64 Linux.
+    // Normalize with a lossless widening conversion so both shipped GNU
+    // targets enforce the same link-count invariant.
+    #[allow(clippy::useless_conversion)]
+    let link_count = stat.st_nlink.into();
+    Ok(link_count)
 }
 
 #[cfg(target_os = "linux")]
@@ -6591,6 +6694,23 @@ mod tests {
         }
         assert_eq!(unsafe { libc::closedir(stream) }, 0);
         entries
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    #[test]
+    fn musl_cleanup_statx_binding_returns_exact_directory_identity() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().expect("statx fixture directory");
+        let handle = std::fs::File::open(directory.path()).expect("open fixture directory");
+        let metadata = handle.metadata().expect("fixture metadata");
+        let identity = cleanup_fd_identity(handle.as_raw_fd()).expect("musl statx evidence");
+
+        assert_eq!(identity.device, metadata.dev());
+        assert_eq!(identity.inode, metadata.ino());
+        assert_eq!(identity.file_type, libc::S_IFDIR);
+        assert_ne!(identity.mount_id, 0, "Linux mount IDs are positive");
     }
 
     #[cfg(target_os = "linux")]

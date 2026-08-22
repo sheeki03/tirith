@@ -3194,7 +3194,10 @@ mod receipt_interaction_tests {
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                // libc's ioctl request type varies: c_ulong on glibc/macOS,
+                // c_int on musl. Infer the target ABI instead of forcing either
+                // width, so both native and aarch64-musl test harnesses compile.
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0 {

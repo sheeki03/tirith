@@ -60,6 +60,11 @@ use std::time::{Duration, Instant};
 use crate::mcp::output_filter::OutputFilterContext;
 use crate::verdict::{Action, Finding};
 
+/// Structural depth cap for the URI and blob walkers: the same ceiling the leaf
+/// scanner uses, so anything it refused as too deep is not then walked. See
+/// [`crate::mcp::MAX_STRUCTURED_DEPTH`].
+use crate::mcp::MAX_STRUCTURED_DEPTH as MAX_INSPECT_WALK_DEPTH;
+
 /// Maximum decoded size of an inline `blob` we will buffer to MIME-sniff. A blob
 /// larger than this is refused (the gateway's `max_message_bytes` already caps the
 /// whole message; this is a second, tighter bound on a single decoded blob so a
@@ -162,7 +167,9 @@ impl ResponseViolation {
             | "blob_too_large"
             | "blob_undecodable"
             | "mime_spoof"
-            | "sanitized_key_collision" => self.code,
+            | "sanitized_key_collision"
+            | "cross_leaf_secret"
+            | "analysis_budget_exceeded" => self.code,
             _ => "response_policy_violation",
         };
         let detail = match code {
@@ -177,6 +184,10 @@ impl ResponseViolation {
             "mime_spoof" => "resource blob signature conflicts with declared MIME category",
             "sanitized_key_collision" => {
                 "distinct response keys collide after control sanitization"
+            }
+            "cross_leaf_secret" => "supported secret spans structured response leaves",
+            "analysis_budget_exceeded" => {
+                "structured response exceeded the bounded analysis budget"
             }
             _ => "upstream response violated policy",
         };
@@ -262,7 +273,8 @@ impl InspectOutcome {
 /// Inspect a listing/reading response `result` for the given [`ResponseKind`].
 ///
 /// * Streams every string leaf through the engine output analyzer (custom seeds
-///   from `ctx`), folding the verdict's action/findings into the outcome.
+///   from `ctx`), folding the verdict's action/findings into the outcome;
+///   excessive structural complexity becomes a blocking `AnalysisIncomplete`.
 /// * Walks the kind-appropriate URI fields and screens each through the
 ///   canonical outbound URL policy under one bounded response-wide DNS
 ///   deadline. Duplicate host/port pairs share a cached result.
@@ -363,7 +375,7 @@ fn collect_uri_violations(
     dns_budget: &ResponseDnsBudget,
 ) {
     // Generic structural walk: catch resource_link / embedded resource anywhere.
-    walk_for_resource_uris(result, out, dns_budget);
+    walk_for_resource_uris(result, out, dns_budget, 0);
 
     // Kind-specific descriptor fields that are not content blocks.
     match kind {
@@ -420,8 +432,9 @@ fn walk_for_resource_uris(
     v: &Value,
     out: &mut Vec<ResponseViolation>,
     dns_budget: &ResponseDnsBudget,
+    depth: usize,
 ) {
-    if dns_budget.is_exhausted() {
+    if dns_budget.is_exhausted() || depth > MAX_INSPECT_WALK_DEPTH {
         return;
     }
     match v {
@@ -462,12 +475,12 @@ fn walk_for_resource_uris(
                 }
             }
             for child in map.values() {
-                walk_for_resource_uris(child, out, dns_budget);
+                walk_for_resource_uris(child, out, dns_budget, depth + 1);
             }
         }
         Value::Array(items) => {
             for item in items {
-                walk_for_resource_uris(item, out, dns_budget);
+                walk_for_resource_uris(item, out, dns_budget, depth + 1);
             }
         }
         _ => {}
@@ -1218,13 +1231,16 @@ fn collect_blob_violations(result: &Value, out: &mut Vec<ResponseViolation>) {
     }
     // Also screen embedded-resource blobs anywhere in the tree (an embedded
     // `resource` content block can carry a `blob` too).
-    walk_for_embedded_blobs(result, out);
+    walk_for_embedded_blobs(result, out, 0);
 }
 
 /// Recursively find embedded `resource` blocks with an inline `blob` and check
 /// them (the top-level `contents[]` is handled by the caller; this catches
 /// `{type:"resource", resource:{blob, mimeType}}` nested in content arrays).
-fn walk_for_embedded_blobs(v: &Value, out: &mut Vec<ResponseViolation>) {
+fn walk_for_embedded_blobs(v: &Value, out: &mut Vec<ResponseViolation>, depth: usize) {
+    if depth > MAX_INSPECT_WALK_DEPTH {
+        return;
+    }
     match v {
         Value::Object(map) => {
             if map.get("type").and_then(Value::as_str) == Some("resource") {
@@ -1236,12 +1252,12 @@ fn walk_for_embedded_blobs(v: &Value, out: &mut Vec<ResponseViolation>) {
                 }
             }
             for child in map.values() {
-                walk_for_embedded_blobs(child, out);
+                walk_for_embedded_blobs(child, out, depth + 1);
             }
         }
         Value::Array(items) => {
             for item in items {
-                walk_for_embedded_blobs(item, out);
+                walk_for_embedded_blobs(item, out, depth + 1);
             }
         }
         _ => {}
@@ -1526,6 +1542,77 @@ mod tests {
 
     fn ctx() -> OutputFilterContext {
         OutputFilterContext::default()
+    }
+
+    /// Nest `depth` levels of internal-scheme content with an oversized blob at
+    /// the very bottom, which the blob walker reports as `blob_too_large`.
+    ///
+    /// The URIs are deliberately `tirith://`, an internal scheme `screen_uri`
+    /// skips without a DNS lookup. A tree of network URLs is already bounded in
+    /// practice by the shared DNS budget, so using one would mask whether the
+    /// structural ceiling does anything. `walk_for_embedded_blobs` has no
+    /// budget of any kind, which is the walker this pins.
+    fn nested_content_with_bottom_blob(depth: usize) -> Value {
+        let oversized = "A".repeat((MAX_INSPECT_BLOB_BYTES / 3 + 10) * 4);
+        let mut node = json!({
+            "type": "resource",
+            "resource": {
+                "uri": "tirith://bottom",
+                "mimeType": "application/octet-stream",
+                "blob": oversized,
+            },
+        });
+        for _ in 0..depth {
+            node = json!({
+                "type": "resource_link",
+                "uri": "tirith://branch",
+                "content": [node],
+            });
+        }
+        json!({ "contents": [node] })
+    }
+
+    fn has_code(outcome: &InspectOutcome, code: &str) -> bool {
+        outcome
+            .violations
+            .iter()
+            .any(|violation| violation.code == code)
+    }
+
+    #[test]
+    fn the_response_walk_stops_at_the_structural_depth_ceiling() {
+        // `inspect_response` is public, so a direct caller can hand it a Value
+        // built in memory rather than parsed off the wire, with none of
+        // serde_json's recursion limit to cap it. The leaf scan is bounded and
+        // the URI walker shares the DNS budget, but `walk_for_embedded_blobs`
+        // carried no budget at all and recursed the whole tree.
+        //
+        // Depth is set past the ceiling but not somewhere pathological: that is
+        // enough to prove the walk stops, and going deeper would only overflow
+        // the test's own stack in `Value`'s recursive `Drop`.
+        let deep = nested_content_with_bottom_blob(MAX_INSPECT_WALK_DEPTH + 50);
+        let outcome = inspect_response(&deep, ResponseKind::ResourcesRead, &ctx());
+
+        assert!(
+            !has_code(&outcome, "blob_too_large"),
+            "the blob sits past the depth ceiling and must not have been reached: {:?}",
+            outcome.violations
+        );
+    }
+
+    #[test]
+    fn a_shallow_response_still_reaches_the_bottom_blob() {
+        // The ceiling must not cost coverage on ordinary responses: the same
+        // tree within the limit reaches the bottom and refuses the blob. This is
+        // what keeps the assertion above from passing vacuously.
+        let shallow = nested_content_with_bottom_blob(2);
+        let outcome = inspect_response(&shallow, ResponseKind::ResourcesRead, &ctx());
+
+        assert!(
+            has_code(&outcome, "blob_too_large"),
+            "a shallow walk must still refuse the oversized blob: {:?}",
+            outcome.violations
+        );
     }
 
     #[test]
@@ -2029,6 +2116,23 @@ mod tests {
                 assert!(!rendered.contains(canary), "{rendered}");
             }
             assert!(rendered.contains("response_policy_violation"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn structural_sanitization_failure_codes_remain_categorical() {
+        for code in [
+            "sanitized_key_collision",
+            "cross_leaf_secret",
+            "analysis_budget_exceeded",
+        ] {
+            let violation = ResponseViolation {
+                code,
+                detail: "PRIVATE_KEY=attacker-controlled".to_string(),
+            };
+            let rendered = serde_json::to_string(&violation).unwrap();
+            assert!(rendered.contains(code), "{rendered}");
+            assert!(!rendered.contains("attacker-controlled"), "{rendered}");
         }
     }
 

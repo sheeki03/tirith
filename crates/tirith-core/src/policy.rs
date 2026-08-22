@@ -180,11 +180,14 @@ use crate::verdict::{RuleId, Severity};
 /// Try both `.yaml` and `.yml` extensions in a directory.
 fn find_policy_in_dir(dir: &Path) -> Option<PathBuf> {
     let yaml = dir.join("policy.yaml");
-    if yaml.exists() {
+    // `Path::exists` follows the final symlink and therefore treats a dangling
+    // named policy as absent. Retain the directory entry so the scoped loader
+    // can diagnose it and fail closed instead of silently using defaults.
+    if std::fs::symlink_metadata(&yaml).is_ok() {
         return Some(yaml);
     }
     let yml = dir.join("policy.yml");
-    if yml.exists() {
+    if std::fs::symlink_metadata(&yml).is_ok() {
         return Some(yml);
     }
     None
@@ -227,6 +230,44 @@ pub enum PolicyScope {
     /// policy is never mistaken for repo-scoped and accidentally sanitized.
     #[default]
     Default,
+}
+
+#[derive(Clone, Copy)]
+enum PolicyReadMode {
+    TrustedBaseline,
+    UntrustedRepository,
+}
+
+/// Read a repository policy beneath its discovered repository scope without
+/// ever re-resolving `.tirith` or the final policy name from the filesystem
+/// root. A checkout controls both entries, so either becoming a symlink is a
+/// fail-closed read error; trusted User/Org policy uses a separate reader and
+/// may still be a deliberate Nix/Home Manager final symlink.
+fn read_repository_policy(path: &Path) -> Result<Vec<u8>, crate::util::OpenRegularError> {
+    let invalid_shape = || {
+        crate::util::OpenRegularError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository policy path is not repo/.tirith/policy.yaml or policy.yml",
+        ))
+    };
+    let policy_name = path.file_name().ok_or_else(invalid_shape)?;
+    if policy_name != "policy.yaml" && policy_name != "policy.yml" {
+        return Err(invalid_shape());
+    }
+    let policy_dir = path.parent().ok_or_else(invalid_shape)?;
+    if policy_dir.file_name() != Some(std::ffi::OsStr::new(".tirith")) {
+        return Err(invalid_shape());
+    }
+    let repo_root = policy_dir.parent().ok_or_else(invalid_shape)?;
+    let destination =
+        crate::util::ContainedAtomicFile::prepare(repo_root, path, false).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::util::OpenRegularError::NotFound
+            } else {
+                crate::util::OpenRegularError::Io(error)
+            }
+        })?;
+    destination.read_capped(POLICY_FILE_READ_CAP)
 }
 
 impl PolicyScope {
@@ -1778,7 +1819,7 @@ impl Policy {
         let trusted_path = trusted.as_ref().map(|(path, _)| path.clone());
         let mut baseline = match trusted {
             Some((path, scope)) => {
-                let mut policy = Self::load_from_path(&path);
+                let mut policy = Self::load_from_path(&path, PolicyReadMode::TrustedBaseline);
                 policy.scope = scope;
                 policy
             }
@@ -1790,7 +1831,10 @@ impl Policy {
             // not parse and append the same document a second time under a
             // different scope.
             if trusted_path.as_ref() != Some(&repo_path) {
-                let (mut repo, document) = Self::load_from_path_with_document(&repo_path);
+                let (mut repo, document) = Self::load_from_path_with_document(
+                    &repo_path,
+                    PolicyReadMode::UntrustedRepository,
+                );
                 repo.scope = PolicyScope::Repo;
                 // A named but unreadable or malformed repository policy has
                 // already been converted to the explicit catch-all fail-closed
@@ -2598,26 +2642,31 @@ impl Policy {
         }
     }
 
-    fn load_from_path(path: &Path) -> Self {
-        Self::load_from_path_with_document(path).0
+    fn load_from_path(path: &Path, read_mode: PolicyReadMode) -> Self {
+        Self::load_from_path_with_document(path, read_mode).0
     }
 
     /// Load once and retain the migrated document for repository-overlay
-    /// presence checks. Returning the document from the same bounded,
-    /// no-follow read avoids a second-read TOCTOU between policy values and the
-    /// field-presence decisions that govern their merge.
-    fn load_from_path_with_document(path: &Path) -> (Self, RepoPolicyDocument) {
-        // Read via the no-follow, size-capped reader (mirrors `merge_context_labels`
-        // / repo_hooks / scan). The matched file may be an attacker-controlled repo
-        // `.tirith/policy.yaml`, consumed HERE — BEFORE `scope == Repo` sanitization
-        // runs in `discover_local` — so a plain `read_to_string` would let a repo
-        // make it a FIFO (hang), a huge file (memory blow-up), or a symlink
-        // (redirect the read). `read_text_no_follow_capped` refuses non-regular /
-        // symlinked / oversize files. ANY read error on a NAMED policy file is a
-        // misconfiguration (or a hostile special file), not "no policy" — fail
-        // closed (the open default is only for "no policy found anywhere", handled
-        // by the discovery walk).
-        let bytes = match crate::util::read_text_no_follow_capped(path, POLICY_FILE_READ_CAP) {
+    /// presence checks. Returning the document from the same bounded read avoids
+    /// a second-read TOCTOU between policy values and the field-presence
+    /// decisions that govern their merge.
+    fn load_from_path_with_document(
+        path: &Path,
+        read_mode: PolicyReadMode,
+    ) -> (Self, RepoPolicyDocument) {
+        // Repository policy is attacker-controlled before repo-scope
+        // sanitization, so `.tirith` and the final component are both traversed
+        // no-follow beneath a retained repository root. User/org policy is an
+        // operator-controlled baseline and commonly arrives as a Home Manager/
+        // Nix store symlink; follow it open-first, then require the target to be
+        // a bounded regular file. Both readers reject FIFO/device, directory,
+        // broken/looping link, and oversize targets without blocking.
+        let bytes = match match read_mode {
+            PolicyReadMode::TrustedBaseline => {
+                crate::util::read_regular_capped(path, POLICY_FILE_READ_CAP)
+            }
+            PolicyReadMode::UntrustedRepository => read_repository_policy(path),
+        } {
             Ok(b) => b,
             Err(e) => {
                 policy_diagnostic!(
@@ -4866,6 +4915,32 @@ custom_rules:
         let policy = Policy::discover_local_only(repo.path().to_str());
         assert_task_boundaries_fail_closed(&policy);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_repo_policy_directory_cannot_redirect_the_policy_read() {
+        use std::os::unix::fs::symlink;
+
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global policy state");
+        global.remove_env("TIRITH_POLICY_ROOT");
+        global.after_restore(crate::incident::invalidate_cache);
+        crate::incident::invalidate_cache();
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::write(
+            outside.path().join("policy.yaml"),
+            "fail_mode: open\ntask_gate:\n  mode: off\n",
+        )
+        .unwrap();
+        symlink(outside.path(), repo.path().join(".tirith")).unwrap();
+
+        let policy = Policy::discover_local_only(repo.path().to_str());
+        assert_task_boundaries_fail_closed(&policy);
+    }
+
     fn discovery_test_rule(id: &str, pattern: &str) -> CustomRule {
         CustomRule {
             id: id.to_string(),

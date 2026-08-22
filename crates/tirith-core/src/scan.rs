@@ -2402,7 +2402,12 @@ fn collect_config_symlink(
     }
     match std::fs::metadata(&resolved) {
         Ok(metadata) if metadata.is_file() => {
-            if classify_collected_path(logical_path) == CollectedFileKind::TextCandidate {
+            // As with ordinary entries, the suffix is only a scheduling hint.
+            // A media-looking config link can still point at UTF-8 instructions;
+            // queue it so the opened bytes decide. Native/package artifact hints
+            // remain gaps because linked artifacts are not represented by the
+            // linked-text candidate pipeline.
+            if classify_collected_path(logical_path) != CollectedFileKind::ArtifactCandidate {
                 collected.push_linked(LinkedTextCandidate {
                     read_path: resolved,
                     logical_path: logical_path.to_path_buf(),
@@ -3216,6 +3221,39 @@ mod tests {
                 .all(|gap| gap.primary_path() != Some(logical.as_path())),
             "a safe in-root config symlink must not be reported as a gap"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_hinted_config_symlink_is_byte_classified_before_ignore() {
+        let root = tempfile::tempdir().expect("create scan root");
+        let config_dir = root.path().join(".github");
+        std::fs::create_dir(&config_dir).unwrap();
+        let target = root.path().join("shared-instructions.txt");
+        let logical = config_dir.join("instructions.png");
+        std::fs::write(&target, "visible\u{202e}hidden").unwrap();
+        std::os::unix::fs::symlink("../shared-instructions.txt", &logical).unwrap();
+
+        assert_eq!(
+            classify_collected_path(&logical),
+            CollectedFileKind::BinaryIgnored,
+            "the test must exercise the media-suffix scheduling hint"
+        );
+
+        let result = scan_tree(root.path(), None);
+        let logical_result = result
+            .file_results
+            .iter()
+            .find(|result| result.path == logical)
+            .expect("valid UTF-8 behind an in-root config link must reach analysis");
+        assert!(logical_result
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::BidiControls));
+        assert!(result
+            .coverage_gaps
+            .iter()
+            .all(|gap| gap.primary_path() != Some(logical.as_path())));
     }
 
     #[cfg(unix)]

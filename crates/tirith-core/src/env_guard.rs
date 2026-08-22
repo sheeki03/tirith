@@ -2249,10 +2249,15 @@ mod tests {
         let description = public["description"]
             .as_str()
             .expect("projected description");
-        for summary in [title, description] {
-            assert!(summary.contains("AWS_SECRET_ACCESS_KEY"), "{summary}");
-            assert!(summary.contains("[REDACTED:web3_secret]"), "{summary}");
-        }
+        assert!(title.contains("AWS_SECRET_ACCESS_KEY"), "{title}");
+        assert!(
+            description.contains("AWS_SECRET_ACCESS_KEY"),
+            "{description}"
+        );
+        assert!(
+            description.contains("[REDACTED:web3_secret]"),
+            "{description}"
+        );
         let serialized = serde_json::to_string(&public).unwrap();
         assert!(!serialized.contains("AKIALEAKEDSECRET"), "{serialized}");
         let rc_path = home.join(".zshrc").display().to_string();

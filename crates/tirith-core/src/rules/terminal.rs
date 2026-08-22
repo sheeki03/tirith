@@ -706,12 +706,13 @@ pub(crate) fn is_ascii_nearby(input: &[u8], offset: usize) -> bool {
 /// - `…/filename_Отсканированный_документ.pdf` → false (path/`_` separators
 ///   isolate the pure-Cyrillic segments). Fixes #134.
 ///
-/// Boundaries are script-aware: any non-alphanumeric ASCII byte (whitespace,
-/// punctuation, and identifier/path separators like `/ _ . -`), plus any
-/// character whose Unicode script is outside the confusable-bearing set
-/// {Latin, Cyrillic, Greek, Common, Inherited} — so Han/Hiragana/Katakana/
-/// Hangul/Thai/Arabic/… terminate a word. The word is suspicious only if, after
-/// trimming at those boundaries, it still contains an ASCII letter.
+/// Boundaries are script-aware: punctuation is always a boundary (including
+/// non-ASCII `Common` punctuation such as U+3002), while combining marks remain
+/// attached to the word they modify. Letters and numbers from the
+/// confusable-bearing set {Latin, Cyrillic, Greek, Common} stay inside a word;
+/// Han/Hiragana/Katakana/Hangul/Thai/Arabic/… terminate it. The word is
+/// suspicious only if, after trimming at those boundaries, it still contains an
+/// ASCII letter.
 pub(crate) fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
     use unicode_script::{Script, UnicodeScript};
 
@@ -721,10 +722,16 @@ pub(crate) fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
         if ch.is_ascii() {
             return ch.is_ascii_alphanumeric();
         }
-        matches!(
-            ch.script(),
-            Script::Latin | Script::Cyrillic | Script::Greek | Script::Common | Script::Inherited
-        )
+        if ch.script() == Script::Inherited {
+            // Combining marks inherit the script of the base character and must
+            // not split an otherwise mixed-script attack word.
+            return true;
+        }
+        ch.is_alphanumeric()
+            && matches!(
+                ch.script(),
+                Script::Latin | Script::Cyrillic | Script::Greek | Script::Common
+            )
     }
 
     let Ok(text) = std::str::from_utf8(input) else {
@@ -824,6 +831,26 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_punctuation_is_a_word_boundary_but_combining_marks_are_not() {
+        let natural = "本文。oEmbed";
+        let punctuation_offset = natural.find('。').expect("ideographic full stop");
+        assert!(!is_same_word_as_ascii(
+            natural.as_bytes(),
+            punctuation_offset
+        ));
+
+        let mixed = "g\u{0301}іthub";
+        let cyrillic_offset = mixed.find('і').expect("Cyrillic i");
+        assert!(is_same_word_as_ascii(mixed.as_bytes(), cyrillic_offset));
+    }
+
+    #[test]
+    fn invalid_utf8_keeps_the_conservative_ascii_fallback() {
+        assert!(is_same_word_as_ascii(b"a\xffb", 1));
+        assert!(!is_same_word_as_ascii(b"a \xff", 2));
+    }
 
     #[test]
     fn variation_flood_cannot_downgrade_later_critical_zero_width() {

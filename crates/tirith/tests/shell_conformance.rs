@@ -126,6 +126,30 @@ fn strict_ledger_counts(env: &IsolatedEnv) -> (usize, usize) {
     (confirmed, unresolved)
 }
 
+/// Number of typed events persisted in the session record.
+///
+/// This is the store `MassFileDeletion` and the other correlation rules read,
+/// and it is NOT the strict execution ledger: a receipt and a typed event are
+/// written by different paths. Asserting only on the ledger would let a change
+/// that persists an observation without committing a receipt pass while the
+/// original bug (#188, a tab completion counted as an executed deletion) came
+/// straight back.
+fn session_typed_event_count(env: &IsolatedEnv) -> usize {
+    let path = env.session_record_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        // No session record yet is the strongest possible form of "nothing was
+        // observed", so it counts as zero rather than failing the read.
+        return 0;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        panic!("session record at {} must be valid JSON", path.display());
+    };
+    value["typed_events"]
+        .as_array()
+        .map(|events| events.len())
+        .unwrap_or(0)
+}
+
 // === bash — PREEXEC mode (DEBUG-trap, warn-only unless
 // TIRITH_BASH_PREEXEC_ENFORCE) ===
 // Delivery goes through bash's own command loop, so it's reliable in a PTY.
@@ -147,6 +171,55 @@ fn bash_preexec_session(env: &mut IsolatedEnv) -> Option<PtySession> {
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
     Some(sess)
+}
+
+/// Issue #176 startup boundary: sourcing on one compound line remains
+/// truthfully `off`, but the first real prompt must capture and chain DEBUG and
+/// publish plain preexec as live `warn-only` before accepting another line.
+/// Exercise both the system Bash (3.2 on macOS) and a distinct modern Bash when
+/// they are available.
+fn assert_bash_preexec_warn_only_after_prompt(bash: &Path) {
+    let mut env = IsolatedEnv::new();
+    env.set("TIRITH_BASH_MODE", "preexec");
+    let mut sess = PtySession::spawn(&env, bash, &["--norc", "--noprofile", "-i"]);
+    sess.send_line("export PS1='TIRITH_PTY> '");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+
+    let hook = embedded_hook("bash-hook.bash");
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+
+    sess.send_line(
+        "printf 'LIVE_MODE=%s LIVE_PROT=%s LIVE_STATUS=%s\\n' \
+         \"$TIRITH_BASH_EFFECTIVE_MODE\" \
+         \"$TIRITH_BASH_EFFECTIVE_PROTECTION\" \"$TIRITH_STATUS\"",
+    );
+    let output = sess.expect("LIVE_MODE=preexec LIVE_PROT=warn-only LIVE_STATUS=warn-only");
+    sess.close();
+    assert!(
+        output.contains("LIVE_MODE=preexec LIVE_PROT=warn-only LIVE_STATUS=warn-only"),
+        "the first prompt must activate warn-only preexec for {}:\n{output}",
+        bash.display()
+    );
+}
+
+#[test]
+fn bash_preexec_reports_warn_only_after_first_prompt() {
+    let system_bash = Path::new("/bin/bash");
+    if system_bash.is_file() {
+        assert_bash_preexec_warn_only_after_prompt(system_bash);
+    }
+
+    if let Some(modern) = modern_bash() {
+        let same_as_system =
+            std::fs::canonicalize(&modern).ok() == std::fs::canonicalize(system_bash).ok();
+        if !same_as_system {
+            assert_bash_preexec_warn_only_after_prompt(&modern);
+        }
+    }
 }
 
 /// Contract (a)+(b): an allowed command in preexec mode executes EXACTLY ONCE.
@@ -310,6 +383,198 @@ fn bash_preexec_enforce_blocked_command_does_not_execute() {
         !marker.exists(),
         "preexec-enforce: a blocked command must not execute (marker file exists)"
     );
+}
+
+/// Issue #176: modern Bash must bracket array-valued PROMPT_COMMAND entries,
+/// decide each typed line once, and keep lazy extdebug out of allowed function
+/// bodies and prompt functions. A blocked function/pipeline line must still be
+/// skipped, then Tirith-owned extdebug must be released at the next prompt.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn bash_preexec_enforce_functions_prompt_array_and_receipt_cardinality() {
+    let mut env = IsolatedEnv::new();
+    let allowed = env.workdir.join("bash-function-allowed.txt");
+    let pipeline = env.workdir.join("bash-pipeline-allowed.txt");
+    let blocked = env.workdir.join("bash-function-blocked.txt");
+    let bash = match modern_bash() {
+        Some(b) => b,
+        None => {
+            eprintln!("skipping: no modern bash (>= 5) found");
+            return;
+        }
+    };
+    env.set("TIRITH_BASH_MODE", "preexec");
+    env.set("TIRITH_BASH_PREEXEC_ENFORCE", "1");
+
+    let mut sess = PtySession::spawn(&env, &bash, &["--norc", "--noprofile", "-i"]);
+    sess.send_line("export PS1='TIRITH_PTY> '");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+
+    // Define both prompt and user functions before the hook exists. The array
+    // form is Bash 5+ and must retain the user's first-to-last ordering.
+    sess.send_line(&format!(
+        "PROMPT_ORDER=; PROMPT_CHECK=0; \
+         prompt_first() {{ local seen=$?; PROMPT_ORDER=\"${{PROMPT_ORDER}}1\"; \
+           if [[ \"$PROMPT_CHECK\" == 1 ]]; then printf 'PROMPT_ARRAY_STATUS=%s\\n' \"$seen\"; fi; \
+           return \"$seen\"; }}; \
+         prompt_second() {{ PROMPT_ORDER=\"${{PROMPT_ORDER}}2\"; \
+           if [[ \"$PROMPT_CHECK\" == 1 ]]; then \
+             printf 'PROMPT_ARRAY_ORDER=%s\\n' \"$PROMPT_ORDER\"; \
+             if shopt -q extdebug; then printf 'PROMPT_EXTDEBUG=on\\n'; \
+             else printf 'PROMPT_EXTDEBUG=off\\n'; fi; fi; }}; \
+         benign_fn() {{ printf 'RAN\\n' >> '{}'; }}; \
+         PROMPT_COMMAND=(prompt_first prompt_second)",
+        allowed.display()
+    ));
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+
+    let hook = embedded_hook("bash-hook.bash");
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+
+    // One composite typed line, one receipt. The first user prompt function
+    // must still observe `false`'s status and the array order must remain 1,2.
+    sess.send_line("PROMPT_ORDER=; PROMPT_CHECK=1; false");
+    let mut prompt_output = sess.expect("PROMPT_ARRAY_ORDER=12");
+    // `expect` returns through the matched token. Collect the remainder too:
+    // the extdebug assertion is intentionally emitted after the order token.
+    prompt_output.push_str(&sess.expect("TIRITH_PTY> "));
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert!(
+        prompt_output.contains("PROMPT_ARRAY_STATUS=1"),
+        "the first user prompt command must see the typed line's status:\n{prompt_output}"
+    );
+    assert!(
+        prompt_output.contains("PROMPT_EXTDEBUG=off"),
+        "allowed lines must leave extdebug off before prompt functions:\n{prompt_output}"
+    );
+    assert_eq!(
+        strict_ledger_counts(&env),
+        (0, 1),
+        "one composite typed line, not its prompt functions, must create one unresolved receipt"
+    );
+    sess.clear_buffer();
+
+    // Calling a benign pre-existing function is one top-level decision and
+    // one receipt; its body and both prompt functions produce no extras.
+    sess.send_line("benign_fn");
+    let allowed_body = wait_for_marker(&allowed, "RAN", MARKER_MAX);
+    let function_output = sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert_eq!(count_occurrences(&allowed_body, "RAN"), 1);
+    assert!(
+        function_output.contains("PROMPT_EXTDEBUG=off"),
+        "extdebug must remain off across an allowed function body:\n{function_output}"
+    );
+    assert_eq!(
+        strict_ledger_counts(&env),
+        (0, 2),
+        "the benign function call must add exactly one top-level receipt"
+    );
+    sess.clear_buffer();
+
+    // Pipeline segments can run in Bash subshells. They reuse the parent
+    // whole-line decision and must not each mint a receipt.
+    sess.send_line(&format!(
+        "printf 'PIPELINE_RAN\\n' | tee '{}' >/dev/null",
+        pipeline.display()
+    ));
+    let pipeline_body = wait_for_marker(&pipeline, "PIPELINE_RAN", MARKER_MAX);
+    let pipeline_output = sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert_eq!(count_occurrences(&pipeline_body, "PIPELINE_RAN"), 1);
+    assert_eq!(
+        strict_ledger_counts(&env),
+        (0, 3),
+        "an allowed pipeline must add exactly one top-level receipt"
+    );
+    sess.clear_buffer();
+
+    // The dangerous function definition and invocation are one typed line;
+    // the complete line contains the pipe-to-interpreter and must be stopped
+    // before the function body can create its sentinel.
+    sess.send_line(&format!(
+        "evil_fn() {{ printf 'touch {}\\n' | bash; }}; evil_fn",
+        blocked.display()
+    ));
+    let blocked_output = sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert!(
+        !blocked.exists(),
+        "the blocked function/pipeline line must not execute"
+    );
+    assert!(
+        blocked_output.contains("BLOCKED"),
+        "the refusal must be visible, got:\n{blocked_output}"
+    );
+    assert!(
+        blocked_output.contains("PROMPT_EXTDEBUG=off"),
+        "Tirith-owned extdebug must be released before prompt functions:\n{blocked_output}"
+    );
+    assert_eq!(
+        strict_ledger_counts(&env),
+        (0, 3),
+        "blocked and automatic prompt/nested commands must not add receipts"
+    );
+
+    let all_output = format!("{prompt_output}{function_output}{pipeline_output}{blocked_output}");
+    assert!(
+        !all_output.contains("tirith: no issues"),
+        "clean hook checks must stay silent:\n{all_output}"
+    );
+    assert!(
+        !all_output.contains("history no longer matches BASH_COMMAND")
+            && !all_output.contains("protection downgraded"),
+        "function or prompt execution must not degrade enforcement:\n{all_output}"
+    );
+
+    // Removing the guards is an explicit trust-boundary loss. The mutation
+    // line itself was decided while the boundary was intact, then the first
+    // automatic prompt function must trigger a visible downgrade without
+    // being receipted. Subsequent warn-only function calls stay usable but no
+    // longer claim durable typed-line evidence.
+    sess.clear_buffer();
+    sess.send_line("PROMPT_COMMAND=(prompt_first prompt_second)");
+    let degrade_output = sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert!(
+        degrade_output
+            .contains("PROMPT_COMMAND no longer contains Tirith's prompt-boundary guards")
+            && degrade_output.contains("protection downgraded"),
+        "prompt-guard loss must be visible:\n{degrade_output}"
+    );
+    assert_eq!(
+        strict_ledger_counts(&env),
+        (0, 4),
+        "only the user-typed guard mutation, not its automatic prompt functions, may add a receipt"
+    );
+    sess.clear_buffer();
+
+    sess.send_line("benign_fn");
+    let post_degrade_output = sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    let post_degrade_body = std::fs::read_to_string(&allowed).expect("read function marker");
+    assert_eq!(
+        count_occurrences(&post_degrade_body, "RAN"),
+        2,
+        "warn-only degradation must not break later shell functions"
+    );
+    assert_eq!(
+        strict_ledger_counts(&env),
+        (0, 4),
+        "post-degrade warn-only and prompt/nested commands must not mint trusted receipts"
+    );
+    assert!(
+        post_degrade_output.contains("PROMPT_EXTDEBUG=off")
+            && !post_degrade_output.contains("tirith: no issues"),
+        "post-degrade prompt state must remain clean and silent:\n{post_degrade_output}"
+    );
+    sess.close();
 }
 
 /// Contract (g): sourcing the bash hook NON-interactively is a complete no-op
@@ -660,6 +925,53 @@ fn fish_allowed_command_executes_exactly_once() {
         count_occurrences(&body, "RAN"),
         1,
         "fish: allowed command must execute exactly once, marker held: {body:?}"
+    );
+}
+
+/// Issue #188: Fish completion must remain an editor-only action. Completing an
+/// `rm` operand may inspect several matching names, but it must not commit a
+/// shell execution receipt (and therefore must not persist deletion events that
+/// can accumulate into `MassFileDeletion`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn fish_rm_tab_completion_does_not_persist_execution() {
+    let mut env = IsolatedEnv::new();
+    for name in [
+        "fish-delete-a.dmg",
+        "fish-delete-b.zip",
+        "fish-delete-c.zip",
+    ] {
+        std::fs::write(env.workdir.join(name), b"fixture").unwrap();
+    }
+    let mut sess = match fish_session(&mut env) {
+        Some(session) => session,
+        None => {
+            eprintln!("skipping: fish not installed");
+            return;
+        }
+    };
+
+    let ledger_before = strict_ledger_counts(&env);
+    let events_before = session_typed_event_count(&env);
+    sess.send_raw(b"rm fish-delete-\t\t");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    let ledger_after = strict_ledger_counts(&env);
+    let events_after = session_typed_event_count(&env);
+
+    // Cancel the unexecuted editor buffer before closing the session.
+    sess.send_raw(b"\x03");
+    sess.close();
+
+    assert_eq!(
+        ledger_after, ledger_before,
+        "Fish tab completion must not commit an execution receipt"
+    );
+    // The second half of the same invariant, and the one the original report
+    // was actually about: the correlation ring must not gain a deletion
+    // observation for a command the user never ran.
+    assert_eq!(
+        events_after, events_before,
+        "Fish tab completion must not persist a typed deletion observation"
     );
 }
 

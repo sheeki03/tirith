@@ -245,6 +245,100 @@ fn a_fifo_is_refused_rather_than_read() {
     assert!(matches!(error, TreeScanError::UnsupportedEntry(path) if path == "pipe"));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_retained_tree_root_cannot_be_redirected_by_visible_root_replacement() {
+    let holder = tempfile::tempdir().expect("tempdir");
+    let visible = holder.path().join("tree");
+    let displaced = holder.path().join("held-tree");
+    std::fs::create_dir(&visible).expect("tree");
+    sample_tree(&visible);
+
+    let outside = tempfile::tempdir().expect("outside");
+    write(outside.path(), "outside-secret", "must never be scanned\n");
+    let capability = DirCapability::open_root(&visible).expect("retain tree root");
+    std::fs::rename(&visible, &displaced).expect("displace visible root");
+    std::os::unix::fs::symlink(outside.path(), &visible).expect("replace root with symlink");
+
+    let retained = scan_tree_from_capability(
+        &capability,
+        &[],
+        PrunedNames::GitMetadata,
+        TreeLimits::default(),
+    )
+    .expect("the retained root remains readable");
+    let expected = source_scan(&displaced);
+    assert_eq!(retained.digest, expected.digest);
+    assert!(retained
+        .files
+        .iter()
+        .all(|entry| entry.path != "outside-secret"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_replaced_by_a_symlink_after_root_open_is_refused_not_followed() {
+    let root = tempfile::tempdir().expect("tempdir");
+    write(root.path(), "sub/inside", "inside\n");
+    let outside = tempfile::tempdir().expect("outside");
+    write(outside.path(), "secret", "must never be scanned\n");
+
+    let capability = DirCapability::open_root(root.path()).expect("retain tree root");
+    std::fs::rename(root.path().join("sub"), root.path().join("held-sub")).expect("displace child");
+    std::os::unix::fs::symlink(outside.path(), root.path().join("sub"))
+        .expect("replace child with symlink");
+
+    let error = scan_tree_from_capability(
+        &capability,
+        &[],
+        PrunedNames::GitMetadata,
+        TreeLimits::default(),
+    )
+    .expect_err("the replacement symlink must never be enumerated");
+    assert!(matches!(error, TreeScanError::Symlink(path) if path == "sub"));
+}
+
+#[test]
+fn names_added_after_the_initial_walk_are_refused_by_quiescence_reenumeration() {
+    for (added, changed_directory) in [("late.txt", "."), ("sub/late.txt", "sub")] {
+        let root = tempfile::tempdir().expect("tempdir");
+        write(root.path(), "keep.txt", "keep\n");
+        write(root.path(), "sub/keep.txt", "keep\n");
+        let capability = DirCapability::open_root(root.path()).expect("retain tree root");
+
+        let error = scan_tree_from_capability_after_walk(
+            &capability,
+            &[],
+            PrunedNames::None,
+            TreeLimits::default(),
+            || write(root.path(), added, "arrived after enumeration\n"),
+        )
+        .expect_err("a name added after enumeration must not be silently omitted");
+        assert!(
+            matches!(&error, TreeScanError::Changed(path) if path == changed_directory),
+            "unexpected refusal for {added}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn an_excluded_name_can_materialize_after_the_walk_without_false_change() {
+    let root = tempfile::tempdir().expect("tempdir");
+    write(root.path(), "keep.txt", "keep\n");
+    let capability = DirCapability::open_root(root.path()).expect("retain tree root");
+
+    let scan = scan_tree_from_capability_after_walk(
+        &capability,
+        &["receipt.json".to_string()],
+        PrunedNames::None,
+        TreeLimits::default(),
+        || write(root.path(), "receipt.json", "excluded publication\n"),
+    )
+    .expect("declared exclusions remain outside the projected name set");
+    assert_eq!(scan.file_count, 1);
+    assert!(scan.files.iter().all(|file| file.path != "receipt.json"));
+}
+
 #[test]
 fn a_case_folded_collision_is_refused() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -383,18 +477,29 @@ fn the_caps_are_folded_into_the_digest() {
 // ---------------------------------------------------------------------------
 
 fn walk_entry(root: &Path, relative: &str, size: u64, mode: u32) -> WalkEntry {
-    let path = root.join(relative);
-    let identity = std::fs::symlink_metadata(&path)
-        .ok()
-        .and_then(|metadata| identity_of(&metadata));
+    let capability = DirCapability::open_root(root).expect("open retained test root");
+    let identity = capability
+        .open_descendant_file(relative, u64::MAX)
+        .map(|file| file_identity(&file).expect("read stable test identity"))
+        // Only the vanished-file test fabricates an already-gone walk entry; its
+        // open fails before this sentinel identity can be compared.
+        .unwrap_or((0, 0));
     WalkEntry {
         relative: relative.to_string(),
-        path,
         directory: false,
         mode,
         size,
         identity,
     }
+}
+
+fn hash_test_entry(
+    root: &Path,
+    entry: &WalkEntry,
+    hasher: &mut DigestBuilder,
+) -> Result<String, TreeScanError> {
+    let capability = DirCapability::open_root(root).expect("open retained test root");
+    hash_bound_file(&capability, entry, hasher)
 }
 
 fn fresh_hasher() -> DigestBuilder {
@@ -415,8 +520,12 @@ fn a_file_larger_than_the_measured_size_is_refused_as_grown() {
     let mut hasher = fresh_hasher();
     // The walk measured 4 bytes and the file holds 10: exactly what an append
     // between the entry scan and the hash looks like.
-    let error = hash_bound_file(&walk_entry(root.path(), "a.txt", 4, real_mode), &mut hasher)
-        .expect_err("a grown file must be refused");
+    let error = hash_test_entry(
+        root.path(),
+        &walk_entry(root.path(), "a.txt", 4, real_mode),
+        &mut hasher,
+    )
+    .expect_err("a grown file must be refused");
     assert!(matches!(error, TreeScanError::Changed(path) if path == "a.txt"));
 }
 
@@ -426,7 +535,8 @@ fn a_file_smaller_than_the_measured_size_is_refused_as_truncated() {
     write(root.path(), "a.txt", "0123");
     let real_mode = mode_of(&std::fs::metadata(root.path().join("a.txt")).expect("stat"));
     let mut hasher = fresh_hasher();
-    let error = hash_bound_file(
+    let error = hash_test_entry(
+        root.path(),
         &walk_entry(root.path(), "a.txt", 10, real_mode),
         &mut hasher,
     )
@@ -440,8 +550,12 @@ fn a_file_whose_mode_no_longer_matches_is_refused_as_rebound() {
     let root = tempfile::tempdir().expect("tempdir");
     write(root.path(), "a.txt", "0123");
     let mut hasher = fresh_hasher();
-    let error = hash_bound_file(&walk_entry(root.path(), "a.txt", 4, 0o777), &mut hasher)
-        .expect_err("a rebound file must be refused");
+    let error = hash_test_entry(
+        root.path(),
+        &walk_entry(root.path(), "a.txt", 4, 0o777),
+        &mut hasher,
+    )
+    .expect_err("a rebound file must be refused");
     assert!(matches!(error, TreeScanError::Changed(path) if path == "a.txt"));
 }
 
@@ -453,6 +567,11 @@ fn a_file_rebound_to_another_inode_of_the_same_size_and_mode_is_refused() {
     // only the recorded filesystem identity can tell them apart.
     write(root.path(), "measured.txt", "AAAA");
     write(root.path(), "decoy.txt", "CCCC");
+    #[cfg(windows)]
+    make_windows_creation_and_write_times_match(
+        &root.path().join("measured.txt"),
+        &root.path().join("decoy.txt"),
+    );
     let measured = walk_entry(root.path(), "measured.txt", 4, 0o644);
     let decoy = walk_entry(root.path(), "decoy.txt", 4, 0o644);
     assert_eq!(
@@ -470,15 +589,6 @@ fn a_file_rebound_to_another_inode_of_the_same_size_and_mode_is_refused() {
         mode_of(&std::fs::metadata(root.path().join("decoy.txt")).expect("stat")),
         "the two inodes must carry the same mode for this test to mean anything"
     );
-    if measured.identity.is_none()
-        || decoy.identity.is_none()
-        || measured.identity == decoy.identity
-    {
-        // A platform that cannot report an identity from a walk stat, or that
-        // reports the same timestamp pair for two files written in the same
-        // tick (Windows), is outside what this test can prove.
-        return;
-    }
     assert_ne!(measured.identity, decoy.identity);
 
     // The rename lands between the walk stat and the open, which is exactly the
@@ -492,23 +602,71 @@ fn a_file_rebound_to_another_inode_of_the_same_size_and_mode_is_refused() {
     let mut hasher = fresh_hasher();
     let entry = WalkEntry {
         relative: "measured.txt".to_string(),
-        path: root.path().join("measured.txt"),
         directory: false,
         mode: real_mode,
         size: 4,
         identity: measured.identity,
     };
-    let error = hash_bound_file(&entry, &mut hasher)
+    let error = hash_test_entry(root.path(), &entry, &mut hasher)
         .expect_err("a name rebound to another inode must be refused");
     assert!(matches!(error, TreeScanError::Changed(path) if path == "measured.txt"));
+}
+
+#[cfg(windows)]
+fn make_windows_creation_and_write_times_match(source: &Path, destination: &Path) {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::ptr::null;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileTime, SetFileTime};
+
+    let source = std::fs::OpenOptions::new()
+        .read(true)
+        .open(source)
+        .expect("open timestamp source");
+    let destination = std::fs::OpenOptions::new()
+        .write(true)
+        .open(destination)
+        .expect("open timestamp destination");
+    let mut creation = FILETIME::default();
+    let mut write = FILETIME::default();
+    // SAFETY: both handles are live and the output structures are writable.
+    assert_ne!(
+        unsafe {
+            GetFileTime(
+                source.as_raw_handle(),
+                &mut creation,
+                null::<FILETIME>().cast_mut(),
+                &mut write,
+            )
+        },
+        0,
+        "read source timestamps"
+    );
+    // SAFETY: the destination handle is live and both timestamp pointers refer
+    // to initialized FILETIME values.
+    assert_ne!(
+        unsafe { SetFileTime(destination.as_raw_handle(), &creation, null(), &write,) },
+        0,
+        "copy source timestamps"
+    );
+
+    use std::os::windows::fs::MetadataExt as _;
+    let source = source.metadata().expect("source metadata");
+    let destination = destination.metadata().expect("destination metadata");
+    assert_eq!(source.creation_time(), destination.creation_time());
+    assert_eq!(source.last_write_time(), destination.last_write_time());
 }
 
 #[test]
 fn a_vanished_file_is_refused_rather_than_skipped() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut hasher = fresh_hasher();
-    let error = hash_bound_file(&walk_entry(root.path(), "gone.txt", 0, 0o644), &mut hasher)
-        .expect_err("a vanished file must be refused");
+    let error = hash_test_entry(
+        root.path(),
+        &walk_entry(root.path(), "gone.txt", 0, 0o644),
+        &mut hasher,
+    )
+    .expect_err("a vanished file must be refused");
     assert!(matches!(error, TreeScanError::Changed(path) if path == "gone.txt"));
 }
 
@@ -783,6 +941,59 @@ fn a_fresh_receipt_is_content_addressed_clean_and_valid() {
 }
 
 #[test]
+fn receipt_tree_limits_cannot_raise_or_remove_the_schema_caps() {
+    type LimitMutation = (&'static str, fn(&mut TreeLimits));
+
+    let (root, receipt) = clean_receipt();
+    let output = root.path().join("dist");
+    let mutations: [LimitMutation; 8] = [
+        ("zero max_files", |limits| limits.max_files = 0),
+        ("zero max_bytes", |limits| limits.max_bytes = 0),
+        ("zero max_depth", |limits| limits.max_depth = 0),
+        ("zero max_path_bytes", |limits| limits.max_path_bytes = 0),
+        ("raised max_files", |limits| {
+            limits.max_files = MAX_TREE_FILES + 1
+        }),
+        ("raised max_bytes", |limits| {
+            limits.max_bytes = MAX_TREE_BYTES + 1
+        }),
+        ("raised max_depth", |limits| {
+            limits.max_depth = MAX_TREE_DEPTH + 1
+        }),
+        ("raised max_path_bytes", |limits| {
+            limits.max_path_bytes = MAX_RELATIVE_PATH_BYTES + 1
+        }),
+    ];
+
+    for (label, mutate) in mutations {
+        let mut unsafe_receipt = receipt.clone();
+        mutate(&mut unsafe_receipt.evidence.limits);
+        unsafe_receipt.signature_present = false;
+        unsafe_receipt.signature = None;
+        unsafe_receipt.receipt_id = unsafe_receipt.compute_content_hash();
+        let error = unsafe_receipt
+            .validate()
+            .expect_err("unsafe receipt limits must fail before a verification scan");
+        assert!(
+            error.to_string().contains("tree limits are unsafe"),
+            "{label} produced the wrong refusal: {error}"
+        );
+
+        let verification = verify_build(
+            &unsafe_receipt,
+            &root.path().join("missing-source"),
+            &output.join("missing-output"),
+            unsigned_anchor(),
+        );
+        assert_eq!(verification.status, AttestStatus::Mismatch, "{label}");
+        assert!(verification.source_digest.is_none(), "{label}");
+        assert!(verification.output_digest.is_none(), "{label}");
+        assert_eq!(verification.findings.len(), 1, "{label}");
+        assert!(verification.findings[0].contains("tree limits are unsafe"));
+    }
+}
+
+#[test]
 fn the_output_root_is_excluded_from_the_source_digest_by_assembly() {
     let (root, receipt) = clean_receipt();
     let source = receipt.subject.source_tree.expect("source tree");
@@ -847,6 +1058,162 @@ fn build_receipt_parsing_rejects_duplicate_members_before_validation() {
         .expect_err("the public file loader must use the same strict parser")
         .to_string()
         .contains("duplicate JSON object key"));
+}
+
+#[test]
+fn build_receipt_parsing_rejects_unknown_root_and_nested_members() {
+    let (_root, receipt) = clean_receipt();
+    let original: serde_json::Value =
+        serde_json::from_str(&receipt.to_json()).expect("receipt JSON value");
+
+    for (label, mutate) in [
+        (
+            "root",
+            (|value: &mut serde_json::Value| value["reproducible"] = true.into())
+                as fn(&mut serde_json::Value),
+        ),
+        ("subject", |value| {
+            value["subject"]["attacker_note"] = "trusted".into()
+        }),
+        ("limits", |value| {
+            value["evidence"]["limits"]["unbounded"] = true.into()
+        }),
+        ("output manifest entry", |value| {
+            value["subject"]["output_files"][0]["download_url"] = "https://attacker.invalid".into()
+        }),
+    ] {
+        let mut injected = original.clone();
+        mutate(&mut injected);
+        let encoded = serde_json::to_string(&injected).expect("encode injected receipt");
+        let error = BuildReceipt::parse(&encoded)
+            .expect_err("unknown receipt members must never be dropped before verification");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "{label} member produced the wrong refusal: {error}"
+        );
+    }
+}
+
+#[test]
+fn build_receipt_publication_is_bounded_atomic_and_idempotent() {
+    let (_fixture, receipt) = clean_receipt();
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("receipt.json");
+
+    receipt.write_to(&path).expect("first publication");
+    let first = std::fs::read(&path).expect("published receipt");
+    receipt.write_to(&path).expect("idempotent publication");
+    let second = std::fs::read(&path).expect("republished receipt");
+    assert_eq!(first, second);
+    assert_eq!(
+        BuildReceipt::load(&path)
+            .expect("load retained receipt")
+            .receipt_id,
+        receipt.receipt_id
+    );
+    assert!(std::fs::read_dir(directory.path())
+        .expect("list publication directory")
+        .filter_map(Result::ok)
+        .all(|entry| !entry
+            .file_name()
+            .to_string_lossy()
+            .contains("tirith-contained")));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("receipt metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let oversized = directory.path().join("oversized.json");
+    let file = std::fs::File::create(&oversized).expect("oversized receipt");
+    file.set_len(MAX_BUILD_RECEIPT_BYTES + 1)
+        .expect("extend receipt past cap");
+    assert!(BuildReceipt::load_unvalidated(&oversized).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn build_receipt_leaf_symlinks_and_special_files_are_refused_without_mutation() {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let (_fixture, receipt) = clean_receipt();
+    let directory = tempfile::tempdir().expect("tempdir");
+    let victim = directory.path().join("victim.json");
+    let symlink = directory.path().join("symlink.json");
+    std::fs::write(&victim, b"victim sentinel").expect("victim");
+    std::os::unix::fs::symlink(&victim, &symlink).expect("symlink");
+
+    assert!(receipt.write_to(&symlink).is_err());
+    assert!(BuildReceipt::load_unvalidated(&symlink).is_err());
+    assert_eq!(
+        std::fs::read(&victim).expect("victim remains"),
+        b"victim sentinel"
+    );
+
+    let outside_parent = tempfile::tempdir().expect("outside parent");
+    let linked_parent = directory.path().join("linked-parent");
+    std::os::unix::fs::symlink(outside_parent.path(), &linked_parent).expect("parent symlink");
+    let redirected = linked_parent.join("receipt.json");
+    assert!(receipt.write_to(&redirected).is_err());
+    assert!(BuildReceipt::load_unvalidated(&redirected).is_err());
+    assert!(!outside_parent.path().join("receipt.json").exists());
+
+    let fifo = directory.path().join("receipt.fifo");
+    let encoded = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("cstring");
+    // SAFETY: the path is NUL-terminated and owned by this temporary directory.
+    assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+    assert!(receipt.write_to(&fifo).is_err());
+    assert!(BuildReceipt::load_unvalidated(&fifo).is_err());
+    assert!(std::fs::symlink_metadata(&fifo)
+        .expect("fifo remains")
+        .file_type()
+        .is_fifo());
+
+    let directory_leaf = directory.path().join("receipt.directory");
+    std::fs::create_dir(&directory_leaf).expect("directory leaf");
+    assert!(receipt.write_to(&directory_leaf).is_err());
+    assert!(BuildReceipt::load_unvalidated(&directory_leaf).is_err());
+    assert!(directory_leaf.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn build_receipt_read_and_write_stay_under_the_retained_parent() {
+    let (_fixture, receipt) = clean_receipt();
+    let holder = tempfile::tempdir().expect("tempdir");
+    let parent = holder.path().join("parent");
+    let displaced = holder.path().join("held-parent");
+    std::fs::create_dir(&parent).expect("parent");
+    let destination = parent.join("receipt.json");
+    let capability = prepare_build_receipt_file(&destination).expect("retain destination parent");
+
+    let outside = tempfile::tempdir().expect("outside");
+    let outside_receipt = outside.path().join("receipt.json");
+    std::fs::write(&outside_receipt, b"outside sentinel").expect("outside sentinel");
+    std::fs::rename(&parent, &displaced).expect("displace parent");
+    std::os::unix::fs::symlink(outside.path(), &parent).expect("redirect visible parent");
+
+    write_build_receipt_to_capability(&receipt, &capability)
+        .expect("publish through retained parent");
+    assert_eq!(
+        load_build_receipt_from_capability(&capability)
+            .expect("read through retained parent")
+            .receipt_id,
+        receipt.receipt_id
+    );
+    assert!(displaced.join("receipt.json").is_file());
+    assert_eq!(
+        std::fs::read(&outside_receipt).expect("outside remains"),
+        b"outside sentinel"
+    );
 }
 
 #[test]
@@ -1374,7 +1741,12 @@ fn verify_build_refuses_a_receipt_whose_signature_does_not_verify() {
     let mut forged = receipt.clone();
     forged.signature = Some("AAAA-not-a-real-ed25519-signature".to_string());
     forged.receipt_id = forged.compute_content_hash();
-    let verification = verify_build(&forged, root.path(), &output, anchor);
+    let verification = verify_build(
+        &forged,
+        &root.path().join("missing-source"),
+        &root.path().join("missing-output"),
+        anchor,
+    );
     assert_eq!(verification.status, AttestStatus::Mismatch);
     assert_eq!(verification.status.exit_code(), 1);
     assert_eq!(verification.signature, SignatureTrust::Rejected);
@@ -1382,6 +1754,13 @@ fn verify_build_refuses_a_receipt_whose_signature_does_not_verify() {
         .findings
         .iter()
         .any(|finding| finding.contains("does not verify")));
+    assert!(verification.source_digest.is_none());
+    assert!(verification.output_digest.is_none());
+    assert_eq!(
+        verification.findings.len(),
+        1,
+        "a rejected receipt must not drive either filesystem scan"
+    );
 
     // A genuine signature over DIFFERENT content is equally rejected: this is
     // the spliced-subject forgery, where a stale signature is retained over a
@@ -1389,7 +1768,12 @@ fn verify_build_refuses_a_receipt_whose_signature_does_not_verify() {
     let mut spliced = receipt.clone();
     spliced.subject.source_exclusions = vec!["src".to_string(), "assets".to_string()];
     spliced.receipt_id = spliced.compute_content_hash();
-    let verification = verify_build(&spliced, root.path(), &output, anchor);
+    let verification = verify_build(
+        &spliced,
+        &root.path().join("missing-source"),
+        &root.path().join("missing-output"),
+        anchor,
+    );
     assert_eq!(verification.status, AttestStatus::Mismatch);
     assert_eq!(verification.signature, SignatureTrust::Rejected);
 }
@@ -1421,20 +1805,31 @@ fn verify_build_refuses_an_unsigned_receipt_on_an_installation_that_signs() {
 fn verify_build_is_partial_when_a_signature_cannot_be_checked() {
     let key = test_signing_key();
     let (root, mut receipt) = clean_receipt();
-    let output = root.path().join("dist");
     sign_build_receipt(&mut receipt, &key);
 
     let no_key = SignatureAnchor {
         verifying_key: None,
         signing_expected: true,
     };
-    let verification = verify_build(&receipt, root.path(), &output, no_key);
+    let verification = verify_build(
+        &receipt,
+        &root.path().join("missing-source"),
+        &root.path().join("missing-output"),
+        no_key,
+    );
     assert_eq!(verification.status, AttestStatus::Partial);
     assert_eq!(verification.signature, SignatureTrust::Uncheckable);
     assert!(verification
         .findings
         .iter()
         .any(|finding| finding.contains("could not be checked")));
+    assert!(verification.source_digest.is_none());
+    assert!(verification.output_digest.is_none());
+    assert_eq!(
+        verification.findings.len(),
+        1,
+        "an uncheckable receipt must not drive either filesystem scan"
+    );
 }
 
 #[test]

@@ -70,6 +70,7 @@ struct Stats {
     id_other: usize,
     license_cc_by: usize,
     license_cc0_explicit: usize,
+    license_other_explicit: usize,
     license_unset: usize,
     with_patched: usize,
     with_unaffected: usize,
@@ -213,7 +214,10 @@ fn tally(stats: &mut Stats, adv: &Advisory) {
     match meta.license.as_deref() {
         Some("CC-BY-4.0") => stats.license_cc_by += 1,
         Some("CC0-1.0") => stats.license_cc0_explicit += 1,
-        Some(_) => stats.license_cc0_explicit += 1,
+        // Any OTHER explicit license is its own category. Folding it into the
+        // CC0 tally (the two arms were identical) inflated the headline CC0
+        // count with every MIT-or-similar advisory.
+        Some(_) => stats.license_other_explicit += 1,
         None => stats.license_unset += 1,
     }
 
@@ -321,7 +325,8 @@ fn print_report(root: &Path, s: &Stats) {
     println!("  alias other              : {}", s.alias_other);
     println!();
     println!("license CC-BY-4.0 (GHSA)   : {}", s.license_cc_by);
-    println!("license CC0/other explicit : {}", s.license_cc0_explicit);
+    println!("license CC0-1.0 explicit    : {}", s.license_cc0_explicit);
+    println!("license other explicit      : {}", s.license_other_explicit);
     println!("license unset (CC0 default): {}", s.license_unset);
     println!();
     println!("with patched ranges        : {}", s.with_patched);

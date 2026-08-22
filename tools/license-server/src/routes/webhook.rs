@@ -19,6 +19,25 @@ use crate::webhook_verify;
 
 const B64URL: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+/// Record a dead-letter row, logging at error level if the insert itself fails.
+///
+/// The caller has already decided to answer the webhook: these paths handle a
+/// malformed or unresolvable event that a Polar retry would not help, so they
+/// return 200 rather than 500. That makes the dead-letter the sole durable
+/// trace of the event, and a silently swallowed insert failure would leave a
+/// terminal event with no record at all. Logging keeps the 200/no-retry
+/// contract while making the loss visible to operators.
+async fn record_dead_letter(state: &AppState, data: DeadLetterData) {
+    let summary = format!("{} ({})", data.event_type, data.reason);
+    if let Err(error) = state.db.insert_dead_letter(data).await {
+        error!(
+            error = %error,
+            dead_letter = %summary,
+            "failed to record dead-letter; this terminal event now has no durable trace"
+        );
+    }
+}
+
 pub async fn webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -259,17 +278,18 @@ async fn handle_sub_active(
                     sub_id = %sub_id,
                     "subscription.active with unknown product, cannot provision"
                 );
-                let _ = state
-                    .db
-                    .insert_dead_letter(DeadLetterData {
+                record_dead_letter(
+                    state,
+                    DeadLetterData {
                         event_id: event_id.to_string(),
                         subscription_id: Some(sub_id.clone()),
                         event_type: "subscription.active".to_string(),
                         reason: "unresolvable_product".to_string(),
                         occurred_at: Some(created_at.clone()),
                         payload: redact_event(event),
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 return Err(AppError::Internal("unknown product_id".into()));
             }
         };
@@ -318,9 +338,9 @@ async fn handle_sub_canceled(
     let sub_id = match json_str(data, "id") {
         Some(id) => id,
         None => {
-            let _ = state
-                .db
-                .insert_dead_letter(DeadLetterData {
+            record_dead_letter(
+                state,
+                DeadLetterData {
                     event_id: event_id.to_string(),
                     subscription_id: None,
                     event_type: "subscription.canceled".to_string(),
@@ -330,8 +350,9 @@ async fn handle_sub_canceled(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     payload: redact_event(event),
-                })
-                .await;
+                },
+            )
+            .await;
             error!(event_id = %event_id, "canceled event missing subscription_id");
             return Ok(StatusCode::OK);
         }
@@ -385,9 +406,9 @@ async fn handle_sub_revoked(
     let sub_id = match json_str(data, "id") {
         Some(id) => id,
         None => {
-            let _ = state
-                .db
-                .insert_dead_letter(DeadLetterData {
+            record_dead_letter(
+                state,
+                DeadLetterData {
                     event_id: event_id.to_string(),
                     subscription_id: None,
                     event_type: "subscription.revoked".to_string(),
@@ -397,8 +418,9 @@ async fn handle_sub_revoked(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     payload: redact_event(event),
-                })
-                .await;
+                },
+            )
+            .await;
             error!(event_id = %event_id, "revoked event missing subscription_id");
             return Ok(StatusCode::OK);
         }
@@ -631,17 +653,18 @@ async fn resolve_tier(
                     product_id = %pid,
                     "unresolvable product_id — setting tier to unknown"
                 );
-                let _ = state
-                    .db
-                    .insert_dead_letter(DeadLetterData {
+                record_dead_letter(
+                    state,
+                    DeadLetterData {
                         event_id: event_id.to_string(),
                         subscription_id: Some(sub_id.to_string()),
                         event_type: event_type.to_string(),
                         reason: "unresolvable_product".to_string(),
                         occurred_at: created_at.clone(),
                         payload: redact_event(event),
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 (None, true)
             }
         },
@@ -650,17 +673,18 @@ async fn resolve_tier(
                 sub_id = %sub_id,
                 "no product_id in event — setting tier to unknown"
             );
-            let _ = state
-                .db
-                .insert_dead_letter(DeadLetterData {
+            record_dead_letter(
+                state,
+                DeadLetterData {
                     event_id: event_id.to_string(),
                     subscription_id: Some(sub_id.to_string()),
                     event_type: event_type.to_string(),
                     reason: "unresolvable_product".to_string(),
                     occurred_at: created_at.clone(),
                     payload: redact_event(event),
-                })
-                .await;
+                },
+            )
+            .await;
             (None, true)
         }
     }
@@ -768,6 +792,58 @@ fn redact_event(event: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_event_keeps_only_the_allowlisted_fields() {
+        // The dead-letter payload is stored, so it must carry the operational
+        // ids needed to retry and nothing else: no customer email, no API key,
+        // no arbitrary nested data. This is the only thing standing between a
+        // dropped event and a plaintext PII leak into the dead-letter table.
+        let event = serde_json::json!({
+            "type": "subscription.past_due",
+            "created_at": "2024-01-01T00:00:00Z",
+            "secret_top_level": "must-not-appear",
+            "data": {
+                "id": "sub_1",
+                "status": "past_due",
+                "product_id": "prod_1",
+                "checkout_id": "chk_1",
+                "customer_id": "cust_1",
+                "customer": { "email": "victim@example.com" },
+                "metadata": { "api_key": "sk_live_should_not_leak" },
+                "raw_note": "free text that could hold anything"
+            }
+        });
+        let redacted = redact_event(&event);
+        let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+
+        assert_eq!(parsed["type"], "subscription.past_due");
+        assert_eq!(parsed["created_at"], "2024-01-01T00:00:00Z");
+        assert_eq!(parsed["data"]["id"], "sub_1");
+        assert_eq!(parsed["data"]["status"], "past_due");
+        assert_eq!(parsed["data"]["product_id"], "prod_1");
+        assert_eq!(parsed["data"]["checkout_id"], "chk_1");
+        assert_eq!(parsed["data"]["customer_id"], "cust_1");
+
+        // Everything not on the allowlist is absent, checked structurally and
+        // by substring so a future field addition cannot quietly leak.
+        assert!(parsed["secret_top_level"].is_null());
+        assert!(parsed["data"]["customer"].is_null());
+        assert!(parsed["data"]["metadata"].is_null());
+        assert!(parsed["data"]["raw_note"].is_null());
+        assert!(
+            !redacted.contains("victim@example.com"),
+            "email leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("sk_live_should_not_leak"),
+            "api key leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("free text"),
+            "arbitrary data leaked: {redacted}"
+        );
+    }
 
     #[test]
     fn lifecycle_timestamp_is_required_and_must_be_rfc3339() {

@@ -93,7 +93,40 @@
     },
     "history": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "event": {
+                "enum": [
+                  "blocker_added",
+                  "blocker_cleared"
+                ]
+              }
+            },
+            "required": [
+              "event"
+            ]
+          },
+          "then": {
+            "required": [
+              "blocker_id"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "blocker_id"
+              ]
+            }
+          }
+        }
+      ],
       "properties": {
+        "blocker_id": {
+          "pattern": "^blocked_[a-z0-9_]+$",
+          "type": "string"
+        },
         "date": {
           "format": "date",
           "type": "string"
@@ -187,7 +220,15 @@
                   "type": "string"
                 },
                 "closed_date": {
-                  "type": "null"
+                  "oneOf": [
+                    {
+                      "format": "date",
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "opened_date": {
                   "format": "date",

@@ -1216,18 +1216,27 @@ refuses before reading the run config or starting the upstream process;
 Examples:
   tirith setup claude-code --with-mcp
   tirith setup cursor
+  tirith setup cline
+  tirith setup continue
+  tirith setup roo-code
+  tirith setup openhands
+  tirith setup grok-build --scope user
+  tirith setup omp
+  tirith setup opencode
+  tirith setup fx
+  tirith setup prime-agent
   tirith setup copilot-cli
   tirith setup kiro --scope user
   tirith setup claude-code --dry-run")]
     Setup {
-        /// Tool to configure: claude-code, codex, copilot-cli, cursor, gemini-cli, kiro, openclaw, pi-cli, vscode, windsurf
+        /// Tool to configure: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, windsurf
         tool: String,
 
         /// Scope: project (default for most tools) or user
         #[arg(long)]
         scope: Option<String>,
 
-        /// Also register tirith MCP server (Claude Code and Gemini CLI)
+        /// Also register tirith MCP server (Claude Code and Gemini CLI; MCP-only clients register it automatically)
         #[arg(long)]
         with_mcp: bool,
 

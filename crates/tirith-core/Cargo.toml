@@ -158,11 +158,17 @@ windows = { version = "0.62", default-features = false, features = [
 # filesystem (and, on ABI v4 / Linux 6.7, port-level network) access control;
 # extrasafe = an ergonomic seccomp-BPF policy builder (wraps seccompiler). Both
 # are applied by the internal `tirith __capsule-child` launcher, NOT inside
-# `pre_exec`. `cfg(target_os = "linux")`-gated so macOS / Windows targets compile
-# without them. Proven to resolve + build on MSRV 1.83 across the linux-gnu target
-# in the PR-0 spike. Licenses: landlock MIT/Apache-2.0, extrasafe MIT.
+# `pre_exec`. Landlock supports Linux generally, but extrasafe 0.5 intentionally
+# compile-errors outside linux-x86_64, so keep that dependency gated to the only
+# architecture where `capsule::linux::apply_seccomp` uses it. On other Linux
+# architectures the backend reports `network_raw_denied = false`; locked-down
+# callers therefore degrade/fail closed rather than claiming absent seccomp.
+# Proven to resolve + build on MSRV 1.83. Licenses: landlock MIT/Apache-2.0,
+# extrasafe MIT.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 extrasafe = "0.5"
 
 [build-dependencies]

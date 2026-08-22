@@ -502,13 +502,17 @@ Download from [GitHub Releases](https://github.com/sheeki03/tirith/releases/late
 sudo dpkg -i tirith_*_amd64.deb
 ```
 
-**Fedora / RHEL / CentOS 9+ (.rpm):**
+**Fedora / RHEL / CentOS 8+ and Amazon Linux 2023 (.rpm):**
 
 Download from [GitHub Releases](https://github.com/sheeki03/tirith/releases/latest), then:
 
 ```bash
 sudo dnf install ./tirith-*.rpm
 ```
+
+The Linux GNU release binaries target a GLIBC 2.28 ceiling. CI runs both
+x86_64 and aarch64 tarballs on AlmaLinux 8, Amazon Linux 2023, and Rocky Linux
+9; the `.deb` and x86_64 `.rpm` contain those same canonical binaries.
 
 **Arch Linux (AUR):**
 
@@ -629,14 +633,14 @@ tirith init --shell fish | source   # in ~/.config/fish/config.fish
 Bash uses enter mode when a capability self-test has proven it works for your bash, and preexec otherwise. `tirith setup` / `tirith doctor` run the self-test; the shell hook reads its cached verdict at startup. See [troubleshooting](docs/troubleshooting.md#bash-enter-mode-vs-preexec-mode) for details on the modes, the self-test, and SSH fallback behavior.
 
 > [!WARNING]
-> Bash's preexec mode warns but cannot block in-place. Set `TIRITH_BASH_PREEXEC_ENFORCE=1` for real blocking via `shopt -s extdebug`. Enforcement refuses to activate when `HISTCONTROL` contains `ignorespace` / `ignoredups` / `ignoreboth`, any `HISTIGNORE` is set, or `set +o history` is active, those make the block racy.
+> Bash's preexec mode is warn-only by default. Set `TIRITH_BASH_PREEXEC_ENFORCE=1` for conditional blocking. Tirith scans the trustworthy typed line once, enables its own `extdebug` only after a block verdict, and releases it before `PROMPT_COMMAND` runs. If prompt boundaries or a caller-owned DEBUG trap cannot be preserved safely, or `extdebug` is already user-enabled, Tirith visibly leaves preexec interception off instead of clobbering shell state.
 
 #### Enforcement by shell
 
 | Shell | Behavior |
 |---|---|
 | bash **enter mode** | **Reliable blocking.** Binds Enter; can stop a command before bash commits to running it. Used by default only where a capability self-test (`tirith doctor --simulate-enter`) has proven `bind -x` delivery works for the running bash. |
-| bash **preexec + `TIRITH_BASH_PREEXEC_ENFORCE=1`** | **Conditional blocking.** Uses `shopt -s extdebug`; blocks when bash's `history` can provide a trustworthy whole-line view. Downgrades to warn-only when history is filtered (`HISTCONTROL=ignorespace/ignoredups/ignoreboth`, any `HISTIGNORE`, or `set +o history`) or an alias / command substitution / `eval` makes the typed line drift from `BASH_COMMAND`. |
+| bash **preexec + `TIRITH_BASH_PREEXEC_ENFORCE=1`** | **Conditional blocking.** Scans one trustworthy whole line, then turns on Tirith-owned `extdebug` only for a block and restores it at the next prompt. Existing string/array `PROMPT_COMMAND` entries keep their order and run outside scanning. Enforcement visibly refuses or downgrades when history is filtered or an alias / command substitution / `eval` makes the typed line drift from `BASH_COMMAND`; unsafe prompt/DEBUG ownership or user-owned `extdebug` leaves interception explicitly off rather than mutating user state. |
 | bash **preexec** (no enforce flag) | Warn-only. Prints a DETECTED banner on risky commands; does not block. The fallback when the enter-mode self-test has not proven delivery works. |
 | zsh, fish | Reliable blocking in their Enter/accept-line handlers, before the native shell handoff. Notification-only preexec events are not treated as authorization gates. |
 | PowerShell | Reliable PSReadLine preflight blocking; no strict execution receipt. |
@@ -722,12 +726,28 @@ tirith setup copilot-cli              # GitHub Copilot CLI (run from repo root)
 tirith setup cursor                   # Cursor
 tirith setup gemini-cli --with-mcp    # Gemini CLI + MCP server
 tirith setup kiro                     # Kiro CLI (formerly Amazon Q)
-tirith setup pi-cli                   # Pi CLI
+tirith setup pi-cli                   # Pi CLI: blocking tool_call guard
+tirith setup grok-build               # Grok Build MCP + POSIX PreToolUse hook
+tirith setup omp                      # OMP / Oh My Pi: blocking tool_call guard + MCP
+tirith setup opencode                 # OpenCode MCP tools
+tirith setup fx                       # Vercel Labs fx MCP tools (trusted user profile)
+tirith setup prime-agent              # Prime Agent: blocking guard (bash + ipython) + MCP
+tirith setup cline                    # Cline: blocking PreToolUse hook (POSIX + Windows) + MCP
+tirith setup roo-code                 # Roo Code MCP tools (project scope)
+tirith setup continue                 # Continue MCP tools (project scope)
+tirith setup openhands                # OpenHands: MCP (user) / blocking hook (--scope project)
 tirith setup vscode                   # VS Code
 tirith setup windsurf                 # Windsurf
 ```
 
-For manual configuration, see `mcp/clients/` for per-tool guides.
+Pi CLI, Prime Agent, OMP, Cline, OpenHands, and Grok Build (POSIX) get a
+blocking pre-execution hook: the host asks Tirith before running a command and
+honours a refusal. OpenCode, fx, Roo Code, and Continue are MCP only: their
+registrations expose Tirith's tools to the agent but do not intercept
+commands. Which hosts fail open when a hook itself errors, and what each hook
+can and cannot see, is in the
+[agent integration and trust matrix](mcp/clients/mcp-only-agents.md).
+See `mcp/clients/` for per-tool guides.
 
 ### CI/CD Integration
 
@@ -739,6 +759,10 @@ For manual configuration, see `mcp/clients/` for per-tool guides.
     fail_on: high
     sarif: true
 ```
+
+The action's pinned dependencies use the Node 24 action runtime. Self-hosted
+runners must use [Actions Runner v2.327.1 or newer](https://github.com/actions/runner/releases/tag/v2.327.1);
+GitHub-hosted runners already satisfy this requirement.
 
 Also available as a **pre-commit hook**: see `.pre-commit-hooks.yaml` in this repo.
 

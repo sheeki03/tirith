@@ -144,7 +144,8 @@ impl ContainedAtomicFile {
 
     /// Atomically publish `contents` through the retained parent capability.
     /// The prepared tempfile is flushed before publication; publication never
-    /// follows a final-component symlink.
+    /// follows a final-component symlink and refuses to replace anything except
+    /// the same regular file observed before staging began.
     pub fn write_atomic(&self, contents: &[u8], overwrite: bool) -> io::Result<()> {
         self.inner.write_atomic(contents, overwrite)
     }
@@ -313,7 +314,8 @@ impl ContainedAtomicFile {
     /// `Some`, the temporary file is `fchmod`'d BEFORE publication so the
     /// destination entry appears with its final permissions atomically — no
     /// post-rename chmod window and no more-permissive intermediate mode.
-    /// Ignored off unix.
+    /// Ignored off unix. Existing destinations have the same regular-file and
+    /// identity requirement as [`Self::write_atomic`].
     pub fn write_atomic_from_reader<R: std::io::Read + ?Sized>(
         &self,
         reader: &mut R,
@@ -643,7 +645,23 @@ mod platform {
             .collect()
     }
 
-    fn inspect_final(parent: &File, name: &CString) -> io::Result<Option<libc::mode_t>> {
+    #[derive(Clone, Copy)]
+    struct FinalEntry {
+        mode: libc::mode_t,
+        device: libc::dev_t,
+        inode: libc::ino_t,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PublicationPreimage {
+        Absent,
+        Regular {
+            device: libc::dev_t,
+            inode: libc::ino_t,
+        },
+    }
+
+    fn inspect_final(parent: &File, name: &CString) -> io::Result<Option<FinalEntry>> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: fd/name are live, `stat` points to writable storage, and
         // AT_SYMLINK_NOFOLLOW ensures the named entry itself is inspected.
@@ -657,7 +675,12 @@ mod platform {
         };
         if result == 0 {
             // SAFETY: successful `fstatat` initialized `stat`.
-            return Ok(Some(unsafe { stat.assume_init() }.st_mode));
+            let stat = unsafe { stat.assume_init() };
+            return Ok(Some(FinalEntry {
+                mode: stat.st_mode,
+                device: stat.st_dev,
+                inode: stat.st_ino,
+            }));
         }
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::NotFound {
@@ -668,13 +691,42 @@ mod platform {
     }
 
     fn require_nonsymlink_final(parent: &File, name: &CString, display: &Path) -> io::Result<()> {
-        if inspect_final(parent, name)?.is_some_and(|mode| mode & libc::S_IFMT == libc::S_IFLNK) {
+        if inspect_final(parent, name)?
+            .is_some_and(|entry| entry.mode & libc::S_IFMT == libc::S_IFLNK)
+        {
             return Err(invalid_input(format!(
                 "refusing symlinked contained destination {}",
                 display.display()
             )));
         }
         Ok(())
+    }
+
+    fn publication_preimage(
+        parent: &File,
+        name: &CString,
+        display: &Path,
+    ) -> io::Result<PublicationPreimage> {
+        classify_publication_preimage(inspect_final(parent, name)?, display)
+    }
+
+    fn classify_publication_preimage(
+        entry: Option<FinalEntry>,
+        display: &Path,
+    ) -> io::Result<PublicationPreimage> {
+        let Some(entry) = entry else {
+            return Ok(PublicationPreimage::Absent);
+        };
+        if entry.mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(invalid_input(format!(
+                "refusing non-regular contained publication destination {}",
+                display.display()
+            )));
+        }
+        Ok(PublicationPreimage::Regular {
+            device: entry.device,
+            inode: entry.inode,
+        })
     }
 
     pub(super) struct ContainedAtomicFile {
@@ -1036,8 +1088,14 @@ mod platform {
             R: std::io::Read + ?Sized,
             F: FnOnce() -> io::Result<()>,
         {
-            require_nonsymlink_final(&self.parent, &self.name, &self.display)?;
-            if !overwrite && inspect_final(&self.parent, &self.name)?.is_some() {
+            // Snapshot only namespace identity here, without opening the leaf.
+            // `fstatat(AT_SYMLINK_NOFOLLOW)` cannot block on a FIFO/device and
+            // rejects every existing shape except a regular file. Content-
+            // sensitive callers retain their stronger digest
+            // preimage check in `before_publish`.
+            let expected_destination =
+                publication_preimage(&self.parent, &self.name, &self.display)?;
+            if !overwrite && expected_destination != PublicationPreimage::Absent {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!("{} already exists", self.display.display()),
@@ -1090,10 +1148,19 @@ mod platform {
 
             before_publish()?;
 
-            // Recheck the final entry immediately before the atomic namespace
-            // operation.  A later swap to a symlink is still safe: renameat
-            // replaces the link entry itself and never follows its target.
-            require_nonsymlink_final(&self.parent, &self.name, &self.display)?;
+            // Refuse a probe-to-publication identity swap. The following same-
+            // parent rename remains the single atomic namespace operation; it
+            // never opens or writes through the destination. A new hard link to
+            // the same inode is safe: replacement detaches only this name and
+            // leaves every sibling link and the shared old inode untouched.
+            let current_destination =
+                publication_preimage(&self.parent, &self.name, &self.display)?;
+            if current_destination != expected_destination {
+                return Err(permission_denied(format!(
+                    "contained publication destination {} changed before atomic publication",
+                    self.display.display()
+                )));
+            }
             let result = if overwrite {
                 // SAFETY: both descriptors and names are live. Same-parent
                 // rename is atomic and cannot escape the retained directory.
@@ -1202,12 +1269,148 @@ mod platform {
     mod tests {
         use std::cell::Cell;
         use std::ffi::OsStr;
+        use std::os::unix::fs::FileTypeExt as _;
+        use std::os::unix::net::UnixListener;
         use std::rc::Rc;
 
         use super::*;
 
         fn clear_directory_open_hook() {
             DIRECTORY_OPEN_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+
+        fn make_fifo(path: &Path) {
+            let encoded = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: `encoded` is a live NUL-terminated path and mkfifo does
+            // not retain the pointer.
+            assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        }
+
+        #[test]
+        fn publication_classifier_refuses_device_nodes() {
+            let display = Path::new("synthetic-device");
+            for mode in [libc::S_IFCHR, libc::S_IFBLK] {
+                let error = classify_publication_preimage(
+                    Some(FinalEntry {
+                        mode,
+                        device: 1,
+                        inode: 1,
+                    }),
+                    display,
+                )
+                .expect_err("device nodes must never be atomic-write destinations");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            }
+        }
+
+        #[test]
+        fn atomic_write_refuses_special_destinations_without_replacing_them() {
+            let root = tempfile::tempdir().unwrap();
+            let fifo = root.path().join("out.fifo");
+            let socket = root.path().join("out.socket");
+            let directory = root.path().join("out.directory");
+            let symlink = root.path().join("out.symlink");
+            let victim = root.path().join("victim");
+
+            // Bind every capability while its leaf is absent. This exercises
+            // publication-time validation, not prepare-time validation.
+            let fifo_writer = ContainedAtomicFile::prepare(root.path(), &fifo, false).unwrap();
+            let socket_writer = ContainedAtomicFile::prepare(root.path(), &socket, false).unwrap();
+            let directory_writer =
+                ContainedAtomicFile::prepare(root.path(), &directory, false).unwrap();
+            let symlink_writer =
+                ContainedAtomicFile::prepare(root.path(), &symlink, false).unwrap();
+
+            make_fifo(&fifo);
+            let _listener = UnixListener::bind(&socket).unwrap();
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(&victim, b"victim sentinel").unwrap();
+            std::os::unix::fs::symlink(&victim, &symlink).unwrap();
+
+            for (kind, writer) in [
+                ("FIFO", &fifo_writer),
+                ("socket", &socket_writer),
+                ("directory", &directory_writer),
+                ("symlink", &symlink_writer),
+            ] {
+                let error = writer
+                    .write_atomic(b"must not publish", true)
+                    .expect_err(kind);
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{kind}");
+            }
+
+            assert!(std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo());
+            assert!(std::fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket());
+            assert!(directory.is_dir());
+            assert!(std::fs::symlink_metadata(&symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"victim sentinel");
+        }
+
+        #[test]
+        fn checked_atomic_write_refuses_fifo_swap_at_final_publication_seam() {
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("out.bin");
+            std::fs::write(&destination, b"original").unwrap();
+            let writer = ContainedAtomicFile::prepare(root.path(), &destination, false).unwrap();
+
+            let error = writer
+                .write_atomic_checked(b"must not publish", true, || {
+                    std::fs::remove_file(&destination)?;
+                    make_fifo(&destination);
+                    Ok(())
+                })
+                .expect_err("a FIFO planted after staging must be refused");
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(std::fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_fifo());
+        }
+
+        #[test]
+        fn checked_atomic_write_refuses_regular_identity_swap() {
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("out.bin");
+            std::fs::write(&destination, b"original").unwrap();
+            let writer = ContainedAtomicFile::prepare(root.path(), &destination, false).unwrap();
+
+            let error = writer
+                .write_atomic_checked(b"must not publish", true, || {
+                    std::fs::remove_file(&destination)?;
+                    std::fs::write(&destination, b"replacement")
+                })
+                .expect_err("a different regular inode must not satisfy the snapshot");
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+        }
+
+        #[test]
+        fn checked_atomic_write_safely_detaches_hardlink_added_at_final_seam() {
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("out.bin");
+            let alias = root.path().join("alias.bin");
+            std::fs::write(&destination, b"original").unwrap();
+            let writer = ContainedAtomicFile::prepare(root.path(), &destination, false).unwrap();
+
+            writer
+                .write_atomic_checked(b"published", true, || {
+                    std::fs::hard_link(&destination, &alias)
+                })
+                .unwrap();
+
+            assert_eq!(std::fs::read(&destination).unwrap(), b"published");
+            assert_eq!(std::fs::read(&alias).unwrap(), b"original");
         }
 
         #[test]
@@ -1912,6 +2115,43 @@ mod platform {
         Ok(true)
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PublicationPreimage {
+        Absent,
+        Regular { volume: u32, index: u64 },
+    }
+
+    fn publication_preimage(
+        parent: &HeldDirectory,
+        name: &OsStr,
+        display: &Path,
+    ) -> io::Result<PublicationPreimage> {
+        let Some(handle) = open_named_file(
+            parent,
+            name,
+            FILE_READ_ATTRIBUTES,
+            RelativeFileDisposition::OpenExisting,
+        )?
+        else {
+            return Ok(PublicationPreimage::Absent);
+        };
+        inspect_regular(handle.0, display)?;
+
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: handle is live and `info` is writable.
+        if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
+            return Err(with_context(
+                "inspect publication destination",
+                display.display(),
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(PublicationPreimage::Regular {
+            volume: info.dwVolumeSerialNumber,
+            index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        })
+    }
+
     pub(super) struct ContainedAtomicFile {
         _root: OwnedHandle,
         parent: HeldDirectory,
@@ -2230,8 +2470,9 @@ mod platform {
             R: std::io::Read + ?Sized,
             F: FnOnce() -> io::Result<()>,
         {
-            let exists = inspect_destination(&self.parent, &self.name, &self.display)?;
-            if exists && !overwrite {
+            let expected_destination =
+                publication_preimage(&self.parent, &self.name, &self.display)?;
+            if expected_destination != PublicationPreimage::Absent && !overwrite {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!("{} already exists", self.display.display()),
@@ -2263,7 +2504,14 @@ mod platform {
             // Revalidate the live destination immediately before a handle-
             // relative rename. A later path swap cannot redirect publication:
             // RootDirectory remains the retained parent handle.
-            inspect_destination(&self.parent, &self.name, &self.display)?;
+            let current_destination =
+                publication_preimage(&self.parent, &self.name, &self.display)?;
+            if current_destination != expected_destination {
+                return Err(permission_denied(format!(
+                    "contained publication destination {} changed before atomic publication",
+                    self.display.display()
+                )));
+            }
             rename_held_file(
                 raw_handle(&temp.file),
                 self.parent.handle.0,
@@ -2506,7 +2754,70 @@ mod platform {
 
 #[cfg(all(test, any(unix, windows)))]
 mod retained_child_tests {
-    use super::ContainedAtomicFile;
+    use super::{ContainedAtomicFile, OpenRegularError};
+
+    #[test]
+    fn regular_file_creation_and_update_remain_supported() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("state.json");
+        let writer = ContainedAtomicFile::prepare(root.path(), &destination, false).unwrap();
+
+        writer.write_atomic(b"first", true).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"first");
+
+        writer.write_atomic(b"second", true).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"second");
+    }
+
+    #[test]
+    fn existing_hardlinked_regular_file_is_safely_detached() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("state.json");
+        let alias = root.path().join("alias.json");
+        std::fs::write(&destination, b"original").unwrap();
+        std::fs::hard_link(&destination, &alias).unwrap();
+        let writer = ContainedAtomicFile::prepare(root.path(), &destination, false).unwrap();
+
+        writer.write_atomic(b"published", true).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"published");
+        assert_eq!(std::fs::read(&alias).unwrap(), b"original");
+    }
+
+    #[test]
+    fn observed_regular_file_update_and_stale_refusal_remain_supported() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("state.json");
+        std::fs::write(&destination, b"first").unwrap();
+        let writer = ContainedAtomicFile::prepare(root.path(), &destination, false).unwrap();
+
+        assert_eq!(writer.read_capped(16).unwrap(), b"first");
+        writer.write_atomic_if_observed(b"second", true).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"second");
+
+        assert_eq!(writer.read_capped(16).unwrap(), b"second");
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::write(&destination, b"attacker replacement").unwrap();
+        let error = writer
+            .write_atomic_if_observed(b"must not publish", true)
+            .expect_err("a stale observed snapshot must still refuse publication");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"attacker replacement"
+        );
+
+        // Keep the NotFound observation path covered portably as well: an
+        // absent preimage may create a new regular file.
+        let created = root.path().join("created.json");
+        let creator = ContainedAtomicFile::prepare(root.path(), &created, false).unwrap();
+        assert!(matches!(
+            creator.read_capped(0),
+            Err(OpenRegularError::NotFound)
+        ));
+        creator.write_atomic_if_observed(b"created", true).unwrap();
+        assert_eq!(std::fs::read(&created).unwrap(), b"created");
+    }
 
     #[test]
     fn retained_absent_directory_creates_and_publishes_child_after_authorization() {

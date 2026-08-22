@@ -92,6 +92,737 @@ pub fn merge_mcp_json_with_key(
     Ok(())
 }
 
+/// Merge one MCP server into a JSON or JSONC configuration while preserving
+/// every unrelated byte. This is used by clients whose supported config may
+/// contain comments (notably OpenCode), so parsing and re-serializing the whole
+/// document would be an unnecessarily destructive setup operation.
+// The explicit scope root and output mode are security boundaries and must not
+// be inferred from the destination path.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_mcp_jsonc_with_key(
+    path: &Path,
+    scope_root: &Path,
+    server_name: &str,
+    server_config: Value,
+    server_key: &str,
+    mode: u32,
+    exact_mode: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    merge_mcp_jsonc_with_key_inner(
+        path,
+        scope_root,
+        server_name,
+        server_config,
+        server_key,
+        None,
+        false,
+        StrictJsonEmptyPolicy::Reject,
+        mode,
+        exact_mode,
+        force,
+        dry_run,
+    )
+}
+
+/// Merge one MCP server into a strict-JSON configuration while preserving
+/// unrelated bytes. Unlike [`merge_mcp_jsonc_with_key`], this rejects comments,
+/// trailing commas, and every other extension that the target host's
+/// `JSON.parse` loader would reject.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_mcp_strict_json_with_key(
+    path: &Path,
+    scope_root: &Path,
+    server_name: &str,
+    server_config: Value,
+    server_key: &str,
+    mode: u32,
+    exact_mode: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    merge_mcp_jsonc_with_key_inner(
+        path,
+        scope_root,
+        server_name,
+        server_config,
+        server_key,
+        None,
+        true,
+        StrictJsonEmptyPolicy::Reject,
+        mode,
+        exact_mode,
+        force,
+        dry_run,
+    )
+}
+
+/// Strict-JSON merge for hosts that define an existing zero-byte settings file
+/// as their initial `{}` state. This exception is deliberately separate from
+/// [`merge_mcp_strict_json_with_key`] so strict hosts without that documented
+/// bootstrap behavior continue to reject empty input.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_mcp_strict_json_with_key_allow_empty(
+    path: &Path,
+    scope_root: &Path,
+    server_name: &str,
+    server_config: Value,
+    server_key: &str,
+    mode: u32,
+    exact_mode: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    merge_mcp_jsonc_with_key_inner(
+        path,
+        scope_root,
+        server_name,
+        server_config,
+        server_key,
+        None,
+        true,
+        StrictJsonEmptyPolicy::ExactEmpty,
+        mode,
+        exact_mode,
+        force,
+        dry_run,
+    )
+}
+
+/// Strict-JSON merge for hosts that trim an existing settings file before
+/// treating empty content as their initial `{}` state.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_mcp_strict_json_with_key_allow_blank(
+    path: &Path,
+    scope_root: &Path,
+    server_name: &str,
+    server_config: Value,
+    server_key: &str,
+    mode: u32,
+    exact_mode: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    merge_mcp_jsonc_with_key_inner(
+        path,
+        scope_root,
+        server_name,
+        server_config,
+        server_key,
+        None,
+        true,
+        StrictJsonEmptyPolicy::WhitespaceOnly,
+        mode,
+        exact_mode,
+        force,
+        dry_run,
+    )
+}
+
+/// Merge an MCP server and remove its name from a top-level disable list in
+/// one strict-JSON transaction. OMP's `disabledServers` has higher precedence
+/// than every server-level `enabled` value, so these changes must publish as a
+/// single unit.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_mcp_strict_json_with_key_and_enable(
+    path: &Path,
+    scope_root: &Path,
+    server_name: &str,
+    server_config: Value,
+    server_key: &str,
+    disabled_key: &str,
+    mode: u32,
+    exact_mode: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    merge_mcp_jsonc_with_key_inner(
+        path,
+        scope_root,
+        server_name,
+        server_config,
+        server_key,
+        Some(disabled_key),
+        true,
+        StrictJsonEmptyPolicy::Reject,
+        mode,
+        exact_mode,
+        force,
+        dry_run,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum StrictJsonEmptyPolicy {
+    Reject,
+    ExactEmpty,
+    WhitespaceOnly,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_mcp_jsonc_with_key_inner(
+    path: &Path,
+    scope_root: &Path,
+    server_name: &str,
+    server_config: Value,
+    server_key: &str,
+    disabled_key: Option<&str>,
+    strict_json: bool,
+    empty_policy: StrictJsonEmptyPolicy,
+    mode: u32,
+    exact_mode: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    let outcome = super::fs_helpers::transactional_update(path, scope_root, dry_run, |snapshot| {
+        let snapshot_raw = snapshot.text(path)?;
+        let raw = snapshot_raw.unwrap_or("{\n}\n");
+        let raw = match empty_policy {
+            StrictJsonEmptyPolicy::ExactEmpty if snapshot_raw.is_some() && raw.is_empty() => {
+                "{\n}\n"
+            }
+            StrictJsonEmptyPolicy::WhitespaceOnly
+                if snapshot_raw.is_some() && raw.trim().is_empty() =>
+            {
+                "{\n}\n"
+            }
+            _ => raw,
+        };
+        if strict_json {
+            let parsed: Value = serde_json::from_str(raw).map_err(|error| {
+                format!("tirith: {} is not strict JSON: {error}", path.display())
+            })?;
+            if !parsed.is_object() {
+                return Err(format!("tirith: {} is not a JSON object", path.display()));
+            }
+        }
+        let root = parse_jsonc_root(raw)
+            .map_err(|error| error.replace("VS Code settings", &path.display().to_string()))?;
+        let lex = lex_jsonc(raw)
+            .map_err(|error| error.replace("VS Code settings", &path.display().to_string()))?;
+        let root_span = scan_jsonc_object(&lex.without_comments, 0, path)?;
+        if root_span.close != root.close {
+            return Err(format!(
+                "tirith: {} has content outside its root JSON object",
+                path.display()
+            ));
+        }
+
+        let server_key_entries: Vec<&JsoncObjectEntry> = root_span
+            .entries
+            .iter()
+            .filter(|entry| entry.key == server_key)
+            .collect();
+        if server_key_entries.len() > 1 {
+            return Err(format!(
+                "tirith: {} contains duplicate {server_key:?} keys; fix it manually before setup",
+                path.display()
+            ));
+        }
+        let disabled_needs_update = disabled_key
+            .map(|key| jsonc_top_level_string_array_contains(path, &root, key, server_name))
+            .transpose()?
+            .unwrap_or(false);
+
+        let desired_map = json!({server_name: server_config.clone()});
+        let mut rendered = if let Some(server_map_entry) = server_key_entries.first() {
+            let server_map_value = root
+                .value
+                .get(server_key)
+                .ok_or_else(|| format!("{server_key} missing in {}", path.display()))?;
+            if !server_map_value.is_object() {
+                return Err(format!(
+                    "tirith: {server_key} in {} is not an object",
+                    path.display()
+                ));
+            }
+            let map_open = skip_jsonc_ws(&lex.without_comments, server_map_entry.value_start);
+            if lex.without_comments.get(map_open) != Some(&b'{') {
+                return Err(format!(
+                    "tirith: {server_key} in {} is not an object",
+                    path.display()
+                ));
+            }
+            let server_map_span = scan_jsonc_object(&lex.without_comments, map_open, path)?;
+            if server_map_span.close + 1 != server_map_entry.value_end {
+                return Err(format!(
+                    "tirith: {server_key} in {} is not a standalone object",
+                    path.display()
+                ));
+            }
+            let matching: Vec<&JsoncObjectEntry> = server_map_span
+                .entries
+                .iter()
+                .filter(|entry| entry.key == server_name)
+                .collect();
+            if matching.len() > 1 {
+                return Err(format!(
+                    "tirith: {server_key} in {} contains duplicate {server_name:?} entries; fix it manually before setup",
+                    path.display()
+                ));
+            }
+
+            if let Some(existing_entry) = matching.first() {
+                let existing = server_map_value
+                    .get(server_name)
+                    .ok_or_else(|| format!("{server_name} missing in {}", path.display()))?;
+                if existing == &server_config && !disabled_needs_update {
+                    #[cfg(unix)]
+                    if exact_mode && snapshot.mode().unwrap_or(0) & 0o777 != mode {
+                        if dry_run {
+                            eprintln!(
+                                "[dry-run] would correct {} permissions to mode {mode:04o}",
+                                path.display()
+                            );
+                        }
+                        return Ok(super::fs_helpers::FileUpdate::write_text(
+                            raw.to_string(),
+                            mode,
+                        )
+                        .with_exact_mode());
+                    }
+                    eprintln!(
+                        "tirith: {server_name} already in {}, up to date",
+                        path.display()
+                    );
+                    return Ok(super::fs_helpers::FileUpdate::unchanged());
+                }
+                if existing != &server_config && !force {
+                    if dry_run {
+                        eprintln!(
+                            "[dry-run] would error: {server_name} in {} has different config — use --force to update",
+                            path.display()
+                        );
+                        return Ok(super::fs_helpers::FileUpdate::unchanged());
+                    }
+                    return Err(format!(
+                        "tirith: {server_name} in {} has different config than expected — use --force to update",
+                        path.display()
+                    ));
+                }
+                if existing == &server_config {
+                    raw.to_string()
+                } else {
+                    replace_jsonc_value(raw, existing_entry, &server_config)?
+                }
+            } else {
+                insert_jsonc_entry(raw, &server_map_span, server_name, &server_config, 4)?
+            }
+        } else {
+            insert_jsonc_entry(raw, &root_span, server_key, &desired_map, 2)?
+        };
+
+        if let Some(key) = disabled_key {
+            rendered = remove_jsonc_top_level_array_string(path, &rendered, key, server_name)?;
+        }
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        if strict_json {
+            let parsed: Value = serde_json::from_str(&rendered).map_err(|error| {
+                format!(
+                    "tirith: generated {} is not strict JSON: {error}",
+                    path.display()
+                )
+            })?;
+            if !parsed.is_object() {
+                return Err(format!(
+                    "tirith: generated {} is not a JSON object",
+                    path.display()
+                ));
+            }
+        }
+        verify_jsonc_server(path, &rendered, server_key, server_name, &server_config)?;
+        if let Some(key) = disabled_key {
+            let root = parse_jsonc_root(&rendered)
+                .map_err(|error| error.replace("VS Code settings", &path.display().to_string()))?;
+            if jsonc_top_level_string_array_contains(path, &root, key, server_name)? {
+                return Err(format!(
+                    "tirith: generated {} still disables {server_name:?} in {key}",
+                    path.display()
+                ));
+            }
+        }
+        if dry_run {
+            eprintln!(
+                "[dry-run] would write {} ({} bytes)",
+                path.display(),
+                rendered.len()
+            );
+        }
+
+        let update = super::fs_helpers::FileUpdate::write_text(rendered, mode)
+            .with_backup(snapshot.exists());
+        #[cfg(unix)]
+        let update = if exact_mode {
+            update.with_exact_mode()
+        } else {
+            update
+        };
+        #[cfg(not(unix))]
+        let update = {
+            let _ = exact_mode;
+            update
+        };
+        Ok(update)
+    })?;
+    if let Some(annotation) = outcome.completion_annotation() {
+        eprintln!("tirith: wrote {}{annotation}", path.display());
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct JsoncObjectEntry {
+    key: String,
+    value_start: usize,
+    value_end: usize,
+}
+
+#[derive(Debug)]
+struct JsoncObjectSpan {
+    close: usize,
+    entries: Vec<JsoncObjectEntry>,
+    trailing_comma: bool,
+}
+
+fn skip_jsonc_ws(bytes: &[u8], mut index: usize) -> usize {
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    index
+}
+
+fn json_string_end(bytes: &[u8], start: usize, path: &Path) -> Result<usize, String> {
+    if bytes.get(start) != Some(&b'"') {
+        return Err(format!(
+            "tirith: expected a JSON string in {}",
+            path.display()
+        ));
+    }
+    let mut index = start + 1;
+    let mut escaped = false;
+    while let Some(byte) = bytes.get(index).copied() {
+        index += 1;
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return Ok(index);
+        }
+    }
+    Err(format!(
+        "tirith: unterminated JSON string in {}",
+        path.display()
+    ))
+}
+
+fn json_value_end(bytes: &[u8], start: usize, path: &Path) -> Result<usize, String> {
+    let start = skip_jsonc_ws(bytes, start);
+    match bytes.get(start).copied() {
+        Some(b'"') => json_string_end(bytes, start, path),
+        Some(b'{') | Some(b'[') => {
+            let mut stack = Vec::new();
+            let mut index = start;
+            while let Some(byte) = bytes.get(index).copied() {
+                match byte {
+                    b'"' => index = json_string_end(bytes, index, path)?,
+                    b'{' => {
+                        stack.push(b'}');
+                        index += 1;
+                    }
+                    b'[' => {
+                        stack.push(b']');
+                        index += 1;
+                    }
+                    b'}' | b']' => {
+                        if stack.pop() != Some(byte) {
+                            return Err(format!(
+                                "tirith: unbalanced JSON value in {}",
+                                path.display()
+                            ));
+                        }
+                        index += 1;
+                        if stack.is_empty() {
+                            return Ok(index);
+                        }
+                    }
+                    _ => index += 1,
+                }
+            }
+            Err(format!(
+                "tirith: unterminated JSON value in {}",
+                path.display()
+            ))
+        }
+        Some(_) => {
+            let mut end = start;
+            while bytes
+                .get(end)
+                .is_some_and(|byte| !matches!(*byte, b',' | b'}'))
+            {
+                end += 1;
+            }
+            while end > start && bytes[end - 1].is_ascii_whitespace() {
+                end -= 1;
+            }
+            if end == start {
+                Err(format!("tirith: empty JSON value in {}", path.display()))
+            } else {
+                Ok(end)
+            }
+        }
+        None => Err(format!("tirith: missing JSON value in {}", path.display())),
+    }
+}
+
+fn scan_jsonc_object(bytes: &[u8], start: usize, path: &Path) -> Result<JsoncObjectSpan, String> {
+    let start = skip_jsonc_ws(bytes, start);
+    if bytes.get(start) != Some(&b'{') {
+        return Err(format!(
+            "tirith: {} root must be a JSON object",
+            path.display()
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut index = start + 1;
+    let mut trailing_comma = false;
+    loop {
+        index = skip_jsonc_ws(bytes, index);
+        match bytes.get(index).copied() {
+            Some(b'}') => {
+                return Ok(JsoncObjectSpan {
+                    close: index,
+                    entries,
+                    trailing_comma,
+                });
+            }
+            Some(b'"') => {}
+            _ => {
+                return Err(format!(
+                    "tirith: expected a JSON object key in {}",
+                    path.display()
+                ));
+            }
+        }
+
+        let key_start = index;
+        let key_end = json_string_end(bytes, key_start, path)?;
+        let key: String = serde_json::from_slice(&bytes[key_start..key_end])
+            .map_err(|error| format!("parse JSON key in {}: {error}", path.display()))?;
+        index = skip_jsonc_ws(bytes, key_end);
+        if bytes.get(index) != Some(&b':') {
+            return Err(format!(
+                "tirith: expected ':' after JSON key in {}",
+                path.display()
+            ));
+        }
+        let value_start = skip_jsonc_ws(bytes, index + 1);
+        let value_end = json_value_end(bytes, value_start, path)?;
+        entries.push(JsoncObjectEntry {
+            key,
+            value_start,
+            value_end,
+        });
+        index = skip_jsonc_ws(bytes, value_end);
+        match bytes.get(index).copied() {
+            Some(b',') => {
+                index += 1;
+                let next = skip_jsonc_ws(bytes, index);
+                trailing_comma = bytes.get(next) == Some(&b'}');
+            }
+            Some(b'}') => trailing_comma = false,
+            _ => {
+                return Err(format!(
+                    "tirith: expected ',' or '}}' in {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
+fn replace_jsonc_value(
+    raw: &str,
+    entry: &JsoncObjectEntry,
+    value: &Value,
+) -> Result<String, String> {
+    let replacement = serde_json::to_string(value)
+        .map_err(|error| format!("serialize MCP server config: {error}"))?;
+    let mut result = String::with_capacity(raw.len() + replacement.len());
+    result.push_str(&raw[..entry.value_start]);
+    result.push_str(&replacement);
+    result.push_str(&raw[entry.value_end..]);
+    Ok(result)
+}
+
+fn jsonc_top_level_string_array_contains(
+    path: &Path,
+    root: &JsoncRoot,
+    key: &str,
+    target: &str,
+) -> Result<bool, String> {
+    if root.key_count(key) > 1 {
+        return Err(format!(
+            "tirith: {} contains duplicate {key:?} keys; fix it manually before setup",
+            path.display()
+        ));
+    }
+    let Some(value) = root.value.get(key) else {
+        return Ok(false);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("tirith: {key} in {} is not an array", path.display()))?;
+    if values.iter().any(|value| !value.is_string()) {
+        return Err(format!(
+            "tirith: {key} in {} must contain only strings",
+            path.display()
+        ));
+    }
+    Ok(values.iter().any(|value| value.as_str() == Some(target)))
+}
+
+fn remove_jsonc_top_level_array_string(
+    path: &Path,
+    raw: &str,
+    key: &str,
+    target: &str,
+) -> Result<String, String> {
+    let root = parse_jsonc_root(raw)
+        .map_err(|error| error.replace("VS Code settings", &path.display().to_string()))?;
+    if !jsonc_top_level_string_array_contains(path, &root, key, target)? {
+        return Ok(raw.to_string());
+    }
+    let lex = lex_jsonc(raw)
+        .map_err(|error| error.replace("VS Code settings", &path.display().to_string()))?;
+    let span = scan_jsonc_object(&lex.without_comments, 0, path)?;
+    let entry = span
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .ok_or_else(|| format!("{key} missing in {}", path.display()))?;
+    let filtered = root
+        .value
+        .get(key)
+        .and_then(Value::as_array)
+        .expect("validated string array")
+        .iter()
+        .filter(|value| value.as_str() != Some(target))
+        .cloned()
+        .collect();
+    replace_jsonc_value(raw, entry, &Value::Array(filtered))
+}
+
+/// Read one MCP server from JSON/JSONC while rejecting ambiguous duplicate
+/// keys. Used to preflight later-precedence client config before any write.
+pub(super) fn jsonc_mcp_server(
+    path: &Path,
+    raw: &str,
+    server_key: &str,
+    server_name: &str,
+) -> Result<Option<Value>, String> {
+    let root = parse_jsonc_root(raw)
+        .map_err(|error| error.replace("VS Code settings", &path.display().to_string()))?;
+    if root.key_count(server_key) > 1 {
+        return Err(format!(
+            "tirith: {} contains duplicate {server_key:?} keys; fix it manually before setup",
+            path.display()
+        ));
+    }
+    let Some(servers) = root.value.get(server_key) else {
+        return Ok(None);
+    };
+    if !servers.is_object() {
+        return Err(format!(
+            "tirith: {server_key} in {} is not an object",
+            path.display()
+        ));
+    }
+
+    let lex = lex_jsonc(raw)
+        .map_err(|error| error.replace("VS Code settings", &path.display().to_string()))?;
+    let root_span = scan_jsonc_object(&lex.without_comments, 0, path)?;
+    let map_entry = root_span
+        .entries
+        .iter()
+        .find(|entry| entry.key == server_key)
+        .ok_or_else(|| format!("{server_key} missing in {}", path.display()))?;
+    let map_open = skip_jsonc_ws(&lex.without_comments, map_entry.value_start);
+    let map_span = scan_jsonc_object(&lex.without_comments, map_open, path)?;
+    let matching = map_span
+        .entries
+        .iter()
+        .filter(|entry| entry.key == server_name)
+        .count();
+    if matching > 1 {
+        return Err(format!(
+            "tirith: {server_key} in {} contains duplicate {server_name:?} entries; fix it manually before setup",
+            path.display()
+        ));
+    }
+    Ok(servers.get(server_name).cloned())
+}
+
+fn insert_jsonc_entry(
+    raw: &str,
+    object: &JsoncObjectSpan,
+    key: &str,
+    value: &Value,
+    indent: usize,
+) -> Result<String, String> {
+    let key = serde_json::to_string(key).map_err(|error| format!("serialize key: {error}"))?;
+    let value = serde_json::to_string(value)
+        .map_err(|error| format!("serialize MCP server config: {error}"))?;
+    let mut prefix = raw[..object.close].to_string();
+    if !object.entries.is_empty() && !object.trailing_comma {
+        let insert_at = object
+            .entries
+            .last()
+            .expect("non-empty JSON object has a final entry")
+            .value_end;
+        prefix.insert(insert_at, ',');
+    }
+    if !prefix.ends_with('\n') {
+        prefix.push('\n');
+    }
+    prefix.push_str(&" ".repeat(indent));
+    prefix.push_str(&key);
+    prefix.push_str(": ");
+    prefix.push_str(&value);
+    prefix.push('\n');
+    prefix.push_str(&" ".repeat(indent.saturating_sub(2)));
+    prefix.push_str(&raw[object.close..]);
+    Ok(prefix)
+}
+
+fn verify_jsonc_server(
+    path: &Path,
+    raw: &str,
+    server_key: &str,
+    server_name: &str,
+    expected: &Value,
+) -> Result<(), String> {
+    let root = parse_jsonc_root(raw)
+        .map_err(|error| error.replace("VS Code settings", &path.display().to_string()))?;
+    if root.key_count(server_key) != 1
+        || root
+            .value
+            .get(server_key)
+            .and_then(Value::as_object)
+            .and_then(|servers| servers.get(server_name))
+            != Some(expected)
+    {
+        return Err(format!(
+            "tirith: generated {} does not expose the exact expected {server_key}.{server_name} entry",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Merge a hook entry into a hooks.json file (Cursor/Windsurf format).
 /// Detects existing tirith hooks by the `marker` substring in each `command`.
 // The explicit scope root is a security boundary and must not be inferred from
@@ -975,6 +1706,11 @@ fn parse_jsonc_root(text: &str) -> Result<JsoncRoot, String> {
     })
 }
 
+#[cfg(test)]
+pub(super) fn parse_jsonc_test_value(text: &str) -> Result<Value, String> {
+    Ok(parse_jsonc_root(text)?.value)
+}
+
 fn verify_vscode_managed_document(
     text: &str,
     begin_marker: &str,
@@ -1042,6 +1778,27 @@ mod tests {
             server_name,
             server_config,
             server_key,
+            force,
+            dry_run,
+        )
+    }
+
+    fn merge_mcp_jsonc_with_key(
+        path: &Path,
+        server_name: &str,
+        server_config: Value,
+        server_key: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        super::merge_mcp_jsonc_with_key(
+            path,
+            path.parent().expect("test path has parent"),
+            server_name,
+            server_config,
+            server_key,
+            0o644,
+            false,
             force,
             dry_run,
         )
@@ -1332,6 +2089,172 @@ mod tests {
         let content: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(content["servers"]["other"]["command"], "other");
         assert_eq!(content["servers"]["tirith-gateway"]["command"], "tirith");
+    }
+
+    #[test]
+    fn mcp_jsonc_preserves_comments_and_unrelated_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.jsonc");
+        let original = r#"{
+  // keep this comment byte-for-byte
+  "model": "provider/model",
+  "mcp": {
+    "other": { "type": "remote", "url": "https://example.test/mcp" },
+  },
+}
+"#;
+        fs::write(&path, original).unwrap();
+
+        merge_mcp_jsonc_with_key(
+            &path,
+            "tirith",
+            json!({"type": "local", "command": ["/opt/tirith", "mcp-server"]}),
+            "mcp",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("// keep this comment byte-for-byte"));
+        assert!(content.contains(r#""model": "provider/model""#));
+        let parsed = parse_jsonc_root(&content).unwrap();
+        assert_eq!(parsed.value["mcp"]["other"]["type"], "remote");
+        assert_eq!(
+            parsed.value["mcp"]["tirith"]["command"],
+            json!(["/opt/tirith", "mcp-server"])
+        );
+    }
+
+    #[test]
+    fn mcp_jsonc_force_replaces_only_managed_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.jsonc");
+        fs::write(
+            &path,
+            r#"{
+  "mcp": {
+    // an unrelated server remains untouched
+    "other": { "command": ["other"] },
+    "tirith": { "command": ["/old/tirith", "mcp-server"] }
+  }
+}
+"#,
+        )
+        .unwrap();
+        let desired = json!({"command": ["/new/tirith", "mcp-server"]});
+
+        let drift = merge_mcp_jsonc_with_key(&path, "tirith", desired.clone(), "mcp", false, false);
+        assert!(drift.is_err());
+
+        merge_mcp_jsonc_with_key(&path, "tirith", desired, "mcp", true, false).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("// an unrelated server remains untouched"));
+        assert!(content.contains(r#""other": { "command": ["other"] }"#));
+        let parsed = parse_jsonc_root(&content).unwrap();
+        assert_eq!(
+            parsed.value["mcp"]["tirith"]["command"],
+            json!(["/new/tirith", "mcp-server"])
+        );
+    }
+
+    #[test]
+    fn mcp_jsonc_rejects_duplicate_effective_server_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.jsonc");
+        fs::write(&path, r#"{"mcp": {}, "m\u0063p": {}}"#).unwrap();
+
+        let error = merge_mcp_jsonc_with_key(
+            &path,
+            "tirith",
+            json!({"command": ["/opt/tirith", "mcp-server"]}),
+            "mcp",
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate"));
+    }
+
+    #[test]
+    fn mcp_jsonc_rejects_duplicate_escaped_server_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.jsonc");
+        fs::write(&path, r#"{"mcp": {"tirith": {}, "t\u0069rith": {}}}"#).unwrap();
+
+        let error = merge_mcp_jsonc_with_key(
+            &path,
+            "tirith",
+            json!({"command": ["/opt/tirith", "mcp-server"]}),
+            "mcp",
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn mcp_jsonc_dry_run_does_not_create_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("mcp.jsonc");
+
+        super::merge_mcp_jsonc_with_key(
+            &path,
+            dir.path(),
+            "tirith",
+            json!({"command": ["/opt/tirith", "mcp-server"]}),
+            "mcp",
+            0o644,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_jsonc_repairs_private_mode_when_content_is_current() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let desired = json!({"command": "/opt/tirith", "args": ["mcp-server"]});
+        super::merge_mcp_jsonc_with_key(
+            &path,
+            dir.path(),
+            "tirith",
+            desired.clone(),
+            "mcpServers",
+            0o600,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::merge_mcp_jsonc_with_key(
+            &path,
+            dir.path(),
+            "tirith",
+            desired,
+            "mcpServers",
+            0o600,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

@@ -25,6 +25,33 @@ unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
 [[ "$(declare -p _TIRITH_TEST_SKIP_HEALTH 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] && unset _TIRITH_TEST_SKIP_HEALTH
 [[ "$(declare -p _TIRITH_TEST_FAIL_HEALTH 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] && unset _TIRITH_TEST_FAIL_HEALTH
 
+# Hook state that is READ before this session ever writes it. Everything below
+# is session-local by contract: Tirith only ever hands these to a child as a
+# command prefix on its own `tirith` invocations, so an interactive shell that
+# starts with one already in its environment received it from somewhere else.
+#
+# `_TIRITH_BASH_INTERNAL=1` is the load-bearing one — it is the first line of
+# `_tirith_preexec`, so a parent process that exports it turns off command
+# interception for the whole session without touching a config file, a policy,
+# or the hook itself. The rest are the same shape: a pre-seeded per-line
+# decision cache (an allow verdict Tirith never issued), the DEBUG-chaining
+# slot the trampoline evals, and the one-shot latches that would swallow the
+# downgrade banners a user needs to see.
+#
+# Values set WITHOUT export are left alone, so the session-local test overrides
+# above and any in-shell state keep working exactly as before.
+for _tirith_inherited_state in \
+  _TIRITH_BASH_INTERNAL \
+  _tirith_last_key _tirith_last_rc _tirith_last_cmd \
+  _TIRITH_PREV_DEBUG_TRAP \
+  _TIRITH_DEGRADE_WARNED _TIRITH_OFF_WARNED _TIRITH_PREEXEC_WARNED _TIRITH_RECEIPT_DEGRADE_WARNED \
+  _TIRITH_BINDS_INSTALLED _TIRITH_PREEXEC_PROMPT_STATUS
+do
+  [[ "$(declare -p "$_tirith_inherited_state" 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] \
+    && unset "$_tirith_inherited_state"
+done
+unset _tirith_inherited_state
+
 # Session tracking: generate ID per shell session if not inherited
 if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
   builtin printf -v TIRITH_SESSION_ID '%x-%x-%x-%x' \
@@ -555,7 +582,7 @@ _tirith_read_history_entry() {
 # Used to bridge cosmetic spacing differences (`>/dev/null` vs `> /dev/null`)
 # between BASH_COMMAND and the history line in enforcement mode.
 _tirith_normalize_spacing() {
-  local input="$1" s="" pending_space=0 i char op
+  local input="$1" s="" pending_space=0 i char op restore_patsub=0
   for ((i=0; i<${#input}; i++)); do
     char="${input:i:1}"
     case "$char" in
@@ -569,10 +596,20 @@ _tirith_normalize_spacing() {
         ;;
     esac
   done
+  # Bash 5.2 added `patsub_replacement`, under which an unescaped `&` in the
+  # replacement expands to the matched text. The `&` operator pass below would
+  # then make no progress (`" &"` -> `" &"`) and loop forever after a command
+  # containing `&&`. Disable it only for these literal replacements and restore
+  # the caller's option exactly; older Bash versions simply report it absent.
+  if shopt -q patsub_replacement 2>/dev/null; then
+    shopt -u patsub_replacement
+    restore_patsub=1
+  fi
   for op in '|' '&' ';' '>' '<'; do
     while [[ "$s" == *" $op"* ]]; do s="${s//" $op"/$op}"; done
     while [[ "$s" == *"$op "* ]]; do s="${s//"$op "/$op}"; done
   done
+  [[ $restore_patsub -eq 1 ]] && shopt -s patsub_replacement
   printf '%s' "$s"
 }
 
@@ -647,17 +684,45 @@ _tirith_history_is_trustworthy_for_enforcement() {
   return 0
 }
 
-# Enable `extdebug` if (and only if) tirith is the one turning it on. Tracks
-# ownership via _TIRITH_OWNS_EXTDEBUG so we can safely clean up at shell exit;
-# it is deliberately left on for the rest of the session once enabled, because
-# disabling it inside the DEBUG trap would break the `return 1` skip semantic
-# bash relies on.
-_tirith_enable_extdebug() {
+# `extdebug` makes a non-zero DEBUG-trap result skip the command about to run,
+# but it also inherits DEBUG into every function, command substitution, and
+# subshell on modern Bash. Leaving it enabled therefore turns prompt functions
+# and function bodies into fake user commands. Keep it OFF while an allowed
+# line runs and enable it lazily only when Tirith has already decided to block
+# the complete typed line. The prompt-begin sentinel below turns it off again.
+#
+# Return values from `_tirith_prepare_extdebug_block`:
+#   0 — Tirith owns extdebug (newly enabled or already active for this block)
+#   1 — extdebug could not be enabled
+#   2 — extdebug is active but user-owned; the current skip can work, but the
+#       session must visibly leave enforcement because Tirith cannot restore it
+_tirith_prepare_extdebug_block() {
   if shopt -q extdebug; then
-    return 0
+    [[ "${_TIRITH_OWNS_EXTDEBUG:-0}" == "1" ]] && return 0
+    return 2
   fi
-  shopt -s extdebug
+  shopt -s extdebug || return 1
   _TIRITH_OWNS_EXTDEBUG=1
+  return 0
+}
+
+_tirith_disable_owned_extdebug() {
+  [[ "${_TIRITH_OWNS_EXTDEBUG:-0}" == "1" ]] || return 0
+  shopt -u extdebug || return 1
+  _TIRITH_OWNS_EXTDEBUG=0
+  return 0
+}
+
+# Run the captured user DEBUG handler in its own frame. A DEBUG trap body is
+# ordinarily evaluated at the top level, where `return` is a no-op, so real
+# handlers use it freely as an early exit — `bash-preexec.sh` (oh-my-bash,
+# Atuin, iTerm2 shell integration) opens with exactly that shape. Evaluating
+# such a body inline would make its `return` leave the TRAMPOLINE before
+# Tirith ever scans, silently disabling interception for the whole session.
+# Giving it a frame of its own means the early exit ends the chained handler
+# and nothing else.
+_tirith_run_chained_debug_trap() {
+  builtin eval -- "$_TIRITH_PREV_DEBUG_TRAP"
 }
 
 # Idempotent DEBUG-trap installer. Chains through any pre-existing user DEBUG
@@ -669,11 +734,26 @@ _tirith_enable_extdebug() {
 # explicitly to _tirith_preexec — otherwise preexec would see only its own
 # call frame's line, not the user-typed line.
 _tirith_debug_trampoline() {
+  # Pin the command before chaining a user DEBUG trap: that trap may run
+  # arbitrary shell code and change the live BASH_COMMAND value before Tirith
+  # gets control back.
+  local _user_bash_command="$BASH_COMMAND"
   local _user_line_id="${BASH_LINENO[0]:-0}"
+  # Structural execution depth, not a function-name allowlist. At a top-level
+  # DEBUG fire this trampoline is the sole FUNCNAME frame; extdebug-inherited
+  # fires have at least one caller frame. `_tirith_preexec` only skips a nested
+  # fire after the containing typed line has crossed the top-level decision.
+  local _user_call_depth="${#FUNCNAME[@]}"
+  # Tirith's trap fired, whatever the chained handler goes on to do. The
+  # prompt-boundary ownership check reads this; see `_tirith_preexec_prompt_end`.
+  _TIRITH_DEBUG_TRAP_HEARTBEAT=1
   if [[ -n "${_TIRITH_PREV_DEBUG_TRAP:-}" ]]; then
-    builtin eval -- "$_TIRITH_PREV_DEBUG_TRAP" || true
+    # Status is discarded on purpose: under a Tirith-owned extdebug block a
+    # non-zero DEBUG result skips the command, and that decision belongs to
+    # Tirith alone, not to a chained handler.
+    _tirith_run_chained_debug_trap || true
   fi
-  _tirith_preexec "$_user_line_id"
+  _tirith_preexec "$_user_line_id" "$_user_call_depth" "$_user_bash_command"
 }
 
 _tirith_extract_trap_body() {
@@ -686,16 +766,233 @@ _tirith_extract_trap_body() {
   _TIRITH_EXTRACTED_TRAP="$specification"
 }
 
+_tirith_read_debug_trap_capture() {
+  local file="$1" captured="" line="" first=1 marker="trap -- '" candidate
+  _TIRITH_CAPTURED_DEBUG_TRAP_SPEC=""
+  _tirith_capture_file_is_private "$file" || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ $first -eq 1 ]]; then
+      captured="$line"
+      first=0
+    else
+      captured+=$'\n'"$line"
+    fi
+  done < "$file"
+  [[ -z "$captured" ]] && return 0
+
+  # The previous DEBUG handler itself runs immediately before `trap -p` and
+  # may write to the command's redirected stdout. Bash's own specification is
+  # the final `trap -- '...' DEBUG` record, so discard any preceding handler
+  # output and validate the record before retaining it.
+  [[ "$captured" == *"$marker"* ]] || return 1
+  candidate="${marker}${captured##*"$marker"}"
+  [[ "$candidate" == "$marker"*"' DEBUG" ]] || return 1
+  _tirith_extract_trap_body "$candidate" DEBUG || return 1
+  _TIRITH_CAPTURED_DEBUG_TRAP_SPEC="$candidate"
+  return 0
+}
+
 _tirith_install_debug_trap() {
-  local current
-  current="$(builtin trap -p DEBUG 2>/dev/null)"
-  [[ "$current" == *"_tirith_debug_trampoline"* ]] && return 0
+  [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "1" ]] || return 1
+  local current="${_TIRITH_CAPTURED_DEBUG_TRAP_SPEC:-}"
+  if [[ "$current" == *"_tirith_debug_trampoline"* ]]; then
+    _TIRITH_DEBUG_TRAP_INSTALLED=1
+    return 0
+  fi
 
   _TIRITH_PREV_DEBUG_TRAP=""
-  if _tirith_extract_trap_body "$current" DEBUG; then
+  if [[ -n "$current" ]]; then
+    _tirith_extract_trap_body "$current" DEBUG || return 1
     _TIRITH_PREV_DEBUG_TRAP="$_TIRITH_EXTRACTED_TRAP"
   fi
-  builtin trap '_tirith_debug_trampoline' DEBUG
+  builtin trap '_tirith_debug_trampoline' DEBUG || return 1
+  _TIRITH_DEBUG_TRAP_INSTALLED=1
+  return 0
+}
+
+_tirith_prepare_debug_trap_capture() {
+  [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]] || return 0
+  [[ -n "${_TIRITH_DEBUG_CAPTURE_FILE:-}" ]] && return 0
+  _TIRITH_DEBUG_CAPTURE_FILE="$(_tirith_new_capture_file 2>/dev/null)" || _TIRITH_DEBUG_CAPTURE_FILE=""
+  [[ -n "$_TIRITH_DEBUG_CAPTURE_FILE" ]]
+}
+
+_tirith_finalize_debug_trap_capture() {
+  [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]] || return 0
+  local capture_ok=0
+  if [[ -n "${_TIRITH_DEBUG_CAPTURE_FILE:-}" ]] \
+     && _tirith_read_debug_trap_capture "$_TIRITH_DEBUG_CAPTURE_FILE"; then
+    capture_ok=1
+  fi
+  if [[ -n "${_TIRITH_DEBUG_CAPTURE_FILE:-}" ]]; then
+    _tirith_remove_capture_file "$_TIRITH_DEBUG_CAPTURE_FILE" >/dev/null 2>&1 || capture_ok=0
+  fi
+  _TIRITH_DEBUG_CAPTURE_FILE=""
+
+  if [[ $capture_ok -ne 1 ]]; then
+    _TIRITH_DEBUG_TRAP_CAPTURE_READY=2
+    _TIRITH_PREEXEC_PHASE="off"
+    _TIRITH_PREEXEC_ENFORCE=0
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "degraded"
+    _tirith_output "tirith: bash preexec hook was not installed because the existing DEBUG trap could not be preserved safely; existing debugger state was left unchanged"
+    return 1
+  fi
+
+  _TIRITH_DEBUG_TRAP_CAPTURE_READY=1
+  if ! _tirith_install_debug_trap; then
+    _TIRITH_DEBUG_TRAP_CAPTURE_READY=2
+    _TIRITH_PREEXEC_PHASE="off"
+    _TIRITH_PREEXEC_ENFORCE=0
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "degraded"
+    _tirith_output "tirith: bash preexec hook was not installed because the existing DEBUG trap could not be chained safely; existing debugger state was left unchanged"
+    return 1
+  fi
+
+  if [[ "${_TIRITH_PREEXEC_ENFORCE_PENDING:-0}" == "1" ]]; then
+    _TIRITH_PREEXEC_ENFORCE_PENDING=0
+    _TIRITH_PREEXEC_ENFORCE=1
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="blocks"
+    _tirith_set_status "blocks"
+  else
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
+    [[ "${TIRITH_STATUS:-}" == "degraded" ]] || _tirith_set_status "warn-only"
+  fi
+  return 0
+}
+
+_tirith_discard_pending_debug_trap_capture() {
+  [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]] || return 0
+  local capture_file="${_TIRITH_DEBUG_CAPTURE_FILE:-}"
+  _TIRITH_DEBUG_CAPTURE_FILE=""
+  [[ -n "$capture_file" ]] || return 0
+  # A non-prompt interactive invocation (`bash -i -c`) can exit before the
+  # bootstrap consumes this file. Remove only a still-private regular file;
+  # never follow a replacement symlink or touch an activated trap's state.
+  _tirith_capture_file_is_private "$capture_file" || return 0
+  _tirith_remove_capture_file "$capture_file" >/dev/null 2>&1 || true
+}
+
+# --- Preexec prompt-boundary state machine ---------------------------------
+# Bash exposes no native "currently running PROMPT_COMMAND" flag. Bracket the
+# user's existing prompt commands with exact Tirith sentinels instead. Their
+# position preserves user ordering, and returning the captured `$?` preserves
+# the status the first/last user prompt command would otherwise observe.
+_tirith_preexec_prompt_begin() {
+  local previous_status=$?
+  _TIRITH_PREEXEC_PROMPT_STATUS="$previous_status"
+  [[ "${_TIRITH_PREEXEC_PHASE:-}" == "off" ]] && return "$previous_status"
+  _TIRITH_PREEXEC_PHASE="prompt"
+  _TIRITH_PREEXEC_AWAITING_USER=0
+  return "$previous_status"
+}
+
+_tirith_restore_prompt_status() {
+  return "${_TIRITH_PREEXEC_PROMPT_STATUS:-0}"
+}
+
+_tirith_preexec_prompt_end() {
+  local previous_status=$?
+  unset _TIRITH_PREEXEC_PROMPT_STATUS
+  [[ "${_TIRITH_PREEXEC_PHASE:-}" == "off" ]] && return "$previous_status"
+  if [[ "${_TIRITH_PREEXEC_ENFORCE:-0}" == "1" ]] \
+     && [[ "${_TIRITH_OWNS_EXTDEBUG:-0}" != "1" ]] \
+     && shopt -q extdebug; then
+    _tirith_session_degrade_to_warn_only \
+      "tirith: extdebug became enabled by prompt code outside Tirith; enforcement is disabled because user debugger state cannot be safely restored"
+  fi
+  # Ownership check. Every prompt cycle fires DEBUG for the sentinels
+  # themselves, so a live Tirith trap has always set the heartbeat by the time
+  # this runs. A cycle with no heartbeat means the trap is no longer ours.
+  if [[ "${_TIRITH_DEBUG_TRAP_INSTALLED:-0}" == "1" ]]; then
+    if [[ "${_TIRITH_DEBUG_TRAP_WATCH:-0}" == "1" ]] \
+       && [[ "${_TIRITH_DEBUG_TRAP_HEARTBEAT:-0}" != "1" ]]; then
+      _tirith_session_lost_debug_trap
+      return "$previous_status"
+    fi
+    _TIRITH_DEBUG_TRAP_WATCH=1
+  fi
+  _TIRITH_PREEXEC_PHASE="user"
+  _TIRITH_PREEXEC_AWAITING_USER=1
+  # Last write before the next cycle: under `set -T` the trampoline fires for
+  # commands inside this function too, and re-arming earlier would let one of
+  # those fires forge the next cycle's heartbeat.
+  _TIRITH_DEBUG_TRAP_HEARTBEAT=0
+  return "$previous_status"
+}
+
+_tirith_prompt_command_array_supported() {
+  # Bash accepted ordinary indexed arrays long before it learned to execute
+  # every PROMPT_COMMAND array element. That prompt behavior was added in 5.1;
+  # wrapping an array on older Bash would run the begin guard but never the end
+  # guard and silently strand the hook in prompt phase.
+  (( BASH_VERSINFO[0] > 5 \
+     || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) ))
+}
+
+_tirith_prompt_command_attrs_safe() {
+  local attrs="$1"
+  # Export/trace/indexed-array attributes do not change assignment semantics.
+  # Readonly, associative, integer, case-transforming, and nameref variables
+  # either cannot be wrapped or would mutate/coerce state Tirith does not own.
+  [[ "$attrs" != *[rAilnu]* ]]
+}
+
+_tirith_preexec_prompt_guards_attached() {
+  local pc_decl pc_attrs
+  pc_decl="$(declare -p PROMPT_COMMAND 2>/dev/null)" || return 1
+  pc_attrs="${pc_decl#declare }"
+  pc_attrs="${pc_attrs%% *}"
+  _tirith_prompt_command_attrs_safe "$pc_attrs" || return 1
+  if [[ "$pc_attrs" == *a* ]]; then
+    _tirith_prompt_command_array_supported || return 1
+    local count="${#PROMPT_COMMAND[@]}"
+    [[ "$count" -ge 3 ]] || return 1
+    [[ "${PROMPT_COMMAND[0]}" == "_tirith_preexec_prompt_begin" ]] || return 1
+    [[ "${PROMPT_COMMAND[1]}" == "$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND" ]] || return 1
+    [[ "${PROMPT_COMMAND[$((count - 1))]}" == "_tirith_preexec_prompt_end" ]]
+    return
+  fi
+  [[ "${PROMPT_COMMAND:-}" == "_tirith_preexec_prompt_begin"$'\n'* ]] || return 1
+  [[ "${PROMPT_COMMAND:-}" == "_tirith_preexec_prompt_begin"$'\n'"$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND"$'\n'* ]] || return 1
+  [[ "${PROMPT_COMMAND:-}" == *$'\n'"_tirith_preexec_prompt_end" ]]
+}
+
+_tirith_install_preexec_prompt_guards() {
+  if _tirith_preexec_prompt_guards_attached; then
+    _TIRITH_PREEXEC_PROMPT_GUARDS=1
+    return 0
+  fi
+
+  local pc_decl pc_attrs
+  pc_decl="$(declare -p PROMPT_COMMAND 2>/dev/null)" || pc_decl=""
+  pc_attrs="${pc_decl#declare }"
+  pc_attrs="${pc_attrs%% *}"
+  # Never provoke or mask Bash's own readonly-assignment failure. Refuse before
+  # mutation and leave the user's scalar/array value and attributes untouched.
+  _tirith_prompt_command_attrs_safe "$pc_attrs" || return 1
+  if [[ "$pc_attrs" == *a* ]]; then
+    _tirith_prompt_command_array_supported || return 1
+    PROMPT_COMMAND=(
+      _tirith_preexec_prompt_begin
+      "$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND"
+      "${PROMPT_COMMAND[@]}"
+      _tirith_preexec_prompt_end
+    ) 2>/dev/null || return 1
+  else
+    local existing="${PROMPT_COMMAND:-}"
+    if [[ -n "$existing" ]]; then
+      PROMPT_COMMAND="_tirith_preexec_prompt_begin"$'\n'"$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND"$'\n'"${existing}"$'\n'"_tirith_preexec_prompt_end" 2>/dev/null || return 1
+    else
+      PROMPT_COMMAND="_tirith_preexec_prompt_begin"$'\n'"$_TIRITH_PREEXEC_BOOTSTRAP_COMMAND"$'\n'"_tirith_preexec_prompt_end" 2>/dev/null || return 1
+    fi
+  fi
+  _tirith_preexec_prompt_guards_attached || return 1
+  _TIRITH_PREEXEC_PROMPT_GUARDS=1
+  return 0
 }
 
 # --- Protection-status indicator + one-shot degrade banner -----------------
@@ -742,16 +1039,44 @@ _tirith_warn_degraded_once() {
 # effective protection string so a subsequent `tirith doctor` sees the truth.
 # Callers that already know a history index should pin the cache BEFORE
 # invoking this helper so the current line's remaining DEBUG fires stay
-# blocked (extdebug stays on for the life of the session).
+# blocked. Any Tirith-owned extdebug state is released at the next prompt.
 _tirith_session_degrade_to_warn_only() {
   local reason="$1"
   _TIRITH_PREEXEC_ENFORCE=0
   _TIRITH_WARN_ONLY_USE_BASH_COMMAND=1
+  # Once the whole-line/history contract is lost, simple-command fragments are
+  # still useful warnings but are not honest typed-line execution evidence.
+  _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
   _TIRITH_PREEXEC_WARNED=1   # suppress the generic warn-only banner
   export TIRITH_BASH_EFFECTIVE_PROTECTION="warn-only"
   _tirith_set_status "degraded"
   # One consolidated headline, then the path-specific reason as the detail line.
   _tirith_warn_degraded_once "$reason"
+}
+
+# A replaced or removed DEBUG trap is not a downgrade to warn-only — it is the
+# total loss of interception, because nothing calls into Tirith any more. Say
+# so, and deliberately do NOT reinstall: whichever tool took the trap owns it
+# now, and clobbering it back would start the same fight from the other side.
+_tirith_session_lost_debug_trap() {
+  _TIRITH_PREEXEC_PHASE="off"
+  _TIRITH_PREEXEC_ENFORCE=0
+  _TIRITH_PREEXEC_ENFORCE_PENDING=0
+  _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+  _TIRITH_DEBUG_TRAP_WATCH=0
+  _TIRITH_PREEXEC_WARNED=1
+  export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+  _tirith_set_status "degraded"
+  # Its own latch, deliberately not `_TIRITH_DEGRADE_WARNED`. That one belongs
+  # to the warn-only downgrade, and a session that already paid that banner must
+  # still hear about this one: warn-only to off is the transition that matters
+  # most, and sharing the latch made it the one transition that stayed silent.
+  [[ -n "${_TIRITH_OFF_WARNED:-}" ]] && return 0
+  _TIRITH_OFF_WARNED=1
+  [[ $- == *i* ]] || return 0
+  _tirith_output "tirith: protection is OFF for this shell — run 'tirith doctor' for details"
+  _tirith_output "  another tool replaced or removed Tirith's DEBUG trap; commands are no longer being checked. Tirith did not take the trap back. Restart your shell, or load tirith after that tool."
+  return 0
 }
 
 _tirith_preexec_receipt_check() {
@@ -793,23 +1118,147 @@ _tirith_preexec_receipt_check() {
 }
 
 
+# Return 1 only when Bash is actually in extdebug skip mode. A non-empty reason
+# means the current line also ends enforcement after being skipped. When Bash
+# cannot enter skip mode, return 0 and say explicitly that the command could not
+# be blocked; never print a BLOCKED verdict and silently execute it.
+_tirith_preexec_block_current_line() {
+  local reason="${1:-}" extdebug_state
+  _tirith_prepare_extdebug_block
+  extdebug_state=$?
+  if [[ $extdebug_state -eq 1 ]]; then
+    _TIRITH_PREEXEC_BLOCK_ACTIVE=0
+    _TIRITH_PREEXEC_ACTIVE_DECISION="allow"
+    _tirith_session_degrade_to_warn_only \
+      "tirith: bash could not enable extdebug for the blocking decision; this command was NOT blocked and enforcement is disabled for this shell"
+    return 0
+  fi
+  if [[ $extdebug_state -eq 2 ]]; then
+    _tirith_session_degrade_to_warn_only \
+      "tirith: extdebug became enabled outside Tirith; the current command was blocked, but Tirith cannot safely own or restore debugger state, so enforcement is disabled for this shell"
+  elif [[ -n "$reason" ]]; then
+    _tirith_session_degrade_to_warn_only "$reason"
+  fi
+  _TIRITH_PREEXEC_BLOCK_ACTIVE=1
+  _TIRITH_PREEXEC_ACTIVE_DECISION="block"
+  return 1
+}
+
+
 _tirith_preexec() {
   [[ "${_TIRITH_BASH_INTERNAL:-0}" == "1" ]] && return 0
+  local bash_cmd="${3:-$BASH_COMMAND}"
+  local entry history_index="" history_line=""
+  if entry="$(_tirith_read_history_entry)"; then
+    history_index="${entry%%|*}"
+    history_line="${entry#*|}"
+  fi
 
-  # Once-per-shell warn-only banner for interactive preexec users.
+  # Exact prompt sentinels are internal only when Bash reached them through the
+  # installed prompt bracket. A user who types the private function name gets a
+  # normal history match and therefore a normal full-line scan; this is not a
+  # function-name allowlist.
+  if [[ "${_TIRITH_PREEXEC_PROMPT_GUARDS:-0}" == "1" ]] \
+     && [[ "$bash_cmd" == "_tirith_preexec_prompt_begin" ]]; then
+    local automatic_prompt_begin=0
+    if [[ "${_TIRITH_PREEXEC_PHASE:-startup}" != "user" ]] \
+       || [[ -n "${_TIRITH_PREEXEC_ACTIVE_DECISION:-}" ]]; then
+      automatic_prompt_begin=1
+    elif ! _tirith_cmd_is_in_line "$bash_cmd" "$history_line"; then
+      automatic_prompt_begin=1
+    fi
+    if [[ $automatic_prompt_begin -eq 1 ]]; then
+      _TIRITH_PREEXEC_PHASE="prompt"
+      _TIRITH_PREEXEC_AWAITING_USER=0
+      _TIRITH_PREEXEC_BLOCK_ACTIVE=0
+      _TIRITH_PREEXEC_ACTIVE_DECISION=""
+      unset _tirith_last_key _tirith_last_rc _tirith_last_cmd
+      if ! _tirith_disable_owned_extdebug; then
+        _tirith_session_degrade_to_warn_only \
+          "tirith: could not restore Tirith-owned extdebug state at the prompt boundary; enforcement is disabled for this shell"
+      elif [[ "${_TIRITH_PREEXEC_ENFORCE:-0}" == "1" ]] \
+           && shopt -q extdebug; then
+        _tirith_session_degrade_to_warn_only \
+          "tirith: extdebug became enabled outside Tirith; enforcement is disabled because user debugger state cannot be safely restored"
+      fi
+      return 0
+    fi
+  fi
+  if [[ "${_TIRITH_PREEXEC_PROMPT_GUARDS:-0}" == "1" ]] \
+     && [[ "$bash_cmd" == "_tirith_preexec_prompt_end" ]] \
+     && [[ "${_TIRITH_PREEXEC_PHASE:-}" == "prompt" ]]; then
+    return 0
+  fi
+
+  # Nothing sourced after the hook and nothing run by PROMPT_COMMAND is a typed
+  # user line. In particular, neither path may create an execution receipt.
+  case "${_TIRITH_PREEXEC_PHASE:-startup}" in
+    startup|prompt|off) return 0 ;;
+  esac
+
+  # Bash synthesizes `exit` when interactive stdin reaches EOF. Bash 3.2 can
+  # instead expose the prompt-end function's final `return` as BASH_COMMAND
+  # during that EOF handoff. No user line was accepted in either case, so the
+  # previous history entry must not be treated as drift (or receipted). A typed
+  # command with the same text remains a normal user line because history then
+  # matches it and this narrow prompt-tail exception does not apply.
+  if [[ "${_TIRITH_PREEXEC_AWAITING_USER:-0}" == "1" ]] \
+     && { [[ "$bash_cmd" == "exit" ]] \
+          || [[ "$bash_cmd" == 'return "$previous_status"' ]]; } \
+     && ! _tirith_cmd_is_in_line "$bash_cmd" "$history_line"; then
+    return 0
+  fi
+
+  # A lazy-block event inherits DEBUG into nested execution. Once the complete
+  # top-level line has a decision, descendants reuse it without re-reading
+  # history, re-scanning function bodies, or issuing duplicate receipts.
+  local call_depth="${2:-1}"
+  if [[ "$call_depth" -gt 1 ]]; then
+    if [[ "${_TIRITH_PREEXEC_BLOCK_ACTIVE:-0}" == "1" ]] \
+       && [[ "${_TIRITH_PREEXEC_ACTIVE_DECISION:-}" == "block" ]]; then
+      return 1
+    fi
+    return 0
+  fi
+  if [[ "${_TIRITH_PREEXEC_BLOCK_ACTIVE:-0}" == "1" ]]; then
+    return 1
+  fi
+  _TIRITH_PREEXEC_AWAITING_USER=0
+
+  if [[ "${_TIRITH_PREEXEC_PHASE:-}" == "unbracketed" ]] \
+     && ! _tirith_cmd_is_in_line "$bash_cmd" "$history_line"; then
+    return 0
+  fi
+
+  # Guard removal destroys the only reliable prompt/user origin boundary.
+  # Continue in visibly degraded fragment warn-only mode; never claim blocking
+  # or typed-line receipt evidence after that boundary is lost.
+  if [[ "${_TIRITH_PREEXEC_PROMPT_GUARDS:-0}" == "1" ]] \
+     && ! _tirith_preexec_prompt_guards_attached; then
+    _TIRITH_PREEXEC_PROMPT_GUARDS=0
+    _TIRITH_PREEXEC_PHASE="unbracketed"
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+    _TIRITH_WARN_ONLY_USE_BASH_COMMAND=1
+    if [[ "${_TIRITH_PREEXEC_ENFORCE:-0}" == "1" ]]; then
+      _tirith_session_degrade_to_warn_only \
+        "tirith: PROMPT_COMMAND no longer contains Tirith's prompt-boundary guards; enforcement is disabled for this shell"
+    fi
+    # If a prompt framework removed the guards, this fire may itself be one of
+    # its automatic commands. Do not scan it as user input; a real typed line
+    # still matches history and continues below in fragment warn-only mode.
+    if ! _tirith_cmd_is_in_line "$bash_cmd" "$history_line"; then
+      return 0
+    fi
+  fi
+
+  # Once-per-shell warn-only banner, emitted only for a typed user line (never
+  # while .bashrc or PROMPT_COMMAND is running).
   if [[ -z "${_TIRITH_PREEXEC_WARNED:-}" ]] \
      && [[ $- == *i* ]] \
      && [[ "${_TIRITH_PREEXEC_ENFORCE:-0}" != "1" ]]; then
     _TIRITH_PREEXEC_WARNED=1
     _tirith_output "tirith: bash is in preexec mode (warn-only, does not block)"
     _tirith_output "  Run 'tirith doctor' to test enter mode (blocking) for this shell"
-  fi
-
-  local bash_cmd="$BASH_COMMAND"
-  local entry history_index="" history_line=""
-  if entry="$(_tirith_read_history_entry)"; then
-    history_index="${entry%%|*}"
-    history_line="${entry#*|}"
   fi
 
   # Per-typed-line cache key. The trampoline captures the caller's line
@@ -830,9 +1279,11 @@ _tirith_preexec() {
     # Helper failed (no history entry available): cannot enforce whole-line
     # semantics, so block the current DEBUG fire and downgrade the session.
     if [[ -z "$history_index" ]]; then
-      _tirith_session_degrade_to_warn_only \
+      _tirith_last_key="$line_id"
+      _tirith_last_rc=1
+      _tirith_preexec_block_current_line \
         "tirith: bash history is unavailable in this shell (history disabled or buffer empty), cannot enforce whole-line semantics; falling back to warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
-      return 1
+      return $?
     fi
 
     # Drift check FIRST. Critical: a stale history index (e.g. when a
@@ -844,9 +1295,27 @@ _tirith_preexec() {
     if ! _tirith_cmd_is_in_line "$bash_cmd" "$history_line"; then
       _tirith_last_key="$line_id"
       _tirith_last_rc=1
-      _tirith_session_degrade_to_warn_only \
+      _tirith_preexec_block_current_line \
         "tirith: bash history no longer matches BASH_COMMAND (likely HISTCONTROL/HISTIGNORE filtering, an alias, or a shell transformation outside the whole-line drift check); cannot enforce whole-line semantics; falling back to warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
-      return 1
+      return $?
+    fi
+
+    # Modern Bash can expose the same blocked function invocation once more
+    # while handing an interactive pipe to EOF, after PROMPT_COMMAND has already
+    # run. `history` does not advance for that synthetic retry. Carry only a
+    # prior BLOCK across the prompt and key it to both index and complete line:
+    # this suppresses duplicate decisions/receipts without ever reusing an
+    # allow verdict. A real re-submission gets a new history index (enforcement
+    # already rejects ignoredups/ignoreboth), so it is checked afresh.
+    local history_key="${history_index}|${history_line}"
+    if [[ -n "${_TIRITH_PREEXEC_BLOCK_HISTORY_KEY:-}" ]]; then
+      if [[ "$_TIRITH_PREEXEC_BLOCK_HISTORY_KEY" == "$history_key" ]]; then
+        _tirith_last_key="$line_id"
+        _tirith_last_rc=1
+        _tirith_preexec_block_current_line
+        return $?
+      fi
+      unset _TIRITH_PREEXEC_BLOCK_HISTORY_KEY
     fi
 
     # Cache hit on the current typed line (drift just validated).
@@ -856,7 +1325,8 @@ _tirith_preexec() {
 
     # Cache miss: fresh whole-line scan.
     _TIRITH_BASH_INTERNAL=1
-    if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
+    if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 \
+          && "${_TIRITH_PREEXEC_RECEIPTS_TRUSTED:-0}" == "1" ]]; then
       _tirith_preexec_receipt_check "$history_line" no
       rc=$?
     else
@@ -869,19 +1339,23 @@ _tirith_preexec() {
       0|2)
         _tirith_last_key="$line_id"
         _tirith_last_rc=0
+        _TIRITH_PREEXEC_ACTIVE_DECISION="allow"
         return 0
         ;;
       1)
         _tirith_last_key="$line_id"
         _tirith_last_rc=1
-        return 1
+        _TIRITH_PREEXEC_BLOCK_HISTORY_KEY="$history_key"
+        _tirith_preexec_block_current_line
+        return $?
         ;;
       *)
         _tirith_last_key="$line_id"
         _tirith_last_rc=1
-        _tirith_session_degrade_to_warn_only \
+        _TIRITH_PREEXEC_BLOCK_HISTORY_KEY="$history_key"
+        _tirith_preexec_block_current_line \
           "tirith: preexec enforcement failed unexpectedly (exit $rc), blocking this command and disabling enforcement for this shell"
-        return 1
+        return $?
         ;;
     esac
   fi
@@ -917,13 +1391,29 @@ _tirith_preexec() {
   # fresh DETECTED banner — the prompt boundary advances line_id and
   # naturally invalidates the dedupe.
   local dedupe_key="${line_id}|${scan_target}"
-  [[ "${_tirith_last_cmd:-}" == "$dedupe_key" ]] && return 0
+  if [[ "${_tirith_last_cmd:-}" == "$dedupe_key" ]]; then
+    _TIRITH_PREEXEC_ACTIVE_DECISION="allow"
+    return 0
+  fi
   _tirith_last_cmd="$dedupe_key"
 
   _TIRITH_BASH_INTERNAL=1
-  if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
+  if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 \
+        && "${_TIRITH_PREEXEC_RECEIPTS_TRUSTED:-0}" == "1" ]]; then
     if _tirith_receipt_parent_context_is_valid; then
-      _tirith_preexec_receipt_check "$scan_target" yes || true
+      if ! _tirith_preexec_receipt_check "$scan_target" yes; then
+        # The receipt path failed before the user saw anything: its stdout goes
+        # to a capture file, so a capture, parse, or consume failure swallows
+        # the scan output along with the receipt. The command runs regardless
+        # in warn-only mode, which makes the scan the only thing this mode
+        # offers. Run it plainly, and say once that execution evidence for this
+        # shell is no longer strict.
+        _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
+        if [[ -z "${_TIRITH_RECEIPT_DEGRADE_WARNED:-}" ]]; then
+          _TIRITH_RECEIPT_DEGRADE_WARNED=1
+          _tirith_output "tirith: execution receipts unavailable; legacy checks remain active but session execution evidence is degraded"
+        fi
+      fi
     else
       # A functrace-inherited DEBUG trap may run in a Bash subshell where `$$`
       # still names the registered top-level shell. Do not make a false strict
@@ -934,6 +1424,7 @@ _tirith_preexec() {
     _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
   fi
   _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
+  _TIRITH_PREEXEC_ACTIVE_DECISION="allow"
   return 0
 }
 
@@ -952,7 +1443,53 @@ _tirith_degrade_to_preexec() {
     _TIRITH_BINDS_INSTALLED=0
   fi
 
-  _tirith_install_debug_trap
+  _TIRITH_PREEXEC_PHASE="startup"
+  _TIRITH_PREEXEC_ACTIVE_DECISION=""
+  _TIRITH_PREEXEC_BLOCK_ACTIVE=0
+  _TIRITH_PREEXEC_ENFORCE_PENDING=0
+  if shopt -q extdebug; then
+    _TIRITH_PREEXEC_PHASE="off"
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+    _TIRITH_BASH_MODE="preexec"
+    _tirith_persist_safe_mode
+    export TIRITH_BASH_EFFECTIVE_MODE="preexec"
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "degraded"
+    _tirith_output "tirith: enter mode failed ($reason), and the preexec fallback cannot own a user-enabled extdebug setting; interception is off for this shell"
+    return 1
+  elif ! _tirith_prepare_debug_trap_capture; then
+    _TIRITH_PREEXEC_PHASE="off"
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+    _TIRITH_BASH_MODE="preexec"
+    _tirith_persist_safe_mode
+    export TIRITH_BASH_EFFECTIVE_MODE="preexec"
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "degraded"
+    _tirith_output "tirith: enter mode failed ($reason), and the preexec fallback could not preserve the existing DEBUG trap; interception is off for this shell"
+    return 1
+  elif _tirith_install_preexec_prompt_guards; then
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=1
+    # Capture/chaining completes in the first prompt before Bash accepts input.
+    # Until then, advertise no interception rather than a premature guarantee.
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "off"
+  else
+    if [[ -n "${_TIRITH_DEBUG_CAPTURE_FILE:-}" ]]; then
+      _tirith_remove_capture_file "$_TIRITH_DEBUG_CAPTURE_FILE" >/dev/null 2>&1 || true
+    fi
+    _TIRITH_DEBUG_CAPTURE_FILE=""
+    _TIRITH_DEBUG_TRAP_CAPTURE_READY=2
+    _TIRITH_PREEXEC_PHASE="off"
+    _TIRITH_PREEXEC_PROMPT_GUARDS=0
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+    _TIRITH_BASH_MODE="preexec"
+    _tirith_persist_safe_mode
+    export TIRITH_BASH_EFFECTIVE_MODE="preexec"
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "degraded"
+    _tirith_output "tirith: enter mode failed ($reason), and the preexec fallback could not safely bracket PROMPT_COMMAND; interception is off for this shell"
+    return 1
+  fi
   _TIRITH_BASH_MODE="preexec"
   _tirith_persist_safe_mode
   if [[ $- == *i* ]]; then
@@ -1041,6 +1578,25 @@ _tirith_ensure_prompt_hook() {
 }
 
 
+# A sourced file cannot see its caller's DEBUG trap: `trap -p DEBUG` reports an
+# empty handler inside the file even though returning to the interactive shell
+# restores one. Defer capture to a direct PROMPT_COMMAND element, which Bash
+# evaluates in the caller's top-level context before the next user command.
+_TIRITH_DEBUG_TRAP_CAPTURE_READY=0
+_TIRITH_CAPTURED_DEBUG_TRAP_SPEC=""
+_TIRITH_DEBUG_TRAP_INSTALLED=0
+_TIRITH_DEBUG_CAPTURE_FILE=""
+# Prompt-boundary proof that Tirith's DEBUG trap is still the installed one.
+# `trap -p DEBUG` reports an empty handler inside a function, so ownership
+# cannot be re-read from `_tirith_preexec_prompt_end`; the trampoline reports
+# itself instead. HEARTBEAT is set on every fire, WATCH arms the check one full
+# prompt cycle after installation so the install cycle is not mistaken for a loss.
+_TIRITH_DEBUG_TRAP_HEARTBEAT=0
+_TIRITH_DEBUG_TRAP_WATCH=0
+_TIRITH_PREEXEC_ENFORCE_PENDING=0
+_TIRITH_PREEXEC_BOOTSTRAP_COMMAND='if [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]]; then builtin trap -p DEBUG >"$_TIRITH_DEBUG_CAPTURE_FILE" 2>/dev/null; _tirith_finalize_debug_trap_capture; fi; _tirith_restore_prompt_status'
+
+
 if [[ -n "${TIRITH_BASH_MODE:-}" ]]; then
   # Explicit user override always wins. A user who exports TIRITH_BASH_MODE has
   # made a deliberate choice; if they force `enter` in an environment where
@@ -1093,14 +1649,22 @@ fi
 
 #
 # Users who set TIRITH_BASH_PREEXEC_ENFORCE to a truthy value get real
-# blocking in preexec mode via `shopt -s extdebug` + `return 1` from the
-# DEBUG trap. Enforcement requires a trustworthy whole-line view, so hostile
-# history configs are rejected at install time: HISTCONTROL containing
-# ignorespace/ignoredups/ignoreboth, any HISTIGNORE, or `set +o history`
-# downgrade the session to warn-only with a pointer at enter mode.
+# blocking in preexec mode by enabling extdebug lazily after a whole-line block
+# decision and returning 1 from the DEBUG trap. Prompt boundaries release that
+# Tirith-owned state before user prompt functions run. Enforcement requires a
+# trustworthy whole-line view and safe PROMPT_COMMAND bracketing; hostile
+# history downgrades visibly, while unsafe debugger/prompt ownership leaves
+# interception explicitly off.
 _TIRITH_PREEXEC_ENFORCE=0
 _TIRITH_OWNS_EXTDEBUG=0
 _TIRITH_WARN_ONLY_USE_BASH_COMMAND=0
+_TIRITH_PREEXEC_PROMPT_GUARDS=0
+_TIRITH_PREEXEC_PHASE="off"
+_TIRITH_PREEXEC_AWAITING_USER=0
+_TIRITH_PREEXEC_BLOCK_ACTIVE=0
+_TIRITH_PREEXEC_ACTIVE_DECISION=""
+_TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+_TIRITH_PREEXEC_BLOCK_HISTORY_KEY=""
 
 _tirith_env_is_truthy() {
   case "${1:-}" in
@@ -1109,16 +1673,73 @@ _tirith_env_is_truthy() {
   return 1
 }
 
+if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] && [[ $- == *i* ]]; then
+  _TIRITH_PREEXEC_PHASE="startup"
+  if shopt -q extdebug; then
+    _TIRITH_PREEXEC_PHASE="off"
+    _TIRITH_PREEXEC_WARNED=1
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "degraded"
+    _tirith_output "tirith: bash preexec hook was not installed because extdebug is already user-enabled; existing debugger state was left unchanged"
+  elif ! _tirith_prepare_debug_trap_capture; then
+    # Do not mutate PROMPT_COMMAND unless the top-level DEBUG capture has a
+    # private destination. With no future Tirith trap, warn-only is false too.
+    _TIRITH_PREEXEC_PHASE="off"
+    _TIRITH_PREEXEC_WARNED=1
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "degraded"
+    _tirith_output "tirith: bash preexec hook was not installed because the existing DEBUG trap could not be preserved safely; existing debugger state was left unchanged"
+  elif _tirith_install_preexec_prompt_guards; then
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=1
+    # Capture/chaining completes in the first prompt before Bash accepts input.
+    # Until then, advertise no interception rather than a premature guarantee.
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "off"
+  else
+    # The direct prompt bootstrap is the only context where Bash exposes a
+    # caller-owned DEBUG trap. If PROMPT_COMMAND cannot be bracketed, preserve
+    # both user-owned states and make the lack of interception explicit.
+    if [[ -n "${_TIRITH_DEBUG_CAPTURE_FILE:-}" ]]; then
+      _tirith_remove_capture_file "$_TIRITH_DEBUG_CAPTURE_FILE" >/dev/null 2>&1 || true
+    fi
+    _TIRITH_DEBUG_CAPTURE_FILE=""
+    _TIRITH_DEBUG_TRAP_CAPTURE_READY=2
+    _TIRITH_PREEXEC_PHASE="off"
+    _TIRITH_PREEXEC_PROMPT_GUARDS=0
+    _TIRITH_PREEXEC_WARNED=1
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
+    export TIRITH_BASH_EFFECTIVE_PROTECTION="off"
+    _tirith_set_status "degraded"
+    _tirith_output "tirith: bash preexec hook was not installed because PROMPT_COMMAND is readonly, associative, coercing, unsupported, or otherwise cannot be safely bracketed; existing prompt and DEBUG state was left unchanged"
+  fi
+fi
+
 if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] \
    && [[ $- == *i* ]] \
    && _tirith_env_is_truthy "${TIRITH_BASH_PREEXEC_ENFORCE:-}"; then
-  if _tirith_history_is_trustworthy_for_enforcement; then
-    _TIRITH_PREEXEC_ENFORCE=1
-    _tirith_enable_extdebug
-    export TIRITH_BASH_EFFECTIVE_PROTECTION="blocks"
-    # Enforcement engaged: preexec now blocks, so the prompt indicator is
-    # `blocks`, not the `warn-only` exported by the startup block above.
-    _tirith_set_status "blocks"
+  if [[ "${_TIRITH_PREEXEC_PHASE:-}" == "off" ]]; then
+    _TIRITH_PREEXEC_WARNED=1
+    _tirith_set_status "degraded"
+  elif [[ "${_TIRITH_PREEXEC_PROMPT_GUARDS:-0}" != "1" ]]; then
+    _TIRITH_PREEXEC_WARNED=1
+    _tirith_set_status "degraded"
+    _tirith_warn_degraded_once \
+      "preexec enforcement could not engage because PROMPT_COMMAND is readonly, associative, or otherwise cannot be safely bracketed. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
+  elif shopt -q extdebug; then
+    # Preserve user debugger state exactly. Always-on user extdebug inherits
+    # DEBUG into function bodies, so claiming a whole-line blocking boundary
+    # would be unsafe even though warn-only top-level scans remain available.
+    _TIRITH_PREEXEC_WARNED=1
+    _tirith_set_status "degraded"
+    _tirith_warn_degraded_once \
+      "preexec enforcement could not engage because extdebug was already enabled outside Tirith; user debugger state was preserved. Disable extdebug or use enter mode for blocking."
+  elif _tirith_history_is_trustworthy_for_enforcement; then
+    # The caller's DEBUG trap is only visible at the first top-level prompt.
+    # Arm enforcement there, immediately after that trap is captured/chained
+    # and before Bash can accept another user command.
+    _TIRITH_PREEXEC_ENFORCE_PENDING=1
   else
     # Same hostile-history check that triggers a runtime drift downgrade —
     # so the warn-only scan target must also flip to BASH_COMMAND, not the
@@ -1126,11 +1747,13 @@ if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] \
     # produce stale DETECTED banners scanned against whatever entry
     # `history 1` happens to surface.
     _TIRITH_WARN_ONLY_USE_BASH_COMMAND=1
+    _TIRITH_PREEXEC_RECEIPTS_TRUSTED=0
     # The user asked for blocking (TIRITH_BASH_PREEXEC_ENFORCE) but a hostile
     # history config prevents it — that is a downgrade from the requested
     # protection level, so the prompt indicator is `degraded`. Routed through
     # the one-shot banner so the headline matches every other degrade path.
     _tirith_set_status "degraded"
+    _TIRITH_PREEXEC_WARNED=1
     _tirith_warn_degraded_once \
       "preexec enforcement could not engage (HISTCONTROL/HISTIGNORE or disabled history prevents a trustworthy whole-line view). For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter)."
   fi
@@ -1573,6 +2196,7 @@ fi
 
 # Exit summary: show session warnings on shell exit
 _tirith_exit_summary() {
+  _tirith_discard_pending_debug_trap_capture
   local pending_receipt="${_TIRITH_PENDING_RECEIPT:-}"
   unset _TIRITH_PENDING_EVAL
   unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
@@ -1602,13 +2226,9 @@ else
 fi
 unset _tirith_prev_exit_spec _TIRITH_EXTRACTED_TRAP
 
-# Install the DEBUG trap as the absolute last step so no more internal hook
-# code fires it during sourcing. The enter-mode path installs its own bind-x
-# earlier; the degrade path installs DEBUG on demand inside
-# `_tirith_degrade_to_preexec`.
-if [[ "$_TIRITH_BASH_MODE" == "preexec" ]] && [[ $- == *i* ]]; then
-  _tirith_install_debug_trap
-fi
+# Preexec's first prompt captures and chains the caller's DEBUG trap before the
+# shell can accept another user command. Enter mode leaves DEBUG untouched;
+# its runtime fallback installs the same prompt bootstrap on demand.
 
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
 # Opt-in output-direction wrapper. Commented out by default in this embedded

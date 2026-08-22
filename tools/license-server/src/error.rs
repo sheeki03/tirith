@@ -9,8 +9,7 @@ pub enum AppError {
     BadWebhook(String),
     /// Subscription inactive (402)
     PaymentRequired(String),
-    /// Rate limit exceeded (used by rate-limiting middleware)
-    #[allow(dead_code)]
+    /// Rate limit exceeded (constructed by the refresh route).
     RateLimited,
     /// Internal server error (DB, signing, transient)
     Internal(String),
@@ -37,6 +36,17 @@ impl IntoResponse for AppError {
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Too many requests"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         };
+        // The client body is deliberately generic (no internal detail leaks to
+        // the caller), but the detail is the only record of WHY a request
+        // failed. A 500 with the body "Internal server error" and no log line
+        // is an unresolvable incident. Log the full error here, once, at a
+        // level matched to severity: a 5xx is an error, a 4xx is a warning.
+        // The `Display` impl carries the internal message.
+        if status.is_server_error() {
+            tracing::error!(status = %status.as_u16(), detail = %self, "request failed");
+        } else {
+            tracing::warn!(status = %status.as_u16(), detail = %self, "request rejected");
+        }
         (status, body.to_string()).into_response()
     }
 }

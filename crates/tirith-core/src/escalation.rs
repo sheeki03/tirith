@@ -1200,33 +1200,236 @@ fn delete_value_flags_for(tool: &str) -> &'static [&'static str] {
 ///
 /// `shred -n 3 secret.txt` -> `[secret.txt]` (the `3` is `-n`'s value, not a path);
 /// `shred --iterations=3 a b` -> `[a, b]`; `rm a b c` -> `[a, b, c]`.
-fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<&'a String> {
+fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<std::borrow::Cow<'a, str>> {
     let value_flags = delete_value_flags_for(tool);
     let mut paths = Vec::new();
     let mut end_of_options = false;
     let mut skip_next = false;
+    let mut skip_redirection_target = false;
     for a in args {
+        if skip_redirection_target {
+            // A separated shell redirect (`2> /tmp/stderr`) consumes this
+            // shell word; it never reaches rm/unlink/shred as an operand.
+            skip_redirection_target = false;
+            continue;
+        }
+        if let Some(target_is_separate) = shell_redirection_token(a) {
+            // Redirections are removed by the shell before argv construction,
+            // so they cannot satisfy a preceding value-taking option. Keep
+            // `skip_next` armed across both attached and separated forms.
+            skip_redirection_target = target_is_separate;
+            continue;
+        }
+
+        // The lossless word splitter intentionally preserves shell spelling,
+        // so a redirect appended to an argv word remains one token here:
+        // `target>/dev/null`. Model the shell's actual argv by retaining only
+        // the prefix and discarding the operator/target suffix. Quoted or
+        // escaped angle brackets are not operators and remain in the operand.
+        let (logical_arg, suffix_target_is_separate) =
+            if let Some((prefix, target_is_separate)) = shell_redirection_suffix(a) {
+                (prefix, Some(target_is_separate))
+            } else {
+                (a.as_str(), None)
+            };
         if skip_next {
             // This token is the value of a preceding value-taking option (e.g. the
             // `3` after `shred -n`); it is not a path.
             skip_next = false;
-            continue;
-        }
-        if !end_of_options && a.as_str() == "--" {
-            end_of_options = true;
-            continue;
-        }
-        if !end_of_options && a.starts_with('-') {
-            // A bare value-taking option consumes the NEXT token as its value; the
-            // joined `--iterations=3` form is self-contained (consumes nothing).
-            if value_flags.contains(&a.as_str()) {
-                skip_next = true;
+            if let Some(target_is_separate) = suffix_target_is_separate {
+                skip_redirection_target = target_is_separate;
             }
             continue;
         }
-        paths.push(a);
+        if !end_of_options && logical_arg == "--" {
+            end_of_options = true;
+            if let Some(target_is_separate) = suffix_target_is_separate {
+                skip_redirection_target = target_is_separate;
+            }
+            continue;
+        }
+        if !end_of_options && logical_arg.starts_with('-') {
+            // A bare value-taking option consumes the NEXT token as its value; the
+            // joined `--iterations=3` form is self-contained (consumes nothing).
+            if value_flags.contains(&logical_arg) {
+                skip_next = true;
+            }
+            if let Some(target_is_separate) = suffix_target_is_separate {
+                skip_redirection_target = target_is_separate;
+            }
+            continue;
+        }
+        paths.push(std::borrow::Cow::Borrowed(logical_arg));
+        if let Some(target_is_separate) = suffix_target_is_separate {
+            skip_redirection_target = target_is_separate;
+        }
     }
     paths
+}
+
+/// Split the first unquoted, unescaped redirection suffix from a preceding argv
+/// word. Returns the argv prefix plus whether the operator consumes the next
+/// shell word. Process substitutions stay part of the word.
+fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+        Backtick,
+    }
+
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut substitution_depth = 0usize;
+    let mut parameter_depth = 0usize;
+    let mut chars = word.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                }
+                continue;
+            }
+            Quote::Double => {
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quote = Quote::None;
+                }
+                continue;
+            }
+            Quote::Backtick => {
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == '`' {
+                    quote = Quote::None;
+                }
+                continue;
+            }
+            Quote::None => match ch {
+                '\\' => {
+                    escaped = true;
+                    continue;
+                }
+                '\'' => {
+                    quote = Quote::Single;
+                    continue;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    continue;
+                }
+                '`' => {
+                    quote = Quote::Backtick;
+                    continue;
+                }
+                _ => {}
+            },
+        }
+
+        if substitution_depth > 0 {
+            match ch {
+                '(' => substitution_depth = substitution_depth.saturating_add(1),
+                ')' => substitution_depth = substitution_depth.saturating_sub(1),
+                _ => {}
+            }
+            continue;
+        }
+
+        if parameter_depth > 0 {
+            match ch {
+                '{' => parameter_depth = parameter_depth.saturating_add(1),
+                '}' => parameter_depth = parameter_depth.saturating_sub(1),
+                _ => {}
+            }
+            continue;
+        }
+
+        // Operators inside command/process substitutions belong to that
+        // nested command, not the outer delete command. Consume the opening
+        // parenthesis here so it is counted exactly once.
+        if matches!(ch, '$' | '<' | '>') && chars.peek().is_some_and(|(_, next)| *next == '(') {
+            let _ = chars.next();
+            substitution_depth = 1;
+            continue;
+        }
+
+        // A `>` or `<` inside `${parameter expansion}` is word content (for
+        // example `${x:-a>b}`), not an outer redirection operator.
+        if ch == '$' && chars.peek().is_some_and(|(_, next)| *next == '{') {
+            let _ = chars.next();
+            parameter_depth = 1;
+            continue;
+        }
+
+        let candidate_index = ((ch == '&' && chars.peek().is_some_and(|(_, next)| *next == '>'))
+            || matches!(ch, '<' | '>'))
+        .then_some(index);
+        let Some(candidate_index) = candidate_index else {
+            continue;
+        };
+        if candidate_index == 0 {
+            return None;
+        }
+        let candidate = &word[candidate_index..];
+        if let Some(target_is_separate) = shell_redirection_token(candidate) {
+            return Some((&word[..candidate_index], target_is_separate));
+        }
+    }
+    None
+}
+
+/// Classify an unquoted POSIX/Fish redirection word retained by Tirith's
+/// lossless tokenizer. Returns whether the operator consumes the following
+/// token (`2> /tmp/log`) rather than carrying an attached target
+/// (`2>/tmp/log`, `2>&1`). Quoted or escaped lookalikes remain ordinary delete
+/// operands.
+fn shell_redirection_token(word: &str) -> Option<bool> {
+    let mut rest = word;
+    rest = rest.trim_start_matches(|ch: char| ch.is_ascii_digit());
+
+    // Bash also permits a variable-backed descriptor (`{fd}>file`). Only peel
+    // an actual shell identifier so a path that merely starts with braces is
+    // not mistaken for redirection syntax.
+    if let Some(after_open) = rest.strip_prefix('{') {
+        if let Some(close) = after_open.find('}') {
+            let name = &after_open[..close];
+            let mut bytes = name.bytes();
+            let valid_name = bytes
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            if valid_name {
+                rest = &after_open[close + 1..];
+            }
+        }
+    }
+
+    // Quoting or escaping the operator makes it an argv word. Escapes in an
+    // attached target are unrelated (`2>/tmp/a\\>b` is still a redirect).
+    if rest.starts_with(['\'', '"']) || rest.starts_with("\\>") || rest.starts_with("\\<") {
+        return None;
+    }
+
+    // Process substitutions are argv operands which expand to `/dev/fd/...`,
+    // not redirections. Check them before the generic `<`/`>` prefix match.
+    if rest.starts_with("<(") || rest.starts_with(">(") {
+        return None;
+    }
+
+    const OPERATORS: &[&str] = &[
+        "&>>", "&>", ">>", "<<<", "<<-", "<<", "><", "<>", ">|", ">&", "<&", ">", "<",
+    ];
+    let operator = OPERATORS
+        .iter()
+        .find(|operator| rest.starts_with(**operator))?;
+    Some(rest.len() == operator.len())
 }
 
 /// The first PATH operand of a delete command (the representative metadata path).
@@ -1234,7 +1437,9 @@ fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<&'a String> {
 /// a path: `shred -n 3 secret.txt` yields `secret.txt`, not `3`. `rm`/`unlink`
 /// have no value-taking options, so this is the first non-flag token as before.
 fn first_path_arg(tool: &str, args: &[String]) -> Option<String> {
-    delete_path_args(tool, args).first().map(|s| (*s).clone())
+    delete_path_args(tool, args)
+        .first()
+        .map(|path| path.as_ref().to_string())
 }
 
 /// The number of PATH operands a delete command targets, sharing [`delete_path_args`]
@@ -1246,16 +1451,16 @@ fn count_path_args(tool: &str, args: &[String]) -> usize {
     delete_path_args(tool, args).len()
 }
 
-/// The number of PATH operands that are NOT build artifacts, using the same path
-/// rule as [`count_path_args`] plus `crate::util_build_dirs::is_build_artifact_path`
-/// on each path. `rm app.rs dist/x dist/y` -> 1; `rm dist/a dist/b` -> 0;
-/// `rm -rf src x` -> 2. This is what the mass-deletion correlation sums, so a mixed
-/// delete contributes exactly its real non-build paths instead of all-or-nothing on
-/// one sampled path.
+/// Count PATH operands that are not concrete build artifacts. Dynamic operands
+/// remain counted: a shell variable cannot be exempted from text alone because
+/// `mktemp`, `mv`, and `rm` may all resolve to user-defined shell functions.
 fn count_non_build_path_args(tool: &str, args: &[String]) -> usize {
     delete_path_args(tool, args)
         .into_iter()
-        .filter(|a| !crate::util_build_dirs::is_build_artifact_path(a))
+        .filter(|path| {
+            let path = shell_dequote(path.as_ref());
+            !crate::util_build_dirs::is_build_artifact_path(&path)
+        })
         .count()
 }
 
@@ -4012,6 +4217,405 @@ mod tests {
                 .map(String::as_str),
             Some("2"),
             "`-a` and `file` after `--` both count; the leading `-f` does not"
+        );
+    }
+
+    #[test]
+    fn delete_operand_count_ignores_attached_and_separated_shell_redirections() {
+        let verdict = raw_verdict_with(Action::Allow, vec![], None);
+        for command in [
+            "rm -f authored.txt 2>/dev/null",
+            "rm -f authored.txt 2> /tmp/stderr",
+            "rm -f authored.txt >/tmp/stdout 2>&1",
+            "rm -- authored.txt < /tmp/stdin",
+        ] {
+            let event = derive_typed_events(command, &verdict)
+                .into_iter()
+                .find(|event| event.kind == EventKind::FileDelete)
+                .expect("delete event");
+            assert_eq!(
+                event
+                    .metadata
+                    .get(crate::event_buffer::DELETE_COUNT_KEY)
+                    .map(String::as_str),
+                Some("1"),
+                "redirection syntax became a delete operand: {command}"
+            );
+            assert_eq!(
+                event
+                    .metadata
+                    .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                    .map(String::as_str),
+                Some("1"),
+                "redirection syntax inflated mass-delete correlation: {command}"
+            );
+        }
+    }
+
+    fn delete_counts_for_shell(command: &str, shell: ShellType) -> (usize, usize) {
+        let verdict = raw_verdict_with(Action::Allow, vec![], None);
+        let event = derive_event_prototypes_for_shell(command, &verdict, shell)
+            .into_iter()
+            .find(|event| event.kind == EventKind::FileDelete)
+            .expect("delete event");
+        let total = event.metadata[crate::event_buffer::DELETE_COUNT_KEY]
+            .parse()
+            .expect("numeric total delete count");
+        let non_build = event.metadata[crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY]
+            .parse()
+            .expect("numeric non-build delete count");
+        (total, non_build)
+    }
+
+    const HERMES_SNAPSHOT_TEMP_VARIABLE: &str = "__hermes_snap_tmp";
+    const HERMES_SNAPSHOT_TEMP_REFERENCE: &str = "$__hermes_snap_tmp";
+
+    fn hermes_snapshot_wrapper(template: &str, destination: &str) -> String {
+        let producer = format!(
+            "{{ ( unset ${{!HERMES_SESSION_*}} ${{!HERMES_CRON_AUTO_DELIVER_*}} \
+             ${{!HERMES_BROWSER_CONTROL_*}} AI_AGENT HERMES_AGENT \
+             HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; }} \
+             > \"{HERMES_SNAPSHOT_TEMP_REFERENCE}\""
+        );
+        hermes_snapshot_wrapper_with_producer(template, destination, &producer)
+    }
+
+    fn hermes_legacy_snapshot_wrapper(template: &str, destination: &str) -> String {
+        let producer =
+            format!("{{ ( export -p; ) || true; }} > \"{HERMES_SNAPSHOT_TEMP_REFERENCE}\"");
+        hermes_snapshot_wrapper_with_producer(template, destination, &producer)
+    }
+
+    fn hermes_snapshot_wrapper_with_producer(
+        template: &str,
+        destination: &str,
+        producer: &str,
+    ) -> String {
+        format!(
+            "{HERMES_SNAPSHOT_TEMP_VARIABLE}=$(mktemp {template}) && \
+             {{ {producer} && \
+             mv -f \"{HERMES_SNAPSHOT_TEMP_REFERENCE}\" {destination}; }} \
+             2>/dev/null || rm -f \"{HERMES_SNAPSHOT_TEMP_REFERENCE}\" 2>/dev/null || true"
+        )
+    }
+
+    #[test]
+    fn hermes_snapshot_fallback_remains_counted_when_commands_can_be_shadowed() {
+        let command = hermes_snapshot_wrapper(
+            "/data/data/com.termux/files/usr/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
+            "/data/data/com.termux/files/usr/tmp/hermes-snap-session.sh",
+        );
+        assert_eq!(delete_counts_for_shell(&command, ShellType::Posix), (1, 1));
+
+        let legacy = hermes_legacy_snapshot_wrapper(
+            "/run/user/1000/hermes/hermes-snap-legacy.sh.tmp.XXXXXXXXXX",
+            "/run/user/1000/hermes/hermes-snap-legacy.sh",
+        );
+        assert_eq!(
+            delete_counts_for_shell(&legacy, ShellType::Posix),
+            (1, 1),
+            "plain legacy commands can resolve to user-defined shell functions"
+        );
+
+        for command in [
+            hermes_snapshot_wrapper(
+                "/c/Users/Alice/.hermes/cache/terminal/hermes-snap-msys.sh.tmp.XXXXXXXXXX",
+                "/c/Users/Alice/.hermes/cache/terminal/hermes-snap-msys.sh",
+            ),
+            hermes_legacy_snapshot_wrapper(
+                r"'C:\Users\Alice\.hermes\cache\terminal\hermes-snap-native.sh.tmp.XXXXXXXXXX'",
+                r"'C:\Users\Alice\.hermes\cache\terminal\hermes-snap-native.sh'",
+            ),
+        ] {
+            assert_eq!(
+                delete_counts_for_shell(&command, ShellType::Posix),
+                (1, 1),
+                "custom MSYS/native-Windows roots cannot override shadowability"
+            );
+        }
+
+        let with_sorted_passthroughs = command.replace(
+            "HERMES_UI_SESSION_ID 2>/dev/null",
+            "HERMES_UI_SESSION_ID AWS_PROFILE ZED_TOKEN 2>/dev/null",
+        );
+        assert_eq!(
+            delete_counts_for_shell(&with_sorted_passthroughs, ShellType::Posix),
+            (1, 1),
+            "the current producer's plain commands remain shadowable"
+        );
+
+        // The generated command is commonly rendered with physical continued
+        // lines. Proving it must not depend on collapsing those into one line.
+        let continued = command
+            .replace(" && {", " && \\\n{")
+            .replace(" } 2>/dev/null", " } \\\n2>/dev/null");
+        assert_eq!(
+            delete_counts_for_shell(&continued, ShellType::Posix),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn hermes_snapshot_cleanup_keeps_other_delete_segments_counted() {
+        let wrapper = hermes_snapshot_wrapper(
+            "/var/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
+            "/var/tmp/hermes-snap-session.sh",
+        );
+        let command = format!("rm authored.txt; {wrapper}; shred -n 3 another.txt");
+        assert_eq!(
+            delete_counts_for_shell(&command, ShellType::Posix),
+            (3, 3),
+            "dynamic fallback and authored deletes must all remain counted"
+        );
+    }
+
+    #[test]
+    fn hermes_wrapper_whitespace_and_newline_mutations_never_gain_an_exemption() {
+        let command = hermes_snapshot_wrapper(
+            "/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
+            "/tmp/hermes-snap-session.sh",
+        );
+        let mutations = [
+            command.replace(
+                "HERMES_UI_SESSION_ID 2>/dev/null",
+                "HERMES_UI_SESSION_ID\nrm secret source 2>/dev/null",
+            ),
+            command.replace(" && {", " && \\\r\n{"),
+            command.replace(
+                "HERMES_UI_SESSION_ID 2>/dev/null",
+                "HERMES_UI_SESSION_ID\u{000b}EXTRA 2>/dev/null",
+            ),
+            command.replace(
+                "HERMES_UI_SESSION_ID 2>/dev/null",
+                "HERMES_UI_SESSION_ID\u{00a0}EXTRA 2>/dev/null",
+            ),
+        ];
+        for mutation in mutations {
+            assert_eq!(
+                delete_counts_for_shell(&mutation, ShellType::Posix),
+                (1, 1),
+                "control/Unicode whitespace mutation must leave the fallback fully counted: {mutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hermes_cleanup_interacts_safely_with_redirections_and_shell_types() {
+        let command = hermes_snapshot_wrapper(
+            "/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
+            "/tmp/hermes-snap-session.sh",
+        );
+        let segments = tokenize::tokenize(&command, ShellType::Posix);
+        let cleanup = segments
+            .iter()
+            .find(|segment| segment.command.as_deref() == Some("rm"))
+            .expect("fallback rm segment");
+        assert_eq!(
+            delete_path_args("rm", &cleanup.args)
+                .into_iter()
+                .map(|path| shell_dequote(path.as_ref()))
+                .collect::<Vec<_>>(),
+            [HERMES_SNAPSHOT_TEMP_REFERENCE]
+        );
+        assert_eq!(
+            delete_counts_for_shell(&command, ShellType::PowerShell),
+            (1, 1),
+            "the POSIX-only shape must not suppress another shell's deletion"
+        );
+    }
+
+    #[test]
+    fn concrete_hermes_artifacts_are_excluded_but_authored_lookalikes_are_not() {
+        assert_eq!(
+            delete_counts_for_shell(
+                "rm -rf '/tmp/hermes_sandbox_job' \
+                 /tmp/hermes-snap-session.sh.tmp.123",
+                ShellType::Posix,
+            ),
+            (2, 0),
+            "quoted and unquoted generated paths are both concrete artifacts"
+        );
+        assert_eq!(
+            delete_counts_for_shell(
+                "rm -rf project/hermes_sandbox_job \
+                 /workspace/hermes-snap-session.sh.tmp.123",
+                ShellType::Posix,
+            ),
+            (2, 2),
+            "similarly named authored paths must remain counted"
+        );
+        assert_eq!(
+            delete_counts_for_shell(
+                "rm -rf /tmp/hermes_sandbox_job/symlink/important.txt",
+                ShellType::Posix,
+            ),
+            (1, 1),
+            "a sandbox descendant may resolve through a symlink and is never globally exempt"
+        );
+    }
+
+    #[test]
+    fn quoted_and_escaped_redirection_lookalikes_remain_delete_operands() {
+        for args in [
+            vec!["'2>/dev/null'".to_string()],
+            vec!["2\\>/dev/null".to_string()],
+            vec!["2\">\"/dev/null".to_string()],
+            vec!["--".to_string(), "'2>/dev/null'".to_string()],
+        ] {
+            assert_eq!(delete_path_args("rm", &args).len(), 1, "args={args:?}");
+        }
+    }
+
+    #[test]
+    fn attached_redirect_target_may_contain_an_escaped_angle() {
+        let args = vec!["authored.txt".to_string(), "2>/tmp/a\\>b".to_string()];
+        assert_eq!(
+            delete_path_args("rm", &args)
+                .into_iter()
+                .map(std::borrow::Cow::into_owned)
+                .collect::<Vec<_>>(),
+            vec!["authored.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn process_substitutions_remain_delete_operands() {
+        for token in ["<(printf data)", ">(printf data)", "2>(printf data)"] {
+            let args = vec![token.to_string()];
+            assert_eq!(
+                delete_path_args("rm", &args)
+                    .into_iter()
+                    .map(std::borrow::Cow::into_owned)
+                    .collect::<Vec<_>>(),
+                vec![token.to_string()],
+                "process substitution was discarded as a redirect: {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_fd_redirections_do_not_count_as_delete_operands() {
+        for args in [
+            vec!["authored.txt", "{log}>/tmp/log"],
+            vec!["authored.txt", "{log}>", "/tmp/log"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                delete_path_args("rm", &args)
+                    .into_iter()
+                    .map(std::borrow::Cow::into_owned)
+                    .collect::<Vec<_>>(),
+                vec!["authored.txt".to_string()],
+                "dynamic-fd redirect became a delete operand: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_stripping_heredoc_delimiter_is_not_a_delete_operand() {
+        let args = ["authored.txt", "<<-", "EOF"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delete_path_args("rm", &args)
+                .into_iter()
+                .map(std::borrow::Cow::into_owned)
+                .collect::<Vec<_>>(),
+            vec!["authored.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn redirections_do_not_consume_a_delete_option_value_slot() {
+        for args in [
+            vec!["-n", "2>/dev/null", "3", "secret.txt"],
+            vec!["-n", "2>", "/tmp/stderr", "3", "secret.txt"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                delete_path_args("shred", &args)
+                    .into_iter()
+                    .map(std::borrow::Cow::into_owned)
+                    .collect::<Vec<_>>(),
+                vec!["secret.txt".to_string()],
+                "redirection changed effective argv option binding: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attached_redirection_suffix_preserves_only_the_real_delete_operand() {
+        let args = ["target>/dev/null"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delete_path_args("rm", &args)
+                .into_iter()
+                .map(std::borrow::Cow::into_owned)
+                .collect::<Vec<_>>(),
+            vec!["target".to_string()]
+        );
+
+        let verdict = raw_verdict_with(Action::Allow, vec![], None);
+        let event = derive_typed_events("rm -rf target>/dev/null", &verdict)
+            .into_iter()
+            .find(|event| event.kind == EventKind::FileDelete)
+            .expect("delete event");
+        assert_eq!(
+            event.metadata.get("path").map(String::as_str),
+            Some("target")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get(crate::event_buffer::DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get(crate::event_buffer::NON_BUILD_DELETE_COUNT_KEY)
+                .map(String::as_str),
+            Some("0"),
+            "the real `target` build directory must retain its build-artifact classification"
+        );
+    }
+
+    #[test]
+    fn quoted_escaped_and_process_substitution_suffixes_are_not_redirects() {
+        for token in [
+            "target\\>/dev/null",
+            "'target>/dev/null'",
+            "target\">\"/dev/null",
+            "target<(printf data)",
+            "target<(printf data>/dev/null)",
+            "target$(printf data>/dev/null)",
+            "target`printf data>/dev/null`",
+            "target${x:-a>b}",
+            "target${x:-${y:-a>b}}",
+        ] {
+            let args = vec![token.to_string()];
+            assert_eq!(
+                delete_path_args("rm", &args)
+                    .into_iter()
+                    .map(std::borrow::Cow::into_owned)
+                    .collect::<Vec<_>>(),
+                vec![token.to_string()],
+                "quoted, escaped, or process-substitution text was split: {token}"
+            );
+        }
+
+        let args = vec!["target${x:-a>b}>/dev/null".to_string()];
+        assert_eq!(
+            delete_path_args("rm", &args)
+                .into_iter()
+                .map(std::borrow::Cow::into_owned)
+                .collect::<Vec<_>>(),
+            vec!["target${x:-a>b}".to_string()],
+            "an outer redirect after parameter expansion must still be removed"
         );
     }
 

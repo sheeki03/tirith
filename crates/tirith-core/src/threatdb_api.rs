@@ -141,7 +141,11 @@ pub fn enrich_command(
                     };
                     if satisfies {
                         resolved
-                    } else {
+                    } else if resolved.is_some() {
+                        // A concrete default WAS resolved and it does not satisfy
+                        // the requested range (the registry's current default is
+                        // older than the requested floor, say). Deterministic and
+                        // independent of order, so it stays a finding.
                         if seen.insert(format!(
                             "unresolved:{}:{}",
                             package.ecosystem as u8, package.name
@@ -151,16 +155,57 @@ pub fn enrich_command(
                                 severity: Severity::Medium,
                                 title: "Version constraint could not be verified".to_string(),
                                 description: format!(
-                                    "Package '{}' is requested with version constraint '{}' that \
-                                     tirith could not resolve to a concrete, constraint-satisfying \
-                                     version; OSV/KEV correlation was NOT performed against a \
-                                     substituted default version.",
+                                    "Package '{}' is requested with version constraint '{}', and \
+                                     the registry's concrete default version does not satisfy it, \
+                                     so OSV/KEV correlation could not be performed against a \
+                                     constraint-satisfying version.",
                                     package.name, raw
                                 ),
                                 evidence: vec![Evidence::ThreatIntel {
                                     source: "version-resolution".to_string(),
                                     threat_type: "unresolved_constraint".to_string(),
                                     confidence: Confidence::Medium,
+                                    reference: None,
+                                }],
+                                human_view: None,
+                                agent_view: None,
+                                mitre_id: None,
+                                custom_rule_id: None,
+                            });
+                        }
+                        None
+                    } else {
+                        // Resolution did not complete (the shared deadline was
+                        // spent on earlier packages, the network was down, or the
+                        // registry stayed silent). This is not evidence of a
+                        // threat and must not be labelled as a malicious package
+                        // nor block the command; it is an honest "could not
+                        // verify this constraint within the budget". Kept at the
+                        // same Medium severity the old finding used, so the
+                        // action is unchanged, but the framing no longer implies
+                        // the package is malicious.
+                        if seen.insert(format!(
+                            "unverified:{}:{}",
+                            package.ecosystem as u8, package.name
+                        )) {
+                            findings.push(Finding {
+                                rule_id: RuleId::AnalysisIncomplete,
+                                severity: Severity::Medium,
+                                title: "Version constraint could not be verified within the budget"
+                                    .to_string(),
+                                description: format!(
+                                    "Package '{}' is requested with version constraint '{}', but \
+                                     tirith could not resolve it to a concrete version within the \
+                                     enrichment time budget, so OSV/KEV correlation was not \
+                                     performed for it. This is an incomplete check, not a threat \
+                                     signal; run the install for this package on its own to have \
+                                     it fully assessed.",
+                                    package.name, raw
+                                ),
+                                evidence: vec![Evidence::ThreatIntel {
+                                    source: "version-resolution".to_string(),
+                                    threat_type: "resolution_incomplete".to_string(),
+                                    confidence: Confidence::Low,
                                     reference: None,
                                 }],
                                 human_view: None,

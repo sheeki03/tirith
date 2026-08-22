@@ -237,6 +237,16 @@ impl IsolatedEnv {
             .join(format!("{}.execution", self.session_id()))
     }
 
+    /// Session record written by `session_warnings`. This is where a deletion
+    /// OBSERVATION lands (`typed_events`), which is a different store from the
+    /// execution ledger above: correlation rules such as `MassFileDeletion` read
+    /// this ring, not the receipt ledger.
+    pub fn session_record_path(&self) -> PathBuf {
+        self.state_home
+            .join("tirith/sessions")
+            .join(format!("{}.json", self.session_id()))
+    }
+
     /// Path to the persisted bash safe-mode flag (the hook writes it on enter-mode
     /// degrade, so a test can assert a visible degrade also persisted).
     pub fn bash_safe_mode_flag(&self) -> PathBuf {

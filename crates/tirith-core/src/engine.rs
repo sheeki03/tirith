@@ -691,6 +691,10 @@ pub struct OutputAnalyzerState {
     /// ordered stream. This is a boolean only: neither raw bytes, a prefix, nor a
     /// stable digest enter public Debug or the resulting finding.
     supported_secret_seen: bool,
+    /// A supported-secret scan exhausted one of its bounded safety budgets. Keep
+    /// this separate from `supported_secret_seen`: incomplete analysis is not
+    /// evidence that a credential was present.
+    supported_secret_analysis_incomplete: bool,
 }
 
 impl std::fmt::Debug for OutputAnalyzerState {
@@ -703,6 +707,10 @@ impl std::fmt::Debug for OutputAnalyzerState {
                 &self.accumulated_chunk_findings.len(),
             )
             .field("supported_secret_seen", &self.supported_secret_seen)
+            .field(
+                "supported_secret_analysis_incomplete",
+                &self.supported_secret_analysis_incomplete,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -721,6 +729,13 @@ impl OutputAnalyzerState {
             extra_injection_seeds: extra,
             ..Default::default()
         }
+    }
+
+    /// Semantic stream context that the next chunk scan will revisit. MCP
+    /// callers use this to account the analyzer's real cumulative byte and
+    /// decode-candidate work without changing its record-boundary behavior.
+    pub(crate) fn semantic_tail(&self) -> &str {
+        &self.tail_text
     }
 
     /// Keep only the last `OUTPUT_TAIL_KEEP` bytes so a multi-GB stream stays bounded.
@@ -794,9 +809,10 @@ pub(crate) fn analyze_output_chunk_at(
     // other streaming rule. Consequently a key/mnemonic/token split across MCP
     // text items, JSON keys, or JSON leaves is detected without retaining any
     // secret-derived identifier in state.
-    if crate::redact::contains_supported_secret(scan_text) {
-        state.supported_secret_seen = true;
-    }
+    let supported_secret_analysis = crate::redact::analyze_supported_secrets(scan_text);
+    state.supported_secret_seen |= supported_secret_analysis.status.confirmed_secret;
+    state.supported_secret_analysis_incomplete |=
+        supported_secret_analysis.status.analysis_incomplete;
 
     // Code-reviewer Critical-1: scan prompt-injection per-chunk so seeds in the
     // EARLY part of a >32 KiB stream are caught (finalize only sees the last
@@ -867,6 +883,24 @@ pub fn analyze_output_finalize(state: &OutputAnalyzerState) -> Verdict {
 /// Like [`analyze_output_finalize`] but consumes the state mutably to finalize
 /// the byte-scanner's in-flight phase (the `tirith view` path).
 pub fn analyze_output_finalize_mut(state: &mut OutputAnalyzerState) -> Verdict {
+    analyze_output_finalize_mut_inner(state, true)
+}
+
+/// Finalize byte-scanner state without performing the semantic tail rescan.
+/// This is only for a caller that has already decided to fail closed because its
+/// final semantic-work budget is exhausted; it preserves EOF escape handling,
+/// fake-prompt detection, accumulated findings, and DLP while intentionally not
+/// claiming complete prompt/exfil analysis of the retained tail.
+pub(crate) fn analyze_output_finalize_mut_without_semantic_tail(
+    state: &mut OutputAnalyzerState,
+) -> Verdict {
+    analyze_output_finalize_mut_inner(state, false)
+}
+
+fn analyze_output_finalize_mut_inner(
+    state: &mut OutputAnalyzerState,
+    rescan_semantic_tail: bool,
+) -> Verdict {
     let start = Instant::now();
     // Finalize the byte-scanner FIRST: this flushes a trailing zero-width run
     // into the scan result (repo-0328) so `rules::output::check` below sees it,
@@ -876,6 +910,26 @@ pub fn analyze_output_finalize_mut(state: &mut OutputAnalyzerState) -> Verdict {
     // Fold in chunk-level findings evicted from `tail_text` before finalize.
     findings.append(&mut state.accumulated_chunk_findings);
     findings.extend(finalize_output_chunks(state));
+
+    if state.supported_secret_analysis_incomplete {
+        findings.push(crate::verdict::Finding {
+            rule_id: crate::verdict::RuleId::AnalysisIncomplete,
+            severity: crate::verdict::Severity::High,
+            title: "Supported-secret output analysis exceeded its safety budget".to_string(),
+            description: "The ordered output stream exceeded a bounded supported-secret analysis \
+                budget. Tirith blocks rather than treating the partially analyzed output as safe, \
+                and does not claim that a credential was confirmed."
+                .to_string(),
+            evidence: vec![crate::verdict::Evidence::Text {
+                detail: "supported_secret_analysis_incomplete=true;location=output_stream"
+                    .to_string(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
 
     if state.supported_secret_seen {
         findings.push(crate::verdict::Finding {
@@ -929,27 +983,29 @@ pub fn analyze_output_finalize_mut(state: &mut OutputAnalyzerState) -> Verdict {
         });
     }
 
-    // M7 ch5 — prompt-injection seeds on the captured tail (the output pipeline
-    // bypasses PATTERN_TABLE, so this is unconditionally reachable). Dedupe
-    // against `prompt_injection_seen`; the tail-scan covers seeds straddling a
-    // chunk boundary. Also scans deobfuscated forms + policy seeds via `check_with`.
-    for f in
-        crate::rules::prompt_injection::check_with(&state.tail_text, &state.extra_injection_seeds)
-    {
-        let key = format!("{}:{}", f.rule_id, f.title);
-        if state.prompt_injection_seen.insert(key) {
-            findings.push(f);
+    if rescan_semantic_tail {
+        // M7 ch5 — prompt-injection seeds on the captured tail (the output
+        // pipeline bypasses PATTERN_TABLE, so this is unconditionally
+        // reachable). Prefix eviction can make an anchored/boundary regex true
+        // on the retained tail even when it was false on the last full overlap,
+        // so a complete caller must retain this pass.
+        for f in crate::rules::prompt_injection::check_with(
+            &state.tail_text,
+            &state.extra_injection_seeds,
+        ) {
+            let key = format!("{}:{}", f.rule_id, f.title);
+            if state.prompt_injection_seen.insert(key) {
+                findings.push(f);
+            }
         }
-    }
 
-    // C7 — output-side data-exfiltration scan on the captured tail (the output
-    // pipeline bypasses PATTERN_TABLE, so this is unconditionally reachable).
-    // Shares the `prompt_injection_seen` dedup; the tail-scan covers a vector
-    // straddling a chunk boundary.
-    for f in crate::rules::exfil::check(&state.tail_text) {
-        let key = format!("{}:{}", f.rule_id, f.title);
-        if state.prompt_injection_seen.insert(key) {
-            findings.push(f);
+        // C7 — output-side data-exfiltration scan on the captured tail. Shares
+        // the prompt-injection dedup.
+        for f in crate::rules::exfil::check(&state.tail_text) {
+            let key = format!("{}:{}", f.rule_id, f.title);
+            if state.prompt_injection_seen.insert(key) {
+                findings.push(f);
+            }
         }
     }
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -8138,6 +8194,34 @@ mod tests {
             assert!(!projection.contains(&secret), "{projection}");
             assert!(!projection.contains(&secret[..18]), "{projection}");
         }
+    }
+
+    #[test]
+    fn output_dlp_distinguishes_bip39_exhaustion_from_a_confirmed_mnemonic() {
+        let hostile =
+            "abandon ".repeat(crate::sensitive_assets::MAX_BIP39_CHECKSUM_CANDIDATES / 5 + 64);
+        let incomplete = analyze_output(&hostile, OutputContext::default());
+        assert_eq!(incomplete.action, crate::verdict::Action::Block);
+        assert!(incomplete
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete));
+        assert!(incomplete
+            .findings
+            .iter()
+            .all(|finding| finding.rule_id != crate::verdict::RuleId::CredentialInText));
+
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let confirmed = analyze_output(mnemonic, OutputContext::default());
+        assert_eq!(confirmed.action, crate::verdict::Action::Block);
+        assert!(confirmed
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::CredentialInText));
+        assert!(confirmed
+            .findings
+            .iter()
+            .all(|finding| finding.rule_id != crate::verdict::RuleId::AnalysisIncomplete));
     }
 
     #[test]

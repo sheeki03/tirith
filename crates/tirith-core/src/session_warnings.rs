@@ -574,6 +574,9 @@ impl<'de> Deserialize<'de> for SessionWarnings {
             (event.sequence != 0 && !typed_sequences.insert(event.sequence))
                 || (!event.event_id.is_empty() && !typed_ids.insert(event.event_id.clone()))
         });
+        if duplicate_typed_identity {
+            return Err(D::Error::custom("duplicate typed event identity"));
+        }
         if wire.session_id.is_empty()
             || wire.session_id.len() > 128
             || wire.session_start.len() > MAX_TIMESTAMP_BYTES
@@ -587,7 +590,6 @@ impl<'de> Deserialize<'de> for SessionWarnings {
                     || value.len() > MAX_COOLDOWN_VALUE_BYTES
             })
             || wire.typed_events.len() > MAX_TYPED_EVENTS
-            || duplicate_typed_identity
             || wire.surfaced_correlations.len() > MAX_SURFACED_CORRELATIONS
             || wire.surfaced_correlations.iter().any(|signature| {
                 signature.is_empty() || signature.len() > MAX_CORRELATION_SIGNATURE_BYTES
@@ -647,10 +649,15 @@ macro_rules! privacy_projected_event_traits {
             where
                 D: Deserializer<'de>,
             {
-                let event = Self::from(<$wire>::deserialize(deserializer)?);
-                $validate(&event).map_err(D::Error::custom)?;
-                let mut event = event;
+                let mut event = Self::from(<$wire>::deserialize(deserializer)?);
+                // Older Tirith versions could persist values beyond today's
+                // public bounds. Apply the same privacy/bounds projection used
+                // by every output boundary before validating, so one safely
+                // recoverable legacy field cannot discard the entire session.
+                // Irrecoverable semantics (for example a control-only rule id)
+                // still fail validation after projection.
                 $project(&mut event);
+                $validate(&event).map_err(D::Error::custom)?;
                 Ok(event)
             }
         }
@@ -1958,6 +1965,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_overlong_event_fields_are_projected_without_losing_session_history() {
+        let overlong_domain = format!("{}.example", "a".repeat(MAX_DOMAIN_BYTES + 80));
+        let decoded: SessionWarnings = serde_json::from_value(serde_json::json!({
+            "session_id": "legacy-bounds",
+            "session_start": "2026-01-01T00:00:00Z",
+            "total_warnings": 2,
+            "events": [
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "rule_id": "shortened_url",
+                    "severity": "medium",
+                    "title": "legacy title",
+                    "command_redacted": "curl example.invalid",
+                    "domains": [overlong_domain]
+                },
+                {
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "rule_id": "plain_http",
+                    "severity": "low",
+                    "title": "still present",
+                    "command_redacted": "curl http://example.invalid",
+                    "domains": ["example.invalid"]
+                }
+            ]
+        }))
+        .expect("recoverable legacy fields must be projected, not reject the session");
+
+        assert_eq!(decoded.total_warnings, 2);
+        assert_eq!(decoded.events.len(), 2, "valid history must survive");
+        assert!(decoded.events[0].domains[0].len() <= MAX_DOMAIN_BYTES);
+        assert_eq!(decoded.events[1].domains, vec!["example.invalid"]);
+    }
+
+    #[test]
     fn session_public_traits_project_full_graph_and_preserve_categories() {
         use crate::event_buffer::{EventKind, TypedEvent, MANIFEST_FLAG_KEY};
 
@@ -2063,6 +2104,76 @@ mod tests {
             Some("true")
         );
         assert!(decoded.surfaced_correlations.is_empty());
+    }
+
+    #[test]
+    fn multiple_privacy_projected_typed_events_migrate_before_duplicate_rejection() {
+        let canary_a = format!("ghp_canary_{}", "A".repeat(30));
+        let canary_b = format!("ghp_canary_{}", "B".repeat(30));
+        let decoded: SessionWarnings = serde_json::from_value(serde_json::json!({
+            "session_id": "legacy-two-projected-events",
+            "session_start": "2026-01-01T00:00:00Z",
+            "total_warnings": 0,
+            "events": [],
+            "typed_events": [
+                {
+                    "event_id": format!("first-{canary_a}"),
+                    "sequence": 1,
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "kind": "file_write",
+                    "rule_id": format!("write-{canary_a}"),
+                    "metadata": {"path": format!("/wallets/{canary_a}/one")},
+                },
+                {
+                    "event_id": format!("second-{canary_b}"),
+                    "sequence": 2,
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "kind": "network",
+                    "rule_id": format!("network-{canary_b}"),
+                    "metadata": {"host": format!("https://user:{canary_b}@rpc.example/private")},
+                }
+            ],
+            "next_typed_event_sequence": 3,
+        }))
+        .expect("independently projected legacy events must migrate by sequence");
+
+        assert_eq!(decoded.typed_events.len(), 2);
+        assert_eq!(decoded.typed_events[0].event_id, "legacy-event-1");
+        assert_eq!(decoded.typed_events[1].event_id, "legacy-event-2");
+        assert_ne!(
+            decoded.typed_events[0].event_id,
+            decoded.typed_events[1].event_id
+        );
+        let reserialized = serde_json::to_string(&decoded).expect("reserialize migrated session");
+        assert!(!reserialized.contains(&canary_a));
+        assert!(!reserialized.contains(&canary_b));
+    }
+
+    #[test]
+    fn unchanged_duplicate_typed_event_ids_are_still_rejected() {
+        let duplicate = serde_json::json!({
+            "event_id": "same-public-id",
+            "sequence": 1,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "kind": "network",
+            "rule_id": "network_egress",
+            "metadata": {},
+        });
+        let mut second = duplicate.clone();
+        second["sequence"] = serde_json::json!(2);
+        let error = serde_json::from_value::<SessionWarnings>(serde_json::json!({
+            "session_id": "duplicate-public-identities",
+            "session_start": "2026-01-01T00:00:00Z",
+            "total_warnings": 0,
+            "events": [],
+            "typed_events": [duplicate, second],
+            "next_typed_event_sequence": 3,
+        }))
+        .expect_err("unchanged duplicate event IDs must remain invalid");
+        assert!(
+            error.to_string().contains("duplicate typed event identity"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]

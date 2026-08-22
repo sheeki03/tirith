@@ -2,11 +2,10 @@
 //! adds an independent, structurally exact Tirith `postCreateCommand` plus
 //! `TIRITH_DEVCONTAINER=1` in `containerEnv`.
 //!
-//! JSONC support is best-effort, not complete (no single-quoted strings,
-//! unquoted keys, or Unicode-escape edge cases): we strip line/block comments
-//! and trailing commas string-aware, then parse with `serde_json`. Comments
-//! inside the file do NOT survive the rewrite (we re-emit via
-//! `to_string_pretty`); untouched fields keep their values but lose formatting.
+//! Existing JSONC is edited by byte span: line/block comments, trailing commas,
+//! line endings, and unrelated formatting survive unchanged. The effective
+//! document is still validated as strict JSON after masking JSONC extensions,
+//! and ambiguous duplicate managed keys are rejected instead of guessed at.
 
 use std::path::{Path, PathBuf};
 
@@ -154,24 +153,16 @@ pub fn inject_tirith_hook(path: &Path, root: &Path, create_if_missing: bool) -> 
         }
     };
 
-    let stripped = strip_jsonc_comments(&content_str);
-    let mut value: Value = match serde_json::from_str(&stripped) {
-        Ok(v) => v,
-        Err(e) => {
-            return InjectOutcome::ParseError(path.to_path_buf(), format!("parse error: {e}"));
-        }
+    let rendered = match render_tirith_hook_jsonc(&content_str) {
+        Ok(Some(rendered)) => rendered,
+        Ok(None) => return InjectOutcome::AlreadyInjected(path.to_path_buf()),
+        Err(error) => return InjectOutcome::ParseError(path.to_path_buf(), error),
     };
 
-    if has_tirith_marker(&value) && has_env_flag(&value) {
-        return InjectOutcome::AlreadyInjected(path.to_path_buf());
-    }
-
-    if let Err(message) = upsert_post_create(&mut value) {
-        return InjectOutcome::ParseError(path.to_path_buf(), message.to_string());
-    }
-    upsert_container_env_flag(&mut value);
-
-    match write_pretty(&prepared, &value) {
+    match prepared
+        .write_atomic_if_observed(rendered.as_bytes(), true)
+        .map_err(|error| format!("atomic write: {error}"))
+    {
         Ok(()) => InjectOutcome::Updated(path.to_path_buf()),
         Err(e) => InjectOutcome::ParseError(path.to_path_buf(), e),
     }
@@ -225,85 +216,491 @@ pub fn ensure_gitignore_entry(cwd: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-fn has_tirith_marker(value: &Value) -> bool {
-    value
-        .get("postCreateCommand")
-        .and_then(Value::as_object)
-        .and_then(|commands| commands.get(TIRITH_HOOK_KEY))
-        == Some(&tirith_hook_value())
-}
-
-fn has_env_flag(value: &Value) -> bool {
-    value
-        .get("containerEnv")
-        .and_then(|v| v.as_object())
-        .and_then(|m| m.get("TIRITH_DEVCONTAINER"))
-        .and_then(|v| v.as_str())
-        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 fn tirith_hook_value() -> Value {
     json!(TIRITH_HOOK_ARGV)
 }
 
-fn preserve_managed_key_collision(commands: &mut serde_json::Map<String, Value>) {
-    let Some(existing) = commands.remove(TIRITH_HOOK_KEY) else {
-        return;
+#[derive(Debug, Clone)]
+struct JsoncMember {
+    key: String,
+    key_start: usize,
+    key_end: usize,
+    value_start: usize,
+    value_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct JsoncObject {
+    close: usize,
+    members: Vec<JsoncMember>,
+    trailing_comma: bool,
+}
+
+#[derive(Debug)]
+struct JsoncDocument {
+    masked: Vec<u8>,
+    strict: Vec<u8>,
+    root: JsoncObject,
+}
+
+impl JsoncDocument {
+    fn parse(input: &str) -> Result<Self, String> {
+        let masked = mask_jsonc_comments(input)?;
+        let mut strict = masked.clone();
+        mask_jsonc_trailing_commas(&mut strict);
+        let strict_text = std::str::from_utf8(&strict)
+            .map_err(|_| "devcontainer.json is not valid UTF-8".to_string())?;
+        let value: Value =
+            serde_json::from_str(strict_text).map_err(|error| format!("parse error: {error}"))?;
+        if !value.is_object() {
+            return Err("devcontainer.json root must be an object".to_string());
+        }
+
+        let root_start = skip_jsonc_whitespace(&masked, 0);
+        if masked.get(root_start) != Some(&b'{') {
+            return Err("devcontainer.json root must be an object".to_string());
+        }
+        let root = parse_jsonc_object(&masked, root_start)?;
+        if skip_jsonc_whitespace(&masked, root.close + 1) != masked.len() {
+            return Err("devcontainer.json has content after the root object".to_string());
+        }
+        Ok(Self {
+            masked,
+            strict,
+            root,
+        })
+    }
+
+    fn unique_member<'a>(
+        &'a self,
+        object: &'a JsoncObject,
+        key: &str,
+    ) -> Result<Option<&'a JsoncMember>, String> {
+        let mut matches = object.members.iter().filter(|member| member.key == key);
+        let first = matches.next();
+        if matches.next().is_some() {
+            return Err(format!(
+                "devcontainer.json contains duplicate managed key `{key}`"
+            ));
+        }
+        Ok(first)
+    }
+
+    fn value(&self, member: &JsoncMember) -> Result<Value, String> {
+        serde_json::from_slice(&self.strict[member.value_start..member.value_end])
+            .map_err(|error| format!("parse `{}`: {error}", member.key))
+    }
+
+    fn object_value(&self, member: &JsoncMember) -> Result<JsoncObject, String> {
+        let object = parse_jsonc_object(&self.masked, member.value_start)?;
+        if object.close + 1 != member.value_end {
+            return Err(format!("`{}` must be a JSON object", member.key));
+        }
+        Ok(object)
+    }
+}
+
+/// Render the Tirith lifecycle hook into an existing JSONC document while
+/// preserving every byte outside the managed key/value spans. `Ok(None)` means
+/// the effective exact hook and environment marker were already installed.
+pub fn render_tirith_hook_jsonc(input: &str) -> Result<Option<String>, String> {
+    let mut rendered = input.to_string();
+    let mut changed = false;
+
+    if let Some(updated) = render_post_create_command(&rendered)? {
+        rendered = updated;
+        changed = true;
+    }
+    if let Some(updated) = render_container_env(&rendered)? {
+        rendered = updated;
+        changed = true;
+    }
+
+    let effective = JsoncDocument::parse(&rendered)?;
+    let root: Value = serde_json::from_slice(&effective.strict)
+        .map_err(|error| format!("parse generated devcontainer.json: {error}"))?;
+    if root
+        .get("postCreateCommand")
+        .and_then(Value::as_object)
+        .and_then(|commands| commands.get(TIRITH_HOOK_KEY))
+        != Some(&tirith_hook_value())
+        || !root
+            .get("containerEnv")
+            .and_then(Value::as_object)
+            .and_then(|environment| environment.get("TIRITH_DEVCONTAINER"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        return Err("generated devcontainer.json failed Tirith hook validation".to_string());
+    }
+
+    Ok(changed.then_some(rendered))
+}
+
+fn render_post_create_command(input: &str) -> Result<Option<String>, String> {
+    let document = JsoncDocument::parse(input)?;
+    let Some(member) = document.unique_member(&document.root, "postCreateCommand")? else {
+        return Ok(Some(insert_jsonc_object_member(
+            input,
+            &document.root,
+            "postCreateCommand",
+            &managed_post_create_object(),
+        )));
     };
-    let mut suffix = 0usize;
+    let value = document.value(member)?;
+    match value {
+        Value::Object(_) => {
+            let commands = document.object_value(member)?;
+            let existing = document.unique_member(&commands, TIRITH_HOOK_KEY)?;
+            if let Some(existing) = existing {
+                if document.value(existing)? == tirith_hook_value() {
+                    return Ok(None);
+                }
+
+                let keys: std::collections::HashSet<&str> = commands
+                    .members
+                    .iter()
+                    .map(|entry| entry.key.as_str())
+                    .collect();
+                let mut suffix = 0usize;
+                let preserved_key = loop {
+                    let candidate = if suffix == 0 {
+                        format!("{TIRITH_HOOK_KEY}-existing")
+                    } else {
+                        format!("{TIRITH_HOOK_KEY}-existing-{suffix}")
+                    };
+                    if !keys.contains(candidate.as_str()) {
+                        break candidate;
+                    }
+                    suffix = suffix.saturating_add(1);
+                };
+                let mut renamed = input.to_string();
+                renamed.replace_range(
+                    existing.key_start..existing.key_end,
+                    &serde_json::to_string(&preserved_key)
+                        .map_err(|error| format!("serialize preserved hook key: {error}"))?,
+                );
+                return render_post_create_command(&renamed)
+                    .map(|next| Some(next.unwrap_or(renamed)));
+            }
+
+            Ok(Some(insert_jsonc_object_member(
+                input,
+                &commands,
+                TIRITH_HOOK_KEY,
+                r#"["tirith", "init", "--shell", "auto"]"#,
+            )))
+        }
+        Value::String(_) | Value::Array(_) => {
+            let raw_existing = &input[member.value_start..member.value_end];
+            let property_indent = line_indent(input, member.key_start);
+            let child_indent = format!("{property_indent}  ");
+            let newline = preferred_newline(input);
+            let replacement = format!(
+                "{{{newline}{child_indent}\"existing\": {raw_existing},{newline}{child_indent}\"{TIRITH_HOOK_KEY}\": [\"tirith\", \"init\", \"--shell\", \"auto\"]{newline}{property_indent}}}"
+            );
+            let mut output = input.to_string();
+            output.replace_range(member.value_start..member.value_end, &replacement);
+            Ok(Some(output))
+        }
+        Value::Null => {
+            let mut output = input.to_string();
+            output.replace_range(
+                member.value_start..member.value_end,
+                &managed_post_create_object(),
+            );
+            Ok(Some(output))
+        }
+        _ => Err("postCreateCommand must be a string, array, object, or null".to_string()),
+    }
+}
+
+fn render_container_env(input: &str) -> Result<Option<String>, String> {
+    let document = JsoncDocument::parse(input)?;
+    let Some(member) = document.unique_member(&document.root, "containerEnv")? else {
+        return Ok(Some(insert_jsonc_object_member(
+            input,
+            &document.root,
+            "containerEnv",
+            r#"{"TIRITH_DEVCONTAINER": "1"}"#,
+        )));
+    };
+    match document.value(member)? {
+        Value::Object(_) => {
+            let environment = document.object_value(member)?;
+            match document.unique_member(&environment, "TIRITH_DEVCONTAINER")? {
+                Some(flag)
+                    if document.value(flag)?.as_str().is_some_and(|value| {
+                        value == "1" || value.eq_ignore_ascii_case("true")
+                    }) =>
+                {
+                    Ok(None)
+                }
+                Some(flag) => {
+                    let mut output = input.to_string();
+                    output.replace_range(flag.value_start..flag.value_end, r#""1""#);
+                    Ok(Some(output))
+                }
+                None => Ok(Some(insert_jsonc_object_member(
+                    input,
+                    &environment,
+                    "TIRITH_DEVCONTAINER",
+                    r#""1""#,
+                ))),
+            }
+        }
+        Value::Null => {
+            let mut output = input.to_string();
+            output.replace_range(
+                member.value_start..member.value_end,
+                r#"{"TIRITH_DEVCONTAINER": "1"}"#,
+            );
+            Ok(Some(output))
+        }
+        _ => Err("containerEnv must be an object or null".to_string()),
+    }
+}
+
+fn managed_post_create_object() -> String {
+    format!(r#"{{"{TIRITH_HOOK_KEY}": ["tirith", "init", "--shell", "auto"]}}"#)
+}
+
+fn insert_jsonc_object_member(input: &str, object: &JsoncObject, key: &str, value: &str) -> String {
+    let newline = preferred_newline(input);
+    let close_indent = line_indent(input, object.close);
+    let member_indent = object
+        .members
+        .first()
+        .map(|member| line_indent(input, member.key_start))
+        .filter(|indent| indent.len() > close_indent.len())
+        .unwrap_or_else(|| format!("{close_indent}  "));
+
+    let mut output = input.to_string();
+    let mut close = object.close;
+    if !object.members.is_empty() && !object.trailing_comma {
+        let comma_at = object.members.last().expect("non-empty members").value_end;
+        output.insert(comma_at, ',');
+        if comma_at <= close {
+            close += 1;
+        }
+    }
+
+    let begins_new_line = output[..close].ends_with('\n');
+    let mut insertion = String::new();
+    if !begins_new_line {
+        insertion.push_str(newline);
+    }
+    insertion.push_str(&member_indent);
+    insertion.push_str(&serde_json::to_string(key).expect("JSON object key serialization"));
+    insertion.push_str(": ");
+    insertion.push_str(value);
+    insertion.push_str(newline);
+    insertion.push_str(&close_indent);
+    output.insert_str(close, &insertion);
+    output
+}
+
+fn preferred_newline(input: &str) -> &'static str {
+    if input.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn line_indent(input: &str, position: usize) -> String {
+    let line_start = input[..position]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    input[line_start..position]
+        .chars()
+        .take_while(|character| matches!(character, ' ' | '\t' | '\r'))
+        .collect()
+}
+
+fn mask_jsonc_comments(input: &str) -> Result<Vec<u8>, String> {
+    let bytes = input.as_bytes();
+    let mut masked = bytes.to_vec();
+    if masked.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        masked[..3].fill(b' ');
+    }
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index = json_string_end(bytes, index)?;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                let start = index;
+                index += 2;
+                while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
+                    index += 1;
+                }
+                for byte in &mut masked[start..index] {
+                    if *byte != b'\r' {
+                        *byte = b' ';
+                    }
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let start = index;
+                index += 2;
+                while bytes.get(index..index + 2) != Some(b"*/") {
+                    if index >= bytes.len() {
+                        return Err("unterminated block comment in devcontainer.json".to_string());
+                    }
+                    index += 1;
+                }
+                index += 2;
+                for byte in &mut masked[start..index] {
+                    if !matches!(*byte, b'\n' | b'\r') {
+                        *byte = b' ';
+                    }
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(masked)
+}
+
+fn mask_jsonc_trailing_commas(bytes: &mut [u8]) {
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index = json_string_end(bytes, index).unwrap_or(bytes.len());
+            }
+            b',' => {
+                let after = skip_jsonc_whitespace(bytes, index + 1);
+                if bytes
+                    .get(after)
+                    .is_some_and(|byte| matches!(*byte, b'}' | b']'))
+                {
+                    bytes[index] = b' ';
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+}
+
+fn parse_jsonc_object(bytes: &[u8], start: usize) -> Result<JsoncObject, String> {
+    if bytes.get(start) != Some(&b'{') {
+        return Err("expected JSON object".to_string());
+    }
+    let mut members = Vec::new();
+    let mut index = skip_jsonc_whitespace(bytes, start + 1);
+    let mut trailing_comma = false;
     loop {
-        let candidate = if suffix == 0 {
-            format!("{TIRITH_HOOK_KEY}-existing")
-        } else {
-            format!("{TIRITH_HOOK_KEY}-existing-{suffix}")
-        };
-        if !commands.contains_key(&candidate) {
-            commands.insert(candidate, existing);
-            return;
+        if bytes.get(index) == Some(&b'}') {
+            return Ok(JsoncObject {
+                close: index,
+                members,
+                trailing_comma,
+            });
         }
-        suffix = suffix.saturating_add(1);
+        if bytes.get(index) != Some(&b'"') {
+            return Err("JSONC object keys must be double-quoted strings".to_string());
+        }
+        let key_start = index;
+        let key_end = json_string_end(bytes, key_start)?;
+        let key: String = serde_json::from_slice(&bytes[key_start..key_end])
+            .map_err(|error| format!("invalid JSONC object key: {error}"))?;
+        index = skip_jsonc_whitespace(bytes, key_end);
+        if bytes.get(index) != Some(&b':') {
+            return Err(format!("missing colon after JSONC key `{key}`"));
+        }
+        let value_start = skip_jsonc_whitespace(bytes, index + 1);
+        let value_end = skip_jsonc_value(bytes, value_start)?;
+        members.push(JsoncMember {
+            key,
+            key_start,
+            key_end,
+            value_start,
+            value_end,
+        });
+        index = skip_jsonc_whitespace(bytes, value_end);
+        match bytes.get(index) {
+            Some(b',') => {
+                index = skip_jsonc_whitespace(bytes, index + 1);
+                trailing_comma = bytes.get(index) == Some(&b'}');
+            }
+            Some(b'}') => {
+                trailing_comma = false;
+            }
+            _ => return Err("expected comma or object close in JSONC".to_string()),
+        }
     }
 }
 
-fn upsert_post_create(value: &mut Value) -> Result<(), &'static str> {
-    let obj = value
-        .as_object_mut()
-        .ok_or("devcontainer.json root must be an object")?;
-    let existing = obj.remove("postCreateCommand");
-    let mut commands = match existing {
-        Some(Value::Object(commands)) => commands,
-        Some(existing @ (Value::String(_) | Value::Array(_))) => {
-            let mut commands = serde_json::Map::new();
-            commands.insert("existing".to_string(), existing);
-            commands
+fn skip_jsonc_value(bytes: &[u8], start: usize) -> Result<usize, String> {
+    match bytes.get(start) {
+        Some(b'"') => json_string_end(bytes, start),
+        Some(b'{') => Ok(parse_jsonc_object(bytes, start)?.close + 1),
+        Some(b'[') => {
+            let mut index = skip_jsonc_whitespace(bytes, start + 1);
+            if bytes.get(index) == Some(&b']') {
+                return Ok(index + 1);
+            }
+            loop {
+                index = skip_jsonc_value(bytes, index)?;
+                index = skip_jsonc_whitespace(bytes, index);
+                match bytes.get(index) {
+                    Some(b',') => {
+                        index = skip_jsonc_whitespace(bytes, index + 1);
+                        if bytes.get(index) == Some(&b']') {
+                            return Ok(index + 1);
+                        }
+                    }
+                    Some(b']') => return Ok(index + 1),
+                    _ => return Err("expected comma or array close in JSONC".to_string()),
+                }
+            }
         }
-        Some(Value::Null) | None => serde_json::Map::new(),
-        Some(_) => return Err("postCreateCommand must be a string, array, or object"),
-    };
-
-    if commands.get(TIRITH_HOOK_KEY) != Some(&tirith_hook_value()) {
-        preserve_managed_key_collision(&mut commands);
-        commands.insert(TIRITH_HOOK_KEY.to_string(), tirith_hook_value());
+        Some(_) => {
+            let mut index = start;
+            while bytes.get(index).is_some_and(|byte| {
+                !byte.is_ascii_whitespace() && !matches!(*byte, b',' | b'}' | b']')
+            }) {
+                index += 1;
+            }
+            if index == start {
+                Err("missing JSONC value".to_string())
+            } else {
+                Ok(index)
+            }
+        }
+        None => Err("missing JSONC value".to_string()),
     }
-    obj.insert("postCreateCommand".to_string(), Value::Object(commands));
-    Ok(())
 }
 
-fn upsert_container_env_flag(value: &mut Value) {
-    let obj = match value.as_object_mut() {
-        Some(o) => o,
-        None => return,
-    };
-    let env = obj
-        .entry("containerEnv".to_string())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    if let Some(env_obj) = env.as_object_mut() {
-        env_obj.insert(
-            "TIRITH_DEVCONTAINER".to_string(),
-            Value::String("1".to_string()),
-        );
+fn json_string_end(bytes: &[u8], start: usize) -> Result<usize, String> {
+    if bytes.get(start) != Some(&b'"') {
+        return Err("expected JSON string".to_string());
     }
+    let mut index = start + 1;
+    let mut escaped = false;
+    while let Some(byte) = bytes.get(index).copied() {
+        index += 1;
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return Ok(index);
+        }
+    }
+    Err("unterminated string in devcontainer.json".to_string())
+}
+
+fn skip_jsonc_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    index
 }
 
 fn write_pretty(prepared: &ContainedAtomicFile, value: &Value) -> Result<(), String> {
@@ -523,7 +920,7 @@ mod tests {
 
     fn read_devcontainer(path: &Path) -> Value {
         let body = std::fs::read_to_string(path).unwrap();
-        serde_json::from_str(&body).unwrap()
+        serde_json::from_str(&strip_jsonc_comments(&body)).unwrap()
     }
 
     fn assert_exact_tirith_lifecycle_entry(value: &Value) {
@@ -624,6 +1021,95 @@ mod tests {
             json!(["npm", "ci"])
         );
         assert_eq!(value["postCreateCommand"]["notice"], "echo ready");
+    }
+
+    #[test]
+    fn jsonc_render_preserves_comments_trailing_commas_crlf_and_urls() {
+        let input = concat!(
+            "{\r\n",
+            "  // root comment\r\n",
+            "  \"url\": \"https://example.test/a//b\", // URL comment\r\n",
+            "  \"postCreateCommand\": [\r\n",
+            "    \"npm\", /* array comment */\r\n",
+            "    \"ci\",\r\n",
+            "  ],\r\n",
+            "  \"containerEnv\": {\r\n",
+            "    // environment comment\r\n",
+            "    \"EXISTING\": \"yes\",\r\n",
+            "  },\r\n",
+            "  // closing comment\r\n",
+            "}\r\n",
+        );
+
+        let rendered = render_tirith_hook_jsonc(input)
+            .expect("valid JSONC")
+            .expect("hook is missing");
+        for preserved in [
+            "// root comment",
+            "https://example.test/a//b",
+            "// URL comment",
+            "/* array comment */",
+            "// environment comment",
+            "// closing comment",
+        ] {
+            assert!(rendered.contains(preserved), "lost `{preserved}`");
+        }
+        assert!(rendered.contains("\r\n"));
+        assert!(!rendered.replace("\r\n", "").contains('\n'));
+
+        let effective: Value = serde_json::from_str(&strip_jsonc_comments(&rendered)).unwrap();
+        assert_eq!(
+            effective["postCreateCommand"]["existing"],
+            json!(["npm", "ci"])
+        );
+        assert_exact_tirith_lifecycle_entry(&effective);
+        assert_eq!(effective["containerEnv"]["EXISTING"], "yes");
+        assert_eq!(effective["containerEnv"]["TIRITH_DEVCONTAINER"], "1");
+        assert_eq!(
+            render_tirith_hook_jsonc(&rendered).unwrap(),
+            None,
+            "second render must be byte-preserving"
+        );
+    }
+
+    #[test]
+    fn jsonc_render_preserves_conflicting_managed_entry_under_unique_key() {
+        let input = r#"{
+  "postCreateCommand": {
+    // keep the user command and its comment
+    "tirith-init": ["echo", "not tirith"],
+    "tirith-init-existing": "occupied",
+  },
+  "containerEnv": null,
+}"#;
+        let rendered = render_tirith_hook_jsonc(input).unwrap().unwrap();
+        assert!(rendered.contains("// keep the user command and its comment"));
+        let effective: Value = serde_json::from_str(&strip_jsonc_comments(&rendered)).unwrap();
+        assert_eq!(
+            effective["postCreateCommand"]["tirith-init-existing-1"],
+            json!(["echo", "not tirith"])
+        );
+        assert_eq!(
+            effective["postCreateCommand"]["tirith-init-existing"],
+            "occupied"
+        );
+        assert_exact_tirith_lifecycle_entry(&effective);
+        assert_eq!(effective["containerEnv"]["TIRITH_DEVCONTAINER"], "1");
+    }
+
+    #[test]
+    fn jsonc_render_rejects_ambiguous_or_incompatible_managed_fields() {
+        for input in [
+            r#"{"postCreateCommand": null, "postCreate\u0043ommand": null}"#,
+            r#"{"postCreateCommand": 42}"#,
+            r#"{"containerEnv": ["not", "an", "object"]}"#,
+            r#"{/* unterminated"#,
+        ] {
+            assert!(
+                render_tirith_hook_jsonc(input).is_err(),
+                "unsafe document unexpectedly accepted: {input}"
+            );
+        }
     }
 
     #[test]

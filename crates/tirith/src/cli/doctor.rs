@@ -368,6 +368,72 @@ fn detect_ai_tools_with(
         });
     }
 
+    // Hosts where setup installs a Tirith-owned BLOCKING hook. `configured_scope`
+    // here means what it means for copilot-cli and kiro: Tirith is actually
+    // wired in. So each artifact is checked for CONTENT, not merely presence: a
+    // guard that still carries its placeholders, a `hooks.json` with no Tirith
+    // entry, or a wrapper that lost its executable bit would all exist and all
+    // do nothing. Paths follow the same resolution the installers use, and for
+    // OpenHands the same two locations its SDK searches.
+    let openhands_work_dir = match std::env::var_os("OPENHANDS_WORK_DIR") {
+        Some(value) if !value.is_empty() => Some(std::path::PathBuf::from(value)),
+        _ => cwd.map(std::path::Path::to_path_buf),
+    };
+    let grok_repo_root = tirith_core::policy::find_repo_root(None);
+    // (name, user artifact, project artifact). A host configured at both scopes
+    // reports ONE row, project first, the same precedence kiro uses below.
+    let hook_candidates: [(
+        &'static str,
+        Option<std::path::PathBuf>,
+        Option<std::path::PathBuf>,
+    ); 6] = [
+        (
+            "pi-cli",
+            Some(home.join(".pi/agent/extensions/tirith-guard.ts")),
+            None,
+        ),
+        (
+            "prime-agent",
+            Some(home.join(".prime/agent/extensions/tirith-guard.ts")),
+            None,
+        ),
+        (
+            "omp",
+            Some(home.join(".omp/agent/hooks/pre/tirith-guard.ts")),
+            None,
+        ),
+        ("cline", Some(cline_hook_artifact(home)), None),
+        (
+            "grok-build",
+            Some(home.join(".grok/hooks/tirith.json")),
+            grok_repo_root
+                .as_ref()
+                .map(|root| root.join(".grok/hooks/tirith.json")),
+        ),
+        (
+            "openhands",
+            Some(home.join(".openhands/hooks.json")),
+            openhands_work_dir
+                .as_ref()
+                .map(|dir| dir.join(".openhands/hooks.json")),
+        ),
+    ];
+    for (name, user_artifact, project_artifact) in hook_candidates {
+        if project_artifact.is_some_and(|path| hook_artifact_is_effective(name, &path)) {
+            tools.push(DetectedTool {
+                name,
+                configured_scope: Some("project"),
+            });
+            continue;
+        }
+        if user_artifact.is_some_and(|path| hook_artifact_is_effective(name, &path)) {
+            tools.push(DetectedTool {
+                name,
+                configured_scope: Some("user"),
+            });
+        }
+    }
+
     // Kiro: precedence-ordered, single winner.
     //   1. project configured
     //   2. user configured
@@ -402,6 +468,130 @@ fn detect_ai_tools_with(
     }
 
     tools
+}
+
+/// The Cline hook artifact for the current platform: `PreToolUse` (an executable
+/// wrapper) on POSIX, `PreToolUse.ps1` on Windows.
+fn cline_hook_artifact(home: &std::path::Path) -> std::path::PathBuf {
+    let dir = crate::cli::setup::cline_hooks_dir(home);
+    #[cfg(windows)]
+    {
+        dir.join("PreToolUse.ps1")
+    }
+    #[cfg(not(windows))]
+    {
+        dir.join("PreToolUse")
+    }
+}
+
+/// Whether a Tirith-owned hook artifact is installed in a form the host can
+/// load and that actually reaches Tirith. Presence alone proves neither.
+/// The Windows variant: no executable bit, and the Cline hook is a `.ps1` that
+/// must carry the protocol and the adapter reference.
+#[cfg(windows)]
+fn hook_artifact_is_effective(name: &str, path: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match name {
+        "pi-cli" | "prime-agent" | "omp" => {
+            content.contains("tool_call")
+                && content.contains("TIRITH_BIN")
+                && !content.contains("\"__TIRITH_BIN__\"")
+                && !content.contains("\"__TIRITH_INTEGRATION__\"")
+        }
+        "cline" => {
+            content.contains("TIRITH_HOOK_PROTOCOL = 'cline'")
+                && content.contains("tirith-check.py")
+                && !content.contains("__TIRITH_BIN__")
+                && !content.contains("__ADAPTER_PATH__")
+        }
+        "grok-build" => serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/hooks/PreToolUse/0/hooks/0/env/TIRITH_HOOK_PROTOCOL")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|protocol| protocol == "grok-build")
+            })
+            .unwrap_or(false),
+        // OpenHands hooks are POSIX-only (the wrapper is a #!/bin/sh script).
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn hook_artifact_is_effective(name: &str, path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let executable = || {
+        std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    match name {
+        // The shared Pi-family guard: a rendered copy names its host and its
+        // binary; a copy still carrying a placeholder was never substituted.
+        "pi-cli" | "prime-agent" | "omp" => {
+            content.contains("tool_call")
+                && content.contains("TIRITH_BIN")
+                && !content.contains("\"__TIRITH_BIN__\"")
+                && !content.contains("\"__TIRITH_INTEGRATION__\"")
+        }
+        // Cline runs the file directly, so it must be executable and must exec
+        // the adapter it was installed beside.
+        "cline" => executable() && content.contains("tirith-check.py") && content.contains("cline"),
+        // Grok's hook config must select the Grok wire protocol.
+        "grok-build" => serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/hooks/PreToolUse/0/hooks/0/env/TIRITH_HOOK_PROTOCOL")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|protocol| protocol == "grok-build")
+            })
+            .unwrap_or(false),
+        // OpenHands: a `pre_tool_use` entry whose command is the Tirith wrapper,
+        // and that wrapper must exist and be executable, since the host runs it
+        // through a shell and proceeds if it cannot.
+        "openhands" => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+                return false;
+            };
+            let Some(entries) = value
+                .get("pre_tool_use")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return false;
+            };
+            entries.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|hook| {
+                            hook.get("command")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|cmd| cmd.contains("tirith-pre-tool-use"))
+                                .map(|cmd| {
+                                    // The command is a single-quoted path; unquote it.
+                                    let unquoted =
+                                        cmd.trim().trim_matches('\'').replace("'\\''", "'");
+                                    std::fs::metadata(&unquoted)
+                                        .map(|meta| {
+                                            meta.is_file() && meta.permissions().mode() & 0o111 != 0
+                                        })
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+            })
+        }
+        _ => false,
+    }
 }
 
 fn bash_safe_mode_active() -> bool {
@@ -2621,8 +2811,18 @@ fn run_simulate_enter() -> i32 {
         println!("        be written — new shells will fall back to preexec until it can be.");
     } else {
         println!("tirith: bash will use preexec mode (warn-only). For blocking, set");
-        println!("        TIRITH_BASH_PREEXEC_ENFORCE=1 in a clean-history shell, or run");
-        println!("        tirith on a shell where enter-mode delivery works.");
+        println!("        TIRITH_BASH_PREEXEC_ENFORCE=1, or run tirith on a shell where");
+        println!("        enter-mode delivery works.");
+        println!();
+        println!("        Preexec enforcement needs to own the whole typed line, so it");
+        println!("        refuses at startup and says so when any of these hold:");
+        println!("          - HISTCONTROL/HISTIGNORE filter history (ignorespace,");
+        println!("            ignoredups, ignoreboth), or history is off");
+        println!("          - extdebug is already enabled outside tirith");
+        println!("          - PROMPT_COMMAND is readonly, associative, or otherwise");
+        println!("            cannot be bracketed");
+        println!("        It also drops to off mid-session if another tool takes over the");
+        println!("        DEBUG trap. Enter mode has none of these constraints.");
     }
     0
 }
@@ -2666,7 +2866,7 @@ fn reset_safe_mode() -> i32 {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::cli::test_harness::{with_fake_env, EnvGuard, ENV_LOCK};
+    use crate::cli::test_harness::{with_fake_env, CwdGuard, EnvGuard, ENV_LOCK};
 
     fn first_kiro(tools: &[DetectedTool]) -> Option<&DetectedTool> {
         tools.iter().find(|t| t.name == "kiro")
@@ -2702,6 +2902,164 @@ mod tests {
             "helper must not emit a hard-coded 'doctor:' prefix, got: {onboard_msg}"
         );
         assert!(onboard_msg.contains("cannot read profile /tmp/.zshrc: denied"));
+    }
+
+    /// A rendered Pi-family guard body, as setup writes it.
+    fn rendered_guard() -> &'static str {
+        "const TIRITH_BIN = \"/opt/tirith/bin/tirith\";\nconst TIRITH_INTEGRATION = \"omp\";\npi.on(\"tool_call\", () => {});\n"
+    }
+
+    fn write_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn detect_ai_tools_reports_installed_blocking_hooks() {
+        // `configured_scope: Some(..)` means Tirith is actually wired in, so the
+        // artifacts here are the real shapes setup writes, and the assertion
+        // below that a placeholder-bearing or unexecutable artifact is NOT
+        // reported is what keeps "exists" from being mistaken for "works".
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            for relative in [
+                ".pi/agent/extensions/tirith-guard.ts",
+                ".prime/agent/extensions/tirith-guard.ts",
+                ".omp/agent/hooks/pre/tirith-guard.ts",
+            ] {
+                let path = home.join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, rendered_guard()).unwrap();
+            }
+            let cline_wrapper = cline_hook_artifact(home);
+            write_executable(
+                &cline_wrapper,
+                "#!/bin/sh\nTIRITH_HOOK_PROTOCOL=cline exec python3 /x/tirith-check.py\n",
+            );
+
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            for name in ["pi-cli", "prime-agent", "omp", "cline"] {
+                let found = tools
+                    .iter()
+                    .find(|t| t.name == name)
+                    .unwrap_or_else(|| panic!("{name} hook not detected"));
+                assert_eq!(found.configured_scope, Some("user"), "{name}");
+                assert_eq!(count_named(&tools, name), 1, "{name} must appear once");
+            }
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_ignores_hook_artifacts_that_cannot_work() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            // A guard that was never substituted.
+            let guard = home.join(".omp/agent/hooks/pre/tirith-guard.ts");
+            std::fs::create_dir_all(guard.parent().unwrap()).unwrap();
+            std::fs::write(
+                &guard,
+                "const TIRITH_BIN = \"__TIRITH_BIN__\";\npi.on(\"tool_call\", () => {});\n",
+            )
+            .unwrap();
+            // A Cline wrapper with the right content and no executable bit.
+            let cline_wrapper = cline_hook_artifact(home);
+            std::fs::create_dir_all(cline_wrapper.parent().unwrap()).unwrap();
+            std::fs::write(
+                &cline_wrapper,
+                "#!/bin/sh\nexec python3 tirith-check.py cline\n",
+            )
+            .unwrap();
+            // An OpenHands hooks.json with no Tirith entry at all.
+            std::fs::create_dir_all(home.join(".openhands")).unwrap();
+            std::fs::write(home.join(".openhands/hooks.json"), "{\"stop\": []}").unwrap();
+
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            for name in ["omp", "cline", "openhands"] {
+                assert!(
+                    !tools.iter().any(|t| t.name == name),
+                    "{name} must not be reported as configured from an ineffective artifact"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_reports_openhands_hooks_at_both_scopes_project_first() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let _work_dir = EnvGuard::remove("OPENHANDS_WORK_DIR");
+            let install = |root: &std::path::Path| {
+                let wrapper = root.join(".openhands/hooks/tirith-pre-tool-use");
+                write_executable(&wrapper, "#!/bin/sh\nexec python3 tirith-check.py\n");
+                let quoted = format!("'{}'", wrapper.display());
+                std::fs::write(
+                    root.join(".openhands/hooks.json"),
+                    serde_json::json!({
+                        "pre_tool_use": [{
+                            "matcher": "terminal",
+                            "hooks": [{"type": "command", "command": quoted, "timeout": 15}]
+                        }]
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            };
+            // User-level only: reported as user.
+            install(home);
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            let found = tools
+                .iter()
+                .find(|t| t.name == "openhands")
+                .expect("user hook");
+            assert_eq!(found.configured_scope, Some("user"));
+
+            // Add the work-dir one: project wins, and there is still one row.
+            install(cwd);
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            let found = tools
+                .iter()
+                .find(|t| t.name == "openhands")
+                .expect("project hook");
+            assert_eq!(found.configured_scope, Some("project"));
+            assert_eq!(count_named(&tools, "openhands"), 1);
+        });
+    }
+
+    #[test]
+    fn detect_ai_tools_prefers_the_project_grok_hook_and_never_doubles_it() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            std::fs::create_dir_all(cwd.join(".git")).unwrap();
+            let hook_config = serde_json::json!({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+                    "type": "command", "command": "python3 x", "timeout": 15,
+                    "env": {"TIRITH_BIN": "/opt/tirith/bin/tirith", "TIRITH_HOOK_PROTOCOL": "grok-build"}
+                }]}]}
+            })
+            .to_string();
+            for base in [home.to_path_buf(), cwd.to_path_buf()] {
+                std::fs::create_dir_all(base.join(".grok/hooks")).unwrap();
+                std::fs::write(base.join(".grok/hooks/tirith.json"), &hook_config).unwrap();
+            }
+            let _cwd = CwdGuard::set(cwd);
+
+            let tools = detect_ai_tools_with(home, Some(cwd));
+            assert_eq!(
+                count_named(&tools, "grok-build"),
+                1,
+                "a host configured at both scopes must still report one row"
+            );
+            assert_eq!(
+                tools
+                    .iter()
+                    .find(|t| t.name == "grok-build")
+                    .unwrap()
+                    .configured_scope,
+                Some("project")
+            );
+        });
     }
 
     #[test]

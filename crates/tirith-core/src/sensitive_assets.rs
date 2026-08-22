@@ -790,6 +790,16 @@ pub(crate) struct SensitiveValueRedactionSpan {
     pub priority: u16,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct SensitiveValueRedactionPlan {
+    pub spans: Vec<SensitiveValueRedactionSpan>,
+    /// At least one supported value was structurally confirmed. This remains
+    /// independent of `analysis_incomplete`: a bounded scan may confirm an
+    /// earlier value before a later candidate exhausts its safety budget.
+    pub confirmed_secret: bool,
+    pub analysis_incomplete: bool,
+}
+
 /// Namespace type making the ownership boundary explicit at call sites.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SensitiveAssetRegistry;
@@ -944,7 +954,13 @@ static WORD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\p{L}+").expect("Unicode
 // transport limits. Keeping an explicit local budget prevents a future caller
 // from accidentally feeding an unbounded value into checksum recognition.
 pub(crate) const MAX_BIP39_SCAN_INPUT_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_BIP39_WORD_TOKENS: usize = 32_768;
+// Tier 1 may stop counting dictionary words and conservatively route the value
+// to the authoritative scanner. The authoritative pass itself is already
+// bounded by input bytes, checksum candidates, confirmed matches, and a fixed
+// 24-word window; reusing this gate limit there falsely marked large prose with
+// many isolated BIP-39 words as incomplete even when punctuation prevented a
+// candidate phrase from forming.
+pub(crate) const MAX_BIP39_TIER1_WORD_TOKENS: usize = 32_768;
 pub(crate) const MAX_BIP39_CHECKSUM_CANDIDATES: usize = 16_384;
 pub(crate) const MAX_BIP39_MATCHES: usize = 1_024;
 const MAX_BIP39_WORDS_PER_PHRASE: usize = 24;
@@ -1050,9 +1066,10 @@ fn has_bip39_word_run_candidate(input: &str) -> bool {
         }
         cursor = matched.end();
         if bip39_word_index(matched.as_str()).is_some() {
-            if word_tokens == MAX_BIP39_WORD_TOKENS {
-                // Tier 3 will turn the exhausted token budget into an explicit
-                // AnalysisIncomplete result. The gate must never fast-Allow it.
+            if word_tokens == MAX_BIP39_TIER1_WORD_TOKENS {
+                // Stop spending dictionary work in the cheap gate and route to
+                // the authoritative byte-bounded scanner. The gate must never
+                // fast-Allow merely because its own work budget is exhausted.
                 return true;
             }
             word_tokens += 1;
@@ -1709,7 +1726,7 @@ pub fn output_sensitive_regex_fragment() -> String {
 
 /// Byte ranges of reviewed PRIVATE file paths inside free-form command text.
 ///
-/// This is the path counterpart to [`sensitive_value_redaction_spans`], which
+/// This is the path counterpart to [`sensitive_value_redaction_plan`], which
 /// only covers secret *values*. A wallet or credential path is not a secret
 /// byte string, so no value pattern matches it, yet echoing
 /// `~/.config/Exodus/exodus.wallet` still tells a reader exactly which wallet a
@@ -2098,13 +2115,11 @@ pub fn is_encrypted_keystore_json(input: &str) -> bool {
         && json_hex_string(crypto.get("mac"), 32)
 }
 
-fn record_bip39_word(result: &mut Bip39ScanResult) -> bool {
-    if result.stats.bip39_word_tokens == MAX_BIP39_WORD_TOKENS {
-        result.incomplete = true;
-        return false;
-    }
+fn record_bip39_word(result: &mut Bip39ScanResult) {
+    // `global_mnemonic_spans` rejects inputs above
+    // `MAX_BIP39_SCAN_INPUT_BYTES`, so this counter cannot overflow. Expensive
+    // checksum work and retained matches have their own independent caps.
     result.stats.bip39_word_tokens += 1;
-    true
 }
 
 fn check_bip39_candidate(result: &mut Bip39ScanResult, words: &[Bip39WordRecord]) -> Option<bool> {
@@ -2174,9 +2189,7 @@ fn explicit_mnemonic_spans(input: &str, result: &mut Bip39ScanResult) {
             let Some(index) = bip39_word_index(matched.as_str()) else {
                 break;
             };
-            if !record_bip39_word(result) {
-                return;
-            }
+            record_bip39_word(result);
             words.push(Bip39WordRecord {
                 range: range.clone(),
                 index,
@@ -2269,9 +2282,7 @@ fn global_mnemonic_spans(input: &str, result: &mut Bip39ScanResult) {
             }
             continue;
         };
-        if !record_bip39_word(result) {
-            return;
-        }
+        record_bip39_word(result);
         if window.len() == MAX_BIP39_WORDS_PER_PHRASE
             && !process_bip39_window_start(&mut window, result)
         {
@@ -2965,10 +2976,11 @@ fn redact_bare_credential_rpc_urls(input: &str) -> String {
         .into_owned()
 }
 
-pub(crate) fn sensitive_value_redaction_spans(input: &str) -> Vec<SensitiveValueRedactionSpan> {
+pub(crate) fn sensitive_value_redaction_plan(input: &str) -> SensitiveValueRedactionPlan {
     let structured = structured_secret_spans(input, DetectionContext::Redaction);
+    let confirmed_secret = !structured.spans.is_empty();
     if structured.incomplete {
-        return (!input.is_empty())
+        let spans = (!input.is_empty())
             .then(|| SensitiveValueRedactionSpan {
                 range: 0..input.len(),
                 replacement: "[REDACTED:analysis_incomplete]".to_string(),
@@ -2976,6 +2988,11 @@ pub(crate) fn sensitive_value_redaction_spans(input: &str) -> Vec<SensitiveValue
             })
             .into_iter()
             .collect();
+        return SensitiveValueRedactionPlan {
+            spans,
+            confirmed_secret,
+            analysis_incomplete: true,
+        };
     }
     let mut spans = structured
         .spans
@@ -3035,7 +3052,11 @@ pub(crate) fn sensitive_value_redaction_spans(input: &str) -> Vec<SensitiveValue
             priority: 250,
         });
     }
-    spans
+    SensitiveValueRedactionPlan {
+        confirmed_secret: !spans.is_empty(),
+        spans,
+        analysis_incomplete: false,
+    }
 }
 
 fn render_sensitive_value_spans(
@@ -3076,7 +3097,7 @@ fn render_sensitive_value_spans(
 /// Always-on redactor for Web3 command/JSON forms and structurally validated
 /// wallet secrets. It is idempotent and emits no secret-derived identifier.
 pub fn redact_sensitive_values(input: &str) -> String {
-    render_sensitive_value_spans(input, sensitive_value_redaction_spans(input))
+    render_sensitive_value_spans(input, sensitive_value_redaction_plan(input).spans)
 }
 
 #[cfg(test)]
@@ -4000,7 +4021,7 @@ mod tests {
             scan.stats.checksum_candidates,
             MAX_BIP39_CHECKSUM_CANDIDATES
         );
-        assert!(scan.stats.bip39_word_tokens <= MAX_BIP39_WORD_TOKENS);
+        assert!(scan.stats.bip39_word_tokens > 0);
         assert!(scan.stats.max_rolling_words <= MAX_BIP39_WORDS_PER_PHRASE);
     }
 
@@ -4081,7 +4102,7 @@ mod tests {
     }
 
     #[test]
-    fn bip39_word_token_cap_is_exact_for_short_non_candidate_runs() {
+    fn tier1_word_cap_routes_but_authoritative_short_runs_remain_complete() {
         fn input_with_bip_words(count: usize) -> String {
             let mut input = String::with_capacity(count * 9);
             for index in 0..count {
@@ -4095,18 +4116,28 @@ mod tests {
 
         assert!(bip39_word_index("qzxq").is_none());
 
-        let at_cap = input_with_bip_words(MAX_BIP39_WORD_TOKENS);
+        let at_cap = input_with_bip_words(MAX_BIP39_TIER1_WORD_TOKENS);
         let mut complete = Bip39ScanResult::default();
         global_mnemonic_spans(&at_cap, &mut complete);
         assert!(!complete.incomplete);
-        assert_eq!(complete.stats.bip39_word_tokens, MAX_BIP39_WORD_TOKENS);
+        assert_eq!(
+            complete.stats.bip39_word_tokens,
+            MAX_BIP39_TIER1_WORD_TOKENS
+        );
         assert_eq!(complete.stats.checksum_candidates, 0);
 
-        let over_cap = input_with_bip_words(MAX_BIP39_WORD_TOKENS + 1);
-        let mut incomplete = Bip39ScanResult::default();
-        global_mnemonic_spans(&over_cap, &mut incomplete);
-        assert!(incomplete.incomplete);
-        assert_eq!(incomplete.stats.bip39_word_tokens, MAX_BIP39_WORD_TOKENS);
+        let over_cap = input_with_bip_words(MAX_BIP39_TIER1_WORD_TOKENS + 1);
+        assert!(has_bip39_word_run_candidate(&over_cap));
+        let mut routed = Bip39ScanResult::default();
+        global_mnemonic_spans(&over_cap, &mut routed);
+        assert!(!routed.incomplete);
+        assert!(routed.spans.is_empty());
+        assert_eq!(
+            routed.stats.bip39_word_tokens,
+            MAX_BIP39_TIER1_WORD_TOKENS + 1
+        );
+        assert_eq!(routed.stats.checksum_candidates, 0);
+        assert_eq!(redact_sensitive_values(&over_cap), over_cap);
     }
 
     #[test]

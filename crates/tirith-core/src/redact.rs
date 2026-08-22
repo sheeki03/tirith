@@ -6,6 +6,7 @@ use regex::Regex;
 struct CredRedactEntry {
     label: String,
     regex: Regex,
+    tier1: Regex,
 }
 
 /// Target audience for [`redact_for_audience`]. Controls WHAT is redacted on top
@@ -131,6 +132,7 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
     struct CredPat {
         id: String,
         regex: String,
+        tier1_fragment: String,
     }
     #[derive(serde::Deserialize)]
     struct PkPat {
@@ -138,6 +140,7 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
         #[allow(dead_code)]
         regex: String,
         redact_regex: Option<String>,
+        tier1_fragment: String,
     }
 
     let toml_str = include_str!("../assets/data/credential_patterns.toml");
@@ -150,6 +153,8 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
                 entries.push(CredRedactEntry {
                     label: p.id,
                     regex: re,
+                    tier1: Regex::new(&p.tier1_fragment)
+                        .expect("invalid credential Tier-1 fragment"),
                 });
             }
         }
@@ -163,12 +168,132 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
                 entries.push(CredRedactEntry {
                     label: pk.id,
                     regex: re,
+                    tier1: Regex::new(&pk.tier1_fragment)
+                        .expect("invalid private-key Tier-1 fragment"),
                 });
             }
         }
     }
     entries
 });
+
+/// Cheap superset gate for the authoritative supported-secret registry.
+///
+/// Large clean MCP leaves otherwise run every credential regex, structural
+/// wallet validator, and RPC/value scanner repeatedly. The declarative
+/// credential table already requires a Tier-1 fragment for every provider and
+/// private-key pattern. Add the broader protocol/builtin/value families here,
+/// then defer to the sensitive-asset gate for validated wallet formats. A
+/// positive is only a candidate; the full registry still decides whether any
+/// bytes are secret.
+static SUPPORTED_SECRET_TIER1_RE: Lazy<Regex> = Lazy::new(|| {
+    #[derive(serde::Deserialize)]
+    struct CandidateFile {
+        #[serde(default)]
+        pattern: Vec<CandidatePattern>,
+        #[serde(default)]
+        private_key_pattern: Vec<CandidatePattern>,
+    }
+    #[derive(serde::Deserialize)]
+    struct CandidatePattern {
+        tier1_fragment: String,
+    }
+
+    let file: CandidateFile =
+        toml::from_str(include_str!("../assets/data/credential_patterns.toml"))
+            .expect("invalid credential_patterns.toml");
+    let mut fragments = file
+        .pattern
+        .into_iter()
+        .chain(file.private_key_pattern)
+        .map(|pattern| pattern.tier1_fragment)
+        .collect::<Vec<_>>();
+    fragments.extend(
+        [
+            // Compatibility matchers intentionally accept these provider
+            // tokens even when embedded in a larger word, so this superset
+            // must not impose the stricter registry word boundaries.
+            r"(?:sk-|AKIA|ghp_|ghs_|xox[bprs]-)[A-Za-z0-9]",
+            // Protocol credentials need not use a provider-specific shape.
+            r"(?i:\b(?:proxy-)?authorization[ \t]*:[ \t]*bearer[ \t]+)",
+            // Credential-bearing RPC URLs may be bare or follow a field name.
+            r"(?i:\b(?:https?|wss?)://)",
+            // Contextual values handled by sensitive_assets.rs. This is a
+            // deliberately broad superset; exact aliases and value validation
+            // remain authoritative in the full pass.
+            r"(?i:\b(?:private[-_ ]?key|mnemonic|seed[-_ ]?phrase|passphrase|password|access[-_ ]?key|jwt[-_ ]?secret|secret[-_ ]?key|keystore[-_ ]?password)\b)",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    Regex::new(&format!("(?:{})", fragments.join("|")))
+        .expect("supported-secret Tier-1 regex must compile")
+});
+
+static SENSITIVE_VALUE_CONTEXT_TIER1_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i:(?:\b(?:https?|wss?)://)|(?:\b(?:private[-_ ]?key|mnemonic|seed[-_ ]?phrase|passphrase|password|access[-_ ]?key|jwt[-_ ]?secret|secret[-_ ]?key|keystore[-_ ]?password|rpc[-_ ]?(?:url|endpoint)|fork[-_ ]?url|provider[-_ ]?url)\b))",
+    )
+    .expect("sensitive-value Tier-1 regex must compile")
+});
+
+fn sensitive_value_tier1_candidate(input: &str) -> bool {
+    if input.len() > crate::sensitive_assets::MAX_BIP39_SCAN_INPUT_BYTES {
+        // The authoritative mnemonic scanner reports analysis incomplete above
+        // this ceiling even when the payload is a single token. Preserve that
+        // fail-closed result instead of fast-allowing it here.
+        return true;
+    }
+    // Every supported structured value needs a token/field separator, URL/path
+    // delimiter, or JSON container byte. Avoid the heavier wallet/path/wordlist
+    // gate for large single-token provider candidates such as `sk-a...`.
+    let has_structural_separator = input.bytes().any(|byte| {
+        matches!(
+            byte,
+            b' ' | b'\t'
+                | b'\r'
+                | b'\n'
+                | b'='
+                | b':'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b','
+                | b'/'
+                | b'\\'
+                | b'$'
+                | b'%'
+        )
+    }) || (!input.is_ascii()
+        && input.chars().any(char::is_whitespace));
+    has_structural_separator
+        && (SENSITIVE_VALUE_CONTEXT_TIER1_RE.is_match(input)
+            || crate::sensitive_assets::tier1_sensitive_asset_candidate_deep(input))
+}
+
+fn supported_secret_tier1_candidate(input: &str) -> bool {
+    SUPPORTED_SECRET_TIER1_RE.is_match(input) || sensitive_value_tier1_candidate(input)
+}
+
+fn ascii_contains_ignore_case(input: &str, needle: &[u8]) -> bool {
+    input
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn builtin_redaction_candidate(index: usize, input: &str) -> bool {
+    match index {
+        0 | 4 => input.contains("sk-"),
+        1 => input.contains("AKIA"),
+        2 => input.contains("ghp_"),
+        3 => input.contains("ghs_"),
+        5 => input.contains("xox"),
+        6 => input.contains('@'),
+        _ => false,
+    }
+}
 
 /// Built-in redaction patterns: (label, regex).
 static BUILTIN_PATTERNS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
@@ -587,6 +712,21 @@ enum BaseRedactionMode {
     SupportedSecrets,
 }
 
+/// Categorical result of the mandatory supported-secret pass. The two facts are
+/// intentionally independent: a bounded scan can confirm one secret before a
+/// later candidate exhausts its analysis budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SupportedSecretStatus {
+    pub confirmed_secret: bool,
+    pub analysis_incomplete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupportedSecretAnalysis {
+    pub redacted: String,
+    pub status: SupportedSecretStatus,
+}
+
 #[derive(Debug, Clone)]
 struct RedactionSpan {
     start: usize,
@@ -642,7 +782,8 @@ fn collect_base_redaction_spans(
     mode: BaseRedactionMode,
     spans: &mut Vec<RedactionSpan>,
     report_order: &mut Vec<String>,
-) {
+) -> SupportedSecretStatus {
+    let initial_span_count = spans.len();
     let report_counts = matches!(mode, BaseRedactionMode::Audience);
     let (credential_priority, builtin_priority) = match mode {
         BaseRedactionMode::Generic | BaseRedactionMode::SupportedSecrets => {
@@ -651,7 +792,11 @@ fn collect_base_redaction_spans(
         BaseRedactionMode::Audience => (PRIORITY_PRIMARY_PROVIDER, PRIORITY_SECONDARY_PROVIDER),
     };
 
-    let private_key_spans = private_key_redaction_spans(input);
+    let private_key_spans = if input.contains("-----BEGIN") {
+        private_key_redaction_spans(input)
+    } else {
+        Vec::new()
+    };
     let mut saw_pem = false;
     let mut saw_pgp = false;
     for range in private_key_spans {
@@ -682,19 +827,21 @@ fn collect_base_redaction_spans(
     }
 
     let mut bearer_matches = 0usize;
-    for captures in AUTHORIZATION_BEARER_PATTERN.captures_iter(input) {
-        let (Some(prefix), Some(whole)) = (captures.get(1), captures.get(0)) else {
-            continue;
-        };
-        push_redaction_span(
-            spans,
-            prefix.end(),
-            whole.end(),
-            "[REDACTED:Bearer Token]".to_string(),
-            PRIORITY_BEARER,
-            report_counts.then_some("bearer_token"),
-        );
-        bearer_matches += 1;
+    if ascii_contains_ignore_case(input, b"authorization") {
+        for captures in AUTHORIZATION_BEARER_PATTERN.captures_iter(input) {
+            let (Some(prefix), Some(whole)) = (captures.get(1), captures.get(0)) else {
+                continue;
+            };
+            push_redaction_span(
+                spans,
+                prefix.end(),
+                whole.end(),
+                "[REDACTED:Bearer Token]".to_string(),
+                PRIORITY_BEARER,
+                report_counts.then_some("bearer_token"),
+            );
+            bearer_matches += 1;
+        }
     }
     if report_counts && bearer_matches > 0 {
         register_report_label(report_order, "bearer_token");
@@ -707,6 +854,9 @@ fn collect_base_redaction_spans(
         // to EOF unconditionally and are retained for detection, but must not
         // widen an already validated complete-block redaction span.
         if matches!(entry.label.as_str(), "private_key" | "pgp_private_key") {
+            continue;
+        }
+        if !entry.tier1.is_match(input) {
             continue;
         }
         let mut matches = 0usize;
@@ -732,6 +882,9 @@ fn collect_base_redaction_spans(
             // material and must not turn ordinary MCP output into a secret hit.
             continue;
         }
+        if !builtin_redaction_candidate(idx, input) {
+            continue;
+        }
         let mut matches = 0usize;
         for matched in regex.find_iter(input) {
             push_redaction_span(
@@ -749,7 +902,16 @@ fn collect_base_redaction_spans(
         }
     }
 
-    collect_sensitive_value_redaction_spans(input, spans);
+    let mut status = SupportedSecretStatus {
+        confirmed_secret: spans.len() > initial_span_count,
+        analysis_incomplete: false,
+    };
+    if sensitive_value_tier1_candidate(input) {
+        let sensitive = collect_sensitive_value_redaction_spans(input, spans);
+        status.confirmed_secret |= sensitive.confirmed_secret;
+        status.analysis_incomplete = sensitive.analysis_incomplete;
+    }
+    status
 }
 
 /// Redact only supported credential/secret material. Unlike [`redact`], this
@@ -757,19 +919,41 @@ fn collect_base_redaction_spans(
 /// as a high-confidence streaming DLP predicate without creating an output
 /// blocker for ordinary prose.
 pub fn redact_supported_secrets(input: &str) -> String {
+    analyze_supported_secrets(input).redacted
+}
+
+/// Run the supported-secret registry once and retain the distinction between a
+/// confirmed credential and bounded analysis that could not be completed.
+/// Callers making policy decisions must use this checked form rather than infer
+/// status from a fixed redaction marker.
+pub(crate) fn analyze_supported_secrets(input: &str) -> SupportedSecretAnalysis {
+    if !supported_secret_tier1_candidate(input) {
+        return SupportedSecretAnalysis {
+            redacted: input.to_string(),
+            status: SupportedSecretStatus::default(),
+        };
+    }
     let mut spans = Vec::new();
     let mut unused_label_order = Vec::new();
-    collect_base_redaction_spans(
+    let status = collect_base_redaction_spans(
         input,
         BaseRedactionMode::SupportedSecrets,
         &mut spans,
         &mut unused_label_order,
     );
-    render_redaction_spans(input, spans).0
+    SupportedSecretAnalysis {
+        redacted: render_redaction_spans(input, spans).0,
+        status,
+    }
 }
 
+/// Conservative compatibility predicate. `true` means either a supported
+/// secret was confirmed or the bounded analysis could not prove the value clean.
+/// Security-sensitive internal callers use [`analyze_supported_secrets`] to
+/// preserve that distinction in their public finding identity.
 pub fn contains_supported_secret(input: &str) -> bool {
-    redact_supported_secrets(input) != input
+    let analysis = analyze_supported_secrets(input);
+    analysis.status.confirmed_secret || analysis.status.analysis_incomplete
 }
 
 /// Mandatory projection for attacker-controlled text that will participate in
@@ -857,8 +1041,16 @@ pub(crate) fn privacy_project_durable_pair(key: &str, value: &str) -> (String, S
     (projected_key, projected_value)
 }
 
-fn collect_sensitive_value_redaction_spans(input: &str, spans: &mut Vec<RedactionSpan>) {
-    for span in crate::sensitive_assets::sensitive_value_redaction_spans(input) {
+fn collect_sensitive_value_redaction_spans(
+    input: &str,
+    spans: &mut Vec<RedactionSpan>,
+) -> SupportedSecretStatus {
+    let plan = crate::sensitive_assets::sensitive_value_redaction_plan(input);
+    let status = SupportedSecretStatus {
+        confirmed_secret: plan.confirmed_secret,
+        analysis_incomplete: plan.analysis_incomplete,
+    };
+    for span in plan.spans {
         let priority = match span.priority {
             300.. => PRIORITY_STRUCTURED_WALLET,
             290..=299 => PRIORITY_RPC_VALUE,
@@ -873,6 +1065,7 @@ fn collect_sensitive_value_redaction_spans(input: &str, spans: &mut Vec<Redactio
             None,
         );
     }
+    status
 }
 
 /// Blank reviewed private wallet/credential paths quoted out of raw command
@@ -1934,6 +2127,10 @@ mod tests {
             ),
         ];
         for (secret, prefix) in cases {
+            assert!(
+                supported_secret_tier1_candidate(&secret),
+                "registry credential must remain reachable through Tier 1: {prefix}"
+            );
             let redacted = redact_supported_secrets(&secret);
             assert!(!redacted.contains(&secret), "{redacted}");
             let secret_derived_suffix = secret
@@ -1949,6 +2146,87 @@ mod tests {
             assert!(redacted.ends_with(']'), "{redacted}");
             assert_eq!(redacted.matches("[REDACTED:").count(), 1, "{redacted}");
         }
+    }
+
+    #[test]
+    fn supported_secret_tier1_gate_covers_structural_and_protocol_families() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut keypair = vec![7u8; 32];
+        keypair.extend_from_slice(signing.verifying_key().as_bytes());
+        let keypair = serde_json::to_string(&keypair).unwrap();
+        let evm_scalar = format!("PRIVATE_KEY=0x{}1", "0".repeat(63));
+        let cases = [
+            "Authorization: Bearer opaque-provider-token.123".to_string(),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nbody".to_string(),
+            "PASSWORD=hunter2".to_string(),
+            "RPC_URL=https://user:pass@rpc.example/v3/token".to_string(),
+            format!("ask-{}", "A".repeat(20)),
+            format!("xAKIA{}", "A".repeat(16)),
+            format!("xghp_{}", "A".repeat(36)),
+            format!("xxoxb-{}", "A".repeat(10)),
+            format!("mnemonic={mnemonic}"),
+            mnemonic.replace(' ', "\u{00A0}"),
+            mnemonic.replace(' ', "\u{3000}"),
+            format!("solana_keypair={keypair}"),
+            evm_scalar,
+        ];
+
+        for input in cases {
+            assert!(
+                supported_secret_tier1_candidate(&input),
+                "supported secret family missed Tier 1: {input}"
+            );
+            assert_ne!(
+                redact_supported_secrets(&input),
+                input,
+                "candidate must be confirmed by the authoritative registry"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_secret_tier1_gate_skips_large_uniform_benign_text() {
+        let input = "x".repeat(1024 * 1024);
+        assert!(!supported_secret_tier1_candidate(&input));
+        assert!(!contains_supported_secret(&input));
+    }
+
+    #[test]
+    fn supported_secret_analysis_distinguishes_clean_secret_and_incomplete() {
+        let prose = "ordinary safe prose.\n".repeat(50_000);
+        assert_eq!(prose.len(), 1_050_000);
+        let clean = analyze_supported_secrets(&prose);
+        assert_eq!(clean.redacted, prose);
+        assert_eq!(clean.status, SupportedSecretStatus::default());
+
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let secret = analyze_supported_secrets(mnemonic);
+        assert!(secret.status.confirmed_secret);
+        assert!(!secret.status.analysis_incomplete);
+        assert!(!secret.redacted.contains("abandon"));
+
+        let hostile =
+            "abandon ".repeat(crate::sensitive_assets::MAX_BIP39_CHECKSUM_CANDIDATES / 5 + 64);
+        let incomplete = analyze_supported_secrets(&hostile);
+        assert!(!incomplete.status.confirmed_secret);
+        assert!(incomplete.status.analysis_incomplete);
+        assert_eq!(incomplete.redacted, "[REDACTED:analysis_incomplete]");
+        assert!(
+            contains_supported_secret(&hostile),
+            "the compatibility predicate remains conservatively fail-closed"
+        );
+
+        let marker_literal = "[REDACTED:analysis_incomplete]";
+        let marker = analyze_supported_secrets(marker_literal);
+        assert_eq!(marker.redacted, marker_literal);
+        assert_eq!(marker.status, SupportedSecretStatus::default());
+
+        let mixed = format!("{mnemonic} qzxq {hostile}");
+        let mixed = analyze_supported_secrets(&mixed);
+        assert!(mixed.status.confirmed_secret);
+        assert!(mixed.status.analysis_incomplete);
+        assert_eq!(mixed.redacted, "[REDACTED:analysis_incomplete]");
     }
 
     #[test]

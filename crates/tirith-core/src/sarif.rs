@@ -1,7 +1,8 @@
 /// SARIF 2.1.0 output for scan findings.
 use crate::rule_explanations;
 use crate::verdict::{Finding, Severity};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 
 fn project_sarif_text(value: &str) -> String {
     let share_safe =
@@ -10,23 +11,71 @@ fn project_sarif_text(value: &str) -> String {
     crate::redact::redact_blocked_output(&share_safe)
 }
 
+fn raw_and_projected_rule_identity(finding: &Finding) -> (String, String) {
+    let raw = finding
+        .custom_rule_id
+        .clone()
+        .unwrap_or_else(|| finding.rule_id.to_string());
+    let projected = project_sarif_text(&raw);
+    (raw, projected)
+}
+
+fn sarif_fingerprint_v2(projected_rule: &str, projected_path: &str, line_number: u64) -> String {
+    let mut hasher = Sha256::new();
+    // Hash only fields already emitted publicly in SARIF. Free-form finding
+    // text/evidence may contain an unrecognized low-entropy secret; hashing it
+    // would create an offline dictionary oracle and would churn dedup identity
+    // whenever explanatory wording changes.
+    for component in [projected_rule, projected_path, &line_number.to_string()] {
+        let bytes = component.as_bytes();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Convert scan findings to SARIF 2.1.0 JSON. Severity maps as
 /// CRITICAL/HIGH -> "error", MEDIUM -> "warning", LOW/INFO -> "note".
 pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Value {
     let mut rule_map: HashMap<String, usize> = HashMap::new();
     let mut rules = Vec::new();
 
+    // Projection is intentionally non-injective: two private custom IDs may
+    // become the same public text. Distinguishing them with a raw-derived hash
+    // would create a dictionary oracle, while encounter/set ordinals would
+    // make rule IDs unstable across runs. Instead, custom rules live in a
+    // closed `custom/` namespace and projected collisions deliberately share
+    // one public descriptor and fingerprint.
+    let mut custom_projected_raw_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    for finding in findings {
+        if finding.finding.custom_rule_id.is_some() {
+            let (raw, projected) = raw_and_projected_rule_identity(finding.finding);
+            custom_projected_raw_ids
+                .entry(projected)
+                .or_default()
+                .insert(raw);
+        }
+    }
+
+    let rule_identity = |finding: &Finding| {
+        let custom = finding.custom_rule_id.is_some();
+        let (raw, projected) = raw_and_projected_rule_identity(finding);
+        if custom {
+            let projected_collision = custom_projected_raw_ids
+                .get(&projected)
+                .is_some_and(|raw_ids| raw_ids.len() > 1);
+            let presentation = format!("custom/{projected}");
+            (raw, presentation, projected_collision, true)
+        } else {
+            (raw, projected, false, false)
+        }
+    };
+
     for f in findings {
-        // repo-0467: custom rules share RuleId::CustomRuleMatch; their real
-        // identity lives in `custom_rule_id`. Key the SARIF rule descriptor
-        // by the EFFECTIVE id so distinct custom rules get distinct
-        // descriptors and fingerprints.
-        let raw_rule_str = f
-            .finding
-            .custom_rule_id
-            .clone()
-            .unwrap_or_else(|| f.finding.rule_id.to_string());
-        let rule_str = project_sarif_text(&raw_rule_str);
+        // Custom rules share RuleId::CustomRuleMatch, so key descriptors by
+        // their stable public custom namespace. Private IDs that collapse to
+        // the same public projection intentionally aggregate.
+        let (raw_rule_str, rule_str, projected_collision, custom) = rule_identity(f.finding);
         if !rule_map.contains_key(&rule_str) {
             let idx = rules.len();
             rule_map.insert(rule_str.clone(), idx);
@@ -34,27 +83,37 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
             let mut rule = serde_json::json!({
                 "id": rule_str,
                 "shortDescription": {
-                    "text": project_sarif_text(&f.finding.title)
+                    "text": if custom {
+                        format!("Custom rule: {}", rule_str.trim_start_matches("custom/"))
+                    } else {
+                        project_sarif_text(&f.finding.title)
+                    }
                 }
             });
 
-            if let Some(explanation) = rule_explanations::explain(&raw_rule_str) {
-                rule["fullDescription"] = serde_json::json!({
-                    "text": project_sarif_text(explanation.description)
+            if projected_collision {
+                rule["properties"] = serde_json::json!({
+                    "tirithProjectedRuleCollision": true
                 });
+            }
 
-                let mut tags: Vec<&str> = Vec::new();
-                if let Some(mitre) = explanation.mitre_id {
-                    tags.push(mitre);
-                }
-                if !tags.is_empty() {
-                    rule["properties"] = serde_json::json!({
-                        "tags": tags
+            if !custom {
+                if let Some(explanation) = rule_explanations::explain(&raw_rule_str) {
+                    rule["fullDescription"] = serde_json::json!({
+                        "text": project_sarif_text(explanation.description)
                     });
-                }
 
-                if let Some(uri) = explanation.references.first() {
-                    rule["helpUri"] = serde_json::json!(uri);
+                    let mut tags: Vec<&str> = Vec::new();
+                    if let Some(mitre) = explanation.mitre_id {
+                        tags.push(mitre);
+                    }
+                    if !tags.is_empty() {
+                        rule["properties"]["tags"] = serde_json::json!(tags);
+                    }
+
+                    if let Some(uri) = explanation.references.first() {
+                        rule["helpUri"] = serde_json::json!(uri);
+                    }
                 }
             }
 
@@ -65,32 +124,34 @@ pub fn to_sarif(findings: &[SarifFinding], tool_version: &str) -> serde_json::Va
     let results: Vec<serde_json::Value> = findings
         .iter()
         .map(|f| {
-            let rule_str = project_sarif_text(
-                &f.finding
-                    .custom_rule_id
-                    .clone()
-                    .unwrap_or_else(|| f.finding.rule_id.to_string()),
-            );
+            let (_, rule_str, projected_collision, _) = rule_identity(f.finding);
             let rule_index = rule_map[&rule_str];
             let level = severity_to_level(f.finding.severity);
             let projected_path = f.file_path.as_deref().map(project_sarif_text);
-
             let mut result = serde_json::json!({
-                "ruleId": rule_str,
+                "ruleId": rule_str.clone(),
                 "ruleIndex": rule_index,
                 "level": level,
                 "message": {
                     "text": project_sarif_text(&f.finding.description)
                 }
             });
+            if projected_collision {
+                result["properties"] = serde_json::json!({
+                    "tirithProjectedRuleCollision": true,
+                    "tirithStableProjectedRuleId": rule_str.clone(),
+                });
+            }
 
-            // Fingerprint for deduplication across runs
-            let rule_id_str = &rule_str;
+            // Versioned, privacy-safe fingerprint for deduplication across
+            // runs. It uses the same stable public rule ID emitted in SARIF,
+            // never a hidden raw custom ID.
             result["fingerprints"] = serde_json::json!({
-                "tirith/v1": format!("{}:{}:{}",
-                    rule_id_str,
+                "tirith/v2": sarif_fingerprint_v2(
+                    &rule_str,
                     projected_path.as_deref().unwrap_or(""),
-                    f.line_number.unwrap_or(0))
+                    f.line_number.unwrap_or(0),
+                )
             });
 
             if let Some(path) = projected_path {
@@ -160,7 +221,7 @@ fn severity_to_level(severity: Severity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verdict::{Finding, RuleId, Severity};
+    use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
     fn make_finding(rule_id: RuleId, severity: Severity, title: &str) -> Finding {
         Finding {
@@ -320,8 +381,10 @@ mod tests {
         let sarif = to_sarif(&findings, "0.1.0");
         let results = sarif["runs"][0]["results"].as_array().unwrap();
         let result = &results[0];
-        let fp = result["fingerprints"]["tirith/v1"].as_str().unwrap();
-        assert_eq!(fp, "ansi_escapes:test.sh:5");
+        let fp = result["fingerprints"]["tirith/v2"].as_str().unwrap();
+        assert_eq!(fp.len(), 64);
+        assert!(fp.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(result["fingerprints"].get("tirith/v1").is_none());
     }
 
     #[test]
@@ -335,8 +398,8 @@ mod tests {
         }];
         let sarif = to_sarif(&findings, "0.1.0");
         let results = sarif["runs"][0]["results"].as_array().unwrap();
-        let fp = results[0]["fingerprints"]["tirith/v1"].as_str().unwrap();
-        assert_eq!(fp, "ansi_escapes::0");
+        let fp = results[0]["fingerprints"]["tirith/v2"].as_str().unwrap();
+        assert_eq!(fp.len(), 64);
     }
 
     #[test]
@@ -397,6 +460,163 @@ mod tests {
     }
 
     #[test]
+    fn projected_custom_rule_collisions_collapse_to_stable_public_identity() {
+        let first_secret = format!("ghp_{}", "A".repeat(36));
+        let second_secret = format!("ghp_{}", "B".repeat(36));
+        let mut first = make_finding(RuleId::CustomRuleMatch, Severity::High, "same title");
+        first.description = "same description".to_string();
+        first.custom_rule_id = Some(format!("custom-{first_secret}"));
+        let mut second = first.clone();
+        second.custom_rule_id = Some(format!("custom-{second_secret}"));
+        let findings = vec![
+            SarifFinding {
+                finding: &first,
+                file_path: Some("src/main.rs".to_string()),
+                line_number: Some(1),
+                suppressed: false,
+            },
+            SarifFinding {
+                finding: &second,
+                file_path: Some("src/main.rs".to_string()),
+                line_number: Some(1),
+                suppressed: false,
+            },
+        ];
+
+        let sarif = to_sarif(&findings, "0.1.0");
+        let serialized = sarif.to_string();
+        assert!(!serialized.contains(&first_secret), "{serialized}");
+        assert!(!serialized.contains(&second_secret), "{serialized}");
+        let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(
+            rules.len(),
+            1,
+            "private projected collisions must aggregate"
+        );
+        assert_eq!(results[0]["ruleId"], results[1]["ruleId"]);
+        assert!(results[0]["ruleId"]
+            .as_str()
+            .unwrap()
+            .starts_with("custom/"));
+        assert_eq!(
+            results[0]["fingerprints"]["tirith/v2"], results[1]["fingerprints"]["tirith/v2"],
+            "a hidden raw-ID collision must not enter public dedup identity"
+        );
+        assert_eq!(
+            results[0]["properties"]["tirithProjectedRuleCollision"],
+            true
+        );
+
+        let singleton = to_sarif(&findings[..1], "0.1.0");
+        assert_eq!(
+            singleton["runs"][0]["results"][0]["ruleId"], results[0]["ruleId"],
+            "adding a private projected collision must not churn the public rule ID"
+        );
+        assert_eq!(
+            singleton["runs"][0]["results"][0]["fingerprints"]["tirith/v2"],
+            results[0]["fingerprints"]["tirith/v2"],
+            "adding a projected-colliding rule must not churn existing history"
+        );
+
+        let reversed = vec![
+            SarifFinding {
+                finding: &second,
+                file_path: Some("src/main.rs".to_string()),
+                line_number: Some(1),
+                suppressed: false,
+            },
+            SarifFinding {
+                finding: &first,
+                file_path: Some("src/main.rs".to_string()),
+                line_number: Some(1),
+                suppressed: false,
+            },
+        ];
+        let reversed_sarif = to_sarif(&reversed, "0.1.0");
+        assert!(
+            reversed_sarif["runs"][0]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|result| {
+                    result["ruleId"] == results[0]["ruleId"]
+                        && result["fingerprints"]["tirith/v2"]
+                            == results[0]["fingerprints"]["tirith/v2"]
+                }),
+            "input order must not affect public rule or fingerprint identity"
+        );
+    }
+
+    #[test]
+    fn custom_rule_equal_to_builtin_gets_a_distinct_descriptor() {
+        let builtin = make_finding(RuleId::AnsiEscapes, Severity::High, "builtin");
+        let mut custom = make_finding(RuleId::CustomRuleMatch, Severity::High, "custom");
+        custom.custom_rule_id = Some(builtin.rule_id.to_string());
+        let findings = vec![
+            SarifFinding {
+                finding: &custom,
+                file_path: None,
+                line_number: None,
+                suppressed: false,
+            },
+            SarifFinding {
+                finding: &builtin,
+                file_path: None,
+                line_number: None,
+                suppressed: false,
+            },
+        ];
+
+        let sarif = to_sarif(&findings, "0.1.0");
+        let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_ne!(results[0]["ruleId"], results[1]["ruleId"]);
+        assert_eq!(results[0]["ruleId"], "custom/ansi_escapes");
+        assert_eq!(results[1]["ruleId"], builtin.rule_id.to_string());
+        assert_ne!(
+            results[0]["fingerprints"]["tirith/v2"],
+            results[1]["fingerprints"]["tirith/v2"]
+        );
+    }
+
+    #[test]
+    fn custom_namespace_is_injective_for_public_projected_ids() {
+        let mut first = make_finding(RuleId::CustomRuleMatch, Severity::High, "first");
+        first.custom_rule_id = Some("foo".to_string());
+        let mut second = make_finding(RuleId::CustomRuleMatch, Severity::High, "second");
+        second.custom_rule_id = Some("custom/foo".to_string());
+
+        let findings = [&first, &second]
+            .into_iter()
+            .map(|finding| SarifFinding {
+                finding,
+                file_path: None,
+                line_number: None,
+                suppressed: false,
+            })
+            .collect::<Vec<_>>();
+        let sarif = to_sarif(&findings, "0.1.0");
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let ids = results
+            .iter()
+            .map(|result| result["ruleId"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            2,
+            "public custom projections must remain injective"
+        );
+        assert!(ids.contains("custom/foo"));
+        assert!(ids.contains("custom/custom/foo"));
+    }
+
+    #[test]
     fn sarif_preserves_benign_relative_locations_and_rule_ids() {
         let finding = make_finding(RuleId::AnsiEscapes, Severity::High, "ANSI escape");
         let findings = vec![SarifFinding {
@@ -413,8 +633,46 @@ mod tests {
             "src/bin/check.rs"
         );
         assert_eq!(
-            result["fingerprints"]["tirith/v1"],
-            "ansi_escapes:src/bin/check.rs:7"
+            result["fingerprints"]["tirith/v2"]
+                .as_str()
+                .expect("v2 fingerprint")
+                .len(),
+            64
+        );
+    }
+
+    #[test]
+    fn fingerprint_v2_is_stable_across_wording_and_private_evidence_changes() {
+        let mut first = make_finding(RuleId::AnsiEscapes, Severity::High, "first wording");
+        first.evidence = vec![Evidence::Text {
+            detail: "PIN=0000".to_string(),
+        }];
+        let mut second = make_finding(RuleId::AnsiEscapes, Severity::High, "new wording");
+        second.evidence = vec![Evidence::Text {
+            detail: "PIN=9999".to_string(),
+        }];
+        let make = |finding| SarifFinding {
+            finding,
+            file_path: Some("src/main.rs".to_string()),
+            line_number: Some(7),
+            suppressed: false,
+        };
+
+        let first_once = to_sarif(&[make(&first)], "0.1.0");
+        let first_twice = to_sarif(&[make(&first)], "0.1.0");
+        let second_sarif = to_sarif(&[make(&second)], "0.1.0");
+        let fingerprint = |sarif: &serde_json::Value| {
+            sarif["runs"][0]["results"][0]["fingerprints"]["tirith/v2"]
+                .as_str()
+                .expect("v2 fingerprint")
+                .to_string()
+        };
+
+        assert_eq!(fingerprint(&first_once), fingerprint(&first_twice));
+        assert_eq!(
+            fingerprint(&first_once),
+            fingerprint(&second_sarif),
+            "private/free-form text must not become a fingerprint oracle or churn dedup identity"
         );
     }
 }

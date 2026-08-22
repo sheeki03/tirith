@@ -90,6 +90,7 @@ fs2 = { workspace = true }
 portable-pty = "0.9"
 # Parses the embedded `tirith lab` corpus (assets/lab_corpus.toml).
 toml = "0.8"
+toml_edit = { workspace = true }
 # Builds the synthetic, inert `tirith lab` artifact fixtures (wheels) at lab time
 # (`cli::lab_artifacts`, plan unit G2). Same line tirith-core already depends on
 # (2.x, deflate only); already in the lockfile, no new transitive resolution.

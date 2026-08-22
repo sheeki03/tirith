@@ -295,6 +295,33 @@ fn skeleton_fold(s: &str) -> (String, bool) {
 /// Returns `(normalized, transforms)`.
 fn apply_whole_text(input: &str) -> (String, TransformSet) {
     let mut set = TransformSet::new();
+
+    // ASCII cannot contain any strip/NFKC/skeleton target. Avoid three full
+    // Unicode passes (including two hash-map lookups per scalar) on ordinary
+    // large tool output; preserve the two ASCII transforms in their original
+    // order and only run them when their exact candidate byte is present.
+    if input.is_ascii() {
+        let mut text = input.to_string();
+        if input.as_bytes().contains(&b' ') {
+            let (collapsed, changed) = collapse_spaced_chars(&text);
+            if changed {
+                set.insert(Transform::WhitespaceCollapse);
+                text = collapsed;
+            }
+        }
+        if input
+            .bytes()
+            .any(|byte| matches!(byte, b'1' | b'0' | b'3' | b'@' | b'$' | b'!'))
+        {
+            let (leeted, changed) = leet_fold(&text);
+            if changed {
+                set.insert(Transform::Leet);
+                text = leeted;
+            }
+        }
+        return (text, set);
+    }
+
     let mut text = input.to_string();
 
     let stripped = crate::extract::strip_invisible(&text);
@@ -509,6 +536,99 @@ const MIN_BASE64_CANDIDATE_LEN: usize = 16;
 /// Minimum length of a contiguous hex candidate run (must be even).
 const MIN_HEX_CANDIDATE_LEN: usize = 8;
 
+/// Advance `cursor` to the next Base64-shaped run the decoder would spend a
+/// candidate on. Keeping the run walk in one helper prevents the outer MCP work
+/// estimator from drifting from the actual decoder's `=` and length semantics.
+fn next_base64_candidate(bytes: &[u8], cursor: &mut usize) -> Option<Range<usize>> {
+    while *cursor < bytes.len() {
+        if !is_base64_byte(bytes[*cursor]) || bytes[*cursor] == b'=' {
+            *cursor += 1;
+            continue;
+        }
+        let start = *cursor;
+        while *cursor < bytes.len() && is_base64_byte(bytes[*cursor]) {
+            *cursor += 1;
+        }
+        if *cursor - start >= MIN_BASE64_CANDIDATE_LEN {
+            return Some(start..*cursor);
+        }
+    }
+    None
+}
+
+/// Advance `cursor` to the next even-prefix hexadecimal run the decoder would
+/// spend a candidate on. The cursor consumes an odd trailing nibble exactly as
+/// [`hex_forms`] does, while the returned range excludes it.
+fn next_hex_candidate(bytes: &[u8], cursor: &mut usize) -> Option<Range<usize>> {
+    while *cursor < bytes.len() {
+        if !bytes[*cursor].is_ascii_hexdigit() {
+            *cursor += 1;
+            continue;
+        }
+        let start = *cursor;
+        while *cursor < bytes.len() && bytes[*cursor].is_ascii_hexdigit() {
+            *cursor += 1;
+        }
+        let even_end = *cursor - ((*cursor - start) % 2);
+        if even_end - start >= MIN_HEX_CANDIDATE_LEN {
+            return Some(start..even_end);
+        }
+    }
+    None
+}
+
+/// Count the potential Base64/hex decode attempts across the same
+/// alphabet-preserving variants used by [`normalized_forms_with_status`],
+/// stopping at `cap`. This deliberately does not decode: streaming callers use
+/// it to bound cumulative candidate-heavy endpoint work before invoking the
+/// full normalizer. Counting both run classes mirrors [`decode_pass`]; counting
+/// transformed variants prevents invisible/NFKC/skeleton text from bypassing
+/// that outer work budget.
+pub(crate) fn decode_candidate_work_capped(input: &str, cap: usize) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+
+    fn count_pass(text: &str, cap: usize, count: &mut usize) {
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        while *count < cap && next_base64_candidate(bytes, &mut i).is_some() {
+            *count += 1;
+        }
+
+        let mut i = 0usize;
+        while *count < cap && next_hex_candidate(bytes, &mut i).is_some() {
+            *count += 1;
+        }
+    }
+
+    let mut count = 0usize;
+    count_pass(input, cap, &mut count);
+    if count >= cap || input.is_ascii() {
+        return count;
+    }
+
+    let mut variant = crate::extract::strip_invisible(input);
+    if variant != input {
+        count_pass(&variant, cap, &mut count);
+    }
+    if count >= cap {
+        return count;
+    }
+    if !variant.nfkc().eq(variant.chars()) {
+        variant = variant.nfkc().collect();
+        count_pass(&variant, cap, &mut count);
+    }
+    if count >= cap {
+        return count;
+    }
+    let (skeletoned, skeleton_changed) = skeleton_fold(&variant);
+    if skeleton_changed {
+        count_pass(&skeletoned, cap, &mut count);
+    }
+    count
+}
+
 /// Scan `input` for contiguous base64-shaped runs (>= 16 alphabet chars) and emit
 /// a decode-derived [`NormalizedForm`] for each whose decode has recoverable
 /// printable text ([`recover_printable_text`]). The recovered text is itself passed
@@ -531,27 +651,12 @@ fn base64_forms(
     budget: &mut DecodeBudget,
 ) -> (Vec<NormalizedForm>, bool) {
     let bytes = input.as_bytes();
-    let n = bytes.len();
     let mut forms = Vec::new();
     let mut truncated = false;
     let mut i = 0;
 
-    while i < n {
-        if !is_base64_byte(bytes[i]) || bytes[i] == b'=' {
-            // A run cannot start on padding.
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < n && is_base64_byte(bytes[i]) {
-            i += 1;
-        }
-        let end = i;
-        let run = &input[start..end];
-        // Length floor uses the run length (ASCII bytes == chars here).
-        if run.len() < MIN_BASE64_CANDIDATE_LEN {
-            continue;
-        }
+    while let Some(range) = next_base64_candidate(bytes, &mut i) {
+        let run = &input[range.clone()];
         // A whole run made from one repeated alphabet byte is completely
         // characterized without decoding every quartet: its decoded bytes
         // are one fixed three-byte cycle, so it cannot conceal a later,
@@ -580,7 +685,7 @@ fn base64_forms(
                 transforms.insert(Transform::Base64Decode);
                 forms.push(NormalizedForm {
                     text: normalized,
-                    source_range: record_range.then_some(start..end),
+                    source_range: record_range.then_some(range),
                     transforms,
                 });
             }
@@ -607,31 +712,12 @@ fn hex_forms(
     budget: &mut DecodeBudget,
 ) -> (Vec<NormalizedForm>, bool) {
     let bytes = input.as_bytes();
-    let n = bytes.len();
     let mut forms = Vec::new();
     let mut truncated = false;
     let mut i = 0;
 
-    let is_hex = |b: u8| b.is_ascii_hexdigit();
-
-    while i < n {
-        if !is_hex(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < n && is_hex(bytes[i]) {
-            i += 1;
-        }
-        let mut end = i;
-        // Decode only an even-length prefix (drop a trailing odd nibble).
-        if (end - start) % 2 != 0 {
-            end -= 1;
-        }
-        if end - start < MIN_HEX_CANDIDATE_LEN {
-            continue;
-        }
-        let run = &input[start..end];
+    while let Some(range) = next_hex_candidate(bytes, &mut i) {
+        let run = &input[range.clone()];
         let Some(max_decoded) = budget.spend_candidate() else {
             // The candidate/cumulative budget is exhausted before every hex run
             // was decoded.
@@ -648,7 +734,7 @@ fn hex_forms(
                 transforms.insert(Transform::HexDecode);
                 forms.push(NormalizedForm {
                     text: normalized,
-                    source_range: record_range.then_some(start..end),
+                    source_range: record_range.then_some(range),
                     transforms,
                 });
             }
@@ -670,45 +756,12 @@ fn hex_forms(
 /// decode. Decoding + seed matching still happen in `check_with` at tier 3.
 pub fn has_encoded_blob(input: &str) -> bool {
     let bytes = input.as_bytes();
-    let n = bytes.len();
-
-    // Base64-shaped run: a run cannot start on `=` padding (mirrors `base64_forms`).
     let mut i = 0;
-    while i < n {
-        if !is_base64_byte(bytes[i]) || bytes[i] == b'=' {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < n && is_base64_byte(bytes[i]) {
-            i += 1;
-        }
-        if i - start >= MIN_BASE64_CANDIDATE_LEN {
-            return true;
-        }
+    if next_base64_candidate(bytes, &mut i).is_some() {
+        return true;
     }
-
-    // Hex run: count the even-length prefix (mirrors `hex_forms`).
     let mut i = 0;
-    while i < n {
-        if !bytes[i].is_ascii_hexdigit() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < n && bytes[i].is_ascii_hexdigit() {
-            i += 1;
-        }
-        let mut len = i - start;
-        if len % 2 != 0 {
-            len -= 1;
-        }
-        if len >= MIN_HEX_CANDIDATE_LEN {
-            return true;
-        }
-    }
-
-    false
+    next_hex_candidate(bytes, &mut i).is_some()
 }
 
 /// Cheap, short-circuiting pre-check: `true` when [`normalized_forms`] COULD
@@ -841,17 +894,19 @@ pub fn normalized_forms_with_status(input: &str) -> NormalizationResult {
     // changed the text, and the text dedup below drops any forms these
     // duplicate. All passes share the one `budget`, so the extra variants cannot
     // multiply decode work beyond the per-input bounds.
-    let mut variant = crate::extract::strip_invisible(input);
-    if variant != input {
-        decode_pass(&variant, false, &mut budget, &mut forms, &mut incomplete);
-    }
-    if !variant.nfkc().eq(variant.chars()) {
-        variant = variant.nfkc().collect();
-        decode_pass(&variant, false, &mut budget, &mut forms, &mut incomplete);
-    }
-    let (skeletoned, skeleton_changed) = skeleton_fold(&variant);
-    if skeleton_changed {
-        decode_pass(&skeletoned, false, &mut budget, &mut forms, &mut incomplete);
+    if !input.is_ascii() {
+        let mut variant = crate::extract::strip_invisible(input);
+        if variant != input {
+            decode_pass(&variant, false, &mut budget, &mut forms, &mut incomplete);
+        }
+        if !variant.nfkc().eq(variant.chars()) {
+            variant = variant.nfkc().collect();
+            decode_pass(&variant, false, &mut budget, &mut forms, &mut incomplete);
+        }
+        let (skeletoned, skeleton_changed) = skeleton_fold(&variant);
+        if skeleton_changed {
+            decode_pass(&skeletoned, false, &mut budget, &mut forms, &mut incomplete);
+        }
     }
 
     // Dedup on the form TEXT; keep first occurrence (insertion order), which
@@ -1180,6 +1235,42 @@ mod tests {
         assert!(has_encoded_blob(&format!("payload {hex}")));
         // A hex run under the floor (6 chars) is not.
         assert!(!has_encoded_blob("color #abcdef done"));
+    }
+
+    #[test]
+    fn decode_candidate_work_uses_the_decoder_run_semantics() {
+        // Leading padding is not a run start; interior padding stays in the
+        // Base64-shaped run. Neither shape is double-counted by a changed
+        // Unicode stage.
+        assert_eq!(decode_candidate_work_capped("=QQQQQQQQQQQQQQQQ", 10), 1);
+        assert_eq!(decode_candidate_work_capped("QUJDQUJD=QUJDQUJD", 10), 1);
+
+        // Odd hex runs decode only their even prefix, and a 16-byte hex run is
+        // independently attempted by both the Base64 and hex decoders.
+        assert_eq!(decode_candidate_work_capped("deadbeef0", 10), 1);
+        assert_eq!(decode_candidate_work_capped("deadbeefdeadbeef", 10), 2);
+
+        // The estimator is capped without walking later runs.
+        assert_eq!(
+            decode_candidate_work_capped("QQQQQQQQQQQQQQQQ RRRRRRRRRRRRRRRR", 1),
+            1
+        );
+    }
+
+    #[test]
+    fn decode_candidate_work_counts_alphabet_preserving_unicode_stages_once() {
+        let encoded = "QUJDQUJDQUJDQUJD";
+        let laced = format!("{}\u{200B}{}", &encoded[..8], &encoded[8..]);
+        assert_eq!(decode_candidate_work_capped(&laced, 10), 1);
+
+        // Fullwidth Q becomes ASCII under NFKC. Cyrillic capital A remains
+        // unchanged under NFKC and becomes ASCII only in the skeleton stage.
+        assert_eq!(decode_candidate_work_capped(&"Ｑ".repeat(16), 10), 1);
+        assert_eq!(decode_candidate_work_capped(&"А".repeat(16), 10), 2);
+
+        // Plain ASCII has no derived decode passes, so the hot path charges the
+        // raw run once and returns before allocating Unicode variants.
+        assert_eq!(decode_candidate_work_capped(encoded, 10), 1);
     }
 
     #[test]

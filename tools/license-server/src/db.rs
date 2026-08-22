@@ -116,6 +116,16 @@ enum EventTimestampError {
     Stale,
 }
 
+/// Whether a `subscription.updated` new-status revokes the API key, matching
+/// the status side-effect match in `process_subscription_updated`: `active`
+/// unrevokes, `canceled` leaves the key until period end, and everything else
+/// (`past_due`, `revoked`, and any unknown status handled defensively) revokes.
+/// A dropped update of a revoking status keeps paid access open, so those are
+/// the ones worth dead-lettering when they cannot be ordered.
+fn status_revokes(new_status: &str) -> bool {
+    !matches!(new_status, "active" | "canceled")
+}
+
 /// Validate an event timestamp and compare it to the row version observed in
 /// the same transaction. A missing or unparseable timestamp is never allowed to
 /// carry a lifecycle side effect, and an unparseable legacy row fails closed
@@ -627,6 +637,43 @@ impl Db {
                         ?reason,
                         "subscription update did not carry a provably newer timestamp; state unchanged"
                     );
+                    // The same hazard the revoked path guards against reaches
+                    // here too: `past_due` (and any unknown status) revokes the
+                    // API key below, so an unorderable-timestamp update that
+                    // would revoke is a dropped revocation that keeps paid
+                    // access open. `Stale` is an ordinary non-advance and is
+                    // fine to decline; the other variants could not be ordered
+                    // at all, so a would-revoke update is recorded for the
+                    // dead-letter retry tooling rather than only warned.
+                    if !matches!(reason, EventTimestampError::Stale)
+                        && status_revokes(&data.new_status)
+                    {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO dead_letter \
+                             (event_id, subscription_id, event_type, reason, occurred_at, payload) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                data.event_id,
+                                data.subscription_id,
+                                data.event_type,
+                                format!("unorderable revoking update ({}): {reason:?}", data.new_status),
+                                data.occurred_at,
+                                serde_json::json!({
+                                    "subscription_id": data.subscription_id,
+                                    "customer_id": data.customer_id,
+                                    "email": data.email,
+                                    "tier": data.tier,
+                                    "product_id": data.product_id,
+                                    "new_status": data.new_status,
+                                    "occurred_at": data.occurred_at,
+                                })
+                                .to_string(),
+                            ],
+                        )
+                        .map_err(|e| {
+                            AppError::Internal(format!("db dead-letter update: {e}"))
+                        })?;
+                    }
                     tx.execute(
                         "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
                         params![data.event_id, data.event_type],
@@ -913,13 +960,22 @@ impl Db {
             let conn = acquire_db(&conn);
             let inserted = conn
                 .execute(
+                    // A token whose created_at cannot be parsed (a malformed or
+                    // legacy value) makes strftime return NULL. Comparing NULL
+                    // would make the row fall OUT of the recency window and let
+                    // the rate-limited insert through, which is fail-open. Treat
+                    // an unparseable created_at as within the window instead, so
+                    // an existing token still blocks a new one: fail closed.
                     "INSERT INTO tokens (subscription_id, token, expires_at)
                      SELECT ?1, ?2, ?3
                      WHERE NOT EXISTS (
                        SELECT 1 FROM tokens
                        WHERE subscription_id=?1
-                         AND CAST(strftime('%s', created_at) AS INTEGER)
-                             > unixepoch('now') - ?4
+                         AND (
+                           strftime('%s', created_at) IS NULL
+                           OR CAST(strftime('%s', created_at) AS INTEGER)
+                              > unixepoch('now') - ?4
+                         )
                      )",
                     params![sid, tok, expires_at, min_interval_secs],
                 )
@@ -1274,6 +1330,108 @@ mod tests {
         (status, revoked)
     }
 
+    /// Rows in the dead-letter table, as (event_type, reason), for assertions.
+    fn dead_letter_rows(db: &Db) -> Vec<(String, String)> {
+        let conn = db.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT event_type, reason FROM dead_letter ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    }
+
+    #[tokio::test]
+    async fn unorderable_past_due_update_is_dead_lettered() {
+        // `past_due` revokes the API key. An update that cannot be ordered
+        // (here a missing timestamp) is declined so state is unchanged, but the
+        // dropped revocation must be recorded, exactly as the revoked path does,
+        // or a lapsed subscriber keeps a working key with no trace.
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        past_due.occurred_at = None; // Missing -> unorderable, not Stale
+        let outcome = db.process_subscription_updated(past_due).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::StaleIgnored);
+
+        let rows = dead_letter_rows(&db);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a dropped revoking update must be dead-lettered"
+        );
+        assert_eq!(rows[0].0, "subscription.past_due");
+        assert!(rows[0].1.contains("unorderable"), "{}", rows[0].1);
+        // State genuinely unchanged: still active from the created event.
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "active");
+        assert_eq!(revoked, Some(false));
+    }
+
+    #[tokio::test]
+    async fn unorderable_active_update_is_not_dead_lettered() {
+        // `active` does not revoke, so a dropped one keeps no paid access open;
+        // dead-lettering it would be noise. Only revoking updates are recorded.
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        let mut active = make_updated("evt_2", "sub_1", "active");
+        active.occurred_at = Some("not-a-timestamp".to_string()); // InvalidIncoming
+        let outcome = db.process_subscription_updated(active).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::StaleIgnored);
+        assert!(dead_letter_rows(&db).is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_revoking_update_is_not_dead_lettered() {
+        // Stale is an ordinary non-advance: the stored state is already at or
+        // past this event, so declining it is correct and not a dropped action.
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        // Older than the created event's 2024-01-01 -> Stale, not unorderable.
+        past_due.occurred_at = Some("2023-01-01T00:00:00Z".to_string());
+        let outcome = db.process_subscription_updated(past_due).await.unwrap();
+        assert_eq!(outcome, UpdatedOutcome::StaleIgnored);
+        assert!(
+            dead_letter_rows(&db).is_empty(),
+            "a Stale non-advance must not be dead-lettered"
+        );
+    }
+
+    #[tokio::test]
+    async fn unorderable_revoked_event_is_dead_lettered_but_stale_is_not() {
+        // Pins the revoked path the update path now mirrors: Missing/Invalid ->
+        // dead-letter, Stale -> not.
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut unorderable = make_revoked("evt_2", "sub_1");
+        unorderable.occurred_at = None;
+        assert!(!db.process_subscription_revoked(unorderable).await.unwrap());
+        assert_eq!(dead_letter_rows(&db).len(), 1);
+
+        let mut stale = make_revoked("evt_3", "sub_1");
+        stale.occurred_at = Some("2023-01-01T00:00:00Z".to_string());
+        assert!(!db.process_subscription_revoked(stale).await.unwrap());
+        assert_eq!(
+            dead_letter_rows(&db).len(),
+            1,
+            "a Stale revoked event must not add a second dead-letter row"
+        );
+    }
+
     #[tokio::test]
     async fn test_provision_creates_key_and_token() {
         let db = test_db();
@@ -1318,6 +1476,41 @@ mod tests {
             winners += usize::from(task.await.unwrap());
         }
         assert_eq!(winners, 1, "parallel refreshes must have one winner");
+        assert_eq!(db.count_tokens_for_subscription("sub_1"), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_fails_closed_on_an_unparseable_created_at() {
+        // A token row whose created_at cannot be parsed used to fall out of the
+        // recency window and let a second token through (fail-open). It must now
+        // count as recent and block the second insert.
+        let db = test_db();
+        // tokens.subscription_id has a foreign key to subscriptions, so seed one.
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        db.delete_tokens_for_subscription("sub_1"); // start from a clean token slate
+        assert!(
+            db.insert_refresh_token_if_due("sub_1", "tok-1", 9_999_999_999, 60)
+                .await
+                .unwrap(),
+            "the first token is inserted"
+        );
+        // Corrupt the stored created_at so strftime('%s', ...) returns NULL.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tokens SET created_at='not-a-timestamp' WHERE subscription_id='sub_1'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            !db.insert_refresh_token_if_due("sub_1", "tok-2", 9_999_999_999, 60)
+                .await
+                .unwrap(),
+            "an existing token with an unparseable created_at must still rate-limit"
+        );
         assert_eq!(db.count_tokens_for_subscription("sub_1"), 1);
     }
 

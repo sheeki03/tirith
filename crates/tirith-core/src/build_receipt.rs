@@ -48,10 +48,9 @@
 //! `artifact::resolver::attest_pip_trees` binding (domain-separated prefix,
 //! caps folded into the digest, sorted length-prefixed relative paths, mode,
 //! size, no-follow open, post-open re-stat, exact-length read plus a one-byte
-//! grow probe) but is cross-platform, built on
-//! [`crate::util::open_read_no_follow_capped`] rather than raw `libc`, and adds
-//! the case/Unicode collision check and the explicit exclusion set the build
-//! surface needs.
+//! grow probe) but is cross-platform, built on retained directory capabilities,
+//! and adds the case/Unicode collision check and the explicit exclusion set the
+//! build surface needs.
 //!
 //! Every failure is a REFUSAL, never a skip. A digest over a tree that was
 //! silently partial would be a receipt that says something false about bytes.
@@ -62,7 +61,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::command_card::sha256_hex;
-use crate::util::{open_read_no_follow_capped, HashOutcome, OpenRegularError};
+use crate::util::dirfd::{file_identity, ChildError, DirCapability, EntryKind, FileIdentity};
+use crate::util::{open_read_no_follow_capped, ContainedAtomicFile, HashOutcome, OpenRegularError};
 
 /// Schema version of [`BuildReceipt`]. Bumped when a field is added or its
 /// meaning changes.
@@ -252,6 +252,7 @@ impl ModeModel {
 /// looser caps can never be compared against one taken under tighter caps and
 /// silently agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeLimits {
     pub max_files: usize,
     pub max_bytes: u64,
@@ -270,8 +271,53 @@ impl Default for TreeLimits {
     }
 }
 
+impl TreeLimits {
+    /// Enforce the schema's hard ceilings before any walk can allocate, recurse,
+    /// or read according to caller- or receipt-supplied values.
+    fn validate_for_scan(self) -> Result<(), String> {
+        for (name, value) in [
+            ("max_files", self.max_files),
+            ("max_depth", self.max_depth),
+            ("max_path_bytes", self.max_path_bytes),
+        ] {
+            if value == 0 {
+                return Err(format!("{name} must be greater than zero"));
+            }
+        }
+        if self.max_bytes == 0 {
+            return Err("max_bytes must be greater than zero".to_string());
+        }
+        if self.max_files > MAX_TREE_FILES {
+            return Err(format!(
+                "max_files {} exceeds the schema cap {MAX_TREE_FILES}",
+                self.max_files
+            ));
+        }
+        if self.max_bytes > MAX_TREE_BYTES {
+            return Err(format!(
+                "max_bytes {} exceeds the schema cap {MAX_TREE_BYTES}",
+                self.max_bytes
+            ));
+        }
+        if self.max_depth > MAX_TREE_DEPTH {
+            return Err(format!(
+                "max_depth {} exceeds the schema cap {MAX_TREE_DEPTH}",
+                self.max_depth
+            ));
+        }
+        if self.max_path_bytes > MAX_RELATIVE_PATH_BYTES {
+            return Err(format!(
+                "max_path_bytes {} exceeds the schema cap {MAX_RELATIVE_PATH_BYTES}",
+                self.max_path_bytes
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One regular file, as bound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeFile {
     /// The `/`-normalized path relative to the scanned root.
     pub path: String,
@@ -348,6 +394,7 @@ impl TreeScan {
 
 /// The digest of one tree plus the shape that produced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeDigest {
     pub digest: String,
     pub file_count: usize,
@@ -421,25 +468,29 @@ const TREE_DIGEST_TAG: &[u8] = b"tirith-build-tree-v1\0";
 /// One entry as observed by the walk, before it is hashed.
 struct WalkEntry {
     relative: String,
-    path: PathBuf,
     directory: bool,
     mode: u32,
     size: u64,
     /// The filesystem identity the walk saw, re-checked through the open handle.
-    /// `None` when the platform cannot report one from both sides.
-    identity: Option<FileIdentity>,
+    identity: FileIdentity,
 }
 
-/// The pair a scan compares to prove the handle it opened is the entry it
-/// measured.
-///
-/// Unix reports `(st_dev, st_ino)`, which is exact identity. Windows has no
-/// stable identity pair in std (`volume_serial_number` and `file_index` are both
-/// behind the unstable `windows_by_handle` feature), so it reports the creation
-/// and last-write timestamps instead: weaker, but still something a decoy inode
-/// renamed over the name does not reproduce. Both sides are `Option` so a
-/// platform that reports nothing is skipped rather than guessed at.
-type FileIdentity = (u64, u64);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryEntrySnapshot {
+    name: String,
+    kind: EntryKind,
+}
+
+/// One complete retained-directory listing captured before file hashing.
+/// Re-enumerating the same capability-relative directory after hashing requires
+/// the projected name/kind set to match at both scan boundaries.
+struct DirectorySnapshot {
+    relative: String,
+    mode: u32,
+    identity: FileIdentity,
+    entries: Vec<DirectoryEntrySnapshot>,
+    raw_entry_count: usize,
+}
 
 /// Bind `root` into a deterministic digest over sorted relative paths, modes,
 /// sizes, and file contents.
@@ -458,17 +509,44 @@ pub fn scan_tree(
     pruned: PrunedNames,
     limits: TreeLimits,
 ) -> Result<TreeScan, TreeScanError> {
-    let metadata = std::fs::symlink_metadata(root)
-        .map_err(|error| TreeScanError::RootUnusable(error.to_string()))?;
-    if metadata.file_type().is_symlink() {
-        return Err(TreeScanError::Symlink(root.display().to_string()));
-    }
-    if !metadata.is_dir() {
-        return Err(TreeScanError::RootUnusable(
-            "the tree root is not a directory".to_string(),
-        ));
-    }
+    let root_capability = DirCapability::open_root(root).map_err(|error| match error {
+        ChildError::Symlink => TreeScanError::Symlink(root.display().to_string()),
+        ChildError::NotADirectory => {
+            TreeScanError::RootUnusable("the tree root is not a directory".to_string())
+        }
+        ChildError::UnsafeName => {
+            TreeScanError::RootUnusable("the tree root has an unsafe name".to_string())
+        }
+        ChildError::Io(error) => TreeScanError::RootUnusable(error.to_string()),
+    })?;
+    scan_tree_from_capability(&root_capability, exclusions, pruned, limits)
+}
 
+/// Complete a tree scan through an already retained root. Kept separate from
+/// [`scan_tree`] so adversarial tests can replace the visible root after the
+/// capability is acquired and prove no later operation follows it.
+fn scan_tree_from_capability(
+    root: &DirCapability,
+    exclusions: &[String],
+    pruned: PrunedNames,
+    limits: TreeLimits,
+) -> Result<TreeScan, TreeScanError> {
+    scan_tree_from_capability_after_walk(root, exclusions, pruned, limits, || {})
+}
+
+/// Internal seam used by adversarial tests to mutate a tree after every initial
+/// directory listing but before any deferred file hash. Production calls supply
+/// a no-op closure through [`scan_tree_from_capability`].
+fn scan_tree_from_capability_after_walk(
+    root: &DirCapability,
+    exclusions: &[String],
+    pruned: PrunedNames,
+    limits: TreeLimits,
+    after_walk: impl FnOnce(),
+) -> Result<TreeScan, TreeScanError> {
+    limits
+        .validate_for_scan()
+        .map_err(TreeScanError::CapExceeded)?;
     let mut normalized_exclusions: Vec<String> = exclusions
         .iter()
         .map(|value| value.trim_matches('/').to_string())
@@ -485,88 +563,20 @@ pub fn scan_tree(
         .map(|value| format!("{value}/"))
         .collect();
 
-    let mut entries: Vec<WalkEntry> = Vec::new();
-    let mut pruned_paths: Vec<String> = Vec::new();
-    // Depth-first over an explicit stack, so a hostile tree bounds the retained
-    // state by depth rather than by the widest directory.
-    let mut pending: Vec<(String, PathBuf, usize)> = vec![(String::new(), root.to_path_buf(), 0)];
-    while let Some((relative_dir, directory, depth)) = pending.pop() {
-        let reader = std::fs::read_dir(&directory).map_err(|error| {
-            TreeScanError::Io(format!("{}: {error}", display_relative(&relative_dir)))
-        })?;
-        for entry in reader {
-            let entry = entry.map_err(|error| {
-                TreeScanError::Io(format!("{}: {error}", display_relative(&relative_dir)))
-            })?;
-            let raw_name = entry.file_name();
-            let Some(name) = raw_name.to_str() else {
-                return Err(TreeScanError::NonUtf8Path(display_relative(&relative_dir)));
-            };
-            let relative = push_relative(&relative_dir, name);
-            if pruned.prunes(name) {
-                // Recorded rather than dropped: the digest folds this list, so a
-                // subtree removed by the name rule still moves the digest when it
-                // appears or disappears, and the scan can report what it removed.
-                if relative.len() > limits.max_path_bytes {
-                    return Err(TreeScanError::PathTooLong(relative));
-                }
-                pruned_paths.push(relative);
-                continue;
-            }
-            if normalized_exclusions.contains(&relative)
-                || exclusion_prefixes
-                    .iter()
-                    .any(|prefix| relative.starts_with(prefix.as_str()))
-            {
-                continue;
-            }
-            if relative.len() > limits.max_path_bytes {
-                return Err(TreeScanError::PathTooLong(relative));
-            }
-            let path = directory.join(name);
-            let metadata = std::fs::symlink_metadata(&path)
-                .map_err(|error| TreeScanError::Io(format!("{relative}: {error}")))?;
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
-                return Err(TreeScanError::Symlink(relative));
-            }
-            if entries.len() >= limits.max_files {
-                return Err(TreeScanError::CapExceeded(format!(
-                    "more than {} entries",
-                    limits.max_files
-                )));
-            }
-            if file_type.is_dir() {
-                if depth + 1 > limits.max_depth {
-                    return Err(TreeScanError::CapExceeded(format!(
-                        "deeper than {} directories at {relative}",
-                        limits.max_depth
-                    )));
-                }
-                entries.push(WalkEntry {
-                    relative: relative.clone(),
-                    path: path.clone(),
-                    directory: true,
-                    mode: mode_of(&metadata),
-                    size: 0,
-                    identity: identity_of(&metadata),
-                });
-                pending.push((relative, path, depth + 1));
-                continue;
-            }
-            if !file_type.is_file() {
-                return Err(TreeScanError::UnsupportedEntry(relative));
-            }
-            entries.push(WalkEntry {
-                relative,
-                path,
-                directory: false,
-                mode: mode_of(&metadata),
-                size: metadata.len(),
-                identity: identity_of(&metadata),
-            });
-        }
-    }
+    let mut state = TreeWalkState {
+        limits,
+        normalized_exclusions: &normalized_exclusions,
+        exclusion_prefixes: &exclusion_prefixes,
+        pruned,
+        entries: Vec::new(),
+        pruned_paths: Vec::new(),
+        directories: Vec::new(),
+    };
+    walk_capability_directory(root, "", 0, &mut state)?;
+    after_walk();
+    let mut entries = state.entries;
+    let mut pruned_paths = state.pruned_paths;
+    let directories = state.directories;
 
     // Sorting by relative BYTES makes the digest independent of readdir order
     // and of any locale-sensitive comparison.
@@ -604,6 +614,7 @@ pub fn scan_tree(
     for entry in &entries {
         hasher.entry_header(entry.directory, &entry.relative, entry.mode);
         if entry.directory {
+            revalidate_bound_directory(root, entry)?;
             directory_count += 1;
             continue;
         }
@@ -615,13 +626,27 @@ pub fn scan_tree(
                 limits.max_bytes
             )));
         }
-        let digest = hash_bound_file(entry, &mut hasher)?;
+        let digest = hash_bound_file(root, entry, &mut hasher)?;
         files.push(TreeFile {
             path: entry.relative.clone(),
             sha256: digest,
             size: entry.size,
             mode: entry.mode,
         });
+    }
+
+    // The first walk and this second listing bracket every deferred file read.
+    // A clean digest therefore requires the projected name/kind set of every
+    // retained directory to remain quiescent across the complete hash pass.
+    for snapshot in &directories {
+        revalidate_directory_snapshot(
+            root,
+            snapshot,
+            &normalized_exclusions,
+            &exclusion_prefixes,
+            pruned,
+            limits.max_path_bytes,
+        )?;
     }
 
     Ok(TreeScan {
@@ -635,6 +660,330 @@ pub fn scan_tree(
         pruned: pruned_paths,
         files,
     })
+}
+
+struct TreeWalkState<'a> {
+    limits: TreeLimits,
+    normalized_exclusions: &'a [String],
+    exclusion_prefixes: &'a [String],
+    pruned: PrunedNames,
+    entries: Vec<WalkEntry>,
+    pruned_paths: Vec<String>,
+    directories: Vec<DirectorySnapshot>,
+}
+
+fn walk_capability_directory(
+    directory: &DirCapability,
+    relative_dir: &str,
+    depth: usize,
+    state: &mut TreeWalkState<'_>,
+) -> Result<(), TreeScanError> {
+    let directory_metadata = directory.metadata().map_err(|error| {
+        TreeScanError::Io(format!("{}: {error}", display_relative(relative_dir)))
+    })?;
+    if !directory_metadata.is_dir() {
+        return Err(TreeScanError::Changed(display_relative(relative_dir)));
+    }
+    let directory_identity = directory.identity().map_err(|error| {
+        TreeScanError::Io(format!("{}: {error}", display_relative(relative_dir)))
+    })?;
+    // Exact exclusions can account for at most one listed name apiece, and the
+    // only name-based prune rule can account for one more name in a directory.
+    // The extra slot lets the walker observe the first over-cap entry while the
+    // listing itself remains allocation-bounded.
+    let listing_cap = state
+        .limits
+        .max_files
+        .saturating_sub(state.entries.len())
+        .saturating_add(state.normalized_exclusions.len())
+        .saturating_add(2);
+    let (facts, truncated) = directory.read_entries(listing_cap).map_err(|error| {
+        TreeScanError::Io(format!("{}: {error}", display_relative(relative_dir)))
+    })?;
+    if truncated {
+        return Err(TreeScanError::CapExceeded(format!(
+            "more than {} entries",
+            state.limits.max_files
+        )));
+    }
+    let snapshot_entries = projected_directory_entries(
+        &facts,
+        relative_dir,
+        state.normalized_exclusions,
+        state.exclusion_prefixes,
+        state.pruned,
+        state.limits.max_path_bytes,
+    )?;
+    state.directories.push(DirectorySnapshot {
+        relative: relative_dir.to_string(),
+        mode: mode_of(&directory_metadata),
+        identity: directory_identity,
+        entries: snapshot_entries,
+        raw_entry_count: facts.len(),
+    });
+
+    for fact in facts {
+        let Some(name) = fact.name else {
+            return Err(TreeScanError::NonUtf8Path(display_relative(relative_dir)));
+        };
+        let relative = push_relative(relative_dir, &name);
+        if state.pruned.prunes(&name) {
+            if relative.len() > state.limits.max_path_bytes {
+                return Err(TreeScanError::PathTooLong(relative));
+            }
+            state.pruned_paths.push(relative);
+            continue;
+        }
+        if state.normalized_exclusions.contains(&relative)
+            || state
+                .exclusion_prefixes
+                .iter()
+                .any(|prefix| relative.starts_with(prefix.as_str()))
+        {
+            continue;
+        }
+        if relative.len() > state.limits.max_path_bytes {
+            return Err(TreeScanError::PathTooLong(relative));
+        }
+        if fact.kind == EntryKind::Symlink {
+            return Err(TreeScanError::Symlink(relative));
+        }
+        if fact.kind == EntryKind::Other {
+            return Err(TreeScanError::UnsupportedEntry(relative));
+        }
+        if state.entries.len() >= state.limits.max_files {
+            return Err(TreeScanError::CapExceeded(format!(
+                "more than {} entries",
+                state.limits.max_files
+            )));
+        }
+
+        match fact.kind {
+            EntryKind::Directory => {
+                if depth + 1 > state.limits.max_depth {
+                    return Err(TreeScanError::CapExceeded(format!(
+                        "deeper than {} directories at {relative}",
+                        state.limits.max_depth
+                    )));
+                }
+                let child = directory
+                    .open_child_directory(&name)
+                    .map_err(|error| map_child_directory_error(&relative, error))?;
+                let metadata = child
+                    .metadata()
+                    .map_err(|error| TreeScanError::Io(format!("{relative}: {error}")))?;
+                if !metadata.is_dir() {
+                    return Err(TreeScanError::Changed(relative));
+                }
+                state.entries.push(WalkEntry {
+                    relative: relative.clone(),
+                    directory: true,
+                    mode: mode_of(&metadata),
+                    size: 0,
+                    identity: child
+                        .identity()
+                        .map_err(|error| TreeScanError::Io(format!("{relative}: {error}")))?,
+                });
+                walk_capability_directory(&child, &relative, depth + 1, state)?;
+            }
+            EntryKind::RegularFile => {
+                let handle = directory
+                    .open_child_file(&name, state.limits.max_bytes)
+                    .map_err(|error| map_walk_file_error(&relative, error))?;
+                let metadata = handle
+                    .metadata()
+                    .map_err(|error| TreeScanError::Io(format!("{relative}: {error}")))?;
+                if !metadata.is_file() {
+                    return Err(TreeScanError::Changed(relative));
+                }
+                let identity = file_identity(&handle)
+                    .map_err(|error| TreeScanError::Io(format!("{relative}: {error}")))?;
+                state.entries.push(WalkEntry {
+                    relative,
+                    directory: false,
+                    mode: mode_of(&metadata),
+                    size: metadata.len(),
+                    identity,
+                });
+            }
+            EntryKind::Symlink | EntryKind::Other => unreachable!("handled above"),
+        }
+    }
+    Ok(())
+}
+
+fn projected_directory_entries(
+    facts: &[crate::util::dirfd::DirEntryFacts],
+    relative_dir: &str,
+    normalized_exclusions: &[String],
+    exclusion_prefixes: &[String],
+    pruned: PrunedNames,
+    max_path_bytes: usize,
+) -> Result<Vec<DirectoryEntrySnapshot>, TreeScanError> {
+    let mut entries = Vec::with_capacity(facts.len());
+    for fact in facts {
+        let Some(name) = fact.name.as_deref() else {
+            return Err(TreeScanError::NonUtf8Path(display_relative(relative_dir)));
+        };
+        let relative = push_relative(relative_dir, name);
+        if pruned.prunes(name) {
+            if relative.len() > max_path_bytes {
+                return Err(TreeScanError::PathTooLong(relative));
+            }
+            entries.push(DirectoryEntrySnapshot {
+                name: name.to_string(),
+                kind: fact.kind,
+            });
+            continue;
+        }
+        if normalized_exclusions.contains(&relative)
+            || exclusion_prefixes
+                .iter()
+                .any(|prefix| relative.starts_with(prefix.as_str()))
+        {
+            continue;
+        }
+        if relative.len() > max_path_bytes {
+            return Err(TreeScanError::PathTooLong(relative));
+        }
+        entries.push(DirectoryEntrySnapshot {
+            name: name.to_string(),
+            kind: fact.kind,
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.name
+            .as_bytes()
+            .cmp(right.name.as_bytes())
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    Ok(entries)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn revalidate_directory_snapshot(
+    root: &DirCapability,
+    snapshot: &DirectorySnapshot,
+    normalized_exclusions: &[String],
+    exclusion_prefixes: &[String],
+    pruned: PrunedNames,
+    max_path_bytes: usize,
+) -> Result<(), TreeScanError> {
+    if snapshot.relative.is_empty() {
+        return revalidate_directory_snapshot_handle(
+            root,
+            snapshot,
+            normalized_exclusions,
+            exclusion_prefixes,
+            pruned,
+            max_path_bytes,
+        );
+    }
+    let directory = root
+        .open_descendant_directory(&snapshot.relative)
+        .map_err(|error| map_child_directory_error(&snapshot.relative, error))?;
+    revalidate_directory_snapshot_handle(
+        &directory,
+        snapshot,
+        normalized_exclusions,
+        exclusion_prefixes,
+        pruned,
+        max_path_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn revalidate_directory_snapshot_handle(
+    directory: &DirCapability,
+    snapshot: &DirectorySnapshot,
+    normalized_exclusions: &[String],
+    exclusion_prefixes: &[String],
+    pruned: PrunedNames,
+    max_path_bytes: usize,
+) -> Result<(), TreeScanError> {
+    let display = display_relative(&snapshot.relative);
+    let metadata = directory
+        .metadata()
+        .map_err(|error| TreeScanError::Io(format!("{display}: {error}")))?;
+    let identity = directory
+        .identity()
+        .map_err(|error| TreeScanError::Io(format!("{display}: {error}")))?;
+    if !metadata.is_dir() || mode_of(&metadata) != snapshot.mode || identity != snapshot.identity {
+        return Err(TreeScanError::Changed(display));
+    }
+
+    // Permit every declared exclusion to materialize plus the one name-based
+    // prune without letting concurrent additions allocate an unbounded second
+    // listing. One further slot is enough to observe an unprojected addition.
+    let listing_cap = snapshot
+        .raw_entry_count
+        .saturating_add(normalized_exclusions.len())
+        .saturating_add(2);
+    let (facts, truncated) = directory
+        .read_entries(listing_cap)
+        .map_err(|error| TreeScanError::Io(format!("{display}: {error}")))?;
+    if truncated {
+        return Err(TreeScanError::Changed(display));
+    }
+    let entries = projected_directory_entries(
+        &facts,
+        &snapshot.relative,
+        normalized_exclusions,
+        exclusion_prefixes,
+        pruned,
+        max_path_bytes,
+    )?;
+    if entries != snapshot.entries {
+        return Err(TreeScanError::Changed(display));
+    }
+    Ok(())
+}
+
+fn map_child_directory_error(relative: &str, error: ChildError) -> TreeScanError {
+    match error {
+        ChildError::Symlink => TreeScanError::Symlink(relative.to_string()),
+        ChildError::NotADirectory | ChildError::UnsafeName => {
+            TreeScanError::Changed(relative.to_string())
+        }
+        ChildError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            TreeScanError::Changed(relative.to_string())
+        }
+        ChildError::Io(error) => TreeScanError::Io(format!("{relative}: {error}")),
+    }
+}
+
+fn map_walk_file_error(relative: &str, error: OpenRegularError) -> TreeScanError {
+    match error {
+        OpenRegularError::NotFound | OpenRegularError::NotRegularFile => {
+            TreeScanError::Changed(relative.to_string())
+        }
+        OpenRegularError::TooLarge => {
+            TreeScanError::CapExceeded(format!("{relative} is larger than the per-tree byte cap"))
+        }
+        OpenRegularError::Io(error) => TreeScanError::Io(format!("{relative}: {error}")),
+    }
+}
+
+fn revalidate_bound_directory(
+    root: &DirCapability,
+    entry: &WalkEntry,
+) -> Result<(), TreeScanError> {
+    let directory = root
+        .open_descendant_directory(&entry.relative)
+        .map_err(|error| map_child_directory_error(&entry.relative, error))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| TreeScanError::Io(format!("{}: {error}", entry.relative)))?;
+    if !metadata.is_dir() || mode_of(&metadata) != entry.mode {
+        return Err(TreeScanError::Changed(entry.relative.clone()));
+    }
+    let opened_identity = directory
+        .identity()
+        .map_err(|error| TreeScanError::Io(format!("{}: {error}", entry.relative)))?;
+    if entry.identity != opened_identity {
+        return Err(TreeScanError::Changed(entry.relative.clone()));
+    }
+    Ok(())
 }
 
 /// Hash exactly the bytes the entry scan measured, refusing anything else.
@@ -652,11 +1001,15 @@ pub fn scan_tree(
 ///   must return EOF.
 /// - TRUNCATING: an early `read` of zero before the measured size is consumed is
 ///   a refusal, not a short digest.
-fn hash_bound_file(entry: &WalkEntry, tree: &mut DigestBuilder) -> Result<String, TreeScanError> {
+fn hash_bound_file(
+    root: &DirCapability,
+    entry: &WalkEntry,
+    tree: &mut DigestBuilder,
+) -> Result<String, TreeScanError> {
     use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
 
-    let mut handle = match open_read_no_follow_capped(&entry.path, entry.size) {
+    let mut handle = match root.open_descendant_file(&entry.relative, entry.size) {
         Ok(handle) => handle,
         Err(OpenRegularError::NotFound) => {
             return Err(TreeScanError::Changed(entry.relative.clone()))
@@ -677,14 +1030,10 @@ fn hash_bound_file(entry: &WalkEntry, tree: &mut DigestBuilder) -> Result<String
     if !opened.is_file() || opened.len() != entry.size || mode_of(&opened) != entry.mode {
         return Err(TreeScanError::Changed(entry.relative.clone()));
     }
-    // Compared only when BOTH sides reported one: on Windows std populates the
-    // volume/index pair for some metadata sources and not others, and treating
-    // "the platform did not say" as "the identity changed" would refuse honest
-    // trees rather than rebound ones.
-    if let (Some(walked), Some(opened)) = (entry.identity, identity_of(&opened)) {
-        if walked != opened {
-            return Err(TreeScanError::Changed(entry.relative.clone()));
-        }
+    let opened_identity = file_identity(&handle)
+        .map_err(|error| TreeScanError::Io(format!("{}: {error}", entry.relative)))?;
+    if entry.identity != opened_identity {
+        return Err(TreeScanError::Changed(entry.relative.clone()));
     }
 
     tree.size(entry.size);
@@ -785,31 +1134,6 @@ fn mode_of(metadata: &std::fs::Metadata) -> u32 {
     metadata.permissions().mode() & 0o7777
 }
 
-/// The exact `(st_dev, st_ino)` pair, which two different inodes cannot share.
-#[cfg(unix)]
-fn identity_of(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
-    use std::os::unix::fs::MetadataExt as _;
-    Some((metadata.dev(), metadata.ino()))
-}
-
-/// The creation and last-write timestamps.
-///
-/// Windows has no STABLE file-identity pair in std: `volume_serial_number` and
-/// `file_index` are both behind the unstable `windows_by_handle` feature, and
-/// this crate builds on stable. The timestamp pair is what is available, and it
-/// is a weaker claim honestly made: a decoy inode renamed over the name carries
-/// its own creation time, which the file the walk measured does not share.
-#[cfg(windows)]
-fn identity_of(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
-    use std::os::windows::fs::MetadataExt as _;
-    Some((metadata.creation_time(), metadata.last_write_time()))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn identity_of(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
-    None
-}
-
 #[cfg(not(unix))]
 fn mode_of(metadata: &std::fs::Metadata) -> u32 {
     // Windows has no permission bits. Projecting the read-only attribute keeps
@@ -844,6 +1168,7 @@ fn display_relative(relative: &str) -> String {
 
 /// One lockfile, as bound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LockfileDigest {
     pub name: String,
     pub sha256: String,
@@ -854,6 +1179,7 @@ pub struct LockfileDigest {
 /// receipt. NOT the build's toolchain: Tirith does not run the build and has no
 /// way to identify what did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolIdentity {
     /// The program NAME, never its path. A path names the operator's machine
     /// layout, and a receipt is a shareable document.
@@ -864,6 +1190,7 @@ pub struct ToolIdentity {
 
 /// The repository binding, when one could be established.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitBinding {
     /// The resolved `HEAD` commit, or `None` when git was unavailable or the
     /// root is not a repository. Never fabricated.
@@ -1164,6 +1491,7 @@ impl ExecutionVerdict {
 
 /// What the linked capsule receipt did and did not establish.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionLink {
     pub verdict: ExecutionVerdict,
     /// Whether a capsule receipt was asked for at all. Without it the honesty
@@ -1383,6 +1711,7 @@ pub fn load_capsule_receipt(
 
 /// What the receipt binds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildSubject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_tree: Option<TreeDigest>,
@@ -1421,6 +1750,7 @@ pub struct BuildSubject {
 
 /// What the run observed about itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildEvidence {
     pub tools: Vec<ToolIdentity>,
     pub execution: ExecutionLink,
@@ -1431,6 +1761,7 @@ pub struct BuildEvidence {
 
 /// What was and was not accounted for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildCoverage {
     pub source_scanned: bool,
     pub output_scanned: bool,
@@ -1448,6 +1779,7 @@ pub struct BuildCoverage {
 
 /// A content-addressed, optionally ed25519-signed build receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildReceipt {
     pub schema: u32,
     pub receipt_type: String,
@@ -1657,6 +1989,9 @@ impl BuildReceipt {
                 "a verified execution link requires a linked capsule receipt".to_string(),
             ));
         }
+        self.evidence.limits.validate_for_scan().map_err(|reason| {
+            BuildReceiptError::Invalid(format!("the tree limits are unsafe: {reason}"))
+        })?;
         // The manifest cap is a property of the schema, so a hand-written
         // document cannot carry a longer one and turn `attest deployment` into a
         // request amplifier.
@@ -1727,18 +2062,87 @@ impl BuildReceipt {
     /// longer stands up" (a finding the receipt itself must record). Collapsing
     /// the two would report a tampered receipt as a typo.
     pub fn load_unvalidated(path: &Path) -> Result<Self, BuildReceiptError> {
-        let bytes = crate::util::read_text_no_follow_capped(path, MAX_BUILD_RECEIPT_BYTES)
+        let destination = prepare_build_receipt_file(path)
             .map_err(|error| BuildReceiptError::Malformed(format!("{error:?}")))?;
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|error| BuildReceiptError::Malformed(error.to_string()))?;
-        parse_build_receipt_document(text)
+        load_build_receipt_from_capability(&destination)
     }
 
     /// Validate, then write the receipt atomically at mode 0600.
     pub fn write_to(&self, path: &Path) -> Result<(), BuildReceiptError> {
         self.validate()?;
-        crate::util::write_file_atomic_0600(path, self.to_json().as_bytes())
-            .map_err(BuildReceiptError::Io)
+        let destination = prepare_build_receipt_file(path).map_err(BuildReceiptError::Io)?;
+        write_build_receipt_to_capability(self, &destination)
+    }
+}
+
+/// Bind a receipt's existing parent once. The contained traversal permits only
+/// trusted system aliases (for example macOS `/var`) and refuses a symlink in a
+/// user-writable parent path; every later leaf read and publication is relative
+/// to the exact retained directory identity.
+fn prepare_build_receipt_file(path: &Path) -> std::io::Result<ContainedAtomicFile> {
+    let _name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "build receipt destination does not name a file",
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ContainedAtomicFile::prepare(parent, path, false)
+}
+
+fn load_build_receipt_from_capability(
+    destination: &ContainedAtomicFile,
+) -> Result<BuildReceipt, BuildReceiptError> {
+    let bytes = destination
+        .read_capped(MAX_BUILD_RECEIPT_BYTES)
+        .map_err(|error| BuildReceiptError::Malformed(format!("{error:?}")))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| BuildReceiptError::Malformed(error.to_string()))?;
+    parse_build_receipt_document(text)
+}
+
+fn write_build_receipt_to_capability(
+    receipt: &BuildReceipt,
+    destination: &ContainedAtomicFile,
+) -> Result<(), BuildReceiptError> {
+    receipt.validate()?;
+    let body = receipt.to_json();
+    if body.len() as u64 > MAX_BUILD_RECEIPT_BYTES {
+        return Err(BuildReceiptError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("build receipt exceeds the {MAX_BUILD_RECEIPT_BYTES}-byte publication cap"),
+        )));
+    }
+
+    // Besides recording the exact preimage for the checked atomic rename, this
+    // refuses symlinks, FIFOs/devices, directories, and over-cap regular files
+    // before a temporary receipt is staged.
+    match destination.read_capped(MAX_BUILD_RECEIPT_BYTES) {
+        Ok(_) | Err(OpenRegularError::NotFound) => {}
+        Err(error) => return Err(BuildReceiptError::Io(receipt_open_error(error))),
+    }
+    destination
+        .write_atomic_if_observed(body.as_bytes(), true)
+        .map_err(BuildReceiptError::Io)
+}
+
+fn receipt_open_error(error: OpenRegularError) -> std::io::Error {
+    match error {
+        OpenRegularError::NotFound => {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "build receipt was not found")
+        }
+        OpenRegularError::NotRegularFile => std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "build receipt destination is not a regular file",
+        ),
+        OpenRegularError::TooLarge => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("build receipt exceeds the {MAX_BUILD_RECEIPT_BYTES}-byte read cap"),
+        ),
+        OpenRegularError::Io(error) => error,
     }
 }
 
@@ -1962,6 +2366,7 @@ pub fn relative_under(parent: &Path, child: &Path) -> Option<String> {
 
 /// The answer `tirith attest verify-build` produces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildVerification {
     pub status: AttestStatus,
     pub receipt_id: String,
@@ -2018,18 +2423,23 @@ pub fn verify_build(
 
     if let Err(error) = receipt.validate() {
         findings.push(error.to_string());
-        return BuildVerification {
-            status: status.worst(AttestStatus::Mismatch),
-            receipt_id: receipt.receipt_id.clone(),
+        return verification_without_tree_scan(
+            receipt,
             signature,
+            status.worst(AttestStatus::Mismatch),
             findings,
-            source_digest: None,
-            output_digest: None,
-            source_exclusions: receipt.subject.source_exclusions.clone(),
-            output_exclusions: receipt.subject.output_exclusions.clone(),
-            source_files: None,
-            output_files: None,
-        };
+        );
+    }
+
+    // A rejected or uncheckable signature leaves every scan parameter attacker
+    // controlled. Report the trust failure without using those parameters to
+    // allocate, recurse, or read either filesystem tree. Unsigned receipts remain
+    // usable only in the installation mode that explicitly expects no signing.
+    if matches!(
+        signature,
+        SignatureTrust::Rejected | SignatureTrust::Uncheckable
+    ) {
+        return verification_without_tree_scan(receipt, signature, status, findings);
     }
 
     let limits = receipt.evidence.limits;
@@ -2076,6 +2486,26 @@ pub fn verify_build(
         output_exclusions: receipt.subject.output_exclusions.clone(),
         source_files: receipt.subject.source_tree.as_ref().map(|t| t.file_count),
         output_files: receipt.subject.output_tree.as_ref().map(|t| t.file_count),
+    }
+}
+
+fn verification_without_tree_scan(
+    receipt: &BuildReceipt,
+    signature: SignatureTrust,
+    status: AttestStatus,
+    findings: Vec<String>,
+) -> BuildVerification {
+    BuildVerification {
+        status,
+        receipt_id: receipt.receipt_id.clone(),
+        signature,
+        findings,
+        source_digest: None,
+        output_digest: None,
+        source_exclusions: receipt.subject.source_exclusions.clone(),
+        output_exclusions: receipt.subject.output_exclusions.clone(),
+        source_files: None,
+        output_files: None,
     }
 }
 

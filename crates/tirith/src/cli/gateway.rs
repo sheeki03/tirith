@@ -6074,13 +6074,12 @@ fn handle_server_initiated_message(
         return None;
     }
 
-    if output_filter::sanitize_structured_content(&mut parsed).is_err() {
-        write_server_message_audit(
-            "block",
-            "notification",
-            &rule_ids,
-            "sanitized_key_collision",
-        );
+    if let Err(error) = output_filter::sanitize_structured_content(&mut parsed) {
+        let analysis_incomplete = tirith_core::verdict::RuleId::AnalysisIncomplete.to_string();
+        if !rule_ids.contains(&analysis_incomplete) {
+            rule_ids.push(analysis_incomplete);
+        }
+        write_server_message_audit("block", "notification", &rule_ids, error.reason_code());
         return None;
     }
 
@@ -6455,9 +6454,13 @@ fn handle_upstream_response(
                         }
                     };
                 }
-                Err(reason) => {
-                    write_server_message_audit("block", "error", &[], reason);
-                    return Some(build_error_envelope_block(resp_id, reason));
+                Err(failure) => {
+                    write_server_message_audit("block", "error", &failure.rule_ids, failure.reason);
+                    return Some(build_error_envelope_block_with_rule_ids(
+                        resp_id,
+                        failure.reason,
+                        &failure.rule_ids,
+                    ));
                 }
             }
         }
@@ -6792,6 +6795,33 @@ fn write_schema_audit(direction: &str, decision: &str, tool_name: &str, reason: 
 /// sanitization guarantee, independent of the gateway's general failure posture;
 /// a `result`-less JSON-RPC error envelope is scanned and recursively sanitized
 /// across every key/value before forwarding.
+/// Serialize a response the output filter has finished with. Reserializing a
+/// `Value` that was parsed moments ago does not fail in practice, but if it
+/// ever did the caller's fallback would be to forward the ORIGINAL upstream
+/// bytes, which is exactly the content the filter just decided to change.
+/// Fail closed with a block envelope instead, so a serialization error can
+/// never become a forwarding of unsanitized output.
+fn serialize_filtered_response_or_block(parsed: &Value) -> Vec<u8> {
+    match serde_json::to_vec(parsed) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_gateway_audit_json(serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "kind": "gateway_output_filter",
+                "decision": "block",
+                "error": format!("filtered response could not be serialized: {error}"),
+                "fail_mode_triggered": false,
+                "agent_origin": tirith_core::agent_origin::AgentOrigin::Gateway,
+            }));
+            build_error_envelope_block_with_rule_ids(
+                parsed.get("id").cloned().unwrap_or(Value::Null),
+                "filtered response could not be serialized; blocked rather than forwarding the unsanitized original",
+                &[],
+            )
+        }
+    }
+}
+
 fn apply_output_filter_to_response(
     mut parsed: Value,
     fail_mode_closed: bool,
@@ -6814,12 +6844,14 @@ fn apply_output_filter_to_response(
                         &rule_ids,
                         "inspected",
                     );
-                    return serde_json::to_vec(&parsed).ok();
+                    return Some(serialize_filtered_response_or_block(&parsed));
                 }
-                Err(reason) => {
-                    return Some(build_error_envelope_block(
+                Err(failure) => {
+                    write_server_message_audit("block", "error", &failure.rule_ids, failure.reason);
+                    return Some(build_error_envelope_block_with_rule_ids(
                         parsed.get("id").cloned().unwrap_or(Value::Null),
-                        reason,
+                        failure.reason,
+                        &failure.rule_ids,
                     ));
                 }
             }
@@ -6861,7 +6893,7 @@ fn apply_output_filter_to_response(
             });
             let obj = parsed.as_object_mut()?;
             obj.insert("result".to_string(), new_result);
-            return serde_json::to_vec(&parsed).ok();
+            return Some(serialize_filtered_response_or_block(&parsed));
         }
     };
 
@@ -6871,7 +6903,7 @@ fn apply_output_filter_to_response(
     // Splice the re-emitted (lossless) result back into the response.
     let result_slot = parsed.as_object_mut()?.get_mut("result")?;
     *result_slot = new_result;
-    serde_json::to_vec(&parsed).ok()
+    Some(serialize_filtered_response_or_block(&parsed))
 }
 
 /// C4 — inspect a Live listing/reading response (`tools/list`, `resources/list`,
@@ -6915,9 +6947,18 @@ fn apply_response_inspection(
                         build_error_envelope_block(resp_id.clone(), "error_reserialize_failed")
                     });
                 }
-                Err(reason) => {
-                    write_response_inspect_audit(kind, "block", &[], &[reason]);
-                    return build_error_envelope_block(resp_id.clone(), reason);
+                Err(failure) => {
+                    write_response_inspect_audit(
+                        kind,
+                        "block",
+                        &failure.rule_ids,
+                        &[failure.reason],
+                    );
+                    return build_error_envelope_block_with_rule_ids(
+                        resp_id.clone(),
+                        failure.reason,
+                        &failure.rule_ids,
+                    );
                 }
             }
         }
@@ -6947,11 +6988,14 @@ fn apply_response_inspection(
     // On Warn, also prepend a single human-readable notice item where the shape
     // supports it; the sanitize already neutralized the display payload either way.
     if let Some(result_slot) = parsed.get_mut("result") {
-        if output_filter::sanitize_structured_content(result_slot).is_err() {
+        if let Err(error) = output_filter::sanitize_structured_content(result_slot) {
             outcome.action = Action::Block;
+            outcome
+                .findings
+                .push(output_filter::structured_sanitize_failure_finding(error));
             outcome.violations.push(ResponseViolation {
-                code: "sanitized_key_collision",
-                detail: "distinct response keys collide after control sanitization".to_string(),
+                code: error.reason_code(),
+                detail: "structured response sanitization failed closed".to_string(),
             });
             let violation_codes: Vec<&str> = outcome.violations.iter().map(|v| v.code).collect();
             write_response_inspect_audit(kind, "block", &outcome.rule_ids(), &violation_codes);
@@ -7701,15 +7745,15 @@ fn filter_typed_result(
                 // Sanitize every sibling/key in the original block too. The
                 // synthetic scan view already made any collision a Block, but
                 // keep this re-emit seam independently fail-closed.
-                if output_filter::sanitize_structured_content(&mut block_value).is_err() {
-                    return gateway_sanitization_collision_block(outcome);
+                if let Err(error) = output_filter::sanitize_structured_content(&mut block_value) {
+                    return gateway_sanitization_failure_block(outcome, error);
                 }
                 out_blocks.push(block_value);
             }
 
             let mut extra = Value::Object(typed.extra.clone());
-            if output_filter::sanitize_structured_content(&mut extra).is_err() {
-                return gateway_sanitization_collision_block(outcome);
+            if let Err(error) = output_filter::sanitize_structured_content(&mut extra) {
+                return gateway_sanitization_failure_block(outcome, error);
             }
             let Value::Object(mut obj) = extra else {
                 unreachable!("gateway result extras remain an object")
@@ -7718,7 +7762,10 @@ fn filter_typed_result(
                 .iter()
                 .any(|reserved| obj.contains_key(*reserved))
             {
-                return gateway_sanitization_collision_block(outcome);
+                return gateway_sanitization_failure_block(
+                    outcome,
+                    output_filter::StructuredSanitizeError::KeyCollision,
+                );
             }
             obj.insert("content".to_string(), Value::Array(out_blocks));
             if typed.is_error {
@@ -7730,8 +7777,8 @@ fn filter_typed_result(
             // so reconstruct from the original + the filter's scrub instead.
             if let Some(sc) = &typed.structured_content {
                 let mut scrubbed = sc.clone();
-                if output_filter::sanitize_structured_content(&mut scrubbed).is_err() {
-                    return gateway_sanitization_collision_block(outcome);
+                if let Err(error) = output_filter::sanitize_structured_content(&mut scrubbed) {
+                    return gateway_sanitization_failure_block(outcome, error);
                 }
                 obj.insert("structuredContent".to_string(), scrubbed);
             }
@@ -7788,9 +7835,13 @@ fn filter_typed_result(
     (new_result, outcome)
 }
 
-fn gateway_sanitization_collision_block(mut outcome: FilterOutcome) -> (Value, FilterOutcome) {
+fn gateway_sanitization_failure_block(
+    mut outcome: FilterOutcome,
+    error: output_filter::StructuredSanitizeError,
+) -> (Value, FilterOutcome) {
     outcome.action = Action::Block;
-    let rule_id = tirith_core::verdict::RuleId::AnalysisIncomplete.to_string();
+    let failure = output_filter::structured_sanitize_failure_finding(error);
+    let rule_id = failure.rule_id.to_string();
     if !outcome.rule_ids.contains(&rule_id) {
         outcome.rule_ids.push(rule_id);
     }
@@ -7867,11 +7918,26 @@ fn merge_scan_leaves(existing: Option<Value>, extra: Vec<Value>) -> Value {
 /// Scan, recursively sanitize, and re-scan an entire JSON-RPC `error` object.
 /// This covers nested `data`, extension members, and object keys; a collision or
 /// blocking policy result refuses the whole envelope.
+#[derive(Debug)]
+struct ErrorInspectionFailure {
+    reason: &'static str,
+    rule_ids: Vec<String>,
+}
+
+impl ErrorInspectionFailure {
+    fn without_finding(reason: &'static str) -> Self {
+        Self {
+            reason,
+            rule_ids: Vec::new(),
+        }
+    }
+}
+
 fn inspect_and_sanitize_error(
     error: &mut Value,
     filter_ctx: &output_filter::OutputFilterContext,
-) -> Result<(Vec<String>, bool), &'static str> {
-    validate_jsonrpc_error_shape(error)?;
+) -> Result<(Vec<String>, bool), ErrorInspectionFailure> {
+    validate_jsonrpc_error_shape(error).map_err(ErrorInspectionFailure::without_finding)?;
     let initial = output_filter::scan_value_leaves(error, filter_ctx);
     let mut rule_ids: Vec<String> = initial
         .findings
@@ -7879,12 +7945,33 @@ fn inspect_and_sanitize_error(
         .map(|finding| finding.rule_id.to_string())
         .collect();
     if matches!(initial.action, Action::Block) {
-        return Err("error_content_policy");
+        return Err(ErrorInspectionFailure {
+            reason: "error_content_policy",
+            rule_ids,
+        });
     }
 
     let original = error.clone();
-    output_filter::sanitize_structured_content(error)
-        .map_err(|_| "error_sanitized_key_collision")?;
+    if let Err(error) = output_filter::sanitize_structured_content(error) {
+        let reason = match error {
+            output_filter::StructuredSanitizeError::KeyCollision => "error_sanitized_key_collision",
+            output_filter::StructuredSanitizeError::SensitiveMaterialAcrossLeaves => {
+                "error_cross_leaf_secret"
+            }
+            output_filter::StructuredSanitizeError::AnalysisBudgetExceeded => {
+                "error_analysis_budget_exceeded"
+            }
+        };
+        // Every sanitizer refusal means the exact forwarded representation was
+        // not completely analyzable. Preserve that categorical finding in both
+        // audit records and the synthetic client envelope instead of reducing
+        // the typed failure to a reason string.
+        let analysis_incomplete = tirith_core::verdict::RuleId::AnalysisIncomplete.to_string();
+        if !rule_ids.contains(&analysis_incomplete) {
+            rule_ids.push(analysis_incomplete);
+        }
+        return Err(ErrorInspectionFailure { reason, rule_ids });
+    }
 
     let post = output_filter::scan_value_leaves(error, filter_ctx);
     for finding in &post.findings {
@@ -7894,7 +7981,10 @@ fn inspect_and_sanitize_error(
         }
     }
     if matches!(post.action, Action::Block) {
-        return Err("error_post_sanitize_policy");
+        return Err(ErrorInspectionFailure {
+            reason: "error_post_sanitize_policy",
+            rule_ids,
+        });
     }
     Ok((rule_ids, original != *error))
 }
@@ -7937,12 +8027,27 @@ fn inspect_and_sanitize_generic_result(
         .collect();
     if matches!(initial.action, Action::Block) {
         write_server_message_audit("block", "result", &rule_ids, "content_policy");
-        return build_result_envelope_block(id, "result_content_policy");
+        return build_result_envelope_block_with_rule_ids(id, "result_content_policy", &rule_ids);
     }
 
-    if output_filter::sanitize_structured_content(result).is_err() {
-        write_server_message_audit("block", "result", &rule_ids, "sanitized_key_collision");
-        return build_result_envelope_block(id, "result_sanitized_key_collision");
+    if let Err(error) = output_filter::sanitize_structured_content(result) {
+        let analysis_incomplete = tirith_core::verdict::RuleId::AnalysisIncomplete.to_string();
+        if !rule_ids.contains(&analysis_incomplete) {
+            rule_ids.push(analysis_incomplete);
+        }
+        write_server_message_audit("block", "result", &rule_ids, error.reason_code());
+        let reason = match error {
+            output_filter::StructuredSanitizeError::KeyCollision => {
+                "result_sanitized_key_collision"
+            }
+            output_filter::StructuredSanitizeError::SensitiveMaterialAcrossLeaves => {
+                "result_cross_leaf_secret"
+            }
+            output_filter::StructuredSanitizeError::AnalysisBudgetExceeded => {
+                "result_analysis_budget_exceeded"
+            }
+        };
+        return build_result_envelope_block_with_rule_ids(id, reason, &rule_ids);
     }
 
     let post = output_filter::scan_value_leaves(result, filter_ctx);
@@ -7954,7 +8059,11 @@ fn inspect_and_sanitize_generic_result(
     }
     if matches!(post.action, Action::Block) {
         write_server_message_audit("block", "result", &rule_ids, "post_sanitize_policy");
-        return build_result_envelope_block(id, "result_post_sanitize_policy");
+        return build_result_envelope_block_with_rule_ids(
+            id,
+            "result_post_sanitize_policy",
+            &rule_ids,
+        );
     }
 
     let decision = if matches!(initial.action, Action::Warn | Action::WarnAck)
@@ -7970,6 +8079,14 @@ fn inspect_and_sanitize_generic_result(
 }
 
 fn build_error_envelope_block(id: Value, reason: &'static str) -> Vec<u8> {
+    build_error_envelope_block_with_rule_ids(id, reason, &[])
+}
+
+fn build_error_envelope_block_with_rule_ids(
+    id: Value,
+    reason: &'static str,
+    rule_ids: &[String],
+) -> Vec<u8> {
     serde_json::to_vec(&JsonRpcResponse::err(
         id,
         JsonRpcError {
@@ -7979,6 +8096,7 @@ fn build_error_envelope_block(id: Value, reason: &'static str) -> Vec<u8> {
                 "_tirith_schema": 1,
                 "decision": "block",
                 "reason": reason,
+                "rule_ids": rule_ids,
             })),
         },
     ))
@@ -7988,6 +8106,14 @@ fn build_error_envelope_block(id: Value, reason: &'static str) -> Vec<u8> {
 }
 
 fn build_result_envelope_block(id: Value, reason: &'static str) -> Vec<u8> {
+    build_result_envelope_block_with_rule_ids(id, reason, &[])
+}
+
+fn build_result_envelope_block_with_rule_ids(
+    id: Value,
+    reason: &'static str,
+    rule_ids: &[String],
+) -> Vec<u8> {
     serde_json::to_vec(&JsonRpcResponse::err(
         id,
         JsonRpcError {
@@ -7997,6 +8123,7 @@ fn build_result_envelope_block(id: Value, reason: &'static str) -> Vec<u8> {
                 "_tirith_schema": 1,
                 "decision": "block",
                 "reason": reason,
+                "rule_ids": rule_ids,
             })),
         },
     ))
@@ -12435,6 +12562,83 @@ policy:
         assert!(!filtered
             .windows(b"internal".len())
             .any(|w| w == b"internal"));
+    }
+
+    #[test]
+    fn test_error_sanitizer_failure_retains_analysis_incomplete_identity() {
+        let mut error = serde_json::json!({
+            "code": -32603,
+            "message": "safe",
+            "data": {
+                "field": 1,
+                "field\u{200B}": 2,
+            }
+        });
+        let failure =
+            inspect_and_sanitize_error(&mut error, &output_filter::OutputFilterContext::default())
+                .expect_err("keys that collide after sanitization must fail closed");
+        assert_eq!(failure.reason, "error_sanitized_key_collision");
+        let analysis_incomplete = tirith_core::verdict::RuleId::AnalysisIncomplete.to_string();
+        assert_eq!(failure.rule_ids, vec![analysis_incomplete.clone()]);
+
+        let envelope = build_error_envelope_block_with_rule_ids(
+            Value::from(12),
+            failure.reason,
+            &failure.rule_ids,
+        );
+        let envelope: Value = serde_json::from_slice(&envelope).unwrap();
+        assert_eq!(
+            envelope["error"]["data"]["rule_ids"],
+            serde_json::json!([analysis_incomplete])
+        );
+    }
+
+    #[test]
+    fn test_generic_result_block_envelope_retains_rule_identity() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "result": {
+                "instructions": "unsafe\u{001B}]52;c;aGVsbG8=\u{0007}output"
+            }
+        });
+        let envelope = inspect_and_sanitize_generic_result(
+            response,
+            Value::from(13),
+            &output_filter::OutputFilterContext::default(),
+        );
+        let envelope: Value = serde_json::from_slice(&envelope).unwrap();
+        let rule_ids = envelope["error"]["data"]["rule_ids"]
+            .as_array()
+            .expect("generic block must expose categorical rule ids");
+        assert!(!rule_ids.is_empty());
+        assert_eq!(envelope["error"]["data"]["reason"], "result_content_policy");
+    }
+
+    #[test]
+    fn test_generic_result_sanitizer_failure_retains_analysis_incomplete_identity() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 14,
+            "result": {
+                "field": 1,
+                "field\u{200B}": 2
+            }
+        });
+        let envelope = inspect_and_sanitize_generic_result(
+            response,
+            Value::from(14),
+            &output_filter::OutputFilterContext::default(),
+        );
+        let envelope: Value = serde_json::from_slice(&envelope).unwrap();
+        assert_eq!(
+            envelope["error"]["data"]["reason"],
+            "result_sanitized_key_collision"
+        );
+        assert_eq!(
+            envelope["error"]["data"]["rule_ids"],
+            serde_json::json!([tirith_core::verdict::RuleId::AnalysisIncomplete.to_string()])
+        );
     }
 
     #[test]

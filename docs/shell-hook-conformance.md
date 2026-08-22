@@ -123,7 +123,7 @@ cleanly** — never fails — when a prerequisite is missing:
 | Shell / mode | Invariants covered | Status |
 |--------------|--------------------|--------|
 | bash — preexec (DEBUG-trap, warn-only) | a, b, c, e, g | Passing |
-| bash — preexec with `TIRITH_BASH_PREEXEC_ENFORCE=1` | d | Passing |
+| bash — preexec with `TIRITH_BASH_PREEXEC_ENFORCE=1` | a, b, d, phase/receipt cardinality | Passing on Bash 3.2 harness + current-Bash PTY |
 | bash — enter (`bind -x` Enter override) | f | Passing |
 | bash — #111 capability gate | a, b, d | Passing |
 | fish | a, b, c, d, e, g | Passing |
@@ -191,6 +191,26 @@ The capability-cache reader's robustness against hostile bash history
 configuration (`HISTCONTROL`, `HISTIGNORE`, `set +o history`, a pre-set `IFS`,
 an already-enabled `extdebug`) is covered by the `capability_*` tests in
 `crates/tirith/tests/bash_preexec_enforce.rs`.
+
+### Issue #176 — preexec functions and prompt phases
+
+Preexec enforcement keeps `extdebug` off for allowed lines and enables it
+lazily only after a complete typed-line block decision. Exact prompt-boundary
+guards bracket existing scalar entries and Bash 5.1+ arrays, preserving their
+order and the previous command status. Older Bash preserves arrays unchanged
+and leaves interception off because it cannot execute both guards. A sourced
+hook truthfully reports protection `off` until the first prompt captures a
+caller-owned DEBUG trap at top level; that prompt publishes `warn-only` (or
+`blocks` for requested enforcement) before accepting more input. The
+conformance test covers both sides of that transition, noisy existing traps,
+and exact chaining.
+The DEBUG trampoline uses
+structural call depth, not a function-name allowlist: prompt/startup execution
+is excluded by phase, while nested fires reuse the top-level decision and do
+not create receipts. Focused tests cover benign and blocked function lines,
+prompt functions, pipelines, user-owned `extdebug`, readonly prompt state,
+one-receipt-per-typed-line cardinality, and clean-output silence on Bash 3.2
+and a modern Bash PTY.
 
 ## Follow-up
 

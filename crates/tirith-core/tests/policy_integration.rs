@@ -1662,3 +1662,142 @@ fn test_policy_file_symlink_fails_closed() {
         "fail-closed policy must be stamped"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn test_user_policy_symlink_to_regular_file_is_trusted_and_loaded() {
+    use std::os::unix::fs::symlink;
+
+    let mut global = isolated_policy_state();
+    let cfg = global.roots().xdg_config.clone();
+    let tirith_cfg = cfg.join("tirith");
+    fs::create_dir_all(&tirith_cfg).unwrap();
+    let target = cfg.join("nix-store-policy.yaml");
+    fs::write(&target, "fail_mode: open\nallowlist:\n  - bit.ly\n").unwrap();
+    symlink(&target, tirith_cfg.join("policy.yaml")).unwrap();
+
+    global.set_env("XDG_CONFIG_HOME", &cfg);
+    global.set_env("APPDATA", &cfg);
+    global.set_env("LOCALAPPDATA", &cfg);
+    let plain_cwd = TempDir::new().unwrap();
+    let policy = Policy::discover_local_only(plain_cwd.path().to_str());
+
+    assert_eq!(policy.scope, PolicyScope::User);
+    assert_eq!(policy.allowlist, vec!["bit.ly"]);
+    assert!(
+        policy
+            .path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("tirith/policy.yaml")),
+        "diagnostics retain the configured symlink path: {:?}",
+        policy.path
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_org_policy_symlink_to_regular_file_is_trusted_and_loaded() {
+    use std::os::unix::fs::symlink;
+
+    let mut global = isolated_policy_state();
+    let org = TempDir::new().unwrap();
+    let tirith = org.path().join(".tirith");
+    fs::create_dir_all(&tirith).unwrap();
+    let target = org.path().join("immutable-policy.yaml");
+    fs::write(&target, "fail_mode: closed\nparanoia: 4\n").unwrap();
+    symlink(&target, tirith.join("policy.yaml")).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", org.path());
+
+    let plain_cwd = TempDir::new().unwrap();
+    let policy = Policy::discover_local_only(plain_cwd.path().to_str());
+    assert_eq!(policy.scope, PolicyScope::Org);
+    assert_eq!(policy.fail_mode, tirith_core::policy::FailMode::Closed);
+    assert_eq!(policy.paranoia, 4);
+    assert!(
+        policy
+            .path
+            .as_deref()
+            .is_some_and(|path| path.ends_with(".tirith/policy.yaml")),
+        "diagnostics retain the configured org symlink path: {:?}",
+        policy.path
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_broken_user_policy_symlink_is_named_and_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let mut global = isolated_policy_state();
+    let cfg = global.roots().xdg_config.clone();
+    let tirith_cfg = cfg.join("tirith");
+    fs::create_dir_all(&tirith_cfg).unwrap();
+    symlink(
+        cfg.join("missing-policy.yaml"),
+        tirith_cfg.join("policy.yaml"),
+    )
+    .unwrap();
+
+    global.set_env("XDG_CONFIG_HOME", &cfg);
+    global.set_env("APPDATA", &cfg);
+    global.set_env("LOCALAPPDATA", &cfg);
+    let plain_cwd = TempDir::new().unwrap();
+    let policy = Policy::discover_local_only(plain_cwd.path().to_str());
+
+    assert_eq!(policy.path.as_deref(), Some("fail-closed"));
+    assert_eq!(policy.fail_mode, tirith_core::policy::FailMode::Closed);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_unsafe_user_policy_symlink_targets_fail_closed_without_blocking() {
+    use std::os::unix::fs::symlink;
+
+    let mut global = isolated_policy_state();
+    let cfg = global.roots().xdg_config.clone();
+    let tirith_cfg = cfg.join("tirith");
+    fs::create_dir_all(&tirith_cfg).unwrap();
+    global.set_env("XDG_CONFIG_HOME", &cfg);
+    global.set_env("APPDATA", &cfg);
+    global.set_env("LOCALAPPDATA", &cfg);
+    let plain_cwd = TempDir::new().unwrap();
+    let link = tirith_cfg.join("policy.yaml");
+
+    let assert_fails_closed = |label: &str| {
+        let policy = Policy::discover_local_only(plain_cwd.path().to_str());
+        assert_eq!(
+            policy.path.as_deref(),
+            Some("fail-closed"),
+            "unsafe trusted-policy target did not fail closed: {label}"
+        );
+        assert_eq!(
+            policy.fail_mode,
+            tirith_core::policy::FailMode::Closed,
+            "unsafe trusted-policy target changed fail mode: {label}"
+        );
+    };
+
+    symlink(&link, &link).unwrap();
+    assert_fails_closed("symlink loop");
+    fs::remove_file(&link).unwrap();
+
+    let fifo = cfg.join("policy-fifo");
+    let fifo_path = std::ffi::CString::new(fifo.as_os_str().to_str().unwrap()).unwrap();
+    // SAFETY: fifo_path is a valid NUL-terminated path and 0o600 is a valid mode.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    symlink(&fifo, &link).unwrap();
+    assert_fails_closed("FIFO target");
+    fs::remove_file(&link).unwrap();
+
+    let oversized = cfg.join("oversized-policy.yaml");
+    let oversized_file = fs::File::create(&oversized).unwrap();
+    oversized_file.set_len(1024 * 1024 + 1).unwrap();
+    symlink(&oversized, &link).unwrap();
+    assert_fails_closed("oversized target");
+    fs::remove_file(&link).unwrap();
+
+    let directory = cfg.join("policy-directory");
+    fs::create_dir_all(&directory).unwrap();
+    symlink(&directory, &link).unwrap();
+    assert_fails_closed("directory target");
+}

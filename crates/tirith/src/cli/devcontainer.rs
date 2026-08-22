@@ -140,7 +140,7 @@ pub(crate) fn inject_tirith_hook_permitted(
             );
         }
     };
-    let (mut value, created) = match prepared.read_capped(CONFIG_READ_CAP) {
+    let (contents, created) = match prepared.read_capped(CONFIG_READ_CAP) {
         Ok(bytes) => {
             let content = match String::from_utf8(bytes) {
                 Ok(content) => content,
@@ -151,31 +151,38 @@ pub(crate) fn inject_tirith_hook_permitted(
                     );
                 }
             };
-            let stripped = devcontainer_writer::strip_jsonc_comments(&content);
-            let value = match serde_json::from_str(&stripped) {
-                Ok(value) => value,
+            let rendered = match devcontainer_writer::render_tirith_hook_jsonc(&content) {
+                Ok(Some(rendered)) => rendered,
+                Ok(None) => return InjectOutcome::AlreadyInjected(path.to_path_buf()),
                 Err(error) => {
-                    return InjectOutcome::ParseError(
-                        path.to_path_buf(),
-                        format!("parse error: {error}"),
-                    );
+                    return InjectOutcome::ParseError(path.to_path_buf(), error);
                 }
             };
-            (value, false)
+            (rendered, false)
         }
         Err(tirith_core::util::OpenRegularError::NotFound) if !create_if_missing => {
             return InjectOutcome::NotFound(path.to_path_buf());
         }
-        Err(tirith_core::util::OpenRegularError::NotFound) => (
-            serde_json::json!({
+        Err(tirith_core::util::OpenRegularError::NotFound) => {
+            let seed = serde_json::json!({
                 "name": "tirith-protected devcontainer",
                 "postCreateCommand": {
-                    "tirith-init": tirith_hook_value(),
+                    "tirith-init": ["tirith", "init", "--shell", "auto"],
                 },
                 "containerEnv": { "TIRITH_DEVCONTAINER": "1" },
-            }),
-            true,
-        ),
+            });
+            let mut contents = match serde_json::to_string_pretty(&seed) {
+                Ok(contents) => contents,
+                Err(error) => {
+                    return InjectOutcome::ParseError(
+                        path.to_path_buf(),
+                        format!("serialize devcontainer.json: {error}"),
+                    );
+                }
+            };
+            contents.push('\n');
+            (contents, true)
+        }
         Err(error) => {
             return InjectOutcome::ParseError(
                 path.to_path_buf(),
@@ -184,25 +191,6 @@ pub(crate) fn inject_tirith_hook_permitted(
         }
     };
 
-    if !created && has_exact_tirith_hook(&value) && has_devcontainer_env_flag(&value) {
-        return InjectOutcome::AlreadyInjected(path.to_path_buf());
-    }
-    if !created {
-        if let Err(error) = upsert_tirith_hook(&mut value) {
-            return InjectOutcome::ParseError(path.to_path_buf(), error.to_string());
-        }
-        upsert_devcontainer_env_flag(&mut value);
-    }
-    let mut contents = match serde_json::to_string_pretty(&value) {
-        Ok(contents) => contents,
-        Err(error) => {
-            return InjectOutcome::ParseError(
-                path.to_path_buf(),
-                format!("serialize devcontainer.json: {error}"),
-            );
-        }
-    };
-    contents.push('\n');
     if let Err(error) = super::write_prepared_config_file_permitted(
         root,
         path,
@@ -218,85 +206,6 @@ pub(crate) fn inject_tirith_hook_permitted(
         InjectOutcome::Created(path.to_path_buf())
     } else {
         InjectOutcome::Updated(path.to_path_buf())
-    }
-}
-
-fn tirith_hook_value() -> serde_json::Value {
-    serde_json::json!(["tirith", "init", "--shell", "auto"])
-}
-
-fn has_exact_tirith_hook(value: &serde_json::Value) -> bool {
-    value
-        .get("postCreateCommand")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|commands| commands.get(devcontainer_writer::TIRITH_HOOK_KEY))
-        == Some(&tirith_hook_value())
-}
-
-fn has_devcontainer_env_flag(value: &serde_json::Value) -> bool {
-    value
-        .get("containerEnv")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|environment| environment.get("TIRITH_DEVCONTAINER"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-}
-
-fn upsert_tirith_hook(value: &mut serde_json::Value) -> Result<(), &'static str> {
-    let object = value
-        .as_object_mut()
-        .ok_or("devcontainer.json root must be an object")?;
-    let existing = object.remove("postCreateCommand");
-    let mut commands = match existing {
-        Some(serde_json::Value::Object(commands)) => commands,
-        Some(existing @ (serde_json::Value::String(_) | serde_json::Value::Array(_))) => {
-            let mut commands = serde_json::Map::new();
-            commands.insert("existing".to_string(), existing);
-            commands
-        }
-        Some(serde_json::Value::Null) | None => serde_json::Map::new(),
-        Some(_) => return Err("postCreateCommand must be a string, array, or object"),
-    };
-    if commands.get(devcontainer_writer::TIRITH_HOOK_KEY) != Some(&tirith_hook_value()) {
-        if let Some(existing) = commands.remove(devcontainer_writer::TIRITH_HOOK_KEY) {
-            let mut suffix = 0usize;
-            loop {
-                let key = if suffix == 0 {
-                    format!("{}-existing", devcontainer_writer::TIRITH_HOOK_KEY)
-                } else {
-                    format!("{}-existing-{suffix}", devcontainer_writer::TIRITH_HOOK_KEY)
-                };
-                if !commands.contains_key(&key) {
-                    commands.insert(key, existing);
-                    break;
-                }
-                suffix = suffix.saturating_add(1);
-            }
-        }
-        commands.insert(
-            devcontainer_writer::TIRITH_HOOK_KEY.to_string(),
-            tirith_hook_value(),
-        );
-    }
-    object.insert(
-        "postCreateCommand".to_string(),
-        serde_json::Value::Object(commands),
-    );
-    Ok(())
-}
-
-fn upsert_devcontainer_env_flag(value: &mut serde_json::Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    let environment = object
-        .entry("containerEnv".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if let Some(environment) = environment.as_object_mut() {
-        environment.insert(
-            "TIRITH_DEVCONTAINER".to_string(),
-            serde_json::Value::String("1".to_string()),
-        );
     }
 }
 

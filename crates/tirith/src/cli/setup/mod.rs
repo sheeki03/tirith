@@ -19,6 +19,7 @@ mod fs_helpers_windows_path;
 mod merge;
 mod shell_profile;
 mod tools;
+pub(crate) use tools::cline_hooks_dir;
 
 #[cfg(unix)]
 mod zshenv;
@@ -33,15 +34,81 @@ mod run_impl {
     use std::path::{Path, PathBuf};
 
     /// All tools recognized by `tirith setup`.
+    /// Which scopes a host accepts and which one an omitted `--scope` selects.
+    #[derive(Clone, Copy)]
+    enum ScopeSupport {
+        /// Both scopes; the payload is the default.
+        Both(Scope),
+        /// Project only; the payload explains why `--scope user` is refused.
+        ProjectOnly(&'static str),
+        /// User only; the payload explains why `--scope project` is refused.
+        UserOnly(&'static str),
+    }
+
+    /// Everything `tirith setup <tool>` needs to know about a host BEFORE it
+    /// calls the host's installer. Scope rules, the python3 requirement, the
+    /// `--install-zshenv` applicability, and the installer itself live in one
+    /// row per host, so they cannot drift apart again. They did: OpenHands grew
+    /// a project-scope hook installer while `resolve_scope` still refused
+    /// `--scope project`, and the hook was unreachable from the command line.
+    struct HostSpec {
+        name: &'static str,
+        scopes: ScopeSupport,
+        /// The integration runs a Python hook, so setup checks for python3.
+        needs_python: bool,
+        /// `--install-zshenv` is part of this integration.
+        shell_guard: bool,
+        setup: fn(&SetupOpts) -> Result<(), String>,
+    }
+
+    const HOSTS: &[HostSpec] = &[
+        HostSpec { name: "claude-code", scopes: ScopeSupport::Both(Scope::Project), needs_python: true, shell_guard: true, setup: setup_claude_code },
+        HostSpec { name: "cline", scopes: ScopeSupport::UserOnly("Cline's documented MCP registry and global hooks directory are user-global — omit --scope or use --scope user"), needs_python: cfg!(unix), shell_guard: false, setup: setup_cline },
+        HostSpec { name: "codex", scopes: ScopeSupport::UserOnly("Codex is always user-global — omit --scope or use --scope user"), needs_python: false, shell_guard: true, setup: setup_codex },
+        HostSpec { name: "copilot-cli", scopes: ScopeSupport::ProjectOnly("Copilot CLI loads hooks from the repo root — project-only. Omit --scope or use --scope project"), needs_python: true, shell_guard: true, setup: setup_copilot_cli },
+        HostSpec { name: "continue", scopes: ScopeSupport::ProjectOnly("Continue user config is shared YAML; Tirith safely owns only a workspace .continue/mcpServers block — omit --scope or use --scope project"), needs_python: false, shell_guard: false, setup: setup_continue },
+        HostSpec { name: "cursor", scopes: ScopeSupport::Both(Scope::Project), needs_python: true, shell_guard: true, setup: setup_cursor },
+        HostSpec { name: "fx", scopes: ScopeSupport::UserOnly("Vercel Labs fx loads native MCP servers from its trusted user profile only — omit --scope or use --scope user"), needs_python: false, shell_guard: false, setup: setup_fx },
+        HostSpec { name: "gemini-cli", scopes: ScopeSupport::Both(Scope::Project), needs_python: true, shell_guard: true, setup: setup_gemini_cli },
+        HostSpec { name: "grok-build", scopes: ScopeSupport::Both(Scope::Project), needs_python: cfg!(unix), shell_guard: false, setup: setup_grok_build },
+        HostSpec { name: "kiro", scopes: ScopeSupport::Both(Scope::Project), needs_python: true, shell_guard: true, setup: setup_kiro },
+        HostSpec { name: "omp", scopes: ScopeSupport::UserOnly("OMP project MCP setup is deferred because OMP merges settings from multiple project providers that can suppress it — omit --scope or use --scope user"), needs_python: false, shell_guard: false, setup: setup_omp },
+        HostSpec { name: "openclaw", scopes: ScopeSupport::Both(Scope::Project), needs_python: false, shell_guard: true, setup: setup_openclaw },
+        HostSpec { name: "opencode", scopes: ScopeSupport::Both(Scope::Project), needs_python: false, shell_guard: false, setup: setup_opencode },
+        // Both scopes are real: OpenHands searches `<work dir>/.openhands/hooks.json`
+        // and then `~/.openhands/hooks.json`, while its MCP registry is user-level.
+        HostSpec { name: "openhands", scopes: ScopeSupport::Both(Scope::User), needs_python: cfg!(unix), shell_guard: false, setup: setup_openhands },
+        HostSpec { name: "pi-cli", scopes: ScopeSupport::Both(Scope::Project), needs_python: false, shell_guard: true, setup: setup_pi_cli },
+        HostSpec { name: "prime-agent", scopes: ScopeSupport::UserOnly("Prime Agent executes generic MCP servers from user settings only — omit --scope or use --scope user"), needs_python: false, shell_guard: false, setup: setup_prime_agent },
+        HostSpec { name: "roo-code", scopes: ScopeSupport::ProjectOnly("Roo Code's global MCP path is editor-managed; Tirith safely writes the documented project .roo/mcp.json — omit --scope or use --scope project"), needs_python: false, shell_guard: false, setup: setup_roo_code },
+        HostSpec { name: "vscode", scopes: ScopeSupport::ProjectOnly("VS Code user settings use JSONC — run tirith setup vscode in your project directory instead, or configure manually"), needs_python: true, shell_guard: true, setup: setup_vscode },
+        HostSpec { name: "windsurf", scopes: ScopeSupport::UserOnly("Windsurf is always user-global — omit --scope or use --scope user"), needs_python: true, shell_guard: true, setup: setup_windsurf },
+    ];
+
+    fn host_spec(tool: &str) -> Option<&'static HostSpec> {
+        HOSTS.iter().find(|spec| spec.name == tool)
+    }
+
+    /// Kept as a plain list for the error text and the closest-match
+    /// suggestion; pinned to `HOSTS` by a test so it cannot drift either.
     const KNOWN_TOOLS: &[&str] = &[
         "claude-code",
+        "cline",
         "codex",
         "copilot-cli",
+        "continue",
         "cursor",
+        "fx",
         "gemini-cli",
+        "grok-build",
         "kiro",
+        "omp",
         "openclaw",
+        "opencode",
+        "openhands",
         "pi-cli",
+        "prime-agent",
+        "roo-code",
         "vscode",
         "windsurf",
     ];
@@ -134,13 +201,22 @@ mod run_impl {
             );
         }
 
+        let spec = host_spec(tool).ok_or_else(|| unknown_tool_error(tool))?;
         let scope = resolve_scope(tool, scope)?;
 
         let tirith_bin = resolve_tirith_bin(dry_run)?;
 
-        // Most hook scripts are Python; codex/pi-cli/openclaw are not.
-        if tool != "codex" && tool != "pi-cli" && tool != "openclaw" {
+        // Hosts whose hook is a Python script (directly, or through a generated
+        // wrapper that execs it) need python3 on PATH. MCP-only and native
+        // TypeScript integrations do not.
+        if spec.needs_python {
             check_binary_on_path("python3", dry_run)?;
+        }
+
+        if install_zshenv && !spec.shell_guard {
+            return Err(format!(
+                "--install-zshenv is not part of the {tool} integration; use Tirith's shell setup separately when you need a shell-level guard"
+            ));
         }
 
         if tool == "codex" {
@@ -164,66 +240,32 @@ mod run_impl {
             update_configs,
         };
 
-        match tool {
-            "claude-code" => setup_claude_code(&opts),
-            "codex" => setup_codex(&opts),
-            "copilot-cli" => setup_copilot_cli(&opts),
-            "cursor" => setup_cursor(&opts),
-            "gemini-cli" => setup_gemini_cli(&opts),
-            "kiro" => setup_kiro(&opts),
-            "openclaw" => setup_openclaw(&opts),
-            "pi-cli" => setup_pi_cli(&opts),
-            "vscode" => setup_vscode(&opts),
-            "windsurf" => setup_windsurf(&opts),
-            _ => Err(unknown_tool_error(tool)),
-        }
+        (spec.setup)(&opts)
     }
 
     /// Resolve scope for a given tool, applying defaults and validation.
     pub(super) fn resolve_scope(tool: &str, scope: Option<&str>) -> Result<Scope, String> {
-        match tool {
-            "claude-code" | "cursor" | "gemini-cli" | "kiro" | "openclaw" | "pi-cli" => {
-                match scope {
-                    Some("project") | None => Ok(Scope::Project),
-                    Some("user") => Ok(Scope::User),
-                    Some(other) => Err(format!(
-                        "invalid scope '{other}' — expected 'project' or 'user'\n  try: tirith setup {tool} --scope project"
-                    )),
-                }
+        let spec = host_spec(tool).ok_or_else(|| unknown_tool_error(tool))?;
+        let (default, expected) = match spec.scopes {
+            ScopeSupport::Both(default) => (default, "'project' or 'user'"),
+            ScopeSupport::ProjectOnly(_) => (Scope::Project, "'project'"),
+            ScopeSupport::UserOnly(_) => (Scope::User, "'user'"),
+        };
+        let try_scope = match default {
+            Scope::Project => "project",
+            Scope::User => "user",
+        };
+        match (scope, spec.scopes) {
+            (None, _) => Ok(default),
+            (Some("project"), ScopeSupport::Both(_) | ScopeSupport::ProjectOnly(_)) => {
+                Ok(Scope::Project)
             }
-            "vscode" => match scope {
-                Some("project") | None => Ok(Scope::Project),
-                Some("user") => Err(
-                    "VS Code user settings use JSONC — run tirith setup vscode in your project directory instead, or configure manually".into(),
-                ),
-                Some(other) => Err(format!(
-                    "invalid scope '{other}' — expected 'project'\n  try: tirith setup vscode --scope project"
-                )),
-            },
-            "copilot-cli" => match scope {
-                Some("project") | None => Ok(Scope::Project),
-                Some("user") => Err(
-                    "Copilot CLI loads hooks from the repo root — project-only. Omit --scope or use --scope project".into(),
-                ),
-                Some(other) => Err(format!(
-                    "invalid scope '{other}' — expected 'project'\n  try: tirith setup copilot-cli --scope project"
-                )),
-            },
-            "codex" => match scope {
-                Some("project") => Err("Codex is always user-global — omit --scope or use --scope user".into()),
-                Some("user") | None => Ok(Scope::User),
-                Some(other) => Err(format!(
-                    "invalid scope '{other}' — expected 'user'\n  try: tirith setup codex --scope user"
-                )),
-            },
-            "windsurf" => match scope {
-                Some("project") => Err("Windsurf is always user-global — omit --scope or use --scope user".into()),
-                Some("user") | None => Ok(Scope::User),
-                Some(other) => Err(format!(
-                    "invalid scope '{other}' — expected 'user'\n  try: tirith setup windsurf --scope user"
-                )),
-            },
-            _ => Err(unknown_tool_error(tool)),
+            (Some("user"), ScopeSupport::Both(_) | ScopeSupport::UserOnly(_)) => Ok(Scope::User),
+            (Some("project"), ScopeSupport::UserOnly(reason))
+            | (Some("user"), ScopeSupport::ProjectOnly(reason)) => Err(reason.to_string()),
+            (Some(other), _) => Err(format!(
+                "invalid scope '{other}' — expected {expected}\n  try: tirith setup {tool} --scope {try_scope}"
+            )),
         }
     }
 
@@ -625,6 +667,42 @@ mod run_impl {
         super::tools::setup_pi_cli(opts)
     }
 
+    fn setup_prime_agent(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_prime_agent(opts)
+    }
+
+    fn setup_cline(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_cline(opts)
+    }
+
+    fn setup_continue(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_continue(opts)
+    }
+
+    fn setup_grok_build(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_grok_build(opts)
+    }
+
+    fn setup_omp(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_omp(opts)
+    }
+
+    fn setup_opencode(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_opencode(opts)
+    }
+
+    fn setup_fx(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_fx(opts)
+    }
+
+    fn setup_openhands(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_openhands(opts)
+    }
+
+    fn setup_roo_code(opts: &SetupOpts) -> Result<(), String> {
+        super::tools::setup_roo_code(opts)
+    }
+
     fn setup_windsurf(opts: &SetupOpts) -> Result<(), String> {
         super::tools::setup_windsurf(opts)
     }
@@ -632,6 +710,89 @@ mod run_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn known_tools_is_exactly_the_host_table() {
+            let from_table: Vec<&str> = HOSTS.iter().map(|spec| spec.name).collect();
+            assert_eq!(
+                KNOWN_TOOLS,
+                &from_table[..],
+                "KNOWN_TOOLS must list the HOSTS rows in order; add new hosts to HOSTS"
+            );
+        }
+
+        #[test]
+        fn every_host_accepts_its_own_default_and_refuses_the_rest() {
+            for spec in HOSTS {
+                let default = resolve_scope(spec.name, None).unwrap();
+                match spec.scopes {
+                    ScopeSupport::Both(expected) => {
+                        assert_eq!(default, expected, "{}", spec.name);
+                        assert_eq!(
+                            resolve_scope(spec.name, Some("project")).unwrap(),
+                            Scope::Project,
+                            "{}",
+                            spec.name
+                        );
+                        assert_eq!(
+                            resolve_scope(spec.name, Some("user")).unwrap(),
+                            Scope::User,
+                            "{}",
+                            spec.name
+                        );
+                    }
+                    ScopeSupport::ProjectOnly(reason) => {
+                        assert_eq!(default, Scope::Project, "{}", spec.name);
+                        assert_eq!(
+                            resolve_scope(spec.name, Some("user")).unwrap_err(),
+                            reason,
+                            "{}",
+                            spec.name
+                        );
+                    }
+                    ScopeSupport::UserOnly(reason) => {
+                        assert_eq!(default, Scope::User, "{}", spec.name);
+                        assert_eq!(
+                            resolve_scope(spec.name, Some("project")).unwrap_err(),
+                            reason,
+                            "{}",
+                            spec.name
+                        );
+                    }
+                }
+                let bogus = resolve_scope(spec.name, Some("global")).unwrap_err();
+                assert!(
+                    bogus.contains("invalid scope 'global'"),
+                    "{}: {bogus}",
+                    spec.name
+                );
+            }
+        }
+
+        #[test]
+        fn openhands_accepts_both_scopes_with_a_user_default() {
+            // The hook installer exists at both scopes. A dispatcher that still
+            // refused `--scope project` left the project hook unreachable from
+            // the command line while the installer, its tests, and the docs all
+            // assumed it could be run.
+            assert_eq!(resolve_scope("openhands", None).unwrap(), Scope::User);
+            assert_eq!(
+                resolve_scope("openhands", Some("project")).unwrap(),
+                Scope::Project
+            );
+            assert_eq!(
+                resolve_scope("openhands", Some("user")).unwrap(),
+                Scope::User
+            );
+        }
+
+        #[test]
+        fn wrapper_hosts_require_python() {
+            // Cline and OpenHands exec the Python adapter through a wrapper.
+            for name in ["cline", "openhands"] {
+                assert_eq!(host_spec(name).unwrap().needs_python, cfg!(unix), "{name}");
+            }
+        }
 
         #[cfg(unix)]
         #[test]
@@ -960,6 +1121,33 @@ mod run_impl {
                 Scope::Project
             );
             assert_eq!(resolve_scope("kiro", Some("user")).unwrap(), Scope::User);
+        }
+
+        #[test]
+        fn resolve_scope_pins_mcp_only_clients_to_documented_trust_scope() {
+            for tool in ["prime-agent", "fx", "cline", "omp"] {
+                assert_eq!(resolve_scope(tool, None).unwrap(), Scope::User, "{tool}");
+                assert!(resolve_scope(tool, Some("project")).is_err(), "{tool}");
+            }
+            // OpenHands keeps the user default for its MCP registry but accepts
+            // project scope for the per-repository hook.
+            assert_eq!(resolve_scope("openhands", None).unwrap(), Scope::User);
+            assert_eq!(
+                resolve_scope("openhands", Some("project")).unwrap(),
+                Scope::Project
+            );
+            for tool in ["continue", "roo-code"] {
+                assert_eq!(resolve_scope(tool, None).unwrap(), Scope::Project, "{tool}");
+                assert!(resolve_scope(tool, Some("user")).is_err(), "{tool}");
+            }
+            for tool in ["grok-build", "opencode"] {
+                assert_eq!(resolve_scope(tool, None).unwrap(), Scope::Project, "{tool}");
+                assert_eq!(
+                    resolve_scope(tool, Some("user")).unwrap(),
+                    Scope::User,
+                    "{tool}"
+                );
+            }
         }
     }
 }

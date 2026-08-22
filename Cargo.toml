@@ -25,6 +25,9 @@ percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Exact lock-compatible line; preserves the workspace Rust 1.83 floor while
+# allowing setup to edit Grok TOML without discarding unrelated formatting.
+toml_edit = "=0.22.27"
 once_cell = "1"
 base64 = "0.22"
 etcetera = "0.8"

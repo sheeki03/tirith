@@ -129,6 +129,32 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["threat_package_typosquat"]
 
+# Regression for #211: shell quotes around a PEP 508 specifier are syntax, not
+# part of the package identity used by the similar-name detector.
+[[fixture]]
+name = "pip_install_quoted_canonical_requirement"
+min_milestone = 1
+input = 'pip install "requests==2.31.0"'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "uv_pip_install_quoted_canonical_requirements"
+min_milestone = 1
+input = 'uv pip install --dry-run "setuptools==83.0.0" "torch>=2.13.0"'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "pip_install_quoted_similar_name_still_warns"
+min_milestone = 1
+input = 'pip install "requestss==2.31.0"'
+context = "exec"
+expected_action = "warn"
+expected_rules = ["threat_package_similar_name"]
+
 [[fixture]]
 name = "npm_install_similar_to_popular"
 min_milestone = 1

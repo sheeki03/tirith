@@ -30,11 +30,15 @@ def cell(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
+def active_blockers(finding: dict[str, Any]) -> list[dict[str, Any]]:
+    return [blocker for blocker in finding["blockers"] if blocker["closed_date"] is None]
+
+
 def display_status(finding: dict[str, Any]) -> str:
     verification = finding["verification"]
     fixed = (
         finding["lifecycle"] == "merged_verified"
-        and not finding["blockers"]
+        and not active_blockers(finding)
         and finding["resolution_route"] != "upstream_candidate"
         and verification["merge_commit"] is not None
         and any(
@@ -52,7 +56,7 @@ def render(source_index: dict[str, Any], ledger: dict[str, Any]) -> str:
     lifecycle_counts = Counter(item["lifecycle"] for item in ledger["findings"])
     severity_counts = Counter(item["severity"] for item in ledger["findings"])
     route_counts = Counter(item["resolution_route"] for item in ledger["findings"])
-    blocker_count = sum(bool(item["blockers"]) for item in ledger["findings"])
+    blocker_count = sum(bool(active_blockers(item)) for item in ledger["findings"])
     merged = lifecycle_counts["merged_verified"]
     lines = [
         "# Security remediation ledger",
@@ -115,7 +119,7 @@ def render(source_index: dict[str, Any], ledger: dict[str, Any]) -> str:
         lines.append(
             f"| {finding['finding_id']} | {display_status(finding)} | {finding['severity']} | {finding['lifecycle']} | "
             f"{finding['resolution_route']} | {cell(finding['owner'])} | "
-            f"{len(finding['blockers'])} | {len(finding['verification']['attempts'])} | "
+            f"{len(active_blockers(finding))} | {len(finding['verification']['attempts'])} | "
             f"{sources} | {cell(finding['title'])} |"
         )
     lines.extend(
@@ -150,6 +154,7 @@ def render(source_index: dict[str, Any], ledger: dict[str, Any]) -> str:
             "- Regenerate with `python3 docs/security/remediation/render_main.py`.",
             "- Use `--layer OWNER` and `--release-candidate SHA` with downloaded external evidence; use `--merged-main SHA` only with the configured committed closure bundle.",
             "- `reopened`, `invalidated`, and `regressed` are history events, never lifecycle values.",
+            "- Clearing a blocker sets `closed_date` and appends a matching `blocker_cleared` event; the retained closed record no longer gates release.",
             "- Blockers and upstream routing are separate from lifecycle; neither can make a finding appear complete.",
             "",
         ]

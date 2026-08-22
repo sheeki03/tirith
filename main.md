@@ -22,9 +22,9 @@ Exact duplicate source rows inherit the lifecycle of their canonical root; sourc
 | `source-index.json` | `8945e273d928dc1461e75d72ea686754403e79366bc496edbc5107c414ceeaa7` |
 | `findings.json` | `9e9e6b718946ca8b0c83f82378c76840ce00ed15c4b2fe88cb7712067a313b07` |
 | `source-index.schema.json` | `11cfcf409c6fb54615871d11b3cae24e4bf437ed52689baa444e3ebe4d3ea521` |
-| `findings.schema.json` | `46a6639c8b7e7f51d2567f47e14124bb83dc4cc5aba76f728182a7da9de53991` |
+| `findings.schema.json` | `c394c809808d484dac67efc16a53967e2e5121d1d4d8ad895c307500045d13e2` |
 | `evidence-bundle.schema.json` | `803938b38dee2dfdfb2988b7a3a54c37783089c08bc20ad566fdf0ff0af8dada` |
-| `render_main.py` | `f40102784598b01e4d2269ad5875f7422cda1db0fb1544f27b6919b9f857e8c0` |
+| `render_main.py` | `9586a361de1c0af111fbad314f464e1d71eebe0272a610524bd3b9189abe86df` |
 
 ### Source accounting
 
@@ -348,4 +348,5 @@ Exact duplicate source rows inherit the lifecycle of their canonical root; sourc
 - Regenerate with `python3 docs/security/remediation/render_main.py`.
 - Use `--layer OWNER` and `--release-candidate SHA` with downloaded external evidence; use `--merged-main SHA` only with the configured committed closure bundle.
 - `reopened`, `invalidated`, and `regressed` are history events, never lifecycle values.
+- Clearing a blocker sets `closed_date` and appends a matching `blocker_cleared` event; the retained closed record no longer gates release.
 - Blockers and upstream routing are separate from lifecycle; neither can make a finding appear complete.

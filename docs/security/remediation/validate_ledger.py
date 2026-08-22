@@ -156,6 +156,7 @@ HISTORY_EVENTS = {
     "evidence_added",
 }
 RESET_EVENTS = {"reopened", "invalidated", "regressed"}
+BLOCKER_EVENTS = {"blocker_added", "blocker_cleared"}
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -517,13 +518,65 @@ def passed_attempt_kinds(attempts: list[dict[str, Any]], exact_head: str | None)
     }
 
 
+def active_blockers(finding: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only blockers that have not retained a closure date."""
+    return [blocker for blocker in finding["blockers"] if blocker["closed_date"] is None]
+
+
+def validate_blocker_accounting(finding: dict[str, Any], label: str) -> None:
+    """Bind every blocker state transition to its append-only history event."""
+    blockers = finding["blockers"]
+    require(isinstance(blockers, list), f"{label}: blockers must be an array")
+    blocker_ids: set[str] = set()
+    by_id: dict[str, dict[str, Any]] = {}
+    for blocker in blockers:
+        exact_keys(blocker, {"blocker_id", "reason", "opened_date", "closed_date"}, f"{label} blocker")
+        blocker_id = blocker["blocker_id"]
+        require(isinstance(blocker_id, str) and BLOCKER_RE.fullmatch(blocker_id) is not None, f"{label}: blocker ID must start blocked_")
+        require(blocker_id not in blocker_ids, f"{label}: duplicate blocker")
+        blocker_ids.add(blocker_id)
+        by_id[blocker_id] = blocker
+        require(isinstance(blocker["reason"], str) and blocker["reason"].strip(), f"{label}: blocker reason required")
+        require(isinstance(blocker["opened_date"], str) and DATE_RE.fullmatch(blocker["opened_date"]) is not None, f"{label}: blocker open date invalid")
+        closed_date = blocker["closed_date"]
+        require(closed_date is None or (isinstance(closed_date, str) and DATE_RE.fullmatch(closed_date) is not None), f"{label}: blocker close date invalid")
+        require(closed_date is None or closed_date >= blocker["opened_date"], f"{label}: blocker closes before it opens")
+
+    blocker_events: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
+    for index, event in enumerate(finding["history"]):
+        if event["event"] not in BLOCKER_EVENTS:
+            continue
+        blocker_id = event["blocker_id"]
+        require(blocker_id in by_id, f"{label}: {event['event']} references unknown blocker {blocker_id}")
+        blocker_events.setdefault((event["event"], blocker_id), []).append((index, event))
+
+    for blocker_id, blocker in by_id.items():
+        added = blocker_events.get(("blocker_added", blocker_id), [])
+        require(len(added) == 1, f"{label}: {blocker_id} must have exactly one blocker_added history event")
+        added_index, added_event = added[0]
+        require(added_event["date"] == blocker["opened_date"], f"{label}: {blocker_id} opened_date differs from history")
+        cleared = blocker_events.get(("blocker_cleared", blocker_id), [])
+        if blocker["closed_date"] is None:
+            require(not cleared, f"{label}: active blocker {blocker_id} has a blocker_cleared history event")
+        else:
+            require(len(cleared) == 1, f"{label}: closed blocker {blocker_id} must have exactly one blocker_cleared history event")
+            cleared_index, cleared_event = cleared[0]
+            require(cleared_event["date"] == blocker["closed_date"], f"{label}: {blocker_id} closed_date differs from history")
+            require(cleared_index > added_index, f"{label}: {blocker_id} was cleared before it was added")
+
+
 def validate_history(finding: dict[str, Any], label: str) -> None:
     history = finding["history"]
     require(isinstance(history, list) and history, f"{label}: history required")
     previous_lifecycle: str | None = None
     for index, event in enumerate(history):
-        exact_keys(event, {"event", "lifecycle", "date", "reason"}, f"{label} history[{index}]")
+        expected_keys = {"event", "lifecycle", "date", "reason"}
+        if event.get("event") in BLOCKER_EVENTS:
+            expected_keys.add("blocker_id")
+        exact_keys(event, expected_keys, f"{label} history[{index}]")
         require(event["event"] in HISTORY_EVENTS, f"{label}: invalid history event")
+        if event["event"] in BLOCKER_EVENTS:
+            require(isinstance(event["blocker_id"], str) and BLOCKER_RE.fullmatch(event["blocker_id"]) is not None, f"{label}: history blocker ID must start blocked_")
         require(event["lifecycle"] in LIFECYCLES, f"{label}: history lifecycle invalid")
         require(DATE_RE.fullmatch(event["date"]) is not None, f"{label}: history date invalid")
         require(isinstance(event["reason"], str) and event["reason"].strip(), f"{label}: history reason required")
@@ -543,6 +596,7 @@ def validate_history(finding: dict[str, Any], label: str) -> None:
             require(event["lifecycle"] == previous_lifecycle, f"{label}: non-lifecycle event changed lifecycle")
         previous_lifecycle = event["lifecycle"]
     require(history[-1]["lifecycle"] == finding["lifecycle"], f"{label}: lifecycle differs from latest history")
+    validate_blocker_accounting(finding, label)
 
 
 def validate_findings(ledger: dict[str, Any], source_rows: dict[str, dict[str, Any]], head: str) -> None:
@@ -586,16 +640,6 @@ def validate_findings(ledger: dict[str, Any], source_rows: dict[str, dict[str, A
         require(finding["owner"] == expected_owners[0], f"{label}: owner must be {expected_owners[0]}")
         require(finding["lifecycle"] in LIFECYCLES, f"{label}: invalid lifecycle")
         require(finding["resolution_route"] in ROUTES, f"{label}: invalid resolution route")
-        require(isinstance(finding["blockers"], list), f"{label}: blockers must be an array")
-        blocker_ids: set[str] = set()
-        for blocker in finding["blockers"]:
-            exact_keys(blocker, {"blocker_id", "reason", "opened_date", "closed_date"}, f"{label} blocker")
-            require(BLOCKER_RE.fullmatch(blocker["blocker_id"]) is not None, f"{label}: blocker ID must start blocked_")
-            require(blocker["blocker_id"] not in blocker_ids, f"{label}: duplicate blocker")
-            blocker_ids.add(blocker["blocker_id"])
-            require(isinstance(blocker["reason"], str) and blocker["reason"].strip(), f"{label}: blocker reason required")
-            require(DATE_RE.fullmatch(blocker["opened_date"]) is not None, f"{label}: blocker open date invalid")
-            require(blocker["closed_date"] is None, f"{label}: closed blockers must be removed after a blocker_cleared history event")
         commits = finding["vulnerable_commits"]
         require(isinstance(commits, list) and commits == sorted(set(commits)) and commits, f"{label}: vulnerable commits must be sorted and unique")
         require(all(COMMIT_RE.fullmatch(value) for value in commits), f"{label}: invalid vulnerable commit")
@@ -709,7 +753,7 @@ def validate_findings(ledger: dict[str, Any], source_rows: dict[str, dict[str, A
                 f"{label}: stack verification lacks exact-head passed test/platform attempts",
             )
         if rank >= LIFECYCLES.index("ready_to_merge"):
-            require(not finding["blockers"], f"{label}: ready_to_merge cannot have blockers")
+            require(not active_blockers(finding), f"{label}: ready_to_merge cannot have active blockers")
             require(finding["resolution_route"] != "upstream_candidate", f"{label}: unresolved upstream candidate cannot be ready")
             require(
                 passed_attempt_kinds(verification["attempts"], verification["stack_commit"])
@@ -788,6 +832,18 @@ def compare_against_base(base: Any, current_by_id: dict[str, Any]) -> None:
         require(finding_id in current_by_id, f"{finding_id}: canonical finding deleted")
         new = current_by_id[finding_id]
         require(new["history"][: len(old["history"])] == old["history"], f"{finding_id}: history is not append-only")
+        # A pre-blocker-schema base legitimately has no key. Treat that as an
+        # empty historical set; once a blocker exists, however, its accounting
+        # record becomes append-only below.
+        old_blockers = {blocker["blocker_id"]: blocker for blocker in old.get("blockers", [])}
+        new_blockers = {blocker["blocker_id"]: blocker for blocker in new.get("blockers", [])}
+        for blocker_id, old_blocker in old_blockers.items():
+            require(blocker_id in new_blockers, f"{finding_id}: blocker closure record {blocker_id} was deleted")
+            new_blocker = new_blockers[blocker_id]
+            require(new_blocker["reason"] == old_blocker["reason"], f"{finding_id}: blocker reason changed for {blocker_id}")
+            require(new_blocker["opened_date"] == old_blocker["opened_date"], f"{finding_id}: blocker opened_date changed for {blocker_id}")
+            if old_blocker["closed_date"] is not None:
+                require(new_blocker["closed_date"] == old_blocker["closed_date"], f"{finding_id}: blocker closure changed for {blocker_id}")
         old_sources = {
             (
                 x["source_id"],
@@ -1063,7 +1119,7 @@ def main() -> int:
                 all(item["verification"]["stack_commit"] == candidate for item in ledger["findings"]),
                 "release-candidate gate: every finding must bind stack_commit to the exact candidate",
             )
-            require(all(not item["blockers"] for item in ledger["findings"]), "release gate: active blockers remain")
+            require(all(not active_blockers(item) for item in ledger["findings"]), "release gate: active blockers remain")
             require(all(item["resolution_route"] != "upstream_candidate" for item in ledger["findings"]), "release gate: unresolved upstream candidates remain")
             validate_evidence_bundle(args.evidence_bundle, "release-candidate", candidate, ledger)
             print("release-candidate ledger gate passed; CI and release workflows remain separate required checks")
@@ -1079,7 +1135,7 @@ def main() -> int:
                 all(item["verification"]["merge_commit"] == candidate for item in ledger["findings"]),
                 "merged-main gate: every finding must bind merge_commit to exact main HEAD",
             )
-            require(all(not item["blockers"] for item in ledger["findings"]), "merged-main gate: active blockers remain")
+            require(all(not active_blockers(item) for item in ledger["findings"]), "merged-main gate: active blockers remain")
             require(all(item["resolution_route"] != "upstream_candidate" for item in ledger["findings"]), "merged-main gate: unresolved upstream candidates remain")
             validate_evidence_bundle(args.evidence_bundle, "merged-main", candidate, ledger)
             print("merged-main ledger gate passed for exact HEAD; required main/release workflows must also pass")

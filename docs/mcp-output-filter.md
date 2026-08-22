@@ -24,7 +24,7 @@ transforms based on the verdict's `Action`:
 | ------- | ------------------------------------------------------------ | --------- |
 | `Block` | `content` replaced with single placeholder text item         | `true`    |
 | `Warn`  | `[tirith: WARNING …]` text item prepended; existing items sanitized in place | preserved |
-| `Allow` | pass through unchanged                                       | preserved |
+| `Allow` | structure preserved; forwarded strings sanitized in place    | preserved |
 
 ### Block placeholder shape
 
@@ -99,17 +99,29 @@ compatibility flag disables that local-server boundary.
 
 ## Scan cap and large payloads
 
-The streaming analyzer scans all content and structured string leaves that
-reach it; there is no per-call prefix that can leave a suffix uninspected.
-Transport limits bound the input before filtering (the gateway uses its
-configured `max_message_bytes`, and the local dispatcher caps a JSON-RPC line).
+The streaming analyzer scans all accepted content and structured string leaves;
+there is no per-call prefix that can leave a suffix uninspected. Transport limits
+bound bytes before filtering (the gateway uses its configured
+`max_message_bytes`, and the local dispatcher caps a JSON-RPC line). Independent
+depth, node, logical-leaf, total string-byte, cumulative analyzer-work,
+cumulative decode-candidate, and repeated structural-work budgets bound hostile
+JSON layouts and repeated endpoint rescans.
+Exceeding a budget produces a High `analysis_incomplete` block instead of
+truncating, partially scanning, or silently forwarding the result. Logical leaf
+endpoints receive their own prompt/exfil checkpoint so padded encodings, word
+boundaries, and anchored policy seeds retain end-of-leaf semantics. The
+continuous analyzer advances at those same boundaries, so terminal state and
+attacks split across leaves remain detectable without inventing longer context
+or losing a finding that exists only at an intermediate endpoint.
+
 The final presentation is also bounded and replaced by compact safe metadata
 when necessary. The audit `truncated` field refers to presentation bounding,
-not an incomplete security scan.
+not an incomplete security scan; structural analysis refusal is represented by
+the `analysis_incomplete` rule.
 
-Performance: sub-millisecond per call for payloads under the cap on typical
-agent output. The output ruleset is byte-stream-oriented and does not
-allocate per character.
+Performance is bounded by the transport and structural-work limits rather than
+by silently truncating input. The output ruleset is byte-stream-oriented and
+does not invoke network I/O.
 
 ## Rule set
 

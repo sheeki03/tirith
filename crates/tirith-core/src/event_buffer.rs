@@ -151,10 +151,6 @@ fn privacy_project_bounded_text(value: &str, max_bytes: usize) -> String {
     crate::util::truncate_bytes(&privacy_project_unbounded_text(value), max_bytes)
 }
 
-fn fits_bound_or_privacy_projects(value: &str, projected: &str, max_bytes: usize) -> bool {
-    value.len() <= max_bytes || (projected != value && projected.len() <= max_bytes)
-}
-
 pub(crate) fn privacy_project_endpoint(value: &str) -> String {
     let projected = privacy_project_bounded_text(value, MAX_TYPED_EVENT_METADATA_VALUE_BYTES);
     if projected.starts_with("[REDACTED:") {
@@ -229,10 +225,10 @@ pub(crate) fn privacy_project_typed_event(event: &mut TypedEvent) -> bool {
     let projected_id = privacy_project_bounded_text(&event.event_id, MAX_TYPED_EVENT_ID_BYTES);
     let identity_changed = projected_id != event.event_id;
     // An otherwise opaque id may be a digest of any source field that just
-    // changed. A session owner replaces this sentinel with a reproducible
-    // sequence identity after inspecting the whole ring; keeping one bounded,
-    // stable-id-safe sentinel until then also preserves duplicate-id detection
-    // instead of laundering two hostile ids into two empty strings.
+    // changed. Serialization exposes one bounded, stable-id-safe sentinel;
+    // deserialization converts a newly projected sentinel to the legacy-empty
+    // marker so a session owner can derive a reproducible sequence identity.
+    // Unchanged nonempty ids still participate in duplicate-id rejection.
     event.event_id = if source_changed || identity_changed {
         PRIVACY_REDACTED_EVENT_ID.to_string()
     } else {
@@ -258,44 +254,44 @@ impl<'de> Deserialize<'de> for TypedEvent {
         D: Deserializer<'de>,
     {
         let wire = TypedEventWire::deserialize(deserializer)?;
-        let projected_id = privacy_project_unbounded_text(&wire.event_id);
         let projected_rule_id = privacy_project_unbounded_text(&wire.rule_id);
-        let metadata_within_bounds = wire.metadata.iter().all(|(key, value)| {
-            let (projected_key, projected_value) =
-                crate::redact::privacy_project_durable_pair(key, value);
+        let metadata_is_recoverable = wire.metadata.keys().all(|key| {
+            let (projected_key, _) = crate::redact::privacy_project_durable_pair(key, "");
             let projected_key = privacy_project_unbounded_text(&projected_key);
-            let projected_value = privacy_project_unbounded_text(&projected_value);
-            !key.is_empty()
-                && !projected_key.is_empty()
-                && fits_bound_or_privacy_projects(
-                    key,
-                    &projected_key,
-                    MAX_TYPED_EVENT_METADATA_KEY_BYTES,
-                )
-                && fits_bound_or_privacy_projects(
-                    value,
-                    &projected_value,
-                    MAX_TYPED_EVENT_METADATA_VALUE_BYTES,
-                )
+            !key.is_empty() && !projected_key.is_empty()
         });
-        if !fits_bound_or_privacy_projects(&wire.event_id, &projected_id, MAX_TYPED_EVENT_ID_BYTES)
-            || wire.timestamp.len() > MAX_TYPED_EVENT_TIMESTAMP_BYTES
-            || wire.rule_id.is_empty()
-            || projected_rule_id.is_empty()
-            || !fits_bound_or_privacy_projects(
-                &wire.rule_id,
-                &projected_rule_id,
-                MAX_TYPED_EVENT_RULE_ID_BYTES,
-            )
-            || wire.metadata.len() > MAX_TYPED_EVENT_METADATA_ENTRIES
-            || !metadata_within_bounds
-        {
+        if wire.rule_id.is_empty() || projected_rule_id.is_empty() || !metadata_is_recoverable {
             return Err(D::Error::custom(
                 "typed event exceeds its public semantic bounds",
             ));
         }
         let mut event = Self::from(wire);
-        privacy_project_typed_event(&mut event);
+        // A prior Tirith version may have persisted fields beyond today's
+        // public bounds. Project first, then validate the projected graph so a
+        // safely truncatable legacy value cannot discard the whole session.
+        let identity_needs_migration = privacy_project_typed_event(&mut event);
+        if identity_needs_migration {
+            // A session derives a fresh public identity from the projected
+            // event and its sequence. Keeping the common privacy sentinel here
+            // would make two independently recoverable legacy events look like
+            // a hostile duplicate before the session migration can run.
+            event.event_id.clear();
+        }
+        if event.event_id.len() > MAX_TYPED_EVENT_ID_BYTES
+            || event.timestamp.len() > MAX_TYPED_EVENT_TIMESTAMP_BYTES
+            || event.rule_id.is_empty()
+            || event.rule_id.len() > MAX_TYPED_EVENT_RULE_ID_BYTES
+            || event.metadata.len() > MAX_TYPED_EVENT_METADATA_ENTRIES
+            || event.metadata.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > MAX_TYPED_EVENT_METADATA_KEY_BYTES
+                    || value.len() > MAX_TYPED_EVENT_METADATA_VALUE_BYTES
+            })
+        {
+            return Err(D::Error::custom(
+                "typed event exceeds its projected semantic bounds",
+            ));
+        }
         Ok(event)
     }
 }
@@ -485,40 +481,31 @@ impl<'de> Deserialize<'de> for EventPrototype {
     {
         let wire = EventPrototypeWire::deserialize(deserializer)?;
         let projected_rule_id = privacy_project_unbounded_text(&wire.rule_id);
-        let metadata_within_bounds = wire.metadata.iter().all(|(key, value)| {
-            let (projected_key, projected_value) =
-                crate::redact::privacy_project_durable_pair(key, value);
+        let metadata_is_recoverable = wire.metadata.keys().all(|key| {
+            let (projected_key, _) = crate::redact::privacy_project_durable_pair(key, "");
             let projected_key = privacy_project_unbounded_text(&projected_key);
-            let projected_value = privacy_project_unbounded_text(&projected_value);
-            !key.is_empty()
-                && !projected_key.is_empty()
-                && fits_bound_or_privacy_projects(
-                    key,
-                    &projected_key,
-                    MAX_TYPED_EVENT_METADATA_KEY_BYTES,
-                )
-                && fits_bound_or_privacy_projects(
-                    value,
-                    &projected_value,
-                    MAX_TYPED_EVENT_METADATA_VALUE_BYTES,
-                )
+            !key.is_empty() && !projected_key.is_empty()
         });
-        if wire.rule_id.is_empty()
-            || projected_rule_id.is_empty()
-            || !fits_bound_or_privacy_projects(
-                &wire.rule_id,
-                &projected_rule_id,
-                MAX_TYPED_EVENT_RULE_ID_BYTES,
-            )
-            || wire.metadata.len() > MAX_TYPED_EVENT_METADATA_ENTRIES
-            || !metadata_within_bounds
-        {
+        if wire.rule_id.is_empty() || projected_rule_id.is_empty() || !metadata_is_recoverable {
             return Err(D::Error::custom(
                 "event prototype exceeds its public semantic bounds",
             ));
         }
         let mut prototype = Self::from(wire);
         privacy_project_event_prototype(&mut prototype);
+        if prototype.rule_id.is_empty()
+            || prototype.rule_id.len() > MAX_TYPED_EVENT_RULE_ID_BYTES
+            || prototype.metadata.len() > MAX_TYPED_EVENT_METADATA_ENTRIES
+            || prototype.metadata.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > MAX_TYPED_EVENT_METADATA_KEY_BYTES
+                    || value.len() > MAX_TYPED_EVENT_METADATA_VALUE_BYTES
+            })
+        {
+            return Err(D::Error::custom(
+                "event prototype exceeds its projected semantic bounds",
+            ));
+        }
         Ok(prototype)
     }
 }
@@ -1801,10 +1788,18 @@ mod tests {
             "rule_id": format!("network-{canary}"),
             "metadata": metadata,
         });
-        assert!(
-            serde_json::from_value::<TypedEvent>(oversized).is_err(),
-            "oversized untrusted metadata must be rejected before it can launder strict state"
-        );
+        let projected_oversized: TypedEvent = serde_json::from_value(oversized)
+            .expect("recoverable legacy metadata is projected before bounds validation");
+        assert!(projected_oversized.metadata.len() <= MAX_TYPED_EVENT_METADATA_ENTRIES);
+        assert!(projected_oversized
+            .metadata
+            .keys()
+            .all(|key| key.len() <= MAX_TYPED_EVENT_METADATA_KEY_BYTES));
+        assert!(projected_oversized
+            .metadata
+            .values()
+            .all(|value| value.len() <= MAX_TYPED_EVENT_METADATA_VALUE_BYTES));
+        assert!(projected_oversized.event_id.is_empty());
 
         let event: TypedEvent = serde_json::from_value(serde_json::json!({
             "event_id": format!("legacy-{canary}"),
@@ -1820,7 +1815,7 @@ mod tests {
         }))
         .expect("deserialize projected event");
 
-        assert_eq!(event.event_id, PRIVACY_REDACTED_EVENT_ID);
+        assert!(event.event_id.is_empty());
         assert!(event.metadata.len() <= MAX_TYPED_EVENT_METADATA_ENTRIES);
         assert_eq!(
             event.metadata.get(MANIFEST_FLAG_KEY).map(String::as_str),

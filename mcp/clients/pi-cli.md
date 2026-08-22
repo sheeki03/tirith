@@ -34,7 +34,16 @@ tirith setup pi-cli --dry-run
 ```
 
 This creates the extension file and registers it with Pi CLI. Re-run is safe
-(idempotent). Use `--force` to update existing entries.
+(idempotent). The generated extension pins the validated absolute path of the
+running Tirith executable; it never resolves `tirith` from the agent's `PATH`
+or an environment override. Use `--force` to update an existing generated file.
+For user scope, an empty `PI_CODING_AGENT_DIR` selects `~/.pi/agent`; exact `~`
+and `~/...` values are expanded from HOME before the path is validated.
+
+Project extensions are executable repository-local code. Use project scope only
+for a repository whose `.pi/extensions` content you trust and review before
+opening it in Pi. Use `--scope user` when you want the extension to remain in a
+locally controlled user profile instead of the project tree.
 
 ## Manual Setup
 
@@ -65,7 +74,6 @@ stdin. Verification requires running Pi CLI with the extension installed.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
 | `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings with stderr output, `deny` blocks them |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
@@ -89,5 +97,12 @@ and:
 - Hook telemetry events are logged via `tirith hook-event` (fire-and-forget
   via `execFile`).
 - No `python3` dependency -- the extension is pure TypeScript.
-- The repo has no TS test runner. Automated testing of this extension is not
-  currently supported; use manual host E2E verification.
+- `tests/ipython-vector-extraction.mjs` runs in CI against the exact shipped
+  bytes of this extension: the cell extractor, and the `tool_call` handler
+  driven with a fake `tirith` binary. Live verification inside a real Pi CLI
+  session remains a manual E2E step.
+
+The Pi CLI 0.84.2 contract was rechecked on **2026-08-21** at source head
+`f4585b8bec581d005cbb1edfc07edfcce723d0ae`: see its documented
+[executable extension trust and discovery rules](https://github.com/badlogic/pi-mono/blob/f4585b8bec581d005cbb1edfc07edfcce723d0ae/packages/coding-agent/docs/extensions.md#extension-locations)
+and [blocking `tool_call` return contract](https://github.com/badlogic/pi-mono/blob/f4585b8bec581d005cbb1edfc07edfcce723d0ae/packages/coding-agent/docs/extensions.md#tool_call).

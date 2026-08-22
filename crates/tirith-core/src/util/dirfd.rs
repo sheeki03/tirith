@@ -13,10 +13,10 @@
 //! unreachable rather than merely unlikely, because the name is never resolved
 //! from the filesystem root again.
 //!
-//! On a target without `openat` the same API is backed by path joins plus
-//! `symlink_metadata`, which is the best available there; callers that need the
-//! containment guarantee on those targets pair this with
-//! [`super::canonical_within`].
+//! Windows uses retained directory handles plus `NtCreateFile` with
+//! `OBJECT_ATTRIBUTES.RootDirectory`, and `NtQueryDirectoryFile` enumerates the
+//! same retained handle. Targets without either primitive fail closed instead
+//! of presenting a path-based fallback as a capability.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,46 @@ pub(crate) struct DirEntryFacts {
     pub(crate) kind: EntryKind,
 }
 
+/// Stable identity of an object reached through an open filesystem handle.
+///
+/// Unix supplies `(st_dev, st_ino)`. Windows supplies the volume serial number
+/// and the 64-bit file index returned by `GetFileInformationByHandle`. Both are
+/// taken from the OPEN object, never from a pathname that can be rebound between
+/// inspection and use.
+pub(crate) type FileIdentity = (u64, u64);
+
+pub(crate) fn file_identity(file: &File) -> std::io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = file.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the file handle is live and `info` is writable.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(unsupported_capability())
+    }
+}
+
 /// Why one entry could not be turned into a child capability.
 #[derive(Debug)]
 pub(crate) enum ChildError {
@@ -57,11 +97,13 @@ pub(crate) enum ChildError {
 
 /// A retained handle on one directory.
 pub(crate) struct DirCapability {
-    /// The APPARENT path, kept for reporting and for the non-unix fallback. On
-    /// unix it is never used to resolve anything.
+    /// The apparent path, kept for reporting only. Capability operations never
+    /// use it to resolve a child.
     path: PathBuf,
     #[cfg(unix)]
     fd: std::os::fd::OwnedFd,
+    #[cfg(windows)]
+    handle: File,
 }
 
 impl DirCapability {
@@ -87,25 +129,58 @@ impl DirCapability {
                 fd,
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let metadata = std::fs::symlink_metadata(path).map_err(ChildError::Io)?;
-            if metadata.file_type().is_symlink() {
-                return Err(ChildError::Symlink);
-            }
-            if !metadata.is_dir() {
-                return Err(ChildError::NotADirectory);
-            }
+            let handle = windows_open_root(path)?;
             Ok(Self {
                 path: path.to_path_buf(),
+                handle,
             })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            Err(ChildError::Io(unsupported_capability()))
         }
     }
 
-    /// The apparent path of this directory. On unix every component of it was
-    /// opened with `O_NOFOLLOW` from the root down, so it is also the real one.
+    /// The apparent path of this directory, used only in diagnostics.
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Metadata for the retained directory itself, never for a freshly
+    /// re-resolved pathname.
+    pub(crate) fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        #[cfg(unix)]
+        {
+            let file = File::from(self.fd.try_clone()?);
+            file.metadata()
+        }
+        #[cfg(windows)]
+        {
+            self.handle.metadata()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(unsupported_capability())
+        }
+    }
+
+    /// Stable identity of this retained directory handle.
+    pub(crate) fn identity(&self) -> std::io::Result<FileIdentity> {
+        #[cfg(unix)]
+        {
+            file_identity(&File::from(self.fd.try_clone()?))
+        }
+        #[cfg(windows)]
+        {
+            file_identity(&self.handle)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(unsupported_capability())
+        }
     }
 
     /// Descend into `name`, refusing a symlinked component without following it.
@@ -133,10 +208,35 @@ impl DirCapability {
                 fd,
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
             reject_unsafe_component(name)?;
-            Self::open_root(&child_path)
+            let handle = windows_open_relative(
+                &self.handle,
+                &self.path,
+                name,
+                windows_directory_access(),
+                windows_directory_options(),
+                windows_directory_attributes(),
+            )
+            .map_err(ChildError::Io)?;
+            let facts = windows_handle_facts(&handle).map_err(ChildError::Io)?;
+            if facts.reparse {
+                return Err(ChildError::Symlink);
+            }
+            if !facts.directory {
+                return Err(ChildError::NotADirectory);
+            }
+            Ok(Self {
+                path: child_path,
+                handle,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child_path;
+            let _ = name;
+            Err(ChildError::Io(unsupported_capability()))
         }
     }
 
@@ -167,11 +267,76 @@ impl DirCapability {
             let file = unsafe { File::from_raw_fd(opened) };
             super::check_regular_capped(file, cap)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
             reject_unsafe_component(name).map_err(|_| OpenRegularError::NotRegularFile)?;
-            super::open_read_no_follow_capped(&self.path.join(name), cap)
+            let file = windows_open_relative(
+                &self.handle,
+                &self.path,
+                name,
+                windows_file_access(),
+                windows_file_options(),
+                windows_file_attributes(),
+            )
+            .map_err(classify_windows_file_error)?;
+            let facts = windows_handle_facts(&file).map_err(OpenRegularError::Io)?;
+            if facts.reparse || facts.directory {
+                return Err(OpenRegularError::NotRegularFile);
+            }
+            super::check_regular_capped(file, cap)
         }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = name;
+            let _ = cap;
+            Err(OpenRegularError::Io(unsupported_capability()))
+        }
+    }
+
+    /// Re-open a descendant directory from this retained root, one no-follow
+    /// component at a time. `relative` is the `/`-normalized spelling emitted
+    /// by the capability walker itself.
+    pub(crate) fn open_descendant_directory(&self, relative: &str) -> Result<Self, ChildError> {
+        let mut components = relative.split('/').peekable();
+        if components.peek().is_none() {
+            return Err(ChildError::UnsafeName);
+        }
+        let mut current = None;
+        for component in components {
+            let parent = current.as_ref().unwrap_or(self);
+            current = Some(parent.open_child_directory(component)?);
+        }
+        current.ok_or(ChildError::UnsafeName)
+    }
+
+    /// Re-open a descendant regular file from this retained root. Every parent
+    /// is opened relative to the previously retained directory and the final
+    /// component is opened no-follow and size-capped.
+    pub(crate) fn open_descendant_file(
+        &self,
+        relative: &str,
+        cap: u64,
+    ) -> Result<File, OpenRegularError> {
+        let mut components = relative.split('/').peekable();
+        let Some(first) = components.next() else {
+            return Err(OpenRegularError::NotRegularFile);
+        };
+        if components.peek().is_none() {
+            return self.open_child_file(first, cap);
+        }
+
+        let mut current = self
+            .open_child_directory(first)
+            .map_err(child_as_file_error)?;
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                return current.open_child_file(component, cap);
+            }
+            current = current
+                .open_child_directory(component)
+                .map_err(child_as_file_error)?;
+        }
+        Err(OpenRegularError::NotRegularFile)
     }
 
     /// List this directory, stopping once `max_entries` names have been
@@ -186,10 +351,21 @@ impl DirCapability {
     ) -> std::io::Result<(Vec<DirEntryFacts>, bool)> {
         #[cfg(unix)]
         {
-            use std::os::fd::AsRawFd as _;
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
-            let duplicated = self.fd.try_clone()?;
-            let mut stream = DirStream::adopt(duplicated)?;
+            // `dup`/`try_clone` shares one directory offset with the retained
+            // descriptor. That made a second quiescence listing start at EOF.
+            // Opening `.` relative to the retained descriptor creates a fresh
+            // open-file description at offset zero without resolving any
+            // attacker-controlled pathname component.
+            let fresh =
+                unsafe { libc::openat(self.fd.as_raw_fd(), c".".as_ptr(), DIRECTORY_FLAGS) };
+            if fresh < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: openat returned a fresh owned descriptor.
+            let fresh = unsafe { std::os::fd::OwnedFd::from_raw_fd(fresh) };
+            let mut stream = DirStream::adopt(fresh)?;
             let mut entries = Vec::new();
             let mut truncated = false;
             while let Some(raw) = stream.next_name()? {
@@ -212,28 +388,27 @@ impl DirCapability {
             }
             Ok((entries, truncated))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let mut entries = Vec::new();
-            let mut truncated = false;
-            for entry in std::fs::read_dir(&self.path)? {
-                let entry = entry?;
-                if entries.len() >= max_entries {
-                    truncated = true;
-                    break;
-                }
-                let name = entry.file_name().to_str().map(str::to_owned);
-                let kind = match std::fs::symlink_metadata(entry.path()) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => EntryKind::Symlink,
-                    Ok(metadata) if metadata.is_dir() => EntryKind::Directory,
-                    Ok(metadata) if metadata.is_file() => EntryKind::RegularFile,
-                    Ok(_) => EntryKind::Other,
-                    Err(_) => EntryKind::Other,
-                };
-                entries.push(DirEntryFacts { name, kind });
-            }
-            Ok((entries, truncated))
+            windows_read_entries(&self.handle, max_entries)
         }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = max_entries;
+            Err(unsupported_capability())
+        }
+    }
+}
+
+fn child_as_file_error(error: ChildError) -> OpenRegularError {
+    match error {
+        ChildError::Symlink | ChildError::NotADirectory | ChildError::UnsafeName => {
+            OpenRegularError::NotRegularFile
+        }
+        ChildError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            OpenRegularError::NotFound
+        }
+        ChildError::Io(error) => OpenRegularError::Io(error),
     }
 }
 
@@ -257,7 +432,7 @@ pub(crate) fn hard_link_count(file: &File) -> Option<u64> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn reject_unsafe_component(name: &str) -> Result<(), ChildError> {
     if name.is_empty()
         || name == "."
@@ -269,6 +444,342 @@ fn reject_unsafe_component(name: &str) -> Result<(), ChildError> {
         return Err(ChildError::UnsafeName);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct WindowsHandleFacts {
+    directory: bool,
+    reparse: bool,
+}
+
+#[cfg(windows)]
+fn windows_handle_facts(file: &File) -> std::io::Result<WindowsHandleFacts> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the file handle is live and `info` is writable.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(WindowsHandleFacts {
+        directory: info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        reparse: info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+    })
+}
+
+#[cfg(windows)]
+fn windows_open_root(path: &Path) -> Result<File, ChildError> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+        OPEN_EXISTING, SYNCHRONIZE,
+    };
+
+    let encoded = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: `encoded` is NUL-terminated and CreateFileW returns a fresh
+    // handle on success.
+    let raw = unsafe {
+        CreateFileW(
+            encoded.as_ptr(),
+            FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(ChildError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: ownership of the newly opened handle transfers to `File`.
+    let file = unsafe { File::from_raw_handle(raw) };
+    let facts = windows_handle_facts(&file).map_err(ChildError::Io)?;
+    if facts.reparse {
+        return Err(ChildError::Symlink);
+    }
+    if !facts.directory {
+        return Err(ChildError::NotADirectory);
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_directory_access() -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
+    };
+    FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES
+}
+
+#[cfg(windows)]
+fn windows_file_access() -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_READ_ATTRIBUTES};
+    FILE_GENERIC_READ | FILE_READ_ATTRIBUTES
+}
+
+#[cfg(windows)]
+fn windows_directory_options() -> u32 {
+    windows_sys::Wdk::Storage::FileSystem::FILE_DIRECTORY_FILE
+}
+
+#[cfg(windows)]
+fn windows_file_options() -> u32 {
+    windows_sys::Wdk::Storage::FileSystem::FILE_NON_DIRECTORY_FILE
+}
+
+#[cfg(windows)]
+fn windows_directory_attributes() -> u32 {
+    windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+}
+
+#[cfg(windows)]
+fn windows_file_attributes() -> u32 {
+    windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL
+}
+
+#[cfg(windows)]
+fn windows_open_relative(
+    parent: &File,
+    display_parent: &Path,
+    name: &str,
+    access: u32,
+    options: u32,
+    attributes: u32,
+) -> std::io::Result<File> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use std::ptr::{null, null_mut};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtCreateFile, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    };
+    use windows_sys::Win32::Foundation::{
+        RtlNtStatusToDosError, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    reject_unsafe_component(name).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe Windows capability component",
+        )
+    })?;
+    let mut encoded = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
+    let length = u16::try_from(encoded.len() * std::mem::size_of::<u16>()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows capability component is too long",
+        )
+    })?;
+    let unicode = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: encoded.as_mut_ptr(),
+    };
+    let attributes_block = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: &unicode,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: null(),
+        SecurityQualityOfService: null(),
+    };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let mut handle: HANDLE = null_mut();
+    // SAFETY: every pointer references live storage, RootDirectory is a
+    // retained directory handle, and ObjectName is one validated component.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            access | SYNCHRONIZE,
+            &attributes_block,
+            &mut status_block,
+            null(),
+            attributes,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: translating an NTSTATUS has no memory preconditions.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        let source = std::io::Error::from_raw_os_error(code as i32);
+        return Err(std::io::Error::new(
+            source.kind(),
+            format!(
+                "open retained child {}: {source}",
+                display_parent.join(name).display()
+            ),
+        ));
+    }
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::other(
+            "NtCreateFile returned no retained handle",
+        ));
+    }
+    // SAFETY: ownership of the newly opened handle transfers to `File`.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+fn classify_windows_file_error(error: std::io::Error) -> OpenRegularError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        OpenRegularError::NotFound
+    } else {
+        OpenRegularError::Io(error)
+    }
+}
+
+#[cfg(windows)]
+fn windows_read_entries(
+    directory: &File,
+    max_entries: usize,
+) -> std::io::Result<(Vec<DirEntryFacts>, bool)> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileIdBothDirectoryInformation, NtQueryDirectoryFile, FILE_ID_BOTH_DIR_INFORMATION,
+    };
+    use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, STATUS_NO_MORE_FILES};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    const BUFFER_SIZE: usize = 64 * 1024;
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut entries = Vec::new();
+    let mut restart = true;
+    loop {
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // SAFETY: the directory handle is synchronous and retained; buffer and
+        // status storage are live for the whole call.
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                directory.as_raw_handle(),
+                null_mut(),
+                None,
+                null(),
+                &mut io_status,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                FileIdBothDirectoryInformation,
+                false,
+                null(),
+                restart,
+            )
+        };
+        restart = false;
+        if status == STATUS_NO_MORE_FILES {
+            break;
+        }
+        if status < 0 {
+            // SAFETY: pure status translation.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(std::io::Error::from_raw_os_error(code as i32));
+        }
+        let used = io_status.Information.min(buffer.len());
+        if used == 0 {
+            return Err(std::io::Error::other(
+                "retained Windows directory enumeration made no progress",
+            ));
+        }
+        let mut offset = 0usize;
+        while offset < used {
+            let name_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFORMATION, FileName);
+            let remaining = used.saturating_sub(offset);
+            if remaining < name_offset + std::mem::size_of::<u16>() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "truncated retained Windows directory record",
+                ));
+            }
+            // SAFETY: the kernel returned a chain of directory records inside
+            // `used` bytes; unaligned read avoids assuming buffer alignment.
+            let info = unsafe {
+                std::ptr::read_unaligned(
+                    buffer
+                        .as_ptr()
+                        .add(offset)
+                        .cast::<FILE_ID_BOTH_DIR_INFORMATION>(),
+                )
+            };
+            if name_offset.saturating_add(info.FileNameLength as usize) > remaining
+                || info.FileNameLength as usize % std::mem::size_of::<u16>() != 0
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed retained Windows directory record",
+                ));
+            }
+            let name_bytes =
+                &buffer[offset + name_offset..offset + name_offset + info.FileNameLength as usize];
+            let wide_name = name_bytes
+                .chunks_exact(std::mem::size_of::<u16>())
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .collect::<Vec<_>>();
+            let os_name = OsString::from_wide(&wide_name);
+            if os_name != "." && os_name != ".." {
+                if entries.len() >= max_entries {
+                    return Ok((entries, true));
+                }
+                let kind = if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    EntryKind::Symlink
+                } else if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::RegularFile
+                };
+                entries.push(DirEntryFacts {
+                    name: os_name.to_str().map(str::to_owned),
+                    kind,
+                });
+            }
+            if info.NextEntryOffset == 0 {
+                break;
+            }
+            if info.NextEntryOffset as usize > remaining
+                || (info.NextEntryOffset as usize) < name_offset
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed retained Windows directory chain",
+                ));
+            }
+            offset = offset.saturating_add(info.NextEntryOffset as usize);
+        }
+    }
+    Ok((entries, false))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unsupported_capability() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "retained directory capabilities are unavailable on this target",
+    )
 }
 
 #[cfg(unix)]
@@ -471,6 +982,33 @@ mod tests {
         let (entries, truncated) = capability.read_entries(3).expect("listing");
         assert_eq!(entries.len(), 3);
         assert!(truncated, "the cap must be reported, not silently applied");
+    }
+
+    #[test]
+    fn a_retained_directory_can_be_reenumerated_from_the_beginning() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("first"), b"x").expect("file");
+        let capability = DirCapability::open_root(root.path()).expect("root");
+
+        let (first, truncated) = capability.read_entries(64).expect("first listing");
+        assert!(!truncated);
+        assert_eq!(
+            first
+                .into_iter()
+                .filter_map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            vec!["first".to_string()]
+        );
+
+        std::fs::write(root.path().join("second"), b"x").expect("second file");
+        let (second, truncated) = capability.read_entries(64).expect("second listing");
+        assert!(!truncated);
+        let mut names = second
+            .into_iter()
+            .filter_map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["first".to_string(), "second".to_string()]);
     }
 
     #[cfg(unix)]

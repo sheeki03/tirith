@@ -64,7 +64,7 @@ Lifecycle is strictly:
 
 `confirmed_open → reproduced → implemented → layer_verified → stack_verified → ready_to_merge → merged_verified`
 
-`reopened`, `invalidated`, and `regressed` are append-only history events that lower lifecycle; they are never lifecycle values. Active blockers are separate `blocked_*` records. Resolution route is independently one of `local`, `upstream_candidate`, or `upstream_verified`.
+`reopened`, `invalidated`, and `regressed` are append-only history events that lower lifecycle; they are never lifecycle values. Blockers are separate `blocked_*` records: clearing one sets its `closed_date` and appends a matching `blocker_cleared` event carrying the same `blocker_id`. Closed blocker records remain append-only for accounting but no longer gate readiness or release. Resolution route is independently one of `local`, `upstream_candidate`, or `upstream_verified`.
 
 Advancement is gated by progressively stronger evidence. Implementation requires fix commits and regression-test locators. Every verification attempt binds its base, head, synthetic merge tree, workflow revision, platform/toolchain, command, outcome, external log or attestation, and a subject-tree hash. Layer verification requires exact-head passed focused, benign, and adversarial attempts; stack verification adds platform evidence; ready-to-merge and merged verification additionally require exact-head performance, UX, packaging, review, and release attempts. Failed or `blocked_native` attempts are retained but never satisfy a transition. Migrated consumers are retained alongside regression-test locators.
 

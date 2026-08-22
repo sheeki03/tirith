@@ -1155,6 +1155,28 @@ mod tests {
     }
 
     #[test]
+    fn quoted_pep508_specifiers_keep_the_canonical_package_identity() {
+        for (command, expected) in [
+            (r#"pip install "requests==2.31.0""#, vec!["requests"]),
+            ("pip install 'requests==2.31.0'", vec!["requests"]),
+            (
+                r#"uv pip install --dry-run "setuptools==83.0.0" "torch>=2.13.0""#,
+                vec!["setuptools", "torch"],
+            ),
+        ] {
+            let names = tokenize_and_extract(command)
+                .into_iter()
+                .map(|package| package.name)
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected, "command={command}");
+        }
+
+        let typo = tokenize_and_extract(r#"pip install "reqests==2.31.0""#);
+        assert_eq!(typo.len(), 1);
+        assert_eq!(typo[0].name, "reqests");
+    }
+
+    #[test]
     fn pip_install_version_range_is_constraint() {
         let pkgs = tokenize_and_extract("pip install requests>=2.0");
         assert_eq!(pkgs.len(), 1);

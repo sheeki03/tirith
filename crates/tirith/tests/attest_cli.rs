@@ -288,7 +288,7 @@ fn the_receipt_is_written_atomically_at_mode_0600() {
 
 #[cfg(unix)]
 #[test]
-fn a_symlinked_receipt_destination_is_replaced_and_never_followed() {
+fn a_symlinked_receipt_destination_is_refused_without_mutation() {
     let sandbox = Sandbox::new();
     let victim = sandbox.project().join("victim.txt");
     fs::write(&victim, "do not overwrite me\n").expect("write victim");
@@ -304,18 +304,28 @@ fn a_symlinked_receipt_destination_is_replaced_and_never_followed() {
         "--out",
         "planted.receipt.json",
     ]);
-    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("refusing symlinked contained destination"),
+        "{}",
+        stderr(&output)
+    );
     assert_eq!(
         fs::read_to_string(&victim).expect("read victim"),
         "do not overwrite me\n",
         "the write must never follow a planted symlink onto another file"
     );
     assert!(
-        !fs::symlink_metadata(&destination)
+        fs::symlink_metadata(&destination)
             .expect("stat")
             .file_type()
             .is_symlink(),
-        "the atomic rename replaces the link itself"
+        "a refused receipt publication must leave the planted symlink intact"
+    );
+    assert_eq!(
+        fs::read_link(&destination).expect("read destination link"),
+        victim,
+        "a refused receipt publication must not retarget the planted symlink"
     );
 }
 

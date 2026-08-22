@@ -411,11 +411,12 @@ pub fn verify_self(json: bool) -> i32 {
 /// For installs whose binary is legitimately NOT byte-identical to the generic
 /// release artifact, the canonical-binary byte-compare in `verify-self` cannot
 /// apply, so return an honest `Unverified` reason instead of a false `Failed`:
-/// `cargo install` and the AUR compile from source, and the `.rpm` is rebuilt
-/// against the target distro's (older) glibc in a separate container. Returns
-/// `None` for installs that DO ship the canonical release binary (`.deb`/apt,
+/// `cargo install` and the AUR compile from source. Returns `None` for installs
+/// that DO ship the canonical release binary (`.deb`/apt, `.rpm`/dnf,
 /// self-managed, Homebrew, npm, Scoop) and must verify normally. Exhaustive (no
-/// `_`) so a new install method forces a deliberate decision here.
+/// `_`) so a new install method forces a deliberate decision here. The release
+/// workflow byte-compares both RPM executables against the canonical GNU
+/// tarball before publishing, so DNF must never be carved out here again.
 fn source_built_unverified_reason(method: &InstallMethod) -> Option<String> {
     match method {
         InstallMethod::Cargo => Some(
@@ -428,16 +429,12 @@ fn source_built_unverified_reason(method: &InstallMethod) -> Option<String> {
              canonical release binary to byte-compare against"
                 .to_string(),
         ),
-        InstallMethod::Dnf => Some(
-            "installed from the distribution .rpm, which is built against the target distro's \
-             glibc and is intentionally not byte-identical to the generic Linux release binary"
-                .to_string(),
-        ),
         InstallMethod::SelfManaged
         | InstallMethod::Homebrew
         | InstallMethod::Npm
         | InstallMethod::Scoop
         | InstallMethod::Apt
+        | InstallMethod::Dnf
         | InstallMethod::Unknown => None,
     }
 }
@@ -448,8 +445,8 @@ fn source_built_unverified_reason(method: &InstallMethod) -> Option<String> {
 /// (distributed as a bottle), so its binary is not the prebuilt release artifact,
 /// while the `sheeki03/tap` formula pours the prebuilt binary and matches above
 /// (VERIFIED). Every other method that reaches here ships the canonical prebuilt
-/// binary (.deb/apt, npm, Scoop, self-managed), so for them a mismatch IS tampering
-/// and stays `Failed`; the always-source-built methods (cargo/aur/dnf) are
+/// binary (.deb/apt, .rpm/dnf, npm, Scoop, self-managed), so for them a mismatch
+/// IS tampering and stays `Failed`; the always-source-built methods (cargo/aur) are
 /// pre-empted before the network fetch by `source_built_unverified_reason` and
 /// never reach here. Exhaustive (no `_`) so a new method forces a decision.
 fn benign_mismatch_reason(method: &InstallMethod) -> Option<String> {
@@ -484,12 +481,12 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
         });
     }
 
-    // 1b. Source-/distro-built installs are not byte-identical to the generic
-    //     release binary by design (cargo/AUR compile from source; the .rpm is
-    //     rebuilt against the distro's glibc). Byte-comparing them to the generic
-    //     tarball would falsely report "modified or replaced", so report an honest
-    //     Unverified rather than a false Failed. (.deb/apt ships the canonical
-    //     binary, so it is NOT carved out here and verifies normally.)
+    // 1b. Source-built installs are not byte-identical to the generic release
+    //     binary by design (cargo/AUR compile from source). Byte-comparing them
+    //     to the generic tarball would falsely report "modified or replaced",
+    //     so report an honest Unverified rather than a false Failed. Both
+    //     `.deb`/apt and `.rpm`/dnf ship the canonical binary and therefore are
+    //     NOT carved out here; they verify normally.
     if let Some(reason) = source_built_unverified_reason(&prov.install_method) {
         return VerifySelfOutcome::verdict(VerificationStatus::Unverified { reason });
     }
@@ -716,7 +713,10 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
 
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 fn install_method_requires_package_approval_helper(method: &InstallMethod) -> bool {
-    matches!(method, InstallMethod::SelfManaged | InstallMethod::Apt)
+    matches!(
+        method,
+        InstallMethod::SelfManaged | InstallMethod::Apt | InstallMethod::Dnf
+    )
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3245,14 +3245,14 @@ mod tests {
     }
 
     #[test]
-    fn source_built_carveout_is_cargo_aur_dnf_only() {
-        // Compiled-from-source / distro-rebuilt installs get an honest Unverified.
+    fn source_built_carveout_is_cargo_and_aur_only() {
+        // Compiled-from-source installs get an honest Unverified.
         assert!(source_built_unverified_reason(&InstallMethod::Cargo).is_some());
         assert!(source_built_unverified_reason(&InstallMethod::Aur).is_some());
-        assert!(source_built_unverified_reason(&InstallMethod::Dnf).is_some());
         // These ship the canonical binary and MUST verify normally (no carve-out).
         for m in [
             InstallMethod::Apt,
+            InstallMethod::Dnf,
             InstallMethod::SelfManaged,
             InstallMethod::Homebrew,
             InstallMethod::Npm,
@@ -3274,12 +3274,14 @@ mod tests {
         assert!(install_method_requires_package_approval_helper(
             &InstallMethod::Apt
         ));
+        assert!(install_method_requires_package_approval_helper(
+            &InstallMethod::Dnf
+        ));
         for method in [
             InstallMethod::Npm,
             InstallMethod::Homebrew,
             InstallMethod::Cargo,
             InstallMethod::Aur,
-            InstallMethod::Dnf,
             InstallMethod::Unknown,
         ] {
             assert!(!install_method_requires_package_approval_helper(&method));

@@ -58,6 +58,14 @@ pub const COPILOT_HOOK_PY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/hooks/copilot-cli-hook.py"
 ));
+// Installed by `setup_cline` only on Windows, but also rendered by a
+// cross-platform test, so it is compiled in everywhere and this allow keeps the
+// non-Windows non-test build quiet.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const CLINE_PRETOOLUSE_PS1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/hooks/cline-pretooluse.ps1"
+));
 pub const KIRO_HOOK_PY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/hooks/kiro-hook.py"

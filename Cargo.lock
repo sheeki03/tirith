@@ -3212,6 +3212,7 @@ dependencies = [
  "tirith-test-support",
  "tokio",
  "toml",
+ "toml_edit",
  "tower-lsp",
  "unicode-width",
  "url",

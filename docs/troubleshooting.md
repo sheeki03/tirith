@@ -209,7 +209,7 @@ clearing the command hash does not rebind that running hook.
 
 tirith supports two bash integration modes:
 - **enter mode**: Binds to Enter key via `bind -x`. Intercepts commands and paste before execution. Includes startup health gate and runtime self-healing that auto-degrade to preexec if failures are detected.
-- **preexec mode**: Uses `DEBUG` trap. Warn-only by default. Can be upgraded to real blocking via `shopt -s extdebug` + `return 1` from the DEBUG trap; opt in with `TIRITH_BASH_PREEXEC_ENFORCE=1`.
+- **preexec mode**: Uses a phase-aware `DEBUG` trap. Warn-only by default. With `TIRITH_BASH_PREEXEC_ENFORCE=1`, it scans one trustworthy typed line and enables Tirith-owned `extdebug` only when that decision must be blocked.
 
 ### Which mode is used by default
 
@@ -249,18 +249,29 @@ Enforcement needs a trustworthy whole-line view of each typed command, which bas
 | `HISTCONTROL` containing `ignorespace`, `ignoredups`, or `ignoreboth` | Bash skips or merges history entries | `history 1` may return a stale line that no longer matches `BASH_COMMAND` |
 | `HISTIGNORE=...` | Matching commands are dropped from history | Same: a drifted entry would let composite rules like `curl \| sh` slip |
 | `set +o history` | No entries recorded at all | Nothing to check against |
+| readonly, associative, coercing/nameref, otherwise unassignable `PROMPT_COMMAND`, or an array on Bash < 5.1 | Tirith cannot bracket prompt execution safely without mutating user-owned state | Tirith preserves `PROMPT_COMMAND` and the caller's DEBUG trap, reports protection `off`, and installs no preexec interception |
+| user-enabled `extdebug` | The `DEBUG` trap is inherited into functions and substitutions | Tirith preserves user debugger state, reports protection `off`, and installs no preexec interception |
 
-If any of these are set when the hook loads, you'll see:
+Filtered/disabled history leaves a visible warn-only downgrade with the specific reason, for example:
 
 ```
-tirith: cannot enable preexec enforcement in this shell (HISTCONTROL/HISTIGNORE or disabled history prevent trustworthy whole-line view). Running in warn-only. For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter).
+tirith: protection downgraded to warn-only (does not block) — run 'tirith doctor' for details
+  preexec enforcement could not engage (...). For guaranteed blocking, use enter mode (export TIRITH_BASH_MODE=enter).
 ```
 
-Either remove the hostile setting, use enter mode, or accept warn-only.
+Unsafe prompt/debugger ownership instead prints that the preexec hook was not installed and exports protection `off`; it never calls that state warn-only. Remove the hostile setting or use enter mode, then start a new shell.
 
 #### What Phase 1 handles vs what it doesn't
 
 Phase 1 enforcement uses a narrow-but-honest drift check: bash's `BASH_COMMAND` (the current simple command) must word-boundary-match somewhere inside `history 1` (the typed line). Cosmetic spacing differences — `ls -l >/dev/null` vs `ls -l > /dev/null` — are bridged by a whitespace-normalised retry and a command-name fallback, so they do **not** trigger drift.
+
+Startup, prompt, and user-command execution are tracked as separate phases. Tirith brackets an existing scalar `PROMPT_COMMAND`, or an indexed array on Bash 5.1+, without reordering its entries and preserves the previous command's status for the first user prompt function. The sourced hook reports protection `off` until the first internal prompt boundary captures any caller-owned DEBUG trap in Bash's top-level context, chains it, and activates preexec (`warn-only`, or `blocks` when enforcement was requested) before Bash can accept another user command; prompt execution and receipt generation remain excluded during that bootstrap. Older Bash versions do not execute every `PROMPT_COMMAND` array element, so Tirith preserves such an array unchanged and leaves interception visibly off instead of installing a begin guard that can never reach its end guard. A typed function call is decided once at its top-level history line; inherited `DEBUG` fires from its body, prompt functions, substitutions, and subshells neither rescan nor create duplicate execution receipts. A function definition and invocation typed on the same line is therefore checked as that complete line. Pre-existing function bodies are not recursively converted back into shell source for a second scan; use enter mode if policy must reason about indirection that is absent from the accepted line itself.
+
+If a prompt framework later removes or reorders Tirith's boundary entries, the
+hook downgrades visibly and stops issuing trusted execution receipts for that
+shell. History-matching commands continue under best-effort warn-only scans;
+automatic prompt commands remain excluded. Start a new shell after fixing the
+prompt configuration to restore blocking and receipt claims.
 
 The following are explicitly **not** handled in Phase 1; any shell that relies on them triggers a runtime drift detection and downgrades the session to warn-only with a clear message:
 
@@ -279,17 +290,23 @@ One narrow residual remains: if a pipeline's *first* simple command happens to w
 
 #### `extdebug` side effects
 
-When enforcement is enabled, the hook enables `shopt -s extdebug`. This:
+Tirith no longer leaves `extdebug` enabled for an enforced session. Allowed
+lines and prompt functions run with the user's original setting. Only after a
+whole-line block verdict does Tirith temporarily run `shopt -s extdebug`, so
+the `DEBUG` trap's non-zero return can skip the command; the prompt-begin guard
+then disables Tirith-owned `extdebug` before any user `PROMPT_COMMAND` entry.
 
-- Changes the default behavior of `BASH_ARGC` / `BASH_ARGV` (they become populated by default).
-- Makes `declare -F` include source file and line numbers.
-- Interacts with `set -E` (errtrace) so `ERR` traps are inherited by shell functions.
+During that short blocked-line interval, `extdebug` can:
 
-If any of these matter for your workflow, set `TIRITH_BASH_PREEXEC_ENFORCE=0` or use enter mode. Once enabled, `extdebug` stays on for the life of the shell session, even if the session later degrades to warn-only (disabling it inside the DEBUG trap would break the `return 1` skip semantic).
+- Change the default behavior of `BASH_ARGC` / `BASH_ARGV` (they become populated by default).
+- Make `declare -F` include source file and line numbers.
+- Interact with `set -E` (errtrace) so `ERR` traps are inherited by shell functions.
+
+If `extdebug` is already enabled when the hook loads, Tirith leaves it enabled and visibly leaves preexec interception off rather than claiming or later disabling user debugger state. If prompt code enables it after enforcement starts, the prompt-end boundary detects that before another user command, preserves the setting, downgrades to warn-only, and stops trusted receipt claims. If Tirith cannot attach and retain its prompt guards or safely capture a caller-owned DEBUG trap, it likewise preserves that state and reports protection `off`. Use enter mode if the block-to-prompt `extdebug` interval conflicts with your debugging workflow.
 
 ### Chained DEBUG traps
 
-If you have your own `DEBUG` trap installed before sourcing the tirith hook, the hook wraps it in a trampoline and both run on every command. Your trap's return value is ignored by the trampoline; tirith's return value is authoritative. If your trap depends on caller-local state, the wrap may not reproduce behavior perfectly — opt out with `TIRITH_BASH_PREEXEC_ENFORCE=0` in that case.
+If you have your own `DEBUG` trap installed before sourcing the tirith hook, the hook captures it from a direct first-prompt command (a sourced file cannot inspect its caller's DEBUG trap), then wraps it in a trampoline before the shell accepts more input. Both run on every command; the capture tolerates output from the existing trap and does not change `extdebug`. Source the hook as its own startup line: commands appended to the same manual `source ...; command` compound line occur before that first prompt and therefore predate preexec activation. Your trap's return value is ignored by the trampoline; tirith's return value is authoritative. If capture or chaining cannot be proven safe, Tirith leaves the existing trap untouched and reports interception `off`. If your trap depends on caller-local state, the wrap may not reproduce behavior perfectly — leave preexec mode disabled in that case.
 
 ### Checking live state with `tirith doctor`
 
@@ -344,7 +361,7 @@ export TIRITH_BASH_MODE=enter
 
 ### DEBUG trap ownership
 
-In preexec mode (including after auto-degrade from enter mode), tirith sets the `DEBUG` trap. This is the same behavior used by default in SSH sessions. If you have custom `DEBUG` traps in your shell configuration, they will be overridden when tirith is in preexec mode.
+In preexec mode (including after auto-degrade from enter mode), tirith installs a `DEBUG` trap. This is the same behavior used by default in SSH sessions. A `DEBUG` trap you installed BEFORE sourcing the hook is not overridden: it is captured at the first prompt and chained, as described under "Chained DEBUG traps" above. A trap installed AFTER the hook replaces tirith's, and tirith does not take it back; it reports protection `off` at the next prompt and says which tool to load first. Run `tirith doctor` to see the live state.
 
 ## Bash: no visible input after `ssh` / `gcloud compute ssh`
 
