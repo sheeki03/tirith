@@ -18,6 +18,14 @@ ignore = [
     # preflight was bypassable via /ObjStm). Remove this ignore
     # (and the .cargo/audit.toml twin) once MSRV/lopdf can move.
     "RUSTSEC-2026-0187",
+    # hickory-proto 0.24.4 BinEncoder name-compression DoS (O(n²) on a
+    # malicious message with many labels). The fixed line is 0.26.1; that
+    # resolver series is a different API than the 0.24 pin in
+    # crates/tirith-core/Cargo.toml (MSRV 1.83). Tirith only encodes DNS
+    # queries it constructs for hostnames already extracted from policy or
+    # command text; it does not re-encode untrusted DNS messages. Remove
+    # this ignore when the resolver can move to >=0.26.1.
+    "RUSTSEC-2026-0119",
 ]
 
 [licenses]

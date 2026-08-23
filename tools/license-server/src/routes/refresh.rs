@@ -61,16 +61,19 @@ pub async fn refresh(
     // unthrottled loop could exhaust disk and contend on the DB mutex. 60s is
     // far below any legitimate CLI refresh cadence.
     const MIN_REFRESH_INTERVAL_SECS: i64 = 60;
-    if let Some(age) = state.db.seconds_since_last_token(&sub.id).await? {
-        if age < MIN_REFRESH_INTERVAL_SECS {
-            return Err(AppError::RateLimited);
-        }
-    }
-
     let exp_ts = chrono::Utc::now().timestamp() + (state.config.token_ttl_days * 86400);
     let token = state.signer.sign_token(&sub.tier, exp_ts);
 
-    state.db.insert_token(&sub.id, &token, exp_ts).await?;
+    // The throttle check and token publication are one atomic database
+    // operation. Signing can happen speculatively, but only the single winner
+    // is persisted and returned; every parallel loser is rate-limited.
+    if !state
+        .db
+        .insert_refresh_token_if_due(&sub.id, &token, exp_ts, MIN_REFRESH_INTERVAL_SECS)
+        .await?
+    {
+        return Err(AppError::RateLimited);
+    }
 
     Ok((
         StatusCode::OK,

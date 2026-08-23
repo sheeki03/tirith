@@ -108,6 +108,37 @@ fn normalize_event_ts(raw: Option<&str>) -> Option<String> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventTimestampError {
+    Missing,
+    InvalidIncoming,
+    InvalidStored,
+    Stale,
+}
+
+/// Validate an event timestamp and compare it to the row version observed in
+/// the same transaction. A missing or unparseable timestamp is never allowed to
+/// carry a lifecycle side effect, and an unparseable legacy row fails closed
+/// until it is repaired deliberately.
+fn ordered_event_timestamp(
+    incoming: Option<&str>,
+    previous: Option<&str>,
+) -> Result<String, EventTimestampError> {
+    let incoming = incoming.ok_or(EventTimestampError::Missing)?;
+    let incoming = chrono::DateTime::parse_from_rfc3339(incoming)
+        .map_err(|_| EventTimestampError::InvalidIncoming)?;
+    if let Some(previous) = previous {
+        let previous = chrono::DateTime::parse_from_rfc3339(previous)
+            .map_err(|_| EventTimestampError::InvalidStored)?;
+        if incoming < previous {
+            return Err(EventTimestampError::Stale);
+        }
+    }
+    Ok(incoming
+        .to_utc()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
 impl Db {
     pub fn open(path: &str) -> Result<Self, AppError> {
         let conn =
@@ -415,6 +446,71 @@ impl Db {
                 return Ok(false);
             }
 
+            let previous_event_at: Option<String> = tx
+                .query_row(
+                    "SELECT last_event_at FROM subscriptions WHERE id=?1",
+                    params![data.subscription_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|e| AppError::Internal(format!("db read revoked order: {e}")))?
+                .flatten();
+            let occurred_at = match ordered_event_timestamp(
+                data.occurred_at.as_deref(),
+                previous_event_at.as_deref(),
+            ) {
+                Ok(occurred_at) => occurred_at,
+                Err(reason) => {
+                    tracing::warn!(
+                        event_id = %data.event_id,
+                        ?reason,
+                        "subscription.revoked did not carry a provably newer timestamp; state unchanged"
+                    );
+                    // `Stale` is an ordinary non-advance: the stored state is
+                    // already at or past this event, so declining it is right.
+                    // The other variants mean the event could not be ordered at
+                    // all, and marking it processed below is what makes that
+                    // terminal — the handler answers 200, Polar never
+                    // redelivers, and the subscription stays active with its API
+                    // key unrevoked. Revocation is the one action where silently
+                    // declining keeps paid access open, so record those for the
+                    // dead-letter retry tooling instead of only warning.
+                    if !matches!(reason, EventTimestampError::Stale) {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO dead_letter \
+                             (event_id, subscription_id, event_type, reason, occurred_at, payload) \
+                             VALUES (?1, ?2, 'subscription.revoked', ?3, ?4, ?5)",
+                            params![
+                                data.event_id,
+                                data.subscription_id,
+                                format!("unorderable revoked timestamp: {reason:?}"),
+                                data.occurred_at,
+                                serde_json::json!({
+                                    "subscription_id": data.subscription_id,
+                                    "customer_id": data.customer_id,
+                                    "email": data.email,
+                                    "tier": data.tier,
+                                    "product_id": data.product_id,
+                                    "occurred_at": data.occurred_at,
+                                })
+                                .to_string(),
+                            ],
+                        )
+                        .map_err(|e| {
+                            AppError::Internal(format!("db dead-letter revoked: {e}"))
+                        })?;
+                    }
+                    tx.execute(
+                        "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, 'subscription.revoked')",
+                        params![data.event_id],
+                    )
+                    .map_err(|e| AppError::Internal(format!("db mark rejected revoked: {e}")))?;
+                    tx.commit()
+                        .map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
+                    return Ok(false);
+                }
+            };
+
             tx.execute(
                 "INSERT INTO subscriptions (id, customer_id, email, tier, status, product_id, last_event_at)
                  VALUES (?1, ?2, ?3, ?4, 'revoked', ?5, ?6)
@@ -432,7 +528,7 @@ impl Db {
                     data.email.as_deref().unwrap_or("unknown"),
                     data.tier.as_deref().unwrap_or("unknown"),
                     data.product_id.as_deref().unwrap_or("unknown"),
-                    normalize_event_ts(data.occurred_at.as_deref()),
+                    occurred_at,
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert revoked: {e}")))?;
@@ -516,6 +612,32 @@ impl Db {
             let prev_status = prev_row.as_ref().map(|(s, _)| s.as_str());
             let prev_last_event_at = prev_row.as_ref().and_then(|(_, t)| t.as_deref());
 
+            // Missing, malformed, and stale timestamps are all non-advances.
+            // This check runs before the terminal-state branch so every update
+            // has one ordering contract, including events targeting a revoked
+            // row and `revoked` updates routed through this generic seam.
+            let occurred_at = match ordered_event_timestamp(
+                data.occurred_at.as_deref(),
+                prev_last_event_at,
+            ) {
+                Ok(occurred_at) => occurred_at,
+                Err(reason) => {
+                    tracing::warn!(
+                        event_id = %data.event_id,
+                        ?reason,
+                        "subscription update did not carry a provably newer timestamp; state unchanged"
+                    );
+                    tx.execute(
+                        "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
+                        params![data.event_id, data.event_type],
+                    )
+                    .map_err(|e| AppError::Internal(format!("db mark rejected update: {e}")))?;
+                    tx.commit()
+                        .map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
+                    return Ok(UpdatedOutcome::StaleIgnored);
+                }
+            };
+
             // revoked absorbs every non-revoked transition.
             if prev_status == Some("revoked") && data.new_status != "revoked" {
                 tx.execute(
@@ -525,66 +647,6 @@ impl Db {
                 .map_err(|e| AppError::Internal(format!("db mark event: {e}")))?;
                 tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
                 return Ok(UpdatedOutcome::TerminalIgnored);
-            }
-
-            // Out-of-order guard: a stale/reordered genuine event whose
-            // occurred_at predates the row's last_event_at must not overwrite
-            // the status or touch the `revoked` flag. Without this, an older
-            // `active` arriving after `past_due`/`revoked` would re-enable a
-            // key that was correctly disabled by the newer event.
-            //
-            // Both sides carry a Polar event's `created_at`, but
-            // last_event_at is persisted verbatim from the payload, so an
-            // equivalent-or-older instant may be encoded with a different UTC
-            // offset (e.g. `+02:00` vs `Z`) or fractional-second format. A raw
-            // string compare sorts those incorrectly and would let a stale
-            // event through, so parse BOTH to a normalized instant first and
-            // compare the instants.
-            //
-            // Fail-safe policy: a parse failure must never let a stale event
-            // re-apply status side effects. If the incoming occurred_at is
-            // unparseable we cannot trust it is newer, so we reject it as a
-            // non-advance (StaleIgnored). If prev_last_event_at is unparseable
-            // (e.g. a malformed legacy value) we likewise cannot prove the
-            // incoming event is newer, so we conservatively treat the incoming
-            // event as stale. Only a successful parse of BOTH with
-            // occurred >= prev advances the row.
-            if let (Some(occurred), Some(prev_at)) =
-                (data.occurred_at.as_deref(), prev_last_event_at)
-            {
-                let is_stale = match (
-                    chrono::DateTime::parse_from_rfc3339(occurred),
-                    chrono::DateTime::parse_from_rfc3339(prev_at),
-                ) {
-                    (Ok(occurred_ts), Ok(prev_ts)) => occurred_ts < prev_ts,
-                    (Err(e), _) => {
-                        tracing::warn!(
-                            event_id = %data.event_id,
-                            occurred_at = %occurred,
-                            error = %e,
-                            "unparseable incoming occurred_at; rejecting as stale (non-advance)"
-                        );
-                        true
-                    }
-                    (Ok(_), Err(e)) => {
-                        tracing::warn!(
-                            event_id = %data.event_id,
-                            last_event_at = %prev_at,
-                            error = %e,
-                            "unparseable stored last_event_at; conservatively treating incoming event as stale"
-                        );
-                        true
-                    }
-                };
-                if is_stale {
-                    tx.execute(
-                        "INSERT INTO webhook_events (event_id, event_type) VALUES (?1, ?2)",
-                        params![data.event_id, data.event_type],
-                    )
-                    .map_err(|e| AppError::Internal(format!("db mark event: {e}")))?;
-                    tx.commit().map_err(|e| AppError::Internal(format!("db commit: {e}")))?;
-                    return Ok(UpdatedOutcome::StaleIgnored);
-                }
             }
 
             tx.execute(
@@ -603,7 +665,7 @@ impl Db {
                     data.tier.as_deref().unwrap_or("unknown"),
                     data.new_status,
                     data.product_id.as_deref().unwrap_or("unknown"),
-                    normalize_event_ts(data.occurred_at.as_deref()),
+                    occurred_at,
                 ],
             )
             .map_err(|e| AppError::Internal(format!("db upsert updated: {e}")))?;
@@ -706,10 +768,28 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    /// Atomic consume — DELETE … RETURNING ensures exactly one request
-    /// receives the row.
-    /// repo-0237: non-destructive read of a pending receipt. `receipt_view`
-    /// peeks, decrypts/validates, and only then calls [`Self::receipt_consume`]
+    /// Non-destructive availability check for confirmation pages. This avoids
+    /// loading encrypted credentials for safe GET/HEAD requests.
+    pub async fn receipt_available(&self, receipt_secret: &str) -> Result<bool, AppError> {
+        let conn = self.conn.clone();
+        let secret = receipt_secret.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = acquire_db(&conn);
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending_receipts WHERE receipt_secret=?1 AND expires_at > datetime('now'))",
+                    params![secret],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::Internal(format!("db receipt availability: {e}")))?;
+            Ok(exists != 0)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
+    }
+
+    /// repo-0237: non-destructive read of a pending receipt. `receipt_consume`
+    /// peeks, decrypts/validates, and only then calls the atomic consume below
     /// — a decryption/validation failure must not destroy the only recoverable
     /// encrypted API key.
     pub async fn receipt_peek(&self, receipt_secret: &str) -> Result<Option<ReceiptRow>, AppError> {
@@ -739,6 +819,8 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
+    /// Atomic consume — DELETE … RETURNING ensures exactly one request
+    /// receives the row.
     pub async fn receipt_consume(
         &self,
         receipt_secret: &str,
@@ -813,44 +895,60 @@ impl Db {
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    pub async fn insert_token(
+    /// Atomically publish a refresh token only when this subscription has not
+    /// received one inside `min_interval_secs`. The decision and INSERT share
+    /// one SQLite statement while the connection mutex is held, so parallel
+    /// refresh requests cannot all observe an old token and then all win.
+    pub async fn insert_refresh_token_if_due(
         &self,
         sub_id: &str,
         token: &str,
         expires_at: i64,
-    ) -> Result<(), AppError> {
+        min_interval_secs: i64,
+    ) -> Result<bool, AppError> {
         let conn = self.conn.clone();
         let sid = sub_id.to_string();
         let tok = token.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = acquire_db(&conn);
-            conn.execute(
-                "INSERT INTO tokens (subscription_id, token, expires_at) VALUES (?1, ?2, ?3)",
-                params![sid, tok, expires_at],
-            )
-            .map_err(|e| AppError::Internal(format!("db insert token: {e}")))?;
-            Ok(())
+            let inserted = conn
+                .execute(
+                    "INSERT INTO tokens (subscription_id, token, expires_at)
+                     SELECT ?1, ?2, ?3
+                     WHERE NOT EXISTS (
+                       SELECT 1 FROM tokens
+                       WHERE subscription_id=?1
+                         AND CAST(strftime('%s', created_at) AS INTEGER)
+                             > unixepoch('now') - ?4
+                     )",
+                    params![sid, tok, expires_at, min_interval_secs],
+                )
+                .map_err(|e| AppError::Internal(format!("db insert refresh token: {e}")))?;
+            Ok(inserted == 1)
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
     }
 
-    /// Seconds since the most recent token issuance for `sub_id` (`None` when
-    /// never issued). Drives the repo-0449 per-subscription refresh interval.
-    pub async fn seconds_since_last_token(&self, sub_id: &str) -> Result<Option<i64>, AppError> {
-        let conn = self.conn.clone();
-        let sid = sub_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = acquire_db(&conn);
-            conn.query_row(
-                "SELECT CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', MAX(created_at)) AS INTEGER) FROM tokens WHERE subscription_id=?1",
-                params![sid],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .map_err(|e| AppError::Internal(format!("db token age: {e}")))
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("spawn_blocking: {e}")))?
+    #[cfg(test)]
+    fn count_tokens_for_subscription(&self, sub_id: &str) -> i64 {
+        let conn = acquire_db(&self.conn);
+        conn.query_row(
+            "SELECT COUNT(*) FROM tokens WHERE subscription_id=?1",
+            params![sub_id],
+            |row| row.get(0),
+        )
+        .expect("count tokens")
+    }
+
+    #[cfg(test)]
+    fn delete_tokens_for_subscription(&self, sub_id: &str) {
+        let conn = acquire_db(&self.conn);
+        conn.execute(
+            "DELETE FROM tokens WHERE subscription_id=?1",
+            params![sub_id],
+        )
+        .expect("delete tokens");
     }
 
     pub async fn insert_dead_letter(&self, dl: DeadLetterData) -> Result<(), AppError> {
@@ -1189,6 +1287,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_refreshes_have_exactly_one_atomic_winner() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+        db.delete_tokens_for_subscription("sub_1");
+
+        let contestants = 16;
+        let barrier = Arc::new(tokio::sync::Barrier::new(contestants));
+        let mut tasks = Vec::new();
+        for index in 0..contestants {
+            let db = db.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                db.insert_refresh_token_if_due(
+                    "sub_1",
+                    &format!("refresh-token-{index}"),
+                    9_999_999_999,
+                    60,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut winners = 0;
+        for task in tasks {
+            winners += usize::from(task.await.unwrap());
+        }
+        assert_eq!(winners, 1, "parallel refreshes must have one winner");
+        assert_eq!(db.count_tokens_for_subscription("sub_1"), 1);
+    }
+
+    #[tokio::test]
     async fn test_provision_duplicate_event() {
         let db = test_db();
         let data1 = make_created("evt_1", "sub_1", "team");
@@ -1263,6 +1396,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_receipt_availability_is_non_consuming_until_atomic_consume() {
+        let db = test_db();
+        let mut data = make_created("evt_1", "sub_1", "team");
+        data.checkout_id = Some("checkout_real".to_string());
+        db.process_subscription_created(data).await.unwrap();
+
+        assert!(db.receipt_available("receipt_evt_1").await.unwrap());
+        assert!(db.receipt_available("receipt_evt_1").await.unwrap());
+        assert!(db.receipt_consume("receipt_evt_1").await.unwrap().is_some());
+        assert!(!db.receipt_available("receipt_evt_1").await.unwrap());
+        assert!(db.receipt_consume("receipt_evt_1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn test_provision_skipped_if_revoked() {
         let db = test_db();
         {
@@ -1323,6 +1470,86 @@ mod tests {
         let (status, revoked) = read_state(&db, "sub_1");
         assert_eq!(status, "revoked");
         assert_eq!(revoked, Some(true));
+    }
+
+    #[tokio::test]
+    async fn stale_revoked_event_cannot_override_newer_active_state() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut newer_active = make_updated("evt_2", "sub_1", "active");
+        newer_active.occurred_at = Some("2024-03-01T00:00:00Z".to_string());
+        assert_eq!(
+            db.process_subscription_updated(newer_active).await.unwrap(),
+            UpdatedOutcome::Unrevoked
+        );
+
+        let mut stale_revoked = make_revoked("evt_3", "sub_1");
+        stale_revoked.occurred_at = Some("2024-02-01T00:00:00Z".to_string());
+        assert!(!db
+            .process_subscription_revoked(stale_revoked)
+            .await
+            .unwrap());
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "active");
+        assert_eq!(revoked, Some(false));
+
+        let mut newer_revoked = make_revoked("evt_4", "sub_1");
+        newer_revoked.occurred_at = Some("2024-04-01T00:00:00Z".to_string());
+        assert!(db
+            .process_subscription_revoked(newer_revoked)
+            .await
+            .unwrap());
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "revoked");
+        assert_eq!(revoked, Some(true));
+    }
+
+    #[tokio::test]
+    async fn missing_update_timestamp_cannot_reenable_key() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut past_due = make_updated("evt_2", "sub_1", "past_due");
+        past_due.occurred_at = Some("2024-03-01T00:00:00Z".to_string());
+        assert_eq!(
+            db.process_subscription_updated(past_due).await.unwrap(),
+            UpdatedOutcome::Revoked
+        );
+
+        let mut missing_timestamp = make_updated("evt_3", "sub_1", "active");
+        missing_timestamp.occurred_at = None;
+        assert_eq!(
+            db.process_subscription_updated(missing_timestamp)
+                .await
+                .unwrap(),
+            UpdatedOutcome::StaleIgnored
+        );
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "past_due");
+        assert_eq!(revoked, Some(true));
+    }
+
+    #[tokio::test]
+    async fn missing_revoked_timestamp_cannot_change_state() {
+        let db = test_db();
+        db.process_subscription_created(make_created("evt_1", "sub_1", "team"))
+            .await
+            .unwrap();
+
+        let mut revoked_event = make_revoked("evt_2", "sub_1");
+        revoked_event.occurred_at = None;
+        assert!(!db
+            .process_subscription_revoked(revoked_event)
+            .await
+            .unwrap());
+        let (status, revoked) = read_state(&db, "sub_1");
+        assert_eq!(status, "active");
+        assert_eq!(revoked, Some(false));
     }
 
     #[tokio::test]

@@ -593,6 +593,12 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
 #[cfg(unix)]
 fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
     let mut new_findings = Vec::new();
+    // One cancellable resolver and one absolute budget cover every host in this
+    // daemon request. Distinct attacker-controlled findings cannot each reset
+    // the DNS deadline/query allowance.
+    let mut dns = network::SystemDnsResolver::new()
+        .ok()
+        .map(|resolver| (resolver, network::DnsRequestBudget::dnsbl()));
 
     // Resolve shortened URLs and surface blocklist hits on destinations.
     for finding in findings.iter_mut() {
@@ -612,7 +618,12 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
 
                 // DNS blocklist on the resolved destination's host.
                 if let Some(host) = extract_host_from_url(&resolved) {
-                    let blocklist_hits = network::check_dns_blocklist(&host);
+                    let blocklist_hits = dns
+                        .as_mut()
+                        .map(|(resolver, budget)| {
+                            network::check_dns_blocklist_with(&host, resolver, budget)
+                        })
+                        .unwrap_or_default();
                     if !blocklist_hits.is_empty() {
                         new_findings.push(Finding {
                             rule_id: RuleId::ShortenedUrl,
@@ -642,7 +653,12 @@ fn enrich_with_network_checks(findings: &mut Vec<Finding>) {
             if let Evidence::Url { raw } = evidence {
                 if let Some(host) = extract_host_from_url(raw) {
                     if checked_hosts.insert(host.clone()) {
-                        let hits = network::check_dns_blocklist(&host);
+                        let hits = dns
+                            .as_mut()
+                            .map(|(resolver, budget)| {
+                                network::check_dns_blocklist_with(&host, resolver, budget)
+                            })
+                            .unwrap_or_default();
                         if !hits.is_empty() {
                             new_findings.push(Finding {
                                 rule_id: finding.rule_id,

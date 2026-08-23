@@ -12,8 +12,6 @@ pub enum AppError {
     /// Rate limit exceeded (used by rate-limiting middleware)
     #[allow(dead_code)]
     RateLimited,
-    /// Not found (receipt expired, etc.)
-    NotFound(String),
     /// Internal server error (DB, signing, transient)
     Internal(String),
 }
@@ -25,7 +23,6 @@ impl std::fmt::Display for AppError {
             Self::BadWebhook(msg) => write!(f, "bad webhook: {msg}"),
             Self::PaymentRequired(msg) => write!(f, "payment required: {msg}"),
             Self::RateLimited => write!(f, "rate limited"),
-            Self::NotFound(msg) => write!(f, "not found: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -38,7 +35,6 @@ impl IntoResponse for AppError {
             Self::BadWebhook(_) => (StatusCode::BAD_REQUEST, "Bad request"),
             Self::PaymentRequired(msg) => (StatusCode::PAYMENT_REQUIRED, msg.as_str()),
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Too many requests"),
-            Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.as_str()),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         };
         (status, body.to_string()).into_response()

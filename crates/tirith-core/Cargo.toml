@@ -63,6 +63,12 @@ tempfile = "3"
 toml = "0.8"
 ed25519-dalek = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# Socket-based DNS with cancellable async lookups. The resolver worker in
+# `network::dns` drives this on a private current-thread runtime so core callers
+# retain a synchronous API without using libc's non-interruptible resolver.
+# hickory-resolver 0.24.4 declares Rust 1.71.1, below workspace MSRV 1.83.
+hickory-resolver = { version = "0.24.4", default-features = false, features = ["system-config", "tokio-runtime"] }
+tokio = { workspace = true, features = ["net", "rt", "time"] }
 csv = { workspace = true }
 owo-colors = { workspace = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }

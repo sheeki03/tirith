@@ -1,7 +1,7 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use tracing::error;
@@ -13,8 +13,7 @@ use crate::state::AppState;
 pub struct LookupQuery {
     pub checkout: String,
     /// `1` when the not-ready page polls via fetch (repo-0235): returns JSON
-    /// instead of a redirect so the one-time receipt is not consumed by the
-    /// poller.
+    /// instead of following a redirect into the human confirmation page.
     #[serde(default)]
     pub poll: Option<String>,
 }
@@ -29,10 +28,9 @@ pub async fn receipt_lookup(
 
     let secret = state.db.receipt_lookup(&query.checkout).await?;
 
-    // repo-0235: the not-ready poller must NOT follow the redirect — fetch()
-    // auto-follows into /receipt/{secret}, consuming the one-time row, and the
-    // discarded body leaves the customer at a perpetual "not ready". Polling
-    // with `poll=1` returns the URL as JSON; the script navigates top-level.
+    // repo-0235: the not-ready poller must not follow the redirect into HTML it
+    // cannot interpret. Polling with `poll=1` returns the confirmation URL as
+    // JSON; the script then navigates there at top level.
     if query.poll.as_deref() == Some("1") {
         let body = match &secret {
             Some(s) => format!(
@@ -55,7 +53,9 @@ pub async fn receipt_lookup(
     match secret {
         Some(s) => {
             let redirect_url = format!("/receipt/{s}");
-            Ok(Redirect::to(&redirect_url).into_response())
+            let mut response = Redirect::to(&redirect_url).into_response();
+            set_no_store_headers(&mut response);
+            Ok(response)
         }
         None => {
             // Redirect arrived before the webhook finished processing.
@@ -74,18 +74,49 @@ pub async fn receipt_lookup(
     }
 }
 
-pub async fn receipt_view(
+/// Confirm that a one-time receipt is available without consuming it. Browsers,
+/// mail clients, security scanners, and link-preview bots routinely issue GET or
+/// HEAD requests automatically, so neither safe method may reveal credentials or
+/// delete the row. Axum's `get` router also directs HEAD here.
+pub async fn receipt_confirmation(
+    method: Method,
+    State(state): State<AppState>,
+    Path(receipt_secret): Path<String>,
+) -> Result<Response, AppError> {
+    if !state.db.receipt_available(&receipt_secret).await? {
+        return Ok(receipt_not_found_response());
+    }
+
+    // Return no representation for HEAD even when this handler is called
+    // directly; axum also strips GET-handler bodies for implicit HEAD requests.
+    let body = if method == Method::HEAD {
+        String::new()
+    } else {
+        receipt_confirmation_page()
+    };
+    let mut response = (
+        StatusCode::OK,
+        [("content-type", "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response();
+    set_no_store_headers(&mut response);
+    Ok(response)
+}
+
+/// Reveal and atomically consume a one-time receipt. This handler is mounted
+/// only on POST; a second concurrent or repeated POST loses the atomic DELETE
+/// race and receives the not-found response.
+pub async fn receipt_consume(
     State(state): State<AppState>,
     Path(receipt_secret): Path<String>,
 ) -> Result<Response, AppError> {
     // repo-0237: peek first and decrypt/validate BEFORE the destructive
     // consume — a key-rotation mismatch or corrupt row must not delete the
     // only recoverable copy of the customer's API key.
-    let row = state
-        .db
-        .receipt_peek(&receipt_secret)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Receipt expired or already viewed".into()))?;
+    let Some(row) = state.db.receipt_peek(&receipt_secret).await? else {
+        return Ok(receipt_not_found_response());
+    };
 
     let cipher = Aes256Gcm::new_from_slice(&state.config.receipt_encryption_key).map_err(|e| {
         error!("AES-GCM key init failed: {e}");
@@ -121,15 +152,11 @@ pub async fn receipt_view(
 
     // Everything validated — NOW consume atomically. If another request won
     // the race, the row is gone and we report it as already viewed.
-    let consumed = state
-        .db
-        .receipt_consume(&receipt_secret)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Receipt expired or already viewed".into()))?;
+    let Some(consumed) = state.db.receipt_consume(&receipt_secret).await? else {
+        return Ok(receipt_not_found_response());
+    };
     if consumed.subscription_id != row.subscription_id {
-        return Err(AppError::NotFound(
-            "Receipt expired or already viewed".into(),
-        ));
+        return Ok(receipt_not_found_response());
     }
 
     let server_url = state
@@ -143,17 +170,61 @@ pub async fn receipt_view(
         None => receipt_partial_page(&api_key, server_url),
     };
 
-    Ok((
+    let mut response = (
         StatusCode::OK,
-        [
-            ("content-type", "text/html; charset=utf-8"),
-            ("cache-control", "no-store"),
-            ("pragma", "no-cache"),
-            ("x-content-type-options", "nosniff"),
-        ],
+        [("content-type", "text/html; charset=utf-8")],
         html,
     )
-        .into_response())
+        .into_response();
+    set_no_store_headers(&mut response);
+    Ok(response)
+}
+
+fn set_no_store_headers(response: &mut Response) {
+    use axum::http::header::{CACHE_CONTROL, PRAGMA, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS};
+    use axum::http::HeaderValue;
+
+    let headers = response.headers_mut();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+}
+
+fn receipt_not_found_response() -> Response {
+    let mut response = (
+        StatusCode::NOT_FOUND,
+        "Receipt expired or already viewed".to_string(),
+    )
+        .into_response();
+    set_no_store_headers(&mut response);
+    response
+}
+
+fn receipt_confirmation_page() -> String {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tirith — Reveal Your License</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; color: #333; }
+  .warning { background: #fff3cd; border: 1px solid #ffc107; padding: 12px; border-radius: 6px; margin: 20px 0; }
+  button { background: #333; color: #fff; border: none; padding: 10px 18px; border-radius: 4px; cursor: pointer; font-size: 15px; }
+  button:hover { background: #555; }
+</style>
+</head>
+<body>
+<h1>Your Tirith License Is Ready</h1>
+<div class="warning">
+  Continue only when you are ready to save your credentials. Submitting this form reveals and consumes the one-time receipt.
+</div>
+<form method="post">
+  <button type="submit">Reveal my license</button>
+</form>
+</body>
+</html>"#
+        .to_string()
 }
 
 fn receipt_not_ready_page(checkout_id: &str) -> String {
@@ -184,8 +255,8 @@ fn receipt_not_ready_page(checkout_id: &str) -> String {
       return;
     }}
     try {{
-      // Poll the JSON endpoint: following the redirect with fetch() would
-      // CONSUME the one-time receipt before the page navigates (repo-0235).
+      // Poll the JSON endpoint: following the redirect with fetch() would return
+      // the human confirmation HTML rather than a machine-readable status.
       const u = new URL(location.href);
       u.searchParams.set('poll', '1');
       const r = await fetch(u, {{ redirect: 'manual' }});
@@ -326,4 +397,217 @@ export TIRITH_API_KEY="{api_key}"</pre>
 </body>
 </html>"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use crate::config::Config;
+    use crate::db::{CreatedData, CreatedOutcome, Db};
+    use crate::sign::TokenSigner;
+
+    const RECEIPT_SECRET: &str = "receipt-route-test-secret";
+    const API_KEY: &str = "tirith_api_key_route_test";
+    const TOKEN: &str = "route.test.token";
+
+    async fn test_state() -> AppState {
+        let encryption_key = [0x42; 32];
+        let nonce = [0x24; 12];
+        let cipher = Aes256Gcm::new_from_slice(&encryption_key).unwrap();
+        let api_key_enc = cipher
+            .encrypt(Nonce::from_slice(&nonce), API_KEY.as_bytes())
+            .unwrap();
+
+        let db = Db::open(":memory:").unwrap();
+        let outcome = db
+            .process_subscription_created(CreatedData {
+                event_id: "evt_receipt_route".to_string(),
+                event_type: "subscription.active".to_string(),
+                subscription_id: "sub_receipt_route".to_string(),
+                customer_id: "customer_receipt_route".to_string(),
+                email: "receipt-route@example.invalid".to_string(),
+                tier: "pro".to_string(),
+                product_id: "product_receipt_route".to_string(),
+                occurred_at: Some("2026-08-19T00:00:00Z".to_string()),
+                checkout_id: Some("checkout_receipt_route".to_string()),
+                key_hash: "route-test-key-hash".to_string(),
+                token: Some(TOKEN.to_string()),
+                token_expires_at: 4_102_444_800,
+                receipt_secret: RECEIPT_SECRET.to_string(),
+                api_key_enc,
+                api_key_nonce: nonce.to_vec(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CreatedOutcome::Provisioned));
+
+        let config = Config {
+            ed25519_seed_hex: "00".repeat(32),
+            polar_webhook_secret: "whsec_test".to_string(),
+            polar_api_key: "polar_test".to_string(),
+            receipt_encryption_key: encryption_key,
+            product_tier_map: HashMap::new(),
+            kid: "test".to_string(),
+            token_ttl_days: 30,
+            port: 0,
+            database_url: ":memory:".to_string(),
+            receipt_base_url: Some("https://license.example.invalid".to_string()),
+            trusted_proxy: false,
+            backup_r2_endpoint: None,
+            backup_r2_bucket: None,
+            backup_r2_access_key_id: None,
+            backup_r2_secret_access_key: None,
+        };
+
+        AppState {
+            db,
+            signer: Arc::new(
+                TokenSigner::from_hex_seed(&config.ed25519_seed_hex, config.kid.clone()).unwrap(),
+            ),
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    fn assert_no_store(response: &Response) {
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::REFERRER_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-referrer")
+        );
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_and_head_confirm_without_consuming_or_revealing_credentials() {
+        let state = test_state().await;
+
+        let get = receipt_confirmation(
+            Method::GET,
+            State(state.clone()),
+            Path(RECEIPT_SECRET.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_no_store(&get);
+        let get_body = body_text(get).await;
+        assert!(get_body.contains("<form method=\"post\">"));
+        assert!(!get_body.contains(API_KEY));
+        assert!(!get_body.contains(TOKEN));
+        assert!(state
+            .db
+            .receipt_peek(RECEIPT_SECRET)
+            .await
+            .unwrap()
+            .is_some());
+
+        let head = receipt_confirmation(
+            Method::HEAD,
+            State(state.clone()),
+            Path(RECEIPT_SECRET.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_no_store(&head);
+        assert!(body_text(head).await.is_empty());
+        assert!(state
+            .db
+            .receipt_peek(RECEIPT_SECRET)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn lookup_redirect_is_no_store_and_does_not_consume() {
+        let state = test_state().await;
+        let response = receipt_lookup(
+            State(state.clone()),
+            Query(LookupQuery {
+                checkout: "checkout_receipt_route".to_string(),
+                poll: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_no_store(&response);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/receipt/receipt-route-test-secret")
+        );
+        assert!(state
+            .db
+            .receipt_peek(RECEIPT_SECRET)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_posts_reveal_and_consume_exactly_once() {
+        let state = test_state().await;
+        let left = receipt_consume(State(state.clone()), Path(RECEIPT_SECRET.to_string()));
+        let right = receipt_consume(State(state.clone()), Path(RECEIPT_SECRET.to_string()));
+        let (left, right) = tokio::join!(left, right);
+        let responses = [left.unwrap(), right.unwrap()];
+
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.status() == StatusCode::OK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.status() == StatusCode::NOT_FOUND)
+                .count(),
+            1
+        );
+        for response in &responses {
+            assert_no_store(response);
+        }
+
+        let mut bodies = Vec::new();
+        for response in responses {
+            bodies.push(body_text(response).await);
+        }
+        assert_eq!(
+            bodies.iter().filter(|body| body.contains(API_KEY)).count(),
+            1
+        );
+        assert_eq!(bodies.iter().filter(|body| body.contains(TOKEN)).count(), 1);
+        assert!(state
+            .db
+            .receipt_peek(RECEIPT_SECRET)
+            .await
+            .unwrap()
+            .is_none());
+    }
 }
