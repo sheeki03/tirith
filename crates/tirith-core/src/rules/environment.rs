@@ -48,9 +48,8 @@ pub fn check(env: &dyn EnvSnapshot) -> Vec<Finding> {
                     severity: Severity::Low,
                     title: format!("Proxy environment variable {var} is set"),
                     description: format!(
-                        "Environment variable {} is set to '{}'. Traffic may be intercepted by the proxy.",
-                        var,
-                        redact_value(&val)
+                        "Environment variable {} is set. Its proxy value is withheld; traffic may be intercepted by the proxy.",
+                        var
                     ),
                     evidence: vec![Evidence::EnvVar {
                         name: var.to_string(),
@@ -69,12 +68,15 @@ pub fn check(env: &dyn EnvSnapshot) -> Vec<Finding> {
 }
 
 fn redact_value(val: &str) -> String {
-    let prefix = crate::util::truncate_bytes(val, 20);
-    if prefix.len() == val.len() {
-        val.to_string()
-    } else {
-        format!("{prefix}...")
-    }
+    // Never retain a prefix: credentials commonly occur after a long scheme or
+    // username, and truncating first leaks short values in full. Run the shared
+    // projection before collapsing to a fixed category so future refactors
+    // cannot accidentally restore a secret-bearing preview.
+    let share_safe =
+        crate::redact::redact_for_audience(val, crate::redact::ShareAudience::PublicPaste)
+            .redacted_content;
+    let _projected = crate::redact::redact_blocked_output(&share_safe);
+    "[REDACTED:proxy_value]".to_string()
 }
 
 #[cfg(test)]
@@ -101,5 +103,22 @@ mod tests {
         let findings = check(&env);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, RuleId::ProxyEnvSet);
+        assert!(findings[0].description.contains("value is withheld"));
+        assert!(!findings[0].description.contains("proxy.corp"));
+        assert!(matches!(
+            &findings[0].evidence[0],
+            Evidence::EnvVar { value_preview, .. }
+                if value_preview == "[REDACTED:proxy_value]"
+        ));
+    }
+
+    #[test]
+    fn proxy_preview_is_fixed_for_short_and_credential_bearing_values() {
+        assert_eq!(redact_value("x"), "[REDACTED:proxy_value]");
+        let secret = format!("ghp_{}", "A".repeat(36));
+        let proxy = format!("http://user:{secret}@proxy.example:8080");
+        let preview = redact_value(&proxy);
+        assert_eq!(preview, "[REDACTED:proxy_value]");
+        assert!(!preview.contains(&secret));
     }
 }

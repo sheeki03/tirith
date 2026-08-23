@@ -450,6 +450,7 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
         ArchiveVerdict::Ok {
             signed,
             cosign_note,
+            ..
         } => (signed, cosign_note),
         ArchiveVerdict::Failed(reason) => {
             return VerifySelfOutcome::verdict(VerificationStatus::Failed { reason })
@@ -503,16 +504,59 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
         });
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let mut helper_note = None;
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let helper_note: Option<String> = None;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Err(reason) = verify_installed_package_approval_helper(workdir.path(), &target) {
+        if install_method_requires_package_approval_helper(&prov.install_method) {
+            return VerifySelfOutcome::verdict(VerificationStatus::Failed { reason });
+        }
+        helper_note = Some(format!(
+            "binary integrity verified; optional native package-approval capability unavailable: {reason}"
+        ));
+    }
+
     // Running binary == official release binary. Verdict strength is whatever
     // the archive-vs-checksums step achieved; for a checksum-only result, carry
     // the cosign note (absent vs broken) into the detail.
-    match checksum_status {
+    let detail = [cosign_note, helper_note]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let outcome = match checksum_status {
         ChecksumStrength::Signed => VerifySelfOutcome::verdict(VerificationStatus::VerifiedSigned),
         ChecksumStrength::ChecksumOnly => {
             VerifySelfOutcome::verdict(VerificationStatus::VerifiedChecksumOnly)
-                .with_detail(cosign_note)
         }
+    };
+    outcome.with_detail((!detail.is_empty()).then_some(detail))
+}
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+fn install_method_requires_package_approval_helper(method: &InstallMethod) -> bool {
+    matches!(method, InstallMethod::SelfManaged | InstallMethod::Apt)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn verify_installed_package_approval_helper(workdir: &Path, target: &str) -> Result<(), String> {
+    let extracted_helper = extracted_package_approval_helper(workdir, target)?;
+    let extracted_helper_sha = hash_file_opt(&extracted_helper)
+        .ok_or_else(|| "could not hash the verified release package-approval helper".to_string())?;
+    let installed_helper_path = installed_package_approval_helper_path().ok_or_else(|| {
+        "the matching root-owned package-approval helper is not installed".to_string()
+    })?;
+    let installed_helper_sha = hash_file_opt(&installed_helper_path).ok_or_else(|| {
+        "the matching root-owned package-approval helper is not installed".to_string()
+    })?;
+    if !selfupdate::digest_eq(&extracted_helper_sha, &installed_helper_sha) {
+        return Err(
+            "the installed package-approval helper does not match this release".to_string(),
+        );
     }
+    Ok(())
 }
 
 /// Print the `verify-self` result. Returns `1` only when JSON was requested but
@@ -801,6 +845,7 @@ fn run_update(
         ArchiveVerdict::Ok {
             signed,
             cosign_note,
+            ..
         } => {
             if !allow_unsigned && *signed == ChecksumStrength::ChecksumOnly {
                 // Signature is mandatory by default. The checksum DID verify,
@@ -835,15 +880,51 @@ fn run_update(
             return 1;
         }
     };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let helper_install = {
+        let archive_sha256 = match &archive_verdict {
+            ArchiveVerdict::Ok { archive_sha256, .. } => archive_sha256,
+            _ => unreachable!("failed archive verdict returned above"),
+        };
+        match install_package_approval_helper_for_update(&release.archive_path, archive_sha256) {
+            Ok(installed) => Some(installed),
+            Err(error) => {
+                emit_update_error(
+                    json,
+                    &format!("could not update the package-approval helper: {error}"),
+                );
+                return 1;
+            }
+        }
+    };
 
     // 5. Atomic swap, keeping the previous binary for rollback.
     let swap = match atomic_self_replace(&binary_path, &new_binary) {
         Ok(s) => s,
         Err(e) => {
-            emit_update_error(json, &format!("could not install the new binary: {e}"));
+            #[allow(unused_mut)]
+            let mut error = format!("could not install the new binary: {e}");
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            if let Some(helper_install) = helper_install {
+                if let Err(rollback_error) = rollback_package_approval_helper_update(helper_install)
+                {
+                    error.push_str(&format!(
+                        "; additionally failed to restore package-approval helper state: {rollback_error}"
+                    ));
+                }
+            }
+            emit_update_error(json, &error);
             return 1;
         }
     };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(helper_install) = helper_install {
+        if let Err(error) = commit_package_approval_helper_update(helper_install) {
+            eprintln!(
+                "tirith: warning: update succeeded but privileged helper transaction cleanup failed: {error}"
+            );
+        }
+    }
 
     if json {
         let v = serde_json::json!({
@@ -993,7 +1074,6 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
         }
         return 1;
     }
-
     if dry_run {
         if json {
             let v = serde_json::json!({
@@ -1024,12 +1104,137 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
         return 0;
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let helper_restore = if Path::new(PACKAGE_APPROVAL_HELPER_PATH).is_file()
+        || Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file()
+        || Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT).is_file()
+    {
+        use std::ffi::OsStr;
+        let had_previous = Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file();
+        let previously_absent = Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT).is_file();
+        if had_previous == previously_absent {
+            emit_update_error(
+                json,
+                "paired rollback is unavailable because the previous package-approval helper state is ambiguous",
+            );
+            return 1;
+        }
+        // Stage inside a root-owned 0700 directory, not the system temp dir.
+        // The preserved path is handed to `run_as_root("/usr/bin/install", ...)`
+        // further down, so root re-opens it BY NAME. In a world-writable /tmp
+        // that name is one an unprivileged process can race, and the file being
+        // installed is the binary that authorises package installs, so the
+        // failure mode is as bad as it gets. `install_package_approval_helper_for_update`
+        // already solves this; this mirrors it rather than inventing a variant.
+        let transaction_dir = match stage_helper_rollback_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                emit_update_error(json, &format!("could not stage helper rollback: {error}"));
+                return 1;
+            }
+        };
+        // Only preserve a helper that is actually there. The guard above admits
+        // this block when merely the backup or the previously-absent marker
+        // exists, and copying an absent live helper made `fs::copy` return
+        // NotFound and aborted the entire binary rollback with "could not
+        // preserve the current helper" for a wholly unrelated reason.
+        let preserved = if Path::new(PACKAGE_APPROVAL_HELPER_PATH).is_file() {
+            let staged = transaction_dir.join("live-before");
+            if let Err(error) = run_as_root(
+                "/usr/bin/install",
+                &[
+                    OsStr::new("-m"),
+                    OsStr::new("700"),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_PATH),
+                    staged.as_os_str(),
+                ],
+            ) {
+                let _ = remove_helper_rollback_dir(&transaction_dir);
+                emit_update_error(
+                    json,
+                    &format!("could not preserve the current helper: {error}"),
+                );
+                return 1;
+            }
+            Some(staged)
+        } else {
+            None
+        };
+        let helper_result = if had_previous {
+            run_as_root(
+                "/usr/bin/install",
+                &[
+                    OsStr::new("-m"),
+                    OsStr::new("755"),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_BACKUP),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_PATH),
+                ],
+            )
+        } else {
+            run_as_root(
+                "/bin/rm",
+                &[OsStr::new("-f"), OsStr::new(PACKAGE_APPROVAL_HELPER_PATH)],
+            )
+        };
+        if let Err(error) = helper_result {
+            let _ = remove_helper_rollback_dir(&transaction_dir);
+            emit_update_error(json, &format!("helper rollback failed: {error}"));
+            return 1;
+        }
+        Some(HelperRollbackPreserve {
+            transaction_dir,
+            preserved,
+        })
+    } else {
+        None
+    };
+
     // Restore via `atomic_restore_from`, NOT `atomic_self_replace`: the latter
     // would first copy the live binary onto `previous_backup_path(dest)` (the
     // same path as `backup`), clobbering the rollback source before the swap.
     // `atomic_restore_from` reads the source up front and never writes to it.
     match atomic_restore_from(&binary_path, &backup) {
         Ok(()) => {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                use std::ffi::OsStr;
+                if helper_restore.is_some() {
+                    // These two markers describe what the helper looked like
+                    // BEFORE this rollback. Leaving one behind silently makes the
+                    // next rollback reason from stale state -- a stray
+                    // "previously absent" marker in particular tells it to delete
+                    // a helper the user legitimately has. Cleanup is still
+                    // best-effort (the rollback itself already succeeded, so this
+                    // must not turn into a failure), but it no longer happens
+                    // invisibly.
+                    for (marker, description) in [
+                        (PACKAGE_APPROVAL_HELPER_BACKUP, "helper backup"),
+                        (
+                            PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT,
+                            "helper previously-absent marker",
+                        ),
+                    ] {
+                        if let Err(e) =
+                            run_as_root("/bin/rm", &[OsStr::new("-f"), OsStr::new(marker)])
+                        {
+                            eprintln!(
+                                "tirith: warning: rolled back successfully but could not remove \
+                                 the stale {description} at {marker} ({e}); delete it manually -- \
+                                 a future rollback would otherwise act on out-of-date state"
+                            );
+                        }
+                    }
+                }
+                if let Some(helper_restore) = helper_restore.as_ref() {
+                    if let Err(e) = remove_helper_rollback_dir(&helper_restore.transaction_dir) {
+                        eprintln!(
+                            "tirith: warning: rolled back successfully but could not remove the \
+                             root-owned helper rollback directory {} ({e}); remove it manually",
+                            helper_restore.transaction_dir.display()
+                        );
+                    }
+                }
+            }
             // Remove the now-stale backup (no longer "the previous version").
             // A leftover `.tirith-previous` identical to the live binary would
             // make a later `--rollback` a confusing no-op — so warn if removal
@@ -1056,6 +1261,46 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
             0
         }
         Err(e) => {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                use std::ffi::OsStr;
+                if let Some(helper_restore) = helper_restore {
+                    // Same class as the marker cleanup above, and worse: this is
+                    // the compensating restore on the FAILED-rollback path. If it
+                    // also fails the system is left with neither the new helper
+                    // nor the old one, and the error we are about to report says
+                    // nothing about that. Still best-effort -- the rollback error
+                    // stays the primary result -- but it gets reported.
+                    //
+                    // Only reinstall what was actually captured. When the live
+                    // helper was absent there is nothing to put back, and trying
+                    // would install a path that was never written.
+                    if let Some(preserved) = helper_restore.preserved.as_deref() {
+                        if let Err(e) = run_as_root(
+                            "/usr/bin/install",
+                            &[
+                                OsStr::new("-m"),
+                                OsStr::new("755"),
+                                preserved.as_os_str(),
+                                OsStr::new(PACKAGE_APPROVAL_HELPER_PATH),
+                            ],
+                        ) {
+                            eprintln!(
+                                "tirith: warning: rollback failed AND the package-approval helper \
+                                 could not be restored to {PACKAGE_APPROVAL_HELPER_PATH} ({e}); the \
+                                 helper may now be missing -- reinstall before relying on it"
+                            );
+                        }
+                    }
+                    if let Err(e) = remove_helper_rollback_dir(&helper_restore.transaction_dir) {
+                        eprintln!(
+                            "tirith: warning: could not remove the root-owned helper rollback \
+                             directory {} ({e}); remove it manually",
+                            helper_restore.transaction_dir.display()
+                        );
+                    }
+                }
+            }
             emit_update_error(json, &format!("rollback failed: {e}"));
             1
         }
@@ -1277,6 +1522,13 @@ enum ArchiveVerdict {
     /// The archive's SHA-256 matched the entry in `checksums.txt`.
     Ok {
         signed: ChecksumStrength,
+        /// Exact digest from the checksum entry. Privileged helper staging
+        /// re-checks the root-owned archive copy against this value.
+        #[cfg_attr(
+            not(all(target_os = "linux", target_arch = "x86_64")),
+            allow(dead_code)
+        )]
+        archive_sha256: String,
         /// Why the signature was NOT checked (`None` when fully signed). For
         /// `ChecksumOnly` this distinguishes "cosign not installed" from
         /// "cosign present but unrunnable" — lost by an `eprintln!` under JSON.
@@ -1292,6 +1544,19 @@ enum ArchiveVerdict {
 /// if `cosign` is available and the release shipped a signature — verify the
 /// cosign signature over `checksums.txt`.
 fn verify_archive_against_checksums(release: &ReleaseSet, archive_name: &str) -> ArchiveVerdict {
+    let cosign = cosign_program();
+    verify_archive_against_checksums_with_program(release, archive_name, cosign.as_deref())
+}
+
+/// Internal exact-executable seam for archive verification. Production reaches
+/// this only through [`cosign_program`], which preserves the trusted fixed-path
+/// policy on Linux. Tests pass a private fixture path directly so they can
+/// exercise a non-zero verifier result without weakening that resolver.
+fn verify_archive_against_checksums_with_program(
+    release: &ReleaseSet,
+    archive_name: &str,
+    cosign: Option<&Path>,
+) -> ArchiveVerdict {
     // 1. Archive bytes vs the digest in checksums.txt.
     let archive_bytes = match std::fs::read(&release.archive_path) {
         Ok(b) => b,
@@ -1320,13 +1585,15 @@ fn verify_archive_against_checksums(release: &ReleaseSet, archive_name: &str) ->
     }
 
     // 2. cosign signature over checksums.txt, if possible.
-    match verify_cosign_signature(release) {
+    match verify_cosign_signature_with_program(release, cosign) {
         CosignOutcomeInternal::Verified => ArchiveVerdict::Ok {
             signed: ChecksumStrength::Signed,
+            archive_sha256: expected,
             cosign_note: None,
         },
         CosignOutcomeInternal::Unavailable(reason) => ArchiveVerdict::Ok {
             signed: ChecksumStrength::ChecksumOnly,
+            archive_sha256: expected,
             cosign_note: Some(reason.detail()),
         },
         CosignOutcomeInternal::Failed(reason) => {
@@ -1388,17 +1655,20 @@ enum CosignOutcomeInternal {
 /// and OIDC issuer. Missing cosign / no signature → `Unavailable` (honest, never
 /// a false pass); the cases are reported distinctly so JSON consumers can tell
 /// "cosign absent" from "cosign broken".
-fn verify_cosign_signature(release: &ReleaseSet) -> CosignOutcomeInternal {
+fn verify_cosign_signature_with_program(
+    release: &ReleaseSet,
+    cosign: Option<&Path>,
+) -> CosignOutcomeInternal {
     let (sig, cert) = match (&release.sig_path, &release.cert_path) {
         (Some(s), Some(c)) => (s, c),
         _ => return CosignOutcomeInternal::Unavailable(CosignUnavailable::NoSignaturePublished),
     };
 
-    if !cosign_available() {
+    let Some(cosign) = cosign else {
         return CosignOutcomeInternal::Unavailable(CosignUnavailable::NotInstalled);
-    }
+    };
 
-    let output = std::process::Command::new("cosign")
+    let output = std::process::Command::new(cosign)
         .arg("verify-blob")
         .arg("--signature")
         .arg(sig)
@@ -1433,25 +1703,32 @@ fn verify_cosign_signature(release: &ReleaseSet) -> CosignOutcomeInternal {
     }
 }
 
-/// True when a `cosign` binary is resolvable on `PATH`.
-fn cosign_available() -> bool {
-    let probe = {
-        #[cfg(unix)]
-        {
-            std::process::Command::new("sh")
-                .args(["-c", "command -v cosign >/dev/null 2>&1"])
-                .status()
-        }
-        #[cfg(not(unix))]
-        {
-            std::process::Command::new("where.exe")
-                .arg("cosign")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-        }
-    };
-    probe.map(|s| s.success()).unwrap_or(false)
+fn cosign_program() -> Option<PathBuf> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        // This verifier authorizes bytes that later cross a sudo boundary.
+        // Never accept a caller-PATH executable for that decision.
+        ["/usr/bin/cosign", "/usr/local/bin/cosign"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| {
+                super::package_approval_authority_native::validate_root_owned_executable(path)
+                    .is_ok()
+            })
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|directory| {
+                directory.join(if cfg!(windows) {
+                    "cosign.exe"
+                } else {
+                    "cosign"
+                })
+            })
+            .find(|candidate| candidate.is_file())
+    }
 }
 
 /// Extract the `tirith` binary (`tirith.exe` on Windows) from a release archive
@@ -1463,6 +1740,31 @@ fn cosign_available() -> bool {
 /// `--no-same-owner`, and the produced path is canonicalized and asserted to lie
 /// INSIDE `extract_dir`, so an escaping symlink member is rejected here rather
 /// than hashed/installed.
+/// Root-managed system binary directories searched for `tar`, mirroring
+/// `TRUSTED_ZSH_SEARCH_DIRS`. Global root-owned locations only: no per-user
+/// profile, because a same-UID writer must not be able to choose the archiver
+/// that unpacks a release during self-update.
+#[cfg(unix)]
+const TRUSTED_TAR_SEARCH_DIRS: [&str; 4] = [
+    "/bin",
+    "/usr/bin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
+];
+
+/// Note the privileged installer below still calls `/usr/bin/tar` (alongside
+/// `/usr/bin/install` and `/usr/bin/sha256sum`) through `run_as_root`. That is a
+/// separate, fully hardcoded helper set executed as root, where provenance is
+/// resolved under a different UID than this check runs as; it is deliberately
+/// left alone rather than half-converted here.
+#[cfg(unix)]
+fn resolve_trusted_tar() -> Result<tirith_core::trusted_child::TrustedExecutable, String> {
+    let search_path = std::env::join_paths(TRUSTED_TAR_SEARCH_DIRS)
+        .map_err(|error| format!("could not construct trusted tar search path: {error}"))?;
+    tirith_core::trusted_child::resolve_system_helper_on_path("tar", &search_path)
+        .map_err(|error| format!("trusted system tar not found: {error}"))
+}
+
 fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result<PathBuf, String> {
     let extract_dir = workdir.join("extracted");
     std::fs::create_dir_all(&extract_dir).map_err(|e| format!("create extract dir: {e}"))?;
@@ -1490,7 +1792,22 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
     } else {
         // `.tar.gz` via `tar`. `--no-same-owner` keeps extracted files owned by
         // the current user regardless of the archived uid/gid (matters as root).
-        let status = std::process::Command::new("tar")
+        // Resolve `tar` from a FIXED list of root-managed system directories
+        // instead of the single hardcoded `/usr/bin/tar`. Pinning one absolute
+        // path kept ambient PATH out of the self-update flow, which is the
+        // property worth keeping, but it also made self-update fail outright on
+        // any layout that ships tar elsewhere (/bin/tar, NixOS) -- and the
+        // update mechanism is the one thing you cannot fix remotely once it is
+        // broken. Searching a fixed list still keeps PATH out of it, and
+        // `resolve_system_helper_on_path` additionally applies the shared
+        // system-helper provenance policy that a bare path string never did.
+        #[cfg(unix)]
+        let trusted_tar = resolve_trusted_tar()?;
+        #[cfg(unix)]
+        let tar = trusted_tar.path();
+        #[cfg(not(unix))]
+        let tar = std::path::Path::new("tar");
+        let status = std::process::Command::new(tar)
             .arg("--no-same-owner")
             .arg("-xzf")
             .arg(archive)
@@ -1531,7 +1848,413 @@ fn extract_tirith_binary(archive: &Path, target: &str, workdir: &Path) -> Result
     Ok(canonical_binary)
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PACKAGE_APPROVAL_HELPER_PATH: &str = "/usr/local/libexec/tirith-package-approval-authority";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PACKAGE_APPROVAL_HELPER_BACKUP: &str =
+    "/usr/local/libexec/tirith-package-approval-authority.tirith-previous";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT: &str =
+    "/usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent";
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn installed_package_approval_helper_path() -> Option<PathBuf> {
+    [
+        "/usr/libexec/tirith-package-approval-authority",
+        PACKAGE_APPROVAL_HELPER_PATH,
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn extracted_package_approval_helper(workdir: &Path, target: &str) -> Result<PathBuf, String> {
+    if target != "x86_64-unknown-linux-gnu" && target != "x86_64-unknown-linux-musl" {
+        return Err("x86_64 Linux update selected an incompatible release target".to_string());
+    }
+    let extract_dir = workdir.join("extracted").canonicalize().map_err(|error| {
+        format!("could not canonicalize the verified extraction directory: {error}")
+    })?;
+    let helper = extract_dir.join("tirith-package-approval-authority");
+    let canonical = helper.canonicalize().map_err(|error| {
+        format!("verified release is missing the package-approval helper: {error}")
+    })?;
+    if !canonical.starts_with(&extract_dir) || !canonical.is_file() {
+        return Err(
+            "release package-approval helper escaped the verified archive root".to_string(),
+        );
+    }
+    Ok(canonical)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct HelperInstallRollback {
+    transaction_dir: PathBuf,
+    had_live_helper: bool,
+    had_prior_backup: bool,
+    had_prior_absent_marker: bool,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn run_as_root(program: &str, args: &[&std::ffi::OsStr]) -> Result<(), String> {
+    let mut command = if unsafe { libc::geteuid() } == 0 {
+        std::process::Command::new(program)
+    } else {
+        let sudo = Path::new("/usr/bin/sudo");
+        super::package_approval_authority_native::validate_root_owned_executable(sudo)
+            .map_err(|error| error.to_string())?;
+        let mut command = std::process::Command::new(sudo);
+        command.arg("--").arg(program);
+        command
+    };
+    let status = command
+        .args(args)
+        .status()
+        .map_err(|error| format!("could not run privileged installer: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("privileged package-approval helper installer failed".to_string())
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn run_as_root_output(
+    program: &str,
+    args: &[&std::ffi::OsStr],
+) -> Result<std::process::Output, String> {
+    let mut command = if unsafe { libc::geteuid() } == 0 {
+        std::process::Command::new(program)
+    } else {
+        let sudo = Path::new("/usr/bin/sudo");
+        super::package_approval_authority_native::validate_root_owned_executable(sudo)
+            .map_err(|error| error.to_string())?;
+        let mut command = std::process::Command::new(sudo);
+        command.arg("--").arg(program);
+        command
+    };
+    let output = command
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run privileged installer: {error}"))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err("privileged package-approval helper installer failed".to_string())
+    }
+}
+
+/// What the paired helper rollback preserved, and where.
+///
+/// The preserved copy lives in a root-owned `0700` directory rather than the
+/// system temp dir, because the path is later handed to a privileged
+/// `/usr/bin/install` that re-opens it by name.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct HelperRollbackPreserve {
+    transaction_dir: PathBuf,
+    /// `None` when there was no live helper to preserve. The caller enters the
+    /// preserve block when merely the backup or the previously-absent marker
+    /// exists, so "nothing captured" is a normal outcome, not a failure.
+    preserved: Option<PathBuf>,
+}
+
+/// Create the root-owned `0700` staging directory for a paired helper rollback.
+/// Same discipline as [`install_package_approval_helper_for_update`]: validate
+/// the admin hierarchy first, so root never creates anything beneath a path an
+/// unprivileged writer controls.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn stage_helper_rollback_dir() -> Result<PathBuf, String> {
+    use std::ffi::OsStr;
+
+    super::package_approval_authority_native::validate_admin_hierarchy(Path::new("/usr/local"), 0)
+        .map_err(|error| error.to_string())?;
+    run_as_root(
+        "/usr/bin/install",
+        &[
+            OsStr::new("-d"),
+            OsStr::new("-m"),
+            OsStr::new("755"),
+            OsStr::new("/usr/local/libexec"),
+        ],
+    )?;
+    super::package_approval_authority_native::validate_admin_hierarchy(
+        Path::new("/usr/local/libexec"),
+        0,
+    )
+    .map_err(|error| error.to_string())?;
+    let directory = PathBuf::from(format!(
+        "/usr/local/libexec/.tirith-helper-rollback-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    run_as_root(
+        "/usr/bin/install",
+        &[
+            OsStr::new("-d"),
+            OsStr::new("-m"),
+            OsStr::new("700"),
+            directory.as_os_str(),
+        ],
+    )?;
+    Ok(directory)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn remove_helper_rollback_dir(directory: &Path) -> Result<(), String> {
+    use std::ffi::OsStr;
+
+    run_as_root("/bin/rm", &[OsStr::new("-rf"), directory.as_os_str()])
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn install_package_approval_helper_for_update(
+    archive: &Path,
+    archive_sha256: &str,
+) -> Result<HelperInstallRollback, String> {
+    use std::ffi::OsStr;
+
+    let destination = Path::new(PACKAGE_APPROVAL_HELPER_PATH);
+    let backup = Path::new(PACKAGE_APPROVAL_HELPER_BACKUP);
+    super::package_approval_authority_native::validate_admin_hierarchy(Path::new("/usr/local"), 0)
+        .map_err(|error| error.to_string())?;
+    run_as_root(
+        "/usr/bin/install",
+        &[
+            OsStr::new("-d"),
+            OsStr::new("-m"),
+            OsStr::new("755"),
+            OsStr::new("/usr/local/libexec"),
+        ],
+    )?;
+    super::package_approval_authority_native::validate_admin_hierarchy(
+        Path::new("/usr/local/libexec"),
+        0,
+    )
+    .map_err(|error| error.to_string())?;
+    if archive_sha256.len() != 64
+        || !archive_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("verified release archive has an invalid SHA-256".to_string());
+    }
+    let transaction_dir = PathBuf::from(format!(
+        "/usr/local/libexec/.tirith-helper-update-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    run_as_root(
+        "/usr/bin/install",
+        &[
+            OsStr::new("-d"),
+            OsStr::new("-m"),
+            OsStr::new("700"),
+            transaction_dir.as_os_str(),
+        ],
+    )?;
+    let had_live_helper = destination.exists();
+    let had_prior_backup = backup.exists();
+    let prior_absent = Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT);
+    let had_prior_absent_marker = prior_absent.exists();
+    let transaction = HelperInstallRollback {
+        transaction_dir: transaction_dir.clone(),
+        had_live_helper,
+        had_prior_backup,
+        had_prior_absent_marker,
+    };
+    let preserve = |source: &Path, name: &str, mode: &str| {
+        run_as_root(
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new(mode),
+                source.as_os_str(),
+                transaction_dir.join(name).as_os_str(),
+            ],
+        )
+    };
+    let preserve_result = (|| {
+        if had_live_helper {
+            preserve(destination, "live-before", "755")?;
+        }
+        if had_prior_backup {
+            preserve(backup, "rollback-before", "755")?;
+        }
+        if had_prior_absent_marker {
+            preserve(prior_absent, "absent-before", "600")?;
+        }
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = preserve_result {
+        // Best-effort: `error` is the result the caller acts on. But this is a
+        // root-owned directory, so say something rather than leaving it to be
+        // discovered later.
+        if let Err(cleanup) =
+            run_as_root("/bin/rm", &[OsStr::new("-rf"), transaction_dir.as_os_str()])
+        {
+            eprintln!(
+                "tirith: warning: could not remove the root-owned transaction directory {} \
+                 ({cleanup}); remove it manually",
+                transaction_dir.display()
+            );
+        }
+        return Err(error);
+    }
+
+    let result = (|| {
+        if had_live_helper {
+            run_as_root(
+                "/bin/rm",
+                &[
+                    OsStr::new("-f"),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
+                ],
+            )?;
+            run_as_root(
+                "/usr/bin/install",
+                &[
+                    OsStr::new("-m"),
+                    OsStr::new("755"),
+                    destination.as_os_str(),
+                    backup.as_os_str(),
+                ],
+            )?;
+        } else {
+            run_as_root(
+                "/bin/rm",
+                &[OsStr::new("-f"), OsStr::new(PACKAGE_APPROVAL_HELPER_BACKUP)],
+            )?;
+            run_as_root(
+                "/usr/bin/touch",
+                &[OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT)],
+            )?;
+            run_as_root(
+                "/bin/chmod",
+                &[
+                    OsStr::new("600"),
+                    OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
+                ],
+            )?;
+        }
+        let staged_archive = transaction_dir.join("release.tar.gz");
+        run_as_root(
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new("600"),
+                archive.as_os_str(),
+                staged_archive.as_os_str(),
+            ],
+        )?;
+        let output = run_as_root_output("/usr/bin/sha256sum", &[staged_archive.as_os_str()])?;
+        let observed = String::from_utf8(output.stdout)
+            .map_err(|_| "privileged archive digest output was invalid".to_string())?;
+        if observed.split_whitespace().next() != Some(archive_sha256) {
+            return Err("root-owned staged archive failed its signed digest check".to_string());
+        }
+        run_as_root(
+            "/usr/bin/tar",
+            &[
+                OsStr::new("--no-same-owner"),
+                OsStr::new("-xzf"),
+                staged_archive.as_os_str(),
+                OsStr::new("-C"),
+                transaction_dir.as_os_str(),
+                OsStr::new("tirith-package-approval-authority"),
+            ],
+        )?;
+        run_as_root(
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new("755"),
+                transaction_dir
+                    .join("tirith-package-approval-authority")
+                    .as_os_str(),
+                destination.as_os_str(),
+            ],
+        )
+    })();
+    match result {
+        Ok(()) => Ok(transaction),
+        Err(error) => match rollback_package_approval_helper_update(transaction) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; additionally failed to restore package-approval helper state: {rollback_error}"
+            )),
+        },
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn rollback_package_approval_helper_update(rollback: HelperInstallRollback) -> Result<(), String> {
+    use std::ffi::OsStr;
+
+    let destination = Path::new(PACKAGE_APPROVAL_HELPER_PATH);
+    if rollback.had_live_helper {
+        run_as_root(
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new("755"),
+                rollback.transaction_dir.join("live-before").as_os_str(),
+                destination.as_os_str(),
+            ],
+        )?;
+    } else {
+        run_as_root("/bin/rm", &[OsStr::new("-f"), destination.as_os_str()])?;
+    }
+    if rollback.had_prior_backup {
+        run_as_root(
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new("755"),
+                rollback.transaction_dir.join("rollback-before").as_os_str(),
+                OsStr::new(PACKAGE_APPROVAL_HELPER_BACKUP),
+            ],
+        )?;
+    } else {
+        run_as_root(
+            "/bin/rm",
+            &[OsStr::new("-f"), OsStr::new(PACKAGE_APPROVAL_HELPER_BACKUP)],
+        )?;
+    }
+    if rollback.had_prior_absent_marker {
+        run_as_root(
+            "/usr/bin/install",
+            &[
+                OsStr::new("-m"),
+                OsStr::new("600"),
+                rollback.transaction_dir.join("absent-before").as_os_str(),
+                OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
+            ],
+        )?;
+    } else {
+        run_as_root(
+            "/bin/rm",
+            &[
+                OsStr::new("-f"),
+                OsStr::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
+            ],
+        )?;
+    }
+    run_as_root(
+        "/bin/rm",
+        &[OsStr::new("-rf"), rollback.transaction_dir.as_os_str()],
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn commit_package_approval_helper_update(rollback: HelperInstallRollback) -> Result<(), String> {
+    use std::ffi::OsStr;
+    run_as_root(
+        "/bin/rm",
+        &[OsStr::new("-rf"), rollback.transaction_dir.as_os_str()],
+    )
+}
+
 /// Result of an atomic self-replace.
+#[derive(Debug)]
 struct SwapResult {
     /// Where the previous binary was saved (for `--rollback`).
     previous_backup: PathBuf,
@@ -1570,76 +2293,110 @@ fn atomic_self_replace(dest: &Path, new_binary: &Path) -> Result<SwapResult, Str
         ));
     }
 
-    // 1. Save the current binary as the rollback backup.
+    // Preserve an older rollback point until the entire replacement commits.
+    // A failed second update must not destroy the only known-good backup.
     let backup = previous_backup_path(dest);
-    std::fs::copy(dest, &backup).map_err(|e| {
-        format!(
-            "could not save the current binary to {}: {e}",
-            backup.display()
-        )
-    })?;
-    // Durability: fsync the backup's CONTENTS so a crash after the swap can't
-    // leave the live binary replaced while the `--rollback` target is
-    // truncated. The handle MUST be opened for WRITE — Windows `sync_all` calls
-    // `FlushFileBuffers`, which rejects a read-only handle; `write(true)` opens
-    // the existing copy without truncating. Its dir entry is covered by the
-    // parent fsync at step 4.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&backup)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| {
+    let prior_backup = if backup.exists() {
+        let preserved = tempfile::Builder::new()
+            .prefix(".tirith-prior-backup-")
+            .tempfile_in(dir)
+            .map_err(|e| format!("could not preserve the prior rollback backup: {e}"))?;
+        std::fs::copy(&backup, preserved.path())
+            .and_then(|_| preserved.as_file().sync_all())
+            .map_err(|e| format!("could not preserve the prior rollback backup: {e}"))?;
+        Some(preserved)
+    } else {
+        None
+    };
+
+    let replacement = (|| {
+        // 1. Save the current binary as the rollback backup.
+        std::fs::copy(dest, &backup).map_err(|e| {
             format!(
-                "could not sync the rollback backup {}: {e}",
+                "could not save the current binary to {}: {e}",
                 backup.display()
             )
         })?;
+        // Durability: fsync the backup's CONTENTS so a crash after the swap
+        // cannot leave the live binary replaced with a truncated rollback.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&backup)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| {
+                format!(
+                    "could not sync the rollback backup {}: {e}",
+                    backup.display()
+                )
+            })?;
 
-    // 2. Copy the new binary into a temp file in the destination directory.
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".tirith-new-")
-        .tempfile_in(dir)
-        .map_err(|e| format!("could not create a temp file in {}: {e}", dir.display()))?;
-    let new_bytes =
-        std::fs::read(new_binary).map_err(|e| format!("could not read the new binary: {e}"))?;
-    tmp.write_all(&new_bytes)
-        .map_err(|e| format!("could not write the new binary: {e}"))?;
-    tmp.flush()
-        .map_err(|e| format!("could not flush the new binary: {e}"))?;
+        // 2. Copy the new binary into a temp file in the destination directory.
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".tirith-new-")
+            .tempfile_in(dir)
+            .map_err(|e| format!("could not create a temp file in {}: {e}", dir.display()))?;
+        let new_bytes =
+            std::fs::read(new_binary).map_err(|e| format!("could not read the new binary: {e}"))?;
+        tmp.write_all(&new_bytes)
+            .map_err(|e| format!("could not write the new binary: {e}"))?;
+        tmp.flush()
+            .map_err(|e| format!("could not flush the new binary: {e}"))?;
 
-    // 3. Set the exec bit BEFORE the swap so `tirith` is never live-but-unrunnable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+        // 3. Set the exec bit BEFORE the swap so `tirith` is never
+        // live-but-unrunnable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("could not set executable permissions: {e}"))?;
+        }
         tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("could not set executable permissions: {e}"))?;
+            .sync_all()
+            .map_err(|e| format!("could not sync the new binary: {e}"))?;
+
+        // 4. Atomic rename over the live binary.
+        tmp.persist(dest).map_err(|e| {
+            format!(
+                "could not atomically replace {}: {} (the old binary is intact)",
+                dest.display(),
+                e.error
+            )
+        })?;
+        fsync_parent_dir(dest);
+
+        Ok(SwapResult {
+            previous_backup: backup.clone(),
+        })
+    })();
+
+    match replacement {
+        Ok(swapped) => Ok(swapped),
+        Err(error) => {
+            let restore_result = match prior_backup {
+                Some(preserved) => preserved
+                    .persist(&backup)
+                    .map(|_| fsync_parent_dir(&backup))
+                    .map_err(|e| e.error.to_string()),
+                None => match std::fs::remove_file(&backup) {
+                    Ok(()) => {
+                        fsync_parent_dir(&backup);
+                        Ok(())
+                    }
+                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(())
+                    }
+                    Err(remove_error) => Err(remove_error.to_string()),
+                },
+            };
+            match restore_result {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(format!(
+                    "{error}; additionally could not restore the prior rollback backup: {restore_error}"
+                )),
+            }
+        }
     }
-
-    // Durability: fsync the new binary's bytes AND mode before the rename. The
-    // sync MUST follow `set_permissions` — syncing first could leave the file
-    // durable without the exec bit (durable-but-unrunnable).
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| format!("could not sync the new binary: {e}"))?;
-
-    // 4. Atomic rename over the live binary.
-    tmp.persist(dest).map_err(|e| {
-        // Rename failed; the old binary is intact (rename doesn't touch dest
-        // until it succeeds) and the backup exists.
-        format!(
-            "could not atomically replace {}: {} (the old binary is intact)",
-            dest.display(),
-            e.error
-        )
-    })?;
-    // Rename durability: fsync the parent dir so the new name→inode entry
-    // survives a crash. Best-effort; no-op on non-Unix.
-    fsync_parent_dir(dest);
-
-    Ok(SwapResult {
-        previous_backup: backup,
-    })
 }
 
 /// Atomically install `source`'s bytes onto `dest`, used by `--rollback`.
@@ -1768,6 +2525,30 @@ fn describe_status(status: &VerificationStatus) -> String {
 mod tests {
     use super::*;
 
+    /// The archiver used by self-update must never be selectable by a same-UID
+    /// writer, so the search list stays fixed to global root-managed directories
+    /// and deliberately excludes per-user profiles. This mirrors the equivalent
+    /// guard on the trusted-zsh search path.
+    #[cfg(unix)]
+    #[test]
+    fn trusted_tar_search_is_fixed_to_global_root_managed_directories() {
+        assert_eq!(
+            TRUSTED_TAR_SEARCH_DIRS,
+            [
+                "/bin",
+                "/usr/bin",
+                "/run/current-system/sw/bin",
+                "/nix/var/nix/profiles/default/bin",
+            ]
+        );
+        assert!(TRUSTED_TAR_SEARCH_DIRS.iter().all(|path| {
+            path.starts_with('/')
+                && !path.contains("per-user")
+                && !path.contains(".nix-profile")
+                && !path.contains("$HOME")
+        }));
+    }
+
     #[test]
     fn selfupdate_rejects_unsafe_initial_destinations() {
         for url in [
@@ -1810,6 +2591,21 @@ mod tests {
     }
 
     #[test]
+    fn failed_second_self_replace_preserves_the_existing_rollback_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("tirith");
+        let missing_new = dir.path().join("missing-new-tirith");
+        let backup = previous_backup_path(&live);
+        std::fs::write(&live, b"CURRENT-BINARY").unwrap();
+        std::fs::write(&backup, b"KNOWN-GOOD-BINARY").unwrap();
+
+        atomic_self_replace(&live, &missing_new).expect_err("missing update must fail");
+
+        assert_eq!(std::fs::read(&live).unwrap(), b"CURRENT-BINARY");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"KNOWN-GOOD-BINARY");
+    }
+
+    #[test]
     fn source_built_carveout_is_cargo_aur_dnf_only() {
         // Compiled-from-source / distro-rebuilt installs get an honest Unverified.
         assert!(source_built_unverified_reason(&InstallMethod::Cargo).is_some());
@@ -1828,6 +2624,26 @@ mod tests {
                 source_built_unverified_reason(&m).is_none(),
                 "{m:?} must not be carved out"
             );
+        }
+    }
+
+    #[test]
+    fn native_helper_is_required_only_for_install_methods_that_ship_it() {
+        assert!(install_method_requires_package_approval_helper(
+            &InstallMethod::SelfManaged
+        ));
+        assert!(install_method_requires_package_approval_helper(
+            &InstallMethod::Apt
+        ));
+        for method in [
+            InstallMethod::Npm,
+            InstallMethod::Homebrew,
+            InstallMethod::Cargo,
+            InstallMethod::Aur,
+            InstallMethod::Dnf,
+            InstallMethod::Unknown,
+        ] {
+            assert!(!install_method_requires_package_approval_helper(&method));
         }
     }
 
@@ -2049,6 +2865,7 @@ mod tests {
             ArchiveVerdict::Ok {
                 signed,
                 cosign_note,
+                ..
             } => {
                 assert_eq!(signed, ChecksumStrength::ChecksumOnly);
                 // No `.sig`/`.pem` published — the note must say so, not advise
@@ -2366,20 +3183,19 @@ mod tests {
         assert!(extracted.starts_with(pre.canonicalize().unwrap()));
     }
 
-    /// F19: a `cosign` on `PATH` that EXITS NON-ZERO must yield
-    /// `ArchiveVerdict::Failed` — never folded into a checksum-only pass.
-    /// Mutates `PATH`, so it holds the crate-wide `ENV_LOCK` and restores via
-    /// `EnvGuard`.
+    /// F19: an exact `cosign` executable that EXITS NON-ZERO must yield
+    /// `ArchiveVerdict::Failed` — never folded into a checksum-only pass. The
+    /// test injects the executable through the internal seam rather than PATH;
+    /// Linux production continues to accept only its trusted fixed paths.
     #[cfg(unix)]
     #[test]
     fn cosign_failure_makes_archive_verdict_failed() {
-        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
 
-        // A fake `cosign` that always exits 1. MUST be executable or PATH
-        // resolution would skip it.
+        // A fake `cosign` that always exits 1. It is passed as the exact program
+        // under test; production resolution is not involved.
         let fake_bin_dir = dir.path().join("fakebin");
         std::fs::create_dir_all(&fake_bin_dir).unwrap();
         let fake_cosign = fake_bin_dir.join("cosign");
@@ -2412,20 +3228,11 @@ mod tests {
             checksums_path: checksums,
         };
 
-        let verdict = {
-            // Serialize against every other env-mutating test in the crate.
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // Prepend (not replace) the fake-cosign dir so `sh` stays
-            // resolvable; `EnvGuard` restores PATH on Drop.
-            let mut entries = vec![fake_bin_dir.clone()];
-            if let Some(p) = std::env::var_os("PATH") {
-                entries.extend(std::env::split_paths(&p));
-            }
-            let joined = std::env::join_paths(entries).expect("join PATH");
-            let _path_guard = EnvGuard::set("PATH", std::path::Path::new(&joined));
-
-            verify_archive_against_checksums(&release, "tirith-x86_64-unknown-linux-gnu.tar.gz")
-        };
+        let verdict = verify_archive_against_checksums_with_program(
+            &release,
+            "tirith-x86_64-unknown-linux-gnu.tar.gz",
+            Some(&fake_cosign),
+        );
 
         match verdict {
             ArchiveVerdict::Failed(reason) => {

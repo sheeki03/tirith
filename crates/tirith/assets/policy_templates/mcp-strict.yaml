@@ -21,6 +21,10 @@ allow_bypass_env_noninteractive: false
 # Require explicit acknowledgement for warn findings.
 strict_warn: true
 
+# Enforce the gateway's hardened minimums and require the MCP upstream to run
+# in the OS containment capsule whenever `tirith gateway run` is used.
+gateway_profile: secure
+
 # Severity overrides per rule. The threat model here is the MCP surface itself:
 # an insecure or untrusted server, a server that exposes a dangerous tool set,
 # suspicious server arguments, and drift away from the recorded lockfile. Each

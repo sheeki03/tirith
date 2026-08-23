@@ -341,6 +341,16 @@ pub struct DaemonResponse {
     /// Action AFTER enrichment but BEFORE paranoia.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub requires_approval: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval_fallback: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval_rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval_description: Option<String>,
     /// M11 ch2 — the manifest `allowed[]` entry this command matched, for the
     /// client's audit context. The daemon runs the full `engine::analyze`, so
     /// this is populated from the verdict.
@@ -432,6 +442,11 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         tier_reached: 0,
         raw_findings: None,
         raw_action: None,
+        requires_approval: None,
+        approval_timeout_secs: None,
+        approval_fallback: None,
+        approval_rule: None,
+        approval_description: None,
         manifest_allowed_match: None,
     };
 
@@ -483,6 +498,11 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
                 tier_reached: 2,
                 raw_findings: None,
                 raw_action: None,
+                requires_approval: None,
+                approval_timeout_secs: None,
+                approval_fallback: None,
+                approval_rule: None,
+                approval_description: None,
                 manifest_allowed_match: None,
             };
         }
@@ -535,6 +555,11 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
 
     // Capture before `verdict.findings` is moved below.
     let manifest_allowed_match = verdict.manifest_allowed_match.clone();
+    let requires_approval = verdict.requires_approval;
+    let approval_timeout_secs = verdict.approval_timeout_secs;
+    let approval_fallback = verdict.approval_fallback.clone();
+    let approval_rule = verdict.approval_rule.clone();
+    let approval_description = verdict.approval_description.clone();
 
     DaemonResponse {
         action: verdict.action,
@@ -549,6 +574,11 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         tier_reached: verdict.tier_reached,
         raw_findings,
         raw_action: raw_action_str,
+        requires_approval,
+        approval_timeout_secs,
+        approval_fallback,
+        approval_rule,
+        approval_description,
         manifest_allowed_match,
     }
 }
@@ -819,6 +849,9 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                                 policy_path_used: None, timings_ms: Default::default(),
                                                 urls_extracted_count: None, tier_reached: 0,
                                                 raw_findings: None, raw_action: None,
+                                                requires_approval: None, approval_timeout_secs: None,
+                                                approval_fallback: None, approval_rule: None,
+                                                approval_description: None,
                                                 manifest_allowed_match: None,
                                             })
                                     }
@@ -829,6 +862,9 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                         policy_path_used: None, timings_ms: Default::default(),
                                         urls_extracted_count: None, tier_reached: 0,
                                         raw_findings: None, raw_action: None,
+                                        requires_approval: None, approval_timeout_secs: None,
+                                        approval_fallback: None, approval_rule: None,
+                                        approval_description: None,
                                         manifest_allowed_match: None,
                                     },
                                 };
@@ -1373,6 +1409,11 @@ mod tests {
             tier_reached: 0,
             raw_findings: None,
             raw_action: None,
+            requires_approval: None,
+            approval_timeout_secs: None,
+            approval_fallback: None,
+            approval_rule: None,
+            approval_description: None,
             manifest_allowed_match: None,
         }
     }
@@ -1392,6 +1433,31 @@ mod tests {
         );
         let back: DaemonResponse = serde_json::from_str(&wire).expect("deserialize");
         assert_eq!(back.manifest_allowed_match.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn daemon_response_round_trips_approval_contract() {
+        let response = DaemonResponse {
+            requires_approval: Some(true),
+            approval_timeout_secs: Some(0),
+            approval_fallback: Some("block".into()),
+            approval_rule: Some("web3_network_policy_violation".into()),
+            approval_description: Some("Web3 endpoint requires approval".into()),
+            ..base_response()
+        };
+        let wire = serde_json::to_string(&response).unwrap();
+        let decoded: DaemonResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(decoded.requires_approval, Some(true));
+        assert_eq!(decoded.approval_timeout_secs, Some(0));
+        assert_eq!(decoded.approval_fallback.as_deref(), Some("block"));
+        assert_eq!(
+            decoded.approval_rule.as_deref(),
+            Some("web3_network_policy_violation")
+        );
+        assert_eq!(
+            decoded.approval_description.as_deref(),
+            Some("Web3 endpoint requires approval")
+        );
     }
 
     /// `None` is omitted on the wire and a pre-upgrade payload without the field

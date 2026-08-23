@@ -47,7 +47,9 @@
 //! [`kind_for_method`] returns `None` for them so the inspection is never wrongly
 //! applied to a request shape.
 
+use serde::Serialize;
 use serde_json::Value;
+use std::fmt;
 
 use crate::mcp::output_filter::OutputFilterContext;
 use crate::verdict::{Action, Finding};
@@ -116,7 +118,7 @@ pub fn kind_for_method(method: &str) -> Option<ResponseKind> {
 /// NOT engine RuleIds — they are gateway-level deny reasons, like the gateway's
 /// existing duplicate-id / timeout denials — so they drive a Block directly rather
 /// than going through the rule registry. Carries a short, secret-free reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResponseViolation {
     /// A stable code for the audit trail (`resource_link_ssrf`, `mime_spoof`, …).
     pub code: &'static str,
@@ -124,8 +126,68 @@ pub struct ResponseViolation {
     pub detail: String,
 }
 
+#[derive(Serialize)]
+struct ResponseViolationProjection {
+    code: &'static str,
+    detail: &'static str,
+}
+
+impl ResponseViolation {
+    fn privacy_projection(&self) -> ResponseViolationProjection {
+        let code = match self.code {
+            "resource_link_ssrf"
+            | "embedded_resource_ssrf"
+            | "resource_descriptor_ssrf"
+            | "resource_content_ssrf"
+            | "resource_template_ssrf"
+            | "metadata_uri_ssrf"
+            | "blob_too_large"
+            | "blob_undecodable"
+            | "mime_spoof"
+            | "sanitized_key_collision" => self.code,
+            _ => "response_policy_violation",
+        };
+        let detail = match code {
+            "resource_link_ssrf"
+            | "embedded_resource_ssrf"
+            | "resource_descriptor_ssrf"
+            | "resource_content_ssrf"
+            | "resource_template_ssrf"
+            | "metadata_uri_ssrf" => "resource URI failed outbound policy",
+            "blob_too_large" => "resource blob exceeds inspection limit",
+            "blob_undecodable" => "resource blob is not strictly decodable",
+            "mime_spoof" => "resource blob signature conflicts with declared MIME category",
+            "sanitized_key_collision" => {
+                "distinct response keys collide after control sanitization"
+            }
+            _ => "upstream response violated policy",
+        };
+        ResponseViolationProjection { code, detail }
+    }
+}
+
+impl Serialize for ResponseViolation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.privacy_projection().serialize(serializer)
+    }
+}
+
+impl fmt::Debug for ResponseViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let safe = self.privacy_projection();
+        formatter
+            .debug_struct("ResponseViolation")
+            .field("code", &safe.code)
+            .field("detail", &safe.detail)
+            .finish()
+    }
+}
+
 /// The decision from inspecting one listing/reading response.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InspectOutcome {
     /// Effective action: `Block` when the text scan blocks OR any URI/MIME
     /// violation is present; otherwise the text-scan action (`Warn`/`Allow`).
@@ -135,6 +197,33 @@ pub struct InspectOutcome {
     pub findings: Vec<Finding>,
     /// Non-RuleId URI/MIME violations that force a Block. Empty when none.
     pub violations: Vec<ResponseViolation>,
+}
+
+impl Serialize for InspectOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("InspectOutcome", 3)?;
+        state.serialize_field("action", &self.action)?;
+        state.serialize_field("findings", &self.findings)?;
+        state.serialize_field("violations", &self.violations)?;
+        state.end()
+    }
+}
+
+impl fmt::Debug for InspectOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InspectOutcome")
+            .field("action", &self.action)
+            .field("finding_count", &self.findings.len())
+            .field("rule_ids", &self.rule_ids())
+            .field("violations", &self.violations)
+            .finish()
+    }
 }
 
 impl InspectOutcome {
@@ -495,7 +584,7 @@ fn screen_uri(uri: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
         if let Err(e) = result {
             out.push(ResponseViolation {
                 code,
-                detail: format!("resource link failed SSRF policy: {e}"),
+                detail: categorical_ssrf_detail(&e),
             });
         }
         return;
@@ -506,11 +595,51 @@ fn screen_uri(uri: &str, code: &'static str, out: &mut Vec<ResponseViolation>) {
     if FORBIDDEN_URI_SCHEMES.contains(&scheme.as_str()) {
         out.push(ResponseViolation {
             code,
-            detail: format!("forbidden URI scheme in resource link: {scheme}"),
+            detail: "forbidden URI scheme in resource link".to_string(),
         });
     }
     // Any other scheme (or none) is an opaque internal URI, not a network fetch:
     // leave it alone.
+}
+
+fn categorical_ssrf_detail(reason: &str) -> String {
+    let category = if reason.contains("backslash") {
+        "backslashes are not allowed"
+    } else if reason.contains("embedded credentials") {
+        "embedded credentials"
+    } else if reason.contains("cloud metadata") {
+        "cloud metadata destination"
+    } else if reason.contains("link-local") {
+        "link-local destination"
+    } else if reason.contains("localhost") {
+        "localhost destination"
+    } else if reason.contains("non-public") {
+        "non-public destination"
+    } else if reason.contains("resolve") {
+        "destination resolution failed"
+    } else if reason.contains("scheme") || reason.contains("http:// or https://") {
+        "disallowed URL scheme"
+    } else {
+        "invalid outbound URL"
+    };
+    format!("resource link failed SSRF policy: {category}")
+}
+
+fn categorical_template_detail(reason: &str) -> String {
+    let category = if reason.contains("authorit") {
+        "invalid authority"
+    } else if reason.contains("scheme-relative") {
+        "scheme-relative target"
+    } else if reason.contains("scheme") || reason.contains("target") {
+        "invalid scheme or expansion-controlled target"
+    } else if reason.contains("backslash") {
+        "backslashes are not allowed"
+    } else if reason.contains("whitespace") || reason.contains("control") {
+        "invalid whitespace or control"
+    } else {
+        "malformed template"
+    };
+    format!("resource URI template rejected: {category}")
 }
 
 /// Return the normalized scheme for an absolute URI. Prefer the WHATWG parser so
@@ -566,7 +695,7 @@ fn screen_uri_template(template: &str, code: &'static str, out: &mut Vec<Respons
         Err(e) => {
             out.push(ResponseViolation {
                 code,
-                detail: format!("resource URI template rejected: {e}"),
+                detail: categorical_template_detail(&e),
             });
             return;
         }
@@ -584,13 +713,13 @@ fn screen_uri_template(template: &str, code: &'static str, out: &mut Vec<Respons
             if let Err(e) = crate::url_validate::validate_fetch_url(&base) {
                 out.push(ResponseViolation {
                     code,
-                    detail: format!("resource link failed SSRF policy: {e}"),
+                    detail: categorical_ssrf_detail(&e),
                 });
             }
         }
-        UriTemplateTarget::ForbiddenScheme(scheme) => out.push(ResponseViolation {
+        UriTemplateTarget::ForbiddenScheme(_) => out.push(ResponseViolation {
             code,
-            detail: format!("forbidden URI scheme in resource link: {scheme}"),
+            detail: "forbidden URI scheme in resource link".to_string(),
         }),
         UriTemplateTarget::Opaque => {}
     }
@@ -948,10 +1077,7 @@ fn check_blob(blob_b64: &str, declared: Option<&str>, out: &mut Vec<ResponseViol
     if blob_b64.len() / 4 * 3 > MAX_INSPECT_BLOB_BYTES {
         out.push(ResponseViolation {
             code: "blob_too_large",
-            detail: format!(
-                "resource blob exceeds inspection cap ({} encoded bytes)",
-                blob_b64.len()
-            ),
+            detail: "resource blob exceeds inspection cap before decode".to_string(),
         });
         return;
     }
@@ -993,15 +1119,32 @@ fn check_blob(blob_b64: &str, declared: Option<&str>, out: &mut Vec<ResponseViol
     out.push(ResponseViolation {
         code: "mime_spoof",
         detail: format!(
-            "resource blob sniffed as {} but declared mimeType {:?}",
+            "resource blob signature conflicts with declared MIME category: detected={}; declared={}",
             sniffed.label(),
-            if declared.is_empty() {
-                "<none>"
-            } else {
-                declared.as_str()
-            }
+            declared_mime_category(&declared)
         ),
     });
+}
+
+fn declared_mime_category(declared: &str) -> &'static str {
+    let media_type = declared.split(';').next().unwrap_or("").trim();
+    if media_type.is_empty() {
+        "missing"
+    } else if media_type.starts_with("text/") {
+        "text"
+    } else if media_type.starts_with("image/") {
+        "image"
+    } else if media_type.starts_with("audio/") {
+        "audio"
+    } else if media_type.starts_with("video/") {
+        "video"
+    } else if media_type == "application/json" || media_type.ends_with("+json") {
+        "structured-text"
+    } else if media_type == "application/octet-stream" || media_type == "application/binary" {
+        "opaque-binary"
+    } else {
+        "other"
+    }
 }
 
 /// The dangerous file kinds the blob sniffer recognizes. Used only to decide a
@@ -1311,6 +1454,15 @@ mod tests {
         });
         let outcome = inspect_response(&result, ResponseKind::PromptsGet, &ctx());
         assert!(outcome.is_block(), "{outcome:?}");
+        let details = outcome
+            .violations
+            .iter()
+            .map(|violation| violation.detail.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(details.contains("non-public destination"), "{details}");
+        assert!(!details.contains("10.0.0.5"), "{details}");
+        assert!(!details.contains("/secret"), "{details}");
     }
 
     #[test]
@@ -1633,6 +1785,71 @@ mod tests {
         let outcome = inspect_response(&result, ResponseKind::ResourcesRead, &ctx());
         assert!(outcome.is_block(), "ELF-as-text must block: {outcome:?}");
         assert!(outcome.violations.iter().any(|v| v.code == "mime_spoof"));
+    }
+
+    #[test]
+    fn declared_mime_canary_is_categorical_in_detail_debug_and_serialize() {
+        let canary = "C04_DECLARED_MIME_CANARY_DO_NOT_EXPOSE";
+        let elf = b"\x7fELF\x02\x01\x01\x00rest-of-binary";
+        let result = json!({
+            "contents": [{
+                "uri": "tirith://x",
+                "mimeType": format!("text/plain; profile={canary}"),
+                "blob": b64(elf),
+            }]
+        });
+        let outcome = inspect_response(&result, ResponseKind::ResourcesRead, &ctx());
+        let violation = outcome
+            .violations
+            .iter()
+            .find(|violation| violation.code == "mime_spoof")
+            .expect("ELF declared as text must create a MIME violation");
+        assert!(!violation.detail.contains(canary), "{}", violation.detail);
+        assert!(
+            violation.detail.contains("declared=text"),
+            "{}",
+            violation.detail
+        );
+
+        for rendered in [
+            format!("{violation:?}"),
+            serde_json::to_string(violation).expect("serialize MIME violation"),
+            format!("{outcome:?}"),
+            serde_json::to_string(&outcome).expect("serialize inspection outcome"),
+        ] {
+            assert!(!rendered.contains(canary), "{rendered}");
+            assert!(!rendered.contains("profile="), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn public_violation_traits_project_directly_constructed_payloads() {
+        let provider = format!("https://eth-mainnet.g.alchemy.com/v2/{}", "A".repeat(48));
+        let contextual = format!("PRIVATE_KEY=0x{}", "11".repeat(32));
+        let outcome = InspectOutcome {
+            action: Action::Block,
+            findings: Vec::new(),
+            violations: vec![ResponseViolation {
+                code: "C04_VIOLATION_CODE_CANARY",
+                detail: format!("{provider}; {contextual}"),
+            }],
+        };
+
+        for rendered in [
+            format!("{:?}", outcome.violations[0]),
+            serde_json::to_string(&outcome.violations[0]).expect("serialize projected violation"),
+            format!("{outcome:?}"),
+            serde_json::to_string(&outcome).expect("serialize projected outcome"),
+        ] {
+            for canary in [
+                "C04_VIOLATION_CODE_CANARY",
+                provider.as_str(),
+                contextual.as_str(),
+            ] {
+                assert!(!rendered.contains(canary), "{rendered}");
+            }
+            assert!(rendered.contains("response_policy_violation"), "{rendered}");
+        }
     }
 
     #[test]

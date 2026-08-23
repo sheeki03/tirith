@@ -7,12 +7,14 @@
 //! - `guard on|off|status`: flip / report `policy.env_guard_enabled` (when ON,
 //!   the two exec-path env-guard rules fire from `engine::analyze`).
 //! - `diff [--reset]`: compare sensitive vars set now vs the shell-start
-//!   snapshot at `state_dir()/env_snapshot.json` (names/deltas only); `--reset`
-//!   re-baselines.
+//!   snapshot at `state_dir()/env_snapshot.json` (names/deltas only); persisted
+//!   presence-only baselines explicitly report unavailable value comparison;
+//!   `--reset` re-baselines.
 //! - `explain <VAR>`: locate where `<VAR>` is exported (file + line), value
 //!   MASKED to `****`.
 //! - `_snapshot` (hidden): the shell hook execs this child once per session; it
-//!   reads its OWN environment and stores NAMES + 8-char value-hash prefixes.
+//!   reads its OWN environment and stores variable NAMES categorically, never
+//!   value-derived hashes or raw values.
 
 use std::path::PathBuf;
 
@@ -21,6 +23,44 @@ use tirith_core::policy::{self as policy_mod, Policy};
 
 use super::write_json_stdout;
 
+/// Env-guard output carries caller/policy-controlled names and local paths.
+/// Apply the public-paste projection plus the conservative durable projection
+/// before any JSON or human presenter extracts those fields.
+fn project_env_cli_text(value: &str) -> String {
+    let share_safe = tirith_core::redact::redact_for_audience(
+        value,
+        tirith_core::redact::ShareAudience::PublicPaste,
+    )
+    .redacted_content;
+    tirith_core::redact::redact_blocked_output(&share_safe)
+}
+
+fn project_env_cli_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = project_env_cli_text(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                project_env_cli_json(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                project_env_cli_json(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn write_env_json<T: serde::Serialize>(value: &T, context: &str) -> bool {
+    let Ok(mut value) = serde_json::to_value(value) else {
+        eprintln!("{context}");
+        return false;
+    };
+    project_env_cli_json(&mut value);
+    write_json_stdout(&value, context)
+}
+
 /// `tirith env guard on|off|status` — flip / report `policy.env_guard_enabled`.
 pub fn guard(action: &str, json: bool) -> i32 {
     let enable = match action {
@@ -28,6 +68,7 @@ pub fn guard(action: &str, json: bool) -> i32 {
         "off" | "disable" | "false" => false,
         "status" => return guard_status(json),
         other => {
+            let other = super::sanitize_for_human_output(&project_env_cli_text(other), false);
             eprintln!("tirith env guard: unknown action '{other}' (expected on|off|status)");
             return 2;
         }
@@ -39,10 +80,12 @@ pub fn guard(action: &str, json: bool) -> i32 {
     };
 
     if let Err(e) = update_policy_guard_key(&target_path, enable) {
-        eprintln!(
-            "tirith env guard: failed to update {}: {e}",
-            target_path.display()
+        let path = super::sanitize_for_human_output(
+            &project_env_cli_text(&target_path.display().to_string()),
+            false,
         );
+        let error = super::sanitize_for_human_output(&project_env_cli_text(&e.to_string()), true);
+        eprintln!("tirith env guard: failed to update {path}: {error}");
         return 1;
     }
 
@@ -52,14 +95,18 @@ pub fn guard(action: &str, json: bool) -> i32 {
             "env_guard_enabled": enable,
             "policy_path": target_path.display().to_string(),
         });
-        if !write_json_stdout(&out, "tirith env guard: failed to write JSON output") {
+        if !write_env_json(&out, "tirith env guard: failed to write JSON output") {
             return 1;
         }
     } else {
+        let path = super::sanitize_for_human_output(
+            &project_env_cli_text(&target_path.display().to_string()),
+            false,
+        );
         eprintln!(
             "tirith env guard: {} (written to {})",
             if enable { "ON" } else { "OFF" },
-            target_path.display(),
+            path,
         );
     }
     0
@@ -80,7 +127,7 @@ fn guard_status(json: bool) -> i32 {
             "persisted_secret_count": rc_findings.len(),
             "persisted_secrets": rc_findings,
         });
-        if !write_json_stdout(&out, "tirith env guard: failed to write JSON output") {
+        if !write_env_json(&out, "tirith env guard: failed to write JSON output") {
             return 1;
         }
     } else {
@@ -102,7 +149,8 @@ fn guard_status(json: bool) -> i32 {
             for f in &rc_findings {
                 if let Some(tirith_core::verdict::Evidence::Text { detail }) = f.evidence.first() {
                     // detail embeds the rc-file-derived var name (attacker-influenced).
-                    eprintln!("    {}", super::sanitize_for_human_output(detail, false));
+                    let detail = project_env_cli_text(detail);
+                    eprintln!("    {}", super::sanitize_for_human_output(&detail, false));
                 }
             }
             eprintln!(
@@ -141,19 +189,15 @@ const MAX_POLICY_SIZE: u64 = 1024 * 1024;
 /// `cli::exec::update_policy_guard_key`): the policy path is a repo-discovered
 /// `<repo>/.tirith/policy.yaml` (or `<config>/tirith/policy.yaml`), so an
 /// attacker who can plant a symlink there could otherwise redirect this
-/// truncating write onto an arbitrary file. Three layers defend the write:
-///   * `canonical_within` against the GRANDPARENT (`<repo>` / `<config>`)
-///     canonicalizes through the containing `.tirith` directory, so a SYMLINKED
-///     `.tirith` that escapes the repo is rejected before any read or write.
-///   * the read uses `O_NOFOLLOW` + a size cap (refuses a symlinked final
-///     component, bounds a hostile target); and
-///   * the write uses `O_NOFOLLOW` + `0600` (refuses a symlinked final
-///     component), then the parent dir is fsync'd.
+/// truncating write onto an arbitrary file. A retained directory capability is
+/// traversed from the trusted grandparent without following repo-controlled
+/// symlinks, then held under the parent mutation lock for the bounded read,
+/// exact typed authorization, preimage recheck, and atomic 0600 publication.
 ///
 /// The grandparent is the right containment root because the policy path is
 /// always at least three components deep (`<root>/.tirith/policy.yaml`); a
 /// malformed path with no grandparent is rejected rather than written.
-fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     // The containment root is the grandparent: <repo>/.tirith/policy.yaml →
     // <repo>, <config>/tirith/policy.yaml → <config>. A policy path is always
     // at least three components deep; refuse a malformed shallower path rather
@@ -165,28 +209,21 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         )
     })?;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Containment FIRST: reject a symlinked containing directory (e.g. a
-    // planted `.tirith` symlink) that escapes the trusted root before we read
-    // or write through it. `O_NOFOLLOW` on the final component alone misses
-    // this, because the OS still follows an intermediate-dir symlink during
-    // path resolution. Done after create_dir_all so a legit first-run `.tirith`
-    // exists to canonicalize.
-    if !tirith_core::util::canonical_within(path, containment_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to write policy through a symlinked path",
-        ));
-    }
+    let policy = Policy::discover_local_only(containment_root.to_str());
+    let contained = super::prepare_config_destination_permitted(
+        containment_root,
+        path,
+        true,
+        &policy,
+        true,
+        true,
+    )?;
 
     // Read the current contents WITHOUT following a symlinked final component.
     // An absent file is an empty baseline (the key is then appended); any other
     // read failure (symlinked, oversized, I/O) aborts rather than clobbering
     // blind.
-    let existing = match tirith_core::util::read_text_no_follow_capped(path, MAX_POLICY_SIZE) {
+    let existing = match contained.read_capped(MAX_POLICY_SIZE) {
         Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -201,7 +238,11 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     let mut out = String::new();
     let mut replaced = false;
     for line in existing.lines() {
-        if line.trim_start().starts_with("env_guard_enabled:") {
+        // Top-level only. An indented `env_guard_enabled:` is nested under some
+        // other key and means nothing, so rewriting it at column zero would
+        // corrupt the document AND set `replaced`, suppressing the real
+        // top-level append. Same rule `hooks.rs` and `exec.rs` already apply.
+        if line.starts_with("env_guard_enabled:") {
             out.push_str(&new_line);
             out.push('\n');
             replaced = true;
@@ -218,10 +259,44 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         out.push('\n');
     }
 
-    // Atomic publish (temp + fsync + rename, no-follow, 0600): a crash or full
-    // disk mid-write leaves the previous policy intact (R3 reliability).
-    tirith_core::util::write_file_atomic_0600(path, out.as_bytes())?;
-    Ok(())
+    // Verify BEFORE publishing, as `hooks.rs` and `exec.rs` do: the candidate
+    // must parse and its effective top-level `env_guard_enabled` must equal the
+    // requested value. Without it the operator is told the guard is ON while
+    // later loads fall back to the base policy with the guard disabled.
+    verify_guard_key_effective(&out, "env_guard_enabled", enable)?;
+
+    // Atomic publish (temp + fsync + rename) through the retained parent
+    // capability: a crash or full disk leaves the previous policy intact.
+    super::write_prepared_config_file_permitted(
+        containment_root,
+        path,
+        contained,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
+}
+
+/// Parse the candidate policy and require the top-level `key` to equal
+/// `expected`. Guards against lookalike-key corruption and against pre-existing
+/// invalid YAML silently defeating the toggle.
+fn verify_guard_key_effective(candidate: &str, key: &str, expected: bool) -> std::io::Result<()> {
+    // An empty file parses as `Value::Null`; treat it as an empty mapping.
+    let parsed: serde_yaml::Value = serde_yaml::from_str(candidate).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("resulting policy would not parse as YAML: {e}"),
+        )
+    })?;
+    if parsed.get(key).and_then(serde_yaml::Value::as_bool) == Some(expected) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("resulting policy does not have the requested top-level {key} value"),
+        ))
+    }
 }
 
 /// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`
@@ -243,9 +318,10 @@ fn open_regular_io_error(e: tirith_core::util::OpenRegularError) -> std::io::Err
     }
 }
 
-/// `tirith env diff [--reset]` — show sensitive vars set/changed since shell
-/// start. Exit 1 if any newly appeared (worth a non-zero exit for scripting),
-/// else 0. `--reset` re-baselines and exits 0.
+/// `tirith env diff [--reset]` — show sensitive vars newly set, changed, or not
+/// safely comparable since shell start. Exit 1 for any reported entry (including
+/// an unresolved comparison) so scripting fails conservatively. `--reset`
+/// re-baselines and exits 0.
 pub fn diff(reset: bool, json: bool) -> i32 {
     let policy = Policy::discover_partial(None);
     let sensitive = env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
@@ -261,34 +337,64 @@ pub fn diff(reset: bool, json: bool) -> i32 {
             return 1;
         }
     };
-    let snapshot = env_guard::load_snapshot(&snap_path);
     let snapshot_present = snap_path.exists();
+    let snapshot = match load_snapshot_for_diff(&snap_path, &sensitive) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let path = super::sanitize_for_human_output(
+                &project_env_cli_text(&snap_path.display().to_string()),
+                false,
+            );
+            let error =
+                super::sanitize_for_human_output(&project_env_cli_text(&error.to_string()), true);
+            eprintln!("tirith env diff: failed to load or migrate snapshot {path}: {error}");
+            return 1;
+        }
+    };
     let current = env_guard::current_sensitive_in_process(&sensitive);
     let entries = env_guard::diff_sensitive(&snapshot, &current, &sensitive);
 
     if json {
-        let body = serde_json::json!({
-            "schema_version": 1,
-            "snapshot_path": snap_path.display().to_string(),
-            "snapshot_present": snapshot_present,
-            "changed_count": entries.len(),
-            "changes": entries,
-        });
-        if !write_json_stdout(&body, "tirith env diff: failed to write JSON output") {
+        let body = diff_json_body(&snap_path, snapshot_present, &entries);
+        if !write_env_json(&body, "tirith env diff: failed to write JSON output") {
             return 1;
         }
     } else {
         print_human_diff(&snap_path, snapshot_present, &entries);
     }
 
-    let any_newly_set = entries
-        .iter()
-        .any(|e| e.delta == env_guard::EnvDelta::NewlySet);
-    if any_newly_set {
-        1
-    } else {
+    if entries.is_empty() {
         0
+    } else {
+        1
     }
+}
+
+fn diff_json_body(
+    snap_path: &std::path::Path,
+    snapshot_present: bool,
+    entries: &[env_guard::EnvDiffEntry],
+) -> serde_json::Value {
+    let unavailable_count = entries
+        .iter()
+        .filter(|entry| entry.delta == env_guard::EnvDelta::ValueComparisonUnavailable)
+        .count();
+    serde_json::json!({
+        "schema_version": 1,
+        "snapshot_path": snap_path.display().to_string(),
+        "snapshot_present": snapshot_present,
+        "changed_count": entries.len(),
+        "value_comparison_complete": unavailable_count == 0,
+        "value_comparison_unavailable_count": unavailable_count,
+        "changes": entries,
+    })
+}
+
+fn load_snapshot_for_diff(
+    path: &std::path::Path,
+    sensitive: &[String],
+) -> std::io::Result<EnvSnapshot> {
+    env_guard::load_snapshot_and_migrate(path, sensitive)
 }
 
 fn print_human_diff(
@@ -296,11 +402,12 @@ fn print_human_diff(
     snapshot_present: bool,
     entries: &[env_guard::EnvDiffEntry],
 ) {
+    let snap_path = super::sanitize_for_human_output(
+        &project_env_cli_text(&snap_path.display().to_string()),
+        false,
+    );
     if !snapshot_present {
-        eprintln!(
-            "tirith env diff: no shell-start snapshot found at {}.",
-            snap_path.display()
-        );
+        eprintln!("tirith env diff: no shell-start snapshot found at {snap_path}.");
         eprintln!(
             "  The shell hook records one at shell start; run `tirith env diff --reset` to \
              baseline now, or open a new shell with the hook installed."
@@ -313,21 +420,34 @@ fn print_human_diff(
         return;
     }
     eprintln!(
-        "tirith env diff: {} sensitive variable(s) changed since shell start (values never shown):\n",
+        "tirith env diff: {} sensitive variable(s) reported since shell start (values never shown):\n",
         entries.len()
     );
     for e in entries {
         let label = match e.delta {
             env_guard::EnvDelta::NewlySet => "newly set",
             env_guard::EnvDelta::ValueChanged => "value changed",
+            env_guard::EnvDelta::ValueComparisonUnavailable => "value comparison unavailable",
         };
-        eprintln!("  {:<28} [{label}]", e.name);
+        let name = super::sanitize_for_human_output(&project_env_cli_text(&e.name), false);
+        eprintln!("  {name:<28} [{label}]");
+    }
+    if entries
+        .iter()
+        .any(|entry| entry.delta == env_guard::EnvDelta::ValueComparisonUnavailable)
+    {
+        eprintln!(
+            "\n  A persisted baseline contains variable-name presence only. Tirith cannot safely \
+             claim that a still-present secret is unchanged without retaining a durable \
+             secret-derived identifier."
+        );
     }
     eprintln!("\nRun `tirith env explain <VAR>` to see where a variable is set (value masked).");
 }
 
-/// `tirith env diff --reset` — re-baseline from the current environment
-/// (NAMES + 8-char value-hash prefixes only).
+/// `tirith env diff --reset` — re-baseline from the current environment.
+/// Every persisted entry is presence-only; no value or comparison marker is
+/// written to the snapshot.
 fn reset_snapshot(json: bool) -> i32 {
     let snap_path = match env_guard::snapshot_path() {
         Some(p) => p,
@@ -336,12 +456,16 @@ fn reset_snapshot(json: bool) -> i32 {
             return 1;
         }
     };
-    let snapshot = EnvSnapshot::from_current_process();
-    if let Err(e) = env_guard::save_snapshot(&snap_path, &snapshot) {
-        eprintln!(
-            "tirith env diff --reset: failed to write snapshot {}: {e}",
-            snap_path.display()
+    let policy = Policy::discover_partial(None);
+    let sensitive = env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
+    let snapshot = EnvSnapshot::from_current_process_with_sensitive(&sensitive);
+    if let Err(e) = env_guard::save_snapshot_with_sensitive(&snap_path, &snapshot, &sensitive) {
+        let path = super::sanitize_for_human_output(
+            &project_env_cli_text(&snap_path.display().to_string()),
+            false,
         );
+        let error = super::sanitize_for_human_output(&project_env_cli_text(&e.to_string()), true);
+        eprintln!("tirith env diff --reset: failed to write snapshot {path}: {error}");
         return 1;
     }
     if json {
@@ -351,18 +475,22 @@ fn reset_snapshot(json: bool) -> i32 {
             "recorded_vars": snapshot.vars.len(),
             "reset": true,
         });
-        if !write_json_stdout(
+        if !write_env_json(
             &body,
             "tirith env diff --reset: failed to write JSON output",
         ) {
             return 1;
         }
     } else {
+        let path = super::sanitize_for_human_output(
+            &project_env_cli_text(&snap_path.display().to_string()),
+            false,
+        );
         eprintln!(
-            "tirith env diff: snapshot re-baselined ({} variables recorded, names + 8-char \
-             hashes only) at {}.",
+            "tirith env diff: snapshot re-baselined ({} variable names recorded; all values \
+             presence-only) at {}.",
             snapshot.vars.len(),
-            snap_path.display()
+            path
         );
     }
     0
@@ -375,7 +503,7 @@ pub fn explain(var: &str, json: bool) -> i32 {
     let ex = env_guard::explain_var(var);
 
     if json {
-        if !write_json_stdout(&ex, "tirith env explain: failed to write JSON output") {
+        if !write_env_json(&ex, "tirith env explain: failed to write JSON output") {
             return 1;
         }
     } else {
@@ -390,7 +518,8 @@ pub fn explain(var: &str, json: bool) -> i32 {
 }
 
 fn print_human_explain(ex: &env_guard::EnvExplain) {
-    eprintln!("tirith env explain `{}`:", ex.name);
+    let name = super::sanitize_for_human_output(&project_env_cli_text(&ex.name), false);
+    eprintln!("tirith env explain `{name}`:");
     eprintln!(
         "  currently set in this process: {}",
         if ex.set_in_process { "yes" } else { "no" }
@@ -408,19 +537,24 @@ fn print_human_explain(ex: &env_guard::EnvExplain) {
     eprintln!("  exported in:");
     for src in &ex.sources {
         // masked_line already has the value replaced with ****.
-        eprintln!("    {}:{}  {}", src.file, src.line, src.masked_line);
+        let file = super::sanitize_for_human_output(&project_env_cli_text(&src.file), false);
+        let masked_line =
+            super::sanitize_for_human_output(&project_env_cli_text(&src.masked_line), false);
+        eprintln!("    {file}:{}  {masked_line}", src.line);
     }
     eprintln!("\nThe value is never read or printed — only the location and a masked placeholder.");
 }
 
 /// `tirith env _snapshot` — write the shell-start snapshot from THIS process's
-/// inherited environment (NAMES + 8-char value-hash prefixes only; no value
-/// crosses argv). Invoked by the hook once per session; always exits 0 so a
-/// write failure never disrupts the shell.
+/// inherited environment (variable names only; no value-derived hash/value
+/// crosses argv or persistence). Invoked by the hook once per session; always
+/// exits 0 so a write failure never disrupts the shell.
 pub fn snapshot_write() -> i32 {
     if let Some(path) = env_guard::snapshot_path() {
-        let snapshot = EnvSnapshot::from_current_process();
-        let _ = env_guard::save_snapshot(&path, &snapshot);
+        let policy = Policy::discover_partial(None);
+        let sensitive = env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
+        let snapshot = EnvSnapshot::from_current_process_with_sensitive(&sensitive);
+        let _ = env_guard::save_snapshot_with_sensitive(&path, &snapshot, &sensitive);
     }
     0
 }
@@ -428,6 +562,79 @@ pub fn snapshot_write() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_cli_projection_covers_names_paths_and_nested_json() {
+        let secret = format!("ghp_{}", "N".repeat(36));
+        let mut value = serde_json::json!({
+            "snapshot_path": format!("/Users/alice/private/{secret}/env.json"),
+            "changes": [{ "name": secret.clone() }],
+            "sources": [{ "file": format!("/Users/alice/{secret}/.zshrc") }],
+        });
+        project_env_cli_json(&mut value);
+        let rendered = value.to_string();
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(!rendered.contains("/Users/alice"), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+        assert_eq!(
+            project_env_cli_text("AWS_SECRET_ACCESS_KEY"),
+            "AWS_SECRET_ACCESS_KEY"
+        );
+    }
+
+    #[test]
+    fn env_diff_json_explicitly_surfaces_presence_only_comparison_gap() {
+        let entries = vec![env_guard::EnvDiffEntry {
+            name: "WALLET_PRIVATE_KEY".to_string(),
+            delta: env_guard::EnvDelta::ValueComparisonUnavailable,
+        }];
+        let body = diff_json_body(
+            std::path::Path::new("/tmp/env_snapshot.json"),
+            true,
+            &entries,
+        );
+        assert_eq!(body["changed_count"], 1);
+        assert_eq!(body["value_comparison_complete"], false);
+        assert_eq!(body["value_comparison_unavailable_count"], 1);
+        assert_eq!(body["changes"][0]["delta"], "value_comparison_unavailable");
+    }
+
+    #[test]
+    fn an_indented_lookalike_key_is_not_rewritten_and_does_not_suppress_the_append() {
+        // `env_guard_enabled:` nested under another key means nothing. Matching
+        // it with `trim_start()` rewrote it at column zero, which corrupted the
+        // document and marked the key as already replaced, so the real
+        // top-level line was never appended and the guard silently stayed off.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(
+            &path,
+            "nested:\n  env_guard_enabled: false
+",
+        )
+        .unwrap();
+
+        update_policy_guard_key(&path, true).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("  env_guard_enabled: false"),
+            "the nested key must be left exactly as it was: {content}"
+        );
+        assert!(
+            content
+                .lines()
+                .any(|line| line == "env_guard_enabled: true"),
+            "the real top-level key must still be appended: {content}"
+        );
+
+        // And the published document must actually mean what the operator was
+        // told, which is what the pre-publish verification exists to enforce.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed.get("env_guard_enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
 
     #[test]
     fn update_policy_guard_key_appends_and_replaces() {
@@ -455,6 +662,46 @@ mod tests {
     #[test]
     fn guard_unknown_action_returns_2() {
         assert_eq!(guard("bogus", false), 2);
+    }
+
+    #[test]
+    fn normal_diff_loader_atomically_persists_presence_only_migration_for_all_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env_snapshot.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "schema_version": 1,
+                "taken_at": 9,
+                "vars": {
+                    "AWS_SECRET_CUSTOM": {"name":"AWS_SECRET_CUSTOM","value_hash8":"deadbeef"},
+                    "MY_POLICY_SECRET": {"name":"MY_POLICY_SECRET","value_hash8":"cafebabe"},
+                    "LANG": {"name":"LANG","value_hash8":"12345678"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let snapshot = load_snapshot_for_diff(&path, &["MY_POLICY_SECRET".to_string()]).unwrap();
+        assert_eq!(snapshot.schema_version, 3);
+        assert_eq!(snapshot.vars["AWS_SECRET_CUSTOM"].value_hash8, "");
+        assert_eq!(snapshot.vars["MY_POLICY_SECRET"].value_hash8, "");
+        assert_eq!(snapshot.vars["LANG"].value_hash8, "");
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("deadbeef"), "{persisted}");
+        assert!(!persisted.contains("cafebabe"), "{persisted}");
+        assert!(!persisted.contains("12345678"), "{persisted}");
+        assert!(persisted.contains("\"schema_version\": 3"), "{persisted}");
+    }
+
+    #[test]
+    fn normal_diff_loader_fails_safely_without_overwriting_invalid_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env_snapshot.json");
+        let invalid = "{not valid snapshot json";
+        std::fs::write(&path, invalid).unwrap();
+        assert!(load_snapshot_for_diff(&path, &[]).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), invalid);
     }
 
     /// repo-0383: a symlinked containing directory (planted `.tirith`) that

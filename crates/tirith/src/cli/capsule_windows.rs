@@ -877,7 +877,17 @@ fn build_environment_block(
     let present: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
         .collect();
-    let survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    let mut survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    if policy.deny_sensitive {
+        survivors.retain(|name| {
+            std::env::var_os(name).is_none_or(|value| {
+                value
+                    .to_str()
+                    .map(|value| policy.assignment_survives(name, value))
+                    .unwrap_or_else(|| !tirith_core::sensitive_assets::is_registered_env_name(name))
+            })
+        });
+    }
 
     // Isolated HOME/TEMP for the child when temporary_home is set — the SAME
     // path the launch plan granted to the container SID (repo-0199).

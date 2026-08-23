@@ -119,20 +119,17 @@ const MAX_POLICY_SIZE: u64 = 1024 * 1024;
 /// Symlink-hardened (F16): the policy path is a repo-discovered
 /// `<repo>/.tirith/policy.yaml` (or `<config>/tirith/policy.yaml`), so an attacker
 /// who can plant a symlink there could otherwise redirect this truncating write
-/// onto an arbitrary file. Three layers defend the write:
-///   * `canonical_within` against the GRANDPARENT (`<repo>` / `<config>`)
-///     canonicalizes through the containing `.tirith` directory, so a SYMLINKED
-///     `.tirith` that escapes the repo is rejected before any read or write.
-///   * the read uses `O_NOFOLLOW` + a size cap (refuses a symlinked final
-///     component, bounds a hostile target); and
-///   * the write uses `O_NOFOLLOW` + `0600` (refuses a symlinked final component).
+/// onto an arbitrary file. A retained directory capability traverses from the
+/// trusted grandparent without following repo-controlled symlinks, then owns
+/// both the bounded read and atomic 0600 publication. There is no pathname
+/// re-open between validation and mutation.
 ///
 /// The grandparent is the right containment root because the policy path is always
 /// at least three components deep (`<root>/.tirith/policy.yaml`); passing the
 /// parent (`.tirith`) instead is a tautology for a fixed `policy.yaml` filename and
 /// would NOT catch a symlinked `.tirith`. A malformed path with no grandparent is
 /// rejected rather than written.
-fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     // The containment root is the grandparent: <repo>/.tirith/policy.yaml → <repo>,
     // <config>/tirith/policy.yaml → <config>. A policy path is always at least
     // three components deep; refuse a malformed shallower path rather than guess.
@@ -143,30 +140,24 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         )
     })?;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Containment FIRST: reject a symlinked containing directory (e.g. a planted
-    // `.tirith` symlink) that escapes the trusted root before we read or write
-    // through it. `O_NOFOLLOW` on the final component alone misses this, because
-    // the OS still follows an intermediate-dir symlink during path resolution.
-    // Done after create_dir_all so a legit first-run `.tirith` exists to canonicalize.
-    if !tirith_core::util::canonical_within(path, containment_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to write policy through a symlinked path",
-        ));
-    }
+    let policy = Policy::discover_local_only(containment_root.to_str());
+    let contained = super::prepare_config_destination_permitted(
+        containment_root,
+        path,
+        true,
+        &policy,
+        true,
+        true,
+    )?;
 
     // Read the current contents WITHOUT following a symlinked final component. An
     // absent file is an empty baseline (the key is then appended); any other read
     // failure (symlinked, oversized, I/O) aborts rather than clobbering blind.
-    let existing = match tirith_core::util::read_text_no_follow_capped(path, MAX_POLICY_SIZE) {
+    let existing = match contained.read_capped(MAX_POLICY_SIZE) {
         Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "policy file is not valid UTF-8; refusing to rewrite it",
+                "policy file is not UTF-8; refusing to rewrite it",
             )
         })?,
         Err(tirith_core::util::OpenRegularError::NotFound) => String::new(),
@@ -177,7 +168,7 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     let mut out = String::new();
     let mut replaced = false;
     for line in existing.lines() {
-        if line.trim_start().starts_with("exec_guard_enabled:") {
+        if line.starts_with("exec_guard_enabled:") {
             out.push_str(&new_line);
             out.push('\n');
             replaced = true;
@@ -194,11 +185,38 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         out.push('\n');
     }
 
-    // Atomic publish (temp + fsync + rename, no-follow, 0600): a crash or
-    // full disk mid-write leaves the previous policy intact, never an empty
-    // or partial file (R3 reliability: the truncating in-place write could
-    // destroy security policy on interruption).
-    tirith_core::util::write_file_atomic_0600(path, out.as_bytes())
+    verify_guard_key_effective(&out, enable)?;
+    // Atomic publish (temp + fsync + rename) through the retained parent
+    // capability: interruption cannot truncate the previous policy.
+    super::write_prepared_config_file_permitted(
+        containment_root,
+        path,
+        contained,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
+}
+
+fn verify_guard_key_effective(candidate: &str, expected: bool) -> std::io::Result<()> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(candidate).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("resulting policy would not parse as YAML: {error}"),
+        )
+    })?;
+    let effective = parsed
+        .get("exec_guard_enabled")
+        .and_then(serde_yaml::Value::as_bool);
+    if effective == Some(expected) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "resulting policy does not have the requested top-level exec_guard_enabled value",
+        ))
+    }
 }
 
 /// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`
@@ -489,6 +507,62 @@ mod tests {
         assert!(
             parsed.exec_guard_enabled,
             "exec_guard_enabled must round-trip to the engine-readable Policy"
+        );
+    }
+
+    #[test]
+    fn update_policy_guard_key_ignores_indented_lookalike() {
+        let dir = tempfile::tempdir().unwrap();
+        let tirith_dir = dir.path().join(".tirith");
+        std::fs::create_dir(&tirith_dir).unwrap();
+        let path = tirith_dir.join("policy.yaml");
+        std::fs::write(
+            &path,
+            "custom_rule:\n  exec_guard_enabled: false\n  other: 1\nparanoia: 2\n",
+        )
+        .unwrap();
+
+        update_policy_guard_key(&path, true).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("  exec_guard_enabled: false"),
+            "nested key must be preserved with its indentation: {content}"
+        );
+        assert_eq!(
+            content
+                .lines()
+                .filter(|line| line.starts_with("exec_guard_enabled:"))
+                .count(),
+            1,
+            "exactly one top-level key must be present: {content}"
+        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed
+                .get("exec_guard_enabled")
+                .and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn update_policy_guard_key_rejects_unparseable_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let tirith_dir = dir.path().join(".tirith");
+        std::fs::create_dir(&tirith_dir).unwrap();
+        let path = tirith_dir.join("policy.yaml");
+        let original = "a:\n - 1\n  - 2\n  bad: [\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = update_policy_guard_key(&path, true);
+        assert!(
+            result.is_err(),
+            "invalid YAML baseline must fail: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "validation failure must leave the original policy untouched"
         );
     }
 

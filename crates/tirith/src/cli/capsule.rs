@@ -181,6 +181,16 @@ impl DegradedPolicy {
 /// asserts the same contract, so a future enforcing surface that mis-wires its
 /// policy is caught in tests rather than silently running an attacker's code
 /// uncontained.
+///
+/// C12 extends the same contract to the task gate: a surface holding an
+/// enforcing task decision must never reach a degraded run, or a decision that
+/// TIGHTENED the capsule (`task_boundary::tighten_capsule_spec`) would be
+/// satisfied by no capsule at all. That holds structurally today, because
+/// `pkg install` launches through `run_to_completion_bound_inputs` (whose API
+/// has no degraded mode) and `tirith run` passes `FailClosed`; the source scan
+/// `only_the_declared_best_effort_surfaces_name_the_degraded_policy` in
+/// `crates/tirith/tests/owned_boundary_enforcement.rs` keeps a future surface
+/// from quietly joining the list.
 fn assert_degraded_run_is_permitted(policy: DegradedPolicy) {
     debug_assert!(
         !policy.is_enforcing(),
@@ -5935,7 +5945,26 @@ where
     // The same pure decision the Linux launcher uses (`EnvironmentPolicy`'s own
     // `surviving_vars`): start from the allow-list (or the parent set when
     // `inherit`), then drop every sensitive name.
-    let survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    let mut survivors = policy.surviving_vars(present.iter().map(|s| s.as_str()));
+    if policy.deny_sensitive {
+        survivors.retain(|name| {
+            let sensitive = match exact_env {
+                Some(environment) => environment
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .is_some_and(|(_, value)| !policy.assignment_survives(name, value)),
+                None => std::env::var_os(name).is_some_and(|value| {
+                    value
+                        .to_str()
+                        .map(|value| !policy.assignment_survives(name, value))
+                        .unwrap_or_else(|| {
+                            tirith_core::sensitive_assets::is_registered_env_name(name)
+                        })
+                }),
+            };
+            !sensitive
+        });
+    }
     if survivors.iter().any(|name| name.starts_with("DYLD_")) {
         return Err(
             "macOS contained launch refuses every DYLD_* loader-control variable before the trusted capsule re-exec"

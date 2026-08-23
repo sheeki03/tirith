@@ -25,33 +25,25 @@ guarded_tools:
 
 policy:
   # What to do when tirith reports a "warn" verdict:
-  #   "forward" - forward the command and inject findings into the response (default)
+  #   "forward" - forward the command and inject findings into the response
   #   "allow"   - synonym for "forward"
-  #   "deny"    - treat warnings as denials (stricter, blocks on Medium/Low findings)
-  warn_action: "forward"
+  #   "deny"    - treat warnings as denials (bundled hardened default)
+  warn_action: "deny"
 
   # What to do when tirith analysis fails (timeout, crash, etc):
-  #   "open"   - forward the command (fail open, default)
-  #   "closed" - deny the command (fail closed, stricter)
-  fail_mode: "open"
+  #   "open"   - compatibility posture for explicitly accepted availability risk
+  #   "closed" - deny the command when analysis cannot complete (bundled default)
+  fail_mode: "closed"
 
-  # Fail-mode rationale:
-  # The gateway defaults fail-open because it proxies MCP tool calls for AI agents.
-  # A false positive or infrastructure failure (tirith crash, timeout) should not
-  # silently break the user's coding session — the agent would see an opaque denial
-  # with no way to recover. High/Critical findings still block unconditionally
-  # (warn_action only affects Medium/Low).
-  #
-  # Shell hooks (bash, zsh, fish) default fail-closed because they intercept
-  # human-initiated commands where the user can immediately see and respond to a
-  # false positive. The asymmetry is intentional: human-in-the-loop vs autonomous.
+  # An autonomous MCP boundary must deny on uncertainty. Operators who deliberately
+  # choose compatibility over this guarantee can set `open` in a private config.
 
   # Maximum time (ms) to wait for tirith analysis before applying fail_mode
   timeout_ms: 10000
 
   # Maximum bytes per JSON-RPC message line (DoS protection)
   # Oversize messages trigger immediate session termination
-  max_message_bytes: 1048576  # 1 MiB
+  max_message_bytes: 262144  # 256 KiB
 
   # How long (ms) an in-flight request waits for its response before it becomes a
   # TimedOut tombstone. The entry is NOT deleted at the deadline: a response that
@@ -64,3 +56,9 @@ policy:
   # collection. Bounds memory while keeping late-response detection effective for
   # the retention window.
   tombstone_retention_ms: 60000  # 60s
+
+  # Absolute in-memory/concurrency ceilings. Backpressure is applied before
+  # these limits can be exceeded.
+  max_pending_requests: 1024
+  max_output_queue: 256
+  max_analysis_workers: 4

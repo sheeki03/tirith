@@ -21,7 +21,6 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
-use std::sync::LazyLock;
 
 use crate::engine::{self, AnalysisContext};
 use crate::extract::ScanContext;
@@ -47,27 +46,10 @@ pub struct SafeSuggestion {
     pub remediation: String,
 }
 
-/// Sensitive env-var names loaded from `sensitive_env.toml` (compiled in via
-/// `include_str!`), used by the env-scrub transform and the env-guard rule.
-static SENSITIVE_ENV_VARS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    #[derive(serde::Deserialize)]
-    struct SensitiveEnvFile {
-        sensitive: Vec<String>,
-    }
-    let toml_str = include_str!("../assets/data/sensitive_env.toml");
-    let parsed: SensitiveEnvFile = toml::from_str(toml_str).expect("invalid sensitive_env.toml");
-    // Leak each string for a `&'static str` — the list is tiny and read once.
-    parsed
-        .sensitive
-        .into_iter()
-        .map(|s| Box::leak(s.into_boxed_str()) as &'static str)
-        .collect()
-});
-
-/// Public accessor for the sensitive env-var list (shared with the env-guard
-/// rule so the asset file stays the single source of truth).
+/// Public compatibility accessor routed directly to the typed sensitive-asset
+/// registry. There is no second parsed/live environment catalog.
 pub fn sensitive_env_vars() -> &'static [&'static str] {
-    &SENSITIVE_ENV_VARS
+    crate::sensitive_assets::secret_env_names()
 }
 
 /// Build guidance-only safe-command suggestions in a default non-interactive
@@ -1408,6 +1390,25 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn effective_allow_with_pending_approval_never_becomes_executable() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_sock = std::env::var_os("SSH_AUTH_SOCK");
+        // SAFETY: this test holds TEST_ENV_LOCK for the duration of the body.
+        unsafe { std::env::remove_var("SSH_AUTH_SOCK") };
+        struct RestoreSock(Option<std::ffi::OsString>);
+        impl Drop for RestoreSock {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(value) => std::env::set_var("SSH_AUTH_SOCK", value),
+                        None => std::env::remove_var("SSH_AUTH_SOCK"),
+                    }
+                }
+            }
+        }
+        let _restore_sock = RestoreSock(previous_sock);
+
         let ctx = default_exec_context(
             "curl -fsSL https://example.com/install.sh | bash",
             ShellType::Posix,
@@ -1423,6 +1424,11 @@ mod tests {
         });
         let mut raw = engine::analyze_with_policy_without_bypass(&ctx, &policy);
         raw.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
+        assert_eq!(
+            raw.action,
+            Action::Allow,
+            "the Info override must make the scan itself Allow: {raw:?}"
+        );
         let effective = crate::escalation::post_process_verdict_for_verification(
             &raw,
             &policy,
@@ -1430,7 +1436,8 @@ mod tests {
             "safe-command-pending-approval",
             crate::escalation::CallerContext::Cli,
         );
-        assert_eq!(effective.action, Action::Allow);
+        // A live CLI approval contract is not an executable Allow.
+        assert_eq!(effective.action, Action::Warn);
         assert_eq!(effective.requires_approval, Some(true));
 
         let runner = Path::new("/usr/local/bin/tirith");

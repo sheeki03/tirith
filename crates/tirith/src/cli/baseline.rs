@@ -208,7 +208,7 @@ fn resolve_policy_path() -> Result<PathBuf, i32> {
 
 /// Idempotently set the `baseline_enabled` line in a policy YAML file:
 /// append-or-rewrite, never touching other lines.
-fn update_baseline_flag(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+pub(super) fn update_baseline_flag(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     // Baseline enablement must never follow an untrusted repository policy
     // symlink (repo-0361): confine the read-modify-write beneath the policy
     // file's own directory (the repository `.tirith` directory or the user
@@ -226,7 +226,9 @@ fn update_baseline_flag(path: &std::path::Path, enable: bool) -> std::io::Result
                 "policy path has no parent directory",
             )
         })?;
-    let prepared = tirith_core::util::ContainedAtomicFile::prepare(root, path, true)?;
+    let policy = Policy::discover_local_only(root.to_str());
+    let prepared =
+        super::prepare_config_destination_permitted(root, path, true, &policy, true, true)?;
     let existing = match prepared.read_capped(1024 * 1024) {
         Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
             std::io::Error::new(
@@ -264,7 +266,15 @@ fn update_baseline_flag(path: &std::path::Path, enable: bool) -> std::io::Result
         out.push('\n');
     }
 
-    prepared.write_atomic(out.as_bytes(), true)
+    super::write_prepared_config_file_permitted(
+        root,
+        path,
+        prepared,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
 }
 
 #[cfg(test)]

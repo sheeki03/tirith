@@ -19,6 +19,64 @@ pub const MIN_BASE64_BLOB_LEN: usize = 96;
 /// (it scans a much lower 16-char floor but must cap decode work identically).
 pub(crate) const MAX_BASE64_VALIDATE_LEN: usize = 8 * 1024;
 
+/// Stable compatibility view retained at its original public type and exact
+/// values. Runtime classification uses `sensitive_assets`.
+pub const SENSITIVE_KEY_VARS: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GITHUB_TOKEN",
+];
+
+/// Stable compatibility view retained at its original public type and exact
+/// values. Runtime bind classification uses `sensitive_assets`.
+pub const SENSITIVE_BIND_PATHS: &[&str] = &[
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/var/run/podman/podman.sock",
+    "~/.ssh",
+    "~/.aws",
+    "~/.kube",
+    "~/.docker",
+    "/etc",
+    "/root/.ssh",
+    "/root/.aws",
+    "${env:HOME}/.ssh",
+    "${env:HOME}/.aws",
+    "${env:HOME}/.kube",
+    "${env:HOME}/.docker",
+    "${localEnv:HOME}/.ssh",
+    "${localEnv:HOME}/.aws",
+    "${localEnv:HOME}/.kube",
+    "${localEnv:HOME}/.docker",
+    "${env:USERPROFILE}/.ssh",
+    "${env:USERPROFILE}/.aws",
+    "${env:USERPROFILE}/.kube",
+    "${env:USERPROFILE}/.docker",
+    "${localEnv:USERPROFILE}/.ssh",
+    "${localEnv:USERPROFILE}/.aws",
+    "${localEnv:USERPROFILE}/.kube",
+    "${localEnv:USERPROFILE}/.docker",
+    "${env:HOMEDRIVE}${env:HOMEPATH}/.ssh",
+    "${env:HOMEDRIVE}${env:HOMEPATH}/.aws",
+    "${env:HOMEDRIVE}${env:HOMEPATH}/.kube",
+    "${env:HOMEDRIVE}${env:HOMEPATH}/.docker",
+    "${localEnv:HOMEDRIVE}${localEnv:HOMEPATH}/.ssh",
+    "${localEnv:HOMEDRIVE}${localEnv:HOMEPATH}/.aws",
+    "${localEnv:HOMEDRIVE}${localEnv:HOMEPATH}/.kube",
+    "${localEnv:HOMEDRIVE}${localEnv:HOMEPATH}/.docker",
+    "%USERPROFILE%/.ssh",
+    "%USERPROFILE%/.aws",
+    "%USERPROFILE%/.kube",
+    "%USERPROFILE%/.docker",
+    "%HOMEDRIVE%%HOMEPATH%/.ssh",
+    "%HOMEDRIVE%%HOMEPATH%/.aws",
+    "%HOMEDRIVE%%HOMEPATH%/.kube",
+    "%HOMEDRIVE%%HOMEPATH%/.docker",
+];
+
 /// Whether `content` contains a long base64 run that actually decodes (standard
 /// or URL-safe, padded or not): the shape of an encoded payload smuggled into a
 /// text field. Returns the matched run passed through `truncate` when found.
@@ -82,78 +140,6 @@ pub fn find_base64_blob_with(
     }
     None
 }
-
-/// Sensitive-credential env var names. Used by `command.rs` (SensitiveEnvExport)
-/// and `credential.rs` (dedup suppression).
-pub const SENSITIVE_KEY_VARS: &[&str] = &[
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "GITHUB_TOKEN",
-];
-
-/// Sensitive filesystem paths (credential directories, runtime sockets, and the
-/// devcontainer `${env:HOME}` / `${localEnv:HOME}` variable forms) that a config
-/// file should not bind-mount. Consumed by `configfile.rs` (bind-mount detection).
-///
-/// NOT shared with `exfil.rs`: the output-side read-and-send directive in
-/// `exfil.rs` maintains its OWN sensitive-path list (a regex path-alternation of a
-/// DIFFERENT shape, `~/.ssh` | `/etc/` | `.env` | `id_rsa` | …) inline in its
-/// rule. The two lists are independent and must be updated together by hand when a
-/// path class changes. They are not merged because their shapes differ (this exact
-/// `&[&str]` of mount targets vs. a regex fragment).
-///
-/// This is ALSO distinct from `command.rs`'s private credential-FILE list
-/// (`/etc/passwd`, `~/.ssh/id_rsa`), which drives the curl-exfil command rule;
-/// those have different shapes on purpose and must not be merged either.
-pub const SENSITIVE_BIND_PATHS: &[&str] = &[
-    "/var/run/docker.sock",
-    "/run/docker.sock",
-    "/var/run/podman/podman.sock",
-    "~/.ssh",
-    "~/.aws",
-    "~/.kube",
-    "~/.docker",
-    "/etc",
-    "/root/.ssh",
-    "/root/.aws",
-    "${env:HOME}/.ssh",
-    "${env:HOME}/.aws",
-    "${env:HOME}/.kube",
-    "${env:HOME}/.docker",
-    "${localEnv:HOME}/.ssh",
-    "${localEnv:HOME}/.aws",
-    "${localEnv:HOME}/.kube",
-    "${localEnv:HOME}/.docker",
-    "${env:USERPROFILE}/.ssh",
-    "${env:USERPROFILE}/.aws",
-    "${env:USERPROFILE}/.kube",
-    "${env:USERPROFILE}/.docker",
-    "${localEnv:USERPROFILE}/.ssh",
-    "${localEnv:USERPROFILE}/.aws",
-    "${localEnv:USERPROFILE}/.kube",
-    "${localEnv:USERPROFILE}/.docker",
-    "${env:HOMEDRIVE}${env:HOMEPATH}/.ssh",
-    "${env:HOMEDRIVE}${env:HOMEPATH}/.aws",
-    "${env:HOMEDRIVE}${env:HOMEPATH}/.kube",
-    "${env:HOMEDRIVE}${env:HOMEPATH}/.docker",
-    "${localEnv:HOMEDRIVE}${localEnv:HOMEPATH}/.ssh",
-    "${localEnv:HOMEDRIVE}${localEnv:HOMEPATH}/.aws",
-    "${localEnv:HOMEDRIVE}${localEnv:HOMEPATH}/.kube",
-    "${localEnv:HOMEDRIVE}${localEnv:HOMEPATH}/.docker",
-    "%USERPROFILE%/.ssh",
-    "%USERPROFILE%/.aws",
-    "%USERPROFILE%/.kube",
-    "%USERPROFILE%/.docker",
-    // The `${env:HOMEDRIVE}${env:HOMEPATH}` spelling above is already covered;
-    // the cmd-style `%VAR%` form names the same home.
-    "%HOMEDRIVE%%HOMEPATH%/.ssh",
-    "%HOMEDRIVE%%HOMEPATH%/.aws",
-    "%HOMEDRIVE%%HOMEPATH%/.kube",
-    "%HOMEDRIVE%%HOMEPATH%/.docker",
-];
 
 /// Known URL-shortener hosts. Centralised so `transport.rs` (`ShortenedUrl`) and
 /// `paste_provenance.rs` (host-mismatch escalation) can't drift (M12 ch1).

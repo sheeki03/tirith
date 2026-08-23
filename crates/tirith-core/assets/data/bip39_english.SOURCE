@@ -1,0 +1,9 @@
+Name: BIP-0039 English wordlist
+Upstream-Path: https://github.com/bitcoin/bips/blob/ed4ffcb6a48d4dc4fdfc11cdba783c233db8c66e/bip-0039/english.txt
+Upstream-Revision: ed4ffcb6a48d4dc4fdfc11cdba783c233db8c66e
+Local-Path: crates/tirith-core/assets/data/bip39_english.txt
+Local-SHA256: 2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda
+Copyright: Bitcoin BIPs contributors
+License: MIT
+SPDX-License-Identifier: MIT
+Purpose: BIP-39 English word membership and checksum validation

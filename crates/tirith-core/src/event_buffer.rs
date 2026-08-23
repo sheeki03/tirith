@@ -14,9 +14,10 @@
 //! no PATTERN_TABLE entry).
 
 use std::collections::BTreeMap;
+use std::fmt;
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::verdict::{RuleId, Severity};
 
@@ -44,23 +45,6 @@ pub enum EventKind {
     PackageInstall,
 }
 
-impl EventKind {
-    /// Stable serialized spelling used in durable identities. Keep this explicit:
-    /// Rust's `Debug` output is not a persistence format.
-    fn stable_tag(self) -> &'static str {
-        match self {
-            Self::ProcessExec => "process_exec",
-            Self::FileWrite => "file_write",
-            Self::FileDelete => "file_delete",
-            Self::GitForcePush => "git_force_push",
-            Self::Network => "network",
-            Self::SecretWrite => "secret_write",
-            Self::ShellPipe => "shell_pipe",
-            Self::PackageInstall => "package_install",
-        }
-    }
-}
-
 /// Assurance attached to a typed event's execution boundary.
 ///
 /// Legacy events default to `Unresolved` because the old JSON recorder carried
@@ -81,19 +65,16 @@ pub enum EventProvenance {
 /// One recorded, time-stamped event. `path` / `host` / `domain` and any other
 /// detail live in [`Self::metadata`] so the struct stays stable as new
 /// correlations want new context.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TypedEvent {
     /// Stable opaque identity. Empty only while deserializing a legacy event;
     /// session migration fills it deterministically before the event is used.
-    #[serde(default)]
     pub event_id: String,
     /// Monotonic sequence within the owning session. Zero is the legacy sentinel
     /// and is replaced under the session lock during migration.
-    #[serde(default)]
     pub sequence: u64,
     /// Execution assurance. Missing on legacy records means unresolved because
     /// those records predate the proof-carrying split.
-    #[serde(default)]
     pub provenance: EventProvenance,
     /// RFC 3339 UTC timestamp (`chrono::Utc::now().to_rfc3339()`), lexically
     /// comparable against other events recorded the same way.
@@ -104,6 +85,236 @@ pub struct TypedEvent {
     pub rule_id: String,
     /// Free-form context: `path`, `host`, `domain`, a `manifest` flag, etc.
     pub metadata: BTreeMap<String, String>,
+}
+
+const MAX_TYPED_EVENT_ID_BYTES: usize = 128;
+const MAX_TYPED_EVENT_TIMESTAMP_BYTES: usize = 64;
+const MAX_TYPED_EVENT_RULE_ID_BYTES: usize = 128;
+const MAX_TYPED_EVENT_METADATA_ENTRIES: usize = 32;
+const MAX_TYPED_EVENT_METADATA_KEY_BYTES: usize = 64;
+const MAX_TYPED_EVENT_METADATA_VALUE_BYTES: usize = 512;
+const PRIVACY_REDACTED_EVENT_ID: &str = "privacy-redacted";
+
+/// Serde-only compatibility shape. The public wire field names and legacy
+/// defaults stay unchanged, while [`TypedEvent`]'s trait boundary gets a chance
+/// to project attacker-controlled strings before they can be rendered or made
+/// durable.
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "TypedEvent")]
+struct TypedEventWire {
+    #[serde(default)]
+    event_id: String,
+    #[serde(default)]
+    sequence: u64,
+    #[serde(default)]
+    provenance: EventProvenance,
+    timestamp: String,
+    kind: EventKind,
+    rule_id: String,
+    metadata: BTreeMap<String, String>,
+}
+
+impl From<TypedEventWire> for TypedEvent {
+    fn from(wire: TypedEventWire) -> Self {
+        Self {
+            event_id: wire.event_id,
+            sequence: wire.sequence,
+            provenance: wire.provenance,
+            timestamp: wire.timestamp,
+            kind: wire.kind,
+            rule_id: wire.rule_id,
+            metadata: wire.metadata,
+        }
+    }
+}
+
+impl From<TypedEvent> for TypedEventWire {
+    fn from(event: TypedEvent) -> Self {
+        Self {
+            event_id: event.event_id,
+            sequence: event.sequence,
+            provenance: event.provenance,
+            timestamp: event.timestamp,
+            kind: event.kind,
+            rule_id: event.rule_id,
+            metadata: event.metadata,
+        }
+    }
+}
+
+fn privacy_project_unbounded_text(value: &str) -> String {
+    let projected = crate::redact::privacy_project_durable_text(value);
+    crate::mcp::output_filter::sanitize_for_display(&projected)
+}
+
+fn privacy_project_bounded_text(value: &str, max_bytes: usize) -> String {
+    crate::util::truncate_bytes(&privacy_project_unbounded_text(value), max_bytes)
+}
+
+fn fits_bound_or_privacy_projects(value: &str, projected: &str, max_bytes: usize) -> bool {
+    value.len() <= max_bytes || (projected != value && projected.len() <= max_bytes)
+}
+
+pub(crate) fn privacy_project_endpoint(value: &str) -> String {
+    let projected = privacy_project_bounded_text(value, MAX_TYPED_EVENT_METADATA_VALUE_BYTES);
+    if projected.starts_with("[REDACTED:") {
+        return projected;
+    }
+    let canonical =
+        crate::sensitive_assets::canonicalize_rpc_for_display(&projected).or_else(|| {
+            let endpoint = format!("https://{projected}");
+            crate::sensitive_assets::canonicalize_rpc_for_display(&endpoint)
+                .and_then(|origin| origin.strip_prefix("https://").map(str::to_string))
+        });
+    crate::util::truncate_bytes(
+        canonical.as_deref().unwrap_or(&projected),
+        MAX_TYPED_EVENT_METADATA_VALUE_BYTES,
+    )
+}
+
+fn metadata_priority(key: &str) -> usize {
+    match key {
+        "path" => 0,
+        "host" => 1,
+        "domain" => 2,
+        "rpc" => 3,
+        "rpc_url" => 4,
+        MANIFEST_FLAG_KEY => 5,
+        DELETE_COUNT_KEY => 6,
+        NON_BUILD_DELETE_COUNT_KEY => 7,
+        _ => 8,
+    }
+}
+
+/// Mandatory privacy and semantic-size projection for a typed event.
+///
+/// The return value says whether any identity-bearing source field or the id
+/// itself changed. A session owner can use that signal to regenerate the stable
+/// id from the fully projected source and to rewrite correlation de-dup markers.
+/// This function deliberately never hashes a rejected value by itself.
+pub(crate) fn privacy_project_typed_event(event: &mut TypedEvent) -> bool {
+    let original_timestamp = event.timestamp.clone();
+    let original_rule_id = event.rule_id.clone();
+    let original_metadata = event.metadata.clone();
+
+    event.timestamp =
+        privacy_project_bounded_text(&event.timestamp, MAX_TYPED_EVENT_TIMESTAMP_BYTES);
+    event.rule_id = privacy_project_bounded_text(&event.rule_id, MAX_TYPED_EVENT_RULE_ID_BYTES);
+
+    let mut projected =
+        Vec::with_capacity(event.metadata.len().min(MAX_TYPED_EVENT_METADATA_ENTRIES));
+    for (key, value) in std::mem::take(&mut event.metadata) {
+        let (key, value) = crate::redact::privacy_project_durable_pair(&key, &value);
+        let key = privacy_project_bounded_text(&key, MAX_TYPED_EVENT_METADATA_KEY_BYTES);
+        if key.is_empty() {
+            continue;
+        }
+        let value = if matches!(key.as_str(), "host" | "domain" | "rpc" | "rpc_url") {
+            privacy_project_endpoint(&value)
+        } else {
+            privacy_project_bounded_text(&value, MAX_TYPED_EVENT_METADATA_VALUE_BYTES)
+        };
+        projected.push((metadata_priority(&key), key, value));
+    }
+    // Preserve correlation-critical categorical metadata before arbitrary
+    // extension fields if a hostile direct construction exceeds the cap.
+    projected.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, key, value) in projected.into_iter().take(MAX_TYPED_EVENT_METADATA_ENTRIES) {
+        event.metadata.insert(key, value);
+    }
+
+    let source_changed = event.timestamp != original_timestamp
+        || event.rule_id != original_rule_id
+        || event.metadata != original_metadata;
+    let projected_id = privacy_project_bounded_text(&event.event_id, MAX_TYPED_EVENT_ID_BYTES);
+    let identity_changed = projected_id != event.event_id;
+    // An otherwise opaque id may be a digest of any source field that just
+    // changed. A session owner replaces this sentinel with a reproducible
+    // sequence identity after inspecting the whole ring; keeping one bounded,
+    // stable-id-safe sentinel until then also preserves duplicate-id detection
+    // instead of laundering two hostile ids into two empty strings.
+    event.event_id = if source_changed || identity_changed {
+        PRIVACY_REDACTED_EVENT_ID.to_string()
+    } else {
+        projected_id
+    };
+    source_changed || identity_changed
+}
+
+impl Serialize for TypedEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut projected = self.clone();
+        privacy_project_typed_event(&mut projected);
+        TypedEventWire::from(projected).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TypedEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TypedEventWire::deserialize(deserializer)?;
+        let projected_id = privacy_project_unbounded_text(&wire.event_id);
+        let projected_rule_id = privacy_project_unbounded_text(&wire.rule_id);
+        let metadata_within_bounds = wire.metadata.iter().all(|(key, value)| {
+            let (projected_key, projected_value) =
+                crate::redact::privacy_project_durable_pair(key, value);
+            let projected_key = privacy_project_unbounded_text(&projected_key);
+            let projected_value = privacy_project_unbounded_text(&projected_value);
+            !key.is_empty()
+                && !projected_key.is_empty()
+                && fits_bound_or_privacy_projects(
+                    key,
+                    &projected_key,
+                    MAX_TYPED_EVENT_METADATA_KEY_BYTES,
+                )
+                && fits_bound_or_privacy_projects(
+                    value,
+                    &projected_value,
+                    MAX_TYPED_EVENT_METADATA_VALUE_BYTES,
+                )
+        });
+        if !fits_bound_or_privacy_projects(&wire.event_id, &projected_id, MAX_TYPED_EVENT_ID_BYTES)
+            || wire.timestamp.len() > MAX_TYPED_EVENT_TIMESTAMP_BYTES
+            || wire.rule_id.is_empty()
+            || projected_rule_id.is_empty()
+            || !fits_bound_or_privacy_projects(
+                &wire.rule_id,
+                &projected_rule_id,
+                MAX_TYPED_EVENT_RULE_ID_BYTES,
+            )
+            || wire.metadata.len() > MAX_TYPED_EVENT_METADATA_ENTRIES
+            || !metadata_within_bounds
+        {
+            return Err(D::Error::custom(
+                "typed event exceeds its public semantic bounds",
+            ));
+        }
+        let mut event = Self::from(wire);
+        privacy_project_typed_event(&mut event);
+        Ok(event)
+    }
+}
+
+impl fmt::Debug for TypedEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut projected = self.clone();
+        privacy_project_typed_event(&mut projected);
+        formatter
+            .debug_struct("TypedEvent")
+            .field("event_id", &projected.event_id)
+            .field("sequence", &projected.sequence)
+            .field("provenance", &projected.provenance)
+            .field("timestamp", &projected.timestamp)
+            .field("kind", &projected.kind)
+            .field("rule_id", &projected.rule_id)
+            .field("metadata", &projected.metadata)
+            .finish()
+    }
 }
 
 impl TypedEvent {
@@ -129,30 +340,16 @@ impl TypedEvent {
     /// Upgrade a deserialized legacy event to a stable identity. The caller
     /// supplies a unique sequence allocated under the session lock, making
     /// migration deterministic even when two legacy events otherwise have equal
-    /// content. The allocator must start above every non-zero legacy/new sequence.
-    pub(crate) fn migrate_legacy_identity(&mut self, session_id: &str, assigned_sequence: u64) {
+    /// content. Identity is intentionally sequence-derived rather than a digest
+    /// of free text: even a later projection bug therefore cannot turn the id
+    /// into an offline oracle for a secret-bearing legacy field. The allocator
+    /// must start above every non-zero legacy/new sequence.
+    pub(crate) fn migrate_legacy_identity(&mut self, _session_id: &str, assigned_sequence: u64) {
         if self.sequence == 0 {
             self.sequence = assigned_sequence.max(1);
         }
         if self.event_id.is_empty() {
-            let mut digest = Sha256::new();
-            digest.update(b"tirith-legacy-event-v1\0");
-            digest.update(session_id.as_bytes());
-            digest.update(b"\0");
-            digest.update(self.sequence.to_le_bytes());
-            digest.update(b"\0");
-            digest.update(self.timestamp.as_bytes());
-            digest.update(b"\0");
-            digest.update(self.kind.stable_tag().as_bytes());
-            digest.update(b"\0");
-            digest.update(self.rule_id.as_bytes());
-            for (key, value) in &self.metadata {
-                digest.update(b"\0");
-                digest.update(key.as_bytes());
-                digest.update(b"=");
-                digest.update(value.as_bytes());
-            }
-            self.event_id = format!("legacy-{:x}", digest.finalize());
+            self.event_id = format!("legacy-event-{}", self.sequence);
         }
     }
 
@@ -204,11 +401,139 @@ impl TypedEvent {
 /// Timestamp-free event derived during preparation. It cannot be mistaken for
 /// executed history; the execution gate supplies time, stable id, and sequence
 /// only while atomically promoting confirmed evidence.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EventPrototype {
     pub kind: EventKind,
     pub rule_id: String,
     pub metadata: BTreeMap<String, String>,
+}
+
+/// Serde-only compatibility shape for [`EventPrototype`]. Public field names
+/// remain stable while every trait boundary projects free text first.
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "EventPrototype")]
+struct EventPrototypeWire {
+    kind: EventKind,
+    rule_id: String,
+    metadata: BTreeMap<String, String>,
+}
+
+impl From<EventPrototypeWire> for EventPrototype {
+    fn from(wire: EventPrototypeWire) -> Self {
+        Self {
+            kind: wire.kind,
+            rule_id: wire.rule_id,
+            metadata: wire.metadata,
+        }
+    }
+}
+
+impl From<EventPrototype> for EventPrototypeWire {
+    fn from(prototype: EventPrototype) -> Self {
+        Self {
+            kind: prototype.kind,
+            rule_id: prototype.rule_id,
+            metadata: prototype.metadata,
+        }
+    }
+}
+
+fn privacy_project_event_prototype(prototype: &mut EventPrototype) {
+    prototype.rule_id =
+        privacy_project_bounded_text(&prototype.rule_id, MAX_TYPED_EVENT_RULE_ID_BYTES);
+
+    let mut projected = Vec::with_capacity(
+        prototype
+            .metadata
+            .len()
+            .min(MAX_TYPED_EVENT_METADATA_ENTRIES),
+    );
+    for (key, value) in std::mem::take(&mut prototype.metadata) {
+        let (key, value) = crate::redact::privacy_project_durable_pair(&key, &value);
+        let key = privacy_project_bounded_text(&key, MAX_TYPED_EVENT_METADATA_KEY_BYTES);
+        if key.is_empty() {
+            continue;
+        }
+        let value = if matches!(key.as_str(), "host" | "domain" | "rpc" | "rpc_url") {
+            privacy_project_endpoint(&value)
+        } else {
+            privacy_project_bounded_text(&value, MAX_TYPED_EVENT_METADATA_VALUE_BYTES)
+        };
+        projected.push((metadata_priority(&key), key, value));
+    }
+    projected.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, key, value) in projected.into_iter().take(MAX_TYPED_EVENT_METADATA_ENTRIES) {
+        prototype.metadata.insert(key, value);
+    }
+}
+
+impl Serialize for EventPrototype {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut projected = self.clone();
+        privacy_project_event_prototype(&mut projected);
+        EventPrototypeWire::from(projected).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EventPrototype {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = EventPrototypeWire::deserialize(deserializer)?;
+        let projected_rule_id = privacy_project_unbounded_text(&wire.rule_id);
+        let metadata_within_bounds = wire.metadata.iter().all(|(key, value)| {
+            let (projected_key, projected_value) =
+                crate::redact::privacy_project_durable_pair(key, value);
+            let projected_key = privacy_project_unbounded_text(&projected_key);
+            let projected_value = privacy_project_unbounded_text(&projected_value);
+            !key.is_empty()
+                && !projected_key.is_empty()
+                && fits_bound_or_privacy_projects(
+                    key,
+                    &projected_key,
+                    MAX_TYPED_EVENT_METADATA_KEY_BYTES,
+                )
+                && fits_bound_or_privacy_projects(
+                    value,
+                    &projected_value,
+                    MAX_TYPED_EVENT_METADATA_VALUE_BYTES,
+                )
+        });
+        if wire.rule_id.is_empty()
+            || projected_rule_id.is_empty()
+            || !fits_bound_or_privacy_projects(
+                &wire.rule_id,
+                &projected_rule_id,
+                MAX_TYPED_EVENT_RULE_ID_BYTES,
+            )
+            || wire.metadata.len() > MAX_TYPED_EVENT_METADATA_ENTRIES
+            || !metadata_within_bounds
+        {
+            return Err(D::Error::custom(
+                "event prototype exceeds its public semantic bounds",
+            ));
+        }
+        let mut prototype = Self::from(wire);
+        privacy_project_event_prototype(&mut prototype);
+        Ok(prototype)
+    }
+}
+
+impl fmt::Debug for EventPrototype {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut projected = self.clone();
+        privacy_project_event_prototype(&mut projected);
+        formatter
+            .debug_struct("EventPrototype")
+            .field("kind", &projected.kind)
+            .field("rule_id", &projected.rule_id)
+            .field("metadata", &projected.metadata)
+            .finish()
+    }
 }
 
 impl EventPrototype {
@@ -226,12 +551,13 @@ impl EventPrototype {
     }
 
     pub(crate) fn materialize(
-        self,
+        mut self,
         event_id: String,
         sequence: u64,
         timestamp: String,
         provenance: EventProvenance,
     ) -> TypedEvent {
+        privacy_project_event_prototype(&mut self);
         TypedEvent {
             event_id,
             sequence,
@@ -247,7 +573,7 @@ impl EventPrototype {
 /// A correlation that fired. Mirrors the shape of a [`crate::verdict::Finding`]
 /// closely enough that a consumer can surface it as one, but stays decoupled so
 /// this module never depends on the full finding/evidence machinery.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CorrelationHit {
     /// The dedicated correlation rule that matched.
     pub rule_id: RuleId,
@@ -261,10 +587,134 @@ pub struct CorrelationHit {
     /// hit while preserving an honest audit/presentation claim.
     pub provenance: EventProvenance,
     /// Stable signature identifying THIS specific match. New events contribute
-    /// their opaque id plus session sequence; legacy events fall back to their
-    /// timestamp. A session-level consumer uses it to de-duplicate the same
-    /// A-then-B pair while its source events remain live.
+    /// only a rebuilt, sequence-derived identity; legacy events fall back to a
+    /// valid projected timestamp. A session-level consumer uses it to
+    /// de-duplicate the same A-then-B pair while its source events remain live.
     pub signature: String,
+}
+
+const MAX_CORRELATION_TITLE_BYTES: usize = 160;
+const MAX_CORRELATION_DESCRIPTION_BYTES: usize = 1024;
+const MAX_CORRELATION_SIGNATURE_PARTS: usize = 8;
+
+/// Serde-only compatibility shape for [`CorrelationHit`]. The shape was not
+/// historically serializable, but keeping its public field names here makes the
+/// new safe trait boundary unsurprising and stable.
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "CorrelationHit")]
+struct CorrelationHitWire {
+    rule_id: RuleId,
+    severity: Severity,
+    title: String,
+    description: String,
+    provenance: EventProvenance,
+    signature: String,
+}
+
+impl From<CorrelationHitWire> for CorrelationHit {
+    fn from(wire: CorrelationHitWire) -> Self {
+        Self {
+            rule_id: wire.rule_id,
+            severity: wire.severity,
+            title: wire.title,
+            description: wire.description,
+            provenance: wire.provenance,
+            signature: wire.signature,
+        }
+    }
+}
+
+impl From<CorrelationHit> for CorrelationHitWire {
+    fn from(hit: CorrelationHit) -> Self {
+        Self {
+            rule_id: hit.rule_id,
+            severity: hit.severity,
+            title: hit.title,
+            description: hit.description,
+            provenance: hit.provenance,
+            signature: hit.signature,
+        }
+    }
+}
+
+fn canonical_correlation_timestamp(value: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc).to_rfc3339())
+}
+
+/// Rebuild a correlation signature exclusively from categorical rule identity,
+/// monotonic sequence numbers, and valid timestamps. In particular, an opaque
+/// event id is never copied: a public caller can directly construct a
+/// [`TypedEvent`], so treating that string as trusted would make the signature a
+/// secret or a stable digest oracle.
+fn privacy_project_correlation_signature(rule_id: RuleId, untrusted: &str) -> String {
+    let mut projected = format!("{rule_id:?}");
+    for part in untrusted
+        .split('|')
+        .skip(1)
+        .take(MAX_CORRELATION_SIGNATURE_PARTS)
+    {
+        let safe_part = if let Some(rest) = part.strip_prefix("e:") {
+            rest.rsplit_once(':')
+                .and_then(|(_, sequence)| sequence.parse::<u64>().ok())
+                .filter(|sequence| *sequence > 0)
+                .map(|sequence| format!("e:legacy-event-{sequence}:{sequence}"))
+        } else {
+            let timestamp = part.strip_prefix("t:").unwrap_or(part);
+            canonical_correlation_timestamp(timestamp).map(|timestamp| format!("t:{timestamp}"))
+        };
+        if let Some(safe_part) = safe_part {
+            projected.push('|');
+            projected.push_str(&safe_part);
+        }
+    }
+    projected
+}
+
+fn privacy_project_correlation_hit(hit: &mut CorrelationHit) {
+    hit.title = privacy_project_bounded_text(&hit.title, MAX_CORRELATION_TITLE_BYTES);
+    hit.description =
+        privacy_project_bounded_text(&hit.description, MAX_CORRELATION_DESCRIPTION_BYTES);
+    hit.signature = privacy_project_correlation_signature(hit.rule_id, &hit.signature);
+}
+
+impl Serialize for CorrelationHit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut projected = self.clone();
+        privacy_project_correlation_hit(&mut projected);
+        CorrelationHitWire::from(projected).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CorrelationHit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut hit = Self::from(CorrelationHitWire::deserialize(deserializer)?);
+        privacy_project_correlation_hit(&mut hit);
+        Ok(hit)
+    }
+}
+
+impl fmt::Debug for CorrelationHit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut projected = self.clone();
+        privacy_project_correlation_hit(&mut projected);
+        formatter
+            .debug_struct("CorrelationHit")
+            .field("rule_id", &projected.rule_id)
+            .field("severity", &projected.severity)
+            .field("title", &projected.title)
+            .field("description", &projected.description)
+            .field("provenance", &projected.provenance)
+            .field("signature", &projected.signature)
+            .finish()
+    }
 }
 
 /// Window, in seconds, for each correlation rule.
@@ -394,22 +844,52 @@ fn provenance_safe_description(
 /// instant). `events` need not be sorted. Returns one [`CorrelationHit`] per rule
 /// that matched (a rule fires at most once per call).
 pub fn correlate(events: &[TypedEvent], now_rfc3339: &str) -> Vec<CorrelationHit> {
+    // `TypedEvent` keeps public fields for compatibility, so callers can bypass
+    // its safe constructor/serde paths with a struct literal. Never match or
+    // render those borrowed values directly. The private clone is fully
+    // projected and receives a sequence-only identity before any description,
+    // ordering key, or signature is built.
+    let events: Vec<TypedEvent> = events
+        .iter()
+        .map(privacy_project_correlation_event)
+        .collect();
     let mut hits = Vec::new();
 
-    if let Some(hit) = secret_then_network(events, now_rfc3339) {
+    if let Some(hit) = secret_then_network(&events, now_rfc3339) {
         hits.push(hit);
     }
-    if let Some(hit) = dependency_change_then_network(events, now_rfc3339) {
+    if let Some(hit) = dependency_change_then_network(&events, now_rfc3339) {
         hits.push(hit);
     }
-    if let Some(hit) = delete_then_force_push(events, now_rfc3339) {
+    if let Some(hit) = delete_then_force_push(&events, now_rfc3339) {
         hits.push(hit);
     }
-    if let Some(hit) = mass_file_deletion(events, now_rfc3339) {
+    if let Some(hit) = mass_file_deletion(&events, now_rfc3339) {
         hits.push(hit);
+    }
+
+    // Keep this final projection even though each current constructor consumes
+    // only projected events. It makes the public return boundary mandatory if a
+    // future correlation adds free-form text without remembering to sanitize it.
+    for hit in &mut hits {
+        privacy_project_correlation_hit(hit);
     }
 
     hits
+}
+
+fn privacy_project_correlation_event(event: &TypedEvent) -> TypedEvent {
+    let mut projected = event.clone();
+    privacy_project_typed_event(&mut projected);
+    projected.event_id = if projected.sequence > 0 {
+        // This is the same sequence-only presentation identity used by session
+        // state projection. Matching that established grammar preserves exact
+        // de-dup markers across the subsequent serialization round-trip.
+        format!("legacy-event-{}", projected.sequence)
+    } else {
+        String::new()
+    };
+    projected
 }
 
 /// Find the earliest event of `kind` within the window, returning the event.
@@ -429,14 +909,55 @@ fn event_order(left: &TypedEvent, right: &TypedEvent) -> std::cmp::Ordering {
     if left.sequence > 0 && right.sequence > 0 {
         left.sequence
             .cmp(&right.sequence)
-            .then_with(|| left.event_id.cmp(&right.event_id))
+            .then_with(|| event_semantic_order(left, right))
     } else {
         // Mixed/legacy state has no durable order identity, so retain the old
-        // wall-clock ordering as a compatibility fallback.
+        // wall-clock ordering as a compatibility fallback. The projected
+        // semantic tail makes selection deterministic without trusting an
+        // attacker-controlled event id as a tie-breaker.
         left.timestamp
             .cmp(&right.timestamp)
             .then_with(|| left.sequence.cmp(&right.sequence))
-            .then_with(|| left.event_id.cmp(&right.event_id))
+            .then_with(|| event_semantic_order(left, right))
+    }
+}
+
+fn event_semantic_order(left: &TypedEvent, right: &TypedEvent) -> std::cmp::Ordering {
+    event_kind_rank(left.kind)
+        .cmp(&event_kind_rank(right.kind))
+        .then_with(|| {
+            event_provenance_rank(left.provenance).cmp(&event_provenance_rank(right.provenance))
+        })
+        .then_with(|| left.rule_id.cmp(&right.rule_id))
+        .then_with(|| left.metadata.cmp(&right.metadata))
+}
+
+fn event_kind_rank(kind: EventKind) -> u8 {
+    match kind {
+        EventKind::ProcessExec => 0,
+        EventKind::FileWrite => 1,
+        EventKind::FileDelete => 2,
+        EventKind::GitForcePush => 3,
+        EventKind::Network => 4,
+        EventKind::SecretWrite => 5,
+        EventKind::ShellPipe => 6,
+        EventKind::PackageInstall => 7,
+    }
+}
+
+fn event_provenance_rank(provenance: EventProvenance) -> u8 {
+    match provenance {
+        EventProvenance::Confirmed => 0,
+        EventProvenance::Unresolved => 1,
+        EventProvenance::Provisional => 2,
+    }
+}
+
+fn causally_after(candidate: &TypedEvent, prior: &TypedEvent) -> bool {
+    if candidate.sequence > 0 && prior.sequence > 0 {
+        candidate.sequence > prior.sequence
+    } else {
+        candidate.timestamp > prior.timestamp
     }
 }
 
@@ -458,16 +979,18 @@ fn any_after<'a>(
         .filter(|e| {
             e.kind == b_kind
                 && within_window(&e.timestamp, cutoff, now_rfc3339)
-                && event_order(e, after).is_gt()
+                && causally_after(e, after)
         })
         .min_by(|a, b| event_order(a, b))
 }
 
-/// Stable signature part for one source event. Prefer identity + sequence;
-/// timestamp-only events exist solely for mixed-version compatibility.
+/// Stable signature part for one source event. A non-zero session sequence is
+/// sufficient inside the owning session and cannot carry a raw or
+/// secret-derived opaque id; timestamp-only events exist solely for
+/// mixed-version compatibility.
 fn event_signature_part(event: &TypedEvent) -> String {
-    if !event.event_id.is_empty() && event.sequence > 0 {
-        format!("e:{}:{}", event.event_id, event.sequence)
+    if event.sequence > 0 {
+        format!("e:legacy-event-{}:{}", event.sequence, event.sequence)
     } else {
         format!("t:{}", event.timestamp)
     }
@@ -484,34 +1007,40 @@ fn signature(rule_id: RuleId, events: &[&TypedEvent]) -> String {
     sig
 }
 
-/// The `|`-delimited timestamp parts a signature was built from (everything after
-/// the leading `{rule_id:?}` segment). Every [`signature`] call site passes ONLY
-/// event timestamps as `parts`, so these are exactly the timestamps of the events
-/// that triggered the correlation. A session-level consumer uses this to expire a
-/// surfaced signature in lockstep with the event window: once NONE of these source
-/// timestamps remain among the live typed events, the correlation can never
-/// re-derive, so its dedup marker is safe to drop. Returns an empty iterator for a
-/// signature with no `|` (defensive; never produced by [`signature`]).
+/// The valid legacy timestamp parts in a signature. Current signatures prefer a
+/// sequence-derived `e:` part and therefore yield no timestamp here; pre-sequence
+/// signatures retain their RFC 3339 timestamp for mixed-version expiry. Invalid
+/// or attacker-provided free text is never returned.
 pub fn signature_event_timestamps(sig: &str) -> impl Iterator<Item = &str> {
     sig.split('|').skip(1).filter_map(|part| {
-        if let Some(timestamp) = part.strip_prefix("t:") {
-            Some(timestamp)
+        let timestamp = if let Some(timestamp) = part.strip_prefix("t:") {
+            timestamp
         } else if part.starts_with("e:") {
-            None
+            return None;
         } else {
             // Pre-stable-id signature: the part itself was a timestamp.
-            Some(part)
-        }
+            part
+        };
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .ok()
+            .map(|_| timestamp)
     })
 }
 
 /// Whether at least one source named by a correlation signature is still in the
-/// live event window. Understands current stable-id signatures and legacy
-/// timestamp signatures so mixed-version state expires markers correctly.
+/// live event window. Understands current sequence-derived signatures, old
+/// opaque-id-plus-sequence signatures, and legacy timestamp signatures so
+/// mixed-version state expires markers correctly. Old opaque ids are ignored:
+/// sequence allocation is unique within the owning session, while accepting the
+/// old id as an output/matching authority would preserve a secret-bearing value.
 pub fn signature_references_live_event(sig: &str, events: &[TypedEvent]) -> bool {
+    let events: Vec<TypedEvent> = events
+        .iter()
+        .map(privacy_project_correlation_event)
+        .collect();
     sig.split('|').skip(1).any(|part| {
         if let Some(rest) = part.strip_prefix("e:") {
-            let Some((event_id, sequence)) = rest.rsplit_once(':') else {
+            let Some((_, sequence)) = rest.rsplit_once(':') else {
                 return false;
             };
             let Ok(sequence) = sequence.parse::<u64>() else {
@@ -519,10 +1048,16 @@ pub fn signature_references_live_event(sig: &str, events: &[TypedEvent]) -> bool
             };
             events
                 .iter()
-                .any(|event| event.event_id == event_id && event.sequence == sequence)
+                .any(|event| event.sequence > 0 && event.sequence == sequence)
         } else {
             let timestamp = part.strip_prefix("t:").unwrap_or(part);
-            events.iter().any(|event| event.timestamp == timestamp)
+            let Some(timestamp) = canonical_correlation_timestamp(timestamp) else {
+                return false;
+            };
+            events.iter().any(|event| {
+                canonical_correlation_timestamp(&event.timestamp).as_deref()
+                    == Some(timestamp.as_str())
+            })
         }
     })
 }
@@ -1200,6 +1735,343 @@ mod tests {
         }))
         .expect("legacy typed event");
         assert_eq!(event.provenance, EventProvenance::Unresolved);
+    }
+
+    #[test]
+    fn typed_event_public_traits_project_the_complete_free_text_graph() {
+        let canary = format!("ghp_canary_{}", "A".repeat(30));
+        let mut event = TypedEvent::new(
+            "2026-01-01T00:00:00Z",
+            EventKind::FileWrite,
+            &format!("rule-{canary}"),
+        )
+        .with_meta("path", &format!("/wallets/{canary}/keypair.json"))
+        .with_meta(
+            "host",
+            &format!("https://operator:{canary}@rpc.example/private/{canary}"),
+        )
+        .with_meta(MANIFEST_FLAG_KEY, "true")
+        .with_meta(&format!("private-{canary}"), &format!("value-{canary}"));
+        event.event_id = format!("event-{canary}");
+        event.sequence = 7;
+
+        let serialized = serde_json::to_string(&event).expect("serialize projected event");
+        let debug = format!("{event:?}");
+        assert!(!serialized.contains(&canary), "{serialized}");
+        assert!(!debug.contains(&canary), "{debug}");
+
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("projected JSON");
+        assert_eq!(value["event_id"], PRIVACY_REDACTED_EVENT_ID);
+        assert_eq!(value["metadata"][MANIFEST_FLAG_KEY], "true");
+        assert!(value["metadata"]["path"]
+            .as_str()
+            .is_some_and(|path| path.contains("[REDACTED:tirith_canary]")));
+        assert_eq!(value["metadata"]["host"], "https://rpc.example");
+    }
+
+    #[test]
+    fn typed_event_deserialization_projects_and_bounds_hostile_metadata() {
+        let canary = format!("ghp_canary_{}", "B".repeat(30));
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "path".to_string(),
+            serde_json::Value::String(format!("/secrets/{canary}/wallet.dat")),
+        );
+        metadata.insert(
+            "host".to_string(),
+            serde_json::Value::String(format!(
+                "https://operator:{canary}@rpc.example/api/{canary}"
+            )),
+        );
+        metadata.insert(
+            MANIFEST_FLAG_KEY.to_string(),
+            serde_json::Value::String("true".to_string()),
+        );
+        for index in 0..64 {
+            metadata.insert(
+                format!("extension-{index:02}-{canary}"),
+                serde_json::Value::String(format!("value-{index}-{canary}")),
+            );
+        }
+        let oversized = serde_json::json!({
+            "event_id": format!("legacy-{canary}"),
+            "sequence": 9,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "kind": "network",
+            "rule_id": format!("network-{canary}"),
+            "metadata": metadata,
+        });
+        assert!(
+            serde_json::from_value::<TypedEvent>(oversized).is_err(),
+            "oversized untrusted metadata must be rejected before it can launder strict state"
+        );
+
+        let event: TypedEvent = serde_json::from_value(serde_json::json!({
+            "event_id": format!("legacy-{canary}"),
+            "sequence": 9,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "kind": "network",
+            "rule_id": format!("network-{canary}"),
+            "metadata": {
+                "path": format!("/secrets/{canary}/wallet.dat"),
+                "host": format!("https://operator:{canary}@rpc.example/api/{canary}"),
+                (MANIFEST_FLAG_KEY): "true",
+            },
+        }))
+        .expect("deserialize projected event");
+
+        assert_eq!(event.event_id, PRIVACY_REDACTED_EVENT_ID);
+        assert!(event.metadata.len() <= MAX_TYPED_EVENT_METADATA_ENTRIES);
+        assert_eq!(
+            event.metadata.get(MANIFEST_FLAG_KEY).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            event.metadata.get("host").map(String::as_str),
+            Some("https://rpc.example")
+        );
+        let serialized = serde_json::to_string(&event).expect("reserialize projected event");
+        let debug = format!("{event:?}");
+        assert!(!serialized.contains(&canary), "{serialized}");
+        assert!(!debug.contains(&canary), "{debug}");
+        assert!(event.metadata.keys().all(|key| key.len() <= 64));
+        assert!(event.metadata.values().all(|value| value.len() <= 512));
+    }
+
+    #[test]
+    fn typed_event_deserialization_rejects_projected_empty_rule_or_key() {
+        let base = serde_json::json!({
+            "event_id": "event-safe",
+            "sequence": 1,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "kind": "network",
+            "rule_id": "\u{1b}[31m",
+            "metadata": {"host": "rpc.example"},
+        });
+        assert!(serde_json::from_value::<TypedEvent>(base).is_err());
+
+        let control_key = serde_json::json!({
+            "event_id": "event-safe",
+            "sequence": 1,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "kind": "network",
+            "rule_id": "network_egress",
+            "metadata": {"\u{1b}[0m": "true"},
+        });
+        assert!(serde_json::from_value::<TypedEvent>(control_key).is_err());
+    }
+
+    #[test]
+    fn event_prototype_public_traits_project_direct_and_hostile_free_text() {
+        let contextual_canary = format!("ghp_canary_{}", "P".repeat(30));
+        let provider_token = "providerToken123456789";
+        let host = format!(
+            "https://operator:{contextual_canary}@mainnet.infura.io/v3/{provider_token}?token={contextual_canary}"
+        );
+        let prototype = EventPrototype {
+            kind: EventKind::Network,
+            rule_id: format!("network-{contextual_canary}"),
+            metadata: BTreeMap::from([
+                ("host".to_string(), host.clone()),
+                (
+                    "path".to_string(),
+                    format!("/wallet/{contextual_canary}/keypair.json"),
+                ),
+            ]),
+        };
+
+        let debug = format!("{prototype:?}");
+        let serialized = serde_json::to_string(&prototype).expect("safe prototype JSON");
+        for rejected in [&contextual_canary, provider_token] {
+            assert!(!debug.contains(rejected), "{debug}");
+            assert!(!serialized.contains(rejected), "{serialized}");
+        }
+        let wire: serde_json::Value =
+            serde_json::from_str(&serialized).expect("prototype wire field names");
+        assert_eq!(wire["kind"], "network");
+        assert!(wire.get("rule_id").is_some());
+        assert!(wire.get("metadata").is_some());
+        assert_eq!(wire["metadata"]["host"], "https://infura.io");
+
+        let deserialized: EventPrototype = serde_json::from_value(serde_json::json!({
+            "kind": "network",
+            "rule_id": format!("network-{contextual_canary}"),
+            "metadata": {
+                "host": host,
+                "path": format!("/wallet/{contextual_canary}/keypair.json"),
+            },
+        }))
+        .expect("hostile prototype is projected on deserialize");
+        let returned = format!("{deserialized:?}");
+        assert_eq!(deserialized.kind, EventKind::Network);
+        assert_eq!(
+            deserialized.metadata.get("host").map(String::as_str),
+            Some("https://infura.io")
+        );
+        assert!(!returned.contains(&contextual_canary), "{returned}");
+        assert!(!returned.contains(provider_token), "{returned}");
+    }
+
+    #[test]
+    fn correlation_projects_direct_inputs_before_returning_fields() {
+        let contextual_canary = format!("ghp_canary_{}", "C".repeat(30));
+        let provider_token = "providerToken123456789";
+        let opaque_secret_digest =
+            "a8624f5f421d627c6b65e30bc39d5f78f8e339603d4cfcb4f3c2d795397347bb";
+        let mut secret = ev(
+            "2026-01-01T00:00:00+00:00".to_string(),
+            EventKind::SecretWrite,
+        );
+        secret.event_id = format!("{opaque_secret_digest}-{contextual_canary}");
+        secret.sequence = 41;
+        secret.metadata.insert(
+            "path".to_string(),
+            format!("/wallet/{contextual_canary}/private-key.json"),
+        );
+        let mut network = ev("2026-01-01T00:00:05+00:00".to_string(), EventKind::Network);
+        network.event_id = format!("{provider_token}-{contextual_canary}");
+        network.sequence = 42;
+        network.metadata.insert(
+            "host".to_string(),
+            format!(
+                "https://operator:{contextual_canary}@mainnet.infura.io/v3/{provider_token}?api_key={contextual_canary}"
+            ),
+        );
+
+        let hit = correlate(
+            &[secret.clone(), network.clone()],
+            "2026-01-01T00:00:10+00:00",
+        )
+        .into_iter()
+        .find(|hit| hit.rule_id == RuleId::SecretWriteThenNetwork)
+        .expect("directly constructed events still correlate");
+
+        let returned_fields = format!("{}\n{}\n{}", hit.title, hit.description, hit.signature);
+        let debug = format!("{hit:?}");
+        let serialized = serde_json::to_string(&hit).expect("safe correlation JSON");
+        for rejected in [
+            contextual_canary.as_str(),
+            provider_token,
+            opaque_secret_digest,
+        ] {
+            assert!(!returned_fields.contains(rejected), "{returned_fields}");
+            assert!(!debug.contains(rejected), "{debug}");
+            assert!(!serialized.contains(rejected), "{serialized}");
+        }
+        assert!(hit.description.contains("https://infura.io"), "{hit:?}");
+        assert_eq!(
+            hit.signature,
+            "SecretWriteThenNetwork|e:legacy-event-41:41|e:legacy-event-42:42"
+        );
+        assert!(signature_references_live_event(
+            &hit.signature,
+            &[secret, network]
+        ));
+    }
+
+    #[test]
+    fn correlation_hit_traits_project_direct_construction_and_hostile_deserialize() {
+        let contextual_canary = format!("ghp_canary_{}", "H".repeat(30));
+        let provider_token = "providerToken123456789";
+        let direct = CorrelationHit {
+            rule_id: RuleId::SecretWriteThenNetwork,
+            severity: Severity::Critical,
+            title: format!("Correlation {contextual_canary}"),
+            description: format!(
+                "Network to https://mainnet.infura.io/v3/{provider_token}?token={contextual_canary}"
+            ),
+            provenance: EventProvenance::Confirmed,
+            signature: format!("attacker-prefix|e:{contextual_canary}:91|e:{provider_token}:92"),
+        };
+        let direct_debug = format!("{direct:?}");
+        let direct_json = serde_json::to_string(&direct).expect("direct correlation JSON");
+        for rejected in [&contextual_canary, provider_token] {
+            assert!(!direct_debug.contains(rejected), "{direct_debug}");
+            assert!(!direct_json.contains(rejected), "{direct_json}");
+        }
+
+        let deserialized: CorrelationHit = serde_json::from_value(serde_json::json!({
+            "rule_id": "secret_write_then_network",
+            "severity": "CRITICAL",
+            "title": format!("Correlation {contextual_canary}"),
+            "description": format!(
+                "Network to https://mainnet.infura.io/v3/{provider_token}?token={contextual_canary}"
+            ),
+            "provenance": "confirmed",
+            "signature": format!(
+                "wrong-rule|e:{contextual_canary}:91|t:2026-01-01T00:00:00Z|e:{provider_token}:92"
+            ),
+        }))
+        .expect("hostile correlation is projected on deserialize");
+        let returned_fields = format!(
+            "{}\n{}\n{}",
+            deserialized.title, deserialized.description, deserialized.signature
+        );
+        for rejected in [&contextual_canary, provider_token] {
+            assert!(!returned_fields.contains(rejected), "{returned_fields}");
+        }
+        assert_eq!(deserialized.rule_id, RuleId::SecretWriteThenNetwork);
+        assert!(deserialized
+            .signature
+            .starts_with("SecretWriteThenNetwork|e:legacy-event-91:91|t:"));
+        assert!(deserialized.signature.ends_with("|e:legacy-event-92:92"));
+
+        let wire = serde_json::to_value(&deserialized).expect("correlation wire fields");
+        for field in [
+            "rule_id",
+            "severity",
+            "title",
+            "description",
+            "provenance",
+            "signature",
+        ] {
+            assert!(wire.get(field).is_some(), "missing {field}: {wire}");
+        }
+    }
+
+    #[test]
+    fn direct_correlation_is_deterministic_without_event_id_tiebreakers() {
+        let contextual_canary = format!("ghp_canary_{}", "D".repeat(30));
+        let mut secret = ev(
+            "2026-01-01T00:00:00+00:00".to_string(),
+            EventKind::SecretWrite,
+        );
+        secret.event_id = format!("secret-{contextual_canary}");
+        secret.sequence = 71;
+
+        let mut early_network = ev("2026-01-01T00:00:05+00:00".to_string(), EventKind::Network);
+        early_network.event_id = format!("early-{contextual_canary}");
+        early_network.sequence = 72;
+        early_network.metadata.insert(
+            "host".to_string(),
+            "https://mainnet.infura.io/v3/firstProviderToken123".to_string(),
+        );
+
+        let mut late_network = ev("2026-01-01T00:00:06+00:00".to_string(), EventKind::Network);
+        late_network.event_id = format!("late-{contextual_canary}");
+        late_network.sequence = 73;
+        late_network.metadata.insert(
+            "host".to_string(),
+            "https://mainnet.infura.io/v3/secondProviderToken456".to_string(),
+        );
+
+        let first_order = vec![late_network.clone(), secret.clone(), early_network.clone()];
+        let reverse_order = vec![early_network, secret, late_network];
+        let select = |events: &[TypedEvent]| {
+            correlate(events, "2026-01-01T00:00:10+00:00")
+                .into_iter()
+                .find(|hit| hit.rule_id == RuleId::SecretWriteThenNetwork)
+                .expect("deterministic match")
+        };
+        let first = select(&first_order);
+        let second = select(&reverse_order);
+        assert_eq!(first.signature, second.signature);
+        assert_eq!(first.description, second.description);
+        assert_eq!(
+            first.signature,
+            "SecretWriteThenNetwork|e:legacy-event-71:71|e:legacy-event-72:72"
+        );
+        assert!(!format!("{first:?}").contains(&contextual_canary));
     }
 
     #[test]

@@ -10,7 +10,9 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-const RECEIPT_SCHEMA_VERSION: u32 = 1;
+const RECEIPT_SCHEMA_VERSION: u32 = 3;
+const LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION: u32 = 1;
+const LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION: u32 = 2;
 const HOOK_CAPABILITY_SCHEMA_VERSION: u32 = 3;
 const HOOK_CAPABILITY_ANCHOR_SCHEMA_VERSION: u32 = 1;
 const RECEIPT_FILE_CAP: u64 = 64 * 1024;
@@ -211,9 +213,25 @@ struct ShellReceipt {
     session_id: String,
     shell: ShellType,
     channel: ShellReceiptChannel,
-    cwd_sha256: String,
+    /// Schema-v1/v2 raw working-directory digest. Parsed only so an
+    /// authenticated legacy receipt can be retired; schema-v3 forbids it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwd_sha256: Option<String>,
+    /// Token-keyed exact working-directory binding. The bearer token is never
+    /// persisted, so this verifies context without leaving a stable raw-path
+    /// oracle. Required by schema-v3 and absent from legacy receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwd_binding_sha256: Option<String>,
     hook_instance_sha256: String,
+    /// Compatibility field name: schema-v2/v3 receipts store the mandatory
+    /// privacy-projected command digest.
     command_sha256: String,
+    /// Token-keyed binding of the exact raw command. The token is never
+    /// persisted, so this closes same-projection substitution without creating a
+    /// durable offline oracle. Optional only so schema-v1 receipts can be parsed
+    /// and retired; schema-v2/v3 validation requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_binding_sha256: Option<String>,
     command_redacted_preview: String,
     decision_binding_sha256: String,
     policy_basis_sha256: String,
@@ -379,30 +397,37 @@ fn current_hook_instance(
 }
 
 #[cfg(unix)]
-fn current_cwd_sha256() -> Result<String, String> {
+fn current_cwd_binding_sha256(token: &str) -> Result<String, String> {
     use std::os::unix::ffi::OsStrExt as _;
 
     let cwd = std::env::current_dir()
         .map_err(|error| format!("resolve shell receipt working directory: {error}"))?;
-    Ok(sha256_hex(cwd.as_os_str().as_bytes()))
+    Ok(secret_seal(
+        token,
+        "tirith-shell-cwd-binding-v1",
+        &serde_json::Value::String(hex::encode(cwd.as_os_str().as_bytes())),
+    ))
 }
 
 #[cfg(not(unix))]
-fn current_cwd_sha256() -> Result<String, String> {
+fn current_cwd_binding_sha256(token: &str) -> Result<String, String> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("resolve shell receipt working directory: {error}"))?;
-    Ok(sha256_hex(cwd.to_string_lossy().as_bytes()))
+    Ok(secret_seal(
+        token,
+        "tirith-shell-cwd-binding-v1",
+        &serde_json::Value::String(cwd.to_string_lossy().into_owned()),
+    ))
 }
 
 fn immutable_receipt_identity(receipt: &ShellReceipt) -> serde_json::Value {
-    serde_json::json!({
+    let mut identity = serde_json::json!({
         "schema_version": receipt.schema_version,
         "token_sha256": receipt.token_sha256,
         "execution_id": receipt.execution_id,
         "session_id": receipt.session_id,
         "shell": receipt.shell,
         "channel": receipt.channel,
-        "cwd_sha256": receipt.cwd_sha256,
         "hook_instance_sha256": receipt.hook_instance_sha256,
         "command_sha256": receipt.command_sha256,
         "command_redacted_preview": receipt.command_redacted_preview,
@@ -418,7 +443,29 @@ fn immutable_receipt_identity(receipt: &ShellReceipt) -> serde_json::Value {
         "strict_warn_override": receipt.strict_warn_override,
         "created_unix_ms": receipt.created_unix_ms,
         "expires_unix_ms": receipt.expires_unix_ms,
-    })
+    });
+    let identity_object = identity
+        .as_object_mut()
+        .expect("static receipt identity is an object");
+    if let Some(digest) = &receipt.cwd_sha256 {
+        identity_object.insert(
+            "cwd_sha256".to_string(),
+            serde_json::Value::String(digest.clone()),
+        );
+    }
+    if let Some(binding) = &receipt.cwd_binding_sha256 {
+        identity_object.insert(
+            "cwd_binding_sha256".to_string(),
+            serde_json::Value::String(binding.clone()),
+        );
+    }
+    if let Some(binding) = &receipt.command_binding_sha256 {
+        identity_object.insert(
+            "command_binding_sha256".to_string(),
+            serde_json::Value::String(binding.clone()),
+        );
+    }
+    identity
 }
 
 fn secret_seal(token: &str, domain: &str, value: &serde_json::Value) -> String {
@@ -1525,6 +1572,15 @@ where
         }
         let executable_identity = current_tirith_executable_identity()?;
         let directory = receipt_directory()?;
+        // A new shell registration is an early post-upgrade maintenance
+        // boundary. Cleanup can remove expired current receipts, but legacy
+        // receipts require bearer-token authentication and are retired only on
+        // direct access. Never nest the independent registries.
+        {
+            let receipt_registry = open_receipt_registry_lock(&directory)?;
+            cleanup_receipts_locked(&directory)?;
+            drop(receipt_registry);
+        }
         // Lock order is global registry -> process anchor. Holding the registry
         // through count, publication, and the issued-marker fsync turns the
         // capacity limit into a real bound across different shell processes.
@@ -1996,19 +2052,84 @@ fn validate_receipt(receipt: &ShellReceipt, token: &str) -> Result<(), String> {
     if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
         return Err("shell receipt schema is unsupported".to_string());
     }
+    validate_receipt_common(receipt, token)
+}
+
+/// Authenticate a privacy-unsafe receipt before deleting it.  Schema alone is
+/// attacker-mutable, so retirement is authorized only when the exact legacy
+/// immutable/state seals validate under the caller-supplied bearer token and
+/// the wire-shape matches the declared historical schema.
+fn validate_legacy_receipt_for_retirement(
+    receipt: &ShellReceipt,
+    token: &str,
+) -> Result<(), String> {
+    if !matches!(
+        receipt.schema_version,
+        LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION | LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION
+    ) {
+        return Err("shell receipt schema is not a supported legacy schema".to_string());
+    }
+    validate_receipt_common(receipt, token)
+}
+
+fn validate_receipt_common(receipt: &ShellReceipt, token: &str) -> Result<(), String> {
     if receipt.token_sha256 != token_sha256(token) {
         return Err("shell receipt token does not match its durable identity".to_string());
     }
     for (label, digest) in [
         ("immutable seal", receipt.immutable_seal_sha256.as_str()),
         ("state seal", receipt.state_seal_sha256.as_str()),
-        ("working directory", receipt.cwd_sha256.as_str()),
         ("hook instance", receipt.hook_instance_sha256.as_str()),
     ] {
         if !digest_is_valid(digest) {
             return Err(format!("shell receipt {label} digest is invalid"));
         }
     }
+    match receipt.schema_version {
+        RECEIPT_SCHEMA_VERSION => {
+            if receipt.cwd_sha256.is_some() {
+                return Err("current shell receipt retains a legacy raw-cwd digest".to_string());
+            }
+            let cwd_binding = receipt.cwd_binding_sha256.as_deref().ok_or_else(|| {
+                "shell receipt lacks its exact working-directory binding".to_string()
+            })?;
+            if !digest_is_valid(cwd_binding) {
+                return Err("shell receipt working-directory binding is invalid".to_string());
+            }
+        }
+        LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION | LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION => {
+            if receipt.cwd_binding_sha256.is_some() {
+                return Err("legacy shell receipt contains a future cwd binding".to_string());
+            }
+            let cwd_digest = receipt
+                .cwd_sha256
+                .as_deref()
+                .ok_or_else(|| "legacy shell receipt lacks its raw-cwd digest".to_string())?;
+            if !digest_is_valid(cwd_digest) {
+                return Err("legacy shell receipt working-directory digest is invalid".to_string());
+            }
+        }
+        _ => return Err("shell receipt schema is unsupported".to_string()),
+    }
+    match receipt.schema_version {
+        LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION => {
+            if receipt.command_binding_sha256.is_some() {
+                return Err("schema-v1 shell receipt contains a future command binding".to_string());
+            }
+        }
+        LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION | RECEIPT_SCHEMA_VERSION => {
+            let command_binding = receipt
+                .command_binding_sha256
+                .as_deref()
+                .ok_or_else(|| "shell receipt lacks its exact command binding".to_string())?;
+            if !digest_is_valid(command_binding) {
+                return Err("shell receipt command binding digest is invalid".to_string());
+            }
+        }
+        _ => return Err("shell receipt schema is unsupported".to_string()),
+    }
+    // This is the authentication boundary for legacy retirement. Keep it
+    // before all semantic acceptance and, critically, before every unlink.
     validate_receipt_seals(receipt, token)?;
     validate_stable_id("shell receipt execution", &receipt.execution_id)?;
     if crate::session_warnings::session_state_path(&receipt.session_id).is_none() {
@@ -2166,10 +2287,72 @@ fn validate_receipt_state(receipt: &ShellReceipt, token: &str) -> Result<(), Str
     }
 }
 
+fn legacy_receipt_retirement_error(state: &ReceiptState) -> String {
+    if matches!(state, ReceiptState::Consuming { .. }) {
+        "legacy shell receipt was retired for privacy with an indeterminate consumption outcome; never replay it automatically"
+            .to_string()
+    } else {
+        "legacy shell receipt was retired for privacy; rerun the command through fresh analysis"
+            .to_string()
+    }
+}
+
+#[cfg(unix)]
+fn remove_receipt_artifacts_locked(
+    receipt_path: &Path,
+    receipt_identity: FileIdentity,
+    lock_path: &Path,
+    lock_file: &File,
+) -> Result<(), String> {
+    if path_identity(receipt_path, "shell receipt cleanup")? != receipt_identity {
+        return Err("shell receipt changed before cleanup".to_string());
+    }
+    let lock_identity = secure_regular_identity(lock_file, "shell receipt cleanup lock")?;
+    if path_identity(lock_path, "shell receipt cleanup lock")? != lock_identity {
+        return Err("shell receipt lock changed before cleanup".to_string());
+    }
+    // JSON first: a crash can leave only an inert lock, which the existing
+    // orphan cleanup removes later. Removing the lock first could expose a live
+    // privacy-unsafe receipt without serialization.
+    fs::remove_file(receipt_path)
+        .map_err(|error| format!("remove privacy-unsafe shell receipt: {error}"))?;
+    crate::util::fsync_parent_dir(receipt_path)
+        .map_err(|error| format!("sync privacy-unsafe shell-receipt removal: {error}"))?;
+    if path_identity(lock_path, "shell receipt cleanup lock")? != lock_identity {
+        return Err("shell receipt lock changed during cleanup".to_string());
+    }
+    fs::remove_file(lock_path)
+        .map_err(|error| format!("remove privacy-unsafe shell receipt lock: {error}"))?;
+    crate::util::fsync_parent_dir(lock_path)
+        .map_err(|error| format!("sync privacy-unsafe shell-receipt lock removal: {error}"))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn remove_receipt_artifacts_locked(
+    _receipt_path: &Path,
+    _receipt_identity: FileIdentity,
+    _lock_path: &Path,
+    _lock_file: &File,
+) -> Result<(), String> {
+    Err("strict shell execution receipts are unsupported on this platform".to_string())
+}
+
 fn lock_receipt(token: &str) -> Result<LockedReceipt, String> {
     let (_, receipt_path, lock_path) = receipt_paths(token)?;
     let lock_file = open_receipt_lock(&lock_path, RECEIPT_LOCK_TIMEOUT, false)?;
     let (receipt, receipt_identity) = read_receipt(&receipt_path)?;
+    if matches!(
+        receipt.schema_version,
+        LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION | LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION
+    ) {
+        validate_legacy_receipt_for_retirement(&receipt, token).map_err(|error| {
+            format!("legacy shell receipt failed authentication and was preserved: {error}")
+        })?;
+        let retirement_error = legacy_receipt_retirement_error(&receipt.state);
+        remove_receipt_artifacts_locked(&receipt_path, receipt_identity, &lock_path, &lock_file)?;
+        return Err(retirement_error);
+    }
     validate_receipt(&receipt, token)?;
     if path_identity(&lock_path, "shell receipt lock")?
         != secure_regular_identity(&lock_file, "shell receipt lock")?
@@ -2258,9 +2441,10 @@ fn publish_receipt(
 
 fn receipt_binding_sha256(
     draft: &ExecutionDraft,
+    command_sha256: &str,
     channel: ShellReceiptChannel,
     strict_warn_override: bool,
-    cwd_sha256: &str,
+    cwd_binding_sha256: &str,
     hook_instance_sha256: &str,
 ) -> Result<String, String> {
     let caller = match draft.caller {
@@ -2274,12 +2458,12 @@ fn receipt_binding_sha256(
     let identity = serde_json::json!({
         "schema": RECEIPT_SCHEMA_VERSION,
         "session_id": draft.session_id,
-        "command_sha256": draft.command_sha256,
+        "command_sha256": command_sha256,
         "command_redacted_preview": draft.command_redacted_preview,
         "caller": caller,
         "shell": draft.shell,
         "channel": channel,
-        "cwd_sha256": cwd_sha256,
+        "cwd_binding_sha256": cwd_binding_sha256,
         "hook_instance_sha256": hook_instance_sha256,
         "strict_warn_override": strict_warn_override,
         "retention_duration_ms": draft
@@ -2310,15 +2494,7 @@ fn receipt_binding_sha256(
 /// a fresh local analysis, and timing measurements are nondeterministic while
 /// every security-relevant verdict field must remain byte-for-byte semantic.
 fn semantic_verdict_sha256(verdict: &Verdict) -> Result<String, String> {
-    let mut value = serde_json::to_value(verdict)
-        .map_err(|error| format!("serialize shell receipt verdict identity: {error}"))?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| "serialized shell receipt verdict is not an object".to_string())?;
-    object.remove("timings_ms");
-    Ok(sha256_hex(
-        crate::audit::canonical_json_for_hash(&value).as_bytes(),
-    ))
+    super::privacy_projected_verdict_sha256(verdict, false)
 }
 
 fn interaction_proof_sha256(token: &str, receipt: &ShellReceipt, tag: &str) -> String {
@@ -2358,9 +2534,10 @@ fn current_session_matches(receipt: &ShellReceipt) -> bool {
 
 fn ensure_live(
     receipt: &ShellReceipt,
+    token: &str,
     expected_channel: ShellReceiptChannel,
 ) -> Result<(), String> {
-    ensure_receipt_context(receipt, expected_channel)?;
+    ensure_receipt_context(receipt, token, expected_channel)?;
     if unix_time_ms()? >= receipt.expires_unix_ms {
         return Err("shell execution receipt expired".to_string());
     }
@@ -2369,6 +2546,7 @@ fn ensure_live(
 
 fn ensure_receipt_context(
     receipt: &ShellReceipt,
+    token: &str,
     expected_channel: ShellReceiptChannel,
 ) -> Result<(), String> {
     expected_channel.hook_family()?;
@@ -2378,7 +2556,11 @@ fn ensure_receipt_context(
     if receipt.channel != expected_channel {
         return Err("shell execution receipt belongs to a different hook channel".to_string());
     }
-    if current_cwd_sha256()? != receipt.cwd_sha256 {
+    let expected_cwd_binding = receipt
+        .cwd_binding_sha256
+        .as_deref()
+        .ok_or_else(|| "shell receipt lacks its exact working-directory binding".to_string())?;
+    if current_cwd_binding_sha256(token)? != expected_cwd_binding {
         return Err("shell execution receipt belongs to a different working directory".to_string());
     }
     let instance = current_hook_instance(expected_channel, &receipt.session_id)?;
@@ -2393,6 +2575,19 @@ fn receipt_is_cleanup_eligible(
     now: u64,
     terminal_retention_ms: u64,
 ) -> bool {
+    // Legacy seals are token-keyed, while background cleanup has only the
+    // token hash encoded in the filename. Never delete an unauthenticated
+    // legacy payload merely because its mutable schema field says "old";
+    // direct bearer-token access performs authenticated retirement instead.
+    if matches!(
+        receipt.schema_version,
+        LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION | LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION
+    ) {
+        return false;
+    }
+    if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
+        return false;
+    }
     match receipt.state {
         ReceiptState::Prepared | ReceiptState::Armed { .. } => receipt.expires_unix_ms <= now,
         ReceiptState::Consuming { .. } => {
@@ -2505,17 +2700,7 @@ fn cleanup_receipts_locked(directory: &Path) -> Result<(), String> {
         {
             continue;
         }
-        fs::remove_file(&path).map_err(|error| format!("remove stale shell receipt: {error}"))?;
-        crate::util::fsync_parent_dir(&path)
-            .map_err(|error| format!("sync stale shell receipt removal: {error}"))?;
-        let lock_identity = secure_regular_identity(&lock, "shell receipt cleanup lock")?;
-        if path_identity(&lock_path, "shell receipt cleanup lock")? != lock_identity {
-            return Err("shell receipt cleanup lock changed while held".to_string());
-        }
-        fs::remove_file(&lock_path)
-            .map_err(|error| format!("remove stale shell receipt lock: {error}"))?;
-        crate::util::fsync_parent_dir(&lock_path)
-            .map_err(|error| format!("sync stale shell receipt lock removal: {error}"))?;
+        remove_receipt_artifacts_locked(&path, current_identity, &lock_path, &lock)?;
         drop(lock);
     }
 
@@ -2672,20 +2857,26 @@ pub fn create_shell_execution_receipt(
         let expires_unix_ms = now
             .checked_add(ttl_ms)
             .ok_or_else(|| "shell receipt expiry overflowed".to_string())?;
-        let hook_instance = current_hook_instance(channel, &prepared.draft.session_id)?;
-        let hook_instance_sha256 = sha256_hex(hook_instance.as_bytes());
-        let cwd_sha256 = current_cwd_sha256()?;
-        let binding = receipt_binding_sha256(
-            &prepared.draft,
-            channel,
-            strict_warn_override,
-            &cwd_sha256,
-            &hook_instance_sha256,
-        )?;
         let mut random = [0u8; 32];
         getrandom::fill(&mut random)
             .map_err(|error| format!("generate shell receipt token: {error}"))?;
         let token = hex_lower(&random);
+        let hook_instance = current_hook_instance(channel, &prepared.draft.session_id)?;
+        let hook_instance_sha256 = sha256_hex(hook_instance.as_bytes());
+        let cwd_binding_sha256 = current_cwd_binding_sha256(&token)?;
+        let command_binding_sha256 = secret_seal(
+            &token,
+            "tirith-shell-command-binding-v1",
+            &serde_json::Value::String(prepared.draft.command.clone()),
+        );
+        let binding = receipt_binding_sha256(
+            &prepared.draft,
+            &prepared.draft.command_sha256,
+            channel,
+            strict_warn_override,
+            &cwd_binding_sha256,
+            &hook_instance_sha256,
+        )?;
         let (_, receipt_path, lock_path) = receipt_paths(&token)?;
         let lock_file = open_receipt_lock(&lock_path, RECEIPT_LOCK_TIMEOUT, true)?;
         let mut receipt = ShellReceipt {
@@ -2697,9 +2888,11 @@ pub fn create_shell_execution_receipt(
             session_id: prepared.draft.session_id.clone(),
             shell: prepared.draft.shell,
             channel,
-            cwd_sha256,
+            cwd_sha256: None,
+            cwd_binding_sha256: Some(cwd_binding_sha256),
             hook_instance_sha256,
             command_sha256: prepared.draft.command_sha256.clone(),
+            command_binding_sha256: Some(command_binding_sha256),
             command_redacted_preview: prepared.draft.command_redacted_preview.clone(),
             decision_binding_sha256: binding,
             policy_basis_sha256: prepared.draft.decision.policy_basis_sha256.clone(),
@@ -2745,7 +2938,7 @@ pub fn shell_execution_receipt_context(
     expected_channel: ShellReceiptChannel,
 ) -> Result<ShellReceiptContext, String> {
     let locked = lock_receipt(token)?;
-    ensure_live(&locked.receipt, expected_channel)?;
+    ensure_live(&locked.receipt, token, expected_channel)?;
     match locked.receipt.state {
         ReceiptState::Armed { .. } | ReceiptState::Consuming { .. } => Ok(ShellReceiptContext {
             session_id: locked.receipt.session_id.clone(),
@@ -2772,7 +2965,7 @@ pub fn arm_shell_execution_receipt(
     warn_acknowledged: bool,
 ) -> Result<(), String> {
     let mut locked = lock_receipt(token)?;
-    ensure_live(&locked.receipt, expected_channel)?;
+    ensure_live(&locked.receipt, token, expected_channel)?;
     if locked.receipt.action == Action::Block && !locked.receipt.bypass_honored {
         return Err("blocked shell decision cannot be armed for execution".to_string());
     }
@@ -2869,7 +3062,7 @@ pub fn discard_shell_execution_receipt(
     let mut locked = lock_receipt(token)?;
     // Discard is non-authorizing cleanup. Permit a context-bound expired
     // Prepared/Armed receipt to become terminal instead of wedging its hook.
-    ensure_receipt_context(&locked.receipt, expected_channel)?;
+    ensure_receipt_context(&locked.receipt, token, expected_channel)?;
     match locked.receipt.state {
         ReceiptState::Prepared | ReceiptState::Armed { .. } => {
             locked.receipt.state = ReceiptState::Discarded {
@@ -2904,7 +3097,7 @@ pub fn reconcile_shell_execution_receipt(
     // Reconciliation never authorizes a transition. It may inspect an expired
     // Consuming/Committed receipt through the bounded recovery-retention window
     // so a lost acknowledgement cannot wedge the shell forever.
-    ensure_receipt_context(&locked.receipt, expected_channel)?;
+    ensure_receipt_context(&locked.receipt, token, expected_channel)?;
     let (
         observation,
         evidence_id,
@@ -2982,7 +3175,7 @@ pub fn consume_shell_execution_receipt(
     lock_timeout: Duration,
 ) -> Result<PromotionOutcome, String> {
     let mut locked = lock_receipt(token)?;
-    ensure_live(&locked.receipt, expected_channel)?;
+    ensure_live(&locked.receipt, token, expected_channel)?;
     let (approval, warn_ack_proof_sha256, prior_consuming) = match &locked.receipt.state {
         ReceiptState::Armed {
             approval,
@@ -3081,10 +3274,19 @@ pub fn consume_shell_execution_receipt(
     {
         return Err("fresh shell decision does not match the receipt context".to_string());
     }
-    if sha256_hex(command.as_bytes()) != locked.receipt.command_sha256
-        || prepared.draft.command_sha256() != locked.receipt.command_sha256
-        || prepared.draft.command() != command
-    {
+    let expected_command_binding = locked
+        .receipt
+        .command_binding_sha256
+        .as_ref()
+        .ok_or_else(|| "shell receipt lacks its exact command binding".to_string())?;
+    let command_matches = secret_seal(
+        token,
+        "tirith-shell-command-binding-v1",
+        &serde_json::Value::String(command.to_string()),
+    ) == *expected_command_binding
+        && super::privacy_projected_command_sha256(command) == locked.receipt.command_sha256
+        && prepared.draft.command_sha256() == locked.receipt.command_sha256;
+    if !command_matches || prepared.draft.command() != command {
         return Err("shell command changed after receipt preparation".to_string());
     }
     if locked.receipt.strict_warn_override
@@ -3097,9 +3299,14 @@ pub fn consume_shell_execution_receipt(
     }
     let binding = receipt_binding_sha256(
         &prepared.draft,
+        &locked.receipt.command_sha256,
         locked.receipt.channel,
         locked.receipt.strict_warn_override,
-        &locked.receipt.cwd_sha256,
+        locked
+            .receipt
+            .cwd_binding_sha256
+            .as_deref()
+            .ok_or_else(|| "shell receipt lacks its exact working-directory binding".to_string())?,
         &locked.receipt.hook_instance_sha256,
     )?;
     if binding != locked.receipt.decision_binding_sha256
@@ -3109,7 +3316,6 @@ pub fn consume_shell_execution_receipt(
     {
         return Err("fresh shell decision changed after receipt preparation".to_string());
     }
-
     prepared
         .draft
         .replace_execution_id(locked.receipt.execution_id.clone())?;
@@ -3354,11 +3560,71 @@ mod tests {
         receipt_paths(token).expect("receipt paths").1
     }
 
+    fn receipt_lock_path(token: &str) -> PathBuf {
+        receipt_paths(token).expect("receipt paths").2
+    }
+
     fn replace_receipt_bytes(token: &str, bytes: &[u8]) {
         let path = receipt_path(token);
         fs::write(&path, bytes).expect("replace shell receipt bytes");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .expect("restore private receipt mode");
+    }
+
+    fn legacy_raw_cwd_sha256() -> String {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        sha256_hex(
+            std::env::current_dir()
+                .expect("legacy cwd")
+                .as_os_str()
+                .as_bytes(),
+        )
+    }
+
+    fn rewrite_as_legacy_v1(token: &str, raw_command_sha256: &str) {
+        let mut receipt: ShellReceipt = serde_json::from_slice(
+            &fs::read(receipt_path(token)).expect("read current receipt fixture"),
+        )
+        .expect("parse current receipt fixture");
+        receipt.schema_version = LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION;
+        receipt.cwd_sha256 = Some(legacy_raw_cwd_sha256());
+        receipt.cwd_binding_sha256 = None;
+        receipt.command_sha256 = raw_command_sha256.to_string();
+        receipt.command_binding_sha256 = None;
+        refresh_receipt_seals(&mut receipt, token).expect("seal authenticated schema-v1 receipt");
+        replace_receipt_bytes(
+            token,
+            &serde_json::to_vec(&receipt).expect("serialize legacy receipt fixture"),
+        );
+    }
+
+    fn rewrite_as_legacy_v2(token: &str) {
+        let mut receipt: ShellReceipt = serde_json::from_slice(
+            &fs::read(receipt_path(token)).expect("read current receipt fixture"),
+        )
+        .expect("parse current receipt fixture");
+        receipt.schema_version = LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION;
+        receipt.cwd_sha256 = Some(legacy_raw_cwd_sha256());
+        receipt.cwd_binding_sha256 = None;
+        refresh_receipt_seals(&mut receipt, token).expect("seal authenticated schema-v2 receipt");
+        replace_receipt_bytes(
+            token,
+            &serde_json::to_vec(&receipt).expect("serialize schema-v2 receipt fixture"),
+        );
+    }
+
+    fn strict_generation(session_id: &str) -> u64 {
+        let state = crate::session_warnings::session_state_path(session_id).expect("state path");
+        let (file, ledger, _, _, _) = open_or_initialize_strict_state(
+            state.parent().expect("state parent"),
+            session_id,
+            None,
+            None,
+        )
+        .expect("strict receipt-test ledger");
+        drop(file);
+        ledger.generation
     }
 
     fn active_capability_paths() -> (PathBuf, PathBuf) {
@@ -3441,6 +3707,7 @@ mod tests {
             let command = "curl -H 'Authorization: Bearer sk-proj-receipt-secret-never-persist' https://example.invalid/really-long-private-command";
             let policy = Policy::default();
             let verdict = allow_verdict();
+            let raw_command_sha256 = sha256_hex(command.as_bytes());
             let token = create(&verdict, &policy, command, session_id, false);
             let durable = fs::read_to_string(receipt_path(&token)).expect("read receipt JSON");
             assert!(
@@ -3450,6 +3717,14 @@ mod tests {
             assert!(
                 !durable.contains(&token),
                 "bearer token reached durable receipt"
+            );
+            assert!(
+                !durable.contains("sk-proj-receipt"),
+                "a stable secret prefix reached durable receipt: {durable}"
+            );
+            assert!(
+                !durable.contains(&raw_command_sha256),
+                "the raw-command digest remained an offline oracle: {durable}"
             );
 
             arm_allow(&token);
@@ -4219,6 +4494,13 @@ mod tests {
     fn invalid_bearer_token_creates_no_lock_file() {
         isolated_state(|_, _| {
             let directory = receipt_directory().expect("receipt directory");
+            let durable_names = || {
+                fs::read_dir(&directory)
+                    .expect("read receipt directory")
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
             assert_eq!(
                 fs::read_dir(&directory)
                     .expect("empty receipt directory")
@@ -4230,22 +4512,22 @@ mod tests {
                     .count(),
                 0
             );
+            // Shell registration intentionally creates persistent global
+            // registry/capability lock inodes before this test reaches the
+            // invalid receipt bearer. Snapshot that authorized baseline: the
+            // invariant is that the invalid token creates NOTHING new, not that
+            // the shared receipt directory contains no protocol locks at all.
+            let before = durable_names();
             let error = shell_execution_receipt_context(
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 ShellReceiptChannel::Zsh,
             )
             .expect_err("uppercase bearer must be rejected");
             assert!(error.contains("lowercase hex"), "unexpected error: {error}");
-            assert!(
-                fs::read_dir(&directory)
-                    .expect("receipt directory after invalid bearer")
-                    .filter_map(Result::ok)
-                    .all(|entry| {
-                        let name = entry.file_name();
-                        let name = name.to_string_lossy();
-                        !name.ends_with(".lock") || name.contains(".capability.lock")
-                    }),
-                "invalid bearer created a durable lock"
+            assert_eq!(
+                durable_names(),
+                before,
+                "invalid bearer changed the durable receipt directory"
             );
         });
     }
@@ -4280,6 +4562,254 @@ mod tests {
             assert!(
                 error.contains("command changed"),
                 "unexpected error: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn token_keyed_binding_rejects_same_projection_different_secret() {
+        isolated_state(|_, session_id| {
+            let first_secret = format!("0x{}", "11".repeat(32));
+            let second_secret = format!("0x{}", "22".repeat(32));
+            let original = format!("PRIVATE_KEY={first_secret} cast block-number");
+            let changed = format!("PRIVATE_KEY={second_secret} cast block-number");
+            assert_eq!(
+                crate::execution_state::privacy_projected_command_sha256(&original),
+                crate::execution_state::privacy_projected_command_sha256(&changed),
+                "fixture must differ only inside the privacy projection"
+            );
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, &original, session_id, false);
+            arm_allow(&token);
+            let fresh = prepare(&verdict, &policy, &changed, session_id);
+            let error = consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                &changed,
+                fresh,
+                Duration::from_secs(1),
+            )
+            .expect_err("a different raw secret must not consume the receipt");
+            assert!(error.contains("command changed"), "{error}");
+            let durable = fs::read_to_string(receipt_path(&token)).expect("durable receipt");
+            assert!(!durable.contains(&first_secret), "{durable}");
+            assert!(
+                !durable.contains(&sha256_hex(original.as_bytes())),
+                "{durable}"
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_v1_armed_receipt_is_deleted_without_promotion() {
+        isolated_state(|_, session_id| {
+            let secret = format!("0x{}", "11".repeat(32));
+            let command = format!("PRIVATE_KEY={secret} cast block-number");
+            let raw_digest = sha256_hex(command.as_bytes());
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, &command, session_id, false);
+            arm_allow(&token);
+            rewrite_as_legacy_v1(&token, &raw_digest);
+            let durable = fs::read_to_string(receipt_path(&token)).expect("legacy armed receipt");
+            assert!(
+                durable.contains(&raw_digest),
+                "legacy fixture lacks raw digest"
+            );
+            let generation = strict_generation(session_id);
+            let fresh = prepare(&verdict, &policy, &command, session_id);
+            let error = consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                &command,
+                fresh,
+                Duration::from_secs(1),
+            )
+            .expect_err("legacy armed receipt must retire, not execute");
+            assert!(
+                error.contains("rerun the command through fresh analysis"),
+                "{error}"
+            );
+            assert!(
+                !receipt_path(&token).exists(),
+                "legacy receipt JSON survived"
+            );
+            assert!(
+                !receipt_lock_path(&token).exists(),
+                "legacy receipt lock survived"
+            );
+            assert_eq!(
+                strict_generation(session_id),
+                generation,
+                "legacy receipt promoted"
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_v1_consuming_receipt_is_deleted_as_indeterminate_without_promotion() {
+        isolated_state(|_, session_id| {
+            let secret = format!("0x{}", "22".repeat(32));
+            let command = format!("PRIVATE_KEY={secret} cast block-number");
+            let raw_digest = sha256_hex(command.as_bytes());
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, &command, session_id, false);
+            arm_allow(&token);
+            let mut prepared = prepare(&verdict, &policy, &command, session_id);
+            force_consuming(&token, &mut prepared);
+            rewrite_as_legacy_v1(&token, &raw_digest);
+            let durable =
+                fs::read_to_string(receipt_path(&token)).expect("legacy consuming receipt");
+            assert!(
+                durable.contains(&raw_digest),
+                "legacy fixture lacks raw digest"
+            );
+            let generation = strict_generation(session_id);
+            let error = reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1),
+            )
+            .expect_err("legacy consuming outcome must be terminally indeterminate");
+            assert!(
+                error.contains("indeterminate consumption outcome"),
+                "{error}"
+            );
+            assert!(error.contains("never replay"), "{error}");
+            assert!(
+                !receipt_path(&token).exists(),
+                "legacy receipt JSON survived"
+            );
+            assert!(
+                !receipt_lock_path(&token).exists(),
+                "legacy receipt lock survived"
+            );
+            assert_eq!(
+                strict_generation(session_id),
+                generation,
+                "legacy receipt promoted"
+            );
+        });
+    }
+
+    #[test]
+    fn authenticated_schema_v2_raw_cwd_receipt_is_retired() {
+        isolated_state(|_, session_id| {
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, "printf legacy-v2", session_id, false);
+            arm_allow(&token);
+            let raw_cwd_digest = legacy_raw_cwd_sha256();
+            rewrite_as_legacy_v2(&token);
+            let durable = fs::read_to_string(receipt_path(&token)).expect("schema-v2 receipt");
+            assert!(
+                durable.contains(&raw_cwd_digest),
+                "legacy fixture lacks cwd oracle"
+            );
+
+            let error = shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh)
+                .expect_err("authenticated schema-v2 receipt must retire");
+            assert!(error.contains("retired for privacy"), "{error}");
+            assert!(!receipt_path(&token).exists());
+            assert!(!receipt_lock_path(&token).exists());
+        });
+    }
+
+    #[test]
+    fn downgraded_current_receipt_failing_legacy_seal_is_preserved() {
+        isolated_state(|_, session_id| {
+            let command = "printf downgrade-attack";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            let mut receipt: ShellReceipt = serde_json::from_slice(
+                &fs::read(receipt_path(&token)).expect("read current receipt"),
+            )
+            .expect("parse current receipt");
+            receipt.schema_version = LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION;
+            receipt.cwd_sha256 = Some(legacy_raw_cwd_sha256());
+            receipt.cwd_binding_sha256 = None;
+            receipt.command_sha256 = sha256_hex(command.as_bytes());
+            receipt.command_binding_sha256 = None;
+            // Deliberately do not refresh either token-keyed seal: changing a
+            // mutable discriminator and making the JSON look historical must
+            // never authorize deletion.
+            replace_receipt_bytes(
+                &token,
+                &serde_json::to_vec(&receipt).expect("serialize downgraded receipt"),
+            );
+
+            let error = shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh)
+                .expect_err("downgraded current receipt must fail authentication");
+            assert!(error.contains("failed authentication"), "{error}");
+            assert!(
+                receipt_path(&token).exists(),
+                "tampered receipt was deleted"
+            );
+            assert!(
+                receipt_lock_path(&token).exists(),
+                "tampered receipt lock was deleted"
+            );
+        });
+    }
+
+    #[test]
+    fn current_receipts_use_token_keyed_non_oracle_cwd_bindings() {
+        isolated_state(|_, session_id| {
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let first = create(&verdict, &policy, "printf cwd-one", session_id, false);
+            let second = create(&verdict, &policy, "printf cwd-two", session_id, false);
+            let read = |token: &str| -> ShellReceipt {
+                serde_json::from_slice(&fs::read(receipt_path(token)).expect("read receipt"))
+                    .expect("parse receipt")
+            };
+            let first_receipt = read(&first);
+            let second_receipt = read(&second);
+            assert!(first_receipt.cwd_sha256.is_none());
+            assert!(second_receipt.cwd_sha256.is_none());
+            assert_ne!(
+                first_receipt.cwd_binding_sha256, second_receipt.cwd_binding_sha256,
+                "the same cwd must not have a stable durable verifier"
+            );
+            let raw_cwd_digest = legacy_raw_cwd_sha256();
+            for token in [&first, &second] {
+                let durable = fs::read_to_string(receipt_path(token)).expect("durable receipt");
+                assert!(!durable.contains(&raw_cwd_digest), "{durable}");
+                assert!(!durable.contains("\"cwd_sha256\""), "{durable}");
+                assert!(durable.contains("\"cwd_binding_sha256\""), "{durable}");
+            }
+        });
+    }
+
+    #[test]
+    fn schema_v3_receipt_without_exact_binding_fails_closed_without_retirement() {
+        isolated_state(|_, session_id| {
+            let command = "printf missing-binding";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            let mut receipt: ShellReceipt = serde_json::from_slice(
+                &fs::read(receipt_path(&token)).expect("read current receipt"),
+            )
+            .expect("parse current receipt");
+            receipt.command_binding_sha256 = None;
+            replace_receipt_bytes(
+                &token,
+                &serde_json::to_vec(&receipt).expect("serialize missing-binding receipt"),
+            );
+            let error = shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh)
+                .expect_err("schema-v3 receipt without binding must fail closed");
+            assert!(error.contains("lacks its exact command binding"), "{error}");
+            assert!(
+                receipt_path(&token).exists(),
+                "current corrupt receipt was downgraded"
+            );
+            assert!(
+                receipt_lock_path(&token).exists(),
+                "current corrupt lock was deleted"
             );
         });
     }
@@ -4348,7 +4878,21 @@ mod tests {
             let command = "printf blocked";
             let policy = Policy::default();
             let verdict = block_verdict_with_allow_fallback();
-            let token = create(&verdict, &policy, command, session_id, false);
+            let prepared = prepare(&verdict, &policy, command, session_id);
+            assert_eq!(prepared.draft.decision.action, Action::Block);
+            assert!(
+                !prepared.draft.decision.requires_approval,
+                "final approval normalization must make Block terminal"
+            );
+            assert!(prepared.draft.effective_verdict.approval_fallback.is_none());
+            let token = create_shell_execution_receipt(
+                &prepared,
+                ShellReceiptChannel::Zsh,
+                true,
+                false,
+                Duration::from_secs(60),
+            )
+            .expect("create normalized block receipt");
 
             for outcome in [
                 ShellApprovalOutcome::Granted,

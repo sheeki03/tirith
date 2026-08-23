@@ -470,30 +470,56 @@ blocklist: []
 /// `overwrite = false` gives create-new semantics: anything already at `path`
 /// (including a dangling symlink the old `exists()` check could not see) fails
 /// with `AlreadyExists` instead of being clobbered or followed.
-fn create_policy_contained(
+pub(super) fn create_policy_contained(
     root: &std::path::Path,
     path: &std::path::Path,
     content: &str,
 ) -> Result<(), String> {
-    let contained =
-        tirith_core::util::ContainedAtomicFile::prepare(root, path, true).map_err(|e| {
-            format!(
-                "refusing to create {} through a symlinked or escaping path: {e}",
-                path.display()
-            )
-        })?;
-    contained
-        .write_atomic(content.as_bytes(), false)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                format!(
+    // Preserve the create-new UX before attempting to parse the policy that is
+    // already present.  In particular, a malformed existing policy must be
+    // reported as an existing destination, not allowed to turn this no-clobber
+    // operation into a task-gate error.  This is only an early diagnostic: the
+    // retained publisher below still enforces create-new atomically, closing a
+    // race where the destination appears after this check.
+    match tirith_core::util::ContainedAtomicFile::prepare(root, path, false) {
+        Ok(destination) => match destination.read_capped(0) {
+            Ok(_)
+            | Err(tirith_core::util::OpenRegularError::TooLarge)
+            | Err(tirith_core::util::OpenRegularError::NotRegularFile) => {
+                return Err(format!(
                     "policy already exists at {} — not overwriting",
                     path.display()
-                )
-            } else {
-                format!("failed to write {}: {e}", path.display())
+                ));
             }
-        })
+            Err(tirith_core::util::OpenRegularError::NotFound) => {}
+            Err(tirith_core::util::OpenRegularError::Io(error)) => {
+                return Err(format!("failed to inspect {}: {error}", path.display()));
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("failed to inspect {}: {error}", path.display())),
+    }
+
+    let policy = tirith_core::policy::Policy::discover_local_only(root.to_str());
+    super::write_config_file_permitted_with_parent_creation(
+        root,
+        path,
+        content.as_bytes(),
+        false,
+        &policy,
+        true,
+        true,
+    )
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "policy already exists at {} — not overwriting",
+                path.display()
+            )
+        } else {
+            format!("failed to write {}: {e}", path.display())
+        }
+    })
 }
 
 /// Findings hidden by the current paranoia level.

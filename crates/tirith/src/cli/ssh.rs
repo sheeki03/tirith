@@ -168,17 +168,12 @@ const MAX_POLICY_SIZE: u64 = 1024 * 1024;
 /// `cli::exec::update_policy_guard_key`): the policy path is a repo-discovered
 /// `<repo>/.tirith/policy.yaml` (or `<config>/tirith/policy.yaml`), so an
 /// attacker who can plant a symlink there could otherwise redirect this
-/// truncating write onto an arbitrary file. Three layers defend the write:
-///   * `canonical_within` against the GRANDPARENT (`<repo>` / `<config>`)
-///     canonicalizes through the containing `.tirith` directory, so a SYMLINKED
-///     `.tirith` that escapes the repo is rejected before any read or write.
-///   * the read uses `O_NOFOLLOW` + a size cap (refuses a symlinked final
-///     component, bounds a hostile target) and ABORTS on any read error other
-///     than genuine absence (the old `unwrap_or_default` turned an unreadable
-///     policy into an empty one and then truncated it); and
-///   * the write uses `O_NOFOLLOW` + `0600` (refuses a symlinked final
-///     component), then the parent dir is fsync'd.
-fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+/// truncating write onto an arbitrary file. A retained directory capability is
+/// traversed from the trusted grandparent without following repo-controlled
+/// symlinks, then used for both the bounded read and atomic 0600 publication.
+/// Any read error other than genuine absence aborts rather than becoming an
+/// empty baseline.
+pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
     // The containment root is the grandparent: <repo>/.tirith/policy.yaml →
     // <repo>, <config>/tirith/policy.yaml → <config>. A policy path is always
     // at least three components deep; refuse a malformed shallower path rather
@@ -190,29 +185,27 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         )
     })?;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Containment FIRST: reject a symlinked containing directory (e.g. a
-    // planted `.tirith` symlink) that escapes the trusted root before we read
-    // or write through it. `O_NOFOLLOW` on the final component alone misses
-    // this, because the OS still follows an intermediate-dir symlink during
-    // path resolution. Done after create_dir_all so a legit first-run `.tirith`
-    // exists to canonicalize.
-    if !tirith_core::util::canonical_within(path, containment_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to write policy through a symlinked path",
-        ));
-    }
+    let policy = Policy::discover_local_only(containment_root.to_str());
+    let contained = super::prepare_config_destination_permitted(
+        containment_root,
+        path,
+        true,
+        &policy,
+        true,
+        true,
+    )?;
 
     // Read the current contents WITHOUT following a symlinked final component.
     // An absent file is an empty baseline (the key is then appended); any other
     // read failure (symlinked, oversized, I/O) aborts rather than clobbering
     // blind.
-    let existing = match tirith_core::util::read_text_no_follow_capped(path, MAX_POLICY_SIZE) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+    let existing = match contained.read_capped(MAX_POLICY_SIZE) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "policy file is not UTF-8; refusing to rewrite it",
+            )
+        })?,
         Err(tirith_core::util::OpenRegularError::NotFound) => String::new(),
         Err(e) => return Err(open_regular_io_error(e)),
     };
@@ -239,12 +232,15 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
         out.push('\n');
     }
 
-    // Truncating write that REFUSES to follow a symlinked final component
-    // (0600), then fsync the parent dir so the update is crash-durable.
-    let mut f = tirith_core::util::open_write_no_follow(path, true)?;
-    f.write_all(out.as_bytes())?;
-    tirith_core::util::fsync_parent_dir_logged(path, "ssh guard policy update");
-    Ok(())
+    super::write_prepared_config_file_permitted(
+        containment_root,
+        path,
+        contained,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
 }
 
 /// Map an `OpenRegularError` from the no-follow policy read onto an `io::Error`
@@ -313,24 +309,24 @@ pub fn label(host: &str, criticality: &str, scope: LabelScope, json: bool) -> i3
         },
     };
 
-    // Write the RAW host input first (the runtime rule looks up the literal
-    // typed string); add the resolved form below when it differs, so labeling an
-    // alias also matches the DNS name. Same flat-YAML format as context labels.
-    if let Err(e) = policy_mod::write_context_label(&target_path, host, criticality) {
+    // Commit the RAW input and resolved form together so an alias can never be
+    // left half-labeled if authorization or publication fails.
+    let mut labels = vec![(host, criticality)];
+    if resolved_host != host {
+        labels.push((resolved_host.as_str(), criticality));
+    }
+    let policy = Policy::discover_local_only(
+        target_path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::to_str),
+    );
+    if let Err(e) = super::write_context_labels_permitted(&target_path, &labels, &policy) {
         eprintln!(
             "tirith ssh label: failed to write {}: {e}",
             target_path.display()
         );
         return 1;
-    }
-    if resolved_host != host {
-        if let Err(e) = policy_mod::write_context_label(&target_path, &resolved_host, criticality) {
-            eprintln!(
-                "tirith ssh label: failed to write resolved-host entry to {}: {e}",
-                target_path.display()
-            );
-            return 1;
-        }
     }
 
     if json {

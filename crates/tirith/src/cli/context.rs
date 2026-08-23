@@ -268,20 +268,26 @@ fn resolve_policy_path_for_guard() -> Result<PathBuf, i32> {
 ///
 /// Write-side hardening (repo-0371): the discovered path may be a
 /// repository-controlled policy, so this writer
-/// - refuses to read or write through a symlinked final component,
-/// - for repo-scope policies, enforces that the canonicalized parent directory
-///   stays inside the canonical repository root (no intermediate-symlink
-///   escape),
+/// - binds the containing directory and target through retained capabilities,
+///   refusing symlinked/reparse directory or final components,
 /// - never treats an unreadable / non-UTF-8 existing file as empty input
 ///   (which previously clobbered the target with only the guard key), and
 /// - publishes through a 0600 atomic temp-file rename instead of truncating
 ///   in place.
-fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    reject_symlinked_policy_target(path)?;
-    let existing = read_existing_policy_for_guard(path)?;
+pub(super) fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Result<()> {
+    let root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "policy path has no containing directory",
+            )
+        })?;
+    let policy = Policy::discover_local_only(root.to_str());
+    let contained =
+        super::prepare_config_destination_permitted(root, path, true, &policy, true, true)?;
+    let existing = read_existing_policy_for_guard(&contained, path)?;
     let new_line = format!("context_guard_enabled: {enable}");
 
     let mut out = String::new();
@@ -312,7 +318,15 @@ fn update_policy_guard_key(path: &std::path::Path, enable: bool) -> std::io::Res
     // `context_guard_enabled` must equal the requested value.
     verify_context_guard_effective(&out, enable)?;
 
-    tirith_core::util::write_file_atomic_0600(path, out.as_bytes())
+    super::write_prepared_config_file_permitted(
+        root,
+        path,
+        contained,
+        out.as_bytes(),
+        true,
+        &policy,
+        true,
+    )
 }
 
 /// Parse the candidate policy and require the top-level `context_guard_enabled`
@@ -338,56 +352,16 @@ fn verify_context_guard_effective(candidate: &str, expected: bool) -> std::io::R
     }
 }
 
-/// Refuse to operate on a policy path whose final component is a symlink, and
-/// — for policies discovered inside a repository — whose canonicalized parent
-/// directory escapes the canonical repository root (intermediate-symlink
-/// escape). A malicious checkout must not turn `tirith context guard on|off`
-/// into an arbitrary-file rewrite.
-fn reject_symlinked_policy_target(path: &std::path::Path) -> std::io::Result<()> {
-    // Final component: never follow a symlink for read-modify-write.
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing to update {}: policy path is a symlink",
-                    path.display()
-                ),
-            ));
-        }
-    }
-
-    // Intermediate components: if this policy lives under a repository root,
-    // its canonicalized directory must remain inside the canonical repo root.
-    if let Some(repo_root) = policy_mod::find_repo_root(None) {
-        if path.starts_with(&repo_root) {
-            let canon_root = repo_root.canonicalize().unwrap_or(repo_root.clone());
-            if let Some(parent) = path.parent() {
-                if parent.exists() {
-                    let canon_parent = parent.canonicalize()?;
-                    if !canon_parent.starts_with(&canon_root) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!(
-                                "refusing to update {}: policy directory escapes the repository root",
-                                path.display()
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Read the existing policy text for a guard update. A missing file is empty
 /// input; ANY other failure (unreadable, non-UTF-8, symlink, oversized) is an
 /// error — never silently treat the target as empty and clobber it.
-fn read_existing_policy_for_guard(path: &std::path::Path) -> std::io::Result<String> {
+fn read_existing_policy_for_guard(
+    contained: &tirith_core::util::ContainedAtomicFile,
+    path: &std::path::Path,
+) -> std::io::Result<String> {
     use tirith_core::util::OpenRegularError;
     const GUARD_POLICY_READ_CAP: u64 = 1024 * 1024;
-    match tirith_core::util::read_text_no_follow_capped(path, GUARD_POLICY_READ_CAP) {
+    match contained.read_capped(GUARD_POLICY_READ_CAP) {
         Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -462,7 +436,15 @@ pub fn label(label_key: &str, criticality: &str, scope: LabelScope, json: bool) 
         },
     };
 
-    if let Err(e) = policy_mod::write_context_label(&target_path, label_key, criticality) {
+    let policy = Policy::discover_local_only(
+        target_path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::to_str),
+    );
+    if let Err(e) =
+        super::write_context_labels_permitted(&target_path, &[(label_key, criticality)], &policy)
+    {
         eprintln!(
             "tirith context label: failed to write {}: {e}",
             target_path.display()
@@ -586,7 +568,7 @@ mod tests {
         let link = dir.path().join("policy.yaml");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let err = update_policy_guard_key(&link, true).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "do not touch\n");
     }
 

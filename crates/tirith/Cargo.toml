@@ -19,6 +19,10 @@ path = "src/main.rs"
 name = "tirith-threatdb-compile"
 path = "src/bin/tirith_threatdb_compile.rs"
 
+[[bin]]
+name = "tirith-package-approval-authority"
+path = "src/bin/tirith_package_approval_authority.rs"
+
 [features]
 # Compatibility-only pass-through retained for downstream build invocations.
 # The core lookup is unconditional so ordinary, no-default-feature, Nix, and
@@ -147,10 +151,11 @@ windows = { version = "0.62", default-features = false, features = [
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"
 section = "utils"
-depends = "ca-certificates"
+depends = "ca-certificates, sudo"
 # Paths relative to crates/tirith/ (NOT repo root)
 assets = [
     ["target/release/tirith", "usr/bin/", "755"],
+    ["target/release/tirith-package-approval-authority", "usr/libexec/", "755"],
     # Shell hooks
     ["assets/shell/tirith.sh", "usr/share/tirith/shell/", "644"],
     ["assets/shell/lib/zsh-hook.zsh", "usr/share/tirith/shell/lib/", "644"],

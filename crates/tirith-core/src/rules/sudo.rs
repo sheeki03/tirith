@@ -8,7 +8,7 @@
 //! 1. **`SudoShellSpawn`** — `sudo sh|bash|…` opens a root shell tirith can't see
 //!    (it intercepts the local shell, not a nested process).
 //! 2. **`SudoEnvPreserveSensitive`** — `sudo -E` / `--preserve-env` with a sensitive
-//!    env var (`sensitive_env.toml`) set; the value becomes readable via
+//!    env var (central sensitive-asset registry) set; the value becomes readable via
 //!    `/proc/<pid>/environ` (exfil-by-misconfiguration).
 //! 3. **`SudoTeeSystemFile`** — `… | sudo tee <system-path>` (`/etc/…`,
 //!    `/usr/local/bin/…`, `/lib/systemd/…`, `/etc/cron*`). Shape-specific:
@@ -24,6 +24,7 @@
 use crate::policy::Policy;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
+use std::collections::BTreeMap;
 
 /// Run the sudo-escalation rules. Returns at most a small handful of
 /// findings — most invocations fire at most one of the five.
@@ -32,7 +33,19 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     let mut findings: Vec<Finding> = Vec::new();
 
     for seg in &segments {
-        if let Some(parsed) = parse_sudo_invocation(seg, shell) {
+        let (parsed, wrapper_budget_exhausted) = parse_sudo_invocation_with_status(seg, shell);
+        if wrapper_budget_exhausted {
+            findings.push(make_finding(
+                RuleId::AnalysisIncomplete,
+                Severity::High,
+                "Sudo wrapper analysis exceeded its safety budget".to_string(),
+                "Tirith could not prove the effective command within the bounded wrapper depth; the invocation is blocked rather than treated as clean.".to_string(),
+                input,
+                seg,
+            ));
+            continue;
+        }
+        if let Some(parsed) = parsed {
             findings.extend(rules_for_segment(&parsed, input, seg, shell));
         }
     }
@@ -45,22 +58,30 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     // into `sudo_require_reason`. Consulted lazily so the no-finding fast path skips disk.
     if policy.sudo_require_reason {
         if let Some(_session) = crate::sudo_session::read_active_session() {
-            for f in &mut findings {
-                if f.severity == Severity::High {
-                    f.severity = Severity::Medium;
-                }
-            }
+            apply_active_sudo_session_downgrade(&mut findings);
         }
     }
 
     findings
 }
 
+/// A tagged sudo session may acknowledge the five concrete sudo hazards, but
+/// it cannot acknowledge analysis that never completed. Keeping
+/// `AnalysisIncomplete` at High is the fail-closed boundary for wrapper-depth
+/// exhaustion; downgrading it would turn the 32/33-wrapper block into a warn.
+fn apply_active_sudo_session_downgrade(findings: &mut [Finding]) {
+    for finding in findings {
+        if finding.severity == Severity::High && finding.rule_id != RuleId::AnalysisIncomplete {
+            finding.severity = Severity::Medium;
+        }
+    }
+}
+
 /// A parsed `sudo` invocation: the inner command (post-flag-strip) plus observed flags.
 struct SudoParsed {
     /// `-E` / `--preserve-env` (no value): preserve ALL. Distinct from `--preserve-env=LIST`.
     preserve_env_all: bool,
-    /// Specific vars from `--preserve-env=A,B,C` (matched case-insensitively).
+    /// Specific POSIX variable names from `--preserve-env=A,B,C`.
     preserve_env_vars: Vec<String>,
     /// `sudo -s` / `--shell` or `sudo -i` / `--login`, including bundled
     /// short flags. These modes spawn a privileged shell even with no command.
@@ -69,13 +90,104 @@ struct SudoParsed {
     inner_cmd: String,
     /// Inner command's args (raw, quotes preserved).
     inner_args: Vec<String>,
+    /// Command-scoped environment assignments from wrappers before `sudo`.
+    /// Values are used transiently for value-aware RPC classification and are
+    /// never copied into findings.
+    wrapper_env: BTreeMap<String, ScopedEnvValue>,
+    /// Whether an inner `env -i` / `--ignore-environment` cleared ambient state.
+    clear_ambient: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ScopedEnvValue {
+    Set(String),
+    Unset,
+}
+
+#[derive(Default)]
+struct EnvWrapperState {
+    clear_ambient: bool,
+    values: BTreeMap<String, ScopedEnvValue>,
+}
+
+/// Insert an assignment that executes closer to sudo than the current map.
+/// POSIX variable identity is exact: aliases such as `RPC_URL` and `rpcUrl`
+/// remain separate slots. Canonical folding is only for classifying each slot.
+fn insert_closer_env_assignment(
+    env: &mut BTreeMap<String, ScopedEnvValue>,
+    name: String,
+    value: ScopedEnvValue,
+) {
+    env.insert(name, value);
+}
+
+/// Merge an outer scope without replacing the same exact POSIX name already
+/// supplied by a scope closer to the executed sudo command.
+fn insert_outer_env_assignment(
+    env: &mut BTreeMap<String, ScopedEnvValue>,
+    name: String,
+    value: ScopedEnvValue,
+) {
+    env.entry(name).or_insert(value);
+}
+
+fn merge_outer_env_state(parsed: &mut SudoParsed, outer: EnvWrapperState) {
+    // An inner clear executes after the outer environment was established, so
+    // no outer value survives it. Otherwise exact names merge without replacing
+    // the value supplied closest to sudo.
+    if !parsed.clear_ambient {
+        for (name, value) in outer.values {
+            insert_outer_env_assignment(&mut parsed.wrapper_env, name, value);
+        }
+    }
+    parsed.clear_ambient |= outer.clear_ambient;
 }
 
 /// Parse a segment as a `sudo` invocation when its leader (after `env`-wrapper
 /// resolution) is `sudo`. `None` for non-sudo segments.
+#[cfg(test)]
 fn parse_sudo_invocation(seg: &tokenize::Segment, shell: ShellType) -> Option<SudoParsed> {
-    let cmd = seg.command.as_deref()?;
-    resolve_wrapped_sudo(cmd, &seg.args, shell, 32)
+    parse_sudo_invocation_with_status(seg, shell).0
+}
+
+fn parse_sudo_invocation_with_status(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> (Option<SudoParsed>, bool) {
+    let Some(cmd) = seg.command.as_deref() else {
+        return (None, false);
+    };
+    let mut wrapper_budget_exhausted = false;
+    let Some(mut parsed) =
+        resolve_wrapped_sudo(cmd, &seg.args, shell, 32, &mut wrapper_budget_exhausted)
+    else {
+        return (None, wrapper_budget_exhausted);
+    };
+    // Shared tokenizer facts preserve command-scoped assignments that precede
+    // the effective leader (`RPC_URL=... sudo -E cmd`). They take precedence
+    // over the ambient process environment for value-aware RPC decisions.
+    let mut leading_env = BTreeMap::new();
+    for (name, value) in tokenize::leading_env_assignments(&seg.raw) {
+        let assignment =
+            crate::rules::command::normalize_shell_token(&format!("{name}={value}"), shell);
+        if let Some((name, value)) = assignment.split_once('=') {
+            // All assignments in this one shell prefix are peers, so ordinary
+            // source-order (last assignment wins) semantics apply here.
+            insert_closer_env_assignment(
+                &mut leading_env,
+                name.to_string(),
+                ScopedEnvValue::Set(value.to_string()),
+            );
+        }
+    }
+    // An env/sudo-scoped assignment executes closer to sudo than a leading
+    // shell assignment and therefore keeps precedence over this outer scope.
+    if !parsed.clear_ambient {
+        for (name, value) in leading_env {
+            insert_outer_env_assignment(&mut parsed.wrapper_env, name, value);
+        }
+    }
+    (Some(parsed), wrapper_budget_exhausted)
 }
 
 /// Resolve `env`/`command`/`time`/`exec`/`nohup` chains until the effective
@@ -85,29 +197,54 @@ fn resolve_wrapped_sudo(
     args: &[String],
     shell: ShellType,
     depth: usize,
+    wrapper_budget_exhausted: &mut bool,
 ) -> Option<SudoParsed> {
+    let leader = command_basename(command, shell);
     if depth == 0 {
+        *wrapper_budget_exhausted = leader == "sudo"
+            || args
+                .iter()
+                .any(|arg| command_basename(arg, shell) == "sudo");
         return None;
     }
-    let leader = command_basename(command, shell);
     if leader == "sudo" {
         return Some(parse_sudo_args(args, shell));
     }
+    if leader == "env" {
+        let (next, next_args, wrapper_env) =
+            unwrap_env(args, shell, depth, wrapper_budget_exhausted)?;
+        let mut parsed = resolve_wrapped_sudo(
+            &next,
+            &next_args,
+            shell,
+            depth - 1,
+            wrapper_budget_exhausted,
+        )?;
+        merge_outer_env_state(&mut parsed, wrapper_env);
+        return Some(parsed);
+    }
     let (next, next_args) = match leader.as_str() {
-        "env" => unwrap_env(args, shell, depth)?,
         "command" | "exec" | "nohup" => unwrap_command_wrapper(&leader, args)?,
         "time" => unwrap_time(args)?,
         _ => return None,
     };
-    resolve_wrapped_sudo(&next, &next_args, shell, depth - 1)
+    resolve_wrapped_sudo(
+        &next,
+        &next_args,
+        shell,
+        depth - 1,
+        wrapper_budget_exhausted,
+    )
 }
 
 fn unwrap_env(
     args: &[String],
     shell: ShellType,
     split_depth: usize,
-) -> Option<(String, Vec<String>)> {
+    wrapper_budget_exhausted: &mut bool,
+) -> Option<(String, Vec<String>, EnvWrapperState)> {
     let mut idx = 0;
+    let mut wrapper_env = EnvWrapperState::default();
     while idx < args.len() {
         let arg = crate::rules::command::normalize_shell_token(&args[idx], shell);
         if arg == "--" {
@@ -115,28 +252,77 @@ fn unwrap_env(
             break;
         }
         if tokenize::is_env_assignment(&arg) {
+            if let Some((name, value)) = arg.split_once('=') {
+                insert_closer_env_assignment(
+                    &mut wrapper_env.values,
+                    name.to_string(),
+                    ScopedEnvValue::Set(value.to_string()),
+                );
+            }
             idx += 1;
             continue;
         }
         if arg == "--split-string" {
-            return unwrap_env_split_string(
+            let (next, next_args, mut split_env) = unwrap_env_split_string(
                 args.get(idx + 1)?,
                 &args[idx + 2..],
                 shell,
                 split_depth,
                 false,
-            );
+                wrapper_budget_exhausted,
+            )?;
+            if !split_env.clear_ambient {
+                for (name, value) in wrapper_env.values {
+                    insert_outer_env_assignment(&mut split_env.values, name, value);
+                }
+            }
+            split_env.clear_ambient |= wrapper_env.clear_ambient;
+            return Some((next, next_args, split_env));
         }
         if let Some(payload) = arg.strip_prefix("--split-string=") {
-            return unwrap_env_split_string(payload, &args[idx + 1..], shell, split_depth, true);
+            let (next, next_args, mut split_env) = unwrap_env_split_string(
+                payload,
+                &args[idx + 1..],
+                shell,
+                split_depth,
+                true,
+                wrapper_budget_exhausted,
+            )?;
+            if !split_env.clear_ambient {
+                for (name, value) in wrapper_env.values {
+                    insert_outer_env_assignment(&mut split_env.values, name, value);
+                }
+            }
+            split_env.clear_ambient |= wrapper_env.clear_ambient;
+            return Some((next, next_args, split_env));
         }
-        if matches!(arg.as_str(), "--unset" | "--chdir" | "--argv0") {
+        if arg == "--ignore-environment" {
+            wrapper_env.clear_ambient = true;
+            wrapper_env.values.clear();
+            idx += 1;
+            continue;
+        }
+        if arg == "--unset" {
+            let name = crate::rules::command::normalize_shell_token(args.get(idx + 1)?, shell);
+            insert_closer_env_assignment(&mut wrapper_env.values, name, ScopedEnvValue::Unset);
+            idx += 2;
+            continue;
+        }
+        if let Some(name) = arg.strip_prefix("--unset=") {
+            insert_closer_env_assignment(
+                &mut wrapper_env.values,
+                name.to_string(),
+                ScopedEnvValue::Unset,
+            );
+            idx += 1;
+            continue;
+        }
+        if matches!(arg.as_str(), "--chdir" | "--argv0") {
             args.get(idx + 1)?;
             idx += 2;
             continue;
         }
-        if arg.starts_with("--unset=") || arg.starts_with("--chdir=") || arg.starts_with("--argv0=")
-        {
+        if arg.starts_with("--chdir=") || arg.starts_with("--argv0=") {
             idx += 1;
             continue;
         }
@@ -145,7 +331,33 @@ fn unwrap_env(
             let mut consumed_value = false;
             for (offset, flag) in cluster.char_indices() {
                 let suffix = &cluster[offset + flag.len_utf8()..];
-                if matches!(flag, 'u' | 'C' | 'a') {
+                if flag == 'i' {
+                    wrapper_env.clear_ambient = true;
+                    wrapper_env.values.clear();
+                    continue;
+                }
+                if flag == 'u' {
+                    let name = if suffix.is_empty() {
+                        args.get(idx + 1).map(|value| {
+                            crate::rules::command::normalize_shell_token(value, shell)
+                        })?
+                    } else {
+                        suffix.to_string()
+                    };
+                    insert_closer_env_assignment(
+                        &mut wrapper_env.values,
+                        name,
+                        ScopedEnvValue::Unset,
+                    );
+                    if suffix.is_empty() {
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                    consumed_value = true;
+                    break;
+                }
+                if matches!(flag, 'C' | 'a') {
                     if suffix.is_empty() {
                         args.get(idx + 1)?;
                         idx += 2;
@@ -161,13 +373,21 @@ fn unwrap_env(
                     } else {
                         (suffix, &args[idx + 1..])
                     };
-                    return unwrap_env_split_string(
+                    let (next, next_args, mut split_env) = unwrap_env_split_string(
                         payload,
                         trailing,
                         shell,
                         split_depth,
                         !suffix.is_empty(),
-                    );
+                        wrapper_budget_exhausted,
+                    )?;
+                    if !split_env.clear_ambient {
+                        for (name, value) in wrapper_env.values {
+                            insert_outer_env_assignment(&mut split_env.values, name, value);
+                        }
+                    }
+                    split_env.clear_ambient |= wrapper_env.clear_ambient;
+                    return Some((next, next_args, split_env));
                 }
             }
             if consumed_value {
@@ -182,14 +402,22 @@ fn unwrap_env(
         }
         break;
     }
-    while idx < args.len()
-        && tokenize::is_env_assignment(&crate::rules::command::normalize_shell_token(
-            &args[idx], shell,
-        ))
-    {
+    while idx < args.len() {
+        let assignment = crate::rules::command::normalize_shell_token(&args[idx], shell);
+        if !tokenize::is_env_assignment(&assignment) {
+            break;
+        }
+        if let Some((name, value)) = assignment.split_once('=') {
+            insert_closer_env_assignment(
+                &mut wrapper_env.values,
+                name.to_string(),
+                ScopedEnvValue::Set(value.to_string()),
+            );
+        }
         idx += 1;
     }
-    command_from(args, idx)
+    let (command, command_args) = command_from(args, idx)?;
+    Some((command, command_args, wrapper_env))
 }
 
 fn unwrap_env_split_string(
@@ -198,8 +426,13 @@ fn unwrap_env_split_string(
     shell: ShellType,
     split_depth: usize,
     payload_is_normalized: bool,
-) -> Option<(String, Vec<String>)> {
-    if split_depth == 0 {
+    wrapper_budget_exhausted: &mut bool,
+) -> Option<(String, Vec<String>, EnvWrapperState)> {
+    if split_depth <= 1 {
+        *wrapper_budget_exhausted = payload
+            .split(|character: char| character.is_whitespace() || matches!(character, '\'' | '\"'))
+            .chain(trailing.iter().map(String::as_str))
+            .any(|word| command_basename(word, shell) == "sudo");
         return None;
     }
     let payload = if payload_is_normalized {
@@ -215,7 +448,7 @@ fn unwrap_env_split_string(
         return None;
     }
     words.extend_from_slice(trailing);
-    unwrap_env(&words, shell, split_depth - 1)
+    unwrap_env(&words, shell, split_depth - 1, wrapper_budget_exhausted)
 }
 
 fn unwrap_command_wrapper(wrapper: &str, args: &[String]) -> Option<(String, Vec<String>)> {
@@ -321,15 +554,40 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
     let mut preserve_env_vars: Vec<String> = Vec::new();
     let mut shell_mode: Option<&'static str> = None;
     let mut inner_start: Option<usize> = None;
+    let mut wrapper_env = BTreeMap::new();
 
     while idx < args.len() {
         let raw = &args[idx];
         let a = strip_outer_quotes(raw);
         if a == "--" {
-            inner_start = Some(idx + 1);
+            idx += 1;
+            while let Some(raw_assignment) = args.get(idx) {
+                let assignment =
+                    crate::rules::command::normalize_shell_token(raw_assignment, shell);
+                if !tokenize::is_env_assignment(&assignment) {
+                    break;
+                }
+                if let Some((name, value)) = assignment.split_once('=') {
+                    insert_closer_env_assignment(
+                        &mut wrapper_env,
+                        name.to_string(),
+                        ScopedEnvValue::Set(value.to_string()),
+                    );
+                }
+                idx += 1;
+            }
+            inner_start = Some(idx);
             break;
         }
-        if tokenize::is_env_assignment(a) {
+        let normalized = crate::rules::command::normalize_shell_token(raw, shell);
+        if tokenize::is_env_assignment(&normalized) {
+            if let Some((name, value)) = normalized.split_once('=') {
+                insert_closer_env_assignment(
+                    &mut wrapper_env,
+                    name.to_string(),
+                    ScopedEnvValue::Set(value.to_string()),
+                );
+            }
             idx += 1;
             continue;
         }
@@ -412,6 +670,8 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
             shell_mode,
             inner_cmd: String::new(),
             inner_args: Vec::new(),
+            wrapper_env,
+            clear_ambient: false,
         };
     }
 
@@ -424,6 +684,8 @@ fn parse_sudo_args(args: &[String], shell: ShellType) -> SudoParsed {
         shell_mode,
         inner_cmd,
         inner_args,
+        wrapper_env,
+        clear_ambient: false,
     }
 }
 
@@ -460,7 +722,23 @@ fn rules_for_segment(
 
     // 2) sudo -E with sensitive env set
     if parsed.preserve_env_all {
-        let active = sensitive_env_active();
+        let mut active = if parsed.clear_ambient {
+            Vec::new()
+        } else {
+            sensitive_env_active()
+                .into_iter()
+                .filter(|process_name| !parsed.wrapper_env.contains_key(process_name))
+                .collect::<Vec<_>>()
+        };
+        active.extend(parsed.wrapper_env.iter().filter_map(|(name, value)| {
+            let ScopedEnvValue::Set(value) = value else {
+                return None;
+            };
+            (!value.is_empty() && crate::sensitive_assets::is_sensitive_env_assignment(name, value))
+                .then_some(name.clone())
+        }));
+        active.sort();
+        active.dedup();
         if !active.is_empty() {
             let preview = active
                 .iter()
@@ -489,11 +767,33 @@ fn rules_for_segment(
             ));
         }
     } else if !parsed.preserve_env_vars.is_empty() {
-        // --preserve-env=VAR_LIST: fire only if a listed var is sensitive (presence-only).
+        // --preserve-env=VAR_LIST: exact secrets are sensitive by name; RPC
+        // endpoint names are promoted only when their current value carries
+        // credentials.
+        let active_process = sensitive_env_active();
         let intersecting: Vec<&str> = parsed
             .preserve_env_vars
             .iter()
-            .filter(|v| is_sensitive_env_name(v))
+            .filter(|requested_name| {
+                let name = requested_name.as_str();
+                parsed
+                    .wrapper_env
+                    .get(name)
+                    .map(|value| match value {
+                        ScopedEnvValue::Set(value) => {
+                            !value.is_empty()
+                                && crate::sensitive_assets::is_sensitive_env_assignment(name, value)
+                        }
+                        ScopedEnvValue::Unset => false,
+                    })
+                    .unwrap_or_else(|| {
+                        !parsed.clear_ambient
+                            && (crate::sensitive_assets::is_sensitive_env_name(name)
+                                || active_process
+                                    .iter()
+                                    .any(|candidate| candidate.as_str() == name))
+                    })
+            })
             .map(|s| s.as_str())
             .collect();
         if !intersecting.is_empty() {
@@ -902,20 +1202,25 @@ fn is_home_shell_init_dotfile(p: &str) -> bool {
     false
 }
 
-/// Sensitive env-var names currently set in `std::env`, ordered by `sensitive_env.toml`.
+/// Sensitive env-var names currently set in `std::env`, classified by the
+/// central registry and sorted for deterministic evidence.
 fn sensitive_env_active() -> Vec<String> {
-    crate::safe_command::sensitive_env_vars()
-        .iter()
-        .filter(|name| std::env::var_os(name).is_some())
-        .map(|s| s.to_string())
-        .collect()
+    let mut active = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.to_string_lossy().into_owned();
+            (!value.is_empty() && is_sensitive_env_value(&name, &value)).then_some(name)
+        })
+        .collect::<Vec<_>>();
+    active.sort();
+    active.dedup();
+    active
 }
 
-fn is_sensitive_env_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    crate::safe_command::sensitive_env_vars()
-        .iter()
-        .any(|s| s.eq_ignore_ascii_case(&upper))
+fn is_sensitive_env_value(name: &str, value: &std::ffi::OsStr) -> bool {
+    value
+        .to_str()
+        .map(|value| crate::sensitive_assets::is_sensitive_env_assignment(name, value))
+        .unwrap_or_else(|| crate::sensitive_assets::is_registered_env_name(name))
 }
 
 fn make_finding(
@@ -926,6 +1231,8 @@ fn make_finding(
     input: &str,
     seg: &tokenize::Segment,
 ) -> Finding {
+    let matched = crate::redact::redact_command_text(&seg.raw, &[]);
+    let input = crate::redact::redact_command_text(input, &[]);
     Finding {
         rule_id,
         severity,
@@ -934,7 +1241,7 @@ fn make_finding(
         evidence: vec![
             Evidence::CommandPattern {
                 pattern: "sudo <escalation-gate>".to_string(),
-                matched: seg.raw.chars().take(200).collect(),
+                matched: matched.chars().take(200).collect(),
             },
             Evidence::Text {
                 detail: format!("input: {}", input.chars().take(200).collect::<String>()),
@@ -1281,6 +1588,77 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_depth_boundaries_fail_closed_instead_of_disabling_sudo_analysis() {
+        let policy = Policy::default();
+        for depth in [31usize, 32, 33] {
+            let command = format!(
+                "{}sudo --preserve-env=AWS_SECRET_ACCESS_KEY sh",
+                "command ".repeat(depth)
+            );
+            let findings = check(&command, ShellType::Posix, &policy);
+            if depth == 31 {
+                assert!(
+                    findings
+                        .iter()
+                        .any(|finding| finding.rule_id == RuleId::SudoShellSpawn),
+                    "last supported wrapper depth lost sudo: {findings:?}"
+                );
+                assert!(
+                    findings
+                        .iter()
+                        .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+                    "supported wrapper depth was marked incomplete: {findings:?}"
+                );
+            } else {
+                assert!(
+                    findings
+                        .iter()
+                        .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+                    "exhausted wrapper depth was silently accepted: {findings:?}"
+                );
+            }
+        }
+
+        let benign = format!("{}printf safe", "command ".repeat(33));
+        assert!(
+            check(&benign, ShellType::Posix, &policy).is_empty(),
+            "a non-sudo exhausted wrapper chain must not be mislabeled"
+        );
+    }
+
+    #[test]
+    fn active_sudo_session_cannot_downgrade_wrapper_analysis_exhaustion() {
+        let policy = Policy::default();
+        for depth in [31usize, 32, 33] {
+            let command = format!("{}sudo sh", "command ".repeat(depth));
+            let mut findings = check(&command, ShellType::Posix, &policy);
+            apply_active_sudo_session_downgrade(&mut findings);
+
+            if depth == 31 {
+                let shell = findings
+                    .iter()
+                    .find(|finding| finding.rule_id == RuleId::SudoShellSpawn)
+                    .expect("the last supported wrapper depth must still resolve sudo");
+                assert_eq!(
+                    shell.severity,
+                    Severity::Medium,
+                    "a tagged session may acknowledge a fully analyzed sudo hazard"
+                );
+            } else {
+                let incomplete = findings
+                    .iter()
+                    .find(|finding| finding.rule_id == RuleId::AnalysisIncomplete)
+                    .expect("wrapper exhaustion must remain explicit");
+                assert_eq!(
+                    incomplete.severity,
+                    Severity::High,
+                    "an active sudo session must not weaken fail-closed analysis exhaustion"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn preserve_env_named_aws_secret_fires() {
         // Uses the explicit `--preserve-env=AWS_SECRET_ACCESS_KEY` form (no env mutation,
         // so the libc-environ race is irrelevant).
@@ -1306,13 +1684,286 @@ mod tests {
             ShellType::Posix,
             &policy,
         );
-        // Neither PATH nor LANG is in sensitive_env.toml.
+        // Neither PATH nor LANG is in the central sensitive-asset registry.
         assert!(
             !findings
                 .iter()
                 .any(|f| matches!(f.rule_id, RuleId::SudoEnvPreserveSensitive)),
             "PATH/LANG must NOT fire SudoEnvPreserveSensitive: {findings:?}"
         );
+    }
+
+    #[test]
+    fn env_clear_unset_and_empty_scopes_mask_preserved_secrets() {
+        let policy = Policy::default();
+        for command in [
+            "env -u AWS_SECRET_ACCESS_KEY sudo -E pip install foo",
+            "env --unset=AWS_SECRET_ACCESS_KEY sudo -E pip install foo",
+        ] {
+            let segments = tokenize::tokenize(command, ShellType::Posix);
+            let parsed = parse_sudo_invocation(&segments[0], ShellType::Posix)
+                .unwrap_or_else(|| panic!("sudo wrapper did not resolve: {command}"));
+            assert!(matches!(
+                parsed.wrapper_env.get("AWS_SECRET_ACCESS_KEY"),
+                Some(ScopedEnvValue::Unset)
+            ));
+        }
+        let clear_segments = tokenize::tokenize("env -i sudo -E pip install foo", ShellType::Posix);
+        assert!(parse_sudo_invocation(&clear_segments[0], ShellType::Posix)
+            .is_some_and(|parsed| parsed.clear_ambient));
+
+        let empty_segments = tokenize::tokenize(
+            "AWS_SECRET_ACCESS_KEY='' sudo -E pip install foo",
+            ShellType::Posix,
+        );
+        let empty = parse_sudo_invocation(&empty_segments[0], ShellType::Posix)
+            .expect("empty scoped sudo assignment");
+        assert!(matches!(
+            empty.wrapper_env.get("AWS_SECRET_ACCESS_KEY"),
+            Some(ScopedEnvValue::Set(value)) if value.is_empty()
+        ));
+
+        for command in [
+            "env -i sudo -E pip install foo",
+            "env --ignore-environment sudo -E pip install foo",
+            "env -i env -u AWS_SECRET_ACCESS_KEY sudo -E pip install foo",
+            "AWS_SECRET_ACCESS_KEY=outer env -i sudo -E pip install foo",
+            "env -i env AWS_SECRET_ACCESS_KEY= sudo -E pip install foo",
+            "AWS_SECRET_ACCESS_KEY='' sudo --preserve-env=AWS_SECRET_ACCESS_KEY pip install foo",
+            "AWS_SECRET_ACCESS_KEY=outer AWS_SECRET_ACCESS_KEY= sudo --preserve-env=AWS_SECRET_ACCESS_KEY pip install foo",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive),
+                "cleared, unset, or empty scoped value must mask a secret for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserve_env_uses_exact_posix_identity_for_aws_secret_prefixes() {
+        let _env_lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_sock = std::env::var_os("SSH_AUTH_SOCK");
+        // SAFETY: this test holds TEST_ENV_LOCK for the duration of the body.
+        unsafe { std::env::remove_var("SSH_AUTH_SOCK") };
+        struct RestoreSock(Option<std::ffi::OsString>);
+        impl Drop for RestoreSock {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(value) => std::env::set_var("SSH_AUTH_SOCK", value),
+                        None => std::env::remove_var("SSH_AUTH_SOCK"),
+                    }
+                }
+            }
+        }
+        let _restore_sock = RestoreSock(previous_sock);
+
+        let policy = Policy::default();
+        for command in [
+            "AWS_SECRET_CUSTOM=hunter2 awsSecretCustom='' sudo --preserve-env=AWS_SECRET_CUSTOM pip install foo",
+            "awsSecretCustom='' AWS_SECRET_CUSTOM=hunter2 sudo --preserve-env=AWS_SECRET_CUSTOM pip install foo",
+            "AWS_SECRET_CUSTOM=hunter2 env -u awsSecretCustom sudo --preserve-env=AWS_SECRET_CUSTOM pip install foo",
+            "AWS_SECRET_CUSTOM=hunter2 env -u awsSecretCustom sudo -E pip install foo",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive),
+                "an empty or unset alias must not overwrite the exact preserved AWS name for {command:?}: {findings:?}"
+            );
+        }
+
+        for command in [
+            "awsSecretCustom=hunter2 AWS_SECRET_CUSTOM='' sudo --preserve-env=AWS_SECRET_CUSTOM pip install foo",
+            "AWS_SECRET_CUSTOM='' awsSecretCustom=hunter2 sudo --preserve-env=AWS_SECRET_CUSTOM pip install foo",
+            "awsSecretCustom=hunter2 env -u AWS_SECRET_CUSTOM sudo --preserve-env=AWS_SECRET_CUSTOM pip install foo",
+            "awsSecretCustom=hunter2 env -u AWS_SECRET_CUSTOM sudo -E pip install foo",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive),
+                "a non-exact alias must not satisfy an empty or unset preserved AWS name for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_env_duplicates_use_last_assignment_and_env_null_does_not_clear() {
+        let policy = Policy::default();
+        for command in [
+            "AWS_SECRET_ACCESS_KEY= AWS_SECRET_ACCESS_KEY=hunter2 sudo -E pip install foo",
+            "awsSecretAccessKey= AWS_SECRET_ACCESS_KEY=hunter2 sudo -E pip install foo",
+            "AWS_SECRET_ACCESS_KEY=hunter2 env -0 sudo -E pip install foo",
+        ] {
+            let findings = check(command, ShellType::Posix, &policy);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive),
+                "nearest non-empty secret must remain active for {command:?}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserve_env_uses_kind_aware_exact_and_prefix_registry() {
+        let policy = Policy::default();
+        let public_rpc = check(
+            "sudo --preserve-env=RPC_URL pip install foo",
+            ShellType::Posix,
+            &policy,
+        );
+        assert!(!public_rpc
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive));
+
+        for name in ["RPC_API_KEY", "AWS_SECRET_C04"] {
+            let findings = check(
+                &format!("sudo --preserve-env={name} pip install foo"),
+                ShellType::Posix,
+                &policy,
+            );
+            assert!(findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive));
+        }
+
+        assert!(!is_sensitive_env_value(
+            "RPC_URL",
+            std::ffi::OsStr::new("https://rpc.example/rpc")
+        ));
+        assert!(is_sensitive_env_value(
+            "RPC_URL",
+            std::ffi::OsStr::new("https://rpc.example/v3/providerToken123456789")
+        ));
+
+        let scoped_secret = "providerToken123456789";
+        for command in [
+            format!(
+                "env RPC_URL=https://rpc.example/v3/{scoped_secret} sudo --preserve-env=RPC_URL pip install foo"
+            ),
+            format!("env RPC_URL=https://rpc.example/v3/{scoped_secret} sudo -E pip install foo"),
+            format!("RPC_URL=https://rpc.example/v3/{scoped_secret} sudo -E pip install foo"),
+            format!(
+                r#"env -S "RPC_URL=https://rpc.example/v3/{scoped_secret} sudo -E pip install foo""#
+            ),
+            format!(
+                r#"env --split-string='rpcUrl=https://rpc.example/v3/{scoped_secret} sudo -E pip install foo'"#
+            ),
+            format!("sudo -E AWS_SECRET_ACCESS_KEY={scoped_secret} pip install foo"),
+            format!(
+                "sudo -E -- rpcUrl=https://rpc.example/v3/{scoped_secret} pip install foo"
+            ),
+        ] {
+            let findings = check(&command, ShellType::Posix, &policy);
+            let finding = findings
+                .iter()
+                .find(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive)
+                .unwrap_or_else(|| panic!("missing RPC preserve finding: {findings:?}"));
+            let serialized = serde_json::to_string(finding).unwrap();
+            assert!(!serialized.contains(scoped_secret), "{serialized}");
+            assert!(!serialized.contains("rpc.example/v3"), "{serialized}");
+        }
+
+        let scoped_public = check(
+            "env RPC_URL=https://rpc.example/rpc sudo --preserve-env=RPC_URL pip install foo",
+            ShellType::Posix,
+            &policy,
+        );
+        assert!(!scoped_public
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive));
+
+        let public_with_comment = check(
+            "RPC_URL=https://rpc.example/rpc sudo --preserve-env=RPC_URL pip install foo # providerToken123456789",
+            ShellType::Posix,
+            &policy,
+        );
+        assert!(!public_with_comment
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive));
+
+        let exact_public = check(
+            &format!(
+                "rpcUrl=https://rpc.example/v3/{scoped_secret} env RPC_URL=https://rpc.example/rpc sudo --preserve-env=RPC_URL pip install foo"
+            ),
+            ShellType::Posix,
+            &policy,
+        );
+        assert!(!exact_public
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive));
+    }
+
+    #[test]
+    fn preserve_env_uses_exact_posix_identity_for_rpc_aliases() {
+        let policy = Policy::default();
+        let scoped_secret = "providerToken123456789";
+        let public = "https://rpc.example/rpc";
+
+        for command in [
+            format!(
+                "RPC_URL=https://rpc.example/v3/{scoped_secret} rpcUrl={public} sudo --preserve-env=RPC_URL pip install foo"
+            ),
+            format!(
+                "rpcUrl={public} RPC_URL=https://rpc.example/v3/{scoped_secret} sudo --preserve-env=RPC_URL pip install foo"
+            ),
+            format!(
+                r#"env RPC_URL=https://rpc.example/v3/{scoped_secret} -S "rpcUrl={public} sudo --preserve-env=RPC_URL pip install foo""#
+            ),
+            format!(
+                "RPC_URL={public} rpcUrl=https://rpc.example/v3/{scoped_secret} sudo --preserve-env=rpcUrl pip install foo"
+            ),
+            format!(
+                "RPC_URL=https://rpc.example/v3/{scoped_secret} env -u rpcUrl sudo -E pip install foo"
+            ),
+            format!(
+                "rpcUrl=https://rpc.example/v3/{scoped_secret} env -u RPC_URL sudo -E pip install foo"
+            ),
+        ] {
+            let findings = check(&command, ShellType::Posix, &policy);
+            let finding = findings
+                .iter()
+                .find(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a benign alias must not overwrite the exact preserved RPC name: {findings:?}"
+                    )
+                });
+            let serialized = serde_json::to_string(finding).unwrap();
+            assert!(!serialized.contains(scoped_secret), "{serialized}");
+        }
+
+        for command in [
+            format!(
+                "rpcUrl=https://rpc.example/v3/{scoped_secret} RPC_URL={public} sudo --preserve-env=RPC_URL pip install foo"
+            ),
+            format!(
+                "RPC_URL={public} rpcUrl=https://rpc.example/v3/{scoped_secret} sudo --preserve-env=RPC_URL pip install foo"
+            ),
+            format!(
+                "rpcUrl=https://rpc.example/v3/{scoped_secret} env -u RPC_URL sudo --preserve-env=RPC_URL pip install foo"
+            ),
+            format!(
+                "RPC_URL=https://rpc.example/v3/{scoped_secret} rpcUrl={public} sudo --preserve-env=rpcUrl pip install foo"
+            ),
+        ] {
+            let findings = check(&command, ShellType::Posix, &policy);
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::SudoEnvPreserveSensitive),
+                "a secret alias must not satisfy the exact benign or unset preserved RPC name for {command:?}: {findings:?}"
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,11 @@ set -eu
 
 REPO="sheeki03/tirith"
 INSTALL_DIR="${TIRITH_INSTALL_DIR:-$HOME/.local/bin}"
+# A release installer that later crosses a sudo boundary must never let a
+# caller-writable PATH select its downloader, verifier, extractor, or copier.
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+COSIGN_BIN=""
 
 err() {
   printf 'error: %s\n' "$1" >&2
@@ -109,7 +114,20 @@ verify_cosign() {
     allow_unsigned=1
   fi
 
-  if ! command -v cosign >/dev/null 2>&1; then
+  for candidate in /usr/bin/cosign /usr/local/bin/cosign /opt/homebrew/bin/cosign; do
+    if [ -x "$candidate" ] && [ ! -L "$candidate" ]; then
+      # Linux is the only platform where bytes are promoted to a root helper.
+      # There the verifier itself must be root-owned and non-writable by group
+      # or other. macOS has no privileged helper in this installer.
+      if [ "$TARGET" != "x86_64-unknown-linux-gnu" ] || \
+         { [ "$(/usr/bin/stat -c %u "$candidate" 2>/dev/null || true)" = "0" ] &&
+           [ -z "$(/usr/bin/find "$candidate" -maxdepth 0 -perm /022 -print 2>/dev/null)" ]; }; then
+        COSIGN_BIN="$candidate"
+        break
+      fi
+    fi
+  done
+  if [ -z "$COSIGN_BIN" ]; then
     if [ "$allow_unsigned" = "1" ]; then
       warn "cosign not found; skipping signature verification (TIRITH_ALLOW_UNSIGNED=1; checksum only)"
       return 0
@@ -140,7 +158,7 @@ verify_cosign() {
   fi
 
   info "Verifying checksums signature with cosign..."
-  if ! cosign verify-blob \
+  if ! "$COSIGN_BIN" verify-blob \
     --signature "${workdir}/checksums.txt.sig" \
     --certificate "${workdir}/checksums.txt.pem" \
     --certificate-identity-regexp '^https://github\.com/sheeki03/tirith/\.github/workflows/' \
@@ -149,6 +167,116 @@ verify_cosign() {
     # A FAILED verification is always fatal: even under TIRITH_ALLOW_UNSIGNED,
     # a present-but-bad signature means tampering, not a missing-tool fallback.
     err "cosign verification failed; the release signature did NOT verify. Do not trust these artifacts."
+  fi
+}
+
+run_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    /usr/bin/sudo -- "$@"
+  fi
+}
+
+install_package_approval_helper() {
+  # Every failure in here must RETURN non-zero, never call `err`. `err` exits
+  # the script outright, which skips the caller's
+  # `restore_package_approval_helper` on the failure branch and leaves the
+  # machine with the new helper half-installed and the old one not put back.
+  helper_archive="$1"
+  helper_archive_sha256="$2"
+  helper_dir="/usr/local/libexec"
+  helper_dest="${helper_dir}/tirith-package-approval-authority"
+  if [ ! -x /usr/bin/install ]; then
+    printf 'error: %s\n' "x86_64 Linux install requires the fixed /usr/bin/install utility" >&2
+    return 1
+  fi
+  if [ ! -x /usr/bin/tar ] || [ ! -x /usr/bin/sha256sum ] || [ ! -x /usr/bin/mktemp ]; then
+    printf 'error: %s\n' "x86_64 Linux install requires fixed /usr/bin tar, sha256sum, and mktemp utilities" >&2
+    return 1
+  fi
+  if [ "$(id -u)" -ne 0 ] && [ ! -x /usr/bin/sudo ]; then
+    printf 'error: %s\n' "x86_64 Linux install requires /usr/bin/sudo to install the root-owned approval helper" >&2
+    return 1
+  fi
+  case "$helper_archive_sha256" in
+    ""|*[!0-9a-f]*)
+      printf 'error: %s\n' "verified release archive has an invalid SHA-256" >&2
+      return 1
+      ;;
+  esac
+  if [ "${#helper_archive_sha256}" -ne 64 ]; then
+    printf 'error: %s\n' "verified release archive has an invalid SHA-256" >&2
+    return 1
+  fi
+
+  # Never promote an executable directly from the caller-owned extraction tree.
+  # Copy the signed archive into a root-owned staging directory, re-check its
+  # signed digest there, and extract/install only from that protected copy.
+  # Validate the protected ancestor before root creates anything beneath it.
+  # Once /usr/local is root-owned and non-writable, an unprivileged caller
+  # cannot race the libexec name into a symlink between validation and mkdir.
+  root_local_check="$(run_root /usr/bin/find /usr/local -maxdepth 0 -type d -uid 0 ! -perm /022 -print)" \
+    || return 1
+  if [ "$root_local_check" != "/usr/local" ]; then
+    printf 'error: %s\n' "/usr/local is not a root-owned, non-writable directory; refusing privileged helper installation" >&2
+    return 1
+  fi
+  if [ -e "$helper_dir" ] || [ -L "$helper_dir" ]; then
+    root_helper_dir_check="$(run_root /usr/bin/find "$helper_dir" -maxdepth 0 -type d -uid 0 ! -perm /022 -print)" \
+      || return 1
+    if [ "$root_helper_dir_check" != "$helper_dir" ]; then
+      printf 'error: %s\n' "$helper_dir is not a root-owned, non-writable directory; refusing privileged helper installation" >&2
+      return 1
+    fi
+  fi
+  run_root /usr/bin/install -d -m 755 "$helper_dir" || return 1
+  root_helper_dir_check="$(run_root /usr/bin/find "$helper_dir" -maxdepth 0 -type d -uid 0 ! -perm /022 -print)" \
+    || return 1
+  if [ "$root_helper_dir_check" != "$helper_dir" ]; then
+    printf 'error: %s\n' "$helper_dir did not resolve to a protected root-owned directory" >&2
+    return 1
+  fi
+  helper_stage="$(run_root /usr/bin/mktemp -d "${helper_dir}/.tirith-helper-stage.XXXXXX")" \
+    || return 1
+  if ! run_root /usr/bin/install -m 600 "$helper_archive" "${helper_stage}/release.tar.gz"; then
+    run_root /bin/rm -rf "$helper_stage" || true
+    return 1
+  fi
+  helper_staged_sum="$(run_root /usr/bin/sha256sum "${helper_stage}/release.tar.gz")" \
+    || {
+      run_root /bin/rm -rf "$helper_stage" || true
+      return 1
+    }
+  if [ "${helper_staged_sum%% *}" != "$helper_archive_sha256" ]; then
+    run_root /bin/rm -rf "$helper_stage" || true
+    return 1
+  fi
+  if ! run_root /usr/bin/tar --no-same-owner -xzf "${helper_stage}/release.tar.gz" \
+      -C "$helper_stage" tirith-package-approval-authority; then
+    run_root /bin/rm -rf "$helper_stage" || true
+    return 1
+  fi
+  if ! run_root /usr/bin/install -m 755 \
+      "${helper_stage}/tirith-package-approval-authority" "$helper_dest"; then
+    run_root /bin/rm -rf "$helper_stage" || true
+    return 1
+  fi
+  # The helper is already installed by this point. A failed staging cleanup
+  # leaves a temp directory behind; it is not a reason to return non-zero and
+  # have the caller roll back a successful installation. Every other cleanup in
+  # this function already tolerates failure the same way.
+  run_root /bin/rm -rf "$helper_stage" || warn "could not remove the helper staging directory ${helper_stage}"
+}
+
+restore_package_approval_helper() {
+  helper_backup="$1"
+  helper_had_previous="$2"
+  helper_dest="/usr/local/libexec/tirith-package-approval-authority"
+  if [ "$helper_had_previous" = "1" ]; then
+    run_root /usr/bin/install -m 755 "$helper_backup" "$helper_dest"
+  else
+    run_root /bin/rm -f "$helper_dest"
   fi
 }
 
@@ -189,11 +317,59 @@ main() {
   info "Extracting..."
   tar xzf "${tmpdir}/${ARCHIVE}" -C "$tmpdir"
   mkdir -p "$INSTALL_DIR"
+  main_had_previous=0
+  if [ -f "${INSTALL_DIR}/tirith" ]; then
+    main_had_previous=1
+    cp "${INSTALL_DIR}/tirith" "${tmpdir}/tirith.previous"
+  fi
+  helper_had_previous=0
+  helper_backup=""
+  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+    if [ -f /usr/local/libexec/tirith-package-approval-authority ]; then
+      helper_had_previous=1
+      helper_backup="$(run_root /usr/bin/mktemp \
+        /usr/local/libexec/.tirith-helper-backup.XXXXXX)"
+      run_root /usr/bin/install -m 755 \
+        /usr/local/libexec/tirith-package-approval-authority "$helper_backup"
+    fi
+    archive_sha256="${CHECKSUM_LINE%% *}"
+    if ! install_package_approval_helper "${tmpdir}/${ARCHIVE}" "$archive_sha256"; then
+      restore_package_approval_helper "$helper_backup" "$helper_had_previous" || true
+      [ -z "$helper_backup" ] || run_root /bin/rm -f "$helper_backup" || true
+      err "could not install the root-owned package-approval helper"
+    fi
+  fi
   if command -v install >/dev/null 2>&1; then
-    install -m 755 "${tmpdir}/tirith" "${INSTALL_DIR}/tirith"
+    if ! install -m 755 "${tmpdir}/tirith" "${INSTALL_DIR}/tirith"; then
+      if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+        restore_package_approval_helper "$helper_backup" "$helper_had_previous" || true
+        [ -z "$helper_backup" ] || run_root /bin/rm -f "$helper_backup" || true
+      fi
+      if [ "$main_had_previous" = "1" ]; then
+        install -m 755 "${tmpdir}/tirith.previous" "${INSTALL_DIR}/tirith" || true
+      else
+        rm -f "${INSTALL_DIR}/tirith"
+      fi
+      err "could not install the paired Tirith binaries"
+    fi
   else
-    cp "${tmpdir}/tirith" "${INSTALL_DIR}/tirith"
-    chmod 755 "${INSTALL_DIR}/tirith"
+    if ! cp "${tmpdir}/tirith" "${INSTALL_DIR}/tirith" || \
+       ! chmod 755 "${INSTALL_DIR}/tirith"; then
+      if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+        restore_package_approval_helper "$helper_backup" "$helper_had_previous" || true
+        [ -z "$helper_backup" ] || run_root /bin/rm -f "$helper_backup" || true
+      fi
+      if [ "$main_had_previous" = "1" ]; then
+        cp "${tmpdir}/tirith.previous" "${INSTALL_DIR}/tirith" || true
+        chmod 755 "${INSTALL_DIR}/tirith" || true
+      else
+        rm -f "${INSTALL_DIR}/tirith"
+      fi
+      err "could not install the paired Tirith binaries"
+    fi
+  fi
+  if [ -n "$helper_backup" ]; then
+    run_root /bin/rm -f "$helper_backup" || true
   fi
 
   info ""
@@ -215,6 +391,11 @@ main() {
   info ""
   info "To uninstall:"
   info "  rm ${INSTALL_DIR}/tirith"
+  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+    info "  sudo rm /usr/local/libexec/tirith-package-approval-authority"
+    info "  sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous"
+    info "  sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent"
+  fi
 }
 
 if [ "${TIRITH_INSTALL_SH_LIB:-0}" != "1" ]; then

@@ -960,26 +960,7 @@ fn is_sensitive_bind_source(src: &str) -> bool {
     };
     let path = normalized.trim_end_matches('/');
 
-    if crate::rules::shared::SENSITIVE_BIND_PATHS
-        .iter()
-        .map(|candidate| candidate.to_ascii_lowercase().replace('\\', "/"))
-        .any(|candidate| path == candidate || path.starts_with(&(candidate + "/")))
-    {
-        return true;
-    }
-
-    // Expanded Windows profile paths are case-insensitive and cannot be listed
-    // exhaustively because the account name and drive vary. Match only the
-    // credential-directory component directly beneath `Users/<account>`.
-    let components: Vec<&str> = path.split('/').collect();
-    if components.len() >= 4
-        && components[0].len() == 2
-        && components[0].as_bytes()[0].is_ascii_alphabetic()
-        && components[0].ends_with(':')
-        && components[1] == "users"
-        && !components[2].is_empty()
-        && matches!(components[3], ".ssh" | ".aws" | ".kube" | ".docker")
-    {
+    if crate::sensitive_assets::is_sensitive_bind_path(path) {
         return true;
     }
 
@@ -987,29 +968,63 @@ fn is_sensitive_bind_source(src: &str) -> bool {
 }
 
 /// Lexically normalize a devcontainer host path without reading the host
-/// filesystem. Separators and case are normalized for cross-platform matching;
-/// `.` and reducible `..` components are collapsed, while traversal above an
-/// absolute/home/variable anchor is rejected.
+/// filesystem. Separators are normalized, Windows spellings are case-folded,
+/// and POSIX spellings remain case-sensitive. `.` and reducible `..` components
+/// are collapsed, while traversal above an absolute/home/variable anchor is
+/// rejected.
 fn normalize_bind_source(src: &str) -> Result<String, ()> {
-    let replaced = src.trim().replace('\\', "/");
-    let lower = replaced.to_ascii_lowercase();
-    let absolute = lower.starts_with('/');
+    let trimmed = src.trim();
+    let flavor_probe = trimmed.to_ascii_lowercase();
+    let bytes = trimmed.as_bytes();
+    let windows_alias = [
+        "%userprofile%",
+        "%homedrive%",
+        "%homepath%",
+        "%appdata%",
+        "%localappdata%",
+        "${env:userprofile}",
+        "${localenv:userprofile}",
+        "${env:homedrive}",
+        "${localenv:homedrive}",
+        "${env:homepath}",
+        "${localenv:homepath}",
+        "${env:appdata}",
+        "${localenv:appdata}",
+        "${env:localappdata}",
+        "${localenv:localappdata}",
+        "$env:userprofile",
+        "$env:homedrive",
+        "$env:homepath",
+        "$env:appdata",
+        "$env:localappdata",
+    ]
+    .iter()
+    .any(|alias| flavor_probe.contains(alias));
+    let windows = trimmed.contains('\\')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || windows_alias;
+    let mut replaced = trimmed.replace('\\', "/");
+    if windows {
+        replaced.make_ascii_lowercase();
+    }
+    let absolute = replaced.starts_with('/');
     let mut components: Vec<&str> = Vec::new();
     let mut protected_components = 0usize;
 
-    for component in lower.split('/') {
+    for component in replaced.split('/') {
         if component.is_empty() || component == "." {
             continue;
         }
+        let anchor_probe = component.to_ascii_lowercase();
         if components.is_empty()
             && (component == "~"
-                || component == "${env:home}"
-                || component == "${localenv:home}"
-                || component == "${env:userprofile}"
-                || component == "${localenv:userprofile}"
-                || component == "%userprofile%"
-                || component == "${env:homedrive}${env:homepath}"
-                || component == "${localenv:homedrive}${localenv:homepath}"
+                || anchor_probe == "${env:home}"
+                || anchor_probe == "${localenv:home}"
+                || anchor_probe == "${env:userprofile}"
+                || anchor_probe == "${localenv:userprofile}"
+                || anchor_probe == "%userprofile%"
+                || anchor_probe == "${env:homedrive}${env:homepath}"
+                || anchor_probe == "${localenv:homedrive}${localenv:homepath}"
                 || (component.len() == 2
                     && component.as_bytes()[0].is_ascii_alphabetic()
                     && component.ends_with(':')))
@@ -3932,6 +3947,7 @@ mod tests {
             "/var//run/./docker.sock",
             "/workspace/../etc",
             "${env:HOME}/projects/../.ssh",
+            "${env:HOME}/../safe",
             "~/.config/../.aws",
             "../unresolved",
         ] {
@@ -3973,5 +3989,31 @@ mod tests {
             Some(r"C:\Users\Alice\.ssh")
         );
         assert!(!is_sensitive_bind_source(r"C:\Users\Alice\projects\tirith"));
+    }
+
+    #[test]
+    fn devcontainer_wallet_mounts_follow_central_cross_platform_path_specs() {
+        assert_eq!(
+            normalize_bind_source("/srv/UserProfile/CaseSensitive").unwrap(),
+            "/srv/UserProfile/CaseSensitive",
+            "a POSIX component merely named UserProfile must not select Windows case-folding"
+        );
+        for source in [
+            "~/.config/Exodus/exodus.wallet",
+            "~/.config/atomic",
+            "~/Library/Application Support/Ledger Live",
+            "~/Library/Ethereum/keystore",
+            r"C:\Users\Alice\AppData\Roaming\Ethereum\keystore",
+            r"C:\Users\Alice\AppData\Roaming\Exodus\exodus.wallet",
+        ] {
+            assert!(is_sensitive_bind_source(source), "must block {source}");
+        }
+        for source in [
+            "~/.config/exodus-docs",
+            "~/Library/Application Support/Ledger Live Docs",
+            r"C:\Users\Alice\AppData\Roaming\Ethereum-not\keystore",
+        ] {
+            assert!(!is_sensitive_bind_source(source), "must preserve {source}");
+        }
     }
 }

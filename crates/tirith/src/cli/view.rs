@@ -23,6 +23,32 @@ const CHUNK_BYTES: usize = 64 * 1024;
 /// explicit `--max-bytes`. v1 cap is 16 MiB.
 pub const DEFAULT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
+fn project_view_text(value: &str) -> String {
+    let share_safe = tirith_core::redact::redact_for_audience(
+        value,
+        tirith_core::redact::ShareAudience::PublicPaste,
+    )
+    .redacted_content;
+    tirith_core::redact::redact_blocked_output(&share_safe)
+}
+
+fn project_view_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = project_view_text(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                project_view_json(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                project_view_json(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
 /// Entry point. Reads `path` (or stdin when `None`), runs the output-direction
 /// analyzer over the bytes in streaming chunks, prints the sanitized content
 /// to stdout, and prints the finding list to stderr (or as JSON when `json`).
@@ -91,11 +117,13 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
     })();
 
     if let Err(e) = read_result {
-        eprintln!(
-            "tirith view: failed to read {}: {e}",
-            path.map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<stdin>".to_string())
+        let source = project_view_text(
+            &path
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<stdin>".to_string()),
         );
+        let error = project_view_text(&e.to_string());
+        eprintln!("tirith view: failed to read {source}: {error}");
         return 1;
     }
 
@@ -111,6 +139,8 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
     if json {
         return emit_json(path, &verdict, total_bytes, truncated);
     }
+
+    let sanitized = protect_blocked_output_before_stdout(sanitized, verdict.action);
 
     // Human path: write the sanitized content to stdout (so callers can
     // `tirith view foo | less`), and the findings/banner to stderr.
@@ -129,6 +159,21 @@ pub fn run(path: Option<&Path>, max_bytes: u64, json: bool) -> i32 {
 
     // Translate the Verdict to an exit code via the standard mapping.
     verdict.action.exit_code()
+}
+
+/// A Block is a refusal boundary, not permission to echo the bytes that caused
+/// it. Terminal neutralization alone does not remove credentials, so apply the
+/// mandatory supported-secret projection to the complete displayed stream
+/// before stdout. The core redactor fails closed to one fixed marker when its
+/// bounded structural scan is incomplete.
+fn protect_blocked_output_before_stdout(sanitized: Vec<u8>, action: Action) -> Vec<u8> {
+    if action != Action::Block {
+        return sanitized;
+    }
+    match String::from_utf8(sanitized) {
+        Ok(text) => tirith_core::redact::redact_blocked_output(&text).into_bytes(),
+        Err(_) => b"[REDACTED:analysis_incomplete]".to_vec(),
+    }
 }
 
 /// Incremental UTF-8 decoder. Definite malformed subsequences become U+FFFD;
@@ -289,7 +334,9 @@ impl StreamingDisplaySanitizer {
 
 fn print_findings_human(verdict: &Verdict, path: Option<&Path>, total_bytes: u64, truncated: bool) {
     let label = path
-        .map(|p| super::sanitize_for_human_output(&p.display().to_string(), false))
+        .map(|p| {
+            super::sanitize_for_human_output(&project_view_text(&p.display().to_string()), false)
+        })
         .unwrap_or_else(|| "<stdin>".to_string());
 
     let banner = match verdict.action {
@@ -309,11 +356,11 @@ fn print_findings_human(verdict: &Verdict, path: Option<&Path>, total_bytes: u64
             "  [{}] {} — {}",
             f.severity,
             f.rule_id,
-            super::sanitize_for_human_output(&f.title, false)
+            super::sanitize_for_human_output(&project_view_text(&f.title), false)
         );
         eprintln!(
             "    {}",
-            super::sanitize_for_human_output(&f.description, true)
+            super::sanitize_for_human_output(&project_view_text(&f.description), true)
         );
     }
 }
@@ -338,6 +385,14 @@ fn emit_json(path: Option<&Path>, verdict: &Verdict, total_bytes: u64, truncated
         findings: &verdict.findings,
         timings_ms: &verdict.timings_ms,
     };
+    let mut out = match serde_json::to_value(&out) {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("tirith view: failed to construct JSON output");
+            return 1;
+        }
+    };
+    project_view_json(&mut out);
     let mut stdout = std::io::stdout().lock();
     if serde_json::to_writer_pretty(&mut stdout, &out).is_err() || writeln!(stdout).is_err() {
         eprintln!("tirith view: failed to write JSON output");
@@ -359,6 +414,69 @@ mod tests {
         }
         let _ = sanitizer.finish(&mut out);
         out
+    }
+
+    #[test]
+    fn blocked_view_output_never_echoes_supported_secret_bytes() {
+        let secret = format!("0x{}1", "0".repeat(63));
+        let content = format!("PRIVATE_KEY={secret}\n");
+        let mut state = OutputAnalyzerState::default();
+        let _ = engine::analyze_output_chunk(&content, &mut state);
+        let verdict = engine::analyze_output_finalize_mut(&mut state);
+        assert_eq!(verdict.action, Action::Block, "secret fixture must block");
+
+        let output = protect_blocked_output_before_stdout(content.into_bytes(), verdict.action);
+        let output = String::from_utf8(output).expect("redacted UTF-8");
+        assert!(!output.contains(&secret), "{output}");
+        assert!(!output.contains(&secret[..18]), "{output}");
+        assert!(output.contains("[REDACTED:"), "{output}");
+    }
+
+    #[test]
+    fn clean_content_at_a_non_secret_block_boundary_is_preserved() {
+        let content = b"plain reviewable content\n".to_vec();
+        assert_eq!(
+            protect_blocked_output_before_stdout(content.clone(), Action::Block),
+            content
+        );
+        assert_eq!(
+            protect_blocked_output_before_stdout(b"clean allow\n".to_vec(), Action::Allow),
+            b"clean allow\n"
+        );
+    }
+
+    #[test]
+    fn blocked_view_conservatively_removes_an_unlabelled_private_scalar() {
+        let secret = format!("0x{}", "11".repeat(32));
+        let content = format!("untrusted output\n{secret}\n").into_bytes();
+        let output = protect_blocked_output_before_stdout(content, Action::Block);
+        let output = String::from_utf8(output).expect("redacted UTF-8");
+        assert!(!output.contains(&secret), "{output}");
+        assert!(output.contains("[REDACTED:evm_private_key]"), "{output}");
+    }
+
+    #[test]
+    fn view_metadata_findings_and_paths_are_projected_before_json_render() {
+        let secret = format!("ghp_{}", "W".repeat(36));
+        let mut value = serde_json::json!({
+            "path": format!("/Users/alice/private/{secret}.txt"),
+            "findings": [{
+                "title": format!("title {secret}"),
+                "description": format!("description {secret}"),
+            }],
+            "metadata": { "source": format!("source-{secret}") },
+        });
+        project_view_json(&mut value);
+        let output = value.to_string();
+        assert!(!output.contains(&secret), "{output}");
+        assert!(!output.contains("/Users/alice"), "{output}");
+        assert!(output.contains("REDACTED"), "{output}");
+    }
+
+    #[test]
+    fn view_projection_preserves_benign_relative_paths_and_titles() {
+        assert_eq!(project_view_text("src/main.rs"), "src/main.rs");
+        assert_eq!(project_view_text("ordinary warning"), "ordinary warning");
     }
 
     fn assert_safe_at_every_split(input: &[u8], expected: &[u8]) {

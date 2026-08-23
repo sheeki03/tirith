@@ -9,7 +9,6 @@
 
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use tirith_core::mcp_lock::{
     self, McpDrift, McpEnvChange, McpInventory, McpLockLoadError, McpLockServer, McpLockfile,
     McpServerDriftEntry, McpToolsChangeKind, McpTransport, McpTransportChange, MCP_LOCK_FILENAME,
@@ -43,6 +42,21 @@ pub fn lock(json: bool, allow_incomplete_configs: bool) -> i32 {
 /// over any unreadable, ambiguous, secret-bearing, or malformed config unless
 /// the operator supplies the explicit audited override.
 pub(crate) fn lock_for_root(repo_root: &Path, json: bool, allow_incomplete_configs: bool) -> i32 {
+    let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
+    let operator_policy = policy::Policy::discover_local_only(repo_root.to_str());
+    if let Err(error) = super::preflight_config_write_authorization(
+        repo_root,
+        &lock_path,
+        true,
+        &operator_policy,
+        true,
+    ) {
+        report_error(
+            json,
+            &format!("task gate refused MCP baseline mutation: {error}"),
+        );
+        return 1;
+    }
     let mutation_guard = match acquire_mutation_lock(repo_root) {
         Ok(guard) => guard,
         Err(error) => {
@@ -67,9 +81,8 @@ pub(crate) fn lock_for_root(repo_root: &Path, json: bool, allow_incomplete_confi
         }
         return 1;
     }
-    let lock_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
     let mut lockfile = McpLockfile::from_inventory(&inventory);
-    let preserved_approvals = match mcp_lock::load_lockfile(&lock_path) {
+    let preserved_approvals = match load_lockfile_retained(mutation_guard.data_destination()) {
         Ok(previous) => lockfile.preserve_approved_descriptors_from(&previous),
         Err(McpLockLoadError::NotFound) => 0,
         // `mcp lock` remains the repair path for a corrupt/legacy lock. A
@@ -77,7 +90,26 @@ pub(crate) fn lock_for_root(repo_root: &Path, json: bool, allow_incomplete_confi
         // safe to carry into the replacement.
         Err(_) => 0,
     };
-    if let Err(e) = write_lockfile(&lock_path, &lockfile) {
+    // C12: the operator policy, discovered offline. The repository whose MCP
+    // servers are being baselined must not get to authorise the write that
+    // baselines them, so a repo-scoped `.tirith/policy.yaml` is out of scope here
+    // for the same reason it is in `tirith policy init`.
+    let publication_destination = match mutation_guard.publication_destination() {
+        Ok(destination) => destination,
+        Err(error) => {
+            report_error(
+                json,
+                &format!("could not retain MCP baseline destination: {error}"),
+            );
+            return 1;
+        }
+    };
+    if let Err(e) = write_lockfile_prepared(
+        &lock_path,
+        publication_destination,
+        &lockfile,
+        &operator_policy,
+    ) {
         report_error(
             json,
             &format!("failed to write {}: {e}", lock_path.display()),
@@ -91,10 +123,9 @@ pub(crate) fn lock_for_root(repo_root: &Path, json: bool, allow_incomplete_confi
             return 1;
         }
     };
-    let read_back = tirith_core::util::read_text_no_follow_capped(
-        &lock_path,
-        expected.len().saturating_add(1) as u64,
-    );
+    let read_back = mutation_guard
+        .data_destination()
+        .read_capped(expected.len().saturating_add(1) as u64);
     if !matches!(read_back, Ok(ref bytes) if bytes == expected.as_bytes()) {
         report_error(
             json,
@@ -133,56 +164,77 @@ pub(crate) fn lock_for_root(repo_root: &Path, json: bool, allow_incomplete_confi
     0
 }
 
-/// Stable-inode interprocess guard for every `.tirith/mcp.lock` mutation. The
-/// data file itself is atomically replaced, so locking it would lock an obsolete
-/// inode after rename; all cooperating writers instead lock this never-renamed
-/// sibling across read/build/recheck/write/readback.
+/// Retained-parent interprocess guard for every `.tirith/mcp.lock` mutation.
+/// The data file and any visible legacy sidecar can both be atomically replaced;
+/// all cooperating writers therefore lock the retained directory authority
+/// across read/build/recheck/write/readback.
 pub(crate) struct McpMutationGuard {
-    file: std::fs::File,
+    lock_destination: tirith_core::util::ContainedAtomicFile,
+    data_destination: tirith_core::util::ContainedAtomicFile,
 }
 
-impl Drop for McpMutationGuard {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+impl McpMutationGuard {
+    pub(crate) fn data_destination(&self) -> &tirith_core::util::ContainedAtomicFile {
+        &self.data_destination
+    }
+
+    pub(crate) fn publication_destination(
+        &self,
+    ) -> std::io::Result<tirith_core::util::ContainedAtomicFile> {
+        let destination = self
+            .lock_destination
+            .prepare_sibling(std::ffi::OsStr::new(MCP_LOCK_FILENAME))?;
+        destination.inherit_observed_preimage(&self.data_destination)?;
+        Ok(destination)
     }
 }
 
 pub(crate) fn acquire_mutation_lock(repo_root: &Path) -> std::io::Result<McpMutationGuard> {
-    let lock_dir = repo_root.join(".tirith");
-    std::fs::create_dir_all(&lock_dir)?;
-    let canonical_root = std::fs::canonicalize(repo_root)?;
-    let canonical_dir = std::fs::canonicalize(&lock_dir)?;
-    if !canonical_dir.starts_with(&canonical_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "MCP mutation lock directory escapes repository root",
-        ));
-    }
-    let lock_path = canonical_dir.join(".mcp-lock.mutation.lock");
-    #[cfg(not(unix))]
-    if std::fs::symlink_metadata(&lock_path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Err(std::io::Error::other(
-            "refusing symlinked MCP mutation lock",
-        ));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options.open(&lock_path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other(
-            "MCP mutation lock is not a regular file",
-        ));
-    }
-    file.lock_exclusive()?;
-    Ok(McpMutationGuard { file })
+    let operator_policy = policy::Policy::discover_local_only(repo_root.to_str());
+    acquire_mutation_lock_with_policy(repo_root, &operator_policy)
+}
+
+fn acquire_mutation_lock_with_policy(
+    repo_root: &Path,
+    operator_policy: &policy::Policy,
+) -> std::io::Result<McpMutationGuard> {
+    let lockfile_path = repo_root.join(".tirith").join(MCP_LOCK_FILENAME);
+    super::preflight_config_write_authorization(
+        repo_root,
+        &lockfile_path,
+        true,
+        operator_policy,
+        true,
+    )?;
+    let lock_path = repo_root.join(".tirith").join(".mcp-lock.mutation.lock");
+    let destination = tirith_core::util::ContainedAtomicFile::prepare(repo_root, &lock_path, true)?;
+    destination.lock_parent_for_mutation()?;
+    let data_destination = destination.prepare_sibling(std::ffi::OsStr::new(MCP_LOCK_FILENAME))?;
+    Ok(McpMutationGuard {
+        lock_destination: destination,
+        data_destination,
+    })
+}
+
+fn load_lockfile_retained(
+    destination: &tirith_core::util::ContainedAtomicFile,
+) -> Result<McpLockfile, McpLockLoadError> {
+    const MAX_LOCKFILE_BYTES: u64 = 4 * 1024 * 1024;
+    let bytes = match destination.read_capped(MAX_LOCKFILE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(tirith_core::util::OpenRegularError::NotFound) => {
+            return Err(McpLockLoadError::NotFound)
+        }
+        Err(_) => {
+            return Err(McpLockLoadError::Io {
+                kind: tirith_core::mcp_lock::McpLockIoKind::Other,
+            })
+        }
+    };
+    let body = std::str::from_utf8(&bytes).map_err(|_| McpLockLoadError::Io {
+        kind: tirith_core::mcp_lock::McpLockIoKind::Other,
+    })?;
+    mcp_lock::parse_lockfile(body)
 }
 
 /// Resolve the repository root for `mcp lock`: `TIRITH_POLICY_ROOT` (treated as
@@ -206,10 +258,22 @@ fn resolve_repo_root() -> Option<PathBuf> {
 
 /// Write the rendered lockfile to `<repo_root>/.tirith/mcp.lock`, creating the
 /// `.tirith/` directory if needed.
-fn write_lockfile(lock_path: &Path, lockfile: &McpLockfile) -> std::io::Result<()> {
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+///
+/// C12: `mcp.lock` is a Tirith-owned configuration file. It records which MCP
+/// servers and tools are approved, which is what `tirith mcp verify` gates drift
+/// against and what the gateway reads for descriptor approval, so re-baselining
+/// it is the same class of act as rewriting the policy. It publishes through the
+/// gated permit rather than the raw contained writer for that reason; `policy` is
+/// passed in so the caller owns the discovery and this stays a pure write.
+///
+/// The write is flagged as a `policy_change`: it governs which servers and
+/// tools are approved, even though the on-disk format is not policy.yaml.
+#[cfg(test)]
+fn write_lockfile(
+    lock_path: &Path,
+    lockfile: &McpLockfile,
+    policy: &policy::Policy,
+) -> std::io::Result<()> {
     let repo_root = lock_path
         .parent()
         .and_then(Path::parent)
@@ -217,7 +281,39 @@ fn write_lockfile(lock_path: &Path, lockfile: &McpLockfile) -> std::io::Result<(
     let rendered = lockfile
         .render()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    super::write_file_atomic_contained(repo_root, lock_path, rendered.as_bytes(), true)
+    super::write_config_file_permitted_with_parent_creation(
+        repo_root,
+        lock_path,
+        rendered.as_bytes(),
+        true,
+        policy,
+        true,
+        true,
+    )
+}
+
+fn write_lockfile_prepared(
+    lock_path: &Path,
+    destination: tirith_core::util::ContainedAtomicFile,
+    lockfile: &McpLockfile,
+    policy: &policy::Policy,
+) -> std::io::Result<()> {
+    let repo_root = lock_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| std::io::Error::other("MCP lock path has no repository root"))?;
+    let rendered = lockfile
+        .render()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    super::write_prepared_config_file_permitted(
+        repo_root,
+        lock_path,
+        destination,
+        rendered.as_bytes(),
+        true,
+        policy,
+        true,
+    )
 }
 
 /// Emit the machine-readable result.
@@ -1043,28 +1139,28 @@ pub(crate) fn policy_init_for_root(repo_root: &Path, json: bool, force: bool) ->
     // Both forms (human YAML, JSON preview) derive from this same shape.
     let scaffold = build_policy_scaffold(lockfile_opt.as_ref());
 
-    if let Some(parent) = example_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            report_error_for(
-                json,
-                "tirith mcp policy init",
-                &format!("failed to create {}: {e}", parent.display()),
-            );
-            return 1;
-        }
-    }
-
     let yaml_body = render_policy_scaffold_yaml(&scaffold);
     // repo-0395: the scaffold lives under the repo's `.tirith/`, which a
     // malicious checkout can make a symlink. Write through the contained,
     // no-follow atomic helper so the write can never land outside the repo.
+    //
+    // C12: and through the gated permit, because it is a file Tirith owns under
+    // `.tirith/`. It is a scaffold the operator copies, not the live policy, so
+    // it is not flagged as a policy change.
     let repo_root = example_path
         .parent()
         .and_then(Path::parent)
         .unwrap_or_else(|| Path::new("."));
-    if let Err(e) =
-        super::write_file_atomic_contained(repo_root, &example_path, yaml_body.as_bytes(), true)
-    {
+    let operator_policy = policy::Policy::discover_local_only(repo_root.to_str());
+    if let Err(e) = super::write_config_file_permitted_with_parent_creation(
+        repo_root,
+        &example_path,
+        yaml_body.as_bytes(),
+        true,
+        &operator_policy,
+        false,
+        true,
+    ) {
         report_error_for(
             json,
             "tirith mcp policy init",
@@ -2033,6 +2129,12 @@ mod tests {
         }
     }
 
+    /// The C12 task gate ships off, so these lockfile tests state that plainly
+    /// rather than depending on whatever policy the host running them has.
+    fn inert_policy() -> policy::Policy {
+        policy::Policy::default()
+    }
+
     #[test]
     fn write_lockfile_creates_tirith_dir_and_file() {
         let repo = tempdir().unwrap();
@@ -2040,7 +2142,7 @@ mod tests {
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
 
-        write_lockfile(&lock_path, &lockfile).expect("write should succeed");
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).expect("write should succeed");
         assert!(lock_path.is_file(), ".tirith/mcp.lock must exist");
 
         let contents = fs::read_to_string(&lock_path).unwrap();
@@ -2060,9 +2162,9 @@ mod tests {
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
 
-        write_lockfile(&lock_path, &lockfile).unwrap();
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).unwrap();
         let first = fs::read_to_string(&lock_path).unwrap();
-        write_lockfile(&lock_path, &lockfile).unwrap();
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).unwrap();
         let second = fs::read_to_string(&lock_path).unwrap();
         assert_eq!(first, second, "re-writing an unchanged lockfile is stable");
     }
@@ -2078,7 +2180,8 @@ mod tests {
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
         let inventory = mcp_lock::build_inventory(repo.path());
         let mut lockfile = McpLockfile::from_inventory(&inventory);
-        write_lockfile(&lock_path, &lockfile).expect("write initial safe baseline");
+        write_lockfile(&lock_path, &lockfile, &inert_policy())
+            .expect("write initial safe baseline");
         let before = fs::read(&lock_path).expect("read initial baseline");
 
         let probe = "ghp_DIRECT_WRITE_SECRET_NEVER_PERSIST_123456";
@@ -2087,7 +2190,7 @@ mod tests {
             args: vec![format!("--token={probe}")],
             env: vec![],
         };
-        let error = write_lockfile(&lock_path, &lockfile)
+        let error = write_lockfile(&lock_path, &lockfile, &inert_policy())
             .expect_err("unsafe direct transport must fail before publication");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(!error.to_string().contains(probe));
@@ -2122,7 +2225,7 @@ mod tests {
         )
         .unwrap();
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
-        write_lockfile(&lock_path, &approved).unwrap();
+        write_lockfile(&lock_path, &approved, &inert_policy()).unwrap();
 
         assert_eq!(lock_for_root(repo.path(), false, false), 0);
         let refreshed = mcp_lock::load_lockfile(&lock_path).unwrap();
@@ -2158,7 +2261,7 @@ mod tests {
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
-        write_lockfile(&lock_path, &lockfile).expect("write");
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).expect("write");
         repo
     }
 
@@ -2253,6 +2356,7 @@ mod tests {
         write_lockfile(
             &repo.path().join(".tirith").join(MCP_LOCK_FILENAME),
             &McpLockfile::from_inventory(&inventory),
+            &inert_policy(),
         )
         .unwrap();
 
@@ -2348,7 +2452,7 @@ mod tests {
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
-        write_lockfile(&lock_path, &lockfile).expect("write");
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).expect("write");
         repo
     }
 
@@ -2469,7 +2573,7 @@ mod tests {
         let inventory = mcp_lock::build_inventory(repo.path());
         let lockfile = McpLockfile::from_inventory(&inventory);
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
-        write_lockfile(&lock_path, &lockfile).unwrap();
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).unwrap();
         let code = policy_init_for_root(repo.path(), false, false);
         assert_eq!(code, 0);
         let body = fs::read_to_string(repo.path().join(".tirith").join("mcp-policy.yaml.example"))
@@ -2505,7 +2609,7 @@ mod tests {
         };
         let lockfile = McpLockfile::from_inventory(&inv);
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
-        write_lockfile(&lock_path, &lockfile).unwrap();
+        write_lockfile(&lock_path, &lockfile, &inert_policy()).unwrap();
 
         let code = policy_init_for_root(repo.path(), false, false);
         assert_eq!(code, 0);
@@ -2949,5 +3053,101 @@ mod tests {
             "the rejected path must appear in the rendered line: {}",
             lines[0],
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_lock_refuses_symlinked_directory_without_outside_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join(".tirith")).unwrap();
+
+        assert!(acquire_mutation_lock(root.path()).is_err());
+        assert!(!outside.path().join(".mcp-lock.mutation.lock").exists());
+    }
+
+    #[test]
+    fn mutation_lock_policy_deny_creates_no_directory_or_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let mut policy = policy::Policy::default();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_denied_for_untrusted_sources
+            .insert(tirith_core::effects::CommandEffectKind::PolicyChange);
+
+        let error = match acquire_mutation_lock_with_policy(root.path(), &policy) {
+            Ok(_) => panic!("PolicyChange deny must happen before lock creation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!root.path().join(".tirith").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_lock_refuses_a_final_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let config = root.path().join(".tirith");
+        fs::create_dir(&config).unwrap();
+        fs::write(outside.path(), b"outside\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), config.join(".mcp-lock.mutation.lock")).unwrap();
+
+        assert!(
+            acquire_mutation_lock(root.path()).is_err(),
+            "a retained lock must never follow its final component"
+        );
+        assert_eq!(fs::read(outside.path()).unwrap(), b"outside\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_lock_and_data_capability_cannot_split_after_parent_swap() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".tirith");
+        let displaced = root.path().join(".tirith-displaced");
+        fs::create_dir(&config).unwrap();
+        let guard = acquire_mutation_lock(root.path()).unwrap();
+        fs::rename(&config, &displaced).unwrap();
+        fs::create_dir(&config).unwrap();
+
+        let lock_path = config.join(MCP_LOCK_FILENAME);
+        let lockfile = McpLockfile::from_inventory(&McpInventory::default());
+        let destination = guard.publication_destination().unwrap();
+        write_lockfile_prepared(&lock_path, destination, &lockfile, &inert_policy())
+            .expect_err("a replacement visible parent must not split lock and data authority");
+
+        assert!(!lock_path.exists());
+        assert!(!displaced.join(MCP_LOCK_FILENAME).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_lock_remains_serialized_after_legacy_sidecar_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let first = acquire_mutation_lock(root.path()).unwrap();
+        let config = root.path().join(".tirith");
+        let sidecar = config.join(".mcp-lock.mutation.lock");
+        fs::write(&sidecar, b"decoy").unwrap();
+        fs::rename(&sidecar, config.join("displaced.lock")).unwrap();
+        fs::write(&sidecar, b"replacement").unwrap();
+
+        let root_path = root.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let acquired = acquire_mutation_lock(&root_path);
+            sender.send(acquired.is_ok()).unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap());
+        contender.join().unwrap();
     }
 }

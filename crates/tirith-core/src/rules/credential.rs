@@ -17,7 +17,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 
 use crate::extract::ScanContext;
-use crate::rules::shared::SENSITIVE_KEY_VARS;
+use crate::sensitive_assets::{DetectionContext as SensitiveDetectionContext, SensitiveAssetKind};
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -37,8 +37,6 @@ struct PatternDef {
     regex: String,
     #[allow(dead_code)]
     tier1_fragment: String,
-    #[allow(dead_code)]
-    redact_prefix_len: Option<usize>,
     #[allow(dead_code)]
     severity: String,
 }
@@ -104,17 +102,14 @@ static GENERIC_SECRET_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("GENERIC_SECRET_RE compile")
 });
 
-/// Check text for credential leaks. Known provider/private-key patterns are
-/// deterministic and safe in every context; generic entropy remains Paste-only.
+/// Check text for credential leaks. Deterministic provider and structural
+/// patterns run in every context; generic entropy remains Paste-only.
 pub fn check(input: &str, shell: ShellType, context: ScanContext) -> Vec<Finding> {
     let mut findings = Vec::new();
 
-    findings.extend(check_known_patterns(
-        input,
-        shell,
-        !matches!(context, ScanContext::FileScan),
-    ));
+    findings.extend(check_known_patterns(input, shell, context));
     findings.extend(check_private_keys(input));
+    findings.extend(check_structural_secrets(input, context));
 
     if matches!(context, ScanContext::Paste) {
         findings.extend(check_generic_secrets(input));
@@ -123,11 +118,96 @@ pub fn check(input: &str, shell: ShellType, context: ScanContext) -> Vec<Finding
     findings
 }
 
-fn check_known_patterns(input: &str, shell: ShellType, suppress_env_export: bool) -> Vec<Finding> {
+fn check_structural_secrets(input: &str, context: ScanContext) -> Vec<Finding> {
+    let context = match context {
+        ScanContext::Exec => SensitiveDetectionContext::Exec,
+        ScanContext::Paste => SensitiveDetectionContext::Paste,
+        ScanContext::FileScan => SensitiveDetectionContext::FileScan,
+    };
+    let scan = crate::sensitive_assets::observations_with_status(input, context);
+    let mut seen = HashSet::new();
+    let mut findings = Vec::new();
+    for observation in scan.observations {
+        if !seen.insert(observation.kind) {
+            continue;
+        }
+        let finding = match observation.kind {
+            SensitiveAssetKind::EvmPrivateKey => Some(structural_secret_finding(
+                "EVM private key detected",
+                "A validated non-zero secp256k1 private scalar was found in an explicit signer/key context.",
+                "validated EVM private scalar",
+            )),
+            SensitiveAssetKind::Bip39Mnemonic => Some(structural_secret_finding(
+                "BIP-39 recovery phrase detected",
+                "A recovery phrase with an allowed word count, the pinned English wordlist, and a valid BIP-39 checksum was found.",
+                "validated BIP-39 mnemonic",
+            )),
+            SensitiveAssetKind::SolanaKeypair => Some(structural_secret_finding(
+                "Solana keypair detected",
+                "A 64-byte Solana keypair whose public half matches its Ed25519 secret half was found.",
+                "validated Solana keypair",
+            )),
+            SensitiveAssetKind::EncryptedKeystore => Some(Finding {
+                rule_id: RuleId::CredentialInText,
+                severity: Severity::High,
+                title: "Encrypted wallet keystore detected".to_string(),
+                description: "An encrypted wallet keystore is sensitive local material. Encryption lowers immediate key exposure but does not make sharing it safe.".to_string(),
+                evidence: vec![Evidence::Text {
+                    detail: "validated encrypted keystore JSON shape".to_string(),
+                }],
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }),
+            _ => None,
+        };
+        if let Some(finding) = finding {
+            findings.push(finding);
+        }
+    }
+    if scan.incomplete {
+        findings.push(Finding {
+            rule_id: RuleId::AnalysisIncomplete,
+            severity: Severity::High,
+            title: "BIP-39 recovery-phrase analysis exceeded its safety budget".to_string(),
+            description: "The input exceeded Tirith's bounded BIP-39 input, word-token, checksum-candidate, or match budget. Tirith blocks instead of treating a partially scanned recovery phrase as safe.".to_string(),
+            evidence: vec![Evidence::Text {
+                detail: "bounded BIP-39 analysis incomplete".to_string(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+    findings
+}
+
+fn structural_secret_finding(title: &str, description: &str, detail: &str) -> Finding {
+    Finding {
+        rule_id: RuleId::PrivateKeyExposed,
+        severity: Severity::Critical,
+        title: title.to_string(),
+        description: description.to_string(),
+        evidence: vec![Evidence::Text {
+            detail: detail.to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
+fn check_known_patterns(input: &str, shell: ShellType, context: ScanContext) -> Vec<Finding> {
     let mut findings = Vec::new();
     for pat in KNOWN_PATTERNS.iter() {
         for m in pat.regex.find_iter(input) {
-            if suppress_env_export && is_covered_by_env_export(input, &m, shell) {
+            // Exec/Paste companion command rules emit SensitiveEnvExport. A
+            // FileScan has no command-rule producer, so suppressing here would
+            // erase the only deterministic credential finding.
+            if context != ScanContext::FileScan && is_covered_by_env_export(input, &m, shell) {
                 continue;
             }
             // AWS access keys legitimately appear in SigV4 pre-signed URLs /
@@ -212,8 +292,9 @@ fn check_generic_secrets(input: &str) -> Vec<Finding> {
 }
 
 /// Suppress a credential match already covered by `SensitiveEnvExport` — i.e.
-/// behind `export VAR=` / `env VAR=` / fish `set ... VAR` where `VAR` is in
-/// `SENSITIVE_KEY_VARS`. Avoids double-reporting.
+/// behind `export VAR=` / `env VAR=` / fish `set ... VAR` where `VAR` is
+/// classified as secret-bearing by the central exact/prefix registry. Avoids
+/// double-reporting.
 fn is_covered_by_env_export(input: &str, m: &regex::Match<'_>, shell: ShellType) -> bool {
     // First bind the regex match to its actual executable shell segment. This
     // prevents text such as `echo env VAR=<secret> | nc ...` from borrowing an
@@ -239,25 +320,27 @@ fn is_covered_by_env_export(input: &str, m: &regex::Match<'_>, shell: ShellType)
     };
 
     match command.as_str() {
-        "export" => export_assignment_is_argument(&seg.args, var, m.as_str()),
-        "env" => env_assignment_precedes_command(&seg.args, var, m.as_str()),
-        "set" => set_assignment_is_argument(&seg.args, var, m.as_str(), space_form),
+        "export" => export_assignment_is_argument(&seg.args, &var, m.as_str()),
+        "env" => env_assignment_precedes_command(&seg.args, &var, m.as_str()),
+        "set" => set_assignment_is_argument(&seg.args, &var, m.as_str(), space_form),
         _ => false,
     }
 }
 
-fn sensitive_assignment_before_match(prefix: &str) -> Option<(&'static str, bool)> {
+fn sensitive_assignment_before_match(prefix: &str) -> Option<(String, bool)> {
     let trimmed = prefix.trim_end();
-    for var in SENSITIVE_KEY_VARS.iter().copied() {
-        if [format!("{var}="), format!("{var}='"), format!("{var}=\"")]
-            .iter()
-            .any(|suffix| trimmed.ends_with(suffix))
-        {
-            return Some((var, false));
+    let token = trimmed.split_whitespace().last().unwrap_or(trimmed);
+    for suffix in ["='", "=\"", "="] {
+        if let Some(var) = token.strip_suffix(suffix) {
+            if crate::sensitive_assets::is_sensitive_env_name(var) {
+                return Some((var.to_string(), false));
+            }
         }
-        if prefix.ends_with(&format!("{var} ")) {
-            return Some((var, true));
-        }
+    }
+    if prefix.chars().last().is_some_and(char::is_whitespace)
+        && crate::sensitive_assets::is_sensitive_env_name(token)
+    {
+        return Some((token.to_string(), true));
     }
     None
 }
@@ -1292,11 +1375,118 @@ mod tests {
     }
 
     #[test]
-    fn file_scan_known_credential_is_detected_once() {
+    fn deterministic_patterns_run_in_file_scan_but_entropy_does_not() {
         let input = "AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Posix, ScanContext::FileScan);
-        assert_eq!(findings.len(), 1, "FileScan owns credential scanning once");
-        assert_eq!(findings[0].rule_id, RuleId::CredentialInText);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.rule_id == RuleId::CredentialInText)
+                .count(),
+            1,
+            "FileScan must own the deterministic provider finding exactly once: {findings:?}"
+        );
+        let entropy = check(
+            r#"secret_key = \"xK9mP2vL7nR4wQ8jF3hB6dT1yC5uA0eG\""#,
+            ShellType::Posix,
+            ScanContext::FileScan,
+        );
+        assert!(entropy
+            .iter()
+            .all(|finding| finding.rule_id != RuleId::HighEntropySecret));
+    }
+
+    #[test]
+    fn file_scan_keeps_provider_credentials_inside_shell_assignments() {
+        for input in [
+            "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+            "env AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE command",
+            "set -gx AWS_ACCESS_KEY_ID AKIAIOSFODNN7EXAMPLE",
+            "export AWS_SECRET_C04=AKIAIOSFODNN7EXAMPLE",
+        ] {
+            let findings = check(input, ShellType::Posix, ScanContext::FileScan);
+            assert_eq!(
+                findings
+                    .iter()
+                    .filter(|finding| finding.rule_id == RuleId::CredentialInText)
+                    .count(),
+                1,
+                "FileScan must retain exactly one deterministic provider finding: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_rpc_endpoint_assignment_is_not_a_credential() {
+        let findings = check(
+            "export RPC_URL=https://rpc.example",
+            ShellType::Posix,
+            ScanContext::FileScan,
+        );
+        assert!(findings.iter().all(|finding| !matches!(
+            finding.rule_id,
+            RuleId::CredentialInText | RuleId::HighEntropySecret
+        )));
+    }
+
+    #[test]
+    fn web3_structural_findings_never_include_secret_values() {
+        let key = format!("0x{}1", "0".repeat(63));
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let input = format!("PRIVATE_KEY={key}\nmnemonic={mnemonic}");
+        let findings = check(&input, ShellType::Posix, ScanContext::FileScan);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "EVM private key detected"));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "BIP-39 recovery phrase detected"));
+        let output = serde_json::to_string(&findings).unwrap();
+        assert!(!output.contains(&key));
+        assert!(!output.contains(mnemonic));
+        assert!(!format!("{findings:?}").contains(&key));
+    }
+
+    #[test]
+    fn checksum_valid_mnemonic_is_detected_and_redacted_in_exec_context() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let input = format!("cast wallet import deployer --mnemonic {mnemonic}");
+        let findings = check(&input, ShellType::Posix, ScanContext::Exec);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "BIP-39 recovery phrase detected"));
+        let output = serde_json::to_string(&findings).unwrap();
+        assert!(!output.contains(mnemonic), "{output}");
+        let redacted = crate::redact::redact(&input);
+        assert!(!redacted.contains(mnemonic));
+        assert!(!redacted.contains("abandon"));
+        assert!(!redacted.contains("about"));
+    }
+
+    #[test]
+    fn hostile_bip39_run_reports_analysis_incomplete_without_secret_evidence() {
+        let input =
+            "abandon ".repeat(crate::sensitive_assets::MAX_BIP39_CHECKSUM_CANDIDATES / 5 + 64);
+        let findings = check(&input, ShellType::Posix, ScanContext::FileScan);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+        let serialized = serde_json::to_string(&findings).unwrap();
+        assert!(!serialized.contains(&input));
+        assert!(!serialized.contains("abandon abandon"));
+    }
+
+    #[test]
+    fn encrypted_keystore_is_high_not_critical() {
+        let keystore = r#"{"version":3,"crypto":{"cipher":"aes-128-ctr","cipherparams":{"iv":"00000000000000000000000000000000"},"ciphertext":"0011","kdf":"scrypt","kdfparams":{"dklen":32,"salt":"00000000000000000000000000000000"},"mac":"0000000000000000000000000000000000000000000000000000000000000000"}}"#;
+        let findings = check(keystore, ShellType::Posix, ScanContext::FileScan);
+        assert!(findings.iter().any(|finding| {
+            finding.title == "Encrypted wallet keystore detected"
+                && finding.severity == Severity::High
+        }));
+        assert!(findings
+            .iter()
+            .all(|finding| finding.severity != Severity::Critical));
     }
 
     #[test]

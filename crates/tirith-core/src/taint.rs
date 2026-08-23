@@ -238,6 +238,8 @@ fn append_entry_unlocked(store: &Path, entry: &TaintEntry) -> std::io::Result<()
     let mut file = opts.open(store)?;
     let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
     writeln!(file, "{line}")?;
+    file.sync_data()?;
+    crate::util::fsync_parent_dir_logged(store, "taint store");
     Ok(())
 }
 

@@ -59,6 +59,9 @@ sudo dnf remove tirith
 ### Shell script install
 ```sh
 rm ~/.local/bin/tirith
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent
 ```
 
 ### Nix
@@ -86,7 +89,14 @@ rm -rf ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/tirith
 ```
 
 ### Manual
-Delete the `tirith` binary from your PATH.
+Delete the `tirith` binary from your PATH. On x86_64 Linux, also remove the
+matching root-owned helper if it was installed manually:
+
+```sh
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous
+sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent
+```
 
 ## Remove data
 
@@ -98,6 +108,9 @@ rm -rf ~/.config/tirith
 
 # Remove data (audit log, receipts, materialized hooks, last_trigger)
 rm -rf ~/.local/share/tirith
+
+# Optional: remove native package-approval keys after all Tirith installs are gone
+sudo rm -rf /etc/tirith/package-approval
 ```
 
 On macOS:

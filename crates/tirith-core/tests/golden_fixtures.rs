@@ -561,6 +561,20 @@ fn test_credential_fixtures() {
     eprintln!("Passed {count} credential fixtures");
 }
 
+/// C05 Web3 source-to-sink contracts. Kept in a dedicated file so later Web3
+/// parser and policy slices can extend the corpus without hiding the DLP
+/// source-only/sink-only boundary among the legacy command fixtures.
+#[test]
+fn test_web3_fixtures() {
+    let fixtures = load_fixtures("web3.toml");
+    let count = fixtures.len();
+    assert!(count > 0, "web3.toml must contain C05 boundary fixtures");
+    for fixture in &fixtures {
+        run_fixture(fixture);
+    }
+    eprintln!("Passed {count} Web3 fixtures");
+}
+
 #[test]
 fn test_codefile_fixtures() {
     let fixtures = load_fixtures("codefile.toml");
@@ -657,6 +671,7 @@ fn test_fixture_count() {
         "configfile.toml",
         "rendered.toml",
         "credential.toml",
+        "web3.toml",
         "codefile.toml",
         "threatintel.toml",
     ];
@@ -669,7 +684,36 @@ fn test_fixture_count() {
     );
 }
 
-/// Verify Tier 1 regex catches all rule-triggering fixtures.
+fn public_sensitive_asset_gate(input: &str) -> bool {
+    use tirith_core::sensitive_assets::{DetectionContext, SensitiveAssetRegistry};
+
+    // Mirror the public portion of the engine's central C04 registry gate. The
+    // registry owns symbolic secret references and structured secret values;
+    // reviewed path candidates are confirmed word-by-word so an unrelated path
+    // elsewhere in prose does not become a fabricated source-to-sink proof.
+    if !SensitiveAssetRegistry::observe(input, DetectionContext::Exec).is_empty() {
+        return true;
+    }
+    for shell in [
+        ShellType::Posix,
+        ShellType::Fish,
+        ShellType::PowerShell,
+        ShellType::Cmd,
+    ] {
+        for segment in tirith_core::tokenize::tokenize(input, shell) {
+            for word in segment.args {
+                if SensitiveAssetRegistry::classify_path(&word).is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Verify the combined production Tier-1 gates catch every rule-triggering
+/// fixture. C04 registry-owned wallet paths and symbolic environment references
+/// are deliberately not duplicated in PATTERN_TABLE.
 #[test]
 fn test_tier1_coverage() {
     let files = [
@@ -680,6 +724,7 @@ fn test_tier1_coverage() {
         "command.toml",
         "ecosystem.toml",
         "credential.toml",
+        "web3.toml",
     ];
 
     let mut missed = Vec::new();
@@ -695,6 +740,10 @@ fn test_tier1_coverage() {
                 "paste" => ScanContext::Paste,
                 _ => continue,
             };
+            let shell = fixture
+                .shell
+                .parse::<ShellType>()
+                .unwrap_or(ShellType::Posix);
 
             // Paste: byte scan catches bidi/zero-width/etc., bypassing the tier-1 regex.
             if scan_context == ScanContext::Paste {
@@ -737,9 +786,11 @@ fn test_tier1_coverage() {
                 }
             }
 
-            let regex_triggered = tirith_core::extract::tier1_scan(&fixture.input, scan_context);
+            let regex_triggered =
+                tirith_core::extract::tier1_scan_for_shell(&fixture.input, scan_context, shell);
+            let sensitive_asset_triggered = public_sensitive_asset_gate(&fixture.input);
 
-            if !regex_triggered {
+            if !regex_triggered && !sensitive_asset_triggered {
                 missed.push(format!(
                     "{}:{} (expected {})",
                     filename, fixture.name, fixture.expected_action
@@ -771,6 +822,7 @@ const ALL_FIXTURE_FILES: &[&str] = &[
     "configfile.toml",
     "rendered.toml",
     "credential.toml",
+    "web3.toml",
     "codefile.toml",
     "cifile.toml",
     "aifile.toml",
@@ -962,6 +1014,10 @@ const ALL_RULE_IDS: &[&str] = &[
     "prompt_injection_obfuscated",
     // Output-side data-exfiltration rule (C7)
     "output_data_exfiltration",
+    // C10 — Web3 execution-boundary rules.
+    "web3_state_changing_command",
+    "web3_signer_risk",
+    "web3_network_policy_violation",
     // Output-side bounded-analysis gap (R2)
     "output_analysis_overflow",
     // Operational-context rules (M8 ch1)
@@ -1119,9 +1175,15 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "command_network_deny",
     "license_required",
     "custom_rule_match", // requires custom_rules in policy (Team-only)
-    "server_cloaking",   // requires network fetch (Unix-only)
-    "clipboard_hidden",  // requires --html clipboard input
-    "pdf_hidden_text",   // requires .pdf file input
+    // C10 — requires a trusted `web3_guard` declaring networks, denied
+    // endpoints, or allowed signers. A fixture cannot supply one: a
+    // repository-scope policy has its grants neutralized by design, which is
+    // the whole point of C07. Covered by unit tests in `rules::web3_gate`,
+    // including the boundary that an UNCLASSIFIED endpoint is not a violation.
+    "web3_network_policy_violation",
+    "server_cloaking",  // requires network fetch (Unix-only)
+    "clipboard_hidden", // requires --html clipboard input
+    "pdf_hidden_text",  // requires .pdf file input
     // requires >4096 scanner hits in one output stream (unit-tested in
     // rules/output.rs and extract.rs)
     "output_analysis_overflow",
@@ -1594,6 +1656,8 @@ rule_id_variant_registry! {
     OutputDataExfiltration,
     // Output-side bounded-analysis gap (R2)
     OutputAnalysisOverflow,
+    // Web3 execution-boundary rules (C10)
+    Web3StateChangingCommand, Web3SignerRisk, Web3NetworkPolicyViolation,
     // Operational-context rules (M8 ch1)
     ContextProdDestructiveCommand, ContextProdWriteOperation, ContextProdCredentialChange,
     // SSH operational-context rules (M8 ch2)

@@ -13,7 +13,7 @@
 //! `$VAR` resolution: the empty-var-glob bug (`rm -rf "$EMPTY/"` → `rm -rf "/"`)
 //! is detected against an injected variable map, not `std::env` inside the
 //! detector, so tests avoid the libc `setenv` race (PR #125). Production callers
-//! pass a `std::env::vars()` snapshot via [`env_snapshot`].
+//! pass a `std::env::vars_os()` snapshot via [`env_snapshot`].
 
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
@@ -137,8 +137,13 @@ struct ParsedFsOp {
 /// Snapshot the process environment for the `env_map` parameter of
 /// [`cheap_check`] / [`simulate`]. Call ONCE in the caller (never inside the
 /// detector) so the detector stays pure and testable.
+///
+/// Non-UTF-8 keys/values are omitted. `std::env::vars()` panics on them
+/// (MSRV 1.83), which would turn a host env byte into an analysis crash.
 pub fn env_snapshot() -> HashMap<String, String> {
-    std::env::vars().collect()
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
 }
 
 const MAX_NESTED_COMMAND_DEPTH: usize = 8;

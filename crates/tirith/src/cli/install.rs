@@ -253,6 +253,14 @@ fn capture_package_manager_output_bounded(
 /// Streaming inherits the terminal (live progress; captured fields `None`);
 /// capture drains stdout/stderr into bounded projections for `--format json`.
 pub trait InstallRunner {
+    /// Validate and consume the exact package-manager execution authorization
+    /// before the caller creates its best-effort filesystem checkpoint. The
+    /// production runner retains the resulting non-clone permit until `run`;
+    /// test runners without a task boundary keep the compatibility default.
+    fn authorize_before_checkpoint(&self, _program: &str, _args: &[String]) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Run `program args...`. `capture` selects streaming vs capture. Only a
     /// launch failure is `Err`; after a successful spawn, capture/wait failures
     /// return `Ok` with categorical output and/or a `None` exit so the caller
@@ -270,9 +278,47 @@ pub trait InstallRunner {
 pub struct ProcessInstallRunner<'a> {
     executable: &'a InstallExecutableBinding,
     source_binding: &'a InstallSourceBinding,
+    execution: std::cell::RefCell<Option<PreparedPackageManagerExecution>>,
+    execution_permit: std::cell::RefCell<
+        Option<
+            tirith_core::task_boundary::TaskBoundaryPermit<
+                tirith_core::task_boundary::PackageManagerExecutionBoundary,
+            >,
+        >,
+    >,
 }
 
 impl InstallRunner for ProcessInstallRunner<'_> {
+    fn authorize_before_checkpoint(&self, program: &str, args: &[String]) -> std::io::Result<()> {
+        if self.execution_permit.borrow().is_some() {
+            return Err(std::io::Error::other(
+                "package-manager execution was authorized more than once",
+            ));
+        }
+        // These are pure/revalidation checks. A mismatch must neither create a
+        // checkpoint nor consume replay state.
+        self.source_binding.verify()?;
+        self.executable.verify_program(program)?;
+        let prepared_execution = self.execution.borrow_mut().take().ok_or_else(|| {
+            std::io::Error::other("package-manager execution authorization is unavailable")
+        })?;
+        let executable_sha256 = self.executable.sha256_hex();
+        let permit = authorize_package_manager_spawn(
+            prepared_execution,
+            program,
+            args,
+            &executable_sha256,
+            chrono::Utc::now(),
+        )
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "task authorization refused before package-manager checkpoint: {error}"
+            ))
+        })?;
+        *self.execution_permit.borrow_mut() = Some(permit);
+        Ok(())
+    }
+
     fn run(
         &self,
         program: &str,
@@ -308,6 +354,24 @@ impl InstallRunner for ProcessInstallRunner<'_> {
         // narrowest available revalidation-to-exec window.
         self.source_binding.verify()?;
         self.executable.verify_program(program)?;
+        let actual_argv = InstallArgv {
+            program: program.to_string(),
+            args: args.to_vec(),
+        };
+        let executable_sha256 = self.executable.sha256_hex();
+        let actual_binding =
+            InstallBoundaryBinding::from_execution(&actual_argv, Some(&executable_sha256));
+        let actual_operation = actual_binding.operation();
+        if !self
+            .execution_permit
+            .borrow()
+            .as_ref()
+            .is_some_and(|permit| permit.binds_operation(&actual_operation))
+        {
+            return Err(std::io::Error::other(
+                "package-manager execution permit does not bind the final spawn operation",
+            ));
+        }
         #[cfg(target_os = "linux")]
         if let Some(fd) = bound_fd {
             use std::os::unix::process::CommandExt as _;
@@ -324,21 +388,55 @@ impl InstallRunner for ProcessInstallRunner<'_> {
                 });
             }
         }
-        if capture {
-            // Stream and drain both pipes under a hard live-memory cap. A bare
-            // `Command::output` retains attacker-sized manager output before the
-            // final JSON projection gets a chance to bound it.
-            capture_package_manager_output_bounded(&mut command)
-        } else {
-            // Streaming (human) mode — child stdio inherits the terminal.
-            let mut child = command.spawn()?;
-            let exit_code = child.wait().ok().and_then(|status| status.code());
-            Ok(InstallRunOutput {
-                exit_code,
-                stdout: None,
-                stderr: None,
-            })
-        }
+        // `run_and_record` consumed the exact authorization before it created
+        // the checkpoint. Revalidation above closes the intervening race, then
+        // this sole spawn seam consumes the retained non-clone permit.
+        let execution_permit = self.execution_permit.borrow_mut().take().ok_or_else(|| {
+            std::io::Error::other(
+                "package-manager execution permit is unavailable at the spawn boundary",
+            )
+        })?;
+        run_authorized_package_manager_command(
+            &mut command,
+            capture,
+            execution_permit,
+            &actual_operation,
+        )
+    }
+}
+
+/// The only production package-manager process side-effect seam. Requiring the
+/// non-clone typed permit here makes it impossible for an authorization check
+/// to be performed and then discarded before the actual spawn.
+fn run_authorized_package_manager_command(
+    command: &mut Command,
+    capture: bool,
+    authorization: tirith_core::task_boundary::TaskBoundaryPermit<
+        tirith_core::task_boundary::PackageManagerExecutionBoundary,
+    >,
+    operation: &tirith_core::task_boundary::BoundaryOperation<'_>,
+) -> std::io::Result<InstallRunOutput> {
+    authorization
+        .authorize_effect_at(operation, chrono::Utc::now())
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "package-manager authorization expired or changed at spawn: {error}"
+            ))
+        })?;
+    if capture {
+        // Stream and drain both pipes under a hard live-memory cap. A bare
+        // `Command::output` retains attacker-sized manager output before the
+        // final JSON projection gets a chance to bound it.
+        capture_package_manager_output_bounded(command)
+    } else {
+        // Streaming (human) mode — child stdio inherits the terminal.
+        let mut child = command.spawn()?;
+        let exit_code = child.wait().ok().and_then(|status| status.code());
+        Ok(InstallRunOutput {
+            exit_code,
+            stdout: None,
+            stderr: None,
+        })
     }
 }
 
@@ -1740,6 +1838,428 @@ pub fn run(
 
 // package-manager form: npm / pip / cargo
 
+/// Exact, owned inputs for one typed `tirith install` transition.
+///
+/// The envelope carries the manager argv as a shell action so the Web3 grammar
+/// still contributes what it can derive; `boundary_effects` states what the
+/// TRANSITION itself does, which the argv grammar cannot tell you. Both feed one
+/// task authorization; nothing here re-implements effect inference.
+///
+/// The two transitions deliberately carry DIFFERENT effects. Analysis reaches a
+/// registry and nothing else: it installs nothing and writes nothing, so
+/// claiming an install effect there would refuse a read-only operation. The
+/// spawn is where the package is actually installed onto the disk. An operator
+/// who denies only `package_install` therefore keeps their analysis and loses
+/// the execution, which is the useful posture and would be unreachable if both
+/// gates asked the same question. Keeping the envelope and effects owned lets
+/// preparation and consumption independently reconstruct the exact same
+/// [`tirith_core::task_boundary::BoundaryOperation`] without a self-reference.
+struct InstallBoundaryBinding {
+    boundary: tirith_core::task_boundary::OwnedBoundary,
+    envelope: tirith_core::task::TaskEnvelopeInput,
+    boundary_effects: std::collections::BTreeSet<tirith_core::effects::CommandEffectKind>,
+}
+
+const PACKAGE_MANAGER_NETWORK_EFFECTS: &[tirith_core::effects::CommandEffectKind] =
+    &[tirith_core::effects::CommandEffectKind::NetworkEgress];
+const PACKAGE_MANAGER_EXECUTION_EFFECTS: &[tirith_core::effects::CommandEffectKind] = &[
+    tirith_core::effects::CommandEffectKind::PackageInstall,
+    tirith_core::effects::CommandEffectKind::NetworkEgress,
+    tirith_core::effects::CommandEffectKind::FilesystemWrite,
+];
+
+impl InstallBoundaryBinding {
+    fn from_argv(
+        boundary: tirith_core::task_boundary::OwnedBoundary,
+        argv: &InstallArgv,
+        boundary_effects: &[tirith_core::effects::CommandEffectKind],
+    ) -> Self {
+        Self {
+            boundary,
+            envelope: tirith_core::task_boundary::shell_envelope(&argv.display()),
+            boundary_effects: boundary_effects.iter().copied().collect(),
+        }
+    }
+
+    fn from_execution(argv: &InstallArgv, executable_sha256: Option<&str>) -> Self {
+        let mut binding = Self::from_argv(
+            tirith_core::task_boundary::OwnedBoundary::PackageManagerExecution,
+            argv,
+            PACKAGE_MANAGER_EXECUTION_EFFECTS,
+        );
+        let projection = serde_json::json!({
+            "binding_version": 1,
+            "manager_argv": {
+                "program": &argv.program,
+                "args": &argv.args,
+            },
+            "executable_sha256": executable_sha256,
+        });
+        let digest =
+            Sha256::digest(tirith_core::audit::canonical_json_for_hash(&projection).as_bytes());
+        binding.envelope.sources[0].content = format!(
+            "tirith-package-manager-execution:v1:sha256:{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        binding
+    }
+
+    /// Bind one exact registry request in addition to the complete package-
+    /// manager argv. The task envelope's source contains only a domain-
+    /// separated digest, so receipt projections bind the selected
+    /// ecosystem/name/version without exposing another copy of package input.
+    fn from_registry_request(
+        argv: &InstallArgv,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> Self {
+        let mut binding = Self::from_argv(
+            tirith_core::task_boundary::OwnedBoundary::PackageManagerNetwork,
+            argv,
+            PACKAGE_MANAGER_NETWORK_EFFECTS,
+        );
+        let projection = serde_json::json!({
+            "binding_version": 1,
+            "manager_argv": {
+                "program": &argv.program,
+                "args": &argv.args,
+            },
+            "registry_request": {
+                "ecosystem": ecosystem.to_string(),
+                "name": name,
+                "version": version,
+            },
+        });
+        let digest =
+            Sha256::digest(tirith_core::audit::canonical_json_for_hash(&projection).as_bytes());
+        binding.envelope.sources[0].content = format!(
+            "tirith-package-manager-registry-request:v1:sha256:{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        binding
+    }
+
+    fn operation(&self) -> tirith_core::task_boundary::BoundaryOperation<'_> {
+        tirith_core::task_boundary::BoundaryOperation {
+            boundary: self.boundary,
+            envelope: &self.envelope,
+            adapter: tirith_core::task::IngressAdapter::Unattributed,
+            boundary_effects: self.boundary_effects.clone(),
+        }
+    }
+}
+
+fn prepare_local_install_authorization<B: tirith_core::task_boundary::BoundaryMarker>(
+    binding: &InstallBoundaryBinding,
+    policy: &Policy,
+) -> Result<
+    tirith_core::task_boundary::PendingBoundaryAuthorization<B>,
+    tirith_core::task_boundary::BoundaryAuthorizationError,
+> {
+    let authorization =
+        tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<B>(
+            &binding.operation(),
+            &policy.task_gate,
+            &tirith_core::task_analysis::TaskAnalysisContext::default(),
+        );
+    let assessment = match &authorization {
+        Ok(pending) => Some(pending.assessment()),
+        Err(error) => error.assessment(),
+    };
+    if let Some(assessment) = assessment {
+        if let Err(error) = tirith_core::audit::log_task_boundary_assessment(assessment) {
+            tirith_core::audit::audit_diagnostic(format!(
+                "task-boundary audit append failed: {error}"
+            ));
+        }
+    }
+    authorization
+}
+
+/// Report a task-authorization refusal. `before` names the irreversible step
+/// that did not happen, in the caller's own words, because the two forms of
+/// `tirith install` reach different ones.
+///
+/// Written to stderr even under `--json`, matching the other pre-transition
+/// refusals. Callers that already hold a plan separately preserve the normal
+/// structured stdout envelope.
+fn report_install_authorization_refusal(
+    boundary: tirith_core::task_boundary::OwnedBoundary,
+    error: &tirith_core::task_boundary::BoundaryAuthorizationError,
+    before: &str,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> i32 {
+    let reason = error
+        .assessment()
+        .and_then(|assessment| assessment.refusal(false))
+        .map(str::to_owned)
+        .unwrap_or_else(|| error.to_string());
+    eprintln!(
+        "tirith install: task gate refused at the {} boundary before {}: {}",
+        boundary.token(),
+        before,
+        tirith_core::output::sanitize_human_field_with_compiled(&reason, compiled),
+    );
+    1
+}
+
+struct PreparedPackageManagerExecution {
+    binding: InstallBoundaryBinding,
+    authorization: tirith_core::task_boundary::PendingBoundaryAuthorization<
+        tirith_core::task_boundary::PackageManagerExecutionBoundary,
+    >,
+}
+
+fn consume_exact_authorization<B, F>(
+    authorization: tirith_core::task_boundary::PendingBoundaryAuthorization<B>,
+    operation: &tirith_core::task_boundary::BoundaryOperation<'_>,
+    consume: F,
+) -> Result<
+    tirith_core::task_boundary::TaskBoundaryPermit<B>,
+    tirith_core::task_boundary::BoundaryAuthorizationError,
+>
+where
+    B: tirith_core::task_boundary::BoundaryMarker,
+    F: FnOnce(
+        tirith_core::task_boundary::PendingBoundaryAuthorization<B>,
+    ) -> Result<
+        tirith_core::task_boundary::TaskBoundaryPermit<B>,
+        tirith_core::task_boundary::BoundaryAuthorizationError,
+    >,
+{
+    // Reject an operation swap BEFORE replay consumption. A valid one-time
+    // authorization remains usable when an internal caller supplies bad argv.
+    if !authorization.binds_operation(operation) {
+        return Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch);
+    }
+    let permit = consume(authorization)?;
+    if !permit.binds_operation(operation) {
+        return Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch);
+    }
+    Ok(permit)
+}
+
+fn authorize_package_manager_spawn(
+    prepared: PreparedPackageManagerExecution,
+    program: &str,
+    args: &[String],
+    executable_sha256: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<
+    tirith_core::task_boundary::TaskBoundaryPermit<
+        tirith_core::task_boundary::PackageManagerExecutionBoundary,
+    >,
+    tirith_core::task_boundary::BoundaryAuthorizationError,
+> {
+    let actual_argv = InstallArgv {
+        program: program.to_string(),
+        args: args.to_vec(),
+    };
+    let actual_binding =
+        InstallBoundaryBinding::from_execution(&actual_argv, Some(executable_sha256));
+    let actual_operation = actual_binding.operation();
+    // Check both the retained approved projection and the current spawn argv
+    // before `consume_default`; neither mismatch may burn replay state.
+    if !prepared
+        .authorization
+        .binds_operation(&prepared.binding.operation())
+        || !prepared.authorization.binds_operation(&actual_operation)
+    {
+        return Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch);
+    }
+    consume_exact_authorization(prepared.authorization, &actual_operation, |authorization| {
+        authorization.consume_default(now)
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryRequestIdentity {
+    ecosystem: Ecosystem,
+    name: String,
+    version: String,
+}
+
+impl RegistryRequestIdentity {
+    fn new(ecosystem: Ecosystem, name: &str, version: &str) -> Self {
+        Self {
+            ecosystem,
+            name: name.to_string(),
+            version: version.to_string(),
+        }
+    }
+}
+
+/// Non-forgeable authorization for exactly one registry transaction. The
+/// permit remains alive until this value is consumed by the only Tirith-owned
+/// registry adapter; no reusable boolean authorization state survives it.
+struct AuthorizedRegistrySession<'a> {
+    client: &'a dyn tirith_core::registry_api::RegistryClient,
+    binding: InstallBoundaryBinding,
+    request: RegistryRequestIdentity,
+    permit: tirith_core::task_boundary::TaskBoundaryPermit<
+        tirith_core::task_boundary::PackageManagerNetworkBoundary,
+    >,
+}
+
+impl<'a> AuthorizedRegistrySession<'a> {
+    fn gather_api_signals_exact(
+        self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> Result<
+        (
+            tirith_core::package_risk::ApiSignals,
+            tirith_core::package_risk::PackageExistence,
+        ),
+        tirith_core::task_boundary::BoundaryAuthorizationError,
+    > {
+        let Self {
+            client,
+            binding,
+            request,
+            permit,
+        } = self;
+        let actual = RegistryRequestIdentity::new(ecosystem, name, version);
+        let operation = binding.operation();
+        if actual != request {
+            return Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch);
+        }
+        permit.authorize_effect_at(&operation, chrono::Utc::now())?;
+        Ok(registry_api::gather_api_signals_exact(
+            client, ecosystem, name, version,
+        ))
+    }
+}
+
+struct AuthorizedRegistryResolver<'a> {
+    client: &'a dyn tirith_core::registry_api::RegistryClient,
+    policy: &'a Policy,
+    argv: InstallArgv,
+    #[cfg(test)]
+    authorization_attempts: std::cell::Cell<usize>,
+    refusal: std::cell::RefCell<Option<tirith_core::task_boundary::BoundaryAuthorizationError>>,
+}
+
+impl<'a> AuthorizedRegistryResolver<'a> {
+    fn new(
+        client: &'a dyn tirith_core::registry_api::RegistryClient,
+        policy: &'a Policy,
+        argv: &InstallArgv,
+    ) -> Self {
+        Self {
+            client,
+            policy,
+            argv: argv.clone(),
+            #[cfg(test)]
+            authorization_attempts: std::cell::Cell::new(0),
+            refusal: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn authorize_request(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> Result<AuthorizedRegistrySession<'a>, tirith_core::task_boundary::BoundaryAuthorizationError>
+    {
+        #[cfg(test)]
+        self.authorization_attempts
+            .set(self.authorization_attempts.get().saturating_add(1));
+        let binding =
+            InstallBoundaryBinding::from_registry_request(&self.argv, ecosystem, name, version);
+        let operation = binding.operation();
+        let permit = prepare_local_install_authorization::<
+            tirith_core::task_boundary::PackageManagerNetworkBoundary,
+        >(&binding, self.policy)
+        .and_then(|authorization| {
+            consume_exact_authorization(authorization, &operation, |authorization| {
+                authorization.consume_default(chrono::Utc::now())
+            })
+        })?;
+        Ok(AuthorizedRegistrySession {
+            client: self.client,
+            binding,
+            request: RegistryRequestIdentity::new(ecosystem, name, version),
+            permit,
+        })
+    }
+
+    fn resolve(
+        &self,
+        eco: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> tirith_core::package_risk::ApiSignals {
+        if self.refusal.borrow().is_some() {
+            return tirith_core::package_risk::ApiSignals::unavailable(
+                "registry request skipped because an earlier transaction authorization was refused",
+            );
+        }
+        let transaction = match self.authorize_request(eco, name, version) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                *self.refusal.borrow_mut() = Some(error);
+                return tirith_core::package_risk::ApiSignals::unavailable(
+                    "registry request skipped because task authorization was refused",
+                );
+            }
+        };
+        let (mut signals, existence) =
+            match transaction.gather_api_signals_exact(eco, name, version) {
+                Ok(result) => result,
+                Err(error) => {
+                    *self.refusal.borrow_mut() = Some(error);
+                    return tirith_core::package_risk::ApiSignals::unavailable(
+                        "registry request skipped because its exact authorization binding changed",
+                    );
+                }
+            };
+        use tirith_core::package_risk::{ApiProvenance, PackageExistence};
+        match &mut signals {
+            tirith_core::package_risk::ApiSignals::Available { provenance } => {
+                provenance.package_existence = existence;
+                let dc = tirith_core::dep_confusion::evaluate(eco, name, self.policy);
+                if dc.risk {
+                    provenance.dep_confusion = Some(dc);
+                }
+            }
+            tirith_core::package_risk::ApiSignals::Unavailable { .. }
+                if matches!(existence, PackageExistence::NotFound) =>
+            {
+                let mut provenance = ApiProvenance {
+                    source: eco.to_string(),
+                    package_name: Some(name.to_string()),
+                    package_existence: PackageExistence::NotFound,
+                    ..Default::default()
+                };
+                let dc = tirith_core::dep_confusion::evaluate(eco, name, self.policy);
+                if dc.risk {
+                    provenance.dep_confusion = Some(dc);
+                }
+                signals = tirith_core::package_risk::ApiSignals::Available { provenance };
+            }
+            _ => {}
+        }
+        signals
+    }
+}
+
+fn package_registry_transition_required(
+    use_online: bool,
+    registry_configuration_issue: Option<&str>,
+) -> bool {
+    use_online && registry_configuration_issue.is_none()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_package_manager(
     manager: PackageManager,
@@ -1815,6 +2335,9 @@ fn run_package_manager(
         args.to_vec()
     };
     let args = effective_args.as_slice();
+    // Resolve the effective online mode before preparing any network
+    // authorization. Offline analysis has no registry transition to authorize.
+    let use_online = online && !offline && !super::offline_env_active();
     let _policy_diagnostic_capture = tirith_core::policy::PolicyDiagnosticCapture::start();
     let policy = Policy::discover(cwd.as_deref());
     tirith_core::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
@@ -1844,7 +2367,6 @@ fn run_package_manager(
     // --- ANALYZE ---
     // Offline by default; `--online` opts in, `--offline` / `TIRITH_OFFLINE`
     // overrides it. The resolver degrades any registry failure to `Unavailable`.
-    let use_online = online && !offline && !super::offline_env_active();
     let http_client = HttpRegistryClient::new();
     // Source ambiguity is a transaction property, not an online-resolver
     // property. Detect it even for the default offline analysis so strict
@@ -1853,39 +2375,23 @@ fn run_package_manager(
         .configuration_issue()
         .map(str::to_owned)
         .or_else(|| detect_registry_configuration_issue(manager, Some(&cwd_path)));
-    // M6 ch6 — fold `PackageExistence` into the provenance so the
-    // `PackageNotFoundInRegistry` gate can read it; an `Unavailable` with a
-    // positive 404 is upgraded to `Available` carrying only existence.
+    let will_use_registry =
+        package_registry_transition_required(use_online, registry_configuration_issue.as_deref());
+    let registry_resolver = will_use_registry.then(|| {
+        AuthorizedRegistryResolver::new(
+            &http_client,
+            &policy,
+            &install_txn::build_argv(manager, args),
+        )
+    });
+    // The planner invokes this only for an exact pinned artifact. Authorization
+    // preparation, replay consumption, and the actual HTTP request all happen
+    // inside that invocation; merely selecting `--online` burns nothing.
     let resolver = |eco: Ecosystem, name: &str, version: &str| {
-        let (mut signals, existence) =
-            registry_api::gather_api_signals_exact(&http_client, eco, name, version);
-        use tirith_core::package_risk::{ApiProvenance, PackageExistence};
-        match &mut signals {
-            tirith_core::package_risk::ApiSignals::Available { provenance } => {
-                provenance.package_existence = existence;
-                let dc = tirith_core::dep_confusion::evaluate(eco, name, &policy);
-                if dc.risk {
-                    provenance.dep_confusion = Some(dc);
-                }
-            }
-            tirith_core::package_risk::ApiSignals::Unavailable { .. }
-                if matches!(existence, PackageExistence::NotFound) =>
-            {
-                let mut prov = ApiProvenance {
-                    source: eco.to_string(),
-                    package_name: Some(name.to_string()),
-                    package_existence: PackageExistence::NotFound,
-                    ..Default::default()
-                };
-                let dc = tirith_core::dep_confusion::evaluate(eco, name, &policy);
-                if dc.risk {
-                    prov.dep_confusion = Some(dc);
-                }
-                signals = tirith_core::package_risk::ApiSignals::Available { provenance: prov };
-            }
-            _ => {}
-        }
-        signals
+        registry_resolver
+            .as_ref()
+            .expect("online resolver mode requires an authorized resolver session")
+            .resolve(eco, name, version)
     };
     let online_mode = if let Some(reason) = registry_configuration_issue.as_deref() {
         OnlineMode::UnverifiedSource(reason)
@@ -1909,6 +2415,17 @@ fn run_package_manager(
         &plan_request,
         source_binding.npm_project_manifest_gap(),
     );
+    if let Some(registry_resolver) = &registry_resolver {
+        let refusal = registry_resolver.refusal.borrow();
+        if let Some(error) = &*refusal {
+            return report_install_authorization_refusal(
+                tirith_core::task_boundary::OwnedBoundary::PackageManagerNetwork,
+                error,
+                "any registry request",
+                &output_dlp,
+            );
+        }
+    }
     if let Some(binding) = &executable_binding {
         plan.argv.program = binding.path().display().to_string();
         plan.analysis_command = plan.argv.display();
@@ -1953,7 +2470,8 @@ fn run_package_manager(
     // Decide the gate BEFORE the audit write so a `TIRITH=0`-bypassed BLOCK is
     // recorded as bypassed. `--no-exec` never installs (no gate); its exit still
     // mirrors the verdict (0 allow, 1 block, 2 warn) so a script can branch.
-    let decision = if no_exec {
+    let mut prepared_execution = None;
+    let mut decision = if no_exec {
         if !json {
             eprintln!(
                 "tirith install: --no-exec — analysis only, '{}' was NOT run.",
@@ -1966,8 +2484,83 @@ fn run_package_manager(
             Action::Warn | Action::WarnAck => ProceedDecision::Stop(2),
         }
     } else {
-        decide_proceed(&plan.verdict, &policy, interactive, yes, json)
+        // Prepare the owned execution authorization from the FINAL argv: this
+        // includes the executable path selected and fingerprinted above, not
+        // merely the package manager token the user supplied. Preparation is
+        // still pure. The pending value is carried through every remaining
+        // confirmation and platform/executable check and is consumed only in
+        // `run_and_record`, immediately before checkpoint/spawn.
+        let executable_sha256 = executable_binding
+            .as_ref()
+            .map(InstallExecutableBinding::sha256_hex);
+        let binding =
+            InstallBoundaryBinding::from_execution(&plan.argv, executable_sha256.as_deref());
+        match prepare_local_install_authorization::<
+            tirith_core::task_boundary::PackageManagerExecutionBoundary,
+        >(&binding, &policy)
+        {
+            Ok(authorization) => {
+                prepared_execution = Some(PreparedPackageManagerExecution {
+                    binding,
+                    authorization,
+                });
+                decide_proceed(&plan.verdict, &policy, interactive, yes, json)
+            }
+            Err(error) => {
+                report_install_authorization_refusal(
+                    binding.boundary,
+                    &error,
+                    "the package manager ran",
+                    &output_dlp,
+                );
+                ProceedDecision::Stop(1)
+            }
+        }
     };
+
+    // A RequireApproval outcome is not permission by itself. Reuse a real
+    // warning acknowledgement/`--yes` when one occurred; otherwise request a
+    // separate task-policy approval. Only then attach opaque evidence for this
+    // exact execution operation. TIRITH=0 alone never counts as approval.
+    if let ProceedDecision::Go = decision {
+        if let Some(prepared) = prepared_execution.take() {
+            if prepared.authorization.requires_approval() {
+                let PreparedPackageManagerExecution {
+                    binding,
+                    authorization,
+                } = prepared;
+                let approval = confirm_package_manager_task_approval(
+                    authorization.package_manager_approval_challenge(),
+                    &plan.argv,
+                    interactive,
+                    yes,
+                    json,
+                    &output_dlp,
+                );
+                match approval
+                    .and_then(|approval| authorization.with_package_manager_approval(approval))
+                {
+                    Ok(authorization) => {
+                        prepared_execution = Some(PreparedPackageManagerExecution {
+                            binding,
+                            authorization,
+                        });
+                    }
+                    Err(error) => {
+                        report_install_authorization_refusal(
+                            binding.boundary,
+                            &error,
+                            "the package manager ran",
+                            &output_dlp,
+                        );
+                        decision = ProceedDecision::Stop(1);
+                    }
+                }
+            } else {
+                prepared_execution = Some(prepared);
+            }
+        }
+    }
 
     // If the gate bypassed a BLOCK via `TIRITH=0`, stamp the verdict so the audit
     // records what happened (else it logs `bypass_honored: false`).
@@ -1978,9 +2571,16 @@ fn run_package_manager(
 
     // Audit regardless of the decision — the analysis happened. A failed write
     // is a non-fatal notice (a record, not a gate), not silent.
+    let manager_executable_audit = executable_binding
+        .as_ref()
+        .map(|binding| binding.sha256_hex())
+        .unwrap_or_else(|| "analysis-only".to_string());
     if let Err(e) = tirith_core::audit::log_verdict(
         &plan.verdict,
-        &format!("install {}", plan.analysis_command),
+        &format!(
+            "install {} [executable_sha256:{}]",
+            plan.analysis_command, manager_executable_audit
+        ),
         None,
         None,
         &policy.dlp_custom_patterns,
@@ -2046,9 +2646,17 @@ fn run_package_manager(
                 );
                 return 2;
             };
+            let Some(authorization) = prepared_execution else {
+                eprintln!(
+                    "tirith install: internal error: package-manager execution authorization is unavailable"
+                );
+                return 1;
+            };
             let runner = ProcessInstallRunner {
                 executable,
                 source_binding: &source_binding,
+                execution: std::cell::RefCell::new(Some(authorization)),
+                execution_permit: std::cell::RefCell::new(None),
             };
             run_and_record(
                 &plan,
@@ -2605,6 +3213,43 @@ fn decide_proceed(
     }
 }
 
+fn confirm_package_manager_task_approval(
+    challenge: tirith_core::task_boundary::PackageManagerApprovalChallenge,
+    argv: &InstallArgv,
+    interactive: bool,
+    yes: bool,
+    json: bool,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> Result<
+    tirith_core::task_boundary::PackageManagerApprovalChannel,
+    tirith_core::task_boundary::BoundaryAuthorizationError,
+> {
+    if yes {
+        return challenge.confirm_cli(
+            tirith_core::task_boundary::PackageManagerApprovalKind::Unattended,
+            "",
+        );
+    }
+    if !interactive {
+        if !json {
+            eprintln!(
+                "tirith install: task policy requires approval for '{}' — not installing in a non-interactive session. Re-run with --yes to approve.",
+                install_command_for_human_with_compiled(argv, compiled),
+            );
+        }
+        return Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalRequired);
+    }
+
+    let prompt = format!(
+        "tirith install: task policy requires approval to run '{}'. Proceed? [y/N] ",
+        install_command_for_human_with_compiled(argv, compiled),
+    );
+    challenge.confirm_cli(
+        tirith_core::task_boundary::PackageManagerApprovalKind::Interactive,
+        &prompt,
+    )
+}
+
 /// Take a before-install checkpoint, run the real install via `runner`, then
 /// report — the *record* and *run* steps.
 ///
@@ -2619,6 +3264,34 @@ fn run_and_record(
     compiled: &tirith_core::redact::CompiledCustomPatterns,
 ) -> i32 {
     let command_display = install_command_for_human_with_compiled(&plan.argv, compiled);
+    // Authorization is part of the install boundary; the checkpoint is a
+    // filesystem write. Do not mutate checkpoint state until the exact final
+    // argv has yielded a typed permit that the production runner will carry to
+    // the sole spawn seam.
+    if let Err(e) = runner.authorize_before_checkpoint(&plan.argv.program, &plan.argv.args) {
+        if !json {
+            eprintln!(
+                "tirith install: failed to authorize '{}': {}",
+                install_value_for_human_with_compiled(&plan.argv.program, compiled),
+                install_value_for_human_with_compiled(&e.to_string(), compiled),
+            );
+        } else {
+            let _ = emit_combined_json(
+                plan,
+                online,
+                Some(OutcomeRecord {
+                    ran: false,
+                    exit_code: None,
+                    checkpoint_id: None,
+                    stdout: None,
+                    stderr: None,
+                    spawn_error: Some(e.to_string()),
+                }),
+                compiled,
+            );
+        }
+        return 1;
+    }
     // --- RECORD: before-install checkpoint ---
     let checkpoint_id = match cwd {
         Some(dir) => {
@@ -2979,6 +3652,82 @@ fn run_url(
         emit_install_policy_diagnostics_human(&output_dlp);
     }
 
+    // C12: the SAME owned download-and-launch transition `tirith run` guards.
+    // Both spellings end in the typed authorized runner entry point immediately
+    // above `download_bounded`, so gating one and not the other would leave the
+    // second as a way to walk around an enforcing gate by swapping two words.
+    // The boundary token stays `remote_script_run` because the transition is the
+    // same one, not an `install`-flavoured cousin of it.
+    //
+    // Placed above the preflight print, the agent-rules pass, and the audit
+    // write: everything below has already resolved the policy but not yet
+    // contacted a host, so a refusal here costs nothing and reveals nothing. The
+    // policy is the snapshot `preflight_url` returned, so this shares the one
+    // discovery the rest of the function was built around instead of opening a
+    // second TOCTOU window.
+    let run_binding =
+        match runner::remote_run_boundary_binding(url, sha256.as_deref(), no_exec, None) {
+            Ok(binding) => binding,
+            Err(error) => {
+                if json {
+                    let _ = print_url_transaction_json(
+                        url,
+                        &preflight,
+                        None,
+                        Some(error.as_str()),
+                        &policy.dlp_custom_patterns,
+                    );
+                } else {
+                    let error = tirith_core::output::sanitize_human_field_with_compiled(
+                        &error,
+                        &output_dlp,
+                    );
+                    eprintln!("tirith install: invalid remote-script request: {error}");
+                }
+                return 1;
+            }
+        };
+    let run_operation = run_binding.operation();
+    let pending_authorization =
+        match tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<
+            tirith_core::task_boundary::RemoteScriptRunBoundary,
+        >(
+            &run_operation,
+            &policy.task_gate,
+            &tirith_core::task_analysis::TaskAnalysisContext::default(),
+        ) {
+            Ok(pending) => {
+                if let Err(error) =
+                    tirith_core::audit::log_task_boundary_assessment(pending.assessment())
+                {
+                    tirith_core::audit::audit_diagnostic(format!(
+                        "task-boundary audit append failed: {error}"
+                    ));
+                }
+                pending
+            }
+            Err(error) => {
+                if let Some(assessment) = error.assessment() {
+                    if let Err(audit_error) =
+                        tirith_core::audit::log_task_boundary_assessment(assessment)
+                    {
+                        tirith_core::audit::audit_diagnostic(format!(
+                            "task-boundary audit append failed: {audit_error}"
+                        ));
+                    }
+                }
+                return report_install_authorization_refusal(
+                    tirith_core::task_boundary::OwnedBoundary::RemoteScriptRun,
+                    &error,
+                    "any download",
+                    &output_dlp,
+                );
+            }
+        };
+    // What the gate refused tightens the capsule the downloaded script would run
+    // in, exactly as in `tirith run`. Empty unless the gate is enforcing.
+    let task_denied_effects = pending_authorization.assessment().enforced_denied_effects();
+
     // M4 item 8 chunk 3 — stamp the caller origin before the audit write, else
     // audit lines land in the "unknown" bucket.
     preflight.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
@@ -3082,7 +3831,22 @@ fn run_url(
         // executor as `tirith run`; there is no uncontained fallback.
         exec_fn: None,
     };
-    match runner::run_with_verified_executor(opts, Box::new(crate::cli::run::capsuled_exec)) {
+    let verified_executor: tirith_core::runner::VerifiedScriptExecutor =
+        Box::new(move |invocation, reviewed, authorizer| {
+            crate::cli::run::capsuled_exec_tightened(
+                invocation,
+                reviewed,
+                authorizer,
+                &task_denied_effects,
+            )
+        });
+    match runner::run_with_authorized_verified_executor(
+        opts,
+        None,
+        pending_authorization,
+        &run_operation,
+        verified_executor,
+    ) {
         Ok(result) => {
             let presentation_patterns =
                 tirith_core::policy::captured_policy_dlp_patterns_or(&policy.dlp_custom_patterns);
@@ -3710,7 +4474,7 @@ mod tests {
             );
         }
         assert!(!serialized.contains(&github));
-        assert_eq!(value["url"], "https://mainnet.infura.io/v3");
+        assert_eq!(value["url"], "https://infura.io/v3");
         let error = value["error"].as_str().unwrap();
         assert!(error.contains("[REDACTED:custom]"), "{error}");
         assert!(error.contains("[REDACTED:GitHub PAT]"), "{error}");
@@ -4037,14 +4801,18 @@ mod tests {
         /// Canned stdout/stderr for capture-mode tests.
         stdout: Option<String>,
         stderr: Option<String>,
+        execution: std::cell::RefCell<Option<PreparedPackageManagerExecution>>,
         seen: Mutex<Vec<(String, Vec<String>, bool)>>,
     }
+    const TEST_MANAGER_EXECUTABLE_SHA256: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
     impl FakeRunner {
         fn new(exit_code: Option<i32>) -> Self {
             Self {
                 exit_code,
                 stdout: None,
                 stderr: None,
+                execution: std::cell::RefCell::new(None),
                 seen: Mutex::new(Vec::new()),
             }
         }
@@ -4053,8 +4821,30 @@ mod tests {
             self.stderr = Some(stderr.to_string());
             self
         }
+        fn with_authorization(self, authorization: PreparedPackageManagerExecution) -> Self {
+            *self.execution.borrow_mut() = Some(authorization);
+            self
+        }
     }
     impl InstallRunner for FakeRunner {
+        fn authorize_before_checkpoint(
+            &self,
+            program: &str,
+            args: &[String],
+        ) -> std::io::Result<()> {
+            if let Some(authorization) = self.execution.borrow_mut().take() {
+                let _authorization = authorize_package_manager_spawn(
+                    authorization,
+                    program,
+                    args,
+                    TEST_MANAGER_EXECUTABLE_SHA256,
+                    chrono::Utc::now(),
+                )
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            }
+            Ok(())
+        }
+
         fn run(
             &self,
             program: &str,
@@ -4070,6 +4860,44 @@ mod tests {
                 stdout: if capture { self.stdout.clone() } else { None },
                 stderr: if capture { self.stderr.clone() } else { None },
             })
+        }
+    }
+
+    fn prepared_execution_for(
+        plan: &InstallPlan,
+        policy: &Policy,
+    ) -> PreparedPackageManagerExecution {
+        prepared_execution_for_argv(&plan.argv, policy)
+    }
+
+    fn prepared_execution_for_argv(
+        argv: &InstallArgv,
+        policy: &Policy,
+    ) -> PreparedPackageManagerExecution {
+        prepared_execution_for_argv_and_sha256(argv, policy, TEST_MANAGER_EXECUTABLE_SHA256)
+    }
+
+    fn prepared_execution_for_bound_executable(
+        argv: &InstallArgv,
+        policy: &Policy,
+        executable: &InstallExecutableBinding,
+    ) -> PreparedPackageManagerExecution {
+        prepared_execution_for_argv_and_sha256(argv, policy, &executable.sha256_hex())
+    }
+
+    fn prepared_execution_for_argv_and_sha256(
+        argv: &InstallArgv,
+        policy: &Policy,
+        executable_sha256: &str,
+    ) -> PreparedPackageManagerExecution {
+        let binding = InstallBoundaryBinding::from_execution(argv, Some(executable_sha256));
+        let authorization = prepare_local_install_authorization::<
+            tirith_core::task_boundary::PackageManagerExecutionBoundary,
+        >(&binding, policy)
+        .expect("test execution authorization must prepare");
+        PreparedPackageManagerExecution {
+            binding,
+            authorization,
         }
     }
 
@@ -4555,18 +5383,85 @@ mod tests {
             "sh".to_string(),
             marker.display().to_string(),
         ];
+        let argv = InstallArgv {
+            program: executable.path().display().to_string(),
+            args: args.clone(),
+        };
         let runner = ProcessInstallRunner {
             executable: &executable,
             source_binding: &source_binding,
+            execution: std::cell::RefCell::new(Some(prepared_execution_for_bound_executable(
+                &argv,
+                &Policy::default(),
+                &executable,
+            ))),
+            execution_permit: std::cell::RefCell::new(None),
         };
         let error = runner
             .run(executable.path().to_str().unwrap(), &args, true)
             .expect_err("the source race must stop the transaction before spawn");
         assert!(error.to_string().contains("appeared after analysis"));
         assert!(
+            runner.execution.borrow().is_some(),
+            "identity validation must fail before authorization/replay consumption"
+        );
+        assert!(
             !marker.exists(),
             "the child must not execute after the race"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_runner_rechecks_the_retained_permit_at_the_spawn_seam() {
+        let directory = tempfile::tempdir().unwrap();
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let executable = InstallExecutableBinding::from_trusted_for_test(
+            tirith_core::trusted_child::TrustedExecutable::from_absolute(&shell, &[]).unwrap(),
+        )
+        .unwrap();
+        let source_binding = InstallSourceBinding::capture(
+            PackageManager::Cargo,
+            Some(directory.path()),
+            &["demo".to_string()],
+        )
+        .unwrap();
+        let approved_marker = directory.path().join("approved-ran");
+        let substituted_marker = directory.path().join("substituted-ran");
+        let approved_args = vec![
+            "-c".to_string(),
+            format!("printf ran > '{}'", approved_marker.display()),
+        ];
+        let substituted_args = vec![
+            "-c".to_string(),
+            format!("printf ran > '{}'", substituted_marker.display()),
+        ];
+        let approved_argv = InstallArgv {
+            program: executable.path().display().to_string(),
+            args: approved_args.clone(),
+        };
+        let runner = ProcessInstallRunner {
+            executable: &executable,
+            source_binding: &source_binding,
+            execution: std::cell::RefCell::new(Some(prepared_execution_for_bound_executable(
+                &approved_argv,
+                &Policy::default(),
+                &executable,
+            ))),
+            execution_permit: std::cell::RefCell::new(None),
+        };
+        runner
+            .authorize_before_checkpoint(executable.path().to_str().unwrap(), &approved_args)
+            .unwrap();
+
+        let error = runner
+            .run(executable.path().to_str().unwrap(), &substituted_args, true)
+            .expect_err("substituted spawn argv used the retained permit");
+
+        assert!(error.to_string().contains("does not bind"));
+        assert!(runner.execution_permit.borrow().is_some());
+        assert!(!approved_marker.exists());
+        assert!(!substituted_marker.exists());
     }
 
     fn command_env(command: &Command, name: &str) -> Option<String> {
@@ -5226,12 +6121,24 @@ mod tests {
             &["demo".to_string()],
         )
         .unwrap();
-        let output = ProcessInstallRunner {
+        let argv = InstallArgv {
+            program: manager.display().to_string(),
+            args: Vec::new(),
+        };
+        let runner = ProcessInstallRunner {
             executable: &binding,
             source_binding: &source_binding,
-        }
-        .run(manager.to_str().unwrap(), &[], true)
-        .unwrap();
+            execution: std::cell::RefCell::new(Some(prepared_execution_for_bound_executable(
+                &argv,
+                &Policy::default(),
+                &binding,
+            ))),
+            execution_permit: std::cell::RefCell::new(None),
+        };
+        runner
+            .authorize_before_checkpoint(manager.to_str().unwrap(), &[])
+            .unwrap();
+        let output = runner.run(manager.to_str().unwrap(), &[], true).unwrap();
 
         assert_eq!(output.exit_code, Some(0));
         assert_eq!(output.stdout.as_deref(), Some("sibling-resource"));
@@ -5266,17 +6173,25 @@ mod tests {
             &["demo".to_string()],
         )
         .unwrap();
+        let args = vec!["-c".to_string(), "printf '%s' \"${0##*/}\"".to_string()];
+        let argv = InstallArgv {
+            program: cargo.display().to_string(),
+            args: args.clone(),
+        };
         let runner = ProcessInstallRunner {
             executable: &binding,
             source_binding: &source_binding,
+            execution: std::cell::RefCell::new(Some(prepared_execution_for_bound_executable(
+                &argv,
+                &Policy::default(),
+                &binding,
+            ))),
+            execution_permit: std::cell::RefCell::new(None),
         };
-        let output = runner
-            .run(
-                cargo.to_str().unwrap(),
-                &["-c".to_string(), "printf '%s' \"${0##*/}\"".to_string()],
-                true,
-            )
+        runner
+            .authorize_before_checkpoint(cargo.to_str().unwrap(), &args)
             .unwrap();
+        let output = runner.run(cargo.to_str().unwrap(), &args, true).unwrap();
         assert_eq!(output.exit_code, Some(0));
         assert_eq!(output.stdout.as_deref(), Some("cargo"));
 
@@ -5288,12 +6203,24 @@ mod tests {
         binding
             .verify_program_with_denied(cargo.to_str().unwrap(), &[])
             .expect("retargeting argv[0] metadata cannot change the retained launch identity");
-        let output = runner
-            .run(
-                cargo.to_str().unwrap(),
-                &["-c".to_string(), "printf '%s' \"${0##*/}\"".to_string()],
-                true,
-            )
+        // The first spawn consumed its one-shot permit. Re-authorize the same
+        // immutable executable binding for this second invocation; the path
+        // retarget must still be unable to change what the retained fd runs.
+        let retargeted_runner = ProcessInstallRunner {
+            executable: &binding,
+            source_binding: &source_binding,
+            execution: std::cell::RefCell::new(Some(prepared_execution_for_bound_executable(
+                &argv,
+                &Policy::default(),
+                &binding,
+            ))),
+            execution_permit: std::cell::RefCell::new(None),
+        };
+        retargeted_runner
+            .authorize_before_checkpoint(cargo.to_str().unwrap(), &args)
+            .unwrap();
+        let output = retargeted_runner
+            .run(cargo.to_str().unwrap(), &args, true)
             .unwrap();
         assert_eq!(output.exit_code, Some(0));
         assert_eq!(output.stdout.as_deref(), Some("cargo"));
@@ -5408,6 +6335,306 @@ mod tests {
     }
 
     #[test]
+    fn registry_authorization_is_only_needed_for_effective_online_resolution() {
+        assert!(package_registry_transition_required(true, None));
+        assert!(!package_registry_transition_required(false, None));
+        assert!(!package_registry_transition_required(
+            true,
+            Some("custom registry")
+        ));
+    }
+
+    #[test]
+    fn unpinned_online_plan_never_starts_or_consumes_registry_authorization() {
+        let client = HttpRegistryClient::new();
+        let policy = Policy::default();
+        let args = vec!["my-pkg".to_string()];
+        let argv = install_txn::build_argv(PackageManager::Npm, &args);
+        let session = AuthorizedRegistryResolver::new(&client, &policy, &argv);
+        let resolver =
+            |eco: Ecosystem, name: &str, version: &str| session.resolve(eco, name, version);
+        let request = PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &args,
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver(&resolver),
+        };
+
+        let _plan = install_txn::plan_install(&request);
+
+        assert_eq!(session.authorization_attempts.get(), 0);
+        assert!(session.refusal.borrow().is_none());
+    }
+
+    struct CountingRegistryClient {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl tirith_core::registry_api::RegistryClient for CountingRegistryClient {
+        fn fetch(
+            &self,
+            _ecosystem: Ecosystem,
+            _name: &str,
+        ) -> Result<
+            tirith_core::registry_api::RegistryMetadata,
+            tirith_core::registry_api::FetchError,
+        > {
+            unreachable!("the authorized install adapter always uses fetch_exact")
+        }
+
+        fn fetch_exact(
+            &self,
+            _ecosystem: Ecosystem,
+            name: &str,
+            version: &str,
+        ) -> Result<
+            tirith_core::registry_api::RegistryMetadata,
+            tirith_core::registry_api::FetchError,
+        > {
+            self.calls.set(self.calls.get().saturating_add(1));
+            Ok(tirith_core::registry_api::RegistryMetadata {
+                source: "npm".to_string(),
+                package_name: Some(name.to_string()),
+                latest_version: Some(version.to_string()),
+                selected_version: Some(version.to_string()),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn registry_session_rejects_changed_exact_request_before_client_fetch() {
+        let client = CountingRegistryClient {
+            calls: std::cell::Cell::new(0),
+        };
+        let argv = InstallArgv {
+            program: "npm".to_string(),
+            args: vec![
+                "install".to_string(),
+                "demo@1.0.0".to_string(),
+                "other@2.0.0".to_string(),
+            ],
+        };
+        let binding =
+            InstallBoundaryBinding::from_registry_request(&argv, Ecosystem::Npm, "demo", "1.0.0");
+        let operation = binding.operation();
+        let permit = prepare_local_install_authorization::<
+            tirith_core::task_boundary::PackageManagerNetworkBoundary,
+        >(&binding, &Policy::default())
+        .unwrap()
+        .consume_default_for_operation(&operation, chrono::Utc::now())
+        .unwrap();
+        let session = AuthorizedRegistrySession {
+            client: &client,
+            binding,
+            request: RegistryRequestIdentity::new(Ecosystem::Npm, "demo", "1.0.0"),
+            permit,
+        };
+
+        assert!(matches!(
+            session.gather_api_signals_exact(Ecosystem::Npm, "demo", "2.0.0"),
+            Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch)
+        ));
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn registry_authorization_binds_the_complete_package_set_and_exact_request() {
+        let approved_argv = InstallArgv {
+            program: "npm".to_string(),
+            args: vec![
+                "install".to_string(),
+                "demo@1.0.0".to_string(),
+                "other@2.0.0".to_string(),
+            ],
+        };
+        let changed_argv = InstallArgv {
+            program: "npm".to_string(),
+            args: vec![
+                "install".to_string(),
+                "demo@1.0.0".to_string(),
+                "replacement@2.0.0".to_string(),
+            ],
+        };
+        let approved = InstallBoundaryBinding::from_registry_request(
+            &approved_argv,
+            Ecosystem::Npm,
+            "demo",
+            "1.0.0",
+        );
+        let changed_set = InstallBoundaryBinding::from_registry_request(
+            &changed_argv,
+            Ecosystem::Npm,
+            "demo",
+            "1.0.0",
+        );
+        let changed_request = InstallBoundaryBinding::from_registry_request(
+            &approved_argv,
+            Ecosystem::Npm,
+            "demo",
+            "2.0.0",
+        );
+        let pending = prepare_local_install_authorization::<
+            tirith_core::task_boundary::PackageManagerNetworkBoundary,
+        >(&approved, &Policy::default())
+        .unwrap();
+
+        assert!(pending.binds_operation(&approved.operation()));
+        assert!(!pending.binds_operation(&changed_set.operation()));
+        assert!(!pending.binds_operation(&changed_request.operation()));
+    }
+
+    #[test]
+    fn registry_session_consumes_exact_request_once_at_typed_adapter() {
+        let client = CountingRegistryClient {
+            calls: std::cell::Cell::new(0),
+        };
+        let argv = InstallArgv {
+            program: "npm".to_string(),
+            args: vec!["install".to_string(), "demo@1.0.0".to_string()],
+        };
+        let policy = Policy::default();
+        let resolver = AuthorizedRegistryResolver::new(&client, &policy, &argv);
+
+        let signals = resolver.resolve(Ecosystem::Npm, "demo", "1.0.0");
+
+        assert!(matches!(
+            signals,
+            tirith_core::package_risk::ApiSignals::Available { .. }
+        ));
+        assert_eq!(resolver.authorization_attempts.get(), 1);
+        assert_eq!(client.calls.get(), 1);
+        assert!(resolver.refusal.borrow().is_none());
+    }
+
+    #[test]
+    fn operation_mismatch_is_rejected_before_replay_consumer_runs() {
+        let policy = Policy::default();
+        let approved_argv = InstallArgv {
+            program: "npm".to_string(),
+            args: vec!["install".to_string(), "approved".to_string()],
+        };
+        let changed_argv = InstallArgv {
+            program: "npm".to_string(),
+            args: vec!["install".to_string(), "changed".to_string()],
+        };
+        let approved_binding = InstallBoundaryBinding::from_argv(
+            tirith_core::task_boundary::OwnedBoundary::PackageManagerExecution,
+            &approved_argv,
+            PACKAGE_MANAGER_EXECUTION_EFFECTS,
+        );
+        let changed_binding = InstallBoundaryBinding::from_argv(
+            tirith_core::task_boundary::OwnedBoundary::PackageManagerExecution,
+            &changed_argv,
+            PACKAGE_MANAGER_EXECUTION_EFFECTS,
+        );
+        let authorization = prepare_local_install_authorization::<
+            tirith_core::task_boundary::PackageManagerExecutionBoundary,
+        >(&approved_binding, &policy)
+        .unwrap();
+        let consumer_calls = std::cell::Cell::new(0usize);
+
+        let result = consume_exact_authorization(
+            authorization,
+            &changed_binding.operation(),
+            |authorization| {
+                consumer_calls.set(consumer_calls.get() + 1);
+                authorization.consume_default(chrono::Utc::now())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalMismatch)
+        ));
+        assert_eq!(
+            consumer_calls.get(),
+            0,
+            "a binding mismatch must not reach replay consumption"
+        );
+    }
+
+    #[test]
+    fn package_manager_execution_approval_requires_the_real_cli_channel() {
+        let mut policy = Policy::default();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy.task_gate.action_incomplete_analysis =
+            tirith_core::web3_policy::Web3GuardAction::RequireApproval;
+        let argv = InstallArgv {
+            program: "ls".to_string(),
+            args: vec!["-la".to_string()],
+        };
+        let binding = InstallBoundaryBinding::from_argv(
+            tirith_core::task_boundary::OwnedBoundary::PackageManagerExecution,
+            &argv,
+            PACKAGE_MANAGER_EXECUTION_EFFECTS,
+        );
+        let pending = prepare_local_install_authorization::<
+            tirith_core::task_boundary::PackageManagerExecutionBoundary,
+        >(&binding, &policy)
+        .expect("incomplete execution should reach its typed approval channel");
+        assert!(pending.requires_approval());
+
+        let challenge = pending.package_manager_approval_challenge();
+        assert!(matches!(
+            challenge.confirm_cli(
+                tirith_core::task_boundary::PackageManagerApprovalKind::Unattended,
+                "",
+            ),
+            Err(tirith_core::task_boundary::BoundaryAuthorizationError::ApprovalRequired)
+        ));
+    }
+
+    #[test]
+    fn locally_derived_package_execution_fails_when_v2_provenance_is_required() {
+        let mut policy = Policy::default();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_requiring_verified_provenance
+            .insert(tirith_core::effects::CommandEffectKind::PackageInstall);
+        let argv = install_txn::build_argv(PackageManager::Npm, &["my-pkg".to_string()]);
+        let binding = InstallBoundaryBinding::from_argv(
+            tirith_core::task_boundary::OwnedBoundary::PackageManagerExecution,
+            &argv,
+            PACKAGE_MANAGER_EXECUTION_EFFECTS,
+        );
+
+        assert!(matches!(
+            prepare_local_install_authorization::<
+                tirith_core::task_boundary::PackageManagerExecutionBoundary,
+            >(&binding, &policy),
+            Err(tirith_core::task_boundary::BoundaryAuthorizationError::SchemaV2Required)
+        ));
+    }
+
+    #[test]
+    fn locally_derived_registry_access_fails_when_v2_provenance_is_required() {
+        let mut policy = Policy::default();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_requiring_verified_provenance
+            .insert(tirith_core::effects::CommandEffectKind::NetworkEgress);
+        let argv = install_txn::build_argv(PackageManager::Npm, &["my-pkg@1.0.0".to_string()]);
+        let binding = InstallBoundaryBinding::from_argv(
+            tirith_core::task_boundary::OwnedBoundary::PackageManagerNetwork,
+            &argv,
+            PACKAGE_MANAGER_NETWORK_EFFECTS,
+        );
+
+        assert!(matches!(
+            prepare_local_install_authorization::<
+                tirith_core::task_boundary::PackageManagerNetworkBoundary,
+            >(&binding, &policy),
+            Err(tirith_core::task_boundary::BoundaryAuthorizationError::SchemaV2Required)
+        ));
+    }
+
+    #[test]
     fn fake_runner_records_argv_and_never_spawns() {
         let req_args = vec!["my-pkg".to_string()];
         let argv = install_txn::build_argv(PackageManager::Npm, &req_args);
@@ -5432,6 +6659,90 @@ mod tests {
         assert!(
             seen[0].2,
             "JSON mode must request capture so child output is embedded"
+        );
+    }
+
+    #[test]
+    fn run_and_record_refuses_when_plan_changes_after_authorization() {
+        let req_args = vec!["my-pkg".to_string()];
+        let argv = install_txn::build_argv(PackageManager::Npm, &req_args);
+        let mut plan = InstallPlan {
+            manager: PackageManager::Npm,
+            argv: argv.clone(),
+            analysis_command: argv.display(),
+            packages: vec![],
+            verdict: allow_verdict(),
+            notes: vec![],
+            coverage: Default::default(),
+        };
+        let authorization = prepared_execution_for(&plan, &Policy::default());
+        plan.argv.args.push("unexpected-package".to_string());
+        let runner = FakeRunner::new(Some(0)).with_authorization(authorization);
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+
+        let code = run_and_record(&plan, None, false, false, &runner, &compiled);
+
+        assert_eq!(code, 1);
+        assert!(
+            runner.seen.lock().unwrap().is_empty(),
+            "a changed operation must be refused before spawn"
+        );
+    }
+
+    #[test]
+    fn authorization_refusal_precedes_checkpoint_creation() {
+        struct RefusingRunner;
+        impl InstallRunner for RefusingRunner {
+            fn authorize_before_checkpoint(
+                &self,
+                _program: &str,
+                _args: &[String],
+            ) -> std::io::Result<()> {
+                Err(std::io::Error::other("test authorization refusal"))
+            }
+
+            fn run(
+                &self,
+                _program: &str,
+                _args: &[String],
+                _capture: bool,
+            ) -> std::io::Result<InstallRunOutput> {
+                panic!("authorization refusal reached the spawn seam")
+            }
+        }
+
+        let _lock = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        let _state_guard = crate::cli::test_harness::EnvGuard::set("XDG_STATE_HOME", state.path());
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("tracked.txt"), b"before\n").unwrap();
+        let argv = install_txn::build_argv(PackageManager::Npm, &["my-pkg".to_string()]);
+        let plan = InstallPlan {
+            manager: PackageManager::Npm,
+            argv: argv.clone(),
+            analysis_command: argv.display(),
+            packages: vec![],
+            verdict: allow_verdict(),
+            notes: vec![],
+            coverage: Default::default(),
+        };
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+
+        let code = run_and_record(
+            &plan,
+            cwd.path().to_str(),
+            false,
+            false,
+            &RefusingRunner,
+            &compiled,
+        );
+
+        assert_eq!(code, 1);
+        assert!(
+            !tirith_core::checkpoint::checkpoints_dir().exists(),
+            "checkpoint state was written before execution authorization"
         );
     }
 
