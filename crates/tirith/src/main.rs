@@ -1732,7 +1732,7 @@ built-ins; configure them via `policy.share.customer_id_patterns`.
 
 Examples:
   tirith share --target llm ./fixture.log
-  tirith share --target public-paste --out /tmp/safe.log ./fixture.log
+  tirith share --target public-paste --out ./safe.log ./fixture.log
   tirith share --target github-issue --json ./fixture.log")]
     Share {
         /// File to redact. Use `-` (or omit) to read stdin.
