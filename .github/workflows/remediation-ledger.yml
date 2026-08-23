@@ -1,0 +1,49 @@
+name: Security remediation ledger
+
+on:
+  pull_request:
+    paths:
+      - "main.md"
+      - "docs/security/remediation/**"
+      - ".github/workflows/remediation-ledger.yml"
+  push:
+    branches: [main]
+    paths:
+      - "main.md"
+      - "docs/security/remediation/**"
+      - ".github/workflows/remediation-ledger.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remediation-ledger-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  structural:
+    name: Immutable source and ledger structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable sources, mappings, ownership, and lifecycle
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            python3 docs/security/remediation/validate_ledger.py --structural --base-ref "$BASE_SHA"
+          else
+            # No base commit to diff against (a first push has an empty
+            # `before`). Say so explicitly: the validator now refuses to skip
+            # append-only enforcement unless the caller states this.
+            python3 docs/security/remediation/validate_ledger.py --structural --allow-missing-base
+          fi
+      - name: Test candidate ancestry, tracker-only, and real-fix binding
+        run: python3 -m unittest discover -s docs/security/remediation/tests -p 'test_*.py'
+      - name: Verify generated human tracker
+        run: python3 docs/security/remediation/render_main.py --check
+      - name: Reject generated drift
+        run: git diff --exit-code -- main.md docs/security/remediation

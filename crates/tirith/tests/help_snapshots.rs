@@ -137,7 +137,7 @@ help_example_tests! {
     help_gateway_run_filter_output    => (["gateway", "run", "--help"], "--filter-output");
     help_gateway_run_filter_output_ex => (["gateway", "run", "--help"], "tirith gateway run --filter-output");
     help_mcp_server_sanitize          => (["mcp-server", "--help"], "--sanitize-tool-output");
-    help_mcp_server_sanitize_ex       => (["mcp-server", "--help"], "tirith mcp-server --sanitize-tool-output");
+    help_mcp_server_unsafe_ex         => (["mcp-server", "--help"], "tirith mcp-server --unsafe-unsanitized-tool-output");
     help_context         => (["context", "--help"], "tirith context status");
     help_context_status  => (["context", "status", "--help"], "tirith context status");
     help_context_guard   => (["context", "guard", "--help"], "tirith context guard on");

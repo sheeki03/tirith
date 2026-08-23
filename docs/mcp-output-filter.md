@@ -1,16 +1,18 @@
 # MCP output filter (M7 ch4)
 
-Tirith ships two opt-in surfaces for routing MCP tool results through the
+Tirith ships two surfaces for routing MCP output through the
 output-direction analyzer before they reach the calling agent:
 
 - `tirith gateway run --filter-output` — filters every guarded-tool response
   returned by an upstream MCP server the gateway is proxying.
-- `tirith mcp-server --sanitize-tool-output` — filters every tool result the
-  tirith MCP server itself produces before sending it back to the client.
+- `tirith mcp-server` — filters every tool result and `resources/read` body the
+  tirith MCP server itself produces before sending it back to the client. This
+  is the secure default; `--unsafe-unsanitized-tool-output` is an explicit
+  legacy compatibility escape hatch.
 
-Both flags are **opt-in**. Default behavior (no flag) preserves the
-pre-M7-ch4 pass-through. The chunk-4 commit is `feat(gateway,mcp):
---filter-output + --sanitize-tool-output (M7 ch4)`.
+Gateway filtering remains an explicit flag outside the secure profile. The
+local MCP server filters by default because its calling agent is a privileged
+consumer and repository-derived resource text is untrusted output.
 
 ## Protocol contract
 
@@ -85,24 +87,25 @@ The prepended notice has the shape:
 
 ## Fail-mode
 
-The two surfaces use different defaults:
-
-- `tirith gateway run --filter-output` — `fail_mode_closed = false`. An
-  analysis truncation past `MAX_SCAN_BYTES` (1 MiB) with no fired findings
-  passes through. Stricter behavior is the gateway's own `policy.fail_mode:
-  closed`; the output filter inherits its lane.
-- `tirith mcp-server --sanitize-tool-output` — `fail_mode_closed = true`.
-  Truncation degrades to Block. Stricter than the gateway default because the
-  calling agent is the highest-privilege consumer of these results.
+A Block decision is final once the filter is engaged: the gateway's
+`policy.fail_mode` governs separate response-lifecycle failures and never turns
+a detected injection or a malformed guarded tool result into an allow. Which
+findings block is a severity question, not a fail-mode one — Critical and High
+findings block and have their content replaced, Medium and Low findings warn
+and keep sanitized content, per the two sections above.
+`tirith mcp-server` engages the filter for tool and resource-read output by
+default. Only the explicitly named `--unsafe-unsanitized-tool-output`
+compatibility flag disables that local-server boundary.
 
 ## Scan cap and large payloads
 
-`MAX_SCAN_BYTES = 1 MiB`. The filter concatenates text items (joined with a
-NUL separator so a multi-item OSC payload split across items is not joined
-back into a single sequence) and analyzes the first 1 MiB. The remainder is
-never dropped — it remains in the unfiltered `content` items (warn path) or
-is replaced wholesale by the placeholder (block path). The `truncated` flag
-on the audit line records that scanning was incomplete.
+The streaming analyzer scans all content and structured string leaves that
+reach it; there is no per-call prefix that can leave a suffix uninspected.
+Transport limits bound the input before filtering (the gateway uses its
+configured `max_message_bytes`, and the local dispatcher caps a JSON-RPC line).
+The final presentation is also bounded and replaced by compact safe metadata
+when necessary. The audit `truncated` field refers to presentation bounding,
+not an incomplete security scan.
 
 Performance: sub-millisecond per call for payloads under the cap on typical
 agent output. The output ruleset is byte-stream-oriented and does not

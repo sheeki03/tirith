@@ -111,7 +111,7 @@ Inspected:
 
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
-| `tirith mcp-server` | Full | Runs tirith as an MCP server (7 tools) over JSON-RPC stdio; inspects tool inputs and, with --sanitize-tool-output, outputs. | Yes |
+| `tirith mcp-server` | Full | Runs tirith as an MCP server (7 tools) over JSON-RPC stdio; inspects tool inputs and sanitizes tool/resource-read outputs by default. | Yes |
 | `tirith mcp` | Full | Inventories and gates a repo's MCP servers into .tirith/mcp.lock; inspects tool descriptors, schemas, and per-capability surfaces. | Yes |
 | `tirith gateway` | Full | MCP gateway proxy that intercepts AI-agent tool calls; inspects requests and filters responses for injection and exfil. | Yes |
 | `tirith agent` | Partial | Caller-origin governance (human / agent / MCP / CI / IDE); an agent_rules.deny match forces a block. Inspects origin and rules, not payloads. | Yes |

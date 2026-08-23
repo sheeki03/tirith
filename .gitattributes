@@ -8,3 +8,11 @@ crates/tirith-core/assets/dashboard/template.html text eol=lf
 crates/tirith-core/assets/data/bip39_english.txt text eol=lf
 crates/tirith-core/assets/data/bip39_english.SOURCE text eol=lf
 docs/capability-manifest.toml text eol=lf
+
+# The remediation ledger's generated artifacts are digest-pinned the same way:
+# main.md embeds a SHA-256 of each schema, and validate_ledger.py compares the
+# rendered bytes. A CRLF checkout would break both. Same reason as above.
+/main.md text eol=lf
+docs/security/remediation/*.json text eol=lf
+docs/security/remediation/*.md text eol=lf
+docs/security/remediation/sources/*.md text eol=lf

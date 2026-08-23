@@ -61,7 +61,7 @@ pub(crate) fn tokenize_bounded(
         max_word_bytes,
     };
     match shell {
-        ShellType::Posix => tokenize_posix(input, true, limits),
+        ShellType::Posix => tokenize_posix(input, true, SingleQuoteStyle::Posix, limits),
         ShellType::Fish => tokenize_fish(input, limits),
         ShellType::PowerShell => tokenize_powershell(input, limits),
         ShellType::Cmd => tokenize_cmd(input, limits),
@@ -87,15 +87,21 @@ struct SegmentAccumulator {
     limits: TokenizeLimits,
     budget: TokenizeBudget,
     defer_word_parsing: bool,
+    single_quote_style: SingleQuoteStyle,
 }
 
 impl SegmentAccumulator {
-    fn new(limits: TokenizeLimits, defer_word_parsing: bool) -> Self {
+    fn new(
+        limits: TokenizeLimits,
+        defer_word_parsing: bool,
+        single_quote_style: SingleQuoteStyle,
+    ) -> Self {
         Self {
             values: Vec::with_capacity(limits.max_segments.min(64)),
             limits,
             budget: TokenizeBudget::default(),
             defer_word_parsing,
+            single_quote_style,
         }
     }
 
@@ -122,12 +128,19 @@ impl SegmentAccumulator {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SingleQuoteStyle {
+    Posix,
+    Fish,
+}
+
 fn tokenize_posix(
     input: &str,
     bash_function_names: bool,
+    single_quote_style: SingleQuoteStyle,
     limits: TokenizeLimits,
 ) -> (Vec<Segment>, TokenizeBudget) {
-    let mut segments = SegmentAccumulator::new(limits, false);
+    let mut segments = SegmentAccumulator::new(limits, false, single_quote_style);
     let mut current = String::new();
     let mut preceding_sep = None;
     let mut search_cursor: usize = 0;
@@ -167,6 +180,19 @@ fn tokenize_posix(
                 current.push(ch);
                 i += 1;
                 while i < len && chars[i] != '\'' {
+                    if single_quote_style == SingleQuoteStyle::Fish
+                        && chars[i] == '\\'
+                        && i + 1 < len
+                        && matches!(chars[i + 1], '\\' | '\'')
+                    {
+                        // Fish recognizes exactly two escapes inside single
+                        // quotes: `\\` and `\'`. In particular, an escaped
+                        // apostrophe does not terminate the quoted word.
+                        current.push(chars[i]);
+                        current.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
                     current.push(chars[i]);
                     i += 1;
                 }
@@ -228,6 +254,7 @@ fn tokenize_posix(
                             &current,
                             paren_depth,
                             bash_function_names,
+                            single_quote_style,
                         ))) =>
             {
                 let embedded_in_word = ends_with_unescaped_char(&current, '$', '\\');
@@ -415,7 +442,12 @@ fn posix_reserved_word_boundary_after(chars: &[char], index: usize) -> bool {
     })
 }
 
-fn opens_posix_brace_scope(current: &str, paren_depth: usize, bash_function_names: bool) -> bool {
+fn opens_posix_brace_scope(
+    current: &str,
+    paren_depth: usize,
+    bash_function_names: bool,
+    single_quote_style: SingleQuoteStyle,
+) -> bool {
     let trimmed = current.trim_end_matches(is_posix_syntax_whitespace);
     if trimmed.is_empty()
         || (paren_depth > 0
@@ -427,7 +459,7 @@ fn opens_posix_brace_scope(current: &str, paren_depth: usize, bash_function_name
         return true;
     }
 
-    let words = split_words(trimmed);
+    let words = split_words_with_style(trimmed, single_quote_style);
     if words
         .first()
         .is_some_and(|word| word.eq_ignore_ascii_case("coproc"))
@@ -523,9 +555,9 @@ fn looks_like_posix_function_header(raw: &str, bash_function_names: bool) -> boo
 }
 
 fn tokenize_fish(input: &str, limits: TokenizeLimits) -> (Vec<Segment>, TokenizeBudget) {
-    // Fish differs slightly from POSIX, but POSIX tokenization is close enough
-    // for URL extraction.
-    tokenize_posix(input, false, limits)
+    // Fish shares the control-operator grammar used by this bounded scanner,
+    // but unlike POSIX it accepts `\'` and `\\` within single-quoted words.
+    tokenize_posix(input, false, SingleQuoteStyle::Fish, limits)
 }
 
 /// Distinguish PowerShell's unary call operator from its postfix background
@@ -975,7 +1007,7 @@ fn normalize_powershell_segment_words(
 }
 
 fn tokenize_powershell(input: &str, limits: TokenizeLimits) -> (Vec<Segment>, TokenizeBudget) {
-    let mut segments = SegmentAccumulator::new(limits, true);
+    let mut segments = SegmentAccumulator::new(limits, true, SingleQuoteStyle::Posix);
     let mut current = String::new();
     let mut preceding_sep = None;
     let mut search_cursor: usize = 0;
@@ -1339,7 +1371,7 @@ fn tokenize_powershell(input: &str, limits: TokenizeLimits) -> (Vec<Segment>, To
 }
 
 fn tokenize_cmd(input: &str, limits: TokenizeLimits) -> (Vec<Segment>, TokenizeBudget) {
-    let mut segments = SegmentAccumulator::new(limits, false);
+    let mut segments = SegmentAccumulator::new(limits, false, SingleQuoteStyle::Posix);
     let mut current = String::new();
     let mut preceding_sep = None;
     let mut search_cursor: usize = 0;
@@ -1564,10 +1596,11 @@ fn push_segment_impl(
     let (command, args) = if segments.defer_word_parsing {
         (None, Vec::new())
     } else {
-        let (words, words_truncated, word_bytes_truncated) = split_words_bounded(
+        let (words, words_truncated, word_bytes_truncated) = split_words_bounded_with_style(
             trimmed,
             segments.limits.max_words_per_segment,
             segments.limits.max_word_bytes,
+            segments.single_quote_style,
         );
         let budget = WordBudget {
             words_truncated,
@@ -1672,6 +1705,15 @@ pub(crate) fn split_words_bounded(
     max_words: usize,
     max_word_bytes: usize,
 ) -> (Vec<String>, bool, bool) {
+    split_words_bounded_with_style(input, max_words, max_word_bytes, SingleQuoteStyle::Posix)
+}
+
+fn split_words_bounded_with_style(
+    input: &str,
+    max_words: usize,
+    max_word_bytes: usize,
+    single_quote_style: SingleQuoteStyle,
+) -> (Vec<String>, bool, bool) {
     let mut words = Vec::with_capacity(max_words.min(64));
     let mut current = String::new();
     let mut overflowed = false;
@@ -1722,6 +1764,28 @@ pub(crate) fn split_words_bounded(
                 );
                 i += 1;
                 while i < len && chars[i] != '\'' {
+                    if single_quote_style == SingleQuoteStyle::Fish
+                        && chars[i] == '\\'
+                        && i + 1 < len
+                        && matches!(chars[i + 1], '\\' | '\'')
+                    {
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            chars[i],
+                            max_word_bytes,
+                            &mut budget,
+                        );
+                        push_bounded_word_char(
+                            &mut current,
+                            &mut overflowed,
+                            chars[i + 1],
+                            max_word_bytes,
+                            &mut budget,
+                        );
+                        i += 2;
+                        continue;
+                    }
                     push_bounded_word_char(
                         &mut current,
                         &mut overflowed,
@@ -1833,6 +1897,10 @@ pub(crate) fn split_words_bounded(
 
 pub(crate) fn split_words(input: &str) -> Vec<String> {
     split_words_bounded(input, usize::MAX, usize::MAX).0
+}
+
+fn split_words_with_style(input: &str, single_quote_style: SingleQuoteStyle) -> Vec<String> {
+    split_words_bounded_with_style(input, usize::MAX, usize::MAX, single_quote_style).0
 }
 
 #[cfg(test)]
@@ -2485,6 +2553,68 @@ mod tests {
     fn test_single_quotes() {
         let segs = tokenize("echo 'hello | world' | bash", ShellType::Posix);
         assert_eq!(segs.len(), 2);
+    }
+
+    #[test]
+    fn fish_escaped_single_quote_keeps_controls_and_spaces_quoted() {
+        let inert = r#"printf '%s\n' 'safe\'; rm -rf /'"#;
+        let fish = tokenize(inert, ShellType::Fish);
+        assert_eq!(
+            fish.len(),
+            1,
+            "Fish quoted data became executable: {fish:?}"
+        );
+        assert_eq!(fish[0].command.as_deref(), Some("printf"));
+        assert_eq!(fish[0].args, vec![r#"'%s\n'"#, r#"'safe\'; rm -rf /'"#]);
+        assert_byte_ranges_match_raw(inert, &fish);
+
+        // POSIX does not recognize an escape inside single quotes. Pin the
+        // dialect distinction so a future cleanup cannot silently merge the
+        // scanners again.
+        let posix = tokenize(inert, ShellType::Posix);
+        assert_eq!(posix.len(), 2, "POSIX quote semantics changed: {posix:?}");
+        assert_eq!(posix[1].command.as_deref(), Some("rm"));
+
+        let spaced = r#"echo 'can\'t split' tail"#;
+        let fish = tokenize(spaced, ShellType::Fish);
+        assert_eq!(fish.len(), 1, "escaped quote split a Fish word: {fish:?}");
+        assert_eq!(fish[0].args, vec![r#"'can\'t split'"#, "tail"]);
+        assert_byte_ranges_match_raw(spaced, &fish);
+    }
+
+    #[test]
+    fn fish_single_quote_backslash_parity_preserves_real_suffixes() {
+        // Two backslashes form Fish's `\\` escape, so the following quote is
+        // a real closer and the destructive suffix remains executable.
+        let even = r#"printf '%s\n' 'safe\\'; rm -rf /"#;
+        let segments = tokenize(even, ShellType::Fish);
+        assert_eq!(
+            segments.len(),
+            2,
+            "real Fish suffix was hidden: {segments:?}"
+        );
+        assert_eq!(segments[1].command.as_deref(), Some("rm"));
+        assert_eq!(segments[1].preceding_separator.as_deref(), Some(";"));
+        assert_byte_ranges_match_raw(even, &segments);
+
+        // With three backslashes, Fish consumes `\\` and then `\'`; the
+        // semicolon is quoted data until the final apostrophe.
+        let odd = r#"printf '%s\n' 'safe\\\'; rm -rf /'"#;
+        let segments = tokenize(odd, ShellType::Fish);
+        assert_eq!(
+            segments.len(),
+            1,
+            "escaped Fish apostrophe exposed an inert suffix: {segments:?}"
+        );
+        assert_byte_ranges_match_raw(odd, &segments);
+
+        // An escaped apostrophe does not swallow a suffix after the actual
+        // closing quote.
+        let closed = r#"printf '%s\n' 'can\'t'; rm -rf /"#;
+        let segments = tokenize(closed, ShellType::Fish);
+        assert_eq!(segments.len(), 2, "closing quote was ignored: {segments:?}");
+        assert_eq!(segments[1].command.as_deref(), Some("rm"));
+        assert_byte_ranges_match_raw(closed, &segments);
     }
 
     #[test]

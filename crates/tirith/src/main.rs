@@ -1106,23 +1106,29 @@ Examples:
         after_help = "\
 Examples:
   tirith mcp-server
-  tirith mcp-server --sanitize-tool-output
+  tirith mcp-server --unsafe-unsanitized-tool-output
 
 Used by MCP client configurations to run tirith as a local tool server.
 
-`--sanitize-tool-output` (M7 ch4) routes every tool result through the
-output-direction analyzer before sending it back to the calling agent. Blocks
-on OSC52 / hyperlink-mismatch / hidden-text / fake-prompt; the agent receives
-a sanitized placeholder citing the audit event_id. Opt-in until field-tested;
-default is current behavior (pass through unchanged)."
+Tool and resource-read output is routed through the output-direction analyzer
+before reaching the calling agent. A high-severity finding blocks: OSC52
+clipboard writes and hyperlink mismatches among them, where the content is
+replaced by a safe placeholder citing the audit event_id. A medium-severity
+finding warns: hidden text and fake shell prompts among them, where the content
+is byte-sanitized and carries a notice citing the same event_id.
+`--unsafe-unsanitized-tool-output` restores the legacy pass-through only for
+compatibility and is not recommended."
     )]
     McpServer {
-        /// Route every tool result through the M7 output-direction analyzer.
-        /// Blocks on dangerous escape sequences (OSC52 clipboard write, OSC0/2
-        /// title rewrite, screen-clear, hyperlink mismatch, hidden text,
-        /// fake-prompt). Default is pass-through.
-        #[arg(long)]
+        /// Compatibility spelling retained from the former opt-in behavior.
+        /// Output sanitization is already enabled by default.
+        #[arg(long, conflicts_with = "unsafe_unsanitized_tool_output")]
         sanitize_tool_output: bool,
+
+        /// UNSAFE compatibility mode: forward tool/resource output without the
+        /// output-direction analyzer.
+        #[arg(long, conflicts_with = "sanitize_tool_output")]
+        unsafe_unsanitized_tool_output: bool,
     },
 
     /// Govern the MCP servers a repository declares
@@ -8252,8 +8258,9 @@ fn run() {
         } => cli::fix::run(&command, &shell, non_interactive, json),
 
         Commands::McpServer {
-            sanitize_tool_output,
-        } => cli::mcp_server::run(sanitize_tool_output),
+            sanitize_tool_output: _,
+            unsafe_unsanitized_tool_output,
+        } => cli::mcp_server::run(!unsafe_unsanitized_tool_output),
 
         Commands::Mcp { action } => match action {
             McpAction::Lock {

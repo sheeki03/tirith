@@ -134,7 +134,7 @@ pub struct ResourceReadParams {
     pub uri: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ResourceContent {
     pub uri: String,
     #[serde(rename = "mimeType")]

@@ -1,0 +1,491 @@
+{
+  "$defs": {
+    "commit": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "attempt": {
+      "additionalProperties": false,
+      "properties": {
+        "arch": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "base_sha": {
+          "$ref": "#/$defs/commit"
+        },
+        "command": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "date": {
+          "format": "date",
+          "type": "string"
+        },
+        "head_sha": {
+          "$ref": "#/$defs/commit"
+        },
+        "kind": {
+          "enum": [
+            "baseline",
+            "focused",
+            "benign",
+            "adversarial",
+            "platform",
+            "performance",
+            "ux",
+            "packaging",
+            "review",
+            "release"
+          ]
+        },
+        "log_or_attestation_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "merge_tree_sha": {
+          "$ref": "#/$defs/commit"
+        },
+        "os": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "os_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "result": {
+          "enum": [
+            "passed",
+            "failed",
+            "blocked_native"
+          ]
+        },
+        "subject_tree_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "toolchain": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "workflow_sha": {
+          "$ref": "#/$defs/commit"
+        }
+      },
+      "required": [
+        "arch",
+        "base_sha",
+        "command",
+        "date",
+        "head_sha",
+        "kind",
+        "log_or_attestation_id",
+        "merge_tree_sha",
+        "os",
+        "os_version",
+        "result",
+        "subject_tree_hash",
+        "toolchain",
+        "workflow_sha"
+      ],
+      "type": "object"
+    },
+    "history": {
+      "additionalProperties": false,
+      "properties": {
+        "date": {
+          "format": "date",
+          "type": "string"
+        },
+        "event": {
+          "enum": [
+            "imported",
+            "lifecycle_changed",
+            "reopened",
+            "invalidated",
+            "regressed",
+            "blocker_added",
+            "blocker_cleared",
+            "route_changed",
+            "evidence_added"
+          ]
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/lifecycle"
+        },
+        "reason": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "date",
+        "event",
+        "lifecycle",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "lifecycle": {
+      "enum": [
+        "confirmed_open",
+        "reproduced",
+        "implemented",
+        "layer_verified",
+        "stack_verified",
+        "ready_to_merge",
+        "merged_verified"
+      ]
+    },
+    "nullable_commit": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/commit"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$id": "https://tirith.dev/schemas/security-remediation-findings-v2.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "allowed_lifecycles": {
+      "const": [
+        "confirmed_open",
+        "reproduced",
+        "implemented",
+        "layer_verified",
+        "stack_verified",
+        "ready_to_merge",
+        "merged_verified"
+      ]
+    },
+    "allowed_resolution_routes": {
+      "const": [
+        "local",
+        "upstream_candidate",
+        "upstream_verified"
+      ]
+    },
+    "closure_evidence_bundle_path": {
+      "const": "docs/security/closure-evidence.json"
+    },
+    "findings": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "blockers": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "blocker_id": {
+                  "pattern": "^blocked_[a-z0-9_]+$",
+                  "type": "string"
+                },
+                "closed_date": {
+                  "type": "null"
+                },
+                "opened_date": {
+                  "format": "date",
+                  "type": "string"
+                },
+                "reason": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "blocker_id",
+                "closed_date",
+                "opened_date",
+                "reason"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "finding_id": {
+            "pattern": "^TIRITH-SEC-[0-9]{4}$",
+            "type": "string"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/$defs/history"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "lifecycle": {
+            "$ref": "#/$defs/lifecycle"
+          },
+          "owner": {
+            "enum": [
+              "pr-197",
+              "pr-198",
+              "pr-201",
+              "pr-199",
+              "poststack-gateway-runtime",
+              "poststack-mcp-identity",
+              "poststack-network-license",
+              "poststack-artifact-analysis",
+              "poststack-state-integrity",
+              "poststack-user-integrations",
+              "poststack-containment-daemon",
+              "poststack-release-convergence"
+            ]
+          },
+          "preconditions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "remediation": {
+            "additionalProperties": false,
+            "properties": {
+              "fix_commits": {
+                "items": {
+                  "$ref": "#/$defs/commit"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "summary": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "upstream_reference": {
+                "format": "uri",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "fix_commits",
+              "summary",
+              "upstream_reference"
+            ],
+            "type": "object"
+          },
+          "reproduction": {
+            "additionalProperties": false,
+            "properties": {
+              "state": {
+                "enum": [
+                  "not_recorded",
+                  "reproduced",
+                  "not_applicable"
+                ]
+              },
+              "steps": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "state",
+              "steps"
+            ],
+            "type": "object"
+          },
+          "resolution_route": {
+            "enum": [
+              "local",
+              "upstream_candidate",
+              "upstream_verified"
+            ]
+          },
+          "review": {
+            "additionalProperties": false,
+            "properties": {
+              "reviewed_commit": {
+                "$ref": "#/$defs/nullable_commit"
+              },
+              "reviewer": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "reviewed_commit",
+              "reviewer"
+            ],
+            "type": "object"
+          },
+          "severity": {
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low",
+              "untriaged"
+            ]
+          },
+          "source_links": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "affected_seams": {
+                  "items": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "canonical_root_id": {
+                  "pattern": "^TIRITH-SEC-[0-9]{4}$",
+                  "type": "string"
+                },
+                "mapped_claims": {
+                  "items": {
+                    "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "mapping_type": {
+                  "enum": [
+                    "exact_duplicate",
+                    "partial_overlap",
+                    "related",
+                    "superseded"
+                  ]
+                },
+                "rationale": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "source_id": {
+                  "pattern": "^(STACK|ADDENDUM|ADDITIONAL|ORIGINAL)-[0-9]{3}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "affected_seams",
+                "canonical_root_id",
+                "mapped_claims",
+                "mapping_type",
+                "rationale",
+                "source_id"
+              ],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "title": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "verification": {
+            "additionalProperties": false,
+            "properties": {
+              "attempts": {
+                "items": {
+                  "$ref": "#/$defs/attempt"
+                },
+                "type": "array"
+              },
+              "layer_commit": {
+                "$ref": "#/$defs/nullable_commit"
+              },
+              "merge_commit": {
+                "$ref": "#/$defs/nullable_commit"
+              },
+              "migrated_consumers": {
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "regression_test_locators": {
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "stack_commit": {
+                "$ref": "#/$defs/nullable_commit"
+              }
+            },
+            "required": [
+              "attempts",
+              "layer_commit",
+              "merge_commit",
+              "migrated_consumers",
+              "regression_test_locators",
+              "stack_commit"
+            ],
+            "type": "object"
+          },
+          "vulnerable_commits": {
+            "items": {
+              "$ref": "#/$defs/commit"
+            },
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "blockers",
+          "finding_id",
+          "history",
+          "lifecycle",
+          "owner",
+          "preconditions",
+          "remediation",
+          "reproduction",
+          "resolution_route",
+          "review",
+          "severity",
+          "source_links",
+          "title",
+          "verification",
+          "vulnerable_commits"
+        ],
+        "type": "object"
+      },
+      "maxItems": 131,
+      "minItems": 131,
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "source_index_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "allowed_lifecycles",
+    "allowed_resolution_routes",
+    "closure_evidence_bundle_path",
+    "findings",
+    "schema_version",
+    "source_index_sha256"
+  ],
+  "title": "Tirith canonical security remediation findings",
+  "type": "object"
+}
