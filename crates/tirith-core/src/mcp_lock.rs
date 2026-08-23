@@ -320,8 +320,10 @@ pub struct McpServerEntry {
 impl McpServerEntry {
     /// A stable per-server content hash over name + transport (incl. a stdio
     /// server's `env`) + tools, so `mcp diff` can detect a changed server by hash
-    /// alone. `source_config` is excluded — moving an unchanged server between
-    /// configs must not drift.
+    /// alone. `source_config` is excluded from this content digest because it is
+    /// already an explicit part of the inventory and drift identity: moving an
+    /// otherwise unchanged server between configs is represented as an exact
+    /// `(name, source_config)` removal plus addition.
     ///
     /// **Collision-free framing:** every variable-length component is
     /// length-prefixed via [`hash_field`], not `\0`-joined — so `["a","b"]` and
@@ -1346,7 +1348,9 @@ pub enum RejectedReason {
     /// A regular file whose size exceeds `MCP_CONFIG_MAX_SIZE`; reading an
     /// unbounded JSON doc would be a DoS surface.
     Oversize {
-        /// The file's size in bytes (`fs::metadata().len()`).
+        /// A proven lower bound on the file size. The retained reader reports
+        /// `MCP_CONFIG_MAX_SIZE + 1` when the exact size cannot be recovered
+        /// without reopening an attacker-racy pathname.
         size_bytes: u64,
     },
     /// A regular file under the cap that could not be read.
@@ -1747,16 +1751,31 @@ pub(crate) const MCP_CONFIG_RELATIVE_PATHS: &[&str] = &[
     ".kiro/settings/mcp.json",
 ];
 
+/// One discovered MCP config bound to the exact retained repository/parent
+/// capabilities through which its bytes will be read. The public discovery API
+/// intentionally returns only the path projection; inventory construction keeps
+/// this authority alive through the capped, no-follow open and complete read.
+pub(crate) struct RetainedMcpConfig {
+    absolute_path: PathBuf,
+    relative_path: String,
+    file: crate::util::ContainedAtomicFile,
+}
+
 /// Discover the repo-local MCP config files under `repo_root`, returning
 /// `(absolute, repo_relative)` pairs sorted by the relative path. Only regular
 /// files reachable without crossing a symlink and resolving inside `repo_root`
 /// are returned — a probed path that is itself a symlink (or under a symlinked
 /// parent), or whose canonical form escapes the root, is rejected, so a
-/// `.mcp.json -> ~/.claude/mcp.json` can't pull a user config in. The symlink
-/// check uses `symlink_metadata` (no TOCTOU). Drops the rejection list — use
+/// `.mcp.json -> ~/.claude/mcp.json` can't pull a user config in. Inventory
+/// construction additionally retains a descriptor/handle-relative parent
+/// authority through the capped no-follow read. Drops the rejection list — use
 /// [`discover_mcp_configs_full`] for it.
 pub fn discover_mcp_configs(repo_root: &Path) -> Vec<(PathBuf, String)> {
-    discover_mcp_configs_full(repo_root).0
+    discover_mcp_configs_full(repo_root)
+        .0
+        .into_iter()
+        .map(|config| (config.absolute_path, config.relative_path))
+        .collect()
 }
 
 /// Like [`discover_mcp_configs`] but also returns the structured rejection list
@@ -1765,7 +1784,7 @@ pub fn discover_mcp_configs(repo_root: &Path) -> Vec<(PathBuf, String)> {
 /// in [`build_inventory`] when the file is read.
 pub(crate) fn discover_mcp_configs_full(
     repo_root: &Path,
-) -> (Vec<(PathBuf, String)>, Vec<RejectedConfig>) {
+) -> (Vec<RetainedMcpConfig>, Vec<RejectedConfig>) {
     // Canonicalize the root once for the containment check; if it doesn't exist,
     // no config under it can be discovered — return empty (nothing to reject).
     let canonical_root = match repo_root.canonicalize() {
@@ -1773,7 +1792,7 @@ pub(crate) fn discover_mcp_configs_full(
         Err(_) => return (Vec::new(), Vec::new()),
     };
 
-    let mut found: Vec<(PathBuf, String)> = Vec::new();
+    let mut found: Vec<RetainedMcpConfig> = Vec::new();
     let mut rejected: Vec<RejectedConfig> = Vec::new();
 
     for rel in MCP_CONFIG_RELATIVE_PATHS {
@@ -1828,9 +1847,40 @@ pub(crate) fn discover_mcp_configs_full(
             }
         }
 
-        found.push((abs, (*rel).to_string()));
+        // Bind the root, every directory component, and final name now; the
+        // retained capability is carried into `build_inventory` and performs
+        // the eventual open relative to this exact parent. A path swap after
+        // discovery therefore cannot redirect the read through a new parent,
+        // and a final-component symlink is refused both here and at read time.
+        let retained_path = canonical_root.join(rel);
+        let file =
+            match crate::util::ContainedAtomicFile::prepare(&canonical_root, &retained_path, false)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    let reason = if path_crosses_symlink(repo_root, rel) {
+                        RejectedReason::Symlink
+                    } else {
+                        RejectedReason::Unreadable {
+                            permission_denied: error.kind() == std::io::ErrorKind::PermissionDenied,
+                        }
+                    };
+                    rejected.push(RejectedConfig {
+                        path: (*rel).to_string(),
+                        reason,
+                    });
+                    continue;
+                }
+            };
+
+        found.push(RetainedMcpConfig {
+            absolute_path: abs,
+            relative_path: (*rel).to_string(),
+            file,
+        });
     }
-    found.sort_by(|a, b| a.1.cmp(&b.1));
+    found.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     rejected.sort_by(|a, b| a.path.cmp(&b.path));
     (found, rejected)
 }
@@ -1868,83 +1918,70 @@ pub const MCP_CONFIG_MAX_SIZE: u64 = 1_048_576;
 ///
 /// Path-level rejections (from [`discover_mcp_configs_full`]) and file-level ones
 /// (oversize, permission) both flow into [`McpInventory::rejected_configs`] — one
-/// "present but skipped" list regardless of which gate tripped. Size is checked
-/// against [`MCP_CONFIG_MAX_SIZE`] before any read. IO errors are categorized:
+/// "present but skipped" list regardless of which gate tripped. The complete
+/// file is opened no-follow and read through the retained parent capability with
+/// a hard [`MCP_CONFIG_MAX_SIZE`] cap; growth after discovery is rejected after
+/// at most one byte beyond the cap. IO errors are categorized:
 /// `PermissionDenied`→`Unreadable{true}`; `NotFound`→silent (vanished mid-edit);
-/// `InvalidData`→malformed; else `Unreadable{false}`.
+/// non-UTF-8→malformed; else `Unreadable{false}`.
 pub fn build_inventory(repo_root: &Path) -> McpInventory {
     let (configs, rejected_from_discovery) = discover_mcp_configs_full(repo_root);
 
+    build_inventory_from_discovered(configs, rejected_from_discovery)
+}
+
+fn build_inventory_from_discovered(
+    configs: Vec<RetainedMcpConfig>,
+    rejected_from_discovery: Vec<RejectedConfig>,
+) -> McpInventory {
     let mut inventory = McpInventory {
         rejected_configs: rejected_from_discovery,
         ..McpInventory::default()
     };
 
-    for (abs_path, rel_path) in configs {
-        // Size pre-check. Discovery already rejected symlinks, so this is a real
-        // regular file; a metadata failure here folds into the unreadable bucket.
-        let size_bytes = match std::fs::metadata(&abs_path) {
-            Ok(m) => m.len(),
-            Err(e) => {
+    for config in configs {
+        let rel_path = config.relative_path;
+        let bytes = match config.file.read_capped(MCP_CONFIG_MAX_SIZE) {
+            Ok(bytes) => bytes,
+            Err(crate::util::OpenRegularError::NotFound) => continue,
+            Err(crate::util::OpenRegularError::NotRegularFile) => {
+                inventory.rejected_configs.push(RejectedConfig {
+                    path: rel_path.clone(),
+                    reason: RejectedReason::NotRegularFile,
+                });
+                continue;
+            }
+            Err(crate::util::OpenRegularError::TooLarge) => {
+                // The retained reader intentionally exposes no attacker-racy
+                // pathname metadata. Report the proven lower bound instead of
+                // reopening by path merely to recover an exact size.
+                inventory.rejected_configs.push(RejectedConfig {
+                    path: rel_path.clone(),
+                    reason: RejectedReason::Oversize {
+                        size_bytes: MCP_CONFIG_MAX_SIZE.saturating_add(1),
+                    },
+                });
+                continue;
+            }
+            Err(crate::util::OpenRegularError::Io(error)) => {
                 inventory.rejected_configs.push(RejectedConfig {
                     path: rel_path.clone(),
                     reason: RejectedReason::Unreadable {
-                        permission_denied: e.kind() == std::io::ErrorKind::PermissionDenied,
+                        permission_denied: error.kind() == std::io::ErrorKind::PermissionDenied,
                     },
                 });
                 continue;
             }
         };
 
-        if size_bytes > MCP_CONFIG_MAX_SIZE {
-            inventory.rejected_configs.push(RejectedConfig {
-                path: rel_path.clone(),
-                reason: RejectedReason::Oversize { size_bytes },
-            });
-            // Oversized: rejected at the gate, never a discovered config.
-            continue;
-        }
-
-        // Admitted: counts as a discovered config from here on, even if it later
-        // fails to read or parse.
+        // Admitted: counts as a discovered config from here on, even if it is
+        // later classified as malformed text or JSON.
         inventory.configs.push(rel_path.clone());
 
-        let content = match std::fs::read_to_string(&abs_path) {
-            Ok(c) => c,
-            Err(e) => {
-                // Categorize so the operator can tell "can't read" from "not UTF-8".
-                match e.kind() {
-                    std::io::ErrorKind::NotFound => {
-                        // Vanished between discovery and read (concurrent edit) —
-                        // pop it off `configs`, nothing to surface.
-                        inventory.configs.pop();
-                    }
-                    std::io::ErrorKind::PermissionDenied => {
-                        inventory.rejected_configs.push(RejectedConfig {
-                            path: rel_path.clone(),
-                            reason: RejectedReason::Unreadable {
-                                permission_denied: true,
-                            },
-                        });
-                        // Pop: discovered structurally, but unreadable; the
-                        // rejection list names it now.
-                        inventory.configs.pop();
-                    }
-                    std::io::ErrorKind::InvalidData => {
-                        // Non-UTF-8: present and attributable, just not text —
-                        // keep the legacy "malformed" path.
-                        inventory.malformed_configs.push(rel_path.clone());
-                    }
-                    _ => {
-                        inventory.rejected_configs.push(RejectedConfig {
-                            path: rel_path.clone(),
-                            reason: RejectedReason::Unreadable {
-                                permission_denied: false,
-                            },
-                        });
-                        inventory.configs.pop();
-                    }
-                }
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) => {
+                inventory.malformed_configs.push(rel_path);
                 continue;
             }
         };
@@ -2379,6 +2416,7 @@ fn secret_key_name(value: &str) -> bool {
             | "awssecretaccesskey"
             | "authtoken"
             | "bearertoken"
+            | "gitlabtoken"
             | "token"
             | "sessiontoken"
             | "securitytoken"
@@ -2490,6 +2528,7 @@ fn looks_like_secret_literal(value: &str) -> bool {
         "ghs_",
         "ghr_",
         "github_pat_",
+        "glpat-",
         "npm_",
         "sk-proj-",
         "sk_live_",
@@ -3000,8 +3039,9 @@ impl McpDrift {
 /// nothing changed — empty drift, no per-server work. Slow path: a merge walk
 /// over the `(name, source_config)`-sorted sides emits `Added`/`Removed`, and
 /// `Changed` (via `compute_changed_entry`) when a per-server `content_hash`
-/// differs. `content_hash` excludes `source_config`, so moving an unchanged
-/// server between configs is a non-event.
+/// differs. `content_hash` excludes `source_config`, but the merge identity does
+/// not: moving an unchanged server between configs is an exact removal plus
+/// addition rather than a name-only cancellation.
 ///
 /// The result is sorted ([`McpDrift::sort_key`]). Privacy: entries carry only
 /// names (server / env-var / tool). V8 records only env names and URL-userinfo
@@ -3122,59 +3162,6 @@ fn compute_drift_static(current: &McpInventory, lock: &McpLockfile) -> Vec<McpDr
         j += 1;
     }
 
-    // repo-0459: `content_hash` excludes `source_config` BY DESIGN, so moving
-    // an unchanged server between config files must not drift. The
-    // `(name, source_config)`-keyed merge walk reports such a move as
-    // Removed+Added when unrelated drift forces this slow path — cancel pairs
-    // whose name AND content hash match (a true move), so fast and slow paths
-    // agree.
-    let mut kept: Vec<McpDrift> = Vec::with_capacity(drifts.len());
-    // (name, hash) for Added entries to match Removed against.
-    let add_keys: Vec<(String, String)> = drifts
-        .iter()
-        .filter_map(|d| match d {
-            McpDrift::Added { name, .. } => {
-                let hash = current_lock
-                    .servers
-                    .iter()
-                    .find(|s| &s.name == name)
-                    .map(|s| s.hash.clone())
-                    .unwrap_or_default();
-                Some((name.clone(), hash))
-            }
-            _ => None,
-        })
-        .collect();
-    let mut used_adds: Vec<bool> = vec![false; add_keys.len()];
-    for d in drifts {
-        if let McpDrift::Removed { name, .. } = &d {
-            let removed_hash = lock
-                .servers
-                .iter()
-                .find(|s| &s.name == name)
-                .map(|s| s.hash.clone())
-                .unwrap_or_default();
-            let matched = add_keys
-                .iter()
-                .enumerate()
-                .find(|(idx, (an, ah))| !used_adds[*idx] && an == name && *ah == removed_hash)
-                .map(|(idx, _)| idx);
-            if let Some(idx) = matched {
-                used_adds[idx] = true;
-                continue; // pure move: drop the Removed
-            }
-        }
-        kept.push(d);
-    }
-    // Drop the matched Adds too.
-    let mut drifts: Vec<McpDrift> = Vec::with_capacity(kept.len());
-    let mut add_iter = used_adds.iter();
-    for d in kept {
-        if matches!(d, McpDrift::Added { .. }) && add_iter.next() == Some(&true) {
-            continue;
-        }
-        drifts.push(d);
-    }
     drifts.sort_by_key(McpDrift::sort_key);
     drifts
 }
@@ -6041,10 +6028,9 @@ mod tests {
 
     #[test]
     fn drift_detects_unchanged_server_moving_between_config_principals() {
-        // repo-0459: `content_hash` excludes `source_config` BY DESIGN, so a
-        // pure move between config files is NOT drift — on the fast path (equal
-        // inventory) or the slow path (unrelated drift forcing the merge
-        // walk). Both paths must agree.
+        // Source config is part of the policy principal even though the
+        // transport/content digest excludes it. A move must therefore retain
+        // both exact identities as Removed(old source) + Added(new source).
         let prev = mk_inventory(vec![McpServerEntry {
             tools_declared: true,
             source_config: ".mcp.json".into(),
@@ -6058,43 +6044,59 @@ mod tests {
             ..stdio_server("s", "node")
         }]);
         let drifts = compute_drift(&cur, &lock);
-        // Fast path: pure move, equal inventory — no drift.
-        if drifts.is_empty() {
-            return;
-        }
-        // Slow path consistency: with an unrelated server added, the move must
-        // STILL not surface as Removed+Added.
-        let cur2 = mk_inventory(vec![
+        assert_eq!(drifts.len(), 2, "source move must preserve both identities");
+        assert!(matches!(
+            &drifts[0],
+            McpDrift::Removed { name, source_config }
+                if name == "s" && source_config == ".mcp.json"
+        ));
+        assert!(matches!(
+            &drifts[1],
+            McpDrift::Added { name, source_config, .. }
+                if name == "s" && source_config == ".vscode/mcp.json"
+        ));
+    }
+
+    #[test]
+    fn duplicate_names_cannot_cancel_exact_source_drift() {
+        // Regression for TIRITH-SEC-0072: the former cancellation pass looked
+        // up hashes by name alone. With duplicate names it could compare the
+        // first twin on each side and erase a Removed/Added pair belonging to
+        // a different source principal.
+        let prev = mk_inventory(vec![
             McpServerEntry {
-                tools_declared: true,
-                source_config: ".vscode/mcp.json".into(),
-                ..stdio_server("s", "node")
+                source_config: ".mcp.json".into(),
+                ..stdio_server("same", "node")
             },
-            stdio_server("other", "node"),
+            McpServerEntry {
+                source_config: ".vscode/mcp.json".into(),
+                ..stdio_server("same", "deno")
+            },
         ]);
-        let drifts2 = compute_drift(&cur2, &lock);
-        assert!(
-            !drifts2.iter().any(|drift| matches!(
-                drift,
-                McpDrift::Removed { name, .. } if name == "s"
-            )),
-            "a pure config-file move must not report removal: {drifts2:?}"
-        );
-        assert!(
-            !drifts2.iter().any(|drift| matches!(
-                drift,
-                McpDrift::Added { name, .. } if name == "s"
-            )),
-            "a pure config-file move must not report addition: {drifts2:?}"
-        );
-        // The genuinely new server IS reported.
-        assert!(
-            drifts2.iter().any(|drift| matches!(
-                drift,
-                McpDrift::Added { name, .. } if name == "other"
-            )),
-            "the new server must be reported: {drifts2:?}"
-        );
+        let lock = McpLockfile::from_inventory(&prev);
+        let cur = mk_inventory(vec![
+            McpServerEntry {
+                source_config: ".mcp.json".into(),
+                ..stdio_server("same", "node")
+            },
+            McpServerEntry {
+                source_config: ".cursor/mcp.json".into(),
+                ..stdio_server("same", "deno")
+            },
+        ]);
+
+        let drifts = compute_drift(&cur, &lock);
+        assert_eq!(drifts.len(), 2, "duplicate-name source move was erased");
+        assert!(drifts.iter().any(|drift| matches!(
+            drift,
+            McpDrift::Removed { name, source_config }
+                if name == "same" && source_config == ".vscode/mcp.json"
+        )));
+        assert!(drifts.iter().any(|drift| matches!(
+            drift,
+            McpDrift::Added { name, source_config, .. }
+                if name == "same" && source_config == ".cursor/mcp.json"
+        )));
     }
 
     #[test]
@@ -7005,6 +7007,98 @@ mod tests {
             }
             ref other => panic!("expected Oversize, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn retained_config_read_rejects_growth_after_discovery() {
+        let repo = tempdir().unwrap();
+        let config = repo.path().join(".mcp.json");
+        fs::write(&config, r#"{"mcpServers":{"safe":{"command":"node"}}}"#).unwrap();
+        let (configs, rejected) = discover_mcp_configs_full(repo.path());
+        assert_eq!(configs.len(), 1);
+        assert!(rejected.is_empty());
+
+        // Grow after discovery/retention. The read itself must enforce the cap;
+        // a pre-read pathname metadata check alone would miss this transition.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&config)
+            .unwrap()
+            .set_len(MCP_CONFIG_MAX_SIZE + 1)
+            .unwrap();
+        let inventory = build_inventory_from_discovered(configs, rejected);
+        assert!(inventory.servers.is_empty());
+        assert!(inventory.configs.is_empty());
+        assert!(matches!(
+            inventory.rejected_configs.as_slice(),
+            [RejectedConfig {
+                path,
+                reason: RejectedReason::Oversize { size_bytes }
+            }] if path == ".mcp.json" && *size_bytes > MCP_CONFIG_MAX_SIZE
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_config_read_refuses_a_leaf_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let config = repo.path().join(".mcp.json");
+        let outside_config = outside.path().join("outside.json");
+        fs::write(&config, r#"{"mcpServers":{"safe":{"command":"node"}}}"#).unwrap();
+        fs::write(
+            &outside_config,
+            r#"{"mcpServers":{"outside":{"command":"evil"}}}"#,
+        )
+        .unwrap();
+        let (configs, rejected) = discover_mcp_configs_full(repo.path());
+        assert_eq!(configs.len(), 1);
+        fs::rename(&config, repo.path().join("approved.json")).unwrap();
+        symlink(&outside_config, &config).unwrap();
+
+        let inventory = build_inventory_from_discovered(configs, rejected);
+        assert!(inventory.servers.is_empty());
+        assert!(inventory.configs.is_empty());
+        assert!(matches!(
+            inventory.rejected_configs.as_slice(),
+            [RejectedConfig {
+                path,
+                reason: RejectedReason::NotRegularFile
+            }] if path == ".mcp.json"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_config_read_stays_on_the_discovered_parent() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let vscode = repo.path().join(".vscode");
+        fs::create_dir(&vscode).unwrap();
+        fs::write(
+            vscode.join("mcp.json"),
+            r#"{"mcpServers":{"safe":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            outside.path().join("mcp.json"),
+            r#"{"mcpServers":{"outside":{"command":"evil"}}}"#,
+        )
+        .unwrap();
+        let (configs, rejected) = discover_mcp_configs_full(repo.path());
+        assert_eq!(configs.len(), 1);
+        fs::rename(&vscode, repo.path().join(".vscode-retained")).unwrap();
+        symlink(outside.path(), &vscode).unwrap();
+
+        let inventory = build_inventory_from_discovered(configs, rejected);
+        assert_eq!(inventory.servers.len(), 1);
+        assert_eq!(inventory.servers[0].name, "safe");
+        assert_eq!(inventory.servers[0].source_config, ".vscode/mcp.json");
+        assert!(inventory.rejected_configs.is_empty());
     }
 
     #[cfg(unix)]
@@ -8058,6 +8152,9 @@ mod tests {
 
         for args in [
             r#"["--api-key","ghp_12345678901234567890"]"#,
+            r#"["--gitlab-token","glpat-12345678901234567890"]"#,
+            r#"["--gitlab-token=glpat-12345678901234567890"]"#,
+            r#"["--opaque","glpat-12345678901234567890"]"#,
             r#"["--token=literal-secret"]"#,
             r#"["--foo=ghp_12345678901234567890"]"#,
             r#"["--mode=AKIA1234567890123456"]"#,
@@ -8097,8 +8194,34 @@ mod tests {
 
         // Explicit environment references and non-secret routing queries remain
         // lockable; the raw credential stays outside the committed document.
-        let safe = r#"{"mcpServers":{"s":{"command":"node","args":["--token","${env:MCP_TOKEN}","--header","Authorization: Bearer ${MCP_TOKEN}","--header=Accept: application/json","--mode=$MODE","--profile=%PROFILE%","--shell=$env:MCP_TOKEN","https://host.test/mcp?region=us"]}}}"#;
+        let safe = r#"{"mcpServers":{"s":{"command":"node","args":["--token","${env:MCP_TOKEN}","--gitlab-token","${env:GITLAB_TOKEN}","--header","Authorization: Bearer ${MCP_TOKEN}","--header=Accept: application/json","--mode=$MODE","--profile=%PROFILE%","--shell=$env:MCP_TOKEN","https://host.test/mcp?region=us"]}}}"#;
         assert!(parse_mcp_config(safe, ".mcp.json").is_some());
+    }
+
+    #[test]
+    fn gitlab_personal_access_tokens_never_reach_public_serialization() {
+        let secret = "glpat-12345678901234567890";
+        for args in [
+            vec!["--gitlab-token".to_string(), secret.to_string()],
+            vec![format!("--gitlab-token={secret}")],
+            vec!["--opaque".to_string(), secret.to_string()],
+        ] {
+            let transport = McpTransport::Stdio {
+                command: "gitlab-mcp".into(),
+                args,
+                env: vec![],
+            };
+            let error = serde_json::to_string(&transport)
+                .expect_err("GitLab PAT must be rejected before lock serialization");
+            assert!(!error.to_string().contains(secret));
+        }
+
+        let safe = McpTransport::Stdio {
+            command: "gitlab-mcp".into(),
+            args: vec!["--gitlab-token".into(), "${env:GITLAB_TOKEN}".into()],
+            env: vec![],
+        };
+        serde_json::to_string(&safe).expect("an explicit environment reference remains safe");
     }
 
     #[test]

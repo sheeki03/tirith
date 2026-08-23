@@ -2103,11 +2103,354 @@ fn spawn_upstream_capsuled(
 struct GatewayLaunchBinding {
     executable: tirith_core::trusted_child::TrustedExecutable,
     executable_digest: String,
+    interpreted_code: Option<InterpretedCodeSnapshot>,
     args: Vec<String>,
     cwd: PathBuf,
     environment: Vec<(String, String)>,
     capsule_spec: Option<tirith_core::capsule::CapsuleSpec>,
     fingerprint: String,
+}
+
+const MAX_INTERPRETED_SNAPSHOT_ENTRIES: usize = 8_192;
+const MAX_INTERPRETED_SNAPSHOT_FILES: usize = 4_096;
+const MAX_INTERPRETED_SNAPSHOT_PATH_BYTES: usize = 1024 * 1024;
+const MAX_INTERPRETED_SNAPSHOT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_INTERPRETED_SNAPSHOT_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct InterpretedSnapshotLimits {
+    max_entries: usize,
+    max_files: usize,
+    max_path_bytes: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+}
+
+impl Default for InterpretedSnapshotLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: MAX_INTERPRETED_SNAPSHOT_ENTRIES,
+            max_files: MAX_INTERPRETED_SNAPSHOT_FILES,
+            max_path_bytes: MAX_INTERPRETED_SNAPSHOT_PATH_BYTES,
+            max_file_bytes: MAX_INTERPRETED_SNAPSHOT_FILE_BYTES,
+            max_total_bytes: MAX_INTERPRETED_SNAPSHOT_TOTAL_BYTES,
+        }
+    }
+}
+
+/// Bounded commitment to the mutable, repository-contained code and dependency
+/// tree of an interpreted MCP launch. Such launches are also required to use
+/// the capsule: the snapshot binds the writable repo closure while containment
+/// restricts all other reads to fixed system runtime roots. The committed lock
+/// stores only the outer launch fingerprint; raw paths and source bytes never
+/// enter it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InterpretedCodeSnapshot {
+    entrypoint: PathBuf,
+    digest: String,
+    file_count: u64,
+    total_bytes: u64,
+}
+
+impl InterpretedCodeSnapshot {
+    fn capture(repo_root: &Path, entrypoint: &Path) -> Result<Self, String> {
+        Self::capture_with_limits(repo_root, entrypoint, InterpretedSnapshotLimits::default())
+    }
+
+    fn capture_with_limits(
+        repo_root: &Path,
+        entrypoint: &Path,
+        limits: InterpretedSnapshotLimits,
+    ) -> Result<Self, String> {
+        let mut relative_files = Vec::new();
+        let mut entry_count = 0_usize;
+        let mut path_bytes = 0_usize;
+
+        for entry in walkdir::WalkDir::new(repo_root).follow_links(false) {
+            let entry = entry.map_err(|_| {
+                "interpreted dependency closure could not be enumerated safely".to_string()
+            })?;
+            if entry.depth() == 0 {
+                continue;
+            }
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(|| "interpreted dependency entry count overflowed".to_string())?;
+            if entry_count > limits.max_entries {
+                return Err("interpreted dependency closure exceeds the entry limit".to_string());
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(repo_root)
+                .map_err(|_| "interpreted dependency escaped the repository root".to_string())?;
+            if !safe_snapshot_relative_path(relative) {
+                return Err("interpreted dependency has a non-portable or unsafe path".to_string());
+            }
+            path_bytes = path_bytes
+                .checked_add(relative.as_os_str().as_encoded_bytes().len())
+                .ok_or_else(|| "interpreted dependency path budget overflowed".to_string())?;
+            if path_bytes > limits.max_path_bytes {
+                return Err("interpreted dependency paths exceed the byte limit".to_string());
+            }
+
+            let file_type = entry.file_type();
+            if file_type.is_symlink() {
+                return Err(
+                    "interpreted dependency closure contains a symlink; exact binding refused"
+                        .to_string(),
+                );
+            }
+            if file_type.is_dir() {
+                continue;
+            }
+            if !file_type.is_file() {
+                return Err(
+                    "interpreted dependency closure contains a non-regular entry".to_string(),
+                );
+            }
+            // The descriptor lock is the output that will receive this outer
+            // fingerprint. Including it would create a self-referential digest.
+            if is_descriptor_lock_control_file(relative) {
+                continue;
+            }
+            if relative_files.len() >= limits.max_files {
+                return Err("interpreted dependency closure exceeds the file limit".to_string());
+            }
+            relative_files.push(relative.to_path_buf());
+        }
+
+        relative_files.sort();
+        if !relative_files.iter().any(|path| path == entrypoint) {
+            return Err(
+                "interpreted entrypoint is not a regular repository-contained file".to_string(),
+            );
+        }
+
+        let mut hasher = Sha256::new();
+        launch_hash_field(&mut hasher, b"tirith-mcp-interpreted-closure-v1");
+        launch_hash_field(&mut hasher, entrypoint.as_os_str().as_encoded_bytes());
+        let mut total_bytes = 0_u64;
+        for relative in &relative_files {
+            let path = repo_root.join(relative);
+            let source = tirith_core::util::ContainedAtomicFile::prepare(repo_root, &path, false)
+                .map_err(|_| {
+                "interpreted dependency path could not be opened without symlinks".to_string()
+            })?;
+            let remaining = limits.max_total_bytes.saturating_sub(total_bytes);
+            let per_file_cap = limits.max_file_bytes.min(remaining);
+            let bytes = source
+                .read_capped(per_file_cap)
+                .map_err(|error| match error {
+                    tirith_core::util::OpenRegularError::TooLarge => {
+                        "interpreted dependency closure exceeds its byte limits".to_string()
+                    }
+                    tirith_core::util::OpenRegularError::NotRegularFile => {
+                        "interpreted dependency changed to a symlink or non-regular file"
+                            .to_string()
+                    }
+                    tirith_core::util::OpenRegularError::NotFound => {
+                        "interpreted dependency disappeared during capture".to_string()
+                    }
+                    tirith_core::util::OpenRegularError::Io(_) => {
+                        "interpreted dependency could not be read safely".to_string()
+                    }
+                })?;
+            total_bytes = total_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| "interpreted dependency byte count overflowed".to_string())?;
+            if total_bytes > limits.max_total_bytes {
+                return Err(
+                    "interpreted dependency closure exceeds the total byte limit".to_string(),
+                );
+            }
+            launch_hash_field(&mut hasher, relative.as_os_str().as_encoded_bytes());
+            launch_hash_field(&mut hasher, &(bytes.len() as u64).to_le_bytes());
+            launch_hash_field(&mut hasher, &bytes);
+        }
+        launch_hash_field(&mut hasher, &(relative_files.len() as u64).to_le_bytes());
+        launch_hash_field(&mut hasher, &total_bytes.to_le_bytes());
+
+        Ok(Self {
+            entrypoint: entrypoint.to_path_buf(),
+            digest: format!("{:x}", hasher.finalize()),
+            file_count: relative_files.len() as u64,
+            total_bytes,
+        })
+    }
+}
+
+fn safe_snapshot_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn normalize_snapshot_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+fn is_descriptor_lock_control_file(path: &Path) -> bool {
+    path == Path::new(".tirith").join(tirith_core::mcp_lock::MCP_LOCK_FILENAME)
+}
+
+fn versioned_interpreter_name(name: &str, prefix: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let suffix = suffix.strip_prefix('-').unwrap_or(suffix);
+    suffix.is_empty()
+        || (suffix
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_digit())
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.'))
+}
+
+fn static_interpreted_entrypoint(
+    executable: &Path,
+    args: &[String],
+    repo_root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let executable_name = executable
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| "upstream executable name is not valid UTF-8".to_string())?
+        .to_ascii_lowercase();
+    let executable_name = executable_name
+        .strip_suffix(".exe")
+        .unwrap_or(&executable_name);
+
+    if [
+        "env",
+        "npx",
+        "npm",
+        "pnpm",
+        "yarn",
+        "uv",
+        "uvx",
+        "poetry",
+        "pipenv",
+        "tsx",
+        "ts-node",
+        "jupyter",
+        "cargo",
+        "go",
+        "rust-script",
+        "dart",
+        "awk",
+        "gawk",
+        "php-cgi",
+    ]
+    .contains(&executable_name)
+    {
+        return Err(
+            "dynamic MCP launchers cannot establish an exact interpreted dependency closure; use an exact wrapper executable"
+                .to_string(),
+        );
+    }
+
+    let ordinary = [
+        "python",
+        "pypy",
+        "node",
+        "nodejs",
+        "ruby",
+        "perl",
+        "php",
+        "lua",
+        "luajit",
+        "bash",
+        "zsh",
+        "fish",
+        "pwsh",
+        "powershell",
+        "dotnet",
+        "tclsh",
+        "wish",
+        "julia",
+        "elixir",
+        "groovy",
+        "rscript",
+    ]
+    .iter()
+    .any(|prefix| versioned_interpreter_name(executable_name, prefix))
+        || matches!(
+            executable_name,
+            "sh" | "dash" | "ksh" | "csh" | "tcsh" | "qjs" | "quickjs" | "osascript"
+        );
+    let entrypoint = if ordinary {
+        let first = args
+            .first()
+            .ok_or_else(|| "interpreted MCP launch is missing a static entrypoint".to_string())?;
+        first
+    } else if executable_name == "deno" {
+        if args.first().map(String::as_str) != Some("run") || args.len() < 2 {
+            return Err(
+                "deno MCP launch must use `deno run <repo-contained-entrypoint>` without launcher flags"
+                    .to_string(),
+            );
+        }
+        &args[1]
+    } else if executable_name == "bun" {
+        let first = args
+            .first()
+            .ok_or_else(|| "interpreted MCP launch is missing a static entrypoint".to_string())?;
+        if first == "run" {
+            return Err(
+                "package-script MCP launchers have a dynamic dependency closure; use a static entrypoint"
+                    .to_string(),
+            );
+        }
+        first
+    } else if executable_name == "java" {
+        if args.first().map(String::as_str) != Some("-jar") || args.len() < 2 {
+            return Err(
+                "java MCP launch must use `java -jar <repo-contained-entrypoint>` without JVM launcher flags"
+                    .to_string(),
+            );
+        }
+        &args[1]
+    } else if let Some(first) = args.first().filter(|value| !value.starts_with('-')) {
+        // A root-owned custom interpreter cannot be identified exhaustively by
+        // basename. Treat a leading positional operand as interpreted code
+        // without consulting its current existence: an absent path could be
+        // created after classification and otherwise escape the code binding.
+        // Native servers that take only flags retain executable-only binding.
+        first
+    } else {
+        return Ok(None);
+    };
+
+    if entrypoint.is_empty()
+        || entrypoint.starts_with('-')
+        || entrypoint.contains("://")
+        || entrypoint.starts_with("data:")
+    {
+        return Err(
+            "interpreted MCP launch must name a static repository-contained entrypoint".to_string(),
+        );
+    }
+    let path = Path::new(entrypoint);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(repo_root)
+            .map_err(|_| "interpreted MCP entrypoint is outside the repository root".to_string())?
+    } else {
+        path
+    };
+    normalize_snapshot_relative_path(relative)
+        .map(Some)
+        .ok_or_else(|| "interpreted MCP entrypoint has an unsafe path".to_string())
 }
 
 fn launch_hash_field(hasher: &mut Sha256, bytes: &[u8]) {
@@ -2258,6 +2601,16 @@ impl GatewayLaunchBinding {
             .to_str()
             .ok_or_else(|| "descriptor repository path is not valid UTF-8".to_string())?;
         let executable_digest = launch_executable_digest(executable.path())?;
+        let interpreted_entrypoint = static_interpreted_entrypoint(executable.path(), args, &cwd)?;
+        if interpreted_entrypoint.is_some() && !contained {
+            return Err(
+                "exact interpreted MCP binding requires the fail-closed capsule so code cannot load an out-of-root dependency"
+                    .to_string(),
+            );
+        }
+        let interpreted_code = interpreted_entrypoint
+            .map(|entrypoint| InterpretedCodeSnapshot::capture(&cwd, &entrypoint))
+            .transpose()?;
         let capsule_spec = contained.then(|| mcp_server_capsule_spec(&cwd));
         let containment = match &capsule_spec {
             Some(spec) => serde_json::to_string(spec)
@@ -2266,7 +2619,14 @@ impl GatewayLaunchBinding {
         };
 
         let mut hasher = Sha256::new();
-        launch_hash_field(&mut hasher, b"tirith-mcp-launch-v1");
+        launch_hash_field(
+            &mut hasher,
+            if interpreted_code.is_some() {
+                b"tirith-mcp-launch-v2-interpreted"
+            } else {
+                b"tirith-mcp-launch-v1"
+            },
+        );
         launch_hash_field(&mut hasher, executable_path.as_bytes());
         launch_hash_field(&mut hasher, executable_digest.as_bytes());
         launch_hash_field(&mut hasher, &(args.len() as u64).to_le_bytes());
@@ -2280,10 +2640,20 @@ impl GatewayLaunchBinding {
             launch_hash_field(&mut hasher, value.as_bytes());
         }
         launch_hash_field(&mut hasher, containment.as_bytes());
+        if let Some(snapshot) = &interpreted_code {
+            launch_hash_field(
+                &mut hasher,
+                snapshot.entrypoint.as_os_str().as_encoded_bytes(),
+            );
+            launch_hash_field(&mut hasher, snapshot.digest.as_bytes());
+            launch_hash_field(&mut hasher, &snapshot.file_count.to_le_bytes());
+            launch_hash_field(&mut hasher, &snapshot.total_bytes.to_le_bytes());
+        }
 
         Ok(Self {
             executable,
             executable_digest,
+            interpreted_code,
             args: args.to_vec(),
             cwd,
             environment,
@@ -2299,6 +2669,14 @@ impl GatewayLaunchBinding {
         let digest = launch_executable_digest(self.executable.path())?;
         if digest != self.executable_digest {
             return Err("upstream executable bytes changed before spawn".to_string());
+        }
+        if let Some(expected) = &self.interpreted_code {
+            let current = InterpretedCodeSnapshot::capture(&self.cwd, &expected.entrypoint)?;
+            if current != *expected {
+                return Err(
+                    "interpreted MCP code or dependency closure changed before spawn".to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -8615,6 +8993,168 @@ mod tests {
             GatewayLaunchBinding::build(command, &args, repo.path(), "1", true).unwrap();
         assert_ne!(first.fingerprint, contained.fingerprint);
         first.revalidate().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn protected_test_interpreter(repo_root: &Path, entrypoint: &str) -> &'static str {
+        [
+            "/bin/sh",
+            "/usr/bin/sh",
+            "/bin/bash",
+            "/usr/bin/python3",
+            "/usr/bin/perl",
+        ]
+        .into_iter()
+        .find(|candidate| {
+            GatewayLaunchBinding::build(candidate, &[entrypoint.to_string()], repo_root, "1", true)
+                .is_ok()
+        })
+        .expect("a protected system interpreter is required for this Unix test")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_launch_fingerprint_binds_interpreted_repo_closure() {
+        let _lock = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("server.sh"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(repo.path().join("dependency.inc"), b"stable-v1\n").unwrap();
+        let interpreter = protected_test_interpreter(repo.path(), "server.sh");
+        let args = vec!["server.sh".to_string()];
+
+        let first =
+            GatewayLaunchBinding::build(interpreter, &args, repo.path(), "1", true).unwrap();
+        let identical =
+            GatewayLaunchBinding::build(interpreter, &args, repo.path(), "1", true).unwrap();
+        assert_eq!(first.fingerprint, identical.fingerprint);
+        assert!(first.interpreted_code.is_some());
+
+        std::fs::write(repo.path().join("dependency.inc"), b"changed-v2\n").unwrap();
+        let error = first.revalidate().unwrap_err();
+        assert!(error.contains("code or dependency closure changed"));
+        let changed =
+            GatewayLaunchBinding::build(interpreter, &args, repo.path(), "1", true).unwrap();
+        assert_ne!(first.fingerprint, changed.fingerprint);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_launch_refuses_dynamic_or_out_of_root_interpreted_entrypoints() {
+        let _lock = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("server.sh"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let interpreter = protected_test_interpreter(repo.path(), "server.sh");
+
+        let uncontained = GatewayLaunchBinding::build(
+            interpreter,
+            &["server.sh".to_string()],
+            repo.path(),
+            "1",
+            false,
+        )
+        .unwrap_err();
+        assert!(uncontained.contains("requires the fail-closed capsule"));
+
+        let dynamic = GatewayLaunchBinding::build(
+            interpreter,
+            &["-c".to_string(), "exit 0".to_string()],
+            repo.path(),
+            "1",
+            true,
+        )
+        .unwrap_err();
+        assert!(dynamic.contains("static repository-contained entrypoint"));
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let outside = GatewayLaunchBinding::build(
+            interpreter,
+            &[outside.path().display().to_string()],
+            repo.path(),
+            "1",
+            true,
+        )
+        .unwrap_err();
+        assert!(outside.contains("outside the repository root"));
+    }
+
+    #[test]
+    fn interpreted_snapshot_refuses_unbounded_closures() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("server.py"), b"pass\n").unwrap();
+        std::fs::write(repo.path().join("dependency.py"), b"pass\n").unwrap();
+        let limits = InterpretedSnapshotLimits {
+            max_entries: 8,
+            max_files: 1,
+            max_path_bytes: 1024,
+            max_file_bytes: 1024,
+            max_total_bytes: 2048,
+        };
+
+        let error = InterpretedCodeSnapshot::capture_with_limits(
+            repo.path(),
+            Path::new("server.py"),
+            limits,
+        )
+        .unwrap_err();
+        assert!(error.contains("file limit"));
+    }
+
+    #[test]
+    fn custom_interpreter_classification_does_not_depend_on_path_existence() {
+        let repo = tempfile::tempdir().unwrap();
+        let entrypoint = static_interpreted_entrypoint(
+            Path::new("/usr/local/bin/custom-runtime"),
+            &["created-after-classification.script".to_string()],
+            repo.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            entrypoint,
+            Some(PathBuf::from("created-after-classification.script"))
+        );
+    }
+
+    // `InterpretedCodeSnapshot::capture` goes through
+    // `ContainedAtomicFile::prepare`, which has no implementation outside Unix
+    // and Windows: the `cfg(all(not(unix), not(windows)))` platform module in
+    // contained_fs.rs returns `Unsupported`, so the `unwrap()` below would
+    // panic. The sibling limits test never reaches `prepare`, and
+    // `interpreted_snapshot_refuses_symlinked_dependencies` right after this is
+    // already gated the same way.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn interpreted_snapshot_excludes_self_referential_descriptor_lock() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("server.py"), b"pass\n").unwrap();
+        std::fs::create_dir(repo.path().join(".tirith")).unwrap();
+        let lock = repo
+            .path()
+            .join(".tirith")
+            .join(tirith_core::mcp_lock::MCP_LOCK_FILENAME);
+        std::fs::write(&lock, b"before approval\n").unwrap();
+        let before = InterpretedCodeSnapshot::capture(repo.path(), Path::new("server.py")).unwrap();
+        std::fs::write(&lock, b"after approval with launch fingerprint\n").unwrap();
+        let after = InterpretedCodeSnapshot::capture(repo.path(), Path::new("server.py")).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interpreted_snapshot_refuses_symlinked_dependencies() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(repo.path().join("server.py"), b"pass\n").unwrap();
+        symlink(outside.path(), repo.path().join("dependency.py")).unwrap();
+
+        let error =
+            InterpretedCodeSnapshot::capture(repo.path(), Path::new("server.py")).unwrap_err();
+        assert!(error.contains("symlink"));
     }
 
     #[cfg(unix)]
