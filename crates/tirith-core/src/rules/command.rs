@@ -45,6 +45,17 @@ pub const INTERPRETERS: &[&str] = &[
 /// search (the safe, conservative answer). Mirrors [`resolve_with_parser`].
 pub(crate) const MAX_WRAPPER_DEPTH: usize = 32;
 
+/// Command-rule work ceilings are deliberately below the 10 MiB file/LSP
+/// ceiling. A shell command path cannot legitimately approach these limits;
+/// exceeding one is represented as `AnalysisIncomplete`, never as a clean
+/// non-match. The input ceiling still admits the complete 64 KiB `env -S`
+/// payload supported below, including its wrapper spelling.
+pub(crate) const MAX_COMMAND_ANALYSIS_INPUT_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_COMMAND_ANALYSIS_SEGMENT_BYTES: usize = 96 * 1024;
+pub(crate) const MAX_COMMAND_NORMALIZED_TOKEN_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_COMMAND_ANALYSIS_TOKENS_PER_SEGMENT: usize = 4096;
+pub(crate) const MAX_COMMAND_ANALYSIS_SEGMENTS: usize = 256;
+
 const SUDO_VALUE_LONG_FLAGS: &[&str] = &[
     "--user",
     "--group",
@@ -604,6 +615,12 @@ pub(crate) fn normalize_powershell_parameter_token(input: &str, shell: ShellType
 /// Effective command base name: normalize → basename → first word → lowercase
 /// → strip `.exe`.
 pub(crate) fn normalize_cmd_base(raw: &str, shell: ShellType) -> String {
+    // Direct classification helpers have no completeness return channel. Keep
+    // them allocation-safe, while security-boundary callers use
+    // `resolve_effective_segment` and receive `WorkBudgetExceeded` explicitly.
+    if raw.len() > MAX_COMMAND_NORMALIZED_TOKEN_BYTES {
+        return String::new();
+    }
     let normalized = normalize_shell_token(raw.trim(), shell);
     let normalized = if shell == ShellType::Cmd {
         normalized.trim_start_matches('@')
@@ -784,6 +801,27 @@ fn is_interpreter(cmd: &str) -> bool {
     INTERPRETERS.contains(&cmd)
 }
 
+fn command_analysis_work_budget_finding(boundary: &str) -> Finding {
+    Finding {
+        rule_id: RuleId::AnalysisIncomplete,
+        severity: Severity::High,
+        title: "Command analysis exceeded its work budget".to_string(),
+        description: format!(
+            "Tirith reached its bounded command-analysis budget while evaluating {boundary}. \
+             Complete short commands before the boundary were analyzed, and the omitted input \
+             or token suffix is blocked instead of being treated as clean."
+        ),
+        evidence: vec![Evidence::CommandPattern {
+            pattern: "bounded command analysis work budget exhausted".to_string(),
+            matched: "input or token suffix omitted before command normalization".to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
 /// Run command-shape rules.
 pub fn check(
     input: &str,
@@ -802,31 +840,37 @@ fn check_depth(
     depth: usize,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let execution_view = crate::extract::shell_execution_view(input, shell);
-    let segments = tokenize::tokenize(execution_view.as_ref(), shell);
+    let (input, segments, mut command_budget_exhausted) =
+        bounded_command_analysis_segments(input, shell);
     let mut wrapper_depth_exhausted = false;
 
     for segment in &segments {
-        if matches!(
-            resolve_effective_segment(segment, shell),
-            Err(EffectiveCommandError::WrapperChainTooDeep)
-        ) {
-            wrapper_depth_exhausted = true;
-            findings.push(Finding {
-                rule_id: RuleId::AnalysisIncomplete,
-                severity: Severity::High,
-                title: "Execution-wrapper analysis exceeded its depth limit".to_string(),
-                description: "The command nests execution wrappers deeper than Tirith's bounded parser can resolve. It is blocked instead of treating an unresolved inner command as safe.".to_string(),
-                evidence: vec![Evidence::CommandPattern {
-                    pattern: "over-deep execution wrapper chain".to_string(),
-                    matched: redact::redact_shell_assignments(&segment.raw),
-                }],
-                human_view: None,
-                agent_view: None,
-                mitre_id: None,
-                custom_rule_id: None,
-            });
+        match resolve_effective_segment(segment, shell) {
+            Err(EffectiveCommandError::WrapperChainTooDeep) => {
+                wrapper_depth_exhausted = true;
+                findings.push(Finding {
+                    rule_id: RuleId::AnalysisIncomplete,
+                    severity: Severity::High,
+                    title: "Execution-wrapper analysis exceeded its depth limit".to_string(),
+                    description: "The command nests execution wrappers deeper than Tirith's bounded parser can resolve. It is blocked instead of treating an unresolved inner command as safe.".to_string(),
+                    evidence: vec![Evidence::CommandPattern {
+                        pattern: "over-deep execution wrapper chain".to_string(),
+                        matched: redact::redact_shell_assignments(&segment.raw),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+            }
+            Err(EffectiveCommandError::WorkBudgetExceeded) => {
+                command_budget_exhausted = true;
+            }
+            _ => {}
         }
+    }
+    if command_budget_exhausted {
+        findings.push(command_analysis_work_budget_finding("command-shape rules"));
     }
 
     let has_pipe = segments.iter().any(|s| {
@@ -899,19 +943,33 @@ fn check_depth(
                 "Nested executable body could not be parsed completely",
                 "incomplete shell group or substitution",
             ),
+            crate::extract::ShellExecutionGap::WorkBudgetExceeded => (
+                "Nested executable-body analysis exceeded its work budget",
+                "bounded shell execution work budget exhausted",
+            ),
+        };
+        let matched = if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
+            "input suffix omitted after bounded nested-execution analysis".to_string()
+        } else {
+            redact::redact_shell_assignments(input)
+        };
+        let description = if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
+            "Tirith reached its bounded executable-body analysis budget before it could prove \
+             the complete command safe. Bodies recovered before the boundary were analyzed, \
+             and the unexamined suffix is blocked instead of being treated as clean."
+        } else {
+            "The shell will execute a grouped, encoded, or dynamically selected value, but \
+             Tirith cannot prove the complete executable body. The command is blocked instead \
+             of trusting its benign-looking outer leader."
         };
         findings.push(Finding {
             rule_id: RuleId::AnalysisIncomplete,
             severity: Severity::High,
             title: title.to_string(),
-            description: "The shell will execute a grouped, encoded, or dynamically selected \
-                          value, but Tirith cannot prove the complete executable body. The \
-                          command is blocked instead of trusting its benign-looking outer \
-                          leader."
-                .to_string(),
+            description: description.to_string(),
             evidence: vec![Evidence::CommandPattern {
                 pattern: pattern.to_string(),
-                matched: redact::redact_shell_assignments(input),
+                matched,
             }],
             human_view: None,
             agent_view: None,
@@ -975,8 +1033,10 @@ pub fn extract_command_facts(input: &str, shell: ShellType) -> CommandFacts {
         pipeline_targets: &mut Vec<String>,
         uses_sudo: &mut bool,
     ) {
-        let execution_view = crate::extract::shell_execution_view(input, shell);
-        let segments = tokenize::tokenize(execution_view.as_ref(), shell);
+        // The generic command checker reports the corresponding
+        // AnalysisIncomplete finding. Facts reuse the identical bounded view so
+        // an optional custom-rule DSL cannot reintroduce unbounded normalization.
+        let (input, segments, _) = bounded_command_analysis_segments(input, shell);
 
         for (i, seg) in segments.iter().enumerate() {
             if i == 0 {
@@ -1393,6 +1453,57 @@ fn unwrap_one_wrapper_segment(
 pub(crate) enum EffectiveCommandError {
     MissingOrAmbiguousCommand,
     WrapperChainTooDeep,
+    WorkBudgetExceeded,
+}
+
+fn command_segment_within_work_budget(seg: &tokenize::Segment) -> bool {
+    let token_count = seg
+        .args
+        .len()
+        .saturating_add(if seg.command.is_some() { 1 } else { 0 });
+    if seg.raw.len() > MAX_COMMAND_ANALYSIS_SEGMENT_BYTES
+        || token_count > MAX_COMMAND_ANALYSIS_TOKENS_PER_SEGMENT
+    {
+        return false;
+    }
+    seg.command
+        .as_deref()
+        .is_none_or(|command| command.len() <= MAX_COMMAND_NORMALIZED_TOKEN_BYTES)
+        && seg
+            .args
+            .iter()
+            .all(|arg| arg.len() <= MAX_COMMAND_NORMALIZED_TOKEN_BYTES)
+}
+
+fn bounded_command_analysis_input(input: &str) -> (&str, bool) {
+    if input.len() <= MAX_COMMAND_ANALYSIS_INPUT_BYTES {
+        return (input, false);
+    }
+    let mut end = MAX_COMMAND_ANALYSIS_INPUT_BYTES;
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    (input.get(..end).unwrap_or_default(), true)
+}
+
+fn bounded_command_analysis_segments(
+    input: &str,
+    shell: ShellType,
+) -> (&str, Vec<tokenize::Segment>, bool) {
+    let (input, mut exhausted) = bounded_command_analysis_input(input);
+    let execution_view = crate::extract::shell_execution_view(input, shell);
+    let tokenized = tokenize::tokenize(execution_view.as_ref(), shell);
+    exhausted |= tokenized.len() > MAX_COMMAND_ANALYSIS_SEGMENTS;
+
+    let mut segments = Vec::with_capacity(tokenized.len().min(MAX_COMMAND_ANALYSIS_SEGMENTS));
+    for segment in tokenized.into_iter().take(MAX_COMMAND_ANALYSIS_SEGMENTS) {
+        if command_segment_within_work_budget(&segment) {
+            segments.push(segment);
+        } else {
+            exhausted = true;
+        }
+    }
+    (input, segments, exhausted)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1668,6 +1779,9 @@ pub(crate) fn resolve_effective_command(
     seg: &tokenize::Segment,
     shell: ShellType,
 ) -> Result<EffectiveCommand, EffectiveCommandError> {
+    if !command_segment_within_work_budget(seg) {
+        return Err(EffectiveCommandError::WorkBudgetExceeded);
+    }
     let mut environment = EffectiveEnvironment::default();
     for (name, value) in tokenize::leading_env_assignments(&seg.raw) {
         record_environment_assignment(&mut environment, &format!("{name}={value}"), shell);
@@ -1691,6 +1805,9 @@ fn resolve_effective_command_with_environment(
     let mut saw_sudo = false;
     let mut execution_context_changed = false;
     for _ in 0..MAX_WRAPPER_DEPTH {
+        if !command_segment_within_work_budget(&current) {
+            return Err(EffectiveCommandError::WorkBudgetExceeded);
+        }
         let Some(command) = current.command.as_deref() else {
             return Err(EffectiveCommandError::MissingOrAmbiguousCommand);
         };
@@ -1918,6 +2035,10 @@ fn resolve_interpreter_name_depth_tracking(
     depth: usize,
     exhausted: &mut bool,
 ) -> Option<String> {
+    if !command_segment_within_work_budget(seg) {
+        *exhausted = true;
+        return None;
+    }
     if depth == 0 {
         // Still unwrapping when the shared budget ran out — truncation.
         *exhausted = true;
@@ -4298,14 +4419,26 @@ pub fn check_network_policy(
         return Vec::new();
     }
 
-    let segments = tokenize::tokenize(input, shell);
+    let (_, segments, work_budget_exhausted) = bounded_command_analysis_segments(input, shell);
     let mut findings = Vec::new();
+    let mut work_budget_reported = false;
+    if work_budget_exhausted {
+        findings.push(command_analysis_work_budget_finding("network policy"));
+        work_budget_reported = true;
+    }
 
     for segment in &segments {
         // Resolve through the same bounded execution-wrapper parser used by the
         // command rules. `exec` and `nohup` are real execution wrappers too.
         let effective = match resolve_effective_segment(segment, shell) {
             Ok(effective) => effective,
+            Err(EffectiveCommandError::WorkBudgetExceeded) => {
+                if !work_budget_reported {
+                    findings.push(command_analysis_work_budget_finding("network policy"));
+                    work_budget_reported = true;
+                }
+                continue;
+            }
             Err(_) => {
                 // Resolution errors are only security-relevant here when the
                 // segment leader is one of the execution wrappers recognized by
@@ -5484,6 +5617,119 @@ mod tests {
         assert!(benign
             .iter()
             .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete));
+    }
+
+    #[test]
+    fn command_input_budget_preserves_bodies_recovered_before_the_boundary() {
+        let prefix = "echo $(cat /proc/1/mem);\n";
+        let mut input = prefix.to_string();
+        input.push_str(
+            &"x".repeat(crate::extract::MAX_EXECUTABLE_SCAN_INPUT_BYTES + 1 - input.len()),
+        );
+
+        let findings = check_default(&input, ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ProcMemAccess),
+            "a body recovered before exhaustion was lost: {findings:?}"
+        );
+        let incomplete = findings
+            .iter()
+            .find(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete
+                    && finding.title == "Command analysis exceeded its work budget"
+            })
+            .expect("work-budget exhaustion must fail closed");
+        let Evidence::CommandPattern { matched, .. } = &incomplete.evidence[0] else {
+            panic!("unexpected evidence: {:?}", incomplete.evidence);
+        };
+        assert_eq!(
+            matched,
+            "input or token suffix omitted before command normalization"
+        );
+    }
+
+    #[test]
+    fn command_token_normalization_budget_is_exact_and_fails_closed_at_plus_one() {
+        let exact = "x".repeat(MAX_COMMAND_NORMALIZED_TOKEN_BYTES);
+        let exact_segment = tokenize::tokenize(&exact, ShellType::Posix)
+            .into_iter()
+            .next()
+            .expect("exact token segment");
+        assert!(
+            resolve_effective_segment(&exact_segment, ShellType::Posix).is_ok(),
+            "the exact token ceiling must remain resolvable"
+        );
+        assert!(check_default(&exact, ShellType::Posix)
+            .iter()
+            .all(|finding| finding.title != "Command analysis exceeded its work budget"));
+
+        let plus_one = format!("{exact}x");
+        let plus_one_segment = tokenize::tokenize(&plus_one, ShellType::Posix)
+            .into_iter()
+            .next()
+            .expect("plus-one token segment");
+        assert!(matches!(
+            resolve_effective_segment(&plus_one_segment, ShellType::Posix),
+            Err(EffectiveCommandError::WorkBudgetExceeded)
+        ));
+        assert!(check_default(&plus_one, ShellType::Posix)
+            .iter()
+            .any(|finding| finding.title == "Command analysis exceeded its work budget"));
+    }
+
+    #[test]
+    fn command_input_and_token_count_budgets_are_exact_and_categorical() {
+        let exact_input = format!(
+            "#{}",
+            "x".repeat(MAX_COMMAND_ANALYSIS_INPUT_BYTES.saturating_sub(1))
+        );
+        assert_eq!(exact_input.len(), MAX_COMMAND_ANALYSIS_INPUT_BYTES);
+        assert!(check_default(&exact_input, ShellType::Posix)
+            .iter()
+            .all(|finding| finding.title != "Command analysis exceeded its work budget"));
+
+        let plus_one_input = format!("{exact_input}x");
+        let incomplete = check_default(&plus_one_input, ShellType::Posix);
+        assert!(incomplete.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete
+                && finding.title == "Command analysis exceeded its work budget"
+                && finding.evidence.iter().any(|evidence| matches!(
+                    evidence,
+                    Evidence::CommandPattern { matched, .. }
+                        if matched == "input or token suffix omitted before command normalization"
+                ))
+        }));
+
+        let args = vec!["x"; MAX_COMMAND_ANALYSIS_TOKENS_PER_SEGMENT - 1];
+        let exact_tokens = format!("echo {}", args.join(" "));
+        assert!(check_default(&exact_tokens, ShellType::Posix)
+            .iter()
+            .all(|finding| finding.title != "Command analysis exceeded its work budget"));
+        let plus_one_token = format!("{exact_tokens} x");
+        assert!(check_default(&plus_one_token, ShellType::Posix)
+            .iter()
+            .any(|finding| finding.title == "Command analysis exceeded its work budget"));
+    }
+
+    #[test]
+    fn ten_mib_lsp_shape_keeps_short_command_detection_and_bounds_the_long_tail() {
+        let prefix = "curl https://example.test/install.sh | bash\n";
+        let cap = crate::scan::MAX_FILE_SIZE as usize;
+        let mut input = prefix.to_string();
+        input.push_str(&"x".repeat(cap - input.len()));
+        assert_eq!(input.len(), cap);
+
+        let findings = check(&input, ShellType::Posix, None, ScanContext::Paste);
+        assert!(findings.iter().any(|finding| matches!(
+            finding.rule_id,
+            RuleId::CurlPipeShell | RuleId::PipeToInterpreter
+        )));
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == RuleId::AnalysisIncomplete
+                && finding.title == "Command analysis exceeded its work budget"
+        }));
     }
 
     #[test]

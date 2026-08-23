@@ -245,11 +245,14 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         // it must not finalize typed execution events.
     };
 
-    crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    crate::redact::redact_verdict_with_compiled(&mut verdict, &compiled);
+    crate::verdict::bound_verdict_for_output(&mut verdict);
     let structured = serde_json::to_value(&verdict)
         .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
-        .ok();
-    let text = format_verdict_text(&verdict);
+        .ok()
+        .map(crate::verdict::bound_json_value_for_output);
+    let text = bounded_safe_mcp_text(format_verdict_text(&verdict), &compiled);
 
     ToolCallResult {
         content: vec![ContentItem {
@@ -322,11 +325,14 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         }
     }
 
-    crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    crate::redact::redact_verdict_with_compiled(&mut verdict, &compiled);
+    crate::verdict::bound_verdict_for_output(&mut verdict);
     let structured = serde_json::to_value(&verdict)
         .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
-        .ok();
-    let text = format_verdict_text(&verdict);
+        .ok()
+        .map(crate::verdict::bound_json_value_for_output);
+    let text = bounded_safe_mcp_text(format_verdict_text(&verdict), &compiled);
 
     ToolCallResult {
         content: vec![ContentItem {
@@ -392,11 +398,14 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         }
     }
 
-    crate::redact::redact_verdict(&mut verdict, &policy.dlp_custom_patterns);
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    crate::redact::redact_verdict_with_compiled(&mut verdict, &compiled);
+    crate::verdict::bound_verdict_for_output(&mut verdict);
     let structured = serde_json::to_value(&verdict)
         .map_err(|e| eprintln!("tirith: mcp: verdict serialization failed: {e}"))
-        .ok();
-    let text = format_verdict_text(&verdict);
+        .ok()
+        .map(crate::verdict::bound_json_value_for_output);
+    let text = bounded_safe_mcp_text(format_verdict_text(&verdict), &compiled);
 
     ToolCallResult {
         content: vec![ContentItem {
@@ -414,13 +423,14 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
         None => return tool_error("Missing required parameter: path"),
     };
 
+    let policy = crate::policy::Policy::discover(None);
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    let safe_path = crate::redact::redact_sanitize_redact_with_compiled(path_str, &compiled);
     let path = PathBuf::from(path_str);
     let path = match validate_path_scope(&path) {
         Ok(p) => p,
-        Err(e) => return tool_error(&e),
+        Err(e) => return tool_error_with_compiled(&e, &compiled),
     };
-
-    let policy = crate::policy::Policy::discover(None);
 
     // Guarded: a long-lived MCP server must not crash if a rule panics on a
     // crafted file — degrade to a tool error instead of unwinding. A skip carries
@@ -428,34 +438,57 @@ fn call_scan_file(args: &Value) -> ToolCallResult {
     use scan::{CoverageGapKind, GuardedScanOutcome, ScanFileOutcome};
     match scan::scan_single_file_guarded(&path) {
         GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(mut result)) => {
-            crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
-            let structured = json!({
-                "path": result.path.display().to_string(),
-                "is_config_file": result.is_config_file,
-                "findings_count": result.findings.len(),
-                "findings": result.findings,
-            });
-            let text = format_file_scan_text(&result);
+            let findings_count = result.findings.len();
+            let analysis_incomplete = result.analysis_incomplete();
+            crate::redact::redact_findings_with_compiled(&mut result.findings, &compiled);
+            crate::verdict::bound_findings_for_output(&mut result.findings);
+            let structured = file_scan_structured(&result, findings_count, &compiled);
+            let text = bounded_safe_mcp_text(format_file_scan_text(&result, &compiled), &compiled);
             ToolCallResult {
                 content: vec![ContentItem {
                     content_type: "text".into(),
                     text,
                 }],
-                is_error: false,
+                is_error: analysis_incomplete,
                 structured_content: Some(structured),
             }
         }
-        GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => tool_error(&format!(
-            "Could not analyze {path_str}: coverage gap ({})",
-            gap.kind.as_str()
-        )),
+        GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => tool_error_with_compiled(
+            &format!(
+                "Could not analyze {safe_path}: coverage gap ({})",
+                gap.kind.as_str()
+            ),
+            &compiled,
+        ),
         GuardedScanOutcome::RulePanic(gap) => {
             debug_assert_eq!(gap.kind, CoverageGapKind::Panicked);
-            tool_error(&format!(
-                "Internal error scanning {path_str}: a rule panicked; file not scanned"
-            ))
+            tool_error_with_compiled(
+                &format!("Internal error scanning {safe_path}: a rule panicked; file not scanned"),
+                &compiled,
+            )
         }
     }
+}
+
+fn file_scan_structured(
+    result: &scan::FileScanResult,
+    findings_count: usize,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> Value {
+    let presented_findings_count = result.findings.len();
+    let mut structured = json!({
+        "path": result.path.display().to_string(),
+        "is_config_file": result.is_config_file,
+        // Enforcement/analysis count, captured before presentation bounding.
+        "findings_count": findings_count,
+        "presented_findings_count": presented_findings_count,
+        "findings": &result.findings,
+        "analysis_incomplete": result.analysis_incomplete(),
+        "coverage_gaps": &result.coverage_gaps,
+        "dlp_redaction_incomplete": compiled.incomplete_reason().is_some(),
+    });
+    crate::redact::redact_json_strings(&mut structured, compiled);
+    crate::verdict::bound_json_value_for_output(structured)
 }
 
 fn call_scan_directory(args: &Value) -> ToolCallResult {
@@ -469,13 +502,16 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
+    let policy = crate::policy::Policy::discover(None);
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    let safe_path = crate::redact::redact_sanitize_redact_with_compiled(path_str, &compiled);
     let path = PathBuf::from(path_str);
     let path = match validate_path_scope(&path) {
         Ok(p) => p,
-        Err(e) => return tool_error(&e),
+        Err(e) => return tool_error_with_compiled(&e, &compiled),
     };
     if !path.is_dir() {
-        return tool_error(&format!("Not a directory: {path_str}"));
+        return tool_error_with_compiled(&format!("Not a directory: {safe_path}"), &compiled);
     }
 
     let config = scan::ScanConfig {
@@ -488,33 +524,45 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
         max_files: Some(crate::mcp::resources::MCP_SCAN_MAX_FILES),
     };
 
-    let policy = crate::policy::Policy::discover(None);
     let mut result = scan::scan(&config);
+    let total_findings = result.total_findings();
     for fr in &mut result.file_results {
-        crate::redact::redact_findings(&mut fr.findings, &policy.dlp_custom_patterns);
+        crate::redact::redact_findings_with_compiled(&mut fr.findings, &compiled);
     }
 
-    let structured = directory_scan_structured(&result);
+    build_directory_scan_response(&result, total_findings, &policy, &compiled)
+}
 
+fn build_directory_scan_response(
+    result: &scan::ScanResult,
+    total_findings: usize,
+    policy: &crate::policy::Policy,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> ToolCallResult {
+    let structured = directory_scan_structured(result, total_findings, compiled);
     // repo-0298: coverage gaps must honor the operator's completeness policy —
     // under `require_complete` (or a per-gap Fail action) an incompletely
     // scanned directory is an ERROR result, never a clean "no issues found".
-    let completeness_violation = !result.coverage_gaps.is_empty()
-        && (policy.scan.require_complete
-            || result.coverage_gaps.iter().any(|gap| {
-                matches!(
-                    policy.scan.action_for_gap_kind(gap.kind),
-                    crate::policy::GapAction::Fail
-                )
-            }));
-    let mut text = format_dir_scan_text(&result);
+    let completeness_violation = directory_scan_is_error(result, policy);
+    let mut text = format_dir_scan_text(result, total_findings, compiled);
     if completeness_violation {
-        text = format!(
-            "ANALYSIS INCOMPLETE (policy `scan.require_complete` / per-gap Fail): {}\n{}",
-            result.coverage_gaps.len(),
-            text
-        );
+        text = if result.has_analysis_incomplete_finding() {
+            format!("ANALYSIS INCOMPLETE (analyzer reported incomplete coverage)\n{text}")
+        } else if result.truncated {
+            format!(
+                "ANALYSIS INCOMPLETE (scan file budget exhausted): {} candidate(s) omitted\n{}",
+                result.skipped_count, text
+            )
+        } else {
+            format!(
+                "ANALYSIS INCOMPLETE (policy `scan.require_complete` / per-gap Fail): {}\n{}",
+                result.coverage_gaps.len(),
+                text
+            )
+        };
     }
+    text = crate::redact::redact_sanitize_redact_with_compiled(&text, compiled);
+    text = crate::verdict::bound_text_for_output(text);
 
     ToolCallResult {
         content: vec![ContentItem {
@@ -526,28 +574,25 @@ fn call_scan_directory(args: &Value) -> ToolCallResult {
     }
 }
 
-fn directory_scan_structured(result: &scan::ScanResult) -> Value {
-    json!({
-        "scanned_count": result.scanned_count,
-        "skipped_count": result.skipped_count,
-        "truncated": result.truncated,
-        "truncation_reason": result.truncation_reason,
-        "panic_count": result.panic_files.len(),
-        "panic_files": result.panic_files.iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "analysis_incomplete": !result.coverage_gaps.is_empty(),
-        "coverage_gaps": &result.coverage_gaps,
-        "total_findings": result.total_findings(),
-        "files": result.file_results.iter()
-            .filter(|r| !r.findings.is_empty())
-            .map(|r| json!({
-                "path": r.path.display().to_string(),
-                "is_config_file": r.is_config_file,
-                "findings": r.findings,
-            }))
-            .collect::<Vec<_>>(),
-    })
+fn directory_scan_is_error(result: &scan::ScanResult, policy: &crate::policy::Policy) -> bool {
+    result.has_analysis_incomplete_finding()
+        || result.truncated
+        || (!result.coverage_gaps.is_empty()
+            && (policy.scan.require_complete
+                || result.coverage_gaps.iter().any(|gap| {
+                    matches!(
+                        policy.scan.action_for_gap_kind(gap.kind),
+                        crate::policy::GapAction::Fail
+                    )
+                })))
+}
+
+fn directory_scan_structured(
+    result: &scan::ScanResult,
+    total_findings: usize,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> Value {
+    super::resources::bounded_scan_projection(result, total_findings, None, compiled)
 }
 
 fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
@@ -556,70 +601,117 @@ fn call_verify_mcp_config(args: &Value) -> ToolCallResult {
         None => return tool_error("Missing required parameter: path"),
     };
 
+    let policy = crate::policy::Policy::discover(None);
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    let safe_path = crate::redact::redact_sanitize_redact_with_compiled(path_str, &compiled);
     let path = PathBuf::from(path_str);
     let path = match validate_path_scope(&path) {
         Ok(p) => p,
-        Err(e) => return tool_error(&e),
+        Err(e) => return tool_error_with_compiled(&e, &compiled),
     };
-
-    let policy = crate::policy::Policy::discover(None);
 
     // scan_single_file routes through FileScan, which runs configfile rules.
     // Guarded so a crafted config can't crash the long-lived MCP server.
     use scan::{GuardedScanOutcome, ScanFileOutcome};
     match scan::scan_single_file_guarded(&path) {
-        GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(mut result)) => {
-            crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
-            let mcp_findings: Vec<_> = result
-                .findings
-                .iter()
-                .filter(|f| {
-                    matches!(
-                        f.rule_id,
-                        crate::verdict::RuleId::McpInsecureServer
-                            | crate::verdict::RuleId::McpUntrustedServer
-                            | crate::verdict::RuleId::McpDuplicateServerName
-                            | crate::verdict::RuleId::McpOverlyPermissive
-                            | crate::verdict::RuleId::McpSuspiciousArgs
-                            | crate::verdict::RuleId::ConfigInvisibleUnicode
-                            | crate::verdict::RuleId::ConfigNonAscii
-                            | crate::verdict::RuleId::ConfigInjection
-                    )
-                })
-                .collect();
-
-            let text = if mcp_findings.is_empty() {
-                format!("{path_str}: MCP config is clean — no issues found.")
-            } else {
-                let mut out = format!("{path_str}: {} issue(s) found:\n", mcp_findings.len());
-                for f in &mcp_findings {
-                    out.push_str(&format!("  [{}] {} — {}\n", f.severity, f.rule_id, f.title));
-                }
-                out
-            };
-
-            let structured = json!({
-                "path": path_str,
-                "findings_count": mcp_findings.len(),
-                "findings": mcp_findings,
-            });
-
-            ToolCallResult {
-                content: vec![ContentItem {
-                    content_type: "text".into(),
-                    text,
-                }],
-                is_error: false,
-                structured_content: Some(structured),
-            }
+        GuardedScanOutcome::Completed(ScanFileOutcome::Scanned(result)) => {
+            build_mcp_config_response(&safe_path, result.findings, &compiled)
         }
-        GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => tool_error(&format!(
-            "Could not analyze {path_str}: coverage gap ({})",
-            gap.kind.as_str()
-        )),
-        GuardedScanOutcome::RulePanic(_) => tool_error(&format!(
-            "Internal error scanning {path_str}: a rule panicked; file not scanned"
-        )),
+        GuardedScanOutcome::Completed(ScanFileOutcome::Skipped(gap)) => tool_error_with_compiled(
+            &format!(
+                "Could not analyze {safe_path}: coverage gap ({})",
+                gap.kind.as_str()
+            ),
+            &compiled,
+        ),
+        GuardedScanOutcome::RulePanic(_) => tool_error_with_compiled(
+            &format!("Internal error scanning {safe_path}: a rule panicked; file not scanned"),
+            &compiled,
+        ),
+    }
+}
+
+fn build_mcp_config_response(
+    safe_path: &str,
+    findings: Vec<crate::verdict::Finding>,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> ToolCallResult {
+    // Select relevant findings before bounding so unrelated entries cannot
+    // consume presentation slots. Malformed input and coverage gaps are part
+    // of the verifier's contract: dropping either could turn a truncated
+    // Base64 payload or malformed MCP document into a false clean result.
+    let mut mcp_findings: Vec<_> = findings
+        .into_iter()
+        .filter(|finding| {
+            matches!(
+                finding.rule_id,
+                crate::verdict::RuleId::McpInsecureServer
+                    | crate::verdict::RuleId::McpUntrustedServer
+                    | crate::verdict::RuleId::McpDuplicateServerName
+                    | crate::verdict::RuleId::McpOverlyPermissive
+                    | crate::verdict::RuleId::McpSuspiciousArgs
+                    | crate::verdict::RuleId::ConfigInvisibleUnicode
+                    | crate::verdict::RuleId::ConfigNonAscii
+                    | crate::verdict::RuleId::ConfigInjection
+                    | crate::verdict::RuleId::ConfigMalformed
+                    | crate::verdict::RuleId::AnalysisIncomplete
+            )
+        })
+        .collect();
+    let findings_count = mcp_findings.len();
+    let analysis_incomplete = mcp_findings.iter().any(|finding| {
+        matches!(
+            finding.rule_id,
+            crate::verdict::RuleId::AnalysisIncomplete | crate::verdict::RuleId::ConfigMalformed
+        )
+    });
+    // Keep the load-bearing completeness findings at the front so the generic
+    // presentation bound retains them even if a document emits many issues.
+    mcp_findings.sort_by_key(|finding| {
+        !matches!(
+            finding.rule_id,
+            crate::verdict::RuleId::AnalysisIncomplete | crate::verdict::RuleId::ConfigMalformed
+        )
+    });
+    crate::redact::redact_findings_with_compiled(&mut mcp_findings, compiled);
+    crate::verdict::bound_findings_for_output(&mut mcp_findings);
+
+    let safe_path = crate::redact::redact_sanitize_redact_with_compiled(safe_path, compiled);
+    let text = if mcp_findings.is_empty() {
+        format!("{safe_path}: MCP config is clean — no issues found.")
+    } else {
+        let prefix = if analysis_incomplete {
+            "ANALYSIS INCOMPLETE — "
+        } else {
+            ""
+        };
+        let mut out = format!("{safe_path}: {prefix}{findings_count} issue(s) found:\n");
+        for finding in &mcp_findings {
+            out.push_str(&format!(
+                "  [{}] {} — {}\n",
+                finding.severity, finding.rule_id, finding.title
+            ));
+        }
+        out
+    };
+
+    let mut structured = json!({
+        "path": safe_path,
+        "findings_count": findings_count,
+        "findings": mcp_findings,
+        "analysis_incomplete": analysis_incomplete,
+        "dlp_redaction_incomplete": compiled.incomplete_reason().is_some(),
+    });
+    crate::redact::redact_json_strings(&mut structured, compiled);
+    let structured = crate::verdict::bound_json_value_for_output(structured);
+
+    ToolCallResult {
+        content: vec![ContentItem {
+            content_type: "text".into(),
+            text: bounded_safe_mcp_text(text, compiled),
+        }],
+        is_error: analysis_incomplete,
+        structured_content: Some(structured),
     }
 }
 
@@ -631,23 +723,54 @@ fn call_fetch_cloaking(args: &Value) -> ToolCallResult {
     };
 
     let policy = crate::policy::Policy::discover(None);
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
 
     match crate::rules::cloaking::check(url) {
-        Ok(mut result) => {
-            crate::redact::redact_findings(&mut result.findings, &policy.dlp_custom_patterns);
-            build_cloaking_response(result, &policy.dlp_custom_patterns)
-        }
-        Err(e) => tool_error(&format!("Cloaking check failed: {e}")),
+        Ok(result) => build_cloaking_response_with_compiled(result, &compiled),
+        Err(e) => tool_error_with_compiled(&format!("Cloaking check failed: {e}"), &compiled),
     }
 }
 
 /// Build the MCP response for a cloaking result. Extracted for testability;
-/// diff_text is DLP-redacted before serialization.
-#[cfg(unix)]
+/// every caller-controlled string is DLP-redacted before serialization.
+#[cfg(all(unix, test))]
 fn build_cloaking_response(
-    mut result: crate::rules::cloaking::CloakingResult,
+    result: crate::rules::cloaking::CloakingResult,
     dlp_patterns: &[String],
 ) -> ToolCallResult {
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(dlp_patterns);
+    build_cloaking_response_with_compiled(result, &compiled)
+}
+
+#[cfg(unix)]
+fn build_cloaking_response_with_compiled(
+    mut result: crate::rules::cloaking::CloakingResult,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> ToolCallResult {
+    result.url = crate::redact::redact_sanitize_redact_with_compiled(&result.url, compiled);
+    crate::redact::redact_findings_with_compiled(&mut result.findings, compiled);
+    crate::verdict::bound_findings_for_output(&mut result.findings);
+    for diff in &mut result.diff_pairs {
+        if let Some(text) = &diff.diff_text {
+            diff.diff_text = Some(crate::redact::redact_sanitize_redact_with_compiled(
+                text, compiled,
+            ));
+        }
+    }
+
+    // repo-0299: the comparison only ran when every agent returned a
+    // non-empty body at the baseline status. If any agent's response was
+    // empty/blocked, "no cloaking" was never established — say so.
+    // `all` is vacuously true on an empty list, which would report a clean
+    // "no cloaking" for a check that compared nothing at all.
+    let all_comparable = !result.agent_responses.is_empty()
+        && result.agent_responses.iter().all(|r| r.content_length > 0);
+    // A detected result is a completed analysis that found something; only the
+    // inconclusive branch is an *incomplete* analysis. Every other tool in this
+    // module reports incompleteness through `is_error`, so leaving it false here
+    // let a consumer branching on `isError` read INCONCLUSIVE as a clean pass.
+    let analysis_incomplete = !result.cloaking_detected && !all_comparable;
+
     let text = if result.cloaking_detected {
         let differing: Vec<&str> = result
             .diff_pairs
@@ -659,52 +782,77 @@ fn build_cloaking_response(
             result.url,
             differing.join(", ")
         )
+    } else if all_comparable {
+        format!("No cloaking detected for {}", result.url)
     } else {
-        // repo-0299: the comparison only ran when every agent returned a
-        // non-empty body at the baseline status. If any agent's response was
-        // empty/blocked, "no cloaking" was never established — say so.
-        // `all` is vacuously true on an empty list, which would report a clean
-        // "no cloaking" for a check that compared nothing at all.
-        let all_comparable = !result.agent_responses.is_empty()
-            && result.agent_responses.iter().all(|r| r.content_length > 0);
-        if all_comparable {
-            format!("No cloaking detected for {}", result.url)
-        } else {
-            format!(
-                "Cloaking check INCONCLUSIVE for {}: at least one agent received an empty/blocked response, so no clean baseline comparison exists",
-                result.url
-            )
-        }
+        format!(
+            "Cloaking check INCONCLUSIVE for {}: at least one agent received an empty/blocked response, so no clean baseline comparison exists",
+            result.url
+        )
     };
 
-    // DLP-redact diff text before serialization.
-    for diff in &mut result.diff_pairs {
-        if let Some(ref text) = diff.diff_text {
-            diff.diff_text = Some(crate::redact::redact_with_custom(text, dlp_patterns));
-        }
+    let text = bounded_safe_mcp_text(text, compiled);
+    let mut structured = result.to_json(true);
+    // Mirror the text-level caveat into the structured payload so a machine
+    // consumer does not have to parse prose to learn the check was inconclusive.
+    if let Some(object) = structured.as_object_mut() {
+        object.insert("analysis_incomplete".into(), json!(analysis_incomplete));
     }
-
-    let structured = result.to_json(true);
+    crate::redact::redact_json_strings(&mut structured, compiled);
+    // Bound AFTER redaction, like every other structured projection in this
+    // module. `to_json(true)` embeds every diff plus its optional `diff_text`,
+    // all of it remote-controlled, so an oversized upstream diff would otherwise
+    // push the response past the MCP presentation limit. This was the only
+    // structured path here missing the bound.
+    let structured = crate::verdict::bound_json_value_for_output(structured);
 
     ToolCallResult {
         content: vec![ContentItem {
             content_type: "text".into(),
             text,
         }],
-        is_error: false,
+        is_error: analysis_incomplete,
         structured_content: Some(structured),
     }
 }
 
 fn tool_error(msg: &str) -> ToolCallResult {
+    // This fallback has no frozen policy snapshot. Do the built-in RSR pass but
+    // deliberately leave transport bounding to the dispatcher, which applies
+    // its invocation-frozen custom DLP plan first. Bounding here could split a
+    // custom secret and make the later pass miss it.
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
     ToolCallResult {
         content: vec![ContentItem {
             content_type: "text".into(),
-            text: msg.to_string(),
+            text: crate::redact::redact_sanitize_redact_with_compiled(msg, &compiled),
         }],
         is_error: true,
         structured_content: None,
     }
+}
+
+fn tool_error_with_compiled(
+    msg: &str,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> ToolCallResult {
+    ToolCallResult {
+        content: vec![ContentItem {
+            content_type: "text".into(),
+            text: bounded_safe_mcp_text(msg.to_string(), compiled),
+        }],
+        is_error: true,
+        structured_content: None,
+    }
+}
+
+/// Apply the shared redact-sanitize-redact terminal boundary before enforcing
+/// the MCP text cap. Redacting the Verdict alone is insufficient because a
+/// secret can be split by ANSI or invisible Unicode until sanitization joins
+/// it back together.
+fn bounded_safe_mcp_text(text: String, compiled: &crate::redact::CompiledCustomPatterns) -> String {
+    let text = crate::redact::redact_sanitize_redact_with_compiled(&text, compiled);
+    crate::verdict::bound_text_for_output(text)
 }
 
 fn format_verdict_text(verdict: &crate::verdict::Verdict) -> String {
@@ -722,23 +870,39 @@ fn format_verdict_text(verdict: &crate::verdict::Verdict) -> String {
     out
 }
 
-fn format_file_scan_text(result: &scan::FileScanResult) -> String {
-    if result.findings.is_empty() {
-        return format!("{}: no issues found.", result.path.display());
-    }
-    let mut out = format!(
-        "{}: {} finding(s):\n",
-        result.path.display(),
-        result.findings.len()
+fn format_file_scan_text(
+    result: &scan::FileScanResult,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> String {
+    let path = crate::redact::redact_sanitize_redact_with_compiled(
+        &result.path.display().to_string(),
+        compiled,
     );
+    let analysis_incomplete = result.analysis_incomplete();
+    if result.findings.is_empty() && !analysis_incomplete {
+        return format!("{path}: no issues found.");
+    }
+    let mut out = if analysis_incomplete {
+        format!(
+            "{path}: ANALYSIS INCOMPLETE — {} finding(s), {} coverage gap(s):\n",
+            result.findings.len(),
+            result.coverage_gaps.len()
+        )
+    } else {
+        format!("{path}: {} finding(s):\n", result.findings.len())
+    };
     for f in &result.findings {
         out.push_str(&format!("  [{}] {} — {}\n", f.severity, f.rule_id, f.title));
     }
     out
 }
 
-fn format_dir_scan_text(result: &scan::ScanResult) -> String {
-    let total = result.total_findings();
+fn format_dir_scan_text(
+    result: &scan::ScanResult,
+    total: usize,
+    compiled: &crate::redact::CompiledCustomPatterns,
+) -> String {
+    let analysis_incomplete = super::resources::scan_analysis_incomplete(result);
     let panic_note = if result.panic_files.is_empty() {
         String::new()
     } else {
@@ -747,18 +911,31 @@ fn format_dir_scan_text(result: &scan::ScanResult) -> String {
             result.panic_files.len()
         )
     };
-    let coverage_note = if result.coverage_gaps.is_empty() {
+    let coverage_note = if !analysis_incomplete {
         String::new()
     } else {
         format!(
-            "\n  WARNING: analysis incomplete due to {} coverage gap(s).",
-            result.coverage_gaps.len()
+            "\n  WARNING: analysis incomplete ({} coverage gap(s), truncated={}).",
+            result.coverage_gaps.len(),
+            result.truncated
         )
     };
+    let truncation_note = if result.truncated {
+        let reason = crate::redact::redact_sanitize_redact_with_compiled(
+            result
+                .truncation_reason
+                .as_deref()
+                .unwrap_or("Scan file budget exhausted; additional files were omitted."),
+            compiled,
+        );
+        format!("\n  {}", reason)
+    } else {
+        String::new()
+    };
     if total == 0 {
-        if !result.coverage_gaps.is_empty() {
+        if analysis_incomplete {
             return format!(
-                "{} files scanned; analysis incomplete.{coverage_note}{panic_note}",
+                "{} files scanned; analysis incomplete.{truncation_note}{coverage_note}{panic_note}",
                 result.scanned_count
             );
         }
@@ -772,36 +949,77 @@ fn format_dir_scan_text(result: &scan::ScanResult) -> String {
         .iter()
         .filter(|r| !r.findings.is_empty())
         .count();
-    let mut out = format!(
+    let mut out = crate::verdict::BoundedTextBuilder::new();
+    out.push_str(&format!(
         "{} files scanned, {} finding(s) in {} file(s):\n",
         result.scanned_count, total, files_with
-    );
+    ));
+    // These notes are why the reader should distrust the list that follows, so
+    // they go in before it. `BoundedTextBuilder` drops the tail once the budget
+    // is spent, and appending them last meant a scan with enough findings to
+    // exhaust the budget silently lost the very caveat saying it was truncated,
+    // had coverage gaps, or panicked. Cutting detail is recoverable; cutting the
+    // caveat turns an incomplete scan into an apparently complete one.
+    out.push_str(&truncation_note);
+    out.push_str(&coverage_note);
+    out.push_str(&panic_note);
     for fr in &result.file_results {
         if fr.findings.is_empty() {
             continue;
         }
-        out.push_str(&format!("\n  {}:\n", fr.path.display()));
+        let path = crate::redact::redact_sanitize_redact_with_compiled(
+            &fr.path.display().to_string(),
+            compiled,
+        );
+        out.push_str(&format!("\n  {path}:\n"));
         for f in &fr.findings {
-            out.push_str(&format!(
-                "    [{}] {} — {}\n",
-                f.severity, f.rule_id, f.title
-            ));
+            let title = crate::redact::redact_sanitize_redact_with_compiled(&f.title, compiled);
+            out.push_str(&format!("    [{}] {} — {}\n", f.severity, f.rule_id, title));
         }
     }
-    if result.truncated {
-        if let Some(ref reason) = result.truncation_reason {
-            out.push_str(&format!("\n  {reason}\n"));
-        }
-    }
-    out.push_str(&coverage_note);
-    out.push_str(&panic_note);
-    out
+    out.finish()
 }
 
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_text_redacts_secrets_that_controls_split_inside_finding_titles() {
+        let custom = "C02_MCP_SPLIT_CANARY";
+        let github = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let split_custom = format!("{}\u{200b}{}", &custom[..9], &custom[9..]);
+        let split_github = format!("{}\u{1b}[31m{}", &github[..18], &github[18..]);
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[regex::escape(custom)]);
+        let mut verdict = crate::verdict::Verdict::from_findings(
+            vec![crate::verdict::Finding {
+                rule_id: crate::verdict::RuleId::ConfigInjection,
+                severity: crate::verdict::Severity::High,
+                title: format!("{split_custom} {split_github}"),
+                description: "test".to_string(),
+                evidence: Vec::new(),
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            1,
+            crate::verdict::Timings::default(),
+        );
+
+        // Pin the real two-stage boundary: the first verdict redaction cannot
+        // see across controls, while the formatted MCP text boundary must.
+        crate::redact::redact_verdict_with_compiled(&mut verdict, &compiled);
+        let text = bounded_safe_mcp_text(format_verdict_text(&verdict), &compiled);
+
+        assert!(!text.contains(custom), "{text}");
+        assert!(!text.contains(&github), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(!text.contains('\u{200b}'), "{text}");
+        assert!(text.contains("[REDACTED:custom]"), "{text}");
+        assert!(text.contains("[REDACTED:GitHub PAT]"), "{text}");
+    }
 
     #[test]
     fn directory_scan_text_never_claims_clean_when_coverage_has_gaps() {
@@ -820,8 +1038,9 @@ mod tests {
             }],
         };
 
-        let text = format_dir_scan_text(&result);
-        let structured = directory_scan_structured(&result);
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        let text = format_dir_scan_text(&result, result.total_findings(), &compiled);
+        let structured = directory_scan_structured(&result, result.total_findings(), &compiled);
 
         assert!(text.contains("incomplete"), "gap must be explicit: {text}");
         assert!(
@@ -830,6 +1049,313 @@ mod tests {
         );
         assert_eq!(structured["analysis_incomplete"], true);
         assert_eq!(structured["coverage_gaps"][0]["kind"], "unreadable");
+    }
+
+    #[test]
+    fn actual_scan_file_tool_fails_closed_for_malformed_pdf() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let tmp = tempfile::Builder::new()
+            .prefix("tirith-mcp-pdf-")
+            .tempdir_in(cwd)
+            .expect("create in-scope tempdir");
+        let path = tmp.path().join("malformed.pdf");
+        std::fs::write(&path, b"%PDF-1.7\nnot a complete PDF\n%%EOF\n").unwrap();
+
+        let response = call_scan_file(&json!({"path": path}));
+        let structured = response
+            .structured_content
+            .as_ref()
+            .expect("scan_file structured response");
+        assert!(response.is_error);
+        assert_eq!(structured["analysis_incomplete"], true);
+        assert_eq!(
+            structured["coverage_gaps"][0]["kind"],
+            "pdf_analyzer_incomplete"
+        );
+        assert!(response.content[0].text.contains("ANALYSIS INCOMPLETE"));
+        assert!(!response.content[0].text.contains("no issues found"));
+    }
+
+    #[test]
+    fn capped_five_thousand_file_scan_is_incomplete_error_with_omission_marker() {
+        let result = scan::ScanResult {
+            file_results: Vec::new(),
+            scanned_count: crate::mcp::resources::MCP_SCAN_MAX_FILES,
+            skipped_count: 1,
+            truncated: true,
+            truncation_reason: Some("Scan capped at 5000 files/artifacts (1 skipped).".to_string()),
+            panic_files: Vec::new(),
+            coverage_gaps: Vec::new(),
+        };
+        let policy = crate::policy::Policy::default();
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+
+        let response = build_directory_scan_response(&result, 0, &policy, &compiled);
+        let text = &response.content[0].text;
+        let structured = response
+            .structured_content
+            .as_ref()
+            .expect("directory response keeps structured omission metadata");
+
+        assert!(directory_scan_is_error(&result, &policy));
+        assert!(response.is_error);
+        assert!(!text.contains("no issues found"), "{text}");
+        assert!(text.contains("analysis incomplete"), "{text}");
+        assert!(text.contains("1 skipped"), "{text}");
+        assert_eq!(structured["analysis_incomplete"], true);
+        assert_eq!(structured["scan_analysis_incomplete"], true);
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["skipped_count"], 1);
+        assert!(structured["truncation_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("1 skipped")));
+    }
+
+    #[test]
+    fn analyzer_incomplete_finding_makes_directory_tool_an_error_without_driver_gap() {
+        let result = scan::ScanResult {
+            file_results: vec![scan::FileScanResult {
+                path: PathBuf::from("malformed.pdf"),
+                findings: vec![crate::verdict::Finding {
+                    rule_id: crate::verdict::RuleId::AnalysisIncomplete,
+                    severity: crate::verdict::Severity::High,
+                    title: "PDF analysis was incomplete".to_string(),
+                    description: "parser coverage failed".to_string(),
+                    evidence: Vec::new(),
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                }],
+                is_config_file: false,
+                coverage_gaps: Vec::new(),
+            }],
+            scanned_count: 1,
+            skipped_count: 0,
+            truncated: false,
+            truncation_reason: None,
+            panic_files: Vec::new(),
+            coverage_gaps: Vec::new(),
+        };
+        let policy = crate::policy::Policy::default();
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+
+        let response = build_directory_scan_response(&result, 1, &policy, &compiled);
+        assert!(directory_scan_is_error(&result, &policy));
+        assert!(response.is_error);
+        assert_eq!(
+            response.structured_content.as_ref().unwrap()["analysis_incomplete"],
+            true
+        );
+        assert!(response.content[0]
+            .text
+            .contains("analyzer reported incomplete"));
+    }
+
+    #[test]
+    fn directory_scan_aggregate_projection_has_a_hard_serialized_cap() {
+        let file_results = (0..600)
+            .map(|index| scan::FileScanResult {
+                path: PathBuf::from(format!(
+                    "/project/{index}/{}",
+                    "attacker-controlled-path".repeat(100)
+                )),
+                findings: vec![crate::verdict::Finding {
+                    rule_id: crate::verdict::RuleId::ConfigInjection,
+                    severity: crate::verdict::Severity::High,
+                    title: "malicious instruction".repeat(20),
+                    description: "d".repeat(2_000),
+                    evidence: Vec::new(),
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                }],
+                is_config_file: true,
+                coverage_gaps: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let result = scan::ScanResult {
+            scanned_count: file_results.len(),
+            skipped_count: 0,
+            file_results,
+            truncated: false,
+            truncation_reason: None,
+            panic_files: Vec::new(),
+            coverage_gaps: Vec::new(),
+        };
+
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        let structured = directory_scan_structured(&result, result.total_findings(), &compiled);
+        let text = format_dir_scan_text(&result, result.total_findings(), &compiled);
+
+        assert!(
+            serde_json::to_vec(&structured).unwrap().len()
+                <= crate::verdict::MAX_PRESENTATION_BYTES
+        );
+        assert!(text.len() <= crate::verdict::MAX_PRESENTATION_BYTES);
+        assert_eq!(structured["presentation_truncated"], true);
+        assert_eq!(structured["total_findings"], 600);
+        assert_eq!(structured["analysis_incomplete"], true);
+        assert!(structured["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty()));
+        assert!(structured["presentation_omitted"]["files"]["items"]
+            .as_u64()
+            .is_some_and(|items| items > 0));
+    }
+
+    /// The notes that say the scan was truncated, had coverage gaps, or hit a
+    /// rule panic are exactly the ones a reader needs when the output is too big
+    /// to show in full. They used to be appended AFTER the per-file detail, and
+    /// `BoundedTextBuilder` silently drops everything once the budget is spent,
+    /// so a scan with enough findings to overflow lost its own caveats and read
+    /// as a complete result. Cutting detail is fine; cutting the caveat is not.
+    #[test]
+    fn incompleteness_warnings_survive_a_truncated_directory_scan_summary() {
+        let file_results = (0..600)
+            .map(|index| scan::FileScanResult {
+                path: PathBuf::from(format!("/project/{index}/{}", "a-long-path".repeat(100))),
+                findings: vec![crate::verdict::Finding {
+                    rule_id: crate::verdict::RuleId::ConfigInjection,
+                    severity: crate::verdict::Severity::High,
+                    title: "malicious instruction".repeat(20),
+                    description: "d".repeat(2_000),
+                    evidence: Vec::new(),
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                }],
+                is_config_file: true,
+                coverage_gaps: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let result = scan::ScanResult {
+            scanned_count: file_results.len(),
+            skipped_count: 1,
+            file_results,
+            truncated: true,
+            truncation_reason: Some("Scan file budget exhausted; 40 file(s) omitted.".into()),
+            panic_files: vec![PathBuf::from("/project/panicking-rule.rs")],
+            coverage_gaps: Vec::new(),
+        };
+
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        let text = format_dir_scan_text(&result, result.total_findings(), &compiled);
+
+        // Precondition: this input really does overflow the presentation budget,
+        // otherwise the assertions below would pass for the wrong reason.
+        assert!(
+            text.contains("[presentation truncated:"),
+            "fixture must exhaust the budget for this test to mean anything"
+        );
+        assert!(text.len() <= crate::verdict::MAX_PRESENTATION_BYTES);
+
+        assert!(
+            text.contains("rule panic"),
+            "the rule-panic warning must survive truncation"
+        );
+        assert!(
+            text.contains("Scan file budget exhausted"),
+            "the truncation reason must survive truncation"
+        );
+        assert!(
+            text.contains("analysis incomplete"),
+            "the coverage-gap warning must survive truncation"
+        );
+    }
+
+    #[test]
+    fn file_scan_findings_count_preserves_raw_count_before_synthetic_bounding() {
+        let finding = crate::verdict::Finding {
+            rule_id: crate::verdict::RuleId::ConfigInjection,
+            severity: crate::verdict::Severity::High,
+            title: "finding".into(),
+            description: "finding".into(),
+            evidence: Vec::new(),
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let mut result = scan::FileScanResult {
+            path: PathBuf::from("CLAUDE.md"),
+            findings: vec![finding; crate::verdict::MAX_PRESENTED_FINDINGS + 17],
+            is_config_file: true,
+            coverage_gaps: Vec::new(),
+        };
+        let raw_count = result.findings.len();
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        crate::verdict::bound_findings_for_output(&mut result.findings);
+
+        let structured = file_scan_structured(&result, raw_count, &compiled);
+        assert_eq!(structured["findings_count"], raw_count);
+        assert_eq!(
+            structured["presented_findings_count"],
+            result.findings.len()
+        );
+        assert!(raw_count > result.findings.len());
+    }
+
+    #[test]
+    fn mcp_verify_retains_incomplete_and_malformed_findings_before_bounding() {
+        fn finding(
+            rule_id: crate::verdict::RuleId,
+            title: impl Into<String>,
+        ) -> crate::verdict::Finding {
+            crate::verdict::Finding {
+                rule_id,
+                severity: crate::verdict::Severity::High,
+                title: title.into(),
+                description: "test finding".into(),
+                evidence: Vec::new(),
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }
+        }
+
+        let mut findings = (0..500)
+            .map(|index| {
+                finding(
+                    crate::verdict::RuleId::PdfHiddenText,
+                    format!("irrelevant PDF finding {index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        findings.push(finding(
+            crate::verdict::RuleId::AnalysisIncomplete,
+            "truncated Base64 payload",
+        ));
+        findings.push(finding(
+            crate::verdict::RuleId::ConfigMalformed,
+            "malformed MCP config",
+        ));
+
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        let response = build_mcp_config_response("mcp.json", findings, &compiled);
+        let text = response
+            .content
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<String>();
+        let structured = response.structured_content.expect("structured response");
+        let retained_rule_ids = structured["findings"]
+            .as_array()
+            .expect("bounded findings array")
+            .iter()
+            .filter_map(|finding| finding["rule_id"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(response.is_error);
+        assert!(!text.contains("config is clean"));
+        assert!(text.contains("ANALYSIS INCOMPLETE"));
+        assert_eq!(structured["analysis_incomplete"], true);
+        assert_eq!(structured["findings_count"], 2);
+        assert!(retained_rule_ids.contains(&"analysis_incomplete"));
+        assert!(retained_rule_ids.contains(&"config_malformed"));
     }
 
     #[test]
@@ -906,6 +1432,111 @@ mod tests {
         );
     }
 
+    /// An inconclusive cloaking check is an INCOMPLETE analysis, and every other
+    /// tool in this module signals incompleteness through `is_error`. Leaving it
+    /// false let a consumer that branches on `isError` (rather than reading the
+    /// prose) treat "at least one agent was blocked" as a clean no-cloaking pass.
+    #[test]
+    fn an_inconclusive_cloaking_check_is_reported_as_an_error() {
+        use crate::rules::cloaking::{AgentResponse, CloakingResult};
+
+        let agent = |name: &str, len: usize| AgentResponse {
+            agent_name: name.into(),
+            status_code: 200,
+            content_length: len,
+        };
+        let build = |detected: bool, agents: Vec<AgentResponse>| CloakingResult {
+            url: "https://example.com".into(),
+            cloaking_detected: detected,
+            findings: vec![],
+            agent_responses: agents,
+            diff_pairs: vec![],
+        };
+
+        // A blocked agent means no clean baseline was ever established.
+        let blocked = build_cloaking_response(
+            build(false, vec![agent("Chrome", 100), agent("ClaudeBot", 0)]),
+            &[],
+        );
+        assert!(
+            blocked.is_error,
+            "a blocked agent leaves the check inconclusive: {blocked:?}"
+        );
+        assert_eq!(
+            blocked.structured_content.as_ref().unwrap()["analysis_incomplete"],
+            serde_json::json!(true),
+            "the caveat must also be machine-readable, not only prose"
+        );
+
+        // `all` is vacuously true on an empty list: nothing was compared at all.
+        let nothing = build_cloaking_response(build(false, vec![]), &[]);
+        assert!(
+            nothing.is_error,
+            "comparing zero agents is not a clean pass: {nothing:?}"
+        );
+
+        // Both conclusive outcomes stay non-error. A detected result is a
+        // COMPLETED analysis that found something, not a failed one.
+        let clean = build_cloaking_response(
+            build(false, vec![agent("Chrome", 100), agent("ClaudeBot", 98)]),
+            &[],
+        );
+        assert!(!clean.is_error, "a fully comparable clean check: {clean:?}");
+        assert_eq!(
+            clean.structured_content.as_ref().unwrap()["analysis_incomplete"],
+            serde_json::json!(false)
+        );
+
+        let detected = build_cloaking_response(
+            build(true, vec![agent("Chrome", 100), agent("ClaudeBot", 0)]),
+            &[],
+        );
+        assert!(
+            !detected.is_error,
+            "detected cloaking is a finding, not an incomplete analysis: {detected:?}"
+        );
+    }
+
+    /// `to_json(true)` embeds every diff and its `diff_text`, all of it supplied
+    /// by the remote origin, and this was the only structured projection in the
+    /// module that skipped `bound_json_value_for_output`. A hostile or merely
+    /// verbose upstream could push the response past the presentation limit.
+    #[test]
+    fn an_oversized_cloaking_diff_is_bounded_like_every_other_projection() {
+        use crate::rules::cloaking::{AgentResponse, CloakingResult, DiffPair};
+
+        let result = CloakingResult {
+            url: "https://example.com".into(),
+            cloaking_detected: true,
+            findings: vec![],
+            agent_responses: vec![AgentResponse {
+                agent_name: "Chrome".into(),
+                status_code: 200,
+                content_length: 100,
+            }],
+            diff_pairs: (0..64)
+                .map(|index| DiffPair {
+                    agent_a: "Chrome".into(),
+                    agent_b: format!("ClaudeBot-{index}"),
+                    diff_chars: 50,
+                    diff_text: Some("remote-controlled diff payload ".repeat(400)),
+                })
+                .collect(),
+        };
+
+        let response = build_cloaking_response(result, &[]);
+        let structured = response
+            .structured_content
+            .as_ref()
+            .expect("structured content present");
+        let serialized = serde_json::to_vec(structured).expect("serializable");
+        assert!(
+            serialized.len() <= crate::verdict::MAX_PRESENTATION_BYTES,
+            "structured cloaking output must be bounded, got {} bytes",
+            serialized.len()
+        );
+    }
+
     #[test]
     fn test_cloaking_custom_dlp_pattern_redacts_diff_text() {
         use crate::rules::cloaking::{AgentResponse, CloakingResult, DiffPair};
@@ -942,6 +1573,84 @@ mod tests {
             diff_text.contains("[REDACTED:custom]"),
             "should contain custom redaction marker: {diff_text}"
         );
+    }
+
+    #[test]
+    fn cloaking_custom_dlp_redacts_url_in_text_and_structured_output() {
+        use crate::rules::cloaking::{AgentResponse, CloakingResult};
+
+        let result = CloakingResult {
+            url: "https://example.com/private/PROJ-99999".into(),
+            cloaking_detected: false,
+            findings: vec![],
+            agent_responses: vec![AgentResponse {
+                agent_name: "Chrome".into(),
+                status_code: 200,
+                content_length: 100,
+            }],
+            diff_pairs: vec![],
+        };
+        let response = build_cloaking_response(result, &[r"PROJ-\d+".to_string()]);
+        let text = response
+            .content
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<String>();
+        let structured = serde_json::to_string(&response.structured_content).unwrap();
+
+        assert!(!text.contains("PROJ-99999"));
+        assert!(!structured.contains("PROJ-99999"));
+        assert!(!structured.contains("https://example.com/private/PROJ-99999"));
+        assert!(text.contains("[REDACTED:custom]"));
+        assert!(structured.contains("[REDACTED:custom]"));
+    }
+
+    #[test]
+    fn directory_text_and_cloaking_errors_apply_custom_dlp_to_paths_and_hostnames() {
+        let secret_path = "/project/PROJ-99999/CLAUDE.md";
+        let result = scan::ScanResult {
+            file_results: vec![scan::FileScanResult {
+                path: PathBuf::from(secret_path),
+                findings: vec![crate::verdict::Finding {
+                    rule_id: crate::verdict::RuleId::ConfigInjection,
+                    severity: crate::verdict::Severity::High,
+                    title: "malicious instruction".to_string(),
+                    description: "test".to_string(),
+                    evidence: Vec::new(),
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                }],
+                is_config_file: true,
+                coverage_gaps: Vec::new(),
+            }],
+            scanned_count: 1,
+            skipped_count: 0,
+            truncated: false,
+            truncation_reason: None,
+            panic_files: Vec::new(),
+            coverage_gaps: Vec::new(),
+        };
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[
+            r"PROJ-\d+".to_string(),
+            r"private-[a-z]+\.example".to_string(),
+        ]);
+        let text = format_dir_scan_text(&result, result.total_findings(), &compiled);
+        let structured =
+            serde_json::to_string(&directory_scan_structured(&result, 1, &compiled)).unwrap();
+        let error = tool_error_with_compiled(
+            "Cloaking check failed: DNS lookup failed for private-alpha.example",
+            &compiled,
+        );
+        let error_text = &error.content[0].text;
+
+        assert!(!text.contains("PROJ-99999"));
+        assert!(!structured.contains("PROJ-99999"));
+        assert!(text.contains("[REDACTED:custom]"));
+        assert!(structured.contains("[REDACTED:custom]"));
+        assert!(!error_text.contains("private-alpha.example"));
+        assert!(error_text.contains("[REDACTED:custom]"));
     }
 
     /// Snapshot an env var and restore on `Drop` (same shape as the one in

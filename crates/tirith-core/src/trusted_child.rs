@@ -9,6 +9,17 @@
 //! process-group reuse. A Unix descendant that deliberately creates a new
 //! session leaves that process-group boundary and is outside this trusted-child
 //! contract.
+//!
+//! Unix embedding has one additional process-wide requirement: `SIGCHLD` must
+//! retain its default disposition without `SA_NOCLDWAIT`, and no competing
+//! waiter may reap a child owned by [`run`]. The supervisor checks the visible
+//! disposition before spawning and again immediately before every numeric
+//! signal, and revalidates direct-child ownership at the signal boundary. This
+//! is the smallest portable anchor available on macOS and other Unix hosts
+//! without a pidfd-like signal primitive. Code already executing in this same
+//! process could still race the final check by changing signal state or calling
+//! `waitpid`; such code already has Tirith's full process authority and is
+//! outside the untrusted-child boundary.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -2084,6 +2095,13 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
         }
     }
 
+    #[cfg(unix)]
+    if let Err(error) = ensure_unix_child_reaper_contract() {
+        return ChildOutcome::SpawnError(format!(
+            "Unix child supervision contract is unavailable before spawn: {error}"
+        ));
+    }
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return ChildOutcome::SpawnError(error.to_string()),
@@ -2091,20 +2109,26 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     #[cfg(unix)]
     let child_pid = child.id();
     #[cfg(unix)]
-    let process_group = match confirm_process_group(child_pid) {
-        Ok(process_group) => process_group,
+    if let Err(error) = ensure_unix_child_reaper_contract() {
+        let cleanup_deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
+        let cleanup = cleanup_unconfirmed_direct_child(&mut child, child_pid, cleanup_deadline);
+        return ChildOutcome::SpawnError(format!(
+            "Unix child supervision contract changed during spawn: {error}; {cleanup}"
+        ));
+    }
+    #[cfg(unix)]
+    let process_group_confirmation = match confirm_process_group(child_pid) {
+        Ok(confirmation) => confirmation,
         Err(error) => {
             let cleanup_deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
-            let _ = child.kill();
-            let reaped = matches!(
-                wait_for_direct_exit_and_reap(&mut child, child_pid, cleanup_deadline),
-                Some(Ok(_))
-            );
+            let cleanup = cleanup_unconfirmed_direct_child(&mut child, child_pid, cleanup_deadline);
             return ChildOutcome::SpawnError(format!(
-                "child process-group confirmation failed: {error}; direct-child cleanup succeeded: {reaped}"
+                "child process-group confirmation failed: {error}; {cleanup}"
             ));
         }
     };
+    #[cfg(unix)]
+    let process_group = process_group_confirmation.process_group;
     let (sender, receiver) = mpsc::channel();
     #[cfg(unix)]
     let mut reader_workers = Vec::with_capacity(2);
@@ -2135,7 +2159,7 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
 
     let deadline = Instant::now() + spec.limits.timeout;
     #[cfg(unix)]
-    let mut direct_exit_observed = false;
+    let mut direct_exit_observed = process_group_confirmation.direct_exit_observed;
     #[cfg(unix)]
     let mut capture = CaptureState::default();
     #[cfg(not(unix))]
@@ -2161,7 +2185,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
                             child: &mut child,
                             child_pid,
                             process_group,
-                            direct_exit_observed,
                             receiver: &receiver,
                             workers: &mut reader_workers,
                             capture: &mut capture,
@@ -2175,7 +2198,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
                             child: &mut child,
                             child_pid,
                             process_group,
-                            direct_exit_observed,
                             receiver: &receiver,
                             workers: &mut reader_workers,
                             capture: &mut capture,
@@ -2217,7 +2239,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
                                 child: &mut child,
                                 child_pid,
                                 process_group,
-                                direct_exit_observed,
                                 receiver: &receiver,
                                 workers: &mut reader_workers,
                                 capture: &mut capture,
@@ -2237,7 +2258,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
                         child: &mut child,
                         child_pid,
                         process_group,
-                        direct_exit_observed: true,
                         receiver: &receiver,
                         workers: &mut reader_workers,
                         capture: &mut capture,
@@ -2282,7 +2302,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
                     child: &mut child,
                     child_pid,
                     process_group,
-                    direct_exit_observed,
                     receiver: &receiver,
                     workers: &mut reader_workers,
                     capture: &mut capture,
@@ -2304,6 +2323,12 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
 
 #[cfg(unix)]
 const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const PROCESS_GROUP_CONFIRMATION_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(unix)]
+const PROCESS_GROUP_CONFIRMATION_POLL: Duration = Duration::from_millis(1);
+#[cfg(unix)]
+const PROCESS_GROUP_CONFIRMATION_ATTEMPTS: usize = 32;
 #[cfg(any(unix, windows))]
 const PROCESS_SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 
@@ -2398,10 +2423,43 @@ struct UnixFinishContext<'a> {
     child: &'a mut std::process::Child,
     child_pid: u32,
     process_group: u32,
-    direct_exit_observed: bool,
     receiver: &'a mpsc::Receiver<ReaderMessage>,
     workers: &'a mut Vec<(CaptureStream, std::thread::JoinHandle<()>)>,
     capture: &'a mut CaptureState,
+}
+
+#[cfg(unix)]
+fn validate_unix_child_reaper_contract(handler: usize, flags: libc::c_int) -> std::io::Result<()> {
+    if flags & libc::SA_NOCLDWAIT != 0 {
+        return Err(std::io::Error::other(
+            "SIGCHLD has SA_NOCLDWAIT set; direct-child PID/PGID ownership cannot be retained",
+        ));
+    }
+    if handler == libc::SIG_IGN {
+        return Err(std::io::Error::other(
+            "SIGCHLD is ignored; direct children may be auto-reaped",
+        ));
+    }
+    if handler != libc::SIG_DFL {
+        return Err(std::io::Error::other(
+            "SIGCHLD has a non-default handler; exclusive direct-child reaping cannot be proven",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_unix_child_reaper_contract() -> std::io::Result<()> {
+    // SAFETY: a null `act` makes `sigaction` a read-only query, and `current`
+    // is valid writable storage for the returned process-wide disposition.
+    let mut current = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) } != 0 {
+        return Err(std::io::Error::other(format!(
+            "cannot inspect SIGCHLD disposition: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    validate_unix_child_reaper_contract(current.sa_sigaction, current.sa_flags)
 }
 
 /// Observe the direct child with `WNOWAIT`. Keeping its zombie unreaped reserves
@@ -2429,43 +2487,185 @@ fn observe_child_exit_without_reaping(child_pid: u32, nonblocking: bool) -> std:
 }
 
 #[cfg(unix)]
-fn confirm_process_group(child_pid: u32) -> std::io::Result<u32> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessGroupConfirmation {
+    process_group: u32,
+    /// `waitid(WNOWAIT)` observed the direct child in a terminal state, so its
+    /// unreaped PID still anchors the numeric process-group ID against reuse.
+    direct_exit_observed: bool,
+}
+
+#[cfg(unix)]
+fn classify_process_group_confirmation(
+    child_pid: u32,
+    process_group: Option<libc::pid_t>,
+    direct_exit_observed: bool,
+) -> std::io::Result<ProcessGroupConfirmation> {
+    match process_group {
+        Some(process_group) if process_group == child_pid as libc::pid_t => {
+            Ok(ProcessGroupConfirmation {
+                process_group: child_pid,
+                direct_exit_observed,
+            })
+        }
+        Some(process_group) => Err(std::io::Error::other(format!(
+            "child {child_pid} joined unexpected process group {process_group}"
+        ))),
+        None if direct_exit_observed => {
+            // `Command::spawn` reports an error when the pre-exec `setpgid`
+            // hook fails, so a successfully spawned child did lead this exact
+            // group before it exited. Keeping the terminal child unreaped
+            // reserves its PID and therefore its PGID until group cleanup has
+            // been attempted. It is safe to retain that anchored identifier;
+            // it is not safe to do so for a still-live or unowned PID.
+            Ok(ProcessGroupConfirmation {
+                process_group: child_pid,
+                direct_exit_observed: true,
+            })
+        }
+        None => Err(std::io::Error::other(format!(
+            "child {child_pid} disappeared before process-group confirmation while still reported live"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn confirm_process_group_with<Probe, ObserveExit, Retry>(
+    child_pid: u32,
+    mut probe: Probe,
+    mut observe_exit: ObserveExit,
+    mut retry: Retry,
+) -> std::io::Result<ProcessGroupConfirmation>
+where
+    Probe: FnMut() -> std::io::Result<Option<libc::pid_t>>,
+    ObserveExit: FnMut() -> std::io::Result<bool>,
+    Retry: FnMut() -> bool,
+{
     loop {
-        let process_group = unsafe { libc::getpgid(child_pid as libc::pid_t) };
-        if process_group == child_pid as libc::pid_t {
-            return Ok(child_pid);
-        }
-        if process_group >= 0 {
-            return Err(std::io::Error::other(format!(
-                "child {child_pid} joined unexpected process group {process_group}"
-            )));
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
+        let process_group = probe()?;
+        // Pair every numeric group observation with proof that the PID is still
+        // our direct child. Besides making the exited-child fallback safe, this
+        // prevents an externally reaped and reused PID from authorizing an
+        // unrelated group that happens to carry the same number.
+        let direct_exit_observed = observe_exit().map_err(|error| {
+            std::io::Error::other(format!(
+                "child {child_pid} direct-child terminal-state confirmation failed: {error}"
+            ))
+        })?;
+        if process_group.is_some() || direct_exit_observed || !retry() {
+            return classify_process_group_confirmation(
+                child_pid,
+                process_group,
+                direct_exit_observed,
+            );
         }
     }
 }
 
 #[cfg(unix)]
+fn confirm_process_group(child_pid: u32) -> std::io::Result<ProcessGroupConfirmation> {
+    let deadline = Instant::now() + PROCESS_GROUP_CONFIRMATION_TIMEOUT;
+    let mut attempts = 1_usize;
+    confirm_process_group_with(
+        child_pid,
+        || loop {
+            // SAFETY: `getpgid` only reads kernel process metadata for the
+            // direct child PID returned by `Command::spawn`.
+            let process_group = unsafe { libc::getpgid(child_pid as libc::pid_t) };
+            if process_group >= 0 {
+                return Ok(Some(process_group));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            return Err(error);
+        },
+        || observe_child_exit_without_reaping(child_pid, true),
+        || {
+            if attempts >= PROCESS_GROUP_CONFIRMATION_ATTEMPTS || Instant::now() >= deadline {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(PROCESS_GROUP_CONFIRMATION_POLL));
+            attempts += 1;
+            true
+        },
+    )
+}
+
+#[cfg(unix)]
+fn signal_process_group_with<Contract, Confirm, ObserveExit, Send>(
+    child_pid: u32,
+    process_group: u32,
+    mut contract: Contract,
+    mut confirm: Confirm,
+    mut observe_exit: ObserveExit,
+    mut send: Send,
+) -> std::io::Result<()>
+where
+    Contract: FnMut() -> std::io::Result<()>,
+    Confirm: FnMut() -> std::io::Result<ProcessGroupConfirmation>,
+    ObserveExit: FnMut() -> std::io::Result<bool>,
+    Send: FnMut(bool) -> std::io::Result<()>,
+{
+    contract()?;
+    let confirmation = confirm()?;
+    if confirmation.process_group != process_group {
+        return Err(std::io::Error::other(format!(
+            "child {child_pid} process group changed from {process_group} to {}",
+            confirmation.process_group
+        )));
+    }
+    // Re-observe after group confirmation. A competing waiter that consumed
+    // the child between those operations yields ECHILD here and prevents the
+    // numeric group signal. The process-wide contract is checked once more
+    // immediately before the signal to catch SIG_IGN/SA_NOCLDWAIT drift.
+    let final_exit_observed = observe_exit().map_err(|error| {
+        std::io::Error::other(format!(
+            "child {child_pid} lost its direct-child ownership anchor before process-group signal: {error}"
+        ))
+    })?;
+    if confirmation.direct_exit_observed && !final_exit_observed {
+        return Err(std::io::Error::other(format!(
+            "child {child_pid} terminal-state ownership proof became inconsistent before process-group signal"
+        )));
+    }
+    contract()?;
+    send(final_exit_observed)
+}
+
+#[cfg(unix)]
 fn signal_process_group(
+    child_pid: u32,
     process_group: u32,
     signal: libc::c_int,
-    direct_exit_observed: bool,
 ) -> std::io::Result<()> {
-    if unsafe { libc::kill(-(process_group as libc::pid_t), signal) } == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    // Some Unix kernels do not count an exited, unreaped leader as a signalable
-    // group member. ESRCH after WNOWAIT observation therefore proves there was
-    // no remaining signalable member while the zombie still prevented PGID
-    // reuse. ESRCH while the direct child is live remains an invariant failure.
-    if direct_exit_observed && error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error)
-    }
+    signal_process_group_with(
+        child_pid,
+        process_group,
+        ensure_unix_child_reaper_contract,
+        || confirm_process_group(child_pid),
+        || observe_child_exit_without_reaping(child_pid, true),
+        |final_exit_observed| {
+            if unsafe { libc::kill(-(process_group as libc::pid_t), signal) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            // Some Unix kernels do not count an exited, unreaped leader as a
+            // signalable group member. ESRCH after the final WNOWAIT ownership
+            // observation proves no signalable member remained while the
+            // zombie still reserved this numeric PID/PGID.
+            if final_exit_observed && error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        },
+    )
 }
 
 #[cfg(unix)]
@@ -2599,6 +2799,7 @@ fn macos_process_group_has_live_members(process_group: u32) -> Option<bool> {
 #[cfg(unix)]
 struct TreeTermination {
     signal_succeeded: bool,
+    signal_error: Option<String>,
     status: Option<ExitStatus>,
     group_disappeared: bool,
     reap_error: Option<String>,
@@ -2622,7 +2823,10 @@ impl TreeTermination {
     fn failure_reason(&self) -> String {
         let mut reasons = Vec::new();
         if !self.signal_succeeded {
-            reasons.push("process-group signal failed".to_string());
+            reasons.push(match &self.signal_error {
+                Some(error) => format!("process-group signal refused or failed: {error}"),
+                None => "process-group signal failed".to_string(),
+            });
         }
         if self.status.is_none() {
             reasons.push("direct child was not reaped before the cleanup deadline".to_string());
@@ -2661,26 +2865,98 @@ fn wait_for_direct_exit_and_reap(
 }
 
 #[cfg(unix)]
+fn signal_direct_child_with<Contract, ObserveExit, Send>(
+    child_pid: u32,
+    mut contract: Contract,
+    mut observe_exit: ObserveExit,
+    mut send: Send,
+) -> std::io::Result<bool>
+where
+    Contract: FnMut() -> std::io::Result<()>,
+    ObserveExit: FnMut() -> std::io::Result<bool>,
+    Send: FnMut() -> std::io::Result<()>,
+{
+    contract()?;
+    if observe_exit()? {
+        return Ok(false);
+    }
+    // The second observation is the deterministic external-reaper seam: if a
+    // waiter consumed this child after the first live proof, ECHILD prevents
+    // `Child::kill` from using a stale numeric PID.
+    if observe_exit().map_err(|error| {
+        std::io::Error::other(format!(
+            "child {child_pid} lost its direct-child ownership anchor before direct signal: {error}"
+        ))
+    })? {
+        return Ok(false);
+    }
+    contract()?;
+    send()?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn signal_direct_child(child: &mut std::process::Child, child_pid: u32) -> std::io::Result<bool> {
+    signal_direct_child_with(
+        child_pid,
+        ensure_unix_child_reaper_contract,
+        || observe_child_exit_without_reaping(child_pid, true),
+        || child.kill(),
+    )
+}
+
+#[cfg(unix)]
+struct UnconfirmedDirectCleanup {
+    reaped: bool,
+    signal_error: Option<String>,
+}
+
+#[cfg(unix)]
+impl fmt::Display for UnconfirmedDirectCleanup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "direct-child cleanup succeeded: {}", self.reaped)?;
+        if let Some(error) = &self.signal_error {
+            write!(formatter, "; numeric direct-child signal refused: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_unconfirmed_direct_child(
+    child: &mut std::process::Child,
+    child_pid: u32,
+    deadline: Instant,
+) -> UnconfirmedDirectCleanup {
+    let signal_error = signal_direct_child(child, child_pid)
+        .err()
+        .map(|error| error.to_string());
+    let reaped = matches!(
+        wait_for_direct_exit_and_reap(child, child_pid, deadline),
+        Some(Ok(_))
+    );
+    UnconfirmedDirectCleanup {
+        reaped,
+        signal_error,
+    }
+}
+
+#[cfg(unix)]
 fn terminate_tree(
     child: &mut std::process::Child,
     child_pid: u32,
     process_group: u32,
-    direct_exit_observed: bool,
     deadline: Instant,
 ) -> TreeTermination {
-    // Signal before reaping. The unreaped direct child anchors the numeric
-    // process-group ID, so this cannot target an unrelated future group.
-    let signal_succeeded =
-        signal_process_group(process_group, libc::SIGKILL, direct_exit_observed).is_ok();
-    // Also address the anchored direct PID. A trusted program normally remains
-    // its group leader, but this prevents an escaped leader from outliving the
-    // bounded cleanup attempt.
-    let _ = child.kill();
-    let reaped = if direct_exit_observed {
-        Some(child.wait().map_err(|error| error.to_string()))
-    } else {
-        wait_for_direct_exit_and_reap(child, child_pid, deadline)
-    };
+    // Reconfirm the process-wide reaper contract and exact WNOWAIT ownership
+    // immediately before signalling. The group signal includes its leader, so
+    // a second numeric `Child::kill` would add only another reuse race.
+    let (signal_succeeded, signal_error) =
+        match signal_process_group(child_pid, process_group, libc::SIGKILL) {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
+    let reaped = wait_for_direct_exit_and_reap(child, child_pid, deadline);
     let (status, reap_error) = match reaped {
         Some(Ok(status)) => (Some(status), None),
         Some(Err(error)) => (None, Some(error)),
@@ -2689,6 +2965,7 @@ fn terminate_tree(
     let group_disappeared = wait_for_process_group_disappearance(process_group, deadline);
     TreeTermination {
         signal_succeeded,
+        signal_error,
         status,
         group_disappeared,
         reap_error,
@@ -2752,7 +3029,6 @@ fn finish_unix_run(context: UnixFinishContext<'_>, cause: UnixFinishCause) -> Ch
         context.child,
         context.child_pid,
         context.process_group,
-        context.direct_exit_observed,
         cleanup_deadline,
     );
     let reader_cleanup = finish_reader_workers(
@@ -2826,12 +3102,17 @@ fn finish_unix_run(context: UnixFinishContext<'_>, cause: UnixFinishCause) -> Ch
 
 #[cfg(all(test, unix))]
 mod unix_cleanup_tests {
-    use super::TreeTermination;
+    use super::{
+        confirm_process_group_with, signal_direct_child_with, signal_process_group_with,
+        validate_unix_child_reaper_contract, ProcessGroupConfirmation, TreeTermination,
+    };
+    use std::collections::VecDeque;
     use std::os::unix::process::ExitStatusExt as _;
 
     fn exited_child(signal_succeeded: bool, group_disappeared: bool) -> TreeTermination {
         TreeTermination {
             signal_succeeded,
+            signal_error: (!signal_succeeded).then(|| "test signal failure".to_string()),
             status: Some(std::process::ExitStatus::from_raw(0)),
             group_disappeared,
             reap_error: None,
@@ -2850,11 +3131,250 @@ mod unix_cleanup_tests {
 
         let unreaped = TreeTermination {
             signal_succeeded: true,
+            signal_error: None,
             status: None,
             group_disappeared: true,
             reap_error: None,
         };
         assert!(!unreaped.cleanup_confirmed());
+    }
+
+    #[test]
+    fn exited_child_is_accepted_with_an_unreaped_terminal_state() {
+        let child_pid = 41_001;
+        let confirmed = confirm_process_group_with(
+            child_pid,
+            || Ok(None),
+            || Ok(true),
+            || panic!("a terminal direct child must not retry"),
+        )
+        .expect("an exited direct child must retain its pre-exec group anchor");
+        assert_eq!(
+            confirmed,
+            ProcessGroupConfirmation {
+                process_group: child_pid,
+                direct_exit_observed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_live_snapshot_retries_until_terminal_proof_arrives() {
+        let child_pid = 41_002;
+        let mut groups = VecDeque::from([None, None]);
+        let mut exits = VecDeque::from([false, true]);
+        let mut retries = 0;
+        let confirmed = confirm_process_group_with(
+            child_pid,
+            || Ok(groups.pop_front().expect("group probe sequence exhausted")),
+            || Ok(exits.pop_front().expect("exit probe sequence exhausted")),
+            || {
+                retries += 1;
+                true
+            },
+        )
+        .expect("a later terminal snapshot must retain the anchored group");
+        assert_eq!(retries, 1);
+        assert_eq!(
+            confirmed,
+            ProcessGroupConfirmation {
+                process_group: child_pid,
+                direct_exit_observed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_live_snapshot_retries_until_exact_group_appears() {
+        let child_pid = 41_003;
+        let mut groups = VecDeque::from([None, Some(child_pid as libc::pid_t)]);
+        let mut exits = VecDeque::from([false, false]);
+        let mut retries = 0;
+        let confirmed = confirm_process_group_with(
+            child_pid,
+            || Ok(groups.pop_front().expect("group probe sequence exhausted")),
+            || Ok(exits.pop_front().expect("exit probe sequence exhausted")),
+            || {
+                retries += 1;
+                true
+            },
+        )
+        .expect("the exact group must be accepted on a bounded retry");
+        assert_eq!(retries, 1);
+        assert_eq!(
+            confirmed,
+            ProcessGroupConfirmation {
+                process_group: child_pid,
+                direct_exit_observed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unexpected_process_group_is_never_adopted() {
+        let child_pid = 41_004;
+        let unrelated_group = child_pid + 1;
+        let error = confirm_process_group_with(
+            child_pid,
+            || Ok(Some(unrelated_group as libc::pid_t)),
+            || Ok(false),
+            || panic!("an unexpected process group must fail without retry"),
+        )
+        .expect_err("an unrelated group must never become a signal target");
+        assert!(error
+            .to_string()
+            .contains(&format!("unexpected process group {unrelated_group}")));
+    }
+
+    #[test]
+    fn unowned_pid_is_never_adopted() {
+        let child_pid = 41_005;
+        let error = confirm_process_group_with(
+            child_pid,
+            || Ok(Some(child_pid as libc::pid_t)),
+            || Err(std::io::Error::from_raw_os_error(libc::ECHILD)),
+            || panic!("an unowned PID must fail without retry"),
+        )
+        .expect_err("an unowned PID cannot safely anchor a process-group signal");
+        assert!(error
+            .to_string()
+            .contains("terminal-state confirmation failed"));
+    }
+
+    #[test]
+    fn live_missing_child_fails_when_retry_deadline_is_exhausted() {
+        let child_pid = 41_006;
+        let mut group_probes = 0;
+        let mut exit_probes = 0;
+        let mut retries = 0;
+        let error = confirm_process_group_with(
+            child_pid,
+            || {
+                group_probes += 1;
+                Ok(None)
+            },
+            || {
+                exit_probes += 1;
+                Ok(false)
+            },
+            || {
+                retries += 1;
+                retries < 3
+            },
+        )
+        .expect_err("a live missing group must fail closed at the retry deadline");
+        assert_eq!(group_probes, 3);
+        assert_eq!(exit_probes, 3);
+        assert_eq!(retries, 3);
+        assert!(error.to_string().contains("while still reported live"));
+    }
+
+    #[test]
+    fn sigchld_contract_requires_default_waitable_children() {
+        validate_unix_child_reaper_contract(libc::SIG_DFL, 0)
+            .expect("the default waitable-child disposition is the contract");
+
+        let ignored = validate_unix_child_reaper_contract(libc::SIG_IGN, 0)
+            .expect_err("SIG_IGN auto-reaping must be rejected");
+        assert!(ignored.to_string().contains("ignored"));
+
+        let no_wait = validate_unix_child_reaper_contract(libc::SIG_DFL, libc::SA_NOCLDWAIT)
+            .expect_err("SA_NOCLDWAIT must be rejected");
+        assert!(no_wait.to_string().contains("SA_NOCLDWAIT"));
+
+        let custom = validate_unix_child_reaper_contract(2, 0)
+            .expect_err("a custom handler can reap behind the supervisor");
+        assert!(custom.to_string().contains("non-default handler"));
+    }
+
+    #[test]
+    fn external_reap_before_group_signal_never_reaches_numeric_send() {
+        let child_pid = 41_007;
+        let mut sends = 0;
+        let error = signal_process_group_with(
+            child_pid,
+            child_pid,
+            || Ok(()),
+            || {
+                Ok(ProcessGroupConfirmation {
+                    process_group: child_pid,
+                    direct_exit_observed: false,
+                })
+            },
+            || Err(std::io::Error::from_raw_os_error(libc::ECHILD)),
+            |_| {
+                sends += 1;
+                Ok(())
+            },
+        )
+        .expect_err("an external reap must invalidate the group signal anchor");
+        assert!(error
+            .to_string()
+            .contains("lost its direct-child ownership"));
+        assert_eq!(sends, 0);
+    }
+
+    #[test]
+    fn sigchld_contract_drift_before_group_signal_never_reaches_send() {
+        let child_pid = 41_008;
+        let mut contract_checks = 0;
+        let mut sends = 0;
+        let error = signal_process_group_with(
+            child_pid,
+            child_pid,
+            || {
+                contract_checks += 1;
+                if contract_checks == 1 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("SIGCHLD contract changed"))
+                }
+            },
+            || {
+                Ok(ProcessGroupConfirmation {
+                    process_group: child_pid,
+                    direct_exit_observed: false,
+                })
+            },
+            || Ok(false),
+            |_| {
+                sends += 1;
+                Ok(())
+            },
+        )
+        .expect_err("a changed process-wide contract must refuse group signalling");
+        assert_eq!(contract_checks, 2);
+        assert_eq!(sends, 0);
+        assert!(error.to_string().contains("contract changed"));
+    }
+
+    #[test]
+    fn external_reap_before_direct_signal_never_reaches_child_kill() {
+        let child_pid = 41_009;
+        let mut observations = 0;
+        let mut sends = 0;
+        let error = signal_direct_child_with(
+            child_pid,
+            || Ok(()),
+            || {
+                observations += 1;
+                if observations == 1 {
+                    Ok(false)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::ECHILD))
+                }
+            },
+            || {
+                sends += 1;
+                Ok(())
+            },
+        )
+        .expect_err("a consumed direct child must invalidate Child::kill");
+        assert_eq!(observations, 2);
+        assert_eq!(sends, 0);
+        assert!(error
+            .to_string()
+            .contains("lost its direct-child ownership"));
     }
 }
 

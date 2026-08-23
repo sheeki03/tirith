@@ -592,15 +592,23 @@ impl CompiledCustomPatterns {
     /// over-budget sets remain explicitly incomplete, causing every subsequent
     /// compatibility-wrapper redaction to fail closed.
     pub fn new(raw_patterns: &[String]) -> Self {
+        let compiled = Self::new_silent(raw_patterns);
+        if let Some(error) = compiled.incomplete_reason() {
+            warn_incomplete_custom_redaction("custom DLP", error);
+        }
+        compiled
+    }
+
+    /// Compile once without writing diagnostics directly. Multi-item output
+    /// surfaces use this constructor and route one bounded diagnostic through
+    /// their own invocation writer.
+    pub fn new_silent(raw_patterns: &[String]) -> Self {
         match Self::try_new(raw_patterns) {
             Ok(compiled) => compiled,
-            Err(error) => {
-                warn_incomplete_custom_redaction("custom DLP", &error);
-                Self {
-                    patterns: Vec::new(),
-                    incomplete: Some(error),
-                }
-            }
+            Err(error) => Self {
+                patterns: Vec::new(),
+                incomplete: Some(error),
+            },
         }
     }
 
@@ -610,6 +618,10 @@ impl CompiledCustomPatterns {
             patterns: compile_custom_dlp_patterns(raw_patterns)?,
             incomplete: None,
         })
+    }
+
+    pub fn incomplete_reason(&self) -> Option<&RedactionIncomplete> {
+        self.incomplete.as_ref()
     }
 }
 
@@ -732,6 +744,152 @@ pub fn redact_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> S
         Ok(redacted) => redacted,
         Err(_) => INCOMPLETE_REDACTION_MARKER.to_string(),
     }
+}
+
+/// Apply the safe terminal-boundary order for attacker-controlled text:
+/// redact, remove terminal/deception controls, then redact again.
+///
+/// The second pass is load-bearing. Removing an ANSI or invisible separator can
+/// reconstitute a credential that was not contiguous during the first pass.
+/// Callers should bound/flatten only after this helper returns.
+pub fn redact_sanitize_redact_with_compiled(
+    input: &str,
+    compiled: &CompiledCustomPatterns,
+) -> String {
+    let redacted = redact_with_compiled(input, compiled);
+    let sanitized = crate::mcp::output_filter::sanitize_for_display(&redacted);
+    redact_with_compiled(&sanitized, compiled)
+}
+
+/// Compile policy custom patterns once for a single terminal-boundary value and
+/// apply [`redact_sanitize_redact_with_compiled`].
+pub fn redact_sanitize_redact(input: &str, custom_patterns: &[String]) -> String {
+    let compiled = CompiledCustomPatterns::new(custom_patterns);
+    redact_sanitize_redact_with_compiled(input, &compiled)
+}
+
+/// Preserve command-assignment/private-key scrubbing, then apply the shared
+/// redact-sanitize-redact boundary. This is the public-output counterpart to
+/// [`redact_command_text_with_compiled`].
+pub fn redact_sanitize_redact_command_with_compiled(
+    input: &str,
+    compiled: &CompiledCustomPatterns,
+) -> String {
+    let command_safe = redact_command_text_with_compiled(input, compiled);
+    redact_sanitize_redact_with_compiled(&command_safe, compiled)
+}
+
+/// Maximum number of Unicode scalar values retained from one untrusted
+/// provenance/receipt field. A trailing ellipsis may add one character.
+pub const PROVENANCE_MAX_CHARS: usize = 256;
+
+/// Apply built-in and frozen custom DLP redaction, remove terminal/deception
+/// controls, flatten row-breaking whitespace, and cap one untrusted field.
+pub fn sanitize_provenance_text_with_compiled(
+    value: &str,
+    compiled: &CompiledCustomPatterns,
+) -> String {
+    let cleaned = redact_sanitize_redact_with_compiled(value, compiled);
+    let flattened: String = cleaned
+        .chars()
+        .map(|character| {
+            if character.is_whitespace() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    cap_provenance_chars(flattened.trim(), PROVENANCE_MAX_CHARS)
+}
+
+/// Sanitize an untrusted URL for public provenance/receipt output. Userinfo,
+/// query, fragment, and hosted-RPC credential paths are removed structurally
+/// before the shared text DLP/control/cap pass.
+pub fn sanitize_provenance_url_with_compiled(
+    value: &str,
+    compiled: &CompiledCustomPatterns,
+) -> String {
+    let structurally_safe = match url::Url::parse(value) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            strip_secret_provider_path(&mut parsed);
+            parsed.to_string()
+        }
+        Err(_) => {
+            let without_userinfo = crate::receipt::redact_url_userinfo(value);
+            let end = without_userinfo
+                .find(['?', '#'])
+                .unwrap_or(without_userinfo.len());
+            without_userinfo[..end].to_string()
+        }
+    };
+    sanitize_provenance_text_with_compiled(&structurally_safe, compiled)
+}
+
+fn strip_secret_provider_path(parsed: &mut url::Url) {
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let provider_host = [
+        "alchemy.com",
+        "ankr.com",
+        "blastapi.io",
+        "chainstack.com",
+        "drpc.org",
+        "getblock.io",
+        "infura.io",
+        "llamarpc.com",
+        "moralis.io",
+        "quicknode.com",
+        "quiknode.pro",
+        "tenderly.co",
+    ]
+    .iter()
+    .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")));
+
+    let segments = parsed
+        .path_segments()
+        .map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if segments.is_empty() {
+        return;
+    }
+    if provider_host {
+        if matches!(segments.first().copied(), Some("v2" | "v3")) {
+            parsed.set_path(&format!("/{}", segments[0]));
+        } else {
+            parsed.set_path("/");
+        }
+        return;
+    }
+    if segments.len() >= 2
+        && matches!(segments[0], "v2" | "v3")
+        && looks_like_secret_path_segment(segments[1])
+    {
+        parsed.set_path(&format!("/{}", segments[0]));
+    }
+}
+
+fn looks_like_secret_path_segment(segment: &str) -> bool {
+    segment.len() >= 16
+        && segment.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'%' | b'~')
+        })
+}
+
+fn cap_provenance_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut bounded: String = value.chars().take(max).collect();
+    bounded.push('…');
+    bounded
 }
 
 /// Stable snake_case label for a built-in pattern (consumed by `--json` and the
@@ -1062,7 +1220,10 @@ pub fn redact_command_text(input: &str, custom_patterns: &[String]) -> String {
     redact_command_text_with_compiled(input, &compiled)
 }
 
-fn redact_command_text_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> String {
+/// Redact a command-like string with one already-compiled custom-DLP plan.
+/// Output surfaces which project several sibling fields use this entry point so
+/// every field is governed by the same frozen plan without regex recompilation.
+pub fn redact_command_text_with_compiled(input: &str, compiled: &CompiledCustomPatterns) -> String {
     // Private-key structure must be removed before assignment scrubbing. An
     // input such as `KEY=-----BEGIN RSA PRIVATE KEY-----\n...` otherwise has
     // its BEGIN marker split by the assignment pass, leaving the key body for
@@ -1092,13 +1253,15 @@ fn redact_finding_with_compiled(
     finding: &mut crate::verdict::Finding,
     compiled: &CompiledCustomPatterns,
 ) {
-    finding.title = redact_with_compiled(&finding.title, compiled);
-    finding.description = redact_with_compiled(&finding.description, compiled);
+    finding.title = redact_sanitize_redact_with_compiled(&finding.title, compiled);
+    finding.description = redact_sanitize_redact_with_compiled(&finding.description, compiled);
+    redact_optional_string(&mut finding.mitre_id, compiled);
+    redact_optional_string(&mut finding.custom_rule_id, compiled);
     if let Some(ref mut v) = finding.human_view {
-        *v = redact_with_compiled(v, compiled);
+        *v = redact_sanitize_redact_with_compiled(v, compiled);
     }
     if let Some(ref mut v) = finding.agent_view {
-        *v = redact_with_compiled(v, compiled);
+        *v = redact_sanitize_redact_with_compiled(v, compiled);
     }
     for ev in &mut finding.evidence {
         redact_evidence(ev, compiled);
@@ -1109,36 +1272,36 @@ fn redact_evidence(ev: &mut crate::verdict::Evidence, compiled: &CompiledCustomP
     use crate::verdict::Evidence;
     match ev {
         Evidence::Url { raw } => {
-            *raw = redact_with_compiled(raw, compiled);
+            *raw = redact_sanitize_redact_with_compiled(raw, compiled);
         }
         Evidence::HostComparison {
             raw_host,
             similar_to,
         } => {
-            *raw_host = redact_with_compiled(raw_host, compiled);
-            *similar_to = redact_with_compiled(similar_to, compiled);
+            *raw_host = redact_sanitize_redact_with_compiled(raw_host, compiled);
+            *similar_to = redact_sanitize_redact_with_compiled(similar_to, compiled);
         }
         Evidence::CommandPattern { pattern, matched } => {
-            *pattern = redact_with_compiled(pattern, compiled);
-            *matched = redact_command_text_with_compiled(matched, compiled);
+            *pattern = redact_sanitize_redact_with_compiled(pattern, compiled);
+            *matched = redact_sanitize_redact_command_with_compiled(matched, compiled);
         }
         Evidence::ByteSequence {
             offset: _,
             hex,
             description,
         } => {
-            *hex = redact_with_compiled(hex, compiled);
-            *description = redact_with_compiled(description, compiled);
+            *hex = redact_sanitize_redact_with_compiled(hex, compiled);
+            *description = redact_sanitize_redact_with_compiled(description, compiled);
         }
         Evidence::EnvVar {
             name,
             value_preview,
         } => {
-            *name = redact_with_compiled(name, compiled);
-            *value_preview = redact_with_compiled(value_preview, compiled);
+            *name = redact_sanitize_redact_with_compiled(name, compiled);
+            *value_preview = redact_sanitize_redact_with_compiled(value_preview, compiled);
         }
         Evidence::Text { detail } => {
-            *detail = redact_command_text_with_compiled(detail, compiled);
+            *detail = redact_sanitize_redact_command_with_compiled(detail, compiled);
         }
         Evidence::ThreatIntel {
             source,
@@ -1146,10 +1309,10 @@ fn redact_evidence(ev: &mut crate::verdict::Evidence, compiled: &CompiledCustomP
             confidence: _,
             reference,
         } => {
-            *source = redact_with_compiled(source, compiled);
-            *threat_type = redact_with_compiled(threat_type, compiled);
+            *source = redact_sanitize_redact_with_compiled(source, compiled);
+            *threat_type = redact_sanitize_redact_with_compiled(threat_type, compiled);
             if let Some(reference) = reference {
-                *reference = redact_with_compiled(reference, compiled);
+                *reference = redact_sanitize_redact_with_compiled(reference, compiled);
             }
         }
         Evidence::HomoglyphAnalysis {
@@ -1157,19 +1320,22 @@ fn redact_evidence(ev: &mut crate::verdict::Evidence, compiled: &CompiledCustomP
             escaped,
             suspicious_chars,
         } => {
-            *raw = redact_with_compiled(raw, compiled);
-            *escaped = redact_with_compiled(escaped, compiled);
+            *raw = redact_sanitize_redact_with_compiled(raw, compiled);
+            *escaped = redact_sanitize_redact_with_compiled(escaped, compiled);
             for suspicious in suspicious_chars {
                 let character = suspicious.character.to_string();
-                if redact_with_compiled(&character, compiled) != character {
+                if redact_sanitize_redact_with_compiled(&character, compiled) != character {
                     // `character` serializes as a one-character string. It
                     // cannot hold a multi-character secret, but a one-character
                     // custom DLP rule must still not leak through this field.
                     suspicious.character = '\u{FFFD}';
                 }
-                suspicious.codepoint = redact_with_compiled(&suspicious.codepoint, compiled);
-                suspicious.description = redact_with_compiled(&suspicious.description, compiled);
-                suspicious.hex_bytes = redact_with_compiled(&suspicious.hex_bytes, compiled);
+                suspicious.codepoint =
+                    redact_sanitize_redact_with_compiled(&suspicious.codepoint, compiled);
+                suspicious.description =
+                    redact_sanitize_redact_with_compiled(&suspicious.description, compiled);
+                suspicious.hex_bytes =
+                    redact_sanitize_redact_with_compiled(&suspicious.hex_bytes, compiled);
             }
         }
     }
@@ -1178,16 +1344,87 @@ fn redact_evidence(ev: &mut crate::verdict::Evidence, compiled: &CompiledCustomP
 /// Redact all findings in a verdict in-place.
 pub fn redact_verdict(verdict: &mut crate::verdict::Verdict, custom_patterns: &[String]) {
     let compiled = CompiledCustomPatterns::new(custom_patterns);
-    for f in &mut verdict.findings {
-        redact_finding_with_compiled(f, &compiled);
+    redact_verdict_with_compiled(verdict, &compiled);
+}
+
+/// Redact a verdict with a caller-owned compiled DLP plan.
+pub fn redact_verdict_with_compiled(
+    verdict: &mut crate::verdict::Verdict,
+    compiled: &CompiledCustomPatterns,
+) {
+    redact_findings_with_compiled(&mut verdict.findings, compiled);
+    redact_optional_string(&mut verdict.policy_path_used, compiled);
+    redact_optional_string(&mut verdict.approval_fallback, compiled);
+    redact_optional_string(&mut verdict.approval_rule, compiled);
+    redact_optional_string(&mut verdict.approval_description, compiled);
+    redact_optional_string(&mut verdict.escalation_reason, compiled);
+    redact_optional_string(&mut verdict.manifest_allowed_match, compiled);
+    if let Some(origin) = verdict.agent_origin.as_mut() {
+        match origin {
+            crate::agent_origin::AgentOrigin::Human { .. }
+            | crate::agent_origin::AgentOrigin::Gateway => {}
+            crate::agent_origin::AgentOrigin::Agent { tool, version } => {
+                *tool = redact_sanitize_redact_with_compiled(tool, compiled);
+                redact_optional_string(version, compiled);
+            }
+            crate::agent_origin::AgentOrigin::Mcp {
+                client_name,
+                client_version,
+            } => {
+                *client_name = redact_sanitize_redact_with_compiled(client_name, compiled);
+                redact_optional_string(client_version, compiled);
+            }
+            crate::agent_origin::AgentOrigin::Ci { provider } => {
+                redact_optional_string(provider, compiled)
+            }
+            crate::agent_origin::AgentOrigin::Ide { name } => {
+                *name = redact_sanitize_redact_with_compiled(name, compiled)
+            }
+        }
+    }
+}
+
+fn redact_optional_string(value: &mut Option<String>, compiled: &CompiledCustomPatterns) {
+    if let Some(value) = value {
+        *value = redact_sanitize_redact_with_compiled(value, compiled);
     }
 }
 
 /// Redact all findings in a slice in-place.
 pub fn redact_findings(findings: &mut [crate::verdict::Finding], custom_patterns: &[String]) {
     let compiled = CompiledCustomPatterns::new(custom_patterns);
+    redact_findings_with_compiled(findings, &compiled);
+}
+
+/// Redact findings with a caller-owned compiled DLP plan.
+pub fn redact_findings_with_compiled(
+    findings: &mut [crate::verdict::Finding],
+    compiled: &CompiledCustomPatterns,
+) {
     for f in findings.iter_mut() {
-        redact_finding_with_compiled(f, &compiled);
+        redact_finding_with_compiled(f, compiled);
+    }
+}
+
+/// Recursively apply redact-sanitize-redact to every string value in a
+/// machine-readable projection while preserving keys, schema, booleans, and
+/// numeric decision metadata. Call this before any presentation bound.
+pub fn redact_json_strings(value: &mut serde_json::Value, compiled: &CompiledCustomPatterns) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = redact_sanitize_redact_with_compiled(text, compiled)
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_strings(item, compiled);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for value in object.values_mut() {
+                redact_json_strings(value, compiled);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1412,6 +1649,32 @@ mod tests {
         let redacted = redact_with_custom(input, &custom);
         assert!(!redacted.contains("PROJ-12345"));
         assert!(redacted.contains("[REDACTED:custom]"));
+    }
+
+    #[test]
+    fn terminal_sanitization_cannot_reconstitute_a_builtin_secret() {
+        let secret = format!("ghp_{}", "A1b2C3d4".repeat(5));
+        let split = format!("{}\u{1b}[31m{}", &secret[..19], &secret[19..]);
+        let compiled = CompiledCustomPatterns::new_silent(&[]);
+
+        let safe = redact_sanitize_redact_with_compiled(&split, &compiled);
+
+        assert!(!safe.contains(&secret));
+        assert!(safe.contains("[REDACTED:GitHub PAT]"), "{safe}");
+        assert!(!safe.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn terminal_sanitization_cannot_reconstitute_a_custom_secret() {
+        let secret = "C02_CUSTOM_DLP_RECONSTITUTION_CANARY";
+        let split = format!("{}\u{200b}{}", &secret[..15], &secret[15..]);
+        let compiled = CompiledCustomPatterns::new_silent(&[regex::escape(secret)]);
+
+        let safe = redact_sanitize_redact_with_compiled(&split, &compiled);
+
+        assert!(!safe.contains(secret));
+        assert!(safe.contains("[REDACTED:custom]"), "{safe}");
+        assert!(!safe.contains('\u{200b}'));
     }
 
     #[test]
@@ -1738,17 +2001,17 @@ mod tests {
             ],
             human_view: None,
             agent_view: None,
-            mitre_id: None,
-            custom_rule_id: None,
+            mitre_id: Some(tagged("mitre")),
+            custom_rule_id: Some(tagged("custom-rule")),
         };
         let patterns = vec![regex::escape(SENTINEL), "^S$".to_string()];
 
         redact_finding(&mut finding, &patterns);
 
-        let serialized = serde_json::to_string(&finding.evidence).unwrap();
+        let serialized = serde_json::to_string(&finding).unwrap();
         assert!(
             !serialized.contains(SENTINEL),
-            "no Evidence string field may retain the sentinel: {serialized}"
+            "no Finding string field may retain the sentinel: {serialized}"
         );
         assert_eq!(
             finding.evidence.len(),
@@ -1960,6 +2223,22 @@ mod tests {
         let report = redact_for_audience(&input, ShareAudience::Slack);
         // Sum across all labels.
         assert!(report.total() >= 2);
+    }
+
+    #[test]
+    fn verdict_redaction_includes_policy_and_metadata_paths() {
+        let secret = "DLP_POLICY_PATH_CANARY";
+        let mut verdict = crate::verdict::Verdict::from_findings(
+            Vec::new(),
+            0,
+            crate::verdict::Timings::default(),
+        );
+        verdict.policy_path_used = Some(format!("/repo/{secret}/policy.yaml"));
+        verdict.escalation_reason = Some(format!("loaded from {secret}"));
+        redact_verdict(&mut verdict, &[regex::escape(secret)]);
+        let serialized = serde_json::to_string(&verdict).unwrap();
+        assert!(!serialized.contains(secret), "{serialized}");
+        assert!(serialized.contains("[REDACTED:custom]"), "{serialized}");
     }
 
     #[test]

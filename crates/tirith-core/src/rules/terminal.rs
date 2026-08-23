@@ -16,10 +16,9 @@ pub fn check_bytes_with_ignore(
     ignore_ranges: &[std::ops::Range<usize>],
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let mut scan = extract::scan_bytes(input);
-    for range in ignore_ranges {
-        scan = scan.with_ignored_range(range);
-    }
+    let report = extract::scan_bytes_with_ignored_ranges(input, ignore_ranges);
+    let dropped_details = report.dropped_details;
+    let scan = report.result;
 
     if scan.has_ansi_escapes {
         findings.push(Finding {
@@ -260,17 +259,16 @@ pub fn check_bytes_with_ignore(
                 d.description.contains("confusable U+")
                     || d.description.contains("text confusable U+")
             })
+            .filter(|d| {
+                if d.description.contains("text confusable U+") {
+                    is_ascii_nearby(input, d.offset)
+                } else {
+                    is_same_word_as_ascii(input, d.offset)
+                }
+            })
             .collect();
 
-        let has_suspicious = confusable_details.iter().any(|d| {
-            if d.description.contains("text confusable U+") {
-                is_ascii_nearby(input, d.offset)
-            } else {
-                is_same_word_as_ascii(input, d.offset)
-            }
-        });
-
-        if has_suspicious {
+        if !confusable_details.is_empty() {
             findings.push(Finding {
                 rule_id: RuleId::ConfusableText,
                 severity: Severity::High,
@@ -310,6 +308,30 @@ pub fn check_bytes_with_ignore(
                     description: d.description.clone(),
                 })
                 .collect(),
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
+    if dropped_details > 0 {
+        findings.push(Finding {
+            rule_id: RuleId::AnalysisIncomplete,
+            severity: Severity::High,
+            title: "Terminal byte scan retained only part of its evidence".to_string(),
+            description: "The input produced more byte-level detail records than Tirith's \
+                          bounded retention cap. Records kept before the cap were analyzed, \
+                          and the omitted records are reported instead of being treated as \
+                          absent."
+                .to_string(),
+            evidence: vec![Evidence::Text {
+                detail: format!(
+                    "byte_detail_omitted_count={} retained_cap={}",
+                    dropped_details,
+                    extract::ByteScanResult::MAX_RETAINED_DETAILS
+                ),
+            }],
             human_view: None,
             agent_view: None,
             mitre_id: None,
@@ -446,7 +468,7 @@ pub fn check_hidden_multiline(input: &str) -> Vec<Finding> {
 /// are in the SAME joining script (Arabic, Devanagari, …), where they are
 /// legitimate. One-sided joining (Latin + ZWJ + Arabic) is suspicious and not
 /// suppressed.
-fn is_joining_script_context(input: &[u8], byte_offset: usize) -> bool {
+pub(crate) fn is_joining_script_context(input: &[u8], byte_offset: usize) -> bool {
     use unicode_script::{Script, UnicodeScript};
 
     let Ok(text) = std::str::from_utf8(input) else {
@@ -668,7 +690,7 @@ fn strip_html_tags(html: &str) -> String {
 }
 
 /// ASCII letters within ±16 bytes (for math alphanumerics, no legit terminal use).
-fn is_ascii_nearby(input: &[u8], offset: usize) -> bool {
+pub(crate) fn is_ascii_nearby(input: &[u8], offset: usize) -> bool {
     let start = offset.saturating_sub(16);
     let end = (offset + 16).min(input.len());
     input[start..end].iter().any(|b| b.is_ascii_alphabetic())
@@ -690,7 +712,7 @@ fn is_ascii_nearby(input: &[u8], offset: usize) -> bool {
 /// {Latin, Cyrillic, Greek, Common, Inherited} — so Han/Hiragana/Katakana/
 /// Hangul/Thai/Arabic/… terminate a word. The word is suspicious only if, after
 /// trimming at those boundaries, it still contains an ASCII letter.
-fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
+pub(crate) fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
     use unicode_script::{Script, UnicodeScript};
 
     // Chars that stay *inside* a word. Non-alphanumeric ASCII and any
@@ -802,6 +824,99 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variation_flood_cannot_downgrade_later_critical_zero_width() {
+        let input = format!(
+            "ASCII{}\u{200B}",
+            "\u{FE0F}".repeat(extract::ByteScanResult::MAX_RETAINED_DETAILS)
+        );
+        let findings = check_bytes(input.as_bytes());
+        let zero_width = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::ZeroWidthChars)
+            .expect("zero-width class must retain representative evidence");
+
+        assert_eq!(zero_width.severity, Severity::Critical);
+        assert!(!zero_width.evidence.is_empty());
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::VariationSelector));
+    }
+
+    #[test]
+    fn benign_joiner_flood_cannot_exhaust_suspicious_zero_width_evidence() {
+        let benign =
+            "ا\u{200d}ا ".repeat(extract::ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS * 3);
+        let input = format!("{benign}echo sa\u{200b}fe");
+        let findings = check_bytes(input.as_bytes());
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::ZeroWidthChars)
+            .expect("later suspicious zero-width character must survive contextual retention");
+        assert!(finding.evidence.iter().any(|evidence| matches!(
+            evidence,
+            Evidence::ByteSequence { hex, .. } if hex == "U+200B"
+        )));
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete
+                    && finding.evidence.iter().any(|evidence| {
+                        matches!(
+                            evidence,
+                            Evidence::Text { detail } if detail.contains("byte_detail_omitted_count=")
+                        )
+                    })
+            }),
+            "omitted byte-scan details must be their own AnalysisIncomplete finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn omitted_byte_details_emit_analysis_incomplete_even_without_other_findings() {
+        // Joiner-script ZWJ is legitimate, so the class flag is set but no
+        // ZeroWidthChars finding is emitted. Overflowing the per-class detail
+        // cap must still surface the gap instead of failing open.
+        let input =
+            "ا\u{200d}ا ".repeat(extract::ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS * 3);
+        let findings = check_bytes(input.as_bytes());
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "benign joiner flood must not emit a security finding besides the gap: {findings:?}"
+        );
+        let incomplete = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::AnalysisIncomplete)
+            .expect("exceeding the byte-scan detail cap must emit AnalysisIncomplete");
+        assert_eq!(incomplete.severity, Severity::High);
+        assert!(incomplete.evidence.iter().any(|evidence| matches!(
+            evidence,
+            Evidence::Text { detail }
+                if detail.contains("byte_detail_omitted_count=")
+                    && detail.contains("retained_cap=")
+        )));
+    }
+
+    #[test]
+    fn benign_confusable_flood_cannot_exhaust_mixed_word_evidence() {
+        let benign = "а ".repeat(extract::ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS * 3);
+        let input = format!("{benign}gіthub");
+        let findings = check_bytes(input.as_bytes());
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::ConfusableText)
+            .expect("later mixed-script confusable must survive contextual retention");
+        assert!(finding.evidence.iter().any(|evidence| matches!(
+            evidence,
+            Evidence::ByteSequence { hex, .. } if hex == "U+0456"
+        )));
+        assert!(finding.evidence.iter().all(|evidence| !matches!(
+            evidence,
+            Evidence::ByteSequence { hex, .. } if hex == "U+0430"
+        )));
+    }
 
     #[test]
     fn malformed_utf8_is_an_explicit_protected_paste_finding() {

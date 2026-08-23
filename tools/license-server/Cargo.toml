@@ -38,5 +38,7 @@ uuid = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Backup (optional R2/S3)
-rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
+# Backup (optional R2/S3). Keep the signer sans-I/O and XML-free: rust-s3's
+# response stack pins vulnerable quick-xml/rustls lines, while this service only
+# needs a presigned PUT URL and already owns the reqwest transport.
+rusty-s3 = { version = "0.8.1", default-features = false }

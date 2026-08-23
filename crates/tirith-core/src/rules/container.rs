@@ -44,6 +44,18 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     for seg in &segments {
         let effective = match crate::rules::command::resolve_effective_segment(seg, shell) {
             Ok(effective) => effective,
+            Err(crate::rules::command::EffectiveCommandError::WorkBudgetExceeded) => {
+                findings.push(make_finding(
+                    RuleId::AnalysisIncomplete,
+                    Severity::High,
+                    "Container command analysis exceeded its work budget".to_string(),
+                    "The container command exceeded Tirith's bounded token-normalization budget. The omitted token suffix is blocked instead of being treated as a non-container command."
+                        .to_string(),
+                    input,
+                    seg,
+                ));
+                continue;
+            }
             Err(_) => {
                 if seg.raw.split_whitespace().any(|word| {
                     matches!(command_basename(word, shell).as_str(), "docker" | "podman")

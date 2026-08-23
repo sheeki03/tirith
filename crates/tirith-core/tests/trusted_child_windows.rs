@@ -77,15 +77,23 @@ fn windows_helper_parent_exits_with_a_live_grandchild() {
     // deliberately remains live with inherited stdout/stderr handles.
 }
 
-/// Hosted Windows runners build under a directory whose owner sits outside the
-/// trusted set, so the resolver legitimately refuses to bind the running test
-/// binary. The supervisor cases below need that binding to have anything to
-/// assert, so they skip there rather than restating the runner's ownership.
+/// Refusals that describe the hosted runner's own checkout, not the code under
+/// test. Both have been observed on GitHub Windows runners: the build directory
+/// is owned outside the trusted set, and on the `D:` work volume its ACLs also
+/// grant broad write access. Either way the resolver is right to refuse, and
+/// the supervisor cases below need a binding to have anything to assert.
+///
+/// Deliberately an exact list rather than "any InvalidPath": a refusal for any
+/// other reason is a real finding and must still fail loudly.
+const RUNNER_CHECKOUT_REFUSALS: &[&str] = &["untrusted owner", "grants broad write access"];
+
 fn trusted_current_exe() -> Option<TrustedExecutable> {
     match TrustedExecutable::current() {
         Ok(executable) => Some(executable),
         Err(error @ TrustedExecutableError::InvalidPath { .. })
-            if error.to_string().contains("untrusted owner") =>
+            if RUNNER_CHECKOUT_REFUSALS
+                .iter()
+                .any(|reason| error.to_string().contains(reason)) =>
         {
             eprintln!("skipping: {error}");
             None

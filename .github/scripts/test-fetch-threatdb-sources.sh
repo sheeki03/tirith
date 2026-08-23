@@ -21,18 +21,93 @@ cat > "$FAKE_BIN/git" <<'EOF'
 set -euo pipefail
 # `git -C <dir> rev-parse HEAD` records the resolved source revision.
 if [[ "$*" == *rev-parse* ]]; then
-  echo "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+  case "$2" in
+    *ossf-mp) echo "1ea2762d5fb415aef003a244d5aa83c5fc48cc6e" ;;
+    *dd-mp) echo "ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc" ;;
+    *typosquats) echo "fd0bde98d200efe5c282a07edc4c68fba13252c6" ;;
+    *) exit 64 ;;
+  esac
+  exit 0
+fi
+if [[ "$*" == *sparse-checkout* ]]; then
+  if [[ "$*" == *"${FAKE_SPARSE_HANG:-never-match}"* ]]; then
+    if [ -n "${FAKE_SPARSE_STARTED:-}" ]; then
+      printf 'started\n' > "$FAKE_SPARSE_STARTED"
+    fi
+    trap 'if [ -n "${FAKE_SPARSE_TERMINATED:-}" ]; then printf "terminated\n" > "$FAKE_SPARSE_TERMINATED"; fi; exit 143' TERM
+    while :; do read -r -t 1 _ || :; done
+  fi
+  exit 0
+fi
+if [[ "$*" == *" fetch "* ]] || [[ "$*" == *" checkout "* ]]; then
   exit 0
 fi
 destination=${!#}
 mkdir -p -- "$destination/.git"
-printf 'fixture\n' > "$destination/feed.json"
+case "$*" in
+  *ossf/malicious-packages*)
+    mkdir -p -- "$destination/osv"
+    printf 'fixture license\n' > "$destination/LICENSE"
+    printf 'fixture readme\n' > "$destination/README.md"
+    for index in $(seq 1 100); do
+      printf '{"id":"MAL-2099-%04d","affected":[{"package":{"ecosystem":"npm","name":"bad-%d"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"}]}]}]}\n' \
+        "$index" "$index" > "$destination/osv/MAL-2099-$(printf '%04d' "$index").json"
+    done
+    ;;
+  *DataDog/malicious-software-packages-dataset*)
+    mkdir -p -- "$destination/samples/npm" "$destination/samples/pypi"
+    printf 'fixture license\n' > "$destination/LICENSE"
+    printf 'fixture readme\n' > "$destination/README.md"
+    printf '{"bad-npm":null}\n' > "$destination/samples/npm/manifest.json"
+    printf '{"bad-pypi":null}\n' > "$destination/samples/pypi/manifest.json"
+    ;;
+  *ecosyste-ms/typosquatting-dataset*)
+    printf 'fixture license\n' > "$destination/LICENSE"
+    printf 'fixture readme\n' > "$destination/README.md"
+    printf 'malicious_package,target_package,ecosystem,registry,classification,source\n' > "$destination/typosquats.csv"
+    for index in $(seq 1 100); do
+      printf 'bad-%d,good-%d,npm,https://npmjs.org,other,fixture\n' "$index" "$index" >> "$destination/typosquats.csv"
+    done
+    ;;
+esac
 if [[ "$*" == *"${FAKE_FETCH_FAILURE:-never-match}"* ]]; then
   exit 41
 fi
 if [[ "$*" == *"${FAKE_FETCH_HANG:-never-match}"* ]]; then
   while :; do read -r -t 1 _ || :; done
 fi
+EOF
+
+cat > "$FAKE_BIN/tirith-threatdb-compile" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+  echo "tirith-threatdb-compile 0.3.3"
+  exit 0
+fi
+if [ "${1:-}" != "fetch-registry-snapshots" ]; then
+  exit 64
+fi
+if [ -n "${FAKE_COMPILER_CALLED:-}" ]; then
+  printf 'called\n' > "$FAKE_COMPILER_CALLED"
+fi
+if [ "${FAKE_COMPILER_FAILURE:-}" = "1" ]; then
+  exit 43
+fi
+if [ "${FAKE_COMPILER_HANG:-}" = "1" ]; then
+  while :; do read -r -t 1 _ || :; done
+fi
+shift
+output=
+while (( $# > 0 )); do
+  case "$1" in
+    --output) output=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+test -n "$output"
+retrieved_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '{"schema_version":1,"ossf_commit":"1ea2762d5fb415aef003a244d5aa83c5fc48cc6e","retrieved_at":"%s","packages":[]}\n' "$retrieved_at" > "$output"
 EOF
 
 cat > "$FAKE_BIN/curl" <<'EOF'
@@ -100,7 +175,8 @@ case "$status" in
 esac
 EOF
 
-chmod +x "$FAKE_BIN/git" "$FAKE_BIN/curl" "$FAKE_BIN/timeout"
+chmod +x "$FAKE_BIN/git" "$FAKE_BIN/curl" "$FAKE_BIN/timeout" \
+  "$FAKE_BIN/tirith-threatdb-compile"
 
 compile_reached="$TEST_ROOT/compile-reached"
 
@@ -118,6 +194,7 @@ echo "::stop-commands::${STOP_TOKEN}"
 status=0
 if PATH="$FAKE_BIN:$PATH" \
    THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
    THREATDB_FETCH_TIMEOUT_SECONDS=invalid \
    bash "$FETCH_SCRIPT"; then
@@ -141,6 +218,31 @@ fi
 status=0
 if PATH="$FAKE_BIN:$PATH" \
    THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
+   THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
+   THREATDB_TRANSACTION_TIMEOUT_SECONDS=invalid \
+   bash "$FETCH_SCRIPT"; then
+  touch "$compile_reached"
+else
+  status=$?
+fi
+if (( status == 0 )); then
+  echo "expected an invalid transaction timeout to fail preflight" >&2
+  exit 1
+fi
+if [ -e "$compile_reached" ] || [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ]; then
+  echo "invalid transaction timeout reached compile/publication" >&2
+  exit 1
+fi
+if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
+  echo "invalid transaction timeout left private staging state" >&2
+  exit 1
+fi
+
+status=0
+if PATH="$FAKE_BIN:$PATH" \
+   THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$TEST_ROOT/missing-timeout" \
    bash "$FETCH_SCRIPT"; then
   touch "$compile_reached"
@@ -163,12 +265,14 @@ fi
 for failed_source in \
   ossf/malicious-packages \
   DataDog/malicious-software-packages-dataset \
+  ecosyste-ms/typosquatting-dataset \
   ipblocklist \
   known_exploited_vulnerabilities
 do
   status=0
   if PATH="$FAKE_BIN:$PATH" \
      THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+     THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
      THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
      FAKE_FETCH_FAILURE="$failed_source" \
      bash "$FETCH_SCRIPT"; then
@@ -189,10 +293,6 @@ do
     echo "a partial source set became visible after $failed_source failed" >&2
     exit 1
   fi
-  if [ -e "$OUTPUT_ROOT/tirith-threatdb-source-pins.json" ]; then
-    echo "source pins were recorded after $failed_source failed" >&2
-    exit 1
-  fi
   if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
     echo "failed source-fetch staging state was not cleaned after $failed_source" >&2
     exit 1
@@ -204,6 +304,7 @@ done
 status=0
 if PATH="$FAKE_BIN:$PATH" \
    THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
    THREATDB_FETCH_TIMEOUT_SECONDS=1 \
    FAKE_FETCH_HANG=ipblocklist \
@@ -225,22 +326,299 @@ if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
   exit 1
 fi
 
+# Blobless clones can lazy-fetch during sparse expansion. The sparse worker is
+# therefore subject to the same per-source timeout as an initial clone, and a
+# timeout must remove all private state before the compiler can run.
+sparse_started="$TEST_ROOT/sparse-per-source-started"
+sparse_terminated="$TEST_ROOT/sparse-per-source-terminated"
+sparse_compiler_called="$TEST_ROOT/sparse-per-source-compiler-called"
+sparse_log="$TEST_ROOT/sparse-per-source.log"
+status=0
+if PATH="$FAKE_BIN:$PATH" \
+   THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
+   THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
+   THREATDB_FETCH_TIMEOUT_SECONDS=1 \
+   THREATDB_TRANSACTION_TIMEOUT_SECONDS=30 \
+   FAKE_SPARSE_HANG=ossf-mp \
+   FAKE_SPARSE_STARTED="$sparse_started" \
+   FAKE_SPARSE_TERMINATED="$sparse_terminated" \
+   FAKE_COMPILER_CALLED="$sparse_compiler_called" \
+   bash "$FETCH_SCRIPT" >"$sparse_log" 2>&1; then
+  touch "$compile_reached"
+else
+  status=$?
+fi
+if (( status == 0 )) || [ ! -s "$sparse_started" ] || [ ! -s "$sparse_terminated" ]; then
+  echo "expected per-source timeout to start and terminate sparse materialization" >&2
+  exit 1
+fi
+if ! grep -q 'OpenSSF malicious-packages: sparse materialization failed or timed out (exit 124)' \
+    "$sparse_log"; then
+  echo "sparse timeout did not retain the exact source/step label" >&2
+  exit 1
+fi
+if [ -e "$compile_reached" ] || [ -e "$sparse_compiler_called" ] ||
+   [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ]; then
+  echo "per-source sparse timeout reached compiler-visible publication state" >&2
+  exit 1
+fi
+if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
+  echo "per-source sparse timeout left private staging state" >&2
+  exit 1
+fi
+
+# The aggregate transaction deadline must also cap sparse materialization even
+# when the per-source allowance is much larger.
+sparse_started="$TEST_ROOT/sparse-transaction-started"
+sparse_terminated="$TEST_ROOT/sparse-transaction-terminated"
+sparse_compiler_called="$TEST_ROOT/sparse-transaction-compiler-called"
+sparse_log="$TEST_ROOT/sparse-transaction.log"
+SECONDS=0
+status=0
+if PATH="$FAKE_BIN:$PATH" \
+   THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
+   THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
+   THREATDB_FETCH_TIMEOUT_SECONDS=30 \
+   THREATDB_TRANSACTION_TIMEOUT_SECONDS=2 \
+   FAKE_SPARSE_HANG=ossf-mp \
+   FAKE_SPARSE_STARTED="$sparse_started" \
+   FAKE_SPARSE_TERMINATED="$sparse_terminated" \
+   FAKE_COMPILER_CALLED="$sparse_compiler_called" \
+   bash "$FETCH_SCRIPT" >"$sparse_log" 2>&1; then
+  touch "$compile_reached"
+else
+  status=$?
+fi
+elapsed=$SECONDS
+if (( status == 0 )) || (( elapsed >= 10 )) ||
+   [ ! -s "$sparse_started" ] || [ ! -s "$sparse_terminated" ]; then
+  echo "expected aggregate deadline to terminate sparse materialization promptly" >&2
+  exit 1
+fi
+if ! grep -q 'OpenSSF malicious-packages: sparse materialization failed or timed out (exit 124)' \
+    "$sparse_log"; then
+  echo "aggregate sparse timeout did not retain the exact source/step label" >&2
+  exit 1
+fi
+if [ -e "$compile_reached" ] || [ -e "$sparse_compiler_called" ] ||
+   [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ]; then
+  echo "aggregate sparse timeout reached compiler-visible publication state" >&2
+  exit 1
+fi
+if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
+  echo "aggregate sparse timeout left private staging state" >&2
+  exit 1
+fi
+
+# Registry-version snapshot generation is part of the same transaction. Its
+# failure must leave neither compiler-visible inputs nor provenance metadata.
+status=0
+if PATH="$FAKE_BIN:$PATH" \
+   THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
+   THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
+   FAKE_COMPILER_FAILURE=1 \
+   bash "$FETCH_SCRIPT"; then
+  touch "$compile_reached"
+else
+  status=$?
+fi
+if (( status == 0 )); then
+  echo "expected registry snapshot generation failure" >&2
+  exit 1
+fi
+if [ -e "$compile_reached" ] ||
+   [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ] ||
+   [ -e "$OUTPUT_ROOT/tirith-threatdb-sources/source-provenance.json" ]; then
+  echo "registry snapshot failure exposed partial publication state" >&2
+  exit 1
+fi
+if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
+  echo "registry snapshot failure left private staging state" >&2
+  exit 1
+fi
+
+# The registry snapshot compiler participates in the same hard transaction
+# deadline as network fetches. A hung compiler must be killed and cannot expose
+# either source inputs or provenance.
+status=0
+if PATH="$FAKE_BIN:$PATH" \
+   THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
+   THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
+   THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
+   THREATDB_FETCH_TIMEOUT_SECONDS=1 \
+   THREATDB_TRANSACTION_TIMEOUT_SECONDS=2 \
+   FAKE_COMPILER_HANG=1 \
+   bash "$FETCH_SCRIPT"; then
+  touch "$compile_reached"
+else
+  status=$?
+fi
+if (( status == 0 )); then
+  echo "expected a hung registry snapshot compiler to time out" >&2
+  exit 1
+fi
+if [ -e "$compile_reached" ] || [ -e "$OUTPUT_ROOT/tirith-threatdb-sources" ]; then
+  echo "hung registry snapshot compiler exposed publication state" >&2
+  exit 1
+fi
+if compgen -G "$OUTPUT_ROOT/.tirith-threatdb-fetch.*" >/dev/null; then
+  echo "hung registry snapshot compiler left private staging state" >&2
+  exit 1
+fi
+
 echo "::${STOP_TOKEN}::"
 
 PATH="$FAKE_BIN:$PATH" \
 THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
 THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
+THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
 bash "$FETCH_SCRIPT"
 
 published="$OUTPUT_ROOT/tirith-threatdb-sources"
 test -d "$published/ossf-mp/.git"
 test -d "$published/dd-mp/.git"
+test -d "$published/typosquats/.git"
 test -s "$published/feodo.txt"
 test -s "$published/cisa-kev.json"
+test -s "$published/registry-versions.json"
+test -s "$published/typosquats/typosquats.csv"
 
 # The resolved upstream revisions must be recorded on the success path only.
-test -s "$OUTPUT_ROOT/tirith-threatdb-source-pins.json"
-grep -q '"commit": "da39a3ee5e6b4b0d3255bfef95601890afd80709"' \
-  "$OUTPUT_ROOT/tirith-threatdb-source-pins.json"
+test -s "$published/source-provenance.json"
+grep -Eq '"commit"[[:space:]]*:[[:space:]]*"1ea2762d5fb415aef003a244d5aa83c5fc48cc6e"' \
+  "$published/source-provenance.json"
+grep -Eq '"compiler_version"[[:space:]]*:[[:space:]]*"0.3.3"' \
+  "$published/source-provenance.json"
+grep -Eq '"schema_version"[[:space:]]*:[[:space:]]*2' \
+  "$published/source-provenance.json"
+grep -Eq '"spdx"[[:space:]]*:[[:space:]]*"CC-BY-4.0"' \
+  "$published/source-provenance.json"
+grep -Eq '"spdx"[[:space:]]*:[[:space:]]*"Apache-2.0"' \
+  "$published/source-provenance.json"
+grep -Eq '"spdx"[[:space:]]*:[[:space:]]*"CC0-1.0"' \
+  "$published/source-provenance.json"
+grep -Eq '"spdx"[[:space:]]*:[[:space:]]*"LicenseRef-abuse-ch-terms"' \
+  "$published/source-provenance.json"
+grep -Eq '"spdx"[[:space:]]*:[[:space:]]*"LicenseRef-US-Government-Work"' \
+  "$published/source-provenance.json"
+grep -Eq '"spdx"[[:space:]]*:[[:space:]]*"LicenseRef-Package-Name-Facts"' \
+  "$published/source-provenance.json"
+grep -Eq '"content_sha256"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' \
+  "$published/source-provenance.json"
+grep -Eq '"retrieved_at"[[:space:]]*:[[:space:]]*"[0-9]{4}-[0-9]{2}-[0-9]{2}T' \
+  "$published/source-provenance.json"
+
+# Provenance retention follows the union of retained/protected database
+# generations. Generation 20 survives through its protected v1 DB; generation
+# 10 loses both formats and therefore loses provenance; orphan generation 5 is
+# also pruned.
+cat > "$TEST_ROOT/prune-assets.json" <<'EOF'
+{"assets":[
+  {"name":"tirith-threatdb-30-1.dat"},
+  {"name":"tirith-threatdb-v2-30-1.dat"},
+  {"name":"threatdb-source-provenance-30-1.json"},
+  {"name":"threatdb-source-integrity-30-1.json"},
+  {"name":"tirith-threatdb-20-1.dat"},
+  {"name":"threatdb-source-provenance-20-1.json"},
+  {"name":"threatdb-source-integrity-20-1.json"},
+  {"name":"tirith-threatdb-10-1.dat"},
+  {"name":"tirith-threatdb-v2-10-1.dat"},
+  {"name":"threatdb-source-provenance-10-1.json"},
+  {"name":"threatdb-source-integrity-10-1.json"},
+  {"name":"threatdb-source-provenance-5-1.json"},
+  {"name":"threatdb-source-integrity-5-1.json"}
+]}
+EOF
+actual_prune=$(
+  "$SCRIPT_DIR/select-threatdb-prune-assets.sh" \
+    "$TEST_ROOT/prune-assets.json" 1 tirith-threatdb-20-1.dat
+)
+expected_prune=$(printf '%s\n' \
+  tirith-threatdb-10-1.dat \
+  tirith-threatdb-v2-10-1.dat \
+  threatdb-source-provenance-10-1.json \
+  threatdb-source-integrity-10-1.json \
+  threatdb-source-provenance-5-1.json \
+  threatdb-source-integrity-5-1.json)
+if [ "$actual_prune" != "$expected_prune" ]; then
+  echo "prune selection did not retain/delete provenance in generation lockstep" >&2
+  printf 'actual:\n%s\nexpected:\n%s\n' "$actual_prune" "$expected_prune" >&2
+  exit 1
+fi
+
+# Simulate the workflow's sequential delete loop with a failure on the second
+# DB. Because selection is DB-first, no provenance/sidecar may be attempted.
+delete_log="$TEST_ROOT/delete-order.log"
+status=0
+while IFS= read -r asset; do
+  printf '%s\n' "$asset" >> "$delete_log"
+  if [ "$asset" = "tirith-threatdb-v2-10-1.dat" ]; then
+    status=1
+    break
+  fi
+done <<< "$actual_prune"
+if (( status == 0 )); then
+  echo "expected injected second-DB prune failure" >&2
+  exit 1
+fi
+if grep -q '\.json$' "$delete_log"; then
+  echo "provenance deletion was attempted before every DB deletion succeeded" >&2
+  exit 1
+fi
+
+# Keep the release-provenance merge and its assertion honest: every external
+# variable referenced by either jq filter must be bound exactly once by that
+# invocation. This catches both a missing --arg and a duplicate --arg before
+# GitHub Actions reaches the publication step.
+python3 - "$SCRIPT_DIR/../workflows/threatdb.yml" <<'PY'
+from collections import Counter
+from pathlib import Path
+import re
+import sys
+
+workflow = Path(sys.argv[1]).read_text(encoding="utf-8")
+anchor = workflow.index('SOURCE_INTEGRITY_MANIFEST_SHA=""')
+merge_start = workflow.index("          jq -n \\\n", anchor)
+validation_start = workflow.index("          jq -e \\\n", merge_start)
+validation_end_marker = '            "$SOURCE_PROVENANCE" >/dev/null'
+validation_end = workflow.index(validation_end_marker, validation_start) + len(
+    validation_end_marker
+)
+
+
+def assert_external_variables_bound_once(label: str, invocation: str) -> None:
+    filters = re.findall(r"'([^']*)'", invocation, flags=re.DOTALL)
+    if len(filters) != 1:
+        raise SystemExit(f"{label}: expected exactly one single-quoted jq filter")
+    jq_filter = filters[0]
+    referenced = set(re.findall(r"\$([A-Za-z_][A-Za-z0-9_]*)", jq_filter))
+    locally_bound = set(
+        re.findall(r"\bas\s+\$([A-Za-z_][A-Za-z0-9_]*)", jq_filter)
+    )
+    external = referenced - locally_bound - {"ARGS", "ENV", "__loc__"}
+    cli_bindings = re.findall(
+        r"--(?:arg|argjson|slurpfile|rawfile|argfile)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+        invocation,
+    )
+    duplicates = sorted(name for name, count in Counter(cli_bindings).items() if count != 1)
+    missing = sorted(external - set(cli_bindings))
+    if duplicates or missing:
+        raise SystemExit(
+            f"{label}: invalid jq bindings; missing={missing}, duplicate={duplicates}"
+        )
+
+
+merge = workflow[merge_start:validation_start]
+validation = workflow[validation_start:validation_end]
+assert_external_variables_bound_once("release provenance merge", merge)
+assert_external_variables_bound_once("release provenance validation", validation)
+
+for label, invocation in (("merge", merge), ("validation", validation)):
+    if "$integrity_manifest_sha" not in invocation:
+        raise SystemExit(f"{label}: source-integrity digest is not covered")
+PY
 
 echo "threatdb source-fetch orchestration regression passed"

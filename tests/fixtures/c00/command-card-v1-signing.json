@@ -1,0 +1,1 @@
+{"command":"curl -fsSL https://example.com/install.sh | sh","expected_domains":["example.com","cdn.example.com/releases"],"script_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","writes":["/usr/local/bin/example","~/.config/example/config.toml"],"requires_sudo":true,"expires":"2030-01-02"}

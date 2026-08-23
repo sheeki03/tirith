@@ -11,6 +11,10 @@ use crate::script_analysis;
 use crate::verdict::{Action, Verdict};
 
 pub struct RunResult {
+    /// The exact raw receipt persisted by the runner. This preserves the
+    /// long-standing API invariant that `RunResult::receipt` and
+    /// `Receipt::load(receipt.sha256)` describe the same record. Public output
+    /// callers must use [`RunResult::presentation_receipt_with_compiled`].
     pub receipt: Receipt,
     /// Redacted policy-complete body verdict. `None` only for a deliberately
     /// non-executing inspection whose bytes/interpreter could not be analyzed
@@ -22,6 +26,17 @@ pub struct RunResult {
     pub refused: bool,
     pub executed: bool,
     pub exit_code: Option<i32>,
+}
+
+impl RunResult {
+    /// Build a separately named public receipt projection with one frozen DLP
+    /// plan, leaving both the returned raw receipt and persisted record intact.
+    pub fn presentation_receipt_with_compiled(
+        &self,
+        compiled: &crate::redact::CompiledCustomPatterns,
+    ) -> Receipt {
+        self.receipt.presentation_clone_with_compiled(compiled)
+    }
 }
 
 /// A pluggable executor for the final "run the downloaded script" step. The core
@@ -1177,6 +1192,11 @@ fn review_script_bytes_for_session(
     }))
     .map_err(|_| "refusing execution: policy analysis did not complete".to_string())?;
     let (mut raw_verdict, policy) = analyzed;
+    // A CLI transaction may already have frozen an earlier preflight policy.
+    // Merge this body-analysis policy into that invocation's presentation plan
+    // so receipt/error DTOs cannot leak a custom pattern introduced between
+    // preflight and the authoritative byte review.
+    crate::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
 
     // Shell source is both an executable command stream and a code file. The
     // Exec pipeline supplies command/policy rules; add the repository's code-file
@@ -1295,18 +1315,18 @@ fn raw_audit_fields(review: &ScriptReview) -> Option<(String, Vec<String>)> {
 
 fn redacted_result_verdict(review: &ScriptReview) -> Option<Verdict> {
     review.effective_verdict.as_ref().map(|effective| {
-        let custom_patterns = review
+        let custom_patterns = &review
             .policy
             .as_ref()
-            .map(|policy| policy.dlp_custom_patterns.as_slice())
-            .unwrap_or(&[]);
+            .expect("an effective runner verdict retains its frozen policy")
+            .dlp_custom_patterns;
         redacted_verdict(effective, custom_patterns)
     })
 }
 
 fn redacted_verdict(verdict: &Verdict, custom_patterns: &[String]) -> Verdict {
     let mut display = verdict.clone();
-    display.findings = crate::redact::redacted_findings(&display.findings, custom_patterns);
+    crate::redact::redact_verdict(&mut display, custom_patterns);
     display
 }
 
@@ -1452,10 +1472,18 @@ fn read_tty_confirmation(tty: &fs::File, prompt: &str) -> Result<bool, String> {
     Ok(response_line.trim().eq_ignore_ascii_case("y"))
 }
 
-fn present_complete_verdict(verdict: &Verdict, writer: impl io::Write) -> Result<(), String> {
-    crate::output::write_human(verdict, false, writer).map_err(|error| {
-        format!("refusing execution because the complete verdict could not be presented: {error}")
-    })
+fn present_complete_verdict(
+    verdict: &Verdict,
+    custom_patterns: &[String],
+    writer: impl io::Write,
+) -> Result<(), String> {
+    crate::output::write_human_with_patterns(verdict, false, custom_patterns, writer).map_err(
+        |error| {
+            format!(
+                "refusing execution because the complete verdict could not be presented: {error}"
+            )
+        },
+    )
 }
 
 fn enforce_required_bypass_audit(
@@ -1744,6 +1772,16 @@ fn run_impl(
         cwd.as_deref(),
         forced_interpreter,
     )?;
+    // Incomplete no-exec analyses have no engine policy, but their public
+    // receipt still needs an authoritative full-policy DLP projection. Resolve
+    // it once here (including remote replacement/runtime overrides) rather
+    // than falling back to an empty pattern set at the DTO boundary.
+    if review.policy.is_none() {
+        let cwd_for_policy = cwd.as_ref().map(|path| path.to_string_lossy().into_owned());
+        let policy = crate::policy::Policy::discover(cwd_for_policy.as_deref());
+        crate::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
+        review.policy = Some(policy);
+    }
     let mut invocation = if let Some(requested) = requested_pipe_invocation.as_ref() {
         ScriptInvocation {
             interpreter: requested.interpreter.as_str().to_string(),
@@ -1837,8 +1875,16 @@ fn run_impl(
 
     let audit_subject = format!("downloaded-script sha256:{sha256}");
     let preview_result_verdict = redacted_result_verdict(&review);
-    if let Some(display) = preview_result_verdict.as_ref() {
-        present_complete_verdict(display, std::io::stderr().lock())?;
+    if let Some(effective) = review.effective_verdict.as_ref() {
+        let custom_patterns = &review
+            .policy
+            .as_ref()
+            .expect("an effective runner verdict retains its frozen policy")
+            .dlp_custom_patterns;
+        // Pass the complete raw verdict into the renderer. It derives its
+        // bounded/redacted display internally while retaining a same-finding
+        // raw target for advisory integrity.
+        present_complete_verdict(effective, custom_patterns, std::io::stderr().lock())?;
     }
 
     if opts.no_exec {
@@ -1962,7 +2008,11 @@ fn run_impl(
         .expect("confirmed complete analysis retains its frozen policy");
     let final_result_verdict =
         redacted_verdict(prepared.verdict(), &final_policy.dlp_custom_patterns);
-    present_complete_verdict(&final_result_verdict, std::io::stderr().lock())?;
+    present_complete_verdict(
+        prepared.verdict(),
+        &final_policy.dlp_custom_patterns,
+        std::io::stderr().lock(),
+    )?;
     audit_complete_review(
         &final_review,
         prepared.verdict(),
@@ -2812,7 +2862,7 @@ mod tests {
             1,
             crate::verdict::Timings::default(),
         );
-        let render_error = present_complete_verdict(&verdict, FailingWriter)
+        let render_error = present_complete_verdict(&verdict, &[], FailingWriter)
             .expect_err("a verdict that was not presented cannot reach confirmation");
         assert!(
             render_error.contains("could not be presented"),
@@ -2837,12 +2887,16 @@ mod tests {
         let inspect = review_script_bytes(invalid, false, false, Some(dir.path()), None)
             .expect("--no-exec must retain incomplete inspection");
         assert!(!inspect.analysis_complete);
+        assert_eq!(inspect.incomplete_reason, Some("invalid-utf8"));
+        assert!(inspect.effective_verdict.is_none());
 
         let unsupported = b"#!/usr/bin/awk -f\nBEGIN { print \"ok\" }\n";
         assert!(review_script_bytes(unsupported, true, false, Some(dir.path()), None).is_err());
         let inspect = review_script_bytes(unsupported, false, false, Some(dir.path()), None)
             .expect("--no-exec must retain unsupported-interpreter inspection");
         assert!(!inspect.analysis_complete);
+        assert_eq!(inspect.incomplete_reason, Some("unsupported-interpreter"));
+        assert!(inspect.effective_verdict.is_none());
     }
 
     #[test]
@@ -2998,7 +3052,22 @@ mod tests {
         assert!(!result.executed);
         assert!(!result.refused, "--no-exec is analysis, not a live refusal");
         assert!(!called.load(Ordering::Acquire));
-        assert_eq!(result.verdict.unwrap().action, Action::Block);
+        assert!(
+            result.receipt.cwd.is_some(),
+            "RunResult must retain the exact persisted raw receipt"
+        );
+        let stored = Receipt::load(&result.receipt.sha256).expect("persisted receipt loads");
+        assert_eq!(
+            serde_json::to_value(&result.receipt).unwrap(),
+            serde_json::to_value(&stored).unwrap(),
+            "RunResult receipt must preserve persisted receipt semantics"
+        );
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&[]);
+        assert!(result
+            .presentation_receipt_with_compiled(&compiled)
+            .cwd
+            .is_none());
+        assert_eq!(result.verdict.as_ref().unwrap().action, Action::Block);
     }
 
     #[cfg(target_os = "macos")]

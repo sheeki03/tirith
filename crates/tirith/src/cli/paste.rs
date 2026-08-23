@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write as _};
 
 use crate::cli::last_trigger;
 use tirith_core::engine::{self, AnalysisContext};
@@ -14,6 +14,7 @@ pub fn run(
     html_path: Option<&str>,
     with_source: bool,
 ) -> i32 {
+    let _policy_diagnostic_capture = tirith_core::policy::PolicyDiagnosticCapture::start();
     const MAX_PASTE: u64 = 1024 * 1024;
 
     let mut raw_bytes = Vec::new();
@@ -33,10 +34,11 @@ pub fn run(
         return 0;
     }
 
+    let mut unknown_shell = None;
     let shell_type = match shell.parse::<ShellType>() {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("tirith: warning: unknown shell '{shell}', falling back to posix");
+            unknown_shell = Some(shell.to_string());
             ShellType::Posix
         }
     };
@@ -69,17 +71,21 @@ pub fn run(
                 Ok(bytes) => match String::from_utf8(bytes) {
                     Ok(html) => Some(html),
                     Err(_) => {
-                        eprintln!(
-                            "tirith: clipboard HTML '{path}' is not valid UTF-8; refusing to skip rich-text analysis"
+                        return emit_early_paste_error(
+                            &format!(
+                                "clipboard HTML '{path}' is not valid UTF-8; refusing to skip rich-text analysis"
+                            ),
+                            2,
                         );
-                        return 2;
                     }
                 },
                 Err(e) => {
-                    eprintln!(
-                        "tirith: cannot read clipboard HTML '{path}' safely ({e:?}); refusing to skip rich-text analysis"
+                    return emit_early_paste_error(
+                        &format!(
+                            "cannot read clipboard HTML '{path}' safely ({e:?}); refusing to skip rich-text analysis"
+                        ),
+                        2,
                     );
-                    return 2;
                 }
             }
         }
@@ -126,8 +132,16 @@ pub fn run(
     // close the TOCTOU window where a `.tirith/policy.yaml` change between two
     // `Policy::discover` reads routed detection and enforcement against different policies.
     let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
+    tirith_core::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
     crate::cli::warn_repo_policy_neutralized(&policy);
     crate::cli::warn_bad_injection_seeds(&policy);
+    let provenance_dlp =
+        tirith_core::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    if let Some(shell) = unknown_shell {
+        let shell =
+            tirith_core::output::sanitize_human_field_with_compiled(&shell, &provenance_dlp);
+        eprintln!("tirith: warning: unknown shell '{shell}', falling back to posix");
+    }
 
     // M4 item 8: origin attribution — the CLI is the only layer that knows whether the
     // caller was a human, an agent (TIRITH_INTEGRATION), or CI. The audit below picks it up.
@@ -170,7 +184,11 @@ pub fn run(
         let source_attribution = if with_source {
             // Hash the ORIGINAL bytes, in lockstep with the engine's paste_source_mismatch.
             let raw = ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes());
-            Some(resolve_source_attribution(raw, display_record.as_ref()))
+            Some(resolve_source_attribution(
+                raw,
+                display_record.as_ref(),
+                &provenance_dlp,
+            ))
         } else {
             None
         };
@@ -185,29 +203,66 @@ pub fn run(
             };
         }
     } else {
-        if output::write_human_auto(&verdict, false).is_err() {
-            eprintln!("tirith: failed to write output");
-        }
+        let mut human = output::HumanInvocationWriter::new(
+            std::io::stderr().lock(),
+            tirith_core::style::use_color_for(tirith_core::style::Stream::Stderr),
+        );
+        let mut human_failed = output::write_human_to_invocation_with_patterns(
+            &verdict,
+            false,
+            &policy.dlp_custom_patterns,
+            &mut human,
+        )
+        .is_err();
         // M12 ch1 `--with-source` human mode: a one-line stderr attribution note
         // (structured keys live in `--json`). Graceful when no source was recorded.
         if with_source {
             let raw = ctx.raw_bytes.as_deref().unwrap_or(ctx.input.as_bytes());
-            match resolve_source_attribution(raw, display_record.as_ref()) {
+            match resolve_source_attribution(raw, display_record.as_ref(), &provenance_dlp) {
                 serde_json::Value::Null => {
-                    eprintln!("tirith paste: no clipboard source recorded for this paste");
+                    human_failed |= writeln!(
+                        human,
+                        "tirith paste: no clipboard source recorded for this paste"
+                    )
+                    .is_err();
                 }
                 v => {
                     let url = v
                         .get("source_url")
                         .and_then(|u| u.as_str())
                         .unwrap_or("(unknown)");
-                    eprintln!("tirith paste: clipboard source: {url}");
+                    human_failed |=
+                        writeln!(human, "tirith paste: clipboard source: {url}").is_err();
                 }
             }
+        }
+        human_failed |= human.finish().is_err();
+        if human_failed {
+            eprintln!("tirith: failed to write output");
         }
     }
 
     verdict.action.exit_code()
+}
+
+fn emit_early_paste_error(message: &str, exit_code: i32) -> i32 {
+    let policy = tirith_core::policy::Policy::discover(None);
+    tirith_core::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
+    let compiled =
+        tirith_core::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    let mut human = output::HumanInvocationWriter::new(
+        std::io::stderr().lock(),
+        tirith_core::style::use_color_for(tirith_core::style::Stream::Stderr),
+    );
+    for diagnostic in tirith_core::policy::drain_captured_policy_diagnostics_for_output(&compiled) {
+        let diagnostic =
+            tirith_core::output::sanitize_human_field_with_compiled(&diagnostic, &compiled);
+        let _ = writeln!(human, "tirith paste: policy diagnostic: {diagnostic}");
+    }
+    let message = tirith_core::output::sanitize_human_field_with_compiled(message, &compiled);
+    let _ = writeln!(human, "tirith: {message}");
+    let _ = human.finish();
+    exit_code
 }
 
 /// Resolve the attributed clipboard source for this paste, if the companion extension
@@ -222,6 +277,7 @@ pub fn run(
 fn resolve_source_attribution(
     raw: &[u8],
     record: Option<&tirith_core::clipboard::ClipboardSourceRecord>,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
 ) -> serde_json::Value {
     let Some(record) = record else {
         return serde_json::Value::Null;
@@ -235,55 +291,9 @@ fn resolve_source_attribution(
     // sanitized before surfacing: drop URL query/fragment/userinfo (token-bearing), strip
     // terminal control sequences, length-cap. Both output paths read these sanitized values.
     serde_json::json!({
-        "source_url": sanitize_source_url(&record.source_url),
-        "source_title": sanitize_provenance_text(&record.source_title),
+        "source_url": crate::cli::sanitize_provenance_url_with_compiled(&record.source_url, compiled),
+        "source_title": crate::cli::sanitize_provenance_text_with_compiled(&record.source_title, compiled),
     })
-}
-
-/// Max characters of provenance text surfaced into output. Bounds how much of a
-/// (potentially sensitive) page title or path can leak into logs / JSON.
-const PROVENANCE_MAX_CHARS: usize = 256;
-
-/// Neutralize one untrusted provenance string before display/logging. Routes through
-/// the shared [`tirith_core::mcp::output_filter::sanitize_for_display`] (strips
-/// ANSI/OSC/APC/DCS, bare CR, C0 controls, DEL, AND the deceptive/invisible Unicode
-/// classes: bidi controls, variation selectors, Hangul fillers, invisible math
-/// operators, zero-width / Unicode-Tag sets), then flattens tabs/newlines to spaces
-/// and length-caps.
-fn sanitize_provenance_text(s: &str) -> String {
-    let cleaned = tirith_core::mcp::output_filter::sanitize_for_display(s);
-    let flattened: String = cleaned
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .collect();
-    cap_chars(flattened.trim(), PROVENANCE_MAX_CHARS)
-}
-
-/// Redact the high-risk parts of a source URL (query, fragment, `user:pass@` userinfo —
-/// all token-bearing) while keeping `scheme://host/path`, then sanitize + cap. A value
-/// that does not parse as a URL is still sanitized verbatim, just not structurally redacted.
-fn sanitize_source_url(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut parsed) => {
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            sanitize_provenance_text(parsed.as_str())
-        }
-        Err(_) => sanitize_provenance_text(url),
-    }
-}
-
-/// Truncate to at most `max` characters (not bytes), appending `…` when cut.
-fn cap_chars(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        let mut t: String = s.chars().take(max).collect();
-        t.push('…');
-        t
-    } else {
-        s.to_string()
-    }
 }
 
 /// Write the paste verdict as JSON, optionally splicing a top-level `clipboard_source`
@@ -314,6 +324,9 @@ fn write_paste_json(
     if let Some(obj) = value.as_object_mut() {
         obj.insert("clipboard_source".to_string(), source);
     }
+    let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(custom_patterns);
+    tirith_core::redact::redact_json_strings(&mut value, &compiled);
+    let value = tirith_core::verdict::bound_json_value_for_output(value);
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &value)?;
     writeln!(stdout)
@@ -323,6 +336,10 @@ fn write_paste_json(
 mod tests {
     use super::*;
     use tirith_core::clipboard::{content_sha256_hex, ClipboardSourceRecord};
+
+    fn dlp(patterns: &[String]) -> tirith_core::redact::CompiledCustomPatterns {
+        tirith_core::redact::CompiledCustomPatterns::new_silent(patterns)
+    }
 
     fn record_for(payload: &[u8], source_url: &str, source_title: &str) -> ClipboardSourceRecord {
         ClipboardSourceRecord {
@@ -339,7 +356,7 @@ mod tests {
     #[test]
     fn no_attribution_when_hash_mismatches() {
         let rec = record_for(b"the-real-bytes", "https://docs.example.com/x", "X");
-        let v = resolve_source_attribution(b"DIFFERENT-bytes", Some(&rec));
+        let v = resolve_source_attribution(b"DIFFERENT-bytes", Some(&rec), &dlp(&[]));
         assert_eq!(v, serde_json::Value::Null);
     }
 
@@ -354,7 +371,7 @@ mod tests {
             // ANSI color escape + BEL + an embedded newline, injected via the page title
             "Install\u{1b}[31mGuide\u{07}\nline2",
         );
-        let v = resolve_source_attribution(payload, Some(&rec));
+        let v = resolve_source_attribution(payload, Some(&rec), &dlp(&[]));
         let url = v.get("source_url").and_then(|u| u.as_str()).unwrap();
         let title = v.get("source_title").and_then(|t| t.as_str()).unwrap();
 
@@ -388,12 +405,12 @@ mod tests {
         let rec = record_for(
             payload,
             "https://example.com/",
-            &"A".repeat(PROVENANCE_MAX_CHARS + 50),
+            &"A".repeat(crate::cli::PROVENANCE_MAX_CHARS + 50),
         );
-        let v = resolve_source_attribution(payload, Some(&rec));
+        let v = resolve_source_attribution(payload, Some(&rec), &dlp(&[]));
         let title = v.get("source_title").and_then(|t| t.as_str()).unwrap();
         // capped to PROVENANCE_MAX_CHARS plus the single ellipsis marker
-        assert!(title.chars().count() <= PROVENANCE_MAX_CHARS + 1);
+        assert!(title.chars().count() <= crate::cli::PROVENANCE_MAX_CHARS + 1);
         assert!(
             title.ends_with('…'),
             "truncation marker expected: {title:?}"
@@ -404,7 +421,38 @@ mod tests {
     // though it can't be structurally redacted.
     #[test]
     fn non_url_source_is_still_sanitized() {
-        let got = sanitize_source_url("not a url\u{1b}[2J\u{07}");
+        let got = crate::cli::sanitize_provenance_url_with_compiled(
+            "not a url\u{1b}[2J\u{07}",
+            &dlp(&[]),
+        );
         assert!(!got.contains('\u{1b}') && !got.contains('\u{07}'));
+    }
+
+    #[test]
+    fn provenance_custom_patterns_are_redacted_before_length_bounding() {
+        let payload = b"x";
+        let canary = "C02_PASTE_SOURCE_SECRET";
+        let rec = record_for(
+            payload,
+            &format!("https://example.com/{canary}/install"),
+            &format!("Guide for {canary}"),
+        );
+        let patterns = vec![regex::escape(canary)];
+        let value = resolve_source_attribution(payload, Some(&rec), &dlp(&patterns));
+        let serialized = serde_json::to_string(&value).unwrap();
+
+        assert!(!serialized.contains(canary));
+        assert!(serialized.contains("[REDACTED:custom]"));
+    }
+
+    #[test]
+    fn provenance_provider_path_tokens_are_removed_by_the_shared_sanitizer() {
+        let token = "rpc-provider-token-0123456789";
+        let value = crate::cli::sanitize_provenance_url_with_compiled(
+            &format!("https://mainnet.infura.io/v3/{token}?key=also-secret#fragment"),
+            &dlp(&[]),
+        );
+        assert_eq!(value, "https://mainnet.infura.io/v3");
+        assert!(!value.contains(token));
     }
 }

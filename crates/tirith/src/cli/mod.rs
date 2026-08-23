@@ -99,7 +99,7 @@ fn write_json_to<W: Write, T: serde::Serialize>(out: &mut W, value: &T) -> bool 
 /// Callers MUST pass only the untrusted VALUE, never a whole formatted line: the
 /// display scrub removes ALL ANSI, including tirith's own severity colors.
 pub fn sanitize_for_human_output(s: &str, allow_multiline: bool) -> String {
-    let cleaned = tirith_core::mcp::output_filter::sanitize_for_display(s);
+    let cleaned = tirith_core::mcp::output_filter::sanitize_for_display(s).replace('\t', "\\t");
     if allow_multiline {
         // Keep newlines but re-indent every continuation line so an injected `\n`
         // cannot fabricate a new top-level row. The display scrub already reduced
@@ -119,9 +119,134 @@ pub fn sanitize_for_human_output(s: &str, allow_multiline: bool) -> String {
     }
 }
 
+/// Maximum number of Unicode scalar values retained from an untrusted
+/// provenance field. The trailing ellipsis, when present, is outside this
+/// budget by one character.
+#[cfg(test)]
+pub(crate) const PROVENANCE_MAX_CHARS: usize = tirith_core::redact::PROVENANCE_MAX_CHARS;
+
+/// Redact and terminal-neutralize an untrusted provenance text field using one
+/// already-frozen custom-DLP plan. Newlines/tabs are flattened so the same
+/// returned value is safe in both JSON and human one-line projections.
+pub(crate) fn sanitize_provenance_text_with_compiled(
+    value: &str,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> String {
+    tirith_core::redact::sanitize_provenance_text_with_compiled(value, compiled)
+}
+
+/// Redact an untrusted provenance URL before it reaches any output surface.
+/// Userinfo, query, and fragment are always removed. Known hosted-RPC provider
+/// paths (and generic `/v2|v3/<secret-shaped-token>` paths) are reduced to a
+/// non-secret prefix because API credentials commonly live in those segments.
+/// The resulting value then passes through the exact text sanitizer above.
+pub(crate) fn sanitize_provenance_url_with_compiled(
+    value: &str,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> String {
+    tirith_core::redact::sanitize_provenance_url_with_compiled(value, compiled)
+}
+
+/// A redacted, priority-bounded clone for one JSON DTO boundary. The raw
+/// verdict remains available to policy, audit, and exit-code callers.
+pub(crate) struct VerdictPresentation {
+    pub verdict: tirith_core::verdict::Verdict,
+    pub original_findings_count: usize,
+    pub presented_findings_count: usize,
+    pub dropped_findings_count: usize,
+}
+
+pub(crate) fn prepare_verdict_presentation(
+    verdict: &tirith_core::verdict::Verdict,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> VerdictPresentation {
+    let original_findings_count = verdict.findings.len();
+    let retained_findings_count =
+        tirith_core::verdict::retained_finding_indices_for_output(&verdict.findings).len();
+    let dropped_findings_count = original_findings_count.saturating_sub(retained_findings_count);
+
+    // Redact before truncation so a presentation boundary cannot split a
+    // secret and make the configured pattern stop matching.
+    let mut display = verdict.clone();
+    tirith_core::redact::redact_verdict_with_compiled(&mut display, compiled);
+    tirith_core::verdict::bound_verdict_for_output(&mut display);
+    let presented_findings_count = display.findings.len();
+
+    VerdictPresentation {
+        verdict: display,
+        original_findings_count,
+        presented_findings_count,
+        dropped_findings_count,
+    }
+}
+
 #[cfg(test)]
 mod write_json_tests {
     use super::write_json_to;
+
+    #[test]
+    fn verdict_projection_keeps_late_critical_high_and_analysis_incomplete() {
+        use tirith_core::verdict::{Finding, RuleId, Severity, Timings, Verdict};
+
+        let finding = |rule_id, severity, title: &str| Finding {
+            rule_id,
+            severity,
+            title: title.to_string(),
+            description: "bounded projection regression".to_string(),
+            evidence: Vec::new(),
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let mut findings = (0..400)
+            .map(|index| {
+                finding(
+                    RuleId::ConfigInjection,
+                    Severity::Low,
+                    &format!("early low {index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        findings.push(finding(
+            RuleId::CredentialInText,
+            Severity::High,
+            "late high",
+        ));
+        findings.push(finding(
+            RuleId::AnalysisIncomplete,
+            Severity::Medium,
+            "late analysis incomplete",
+        ));
+        findings.push(finding(
+            RuleId::PrivateKeyExposed,
+            Severity::Critical,
+            "late critical",
+        ));
+        let verdict = Verdict::from_findings(findings, 3, Timings::default());
+        let raw_count = verdict.findings.len();
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+
+        let projection = super::prepare_verdict_presentation(&verdict, &compiled);
+
+        assert_eq!(verdict.findings.len(), raw_count);
+        assert_eq!(projection.original_findings_count, raw_count);
+        assert!(projection.dropped_findings_count > 0);
+        for rule_id in [
+            RuleId::PrivateKeyExposed,
+            RuleId::CredentialInText,
+            RuleId::AnalysisIncomplete,
+        ] {
+            assert!(
+                projection
+                    .verdict
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == rule_id),
+                "late priority finding {rule_id} was dropped"
+            );
+        }
+    }
 
     /// A writer that always fails — models a broken pipe / closed stdout.
     struct FailingWriter;
@@ -975,19 +1100,50 @@ fn should_warn_neutralized(
         && !marker_exists
 }
 
-/// Surface invalid `injection_seeds_custom` regexes once to stderr on the
-/// paste/check CLI path. The engine compiles these seeds internally on the paste
-/// path but is a library and does not print, so it drops the bad list; a seed that
-/// passes the lenient `tirith policy validate` shape check yet fails the real
-/// compile would otherwise be silently skipped with no operator feedback. Mirrors
-/// the view/lsp/gateway seams. stderr is safe: `tirith check`/`paste` write their
-/// verdict to stdout.
-pub fn warn_bad_injection_seeds(policy: &tirith_core::policy::Policy) {
-    let (_seeds, bad) =
-        tirith_core::rules::prompt_injection::compile_seeds(&policy.injection_seeds_custom);
-    for (pattern, error) in &bad {
-        eprintln!("tirith: warning: invalid injection_seeds_custom regex {pattern:?}: {error}");
+fn invalid_injection_seed_message(
+    context: &str,
+    diagnostic: tirith_core::rules::prompt_injection::InvalidSeedDiagnostic,
+) -> String {
+    format!(
+        "{context}: warning: injection_seeds_custom[{}] was rejected ({})",
+        diagnostic.index,
+        diagnostic.category.as_str()
+    )
+}
+
+/// Surface already-categorical custom-seed failures through one DLP-aware,
+/// single-line, invocation-bounded stderr envelope. Neither this API nor the
+/// diagnostic type accepts the raw regex/error text, so callers cannot
+/// accidentally echo an attacker-controlled policy value.
+pub fn warn_invalid_injection_seed_diagnostics(
+    context: &str,
+    diagnostics: &[tirith_core::rules::prompt_injection::InvalidSeedDiagnostic],
+    policy: &tirith_core::policy::Policy,
+) {
+    let compiled =
+        tirith_core::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    let mut output = tirith_core::verdict::BoundedTextBuilder::new();
+    for &diagnostic in diagnostics {
+        let message = invalid_injection_seed_message(context, diagnostic);
+        let message = tirith_core::output::sanitize_human_field_with_compiled(&message, &compiled);
+        output.push_str(&message);
+        output.push_str("\n");
     }
+    let output = output.finish();
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(output.as_bytes());
+    let _ = stderr.flush();
+}
+
+/// Surface invalid `injection_seeds_custom` regexes once to stderr on the
+/// paste/check CLI path without rendering either the regex or the compiler's
+/// echoing error text.
+pub fn warn_bad_injection_seeds(policy: &tirith_core::policy::Policy) {
+    let (_seeds, diagnostics) =
+        tirith_core::rules::prompt_injection::compile_seeds_with_safe_diagnostics(
+            &policy.injection_seeds_custom,
+        );
+    warn_invalid_injection_seed_diagnostics("tirith", &diagnostics, policy);
 }
 
 /// Once per shell SESSION (per policy), tell the operator that a repo-scoped policy
@@ -1032,12 +1188,35 @@ pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_shim_target, quiet_from_env, resolve_shim_target, resolve_tirith_on_path_from,
-        sanitize_for_human_output, shell_join, should_warn_neutralized,
+        invalid_injection_seed_message, parse_shim_target, quiet_from_env, resolve_shim_target,
+        resolve_tirith_on_path_from, sanitize_for_human_output, shell_join,
+        should_warn_neutralized,
     };
     use std::fs;
     use std::path::PathBuf;
     use tirith_core::policy::PolicyScope;
+
+    #[test]
+    fn invalid_custom_seed_message_is_indexed_and_never_accepts_raw_pattern() {
+        use tirith_core::rules::prompt_injection::{
+            compile_seeds_with_safe_diagnostics, InvalidSeedCategory,
+        };
+
+        let pat = "ghp_".to_string() + &"A".repeat(36);
+        let secret_pattern = format!("(?P<{pat}>\nX");
+        let (_compiled, diagnostics) =
+            compile_seeds_with_safe_diagnostics(&["valid seed".into(), secret_pattern.clone()]);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].index, 1);
+        assert_eq!(diagnostics[0].category, InvalidSeedCategory::RegexRejected);
+
+        let message = invalid_injection_seed_message("tirith", diagnostics[0]);
+        assert!(message.contains("injection_seeds_custom[1]"));
+        assert!(message.contains("regex_rejected"));
+        assert!(!message.contains(&secret_pattern));
+        assert!(!message.contains(&pat));
+        assert!(!message.contains('\n'));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1100,6 +1279,7 @@ mod tests {
             "aredb"
         );
         assert_eq!(sanitize_for_human_output("a\x1b[2Jb", false), "ab");
+        assert_eq!(sanitize_for_human_output("a\tb", false), "a\\tb");
     }
 
     #[test]
@@ -1118,6 +1298,7 @@ mod tests {
         assert_eq!(sanitize_for_human_output("a\u{202E}b", true), "ab");
         // An embedded ESC sequence is scrubbed here too.
         assert_eq!(sanitize_for_human_output("x\x1b[2Jy\nz", true), "xy\n  z");
+        assert_eq!(sanitize_for_human_output("x\ty", true), "x\\ty");
     }
 
     #[test]

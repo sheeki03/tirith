@@ -1,0 +1,17 @@
+{
+  "id": "MAL-2099-0008",
+  "affected": [
+    {
+      "package": { "ecosystem": "npm", "name": "@solana/web3.js" },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            { "introduced": "1.95.6" },
+            { "fixed": "1.95.8" }
+          ]
+        }
+      ]
+    }
+  ]
+}

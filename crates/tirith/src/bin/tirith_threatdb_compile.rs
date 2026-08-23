@@ -3,6 +3,7 @@
 //! …) into a signed `.dat`. Used by CI (`.github/workflows/threatdb.yml`).
 //! The binary format and `ThreatDbWriter` live in `tirith_core::threatdb`.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
@@ -27,7 +28,8 @@ use tirith_core::threatdb_feeds::{
 #[derive(Parser)]
 #[command(
     name = "tirith-threatdb-compile",
-    about = "Compile threat intelligence feeds into a signed binary database"
+    about = "Compile threat intelligence feeds into a signed binary database",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,6 +42,23 @@ struct Cli {
     /// Datadog malicious-software-packages-dataset repo root
     #[arg(long)]
     datadog: Option<PathBuf>,
+
+    /// Audited registry-version snapshot produced by `fetch-registry-snapshots`.
+    /// Required only for active confirmed OpenSSF bounded ranges.
+    #[arg(long, requires = "source_provenance")]
+    registry_snapshots: Option<PathBuf>,
+
+    /// Immutable pre-compile source transaction provenance. Required with a
+    /// registry snapshot so its OpenSSF revision and exact file digest are
+    /// authenticated before bounded versions are materialized.
+    #[arg(long, requires = "ossf")]
+    source_provenance: Option<PathBuf>,
+
+    /// Destination for the compiler's post-parse, machine-readable counters.
+    /// Required for signed generation publication and merged into the released
+    /// provenance only after compilation succeeds.
+    #[arg(long)]
+    compiler_metadata: Option<PathBuf>,
 
     /// Feodo Tracker IP blocklist file
     #[arg(long)]
@@ -145,6 +164,18 @@ struct Cli {
     #[arg(long, requires = "generation_manifest")]
     generation_base_url: Option<String>,
 
+    /// Run-scoped signed source-integrity sidecar. This preserves the existing
+    /// schema-v2 generation payload byte-for-byte while separately binding the
+    /// generation's DB hashes to audited source and compiler metadata.
+    #[arg(
+        long,
+        requires = "output_v2",
+        requires = "generation_manifest",
+        requires = "compiler_metadata",
+        requires = "source_provenance"
+    )]
+    source_integrity_manifest: Option<PathBuf>,
+
     /// Minimum Tirith version allowed to select the v2 asset in the signed
     /// generation manifest.
     #[arg(long, default_value = "0.3.4")]
@@ -161,7 +192,14 @@ const MIN_OSSF_PACKAGES: usize = 100;
 const MIN_DATADOG_PACKAGES: usize = 100;
 const MIN_FEODO_IPS: usize = 10;
 const MIN_CISA_KEV_RECORDS: usize = 100;
+const MIN_TYPOSQUAT_RECORDS: usize = 100;
 const MAX_BASELINE_DROP_PERCENT: u64 = 50;
+const MAX_OSV_VALUE_BYTES: usize = 256;
+const MAX_BOUNDED_PACKAGE_REQUESTS: usize = 1_000;
+const MAX_REGISTRY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REGISTRY_AGGREGATE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REGISTRY_VERSIONS_PER_PACKAGE: usize = 20_000;
+const MAX_SOURCE_PROVENANCE_BYTES: usize = 1024 * 1024;
 
 fn require_minimum(feed: &str, count: usize, minimum: usize) -> FeedResult<()> {
     if count < minimum {
@@ -193,6 +231,22 @@ enum Commands {
         /// Env var name containing Ed25519 private key (base64-encoded)
         #[arg(long)]
         key_env: String,
+    },
+
+    /// Fetch the unique bounded OpenSSF package-version universes into one
+    /// capped, content-hashed snapshot. Whole-package claims are excluded.
+    FetchRegistrySnapshots {
+        /// OpenSSF malicious-packages repo root.
+        #[arg(long)]
+        ossf: PathBuf,
+
+        /// Exact checked-out OpenSSF commit recorded in provenance.
+        #[arg(long)]
+        ossf_commit: String,
+
+        /// Destination JSON file.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -291,6 +345,8 @@ struct OsvEntry {
     #[serde(default)]
     id: String,
     #[serde(default)]
+    withdrawn: Option<String>,
+    #[serde(default)]
     affected: Vec<OsvAffected>,
     #[serde(default)]
     database_specific: Option<OsvDatabaseSpecific>,
@@ -322,10 +378,27 @@ struct OsvPackage {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)] // range_type preserved for Phase A.1 range evaluators
 struct OsvRange {
     #[serde(default, rename = "type")]
     range_type: String,
+    #[serde(default)]
+    events: Vec<OsvEvent>,
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct OsvEvent {
+    #[serde(default)]
+    introduced: Option<String>,
+    #[serde(default)]
+    fixed: Option<String>,
+    #[serde(default)]
+    last_affected: Option<String>,
+    #[serde(default)]
+    limit: Option<String>,
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Entry-level `database_specific`. Legacy OSV exports carried a `type`
@@ -507,21 +580,910 @@ fn ossf_confidence(id: &str, entry_type: Option<&str>) -> Confidence {
     }
 }
 
+#[derive(Debug, Default)]
 struct OssfStats {
     total_entries: usize,
     parsed_packages: usize,
-    skipped_range_only_count: usize,
+    direct_whole_package_claims: usize,
+    bounded_intervals_materialized: usize,
+    exact_versions_emitted: usize,
+    unsupported_confirmed_shapes: usize,
+    snapshot_failures: usize,
+    skipped_withdrawn: usize,
+    skipped_non_malicious: usize,
     skipped_unknown_ecosystem: usize,
     skipped_unreadable: usize,
     skipped_corrupt: usize,
-    /// Records that carried at least one parsed indicator (artifact/IP/domain/URL).
     records_with_indicators: usize,
-    /// Total accepted indicators across all records. Network IOCs use the shared
-    /// base indexes; artifact hashes and URLs use the v2 sections.
     total_indicators: usize,
 }
 
-fn parse_ossf(root: &Path) -> FeedResult<(Vec<PackageEntry>, OssfStats, OssfIndicators)> {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RegistryPackageKey {
+    ecosystem: Ecosystem,
+    name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeEndKind {
+    Fixed,
+    LastAffected,
+    Limit,
+}
+
+#[derive(Debug, Clone)]
+struct OsvInterval {
+    introduced: String,
+    end: Option<(RangeEndKind, String)>,
+}
+
+#[derive(Debug, Clone)]
+enum RangeProjection {
+    None,
+    WholePackage,
+    Bounded(Vec<OsvInterval>),
+}
+
+#[derive(Debug, Clone)]
+struct PendingOssfClaim {
+    key: RegistryPackageKey,
+    explicit_versions: Vec<String>,
+    intervals: Vec<OsvInterval>,
+    confidence: Confidence,
+    reference: Option<String>,
+}
+
+trait RegistryVersionProvider {
+    fn versions_for(&mut self, key: &RegistryPackageKey) -> FeedResult<Vec<String>>;
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrySnapshotDocument {
+    schema_version: u32,
+    ossf_commit: String,
+    retrieved_at: String,
+    packages: Vec<RegistrySnapshotPackage>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrySnapshotPackage {
+    ecosystem: String,
+    name: String,
+    source_url: String,
+    response_sha256: String,
+    response_bytes: usize,
+    versions: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RegistrySnapshotStore {
+    packages: BTreeMap<RegistryPackageKey, Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitSourceProvenance {
+    source_url: String,
+    r#ref: String,
+    commit: String,
+    spdx: String,
+    files: usize,
+    bytes: usize,
+    content_sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RowSourceProvenance {
+    source_url: String,
+    r#ref: String,
+    commit: String,
+    spdx: String,
+    files: usize,
+    rows: usize,
+    bytes: usize,
+    content_sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HashSourceProvenance {
+    source_url: String,
+    spdx: String,
+    files: usize,
+    bytes: usize,
+    sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalSourceProvenance {
+    source_url: String,
+    spdx: String,
+    files: usize,
+    bytes: usize,
+    content_sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrySourceProvenance {
+    ossf_commit: String,
+    retrieved_at: String,
+    source_urls: Vec<String>,
+    spdx: String,
+    packages: usize,
+    bytes: usize,
+    sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceProvenanceDocument {
+    schema_version: u32,
+    retrieved_at: String,
+    compiler_version: String,
+    ossf_malicious_packages: GitSourceProvenance,
+    datadog_malicious_software_packages: GitSourceProvenance,
+    ecosystems_typosquatting_dataset: RowSourceProvenance,
+    registry_version_snapshot: RegistrySourceProvenance,
+    feodo_tracker_ipblocklist: HashSourceProvenance,
+    cisa_known_exploited_vulnerabilities: HashSourceProvenance,
+    web3_package_anchors: LocalSourceProvenance,
+}
+
+#[derive(Debug, Clone)]
+struct SourceTransactionBinding {
+    provenance_sha256: String,
+    registry_snapshot_sha256: String,
+    ossf_commit: String,
+    registry_retrieved_at: String,
+    registry_packages: usize,
+}
+
+struct SourceInputPaths<'a> {
+    ossf: &'a Path,
+    datadog: &'a Path,
+    typosquats: &'a Path,
+    feodo: &'a Path,
+    cisa_kev: &'a Path,
+    web3_anchors: &'a Path,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalSourceSummary {
+    files: usize,
+    bytes: usize,
+    content_sha256: String,
+}
+
+fn validate_lower_hex(value: &str, bytes: usize, label: &str) -> FeedResult<()> {
+    if value.len() != bytes * 2
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || value.bytes().all(|byte| byte == b'0')
+    {
+        return Err(format!(
+            "{label} must be a nonzero lowercase {}-hex digest",
+            bytes * 2
+        ));
+    }
+    Ok(())
+}
+
+fn validate_commit(value: &str, label: &str) -> FeedResult<()> {
+    validate_lower_hex(value, 20, label)
+}
+
+fn validate_utc_timestamp(value: &str, label: &str) -> FeedResult<()> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(value)
+        .map_err(|error| format!("{label} is not RFC3339: {error}"))?;
+    if parsed.to_rfc3339_opts(chrono::SecondsFormat::Secs, true) != value {
+        return Err(format!(
+            "{label} must be canonical UTC whole-second RFC3339"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_git_source(
+    source: &GitSourceProvenance,
+    expected_url: &str,
+    expected_spdx: &str,
+    label: &str,
+) -> FeedResult<()> {
+    if source.source_url != expected_url || source.spdx != expected_spdx {
+        return Err(format!("{label} source URL or SPDX metadata is unexpected"));
+    }
+    validate_commit(&source.r#ref, &format!("{label} ref"))?;
+    validate_commit(&source.commit, &format!("{label} commit"))?;
+    if source.r#ref != source.commit || source.files == 0 || source.bytes == 0 {
+        return Err(format!("{label} revision/count metadata is inconsistent"));
+    }
+    validate_lower_hex(
+        &source.content_sha256,
+        32,
+        &format!("{label} content SHA-256"),
+    )?;
+    Ok(())
+}
+
+fn canonical_source_summary(
+    root: &Path,
+    relative_paths: &[PathBuf],
+) -> FeedResult<CanonicalSourceSummary> {
+    if relative_paths.is_empty() {
+        return Err("source summary has no files".to_string());
+    }
+    let mut paths = relative_paths.to_vec();
+    paths.sort();
+    paths.dedup();
+    if paths.len() != relative_paths.len() {
+        return Err("source summary contains duplicate paths".to_string());
+    }
+    let mut digest = Sha256::new();
+    let mut total_bytes = 0usize;
+    for relative in &paths {
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "source summary path {} is not a safe relative path",
+                relative.display()
+            ));
+        }
+        let normalized = relative
+            .to_str()
+            .ok_or_else(|| format!("source summary path {} is not UTF-8", relative.display()))?
+            .replace('\\', "/");
+        let path = root.join(relative);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect source input {}: {error}", path.display()))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "source input {} is not a regular non-symlink file",
+                path.display()
+            ));
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("cannot read source input {}: {error}", path.display()))?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| "source byte count overflow".to_string())?;
+        digest.update(normalized.as_bytes());
+        digest.update([0]);
+        digest.update(sha256_hex(&bytes).as_bytes());
+        digest.update([0]);
+    }
+    Ok(CanonicalSourceSummary {
+        files: paths.len(),
+        bytes: total_bytes,
+        content_sha256: format!("{:x}", digest.finalize()),
+    })
+}
+
+fn collect_tree_source_paths(root: &Path, subtree: &str) -> FeedResult<Vec<PathBuf>> {
+    let subtree_path = root.join(subtree);
+    let mut paths = Vec::new();
+    for entry in walkdir::WalkDir::new(&subtree_path).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            format!(
+                "cannot walk source subtree {}: {error}",
+                subtree_path.display()
+            )
+        })?;
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "source subtree contains symlink {}",
+                entry.path().display()
+            ));
+        }
+        if entry.file_type().is_file() {
+            paths.push(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|_| "source tree path escaped its root".to_string())?
+                    .to_path_buf(),
+            );
+        }
+    }
+    if paths.is_empty() {
+        return Err(format!("source subtree {subtree} contains no files"));
+    }
+    Ok(paths)
+}
+
+fn verify_expected_summary(
+    label: &str,
+    actual: &CanonicalSourceSummary,
+    files: usize,
+    bytes: usize,
+    content_sha256: &str,
+) -> FeedResult<()> {
+    if actual.files != files || actual.bytes != bytes || actual.content_sha256 != content_sha256 {
+        return Err(format!(
+            "{label} staged files changed after provenance: files={}/{files} bytes={}/{bytes} sha256={}/{}",
+            actual.files, actual.bytes, actual.content_sha256, content_sha256
+        ));
+    }
+    Ok(())
+}
+
+fn verify_git_checkout(root: &Path, expected_commit: &str, label: &str) -> FeedResult<()> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .map_err(|error| format!("cannot inspect {label} Git HEAD: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("cannot resolve {label} Git HEAD"));
+    }
+    let head = std::str::from_utf8(&output.stdout)
+        .map_err(|_| format!("{label} Git HEAD is not UTF-8"))?
+        .trim();
+    if head != expected_commit {
+        return Err(format!(
+            "{label} Git HEAD {head} does not match pinned {expected_commit}"
+        ));
+    }
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .map_err(|error| format!("cannot inspect {label} Git worktree: {error}"))?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return Err(format!(
+            "{label} Git worktree has unrecorded tracked changes"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_source_contents(
+    document: &SourceProvenanceDocument,
+    inputs: &SourceInputPaths<'_>,
+) -> FeedResult<()> {
+    let ossf =
+        canonical_source_summary(inputs.ossf, &collect_tree_source_paths(inputs.ossf, "osv")?)?;
+    verify_expected_summary(
+        "OpenSSF",
+        &ossf,
+        document.ossf_malicious_packages.files,
+        document.ossf_malicious_packages.bytes,
+        &document.ossf_malicious_packages.content_sha256,
+    )?;
+    let datadog_paths = [
+        PathBuf::from("samples/npm/manifest.json"),
+        PathBuf::from("samples/pypi/manifest.json"),
+    ];
+    let datadog = canonical_source_summary(inputs.datadog, &datadog_paths)?;
+    verify_expected_summary(
+        "Datadog",
+        &datadog,
+        document.datadog_malicious_software_packages.files,
+        document.datadog_malicious_software_packages.bytes,
+        &document.datadog_malicious_software_packages.content_sha256,
+    )?;
+    let typosquat_root = inputs
+        .typosquats
+        .parent()
+        .ok_or_else(|| "typosquat CSV has no source root".to_string())?;
+    let typosquat_name = inputs
+        .typosquats
+        .file_name()
+        .ok_or_else(|| "typosquat CSV has no filename".to_string())?;
+    let typosquats = canonical_source_summary(typosquat_root, &[PathBuf::from(typosquat_name)])?;
+    verify_expected_summary(
+        "typosquat",
+        &typosquats,
+        document.ecosystems_typosquatting_dataset.files,
+        document.ecosystems_typosquatting_dataset.bytes,
+        &document.ecosystems_typosquatting_dataset.content_sha256,
+    )?;
+    for (label, path, source) in [
+        ("Feodo", inputs.feodo, &document.feodo_tracker_ipblocklist),
+        (
+            "CISA KEV",
+            inputs.cisa_kev,
+            &document.cisa_known_exploited_vulnerabilities,
+        ),
+    ] {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot inspect {label} source: {error}"))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(format!("{label} source is not a regular non-symlink file"));
+        }
+        let bytes =
+            std::fs::read(path).map_err(|error| format!("cannot read {label} source: {error}"))?;
+        if source.files != 1 || source.bytes != bytes.len() || source.sha256 != sha256_hex(&bytes) {
+            return Err(format!("{label} staged file changed after provenance"));
+        }
+    }
+    let anchor_root = inputs
+        .web3_anchors
+        .parent()
+        .ok_or_else(|| "Web3 anchor file has no source root".to_string())?;
+    let anchor_name = inputs
+        .web3_anchors
+        .file_name()
+        .ok_or_else(|| "Web3 anchor file has no filename".to_string())?;
+    let anchors = canonical_source_summary(anchor_root, &[PathBuf::from(anchor_name)])?;
+    verify_expected_summary(
+        "Web3 anchors",
+        &anchors,
+        document.web3_package_anchors.files,
+        document.web3_package_anchors.bytes,
+        &document.web3_package_anchors.content_sha256,
+    )?;
+    let embedded_anchor_sha = {
+        let mut digest = Sha256::new();
+        digest.update(b"web3_package_anchors.csv");
+        digest.update([0]);
+        digest.update(sha256_hex(WEB3_PACKAGE_ANCHORS_CSV.as_bytes()).as_bytes());
+        digest.update([0]);
+        format!("{:x}", digest.finalize())
+    };
+    if document.web3_package_anchors.bytes != WEB3_PACKAGE_ANCHORS_CSV.len()
+        || document.web3_package_anchors.content_sha256 != embedded_anchor_sha
+    {
+        return Err(
+            "Web3 anchor provenance does not match the compiler-embedded parsed input".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_source_inputs(
+    document: &SourceProvenanceDocument,
+    inputs: &SourceInputPaths<'_>,
+) -> FeedResult<()> {
+    verify_git_checkout(
+        inputs.ossf,
+        &document.ossf_malicious_packages.commit,
+        "OpenSSF",
+    )?;
+    verify_git_checkout(
+        inputs.datadog,
+        &document.datadog_malicious_software_packages.commit,
+        "Datadog",
+    )?;
+    verify_git_checkout(
+        inputs
+            .typosquats
+            .parent()
+            .ok_or_else(|| "typosquat CSV has no source root".to_string())?,
+        &document.ecosystems_typosquatting_dataset.commit,
+        "typosquat",
+    )?;
+    verify_source_contents(document, inputs)
+}
+
+impl SourceTransactionBinding {
+    fn load(
+        provenance_path: &Path,
+        snapshot_path: &Path,
+        inputs: &SourceInputPaths<'_>,
+    ) -> FeedResult<Self> {
+        Self::load_internal(provenance_path, snapshot_path, Some(inputs))
+    }
+
+    #[cfg(test)]
+    fn load_provenance_only(provenance_path: &Path, snapshot_path: &Path) -> FeedResult<Self> {
+        Self::load_internal(provenance_path, snapshot_path, None)
+    }
+
+    fn load_internal(
+        provenance_path: &Path,
+        snapshot_path: &Path,
+        inputs: Option<&SourceInputPaths<'_>>,
+    ) -> FeedResult<Self> {
+        let provenance_bytes = std::fs::read(provenance_path).map_err(|error| {
+            format!(
+                "cannot read source provenance {}: {error}",
+                provenance_path.display()
+            )
+        })?;
+        if provenance_bytes.is_empty() || provenance_bytes.len() > MAX_SOURCE_PROVENANCE_BYTES {
+            return Err("source provenance is empty or above its byte cap".to_string());
+        }
+        let document: SourceProvenanceDocument = serde_json::from_slice(&provenance_bytes)
+            .map_err(|error| format!("invalid source provenance JSON: {error}"))?;
+        if document.schema_version != 2 || document.compiler_version != env!("CARGO_PKG_VERSION") {
+            return Err("source provenance schema or compiler version is unexpected".to_string());
+        }
+        if let Some(inputs) = inputs {
+            verify_source_inputs(&document, inputs)?;
+        }
+        validate_utc_timestamp(&document.retrieved_at, "source retrieval time")?;
+        let source_retrieved_at = chrono::DateTime::parse_from_rfc3339(&document.retrieved_at)
+            .expect("timestamp validated above");
+        validate_git_source(
+            &document.ossf_malicious_packages,
+            "https://github.com/ossf/malicious-packages.git",
+            "CC-BY-4.0",
+            "OpenSSF",
+        )?;
+        validate_git_source(
+            &document.datadog_malicious_software_packages,
+            "https://github.com/DataDog/malicious-software-packages-dataset.git",
+            "Apache-2.0",
+            "Datadog",
+        )?;
+        let typosquats = &document.ecosystems_typosquatting_dataset;
+        if typosquats.source_url != "https://github.com/ecosyste-ms/typosquatting-dataset.git"
+            || typosquats.spdx != "CC0-1.0"
+            || typosquats.files != 1
+            || typosquats.rows == 0
+            || typosquats.bytes == 0
+        {
+            return Err("typosquat source/count metadata is inconsistent".to_string());
+        }
+        validate_commit(&typosquats.r#ref, "typosquat ref")?;
+        validate_commit(&typosquats.commit, "typosquat commit")?;
+        if typosquats.r#ref != typosquats.commit {
+            return Err("typosquat ref/commit metadata disagrees".to_string());
+        }
+        validate_lower_hex(&typosquats.content_sha256, 32, "typosquat content SHA-256")?;
+        for (source, expected_url, expected_spdx, label) in [
+            (
+                &document.feodo_tracker_ipblocklist,
+                "https://feodotracker.abuse.ch/downloads/ipblocklist.txt",
+                "LicenseRef-abuse-ch-terms",
+                "Feodo",
+            ),
+            (
+                &document.cisa_known_exploited_vulnerabilities,
+                "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+                "LicenseRef-US-Government-Work",
+                "CISA KEV",
+            ),
+        ] {
+            if source.source_url != expected_url
+                || source.spdx != expected_spdx
+                || source.files != 1
+                || source.bytes == 0
+            {
+                return Err(format!("{label} source/count metadata is inconsistent"));
+            }
+            validate_lower_hex(&source.sha256, 32, &format!("{label} SHA-256"))?;
+        }
+        let anchors = &document.web3_package_anchors;
+        if anchors.source_url != "repository:crates/tirith/assets/data/web3_package_anchors.csv"
+            || anchors.spdx != "LicenseRef-Package-Name-Facts"
+            || anchors.files != 1
+            || anchors.bytes == 0
+        {
+            return Err("Web3 anchor source/count metadata is inconsistent".to_string());
+        }
+        validate_lower_hex(&anchors.content_sha256, 32, "Web3 anchor content SHA-256")?;
+        let registry = &document.registry_version_snapshot;
+        validate_commit(&registry.ossf_commit, "registry snapshot OpenSSF commit")?;
+        validate_utc_timestamp(&registry.retrieved_at, "registry snapshot retrieval time")?;
+        let registry_retrieved_at = chrono::DateTime::parse_from_rfc3339(&registry.retrieved_at)
+            .expect("timestamp validated above");
+        if registry.ossf_commit != document.ossf_malicious_packages.commit
+            || registry_retrieved_at > source_retrieved_at
+            || source_retrieved_at - registry_retrieved_at > chrono::Duration::hours(1)
+            || registry.source_urls
+                != [
+                    "https://registry.npmjs.org/".to_string(),
+                    "https://pypi.org/pypi/".to_string(),
+                ]
+            || registry.spdx != "LicenseRef-Registry-Metadata"
+            || registry.packages > MAX_BOUNDED_PACKAGE_REQUESTS
+            || registry.bytes == 0
+            || registry.bytes > MAX_REGISTRY_AGGREGATE_BYTES
+        {
+            return Err("registry snapshot provenance metadata is inconsistent".to_string());
+        }
+        validate_lower_hex(&registry.sha256, 32, "registry snapshot SHA-256")?;
+
+        let snapshot_bytes = std::fs::read(snapshot_path).map_err(|error| {
+            format!(
+                "cannot read registry snapshot {}: {error}",
+                snapshot_path.display()
+            )
+        })?;
+        let actual_snapshot_sha256 = sha256_hex(&snapshot_bytes);
+        if registry.bytes != snapshot_bytes.len() || registry.sha256 != actual_snapshot_sha256 {
+            return Err(
+                "registry snapshot bytes/digest do not match source provenance".to_string(),
+            );
+        }
+        Ok(Self {
+            provenance_sha256: sha256_hex(&provenance_bytes),
+            registry_snapshot_sha256: actual_snapshot_sha256,
+            ossf_commit: registry.ossf_commit.clone(),
+            registry_retrieved_at: registry.retrieved_at.clone(),
+            registry_packages: registry.packages,
+        })
+    }
+
+    fn verify_inputs_unchanged(
+        &self,
+        provenance_path: &Path,
+        inputs: &SourceInputPaths<'_>,
+    ) -> FeedResult<()> {
+        let bytes = std::fs::read(provenance_path).map_err(|error| {
+            format!(
+                "cannot reread source provenance {}: {error}",
+                provenance_path.display()
+            )
+        })?;
+        if sha256_hex(&bytes) != self.provenance_sha256 {
+            return Err("source provenance changed during compilation".to_string());
+        }
+        let document: SourceProvenanceDocument = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("cannot reparse source provenance: {error}"))?;
+        verify_source_inputs(&document, inputs)
+    }
+}
+
+impl RegistrySnapshotStore {
+    fn load(path: &Path, binding: &SourceTransactionBinding) -> FeedResult<Self> {
+        let bytes = std::fs::read(path).map_err(|error| {
+            format!("cannot read registry snapshot {}: {error}", path.display())
+        })?;
+        if bytes.len() > MAX_REGISTRY_AGGREGATE_BYTES {
+            return Err(format!(
+                "registry snapshot is {} bytes, above the {} byte aggregate cap",
+                bytes.len(),
+                MAX_REGISTRY_AGGREGATE_BYTES
+            ));
+        }
+        if sha256_hex(&bytes) != binding.registry_snapshot_sha256 {
+            return Err("registry snapshot digest changed after provenance validation".to_string());
+        }
+        let document: RegistrySnapshotDocument = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid registry snapshot JSON: {error}"))?;
+        if document.schema_version != 1 {
+            return Err(format!(
+                "unsupported registry snapshot schema {}",
+                document.schema_version
+            ));
+        }
+        if document.ossf_commit != binding.ossf_commit {
+            return Err(format!(
+                "registry snapshot OpenSSF commit {} does not match expected {}",
+                document.ossf_commit, binding.ossf_commit
+            ));
+        }
+        if document.retrieved_at != binding.registry_retrieved_at {
+            return Err("registry snapshot retrieval time does not match provenance".to_string());
+        }
+        validate_utc_timestamp(&document.retrieved_at, "registry snapshot retrieval time")?;
+        if document.packages.len() > MAX_BOUNDED_PACKAGE_REQUESTS {
+            return Err("registry snapshot exceeds bounded-package cap".to_string());
+        }
+        if document.packages.len() != binding.registry_packages {
+            return Err("registry snapshot package count does not match provenance".to_string());
+        }
+        let mut packages = BTreeMap::new();
+        for package in document.packages {
+            let ecosystem = Ecosystem::from_name(&package.ecosystem).ok_or_else(|| {
+                format!(
+                    "registry snapshot has unsupported ecosystem {:?}",
+                    package.ecosystem
+                )
+            })?;
+            let key = RegistryPackageKey {
+                ecosystem,
+                name: canonical_package_name(ecosystem, &package.name),
+            };
+            if key.name != package.name {
+                return Err(format!(
+                    "registry snapshot package name {:?} is not canonical",
+                    package.name
+                ));
+            }
+            let expected_url = registry_metadata_url(&key)?;
+            if package.source_url != expected_url.as_str() {
+                return Err(format!(
+                    "registry snapshot entry for {} has unexpected source URL",
+                    key.name
+                ));
+            }
+            validate_lower_hex(
+                &package.response_sha256,
+                32,
+                &format!("registry response SHA-256 for {}", key.name),
+            )?;
+            if package.response_bytes > MAX_REGISTRY_RESPONSE_BYTES
+                || package.response_bytes == 0
+                || package.versions.is_empty()
+                || package.versions.len() > MAX_REGISTRY_VERSIONS_PER_PACKAGE
+            {
+                return Err(format!(
+                    "registry snapshot entry for {} is outside caps",
+                    key.name
+                ));
+            }
+            let versions = package.versions;
+            for version in &versions {
+                validate_osv_value(version, "registry version")?;
+            }
+            if versions.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(format!(
+                    "registry snapshot versions for {} are not strictly sorted and unique",
+                    key.name
+                ));
+            }
+            if packages.insert(key.clone(), versions).is_some() {
+                return Err(format!(
+                    "duplicate registry snapshot entry for {}",
+                    key.name
+                ));
+            }
+        }
+        Ok(Self { packages })
+    }
+
+    fn ensure_fully_consumed(&self) -> FeedResult<()> {
+        if self.packages.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "registry snapshot contains {} unrequested package entries",
+                self.packages.len()
+            ))
+        }
+    }
+}
+
+impl RegistryVersionProvider for RegistrySnapshotStore {
+    fn versions_for(&mut self, key: &RegistryPackageKey) -> FeedResult<Vec<String>> {
+        self.packages.remove(key).ok_or_else(|| {
+            format!(
+                "registry snapshot is missing {}:{}",
+                key.ecosystem, key.name
+            )
+        })
+    }
+}
+
+fn validate_osv_value(value: &str, label: &str) -> FeedResult<()> {
+    if value.is_empty() || value.len() > MAX_OSV_VALUE_BYTES || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "{label} is empty, overlong, or contains control bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_range_projection(
+    ranges: &[OsvRange],
+    ecosystem: Ecosystem,
+    path: &Path,
+) -> FeedResult<RangeProjection> {
+    if ranges.is_empty() {
+        return Ok(RangeProjection::None);
+    }
+    let mut intervals = Vec::new();
+    for range in ranges {
+        if !range.extra.is_empty() {
+            return Err(format!(
+                "{} has unsupported OSV range fields {:?}",
+                path.display(),
+                range.extra.keys().collect::<Vec<_>>()
+            ));
+        }
+        if range.range_type != "ECOSYSTEM" {
+            return Err(format!(
+                "{} uses unsupported confirmed OSV range type {:?}",
+                path.display(),
+                range.range_type
+            ));
+        }
+        if range.events.is_empty() {
+            return Err(format!(
+                "{} has an OSV range without events",
+                path.display()
+            ));
+        }
+        let mut open: Option<String> = None;
+        for event in &range.events {
+            if !event.extra.is_empty() {
+                return Err(format!(
+                    "{} has unsupported OSV event fields {:?}",
+                    path.display(),
+                    event.extra.keys().collect::<Vec<_>>()
+                ));
+            }
+            let key_count = [
+                event.introduced.is_some(),
+                event.fixed.is_some(),
+                event.last_affected.is_some(),
+                event.limit.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+            if key_count != 1 {
+                return Err(format!(
+                    "{} has an OSV event with {key_count} recognized keys; expected exactly one",
+                    path.display()
+                ));
+            }
+            if let Some(introduced) = &event.introduced {
+                validate_osv_value(introduced, "introduced boundary")?;
+                if open.replace(introduced.clone()).is_some() {
+                    return Err(format!(
+                        "{} opens an OSV interval before closing the previous interval",
+                        path.display()
+                    ));
+                }
+                continue;
+            }
+            let (kind, close): (RangeEndKind, &str) = if let Some(value) = &event.fixed {
+                (RangeEndKind::Fixed, value.as_str())
+            } else if let Some(value) = &event.last_affected {
+                (RangeEndKind::LastAffected, value.as_str())
+            } else {
+                (
+                    RangeEndKind::Limit,
+                    event.limit.as_deref().unwrap_or_default(),
+                )
+            };
+            validate_osv_value(close, "range closing boundary")?;
+            let introduced = open.take().ok_or_else(|| {
+                format!(
+                    "{} closes an OSV interval before introducing it",
+                    path.display()
+                )
+            })?;
+            intervals.push(OsvInterval {
+                introduced,
+                end: Some((kind, close.to_string())),
+            });
+        }
+        if let Some(introduced) = open {
+            if introduced != "0" {
+                return Err(format!(
+                    "{} has an unrepresentable non-zero open-ended confirmed interval",
+                    path.display()
+                ));
+            }
+            intervals.push(OsvInterval {
+                introduced,
+                end: None,
+            });
+        }
+    }
+    // A package-wide interval changes only the aggregate projection. It must
+    // not let malformed sibling intervals escape validation, because that
+    // would turn contradictory confirmed source data into a broader claim.
+    for interval in &intervals {
+        validate_interval_order(ecosystem, interval)?;
+    }
+    if intervals
+        .iter()
+        .any(|interval| interval.introduced == "0" && interval.end.is_none())
+    {
+        return Ok(RangeProjection::WholePackage);
+    }
+    if intervals.is_empty() {
+        return Err(format!("{} produced no OSV intervals", path.display()));
+    }
+    Ok(RangeProjection::Bounded(intervals))
+}
+
+fn collect_ossf(
+    root: &Path,
+) -> FeedResult<(
+    Vec<PackageEntry>,
+    Vec<PendingOssfClaim>,
+    OssfStats,
+    OssfIndicators,
+)> {
     let metadata = std::fs::metadata(root)
         .map_err(|e| format!("cannot inspect root {}: {e}", root.display()))?;
     if !metadata.is_dir() {
@@ -529,40 +1491,39 @@ fn parse_ossf(root: &Path) -> FeedResult<(Vec<PackageEntry>, OssfStats, OssfIndi
     }
 
     let mut entries = Vec::new();
-    // Aggregate every record's parsed indicators across the tree; DB-B's v2
-    // writer consumes this to populate the artifact-SHA and malicious-URL
-    // sections. DB-A only counted them.
+    let mut pending = Vec::new();
     let mut all_indicators = OssfIndicators::default();
-    let mut stats = OssfStats {
-        total_entries: 0,
-        parsed_packages: 0,
-        skipped_range_only_count: 0,
-        skipped_unknown_ecosystem: 0,
-        skipped_unreadable: 0,
-        skipped_corrupt: 0,
-        records_with_indicators: 0,
-        total_indicators: 0,
-    };
-
+    let mut stats = OssfStats::default();
+    let mut paths = Vec::new();
     for entry in walkdir::WalkDir::new(root) {
         let entry = entry.map_err(|e| format!("root traversal failed: {e}"))?;
-        if !entry.path().extension().is_some_and(|ext| ext == "json")
-            || !entry.file_type().is_file()
-            || !entry
+        if entry.path().extension().is_some_and(|ext| ext == "json")
+            && entry.file_type().is_file()
+            && entry
                 .path()
                 .file_stem()
                 .is_some_and(|stem| stem.to_string_lossy().starts_with("MAL-"))
         {
-            continue;
+            paths.push(entry.into_path());
         }
-        let path = entry.path();
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    }
+    paths.sort();
 
+    for path in paths {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let osv: OsvEntry = serde_json::from_str(&content)
             .map_err(|e| format!("cannot parse {} as OSV JSON: {e}", path.display()))?;
-        if osv.id.trim().is_empty() {
-            return Err(format!("{} has an empty OSV id", path.display()));
+        if osv.id.trim().is_empty() || !osv.id.starts_with("MAL-") {
+            return Err(format!("{} is not an OpenSSF MAL record", path.display()));
+        }
+        stats.total_entries += 1;
+        if let Some(withdrawn) = osv.withdrawn.as_deref() {
+            if withdrawn.trim().is_empty() {
+                return Err(format!("{} has an empty withdrawn value", path.display()));
+            }
+            stats.skipped_withdrawn += 1;
+            continue;
         }
         if osv.affected.is_empty() {
             return Err(format!(
@@ -571,210 +1532,318 @@ fn parse_ossf(root: &Path) -> FeedResult<(Vec<PackageEntry>, OssfStats, OssfIndi
             ));
         }
 
-        stats.total_entries += 1;
-
         let entry_type = osv
             .database_specific
             .as_ref()
             .and_then(|d| d.entry_type.as_deref());
-
-        // Source-specific: an OpenSSF malicious-packages MAL-* record is
-        // Confirmed even without the legacy `type`. parse_ossf is the only
-        // caller, so the OpenSSF-source constraint is satisfied by construction.
+        if entry_type.is_some_and(|value| !matches!(value, "MALWARE" | "POTENTIALLY_UNWANTED")) {
+            return Err(format!(
+                "{} has unsupported database_specific.type {:?}",
+                path.display(),
+                entry_type
+            ));
+        }
         let confidence = ossf_confidence(&osv.id, entry_type);
+        if confidence != Confidence::Confirmed {
+            stats.skipped_non_malicious += 1;
+            continue;
+        }
 
-        // An all-versions ("whole package is bad") entry is produced for a
-        // Confirmed record with no versions and no ranges. Previously only a
-        // legacy `type == "MALWARE"` qualified; current MAL-* records confirm
-        // via the id, so key this on the resolved confidence instead.
-        let is_confirmed = confidence == Confidence::Confirmed;
-
-        // Stage indicators in memory. Hostname/IPv4 IOCs feed the base indexes;
-        // artifact hashes and URLs feed v2-only sections. Only explicit indicator
-        // fields are read; `references` are documentation links and are excluded.
         let indicators = OssfIndicators::from_database_specific(osv.database_specific.as_ref());
         if !indicators.is_empty() {
             stats.records_with_indicators += 1;
             stats.total_indicators += indicators.len();
-            // Retain them for the shared network indexes and v2-only sections.
             all_indicators.extend(indicators);
         }
-
-        let reference = osv.references.first().map(|r| r.url.clone());
+        let reference = osv.references.first().map(|record| record.url.clone());
 
         for affected in &osv.affected {
-            let pkg = affected.package.as_ref().ok_or_else(|| {
+            let package = affected.package.as_ref().ok_or_else(|| {
                 format!(
                     "{} has an affected record without a package",
                     path.display()
                 )
             })?;
-            if pkg.ecosystem.trim().is_empty() || pkg.name.trim().is_empty() {
+            if package.ecosystem.trim().is_empty() || package.name.trim().is_empty() {
                 return Err(format!(
                     "{} has an affected package with an empty ecosystem or name",
                     path.display()
                 ));
             }
-
-            let ecosystem = match Ecosystem::from_name(&pkg.ecosystem) {
-                Some(e) => e,
-                None => {
-                    stats.skipped_unknown_ecosystem += 1;
-                    continue;
-                }
+            let Some(ecosystem) = Ecosystem::from_name(&package.ecosystem) else {
+                return Err(format!(
+                    "unsupported_confirmed_shapes=1: {} has unsupported confirmed ecosystem {:?}",
+                    path.display(),
+                    package.ecosystem
+                ));
             };
+            let key = RegistryPackageKey {
+                ecosystem,
+                name: canonical_package_name(ecosystem, &package.name),
+            };
+            let mut explicit_versions = affected.versions.clone();
+            for version in &explicit_versions {
+                validate_osv_value(version, "explicit affected version")?;
+            }
+            explicit_versions.sort();
+            explicit_versions.dedup();
 
-            let name = normalize_name(ecosystem, &pkg.name);
-
-            let has_versions = !affected.versions.is_empty();
-            let has_ranges = !affected.ranges.is_empty();
-
-            if has_versions {
-                entries.push(PackageEntry {
-                    ecosystem,
-                    name,
-                    affected_versions: affected.versions.clone(),
-                    all_versions_malicious: false,
-                    source: ThreatSource::OssfMalicious,
+            let projection = parse_range_projection(&affected.ranges, ecosystem, &path)
+                .map_err(|error| format!("unsupported_confirmed_shapes=1: {error}"))?;
+            match projection {
+                RangeProjection::WholePackage => {
+                    stats.direct_whole_package_claims += 1;
+                    stats.exact_versions_emitted += explicit_versions.len();
+                    entries.push(PackageEntry {
+                        ecosystem,
+                        name: key.name,
+                        affected_versions: explicit_versions,
+                        all_versions_malicious: true,
+                        source: ThreatSource::OssfMalicious,
+                        confidence,
+                        reference: reference.clone(),
+                    });
+                }
+                RangeProjection::Bounded(intervals) => pending.push(PendingOssfClaim {
+                    key,
+                    explicit_versions,
+                    intervals,
                     confidence,
                     reference: reference.clone(),
-                });
-                stats.parsed_packages += 1;
-            } else if has_ranges && is_confirmed {
-                // pr173-0026: a CONFIRMED malicious record whose affected entry
-                // carries only ranges used to vanish entirely — a victim
-                // version inside the range scored NoRecord (clean). The record
-                // asserts the package itself is malicious, so mark all
-                // versions malicious rather than dropping the record.
-                entries.push(PackageEntry {
-                    ecosystem,
-                    name,
-                    affected_versions: Vec::new(),
-                    all_versions_malicious: true,
-                    source: ThreatSource::OssfMalicious,
-                    confidence,
-                    reference: reference.clone(),
-                });
-                stats.parsed_packages += 1;
-            } else if has_ranges {
-                // Unconfirmed range-only records remain skipped (counted).
-                stats.skipped_range_only_count += 1;
-            } else if is_confirmed {
-                // Confirmed-malicious (legacy MALWARE type or a MAL-* id) with no
-                // versions and no ranges — the whole package is bad.
-                entries.push(PackageEntry {
-                    ecosystem,
-                    name,
-                    affected_versions: Vec::new(),
-                    all_versions_malicious: true,
-                    source: ThreatSource::OssfMalicious,
-                    confidence,
-                    reference: reference.clone(),
-                });
-                stats.parsed_packages += 1;
-            } else {
-                stats.skipped_range_only_count += 1;
+                }),
+                RangeProjection::None if !explicit_versions.is_empty() => {
+                    stats.exact_versions_emitted += explicit_versions.len();
+                    entries.push(PackageEntry {
+                        ecosystem,
+                        name: key.name,
+                        affected_versions: explicit_versions,
+                        all_versions_malicious: false,
+                        source: ThreatSource::OssfMalicious,
+                        confidence,
+                        reference: reference.clone(),
+                    });
+                }
+                RangeProjection::None => {
+                    // A confirmed MAL record with neither versions nor ranges is
+                    // itself a direct package-wide claim, preserving r3's safe
+                    // no-version behavior without conflating bounded ranges.
+                    stats.direct_whole_package_claims += 1;
+                    entries.push(PackageEntry {
+                        ecosystem,
+                        name: key.name,
+                        affected_versions: Vec::new(),
+                        all_versions_malicious: true,
+                        source: ThreatSource::OssfMalicious,
+                        confidence,
+                        reference: reference.clone(),
+                    });
+                }
             }
         }
     }
-
     if stats.total_entries == 0 {
-        return Err(format!("root {} contains no JSON records", root.display()));
-    }
-    if entries.is_empty() {
         return Err(format!(
-            "root {} produced no package records",
+            "root {} contains no MAL JSON records",
             root.display()
         ));
     }
-
-    Ok((entries, stats, all_indicators))
+    Ok((entries, pending, stats, all_indicators))
 }
 
-/// Datadog dataset entry format.
-#[derive(Debug, serde::Deserialize)]
-struct DatadogEntry {
-    #[serde(default)]
-    ecosystem: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(default)]
-    reference: Option<String>,
+fn compare_versions(ecosystem: Ecosystem, left: &str, right: &str) -> FeedResult<Ordering> {
+    match ecosystem {
+        Ecosystem::Npm => tirith_core::version_intent::compare_semver_public_versions(left, right)
+            .ok_or_else(|| format!("unsupported npm version boundary {left:?} or {right:?}")),
+        Ecosystem::PyPI => tirith_core::version_intent::compare_pep440_public_versions(left, right)
+            .ok_or_else(|| format!("unsupported PyPI version boundary {left:?} or {right:?}")),
+        other => Err(format!(
+            "bounded OpenSSF ranges for {other} are not safely representable by the current pinned comparator"
+        )),
+    }
 }
 
-fn datadog_package(entry: DatadogEntry, path: &Path) -> FeedResult<Option<PackageEntry>> {
-    if entry.ecosystem.trim().is_empty() || entry.name.trim().is_empty() {
+fn interval_contains(
+    ecosystem: Ecosystem,
+    interval: &OsvInterval,
+    version: &str,
+) -> FeedResult<bool> {
+    let after_start = interval.introduced == "0"
+        || compare_versions(ecosystem, version, &interval.introduced)? != Ordering::Less;
+    if !after_start {
+        return Ok(false);
+    }
+    let Some((kind, end)) = &interval.end else {
+        return Err("non-zero open interval reached materialization".to_string());
+    };
+    let ordering = compare_versions(ecosystem, version, end)?;
+    Ok(match kind {
+        RangeEndKind::Fixed | RangeEndKind::Limit => ordering == Ordering::Less,
+        RangeEndKind::LastAffected => ordering != Ordering::Greater,
+    })
+}
+
+fn validate_interval_order(ecosystem: Ecosystem, interval: &OsvInterval) -> FeedResult<()> {
+    if interval.introduced == "0" {
+        if let Some((_, end)) = &interval.end {
+            // `0` is OSV's unbounded-start sentinel rather than an ecosystem
+            // version, but a bounded close is still a concrete version and
+            // must parse even when another interval makes the aggregate claim
+            // package-wide.
+            compare_versions(ecosystem, end, end)?;
+        }
+        return Ok(());
+    }
+    let Some((kind, end)) = &interval.end else {
+        return Err("non-zero open interval is unrepresentable".to_string());
+    };
+    let ordering = compare_versions(ecosystem, &interval.introduced, end)?;
+    let valid = match kind {
+        RangeEndKind::Fixed | RangeEndKind::Limit => ordering == Ordering::Less,
+        RangeEndKind::LastAffected => ordering != Ordering::Greater,
+    };
+    if !valid {
         return Err(format!(
-            "{} contains an empty package ecosystem or name",
-            path.display()
+            "contradictory affected interval {} .. {:?} {}",
+            interval.introduced, kind, end
         ));
-    }
-    let Some(ecosystem) = Ecosystem::from_name(&entry.ecosystem) else {
-        return Ok(None);
-    };
-    let name = normalize_name(ecosystem, &entry.name);
-    let (affected_versions, all_versions_malicious) = match entry.version {
-        Some(ref version) if !version.trim().is_empty() => (vec![version.clone()], false),
-        _ => (Vec::new(), true),
-    };
-    Ok(Some(PackageEntry {
-        ecosystem,
-        name,
-        affected_versions,
-        all_versions_malicious,
-        source: ThreatSource::DatadogMalicious,
-        confidence: Confidence::Confirmed,
-        reference: entry.reference,
-    }))
-}
-
-fn extend_datadog_osv(
-    entries: &mut Vec<PackageEntry>,
-    osv: OsvEntry,
-    path: &Path,
-) -> FeedResult<()> {
-    if osv.affected.is_empty() {
-        return Err(format!("{} has an empty affected array", path.display()));
-    }
-    for affected in &osv.affected {
-        let package = affected.package.as_ref().ok_or_else(|| {
-            format!(
-                "{} has an affected record without a package",
-                path.display()
-            )
-        })?;
-        if package.ecosystem.trim().is_empty() || package.name.trim().is_empty() {
-            return Err(format!(
-                "{} contains an empty package ecosystem or name",
-                path.display()
-            ));
-        }
-        // Only explicit version lists, like the OSSF parser.
-        if affected.versions.is_empty() {
-            continue;
-        }
-        let Some(ecosystem) = Ecosystem::from_name(&package.ecosystem) else {
-            continue;
-        };
-        entries.push(PackageEntry {
-            ecosystem,
-            name: normalize_name(ecosystem, &package.name),
-            affected_versions: affected.versions.clone(),
-            all_versions_malicious: false,
-            source: ThreatSource::DatadogMalicious,
-            confidence: Confidence::Confirmed,
-            reference: osv
-                .references
-                .first()
-                .map(|reference| reference.url.clone()),
-        });
     }
     Ok(())
 }
 
-/// Datadog dataset can be a single JSON array or a directory of JSON files.
+fn parse_ossf_with_provider(
+    root: &Path,
+    mut provider: Option<&mut dyn RegistryVersionProvider>,
+) -> FeedResult<(Vec<PackageEntry>, OssfStats, OssfIndicators)> {
+    let (mut entries, pending, mut stats, indicators) = collect_ossf(root)?;
+    let request_set: BTreeSet<RegistryPackageKey> =
+        pending.iter().map(|claim| claim.key.clone()).collect();
+    if request_set.len() > MAX_BOUNDED_PACKAGE_REQUESTS {
+        return Err(format!(
+            "{} unique bounded packages exceed the request cap of {}",
+            request_set.len(),
+            MAX_BOUNDED_PACKAGE_REQUESTS
+        ));
+    }
+    let mut universes = BTreeMap::new();
+    for key in request_set {
+        let result = provider
+            .as_deref_mut()
+            .ok_or_else(|| {
+                format!(
+                    "bounded OpenSSF claim for {}:{} requires --registry-snapshots",
+                    key.ecosystem, key.name
+                )
+            })?
+            .versions_for(&key);
+        match result {
+            Ok(versions) => {
+                universes.insert(key, versions);
+            }
+            Err(error) => {
+                return Err(format!("snapshot_failures=1: {error}"));
+            }
+        }
+    }
+
+    for claim in pending {
+        let versions = universes.get(&claim.key).ok_or_else(|| {
+            format!(
+                "registry snapshot missing materialization key {}",
+                claim.key.name
+            )
+        })?;
+        let mut affected = claim.explicit_versions;
+        for interval in &claim.intervals {
+            validate_interval_order(claim.key.ecosystem, interval)?;
+            let mut interval_matches = 0usize;
+            for version in versions {
+                if interval_contains(claim.key.ecosystem, interval, version)? {
+                    affected.push(version.clone());
+                    interval_matches += 1;
+                }
+            }
+            if interval_matches == 0 {
+                return Err(format!(
+                    "bounded interval for {}:{} materialized to no registry versions",
+                    claim.key.ecosystem, claim.key.name
+                ));
+            }
+        }
+        affected.sort();
+        affected.dedup();
+        if affected.is_empty() {
+            return Err(format!(
+                "bounded confirmed claim for {}:{} materialized to no versions",
+                claim.key.ecosystem, claim.key.name
+            ));
+        }
+        stats.bounded_intervals_materialized += claim.intervals.len();
+        stats.exact_versions_emitted += affected.len();
+        entries.push(PackageEntry {
+            ecosystem: claim.key.ecosystem,
+            name: claim.key.name,
+            affected_versions: affected,
+            all_versions_malicious: false,
+            source: ThreatSource::OssfMalicious,
+            confidence: claim.confidence,
+            reference: claim.reference,
+        });
+    }
+    stats.parsed_packages = entries.len();
+    if entries.is_empty() {
+        return Err(format!(
+            "root {} produced no active package records",
+            root.display()
+        ));
+    }
+    Ok((entries, stats, indicators))
+}
+
+#[cfg(test)]
+fn parse_ossf(root: &Path) -> FeedResult<(Vec<PackageEntry>, OssfStats, OssfIndicators)> {
+    parse_ossf_with_provider(root, None)
+}
+
+/// Parse only Datadog's documented path-derived manifests. `null` is an
+/// explicitly malicious-intent package (all versions); a non-empty array is the
+/// exact compromised-version set. Every other value, including an empty array,
+/// is a publication error.
+struct StrictJsonObject(BTreeMap<String, serde_json::Value>);
+
+impl<'de> serde::Deserialize<'de> for StrictJsonObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ObjectVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ObjectVisitor {
+            type Value = StrictJsonObject;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object with unique package keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    if values.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate package key {key:?}"
+                        )));
+                    }
+                }
+                Ok(StrictJsonObject(values))
+            }
+        }
+
+        deserializer.deserialize_map(ObjectVisitor)
+    }
+}
+
 fn parse_datadog(root: &Path) -> FeedResult<(Vec<PackageEntry>, usize, usize)> {
     let metadata = std::fs::metadata(root)
         .map_err(|e| format!("cannot inspect root {}: {e}", root.display()))?;
@@ -782,106 +1851,110 @@ fn parse_datadog(root: &Path) -> FeedResult<(Vec<PackageEntry>, usize, usize)> {
         return Err(format!("root {} is not a directory", root.display()));
     }
 
-    let mut entries = Vec::new();
-    let skipped = 0usize;
-    let mut files_read = 0usize;
-
-    for entry in walkdir::WalkDir::new(root) {
-        let entry = entry.map_err(|e| format!("root traversal failed: {e}"))?;
-        if !entry.path().extension().is_some_and(|ext| ext == "json")
-            || !entry.file_type().is_file()
-        {
-            continue;
+    let manifests = [
+        (Ecosystem::Npm, root.join("samples/npm/manifest.json")),
+        (Ecosystem::PyPI, root.join("samples/pypi/manifest.json")),
+    ];
+    let mut by_key: BTreeMap<PackageKey, PackageEntry> = BTreeMap::new();
+    for (ecosystem, path) in &manifests {
+        let bytes = std::fs::read(path).map_err(|error| {
+            format!(
+                "cannot read exact Datadog manifest {}: {error}",
+                path.display()
+            )
+        })?;
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let object = <StrictJsonObject as serde::Deserialize>::deserialize(&mut deserializer)
+            .and_then(|object| {
+                deserializer.end()?;
+                Ok(object.0)
+            })
+            .map_err(|error| format!("invalid Datadog manifest {}: {error}", path.display()))?;
+        if object.is_empty() {
+            return Err(format!("Datadog manifest {} is empty", path.display()));
         }
-        let path = entry.path();
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let value: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("cannot parse {} as JSON: {e}", path.display()))?;
-
-        files_read += 1;
-
-        // Classify the schema before deserializing. The structs intentionally
-        // default fields for forward compatibility, so blindly trying them in
-        // sequence would accept an unrelated JSON object as an empty record.
-        if let Some(values) = value.as_array() {
-            if values.is_empty() {
+        let mut raw_names = object.keys().collect::<Vec<_>>();
+        raw_names.sort();
+        for raw_name in raw_names {
+            if raw_name.trim().is_empty() || raw_name.len() > MAX_OSV_VALUE_BYTES {
                 return Err(format!(
-                    "{} contains an empty Datadog array",
+                    "{} contains an invalid package key",
                     path.display()
                 ));
             }
-            let all_datadog = values.iter().all(|entry| {
-                entry.as_object().is_some_and(|object| {
-                    object.contains_key("ecosystem") && object.contains_key("name")
-                })
-            });
-            let all_osv = values.iter().all(|entry| {
-                entry
-                    .as_object()
-                    .is_some_and(|object| object.contains_key("affected"))
-            });
-            if all_osv {
-                let records: Vec<OsvEntry> = serde_json::from_value(value)
-                    .map_err(|e| format!("invalid OSV array {}: {e}", path.display()))?;
-                for record in records {
-                    extend_datadog_osv(&mut entries, record, path)?;
-                }
-            } else if all_datadog {
-                let records: Vec<DatadogEntry> = serde_json::from_value(value)
-                    .map_err(|e| format!("invalid Datadog array {}: {e}", path.display()))?;
-                for record in records {
-                    if let Some(package) = datadog_package(record, path)? {
-                        entries.push(package);
+            let canonical = canonical_package_name(*ecosystem, raw_name);
+            if canonical.is_empty() {
+                return Err(format!(
+                    "{} contains an empty canonical package key",
+                    path.display()
+                ));
+            }
+            let (mut versions, all_versions_malicious) = match &object[raw_name] {
+                serde_json::Value::Null => (Vec::new(), true),
+                serde_json::Value::Array(values) if !values.is_empty() => {
+                    let mut versions = Vec::with_capacity(values.len());
+                    for value in values {
+                        let version = value.as_str().ok_or_else(|| {
+                            format!("{} has a non-string version for {raw_name}", path.display())
+                        })?;
+                        validate_osv_value(version, "Datadog version")?;
+                        versions.push(version.to_string());
                     }
+                    versions.sort();
+                    versions.dedup();
+                    (versions, false)
+                }
+                serde_json::Value::Array(_) => {
+                    return Err(format!(
+                        "{} has an empty version array for {raw_name}",
+                        path.display()
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "{} has an undocumented value shape for {raw_name}",
+                        path.display()
+                    ))
+                }
+            };
+            versions.sort();
+            let key = PackageKey {
+                ecosystem: *ecosystem,
+                name: canonical.clone(),
+            };
+            let package = PackageEntry {
+                ecosystem: *ecosystem,
+                name: canonical,
+                affected_versions: versions,
+                all_versions_malicious,
+                source: ThreatSource::DatadogMalicious,
+                confidence: Confidence::Confirmed,
+                reference: Some(
+                    "https://github.com/DataDog/malicious-software-packages-dataset".to_string(),
+                ),
+            };
+            if let Some(existing) = by_key.get(&key) {
+                if existing.all_versions_malicious != package.all_versions_malicious
+                    || existing.affected_versions != package.affected_versions
+                {
+                    return Err(format!(
+                        "{} has conflicting entries for canonical package {}",
+                        path.display(),
+                        key.name
+                    ));
                 }
             } else {
-                return Err(format!(
-                    "{} contains a mixed or unrecognized record array",
-                    path.display()
-                ));
+                by_key.insert(key, package);
             }
-            continue;
         }
-
-        let object = value
-            .as_object()
-            .ok_or_else(|| format!("{} is neither a JSON object nor array", path.display()))?;
-        let is_datadog_record = object.contains_key("ecosystem") && object.contains_key("name");
-        let is_osv_record = object.contains_key("affected");
-        if is_osv_record {
-            let osv: OsvEntry = serde_json::from_value(value)
-                .map_err(|e| format!("invalid OSV record {}: {e}", path.display()))?;
-            extend_datadog_osv(&mut entries, osv, path)?;
-            continue;
-        }
-
-        if is_datadog_record {
-            let dd: DatadogEntry = serde_json::from_value(value)
-                .map_err(|e| format!("invalid Datadog record {}: {e}", path.display()))?;
-            if let Some(package) = datadog_package(dd, path)? {
-                entries.push(package);
-            }
-            continue;
-        }
-
-        // Repository metadata (for example editor/package configuration) is
-        // outside the feed schema and may coexist in the clone. It is ignored
-        // only when it has none of the feed discriminator keys above; a record
-        // that claims either supported schema is validated strictly.
     }
-
-    if files_read == 0 {
-        return Err(format!("root {} contains no JSON files", root.display()));
-    }
-    if entries.is_empty() {
+    if by_key.is_empty() {
         return Err(format!(
-            "root {} produced no package records",
+            "root {} produced no Datadog records",
             root.display()
         ));
     }
-
-    Ok((entries, skipped, files_read))
+    Ok((by_key.into_values().collect(), 0, manifests.len()))
 }
 
 fn parse_feodo(path: &Path) -> FeedResult<Vec<Ipv4Addr>> {
@@ -1170,8 +2243,17 @@ fn parse_digitalside_file(path: &Path) -> FeedResult<(Vec<String>, Vec<Ipv4Addr>
     Ok((entries.hostnames, entries.ips))
 }
 
-fn parse_typosquats_csv(path: &Path) -> FeedResult<Vec<TyposquatEntry>> {
-    let mut entries = Vec::new();
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TyposquatStats {
+    accepted: usize,
+    rejected_unsupported_ecosystem: usize,
+    rejected_pseudo_package: usize,
+    deduplicated: usize,
+}
+
+fn parse_typosquats_csv(path: &Path) -> FeedResult<(Vec<TyposquatEntry>, TyposquatStats)> {
+    let mut by_key: BTreeMap<(Ecosystem, String), TyposquatEntry> = BTreeMap::new();
+    let mut stats = TyposquatStats::default();
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
@@ -1181,57 +2263,100 @@ fn parse_typosquats_csv(path: &Path) -> FeedResult<Vec<TyposquatEntry>> {
     let headers = reader
         .headers()
         .map_err(|e| format!("cannot read CSV headers: {e}"))?;
-    if headers.get(0) != Some("ecosystem")
-        || headers.get(1) != Some("name")
-        || headers.get(2) != Some("target_name")
+    let expected = [
+        "malicious_package",
+        "target_package",
+        "ecosystem",
+        "registry",
+        "classification",
+        "source",
+    ];
+    if headers.len() != expected.len()
+        || !headers
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual == expected)
     {
-        return Err("expected CSV headers ecosystem,name,target_name".to_string());
+        return Err(format!(
+            "expected typosquat CSV headers {}",
+            expected.join(",")
+        ));
     }
 
     for (record_index, result) in reader.records().enumerate() {
         let record = result.map_err(|e| format!("invalid CSV record {}: {e}", record_index + 2))?;
 
-        // Columns: ecosystem, name, target_name
-        if record.len() < 3 {
+        if record.len() != expected.len() {
             return Err(format!(
-                "CSV record {} has fewer than 3 fields",
+                "CSV record {} has {} fields; expected {}",
+                record_index + 2,
+                record.len(),
+                expected.len()
+            ));
+        }
+
+        let name = record.get(0).unwrap_or("").trim();
+        let target = record.get(1).unwrap_or("").trim();
+        let ecosystem_str = record.get(2).unwrap_or("").trim();
+        let registry = record.get(3).unwrap_or("").trim();
+        let classification = record.get(4).unwrap_or("").trim();
+        let source = record.get(5).unwrap_or("").trim();
+
+        if name.is_empty()
+            || target.is_empty()
+            || registry.is_empty()
+            || classification.is_empty()
+            || source.is_empty()
+        {
+            return Err(format!(
+                "CSV record {} has an empty required field",
                 record_index + 2
             ));
         }
 
-        let ecosystem_str = record.get(0).unwrap_or("").trim();
-        let name = record.get(1).unwrap_or("").trim();
-        let target = record.get(2).unwrap_or("").trim();
-
-        if name.is_empty() || target.is_empty() {
-            return Err(format!(
-                "CSV record {} has an empty package name",
-                record_index + 2
-            ));
+        let Some(eco) = Ecosystem::from_name(ecosystem_str) else {
+            stats.rejected_unsupported_ecosystem += 1;
+            continue;
+        };
+        let name = canonical_package_name(eco, name);
+        let target_name = canonical_package_name(eco, target);
+        if name == target_name {
+            stats.rejected_pseudo_package += 1;
+            continue;
         }
-
-        let eco = Ecosystem::from_name(ecosystem_str).ok_or_else(|| {
-            format!(
-                "CSV record {} has unsupported ecosystem {ecosystem_str:?}",
-                record_index + 2
-            )
-        })?;
-        entries.push(TyposquatEntry {
+        let entry = TyposquatEntry {
             ecosystem: eco,
-            name: normalize_name(eco, name),
-            target_name: normalize_name(eco, target),
-        });
+            name: name.clone(),
+            target_name,
+        };
+        let key = (eco, name);
+        if let Some(existing) = by_key.get(&key) {
+            if existing.target_name != entry.target_name {
+                return Err(format!(
+                    "CSV record {} conflicts on target for {}:{}",
+                    record_index + 2,
+                    eco,
+                    key.1
+                ));
+            }
+            stats.deduplicated += 1;
+        } else {
+            by_key.insert(key, entry);
+        }
     }
 
-    if entries.is_empty() {
+    if by_key.is_empty() {
         return Err("typosquat CSV contains no records".to_string());
     }
-    Ok(entries)
+    let entries = by_key.into_values().collect::<Vec<_>>();
+    stats.accepted = entries.len();
+    Ok((entries, stats))
 }
 
 /// Default popular packages CSV, embedded from the crate's own assets so
 /// `cargo publish` can verify the tarball in isolation.
 const DEFAULT_POPULAR_CSV: &str = include_str!("../../assets/data/popular_packages.csv");
+const WEB3_PACKAGE_ANCHORS_CSV: &str = include_str!("../../assets/data/web3_package_anchors.csv");
 
 fn parse_popular_csv(path: Option<&Path>) -> FeedResult<Vec<PopularEntry>> {
     let content = match path {
@@ -1240,7 +2365,15 @@ fn parse_popular_csv(path: Option<&Path>) -> FeedResult<Vec<PopularEntry>> {
         None => DEFAULT_POPULAR_CSV.to_string(),
     };
 
-    parse_popular_from_string(&content)
+    let mut entries = parse_popular_from_string(&content)?;
+    entries.extend(parse_popular_from_string(WEB3_PACKAGE_ANCHORS_CSV)?);
+    entries.sort_by(|left, right| {
+        left.ecosystem
+            .cmp(&right.ecosystem)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    entries.dedup_by(|left, right| left.ecosystem == right.ecosystem && left.name == right.name);
+    Ok(entries)
 }
 
 fn parse_popular_from_string(csv_content: &str) -> FeedResult<Vec<PopularEntry>> {
@@ -1654,11 +2787,49 @@ struct GenerationPayload {
     sequence: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct SourceIntegrityDigests {
+    compiler_metadata_sha256: String,
+    registry_snapshot_sha256: String,
+    source_transaction_sha256: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SourceIntegrityPayload {
+    compiler_metadata_sha256: String,
+    manifest_version: u64,
+    registry_snapshot_sha256: String,
+    sequence: u64,
+    source_transaction_sha256: String,
+    v1_filename: String,
+    v1_sha256: String,
+    v2_filename: String,
+    v2_sha256: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CompilerParserCounts {
+    accepted: usize,
+    rejected: usize,
+    details: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CompilerParseMetadata {
+    schema_version: u32,
+    compiler_version: String,
+    parsed_at: String,
+    source_transaction_sha256: Option<String>,
+    registry_snapshot_sha256: Option<String>,
+    sources: BTreeMap<String, CompilerParserCounts>,
+}
+
 /// First generation-index schema whose version is part of the signed payload.
 /// Schema v1 placed `manifest_version` outside the signature; publishing v2
 /// gives old clients an unambiguous reason to use the legacy v1 channel while
 /// new clients authenticate the schema before acting on it.
 const GENERATION_MANIFEST_VERSION: u64 = 2;
+const SOURCE_INTEGRITY_MANIFEST_VERSION: u64 = 1;
 
 fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
@@ -1768,6 +2939,99 @@ fn build_generation_manifest(
     bytes.push(b'\n');
     verify_generation_manifest(&bytes, &canonical, signing_key)?;
     Ok(bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_source_integrity_manifest(
+    sequence: u64,
+    v1_path: &Path,
+    v1_data: &[u8],
+    v2_path: &Path,
+    v2_data: &[u8],
+    digests: &SourceIntegrityDigests,
+    signing_key: &SigningKey,
+) -> FeedResult<Vec<u8>> {
+    for (label, digest) in [
+        (
+            "source transaction",
+            digests.source_transaction_sha256.as_str(),
+        ),
+        (
+            "registry snapshot",
+            digests.registry_snapshot_sha256.as_str(),
+        ),
+        (
+            "compiler metadata",
+            digests.compiler_metadata_sha256.as_str(),
+        ),
+    ] {
+        validate_lower_hex(digest, 32, &format!("source-integrity {label} SHA-256"))?;
+    }
+    let payload = SourceIntegrityPayload {
+        compiler_metadata_sha256: digests.compiler_metadata_sha256.clone(),
+        manifest_version: SOURCE_INTEGRITY_MANIFEST_VERSION,
+        registry_snapshot_sha256: digests.registry_snapshot_sha256.clone(),
+        sequence,
+        source_transaction_sha256: digests.source_transaction_sha256.clone(),
+        v1_filename: immutable_asset_filename(v1_path)?,
+        v1_sha256: sha256_hex(v1_data),
+        v2_filename: immutable_asset_filename(v2_path)?,
+        v2_sha256: sha256_hex(v2_data),
+    };
+    let canonical = serde_json::to_string(&payload)
+        .map_err(|error| format!("cannot serialize source-integrity payload: {error}"))?;
+    let signature = sign_payload(&canonical, signing_key);
+    let mut document = serde_json::to_value(payload)
+        .map_err(|error| format!("cannot serialize source-integrity manifest: {error}"))?;
+    document
+        .as_object_mut()
+        .ok_or_else(|| "source-integrity payload did not serialize as an object".to_string())?
+        .insert("signature".to_string(), serde_json::json!(signature));
+    let mut bytes = serde_json::to_vec(&document)
+        .map_err(|error| format!("cannot encode source-integrity manifest: {error}"))?;
+    bytes.push(b'\n');
+    verify_source_integrity_manifest(&bytes, &canonical, signing_key)?;
+    Ok(bytes)
+}
+
+fn verify_source_integrity_manifest(
+    bytes: &[u8],
+    expected_payload: &str,
+    signing_key: &SigningKey,
+) -> FeedResult<()> {
+    let mut document: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("cannot parse source-integrity manifest: {error}"))?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "source-integrity manifest is not an object".to_string())?;
+    let manifest_version = object
+        .get("manifest_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "source-integrity manifest has no integer manifest_version".to_string())?;
+    let signature_b64 = object
+        .remove("signature")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .ok_or_else(|| "source-integrity manifest has no signature".to_string())?;
+    let canonical = serde_json::to_string(&document)
+        .map_err(|error| format!("cannot reconstruct source-integrity payload: {error}"))?;
+    if canonical != expected_payload {
+        return Err("source-integrity signed region changed during staging".to_string());
+    }
+    let signature_bytes = BASE64
+        .decode(signature_b64)
+        .map_err(|error| format!("invalid source-integrity signature base64: {error}"))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|error| format!("invalid source-integrity signature encoding: {error}"))?;
+    signing_key
+        .verifying_key()
+        .verify(canonical.as_bytes(), &signature)
+        .map_err(|_| "source-integrity manifest signature does not verify".to_string())?;
+    if manifest_version != SOURCE_INTEGRITY_MANIFEST_VERSION {
+        return Err(format!(
+            "source-integrity manifest version {manifest_version} is unsupported"
+        ));
+    }
+    Ok(())
 }
 
 fn verify_generation_manifest(
@@ -2147,6 +3411,76 @@ fn stage_generation_manifest(
     Ok(staged)
 }
 
+fn stage_source_integrity_manifest(
+    output: &Path,
+    data: &[u8],
+    signing_key: &SigningKey,
+) -> FeedResult<tempfile::NamedTempFile> {
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("cannot create source-integrity staging file: {error}"))?;
+    staged
+        .write_all(data)
+        .and_then(|_| staged.as_file_mut().flush())
+        .and_then(|_| staged.as_file().sync_all())
+        .map_err(|error| format!("cannot durably stage source-integrity manifest: {error}"))?;
+    let reopened = std::fs::read(staged.path())
+        .map_err(|error| format!("cannot reopen staged source-integrity manifest: {error}"))?;
+    if reopened != data {
+        return Err("source-integrity manifest bytes differ after reopen".to_string());
+    }
+    let mut document: serde_json::Value = serde_json::from_slice(&reopened)
+        .map_err(|error| format!("cannot parse staged source-integrity manifest: {error}"))?;
+    document
+        .as_object_mut()
+        .ok_or_else(|| "source-integrity manifest is not an object".to_string())?
+        .remove("signature");
+    let canonical = serde_json::to_string(&document)
+        .map_err(|error| format!("cannot reconstruct staged source-integrity payload: {error}"))?;
+    verify_source_integrity_manifest(&reopened, &canonical, signing_key)?;
+    Ok(staged)
+}
+
+fn stage_compiler_metadata(output: &Path, data: &[u8]) -> FeedResult<tempfile::NamedTempFile> {
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("cannot create compiler metadata staging file: {error}"))?;
+    staged
+        .write_all(data)
+        .and_then(|_| staged.as_file_mut().flush())
+        .and_then(|_| staged.as_file().sync_all())
+        .map_err(|error| format!("cannot durably stage compiler metadata: {error}"))?;
+    let reopened = std::fs::read(staged.path())
+        .map_err(|error| format!("cannot reopen staged compiler metadata: {error}"))?;
+    if reopened != data {
+        return Err("compiler metadata bytes differ after reopen".to_string());
+    }
+    let document: serde_json::Value = serde_json::from_slice(&reopened)
+        .map_err(|error| format!("cannot parse staged compiler metadata: {error}"))?;
+    if document
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || document
+            .get("compiler_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(env!("CARGO_PKG_VERSION"))
+        || document
+            .get("sources")
+            .and_then(serde_json::Value::as_object)
+            .is_none()
+    {
+        return Err("compiler metadata schema/version/counts are incomplete".to_string());
+    }
+    Ok(staged)
+}
+
 fn publish_staged(staged: tempfile::NamedTempFile, output: &Path) -> FeedResult<()> {
     let published = staged.persist(output).map_err(|e| {
         format!(
@@ -2197,11 +3531,17 @@ fn publish_staged_immutable(staged: tempfile::NamedTempFile, output: &Path) -> F
     Ok(())
 }
 
+struct StagedAuxiliaryArtifacts<'a> {
+    compiler_metadata: Option<(tempfile::NamedTempFile, &'a Path)>,
+    source_integrity: Option<(tempfile::NamedTempFile, &'a Path)>,
+}
+
 fn publish_compiled_generation<F, G>(
     staged_v1: tempfile::NamedTempFile,
     v1_path: &Path,
     staged_v2: Option<(tempfile::NamedTempFile, &Path)>,
     staged_manifest: Option<(tempfile::NamedTempFile, &Path)>,
+    staged_auxiliary: StagedAuxiliaryArtifacts<'_>,
     mut publish_asset: F,
     mut publish_pointer: G,
 ) -> FeedResult<()>
@@ -2231,6 +3571,12 @@ where
         }
         publish_asset(staged_v1, v1_path)?;
         publish_asset(v2, v2_path)?;
+        if let Some((metadata, metadata_path)) = staged_auxiliary.compiler_metadata {
+            publish_asset(metadata, metadata_path)?;
+        }
+        if let Some((integrity, integrity_path)) = staged_auxiliary.source_integrity {
+            publish_asset(integrity, integrity_path)?;
+        }
         // The one shared pointer is the commit point and is always last.
         publish_pointer(manifest, manifest_path)?;
         return Ok(());
@@ -2241,7 +3587,168 @@ where
     if let Some((v2, v2_path)) = staged_v2 {
         publish_staged(v2, v2_path)?;
     }
-    publish_staged(staged_v1, v1_path)
+    publish_staged(staged_v1, v1_path)?;
+    if let Some((metadata, metadata_path)) = staged_auxiliary.compiler_metadata {
+        publish_asset(metadata, metadata_path)?;
+    }
+    if let Some((integrity, integrity_path)) = staged_auxiliary.source_integrity {
+        publish_asset(integrity, integrity_path)?;
+    }
+    Ok(())
+}
+
+fn registry_metadata_url(key: &RegistryPackageKey) -> FeedResult<url::Url> {
+    let base = match key.ecosystem {
+        Ecosystem::Npm => "https://registry.npmjs.org/",
+        Ecosystem::PyPI => "https://pypi.org/pypi/",
+        ecosystem => {
+            return Err(format!(
+                "bounded registry snapshots are unsupported for {ecosystem}:{}",
+                key.name
+            ))
+        }
+    };
+    let mut url = url::Url::parse(base).map_err(|error| error.to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "registry metadata base URL cannot accept path segments".to_string())?
+        .push(&key.name);
+    if key.ecosystem == Ecosystem::PyPI {
+        url.path_segments_mut()
+            .map_err(|_| "PyPI metadata URL cannot accept path segments".to_string())?
+            .push("json");
+    }
+    Ok(url)
+}
+
+fn extract_registry_versions(key: &RegistryPackageKey, bytes: &[u8]) -> FeedResult<Vec<String>> {
+    let document: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid registry response for {}: {error}", key.name))?;
+    let field = match key.ecosystem {
+        Ecosystem::Npm => "versions",
+        Ecosystem::PyPI => "releases",
+        _ => return Err(format!("unsupported registry ecosystem {}", key.ecosystem)),
+    };
+    let versions = document
+        .get(field)
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("registry response for {} has no {field} object", key.name))?;
+    if versions.is_empty() || versions.len() > MAX_REGISTRY_VERSIONS_PER_PACKAGE {
+        return Err(format!(
+            "registry response for {} contains {} versions, outside 1..={} cap",
+            key.name,
+            versions.len(),
+            MAX_REGISTRY_VERSIONS_PER_PACKAGE
+        ));
+    }
+    let mut output = versions.keys().cloned().collect::<Vec<_>>();
+    for version in &output {
+        validate_osv_value(version, "registry version")?;
+    }
+    output.sort();
+    output.dedup();
+    Ok(output)
+}
+
+fn fetch_registry_snapshots(root: &Path, ossf_commit: &str, output: &Path) -> FeedResult<()> {
+    if ossf_commit.len() != 40
+        || !ossf_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("--ossf-commit must be an exact lowercase 40-hex revision".to_string());
+    }
+    let (_, pending, _, _) = collect_ossf(root)?;
+    let requests: BTreeSet<RegistryPackageKey> =
+        pending.into_iter().map(|claim| claim.key).collect();
+    if requests.len() > MAX_BOUNDED_PACKAGE_REQUESTS {
+        return Err(format!(
+            "{} bounded package requests exceed cap {}",
+            requests.len(),
+            MAX_BOUNDED_PACKAGE_REQUESTS
+        ));
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(concat!(
+            "tirith-threatdb-compile/",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .build()
+        .map_err(|error| format!("cannot build bounded registry client: {error}"))?;
+    let mut aggregate_bytes = 0usize;
+    let mut packages = Vec::with_capacity(requests.len());
+    for key in requests {
+        let url = registry_metadata_url(&key)?;
+        let response = client.get(url.clone()).send().map_err(|error| {
+            format!("registry snapshot request for {} failed: {error}", key.name)
+        })?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "registry snapshot request for {} returned {}",
+                key.name,
+                response.status()
+            ));
+        }
+        if response.url() != &url {
+            return Err(format!("registry request for {} redirected", key.name));
+        }
+        let mut bytes = Vec::new();
+        response
+            .take((MAX_REGISTRY_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("cannot read registry response for {}: {error}", key.name))?;
+        if bytes.len() > MAX_REGISTRY_RESPONSE_BYTES {
+            return Err(format!(
+                "registry response for {} exceeds byte cap",
+                key.name
+            ));
+        }
+        aggregate_bytes = aggregate_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| "registry aggregate byte count overflow".to_string())?;
+        if aggregate_bytes > MAX_REGISTRY_AGGREGATE_BYTES {
+            return Err("registry responses exceed aggregate byte cap".to_string());
+        }
+        let versions = extract_registry_versions(&key, &bytes)?;
+        packages.push(RegistrySnapshotPackage {
+            ecosystem: key.ecosystem.to_string(),
+            name: key.name,
+            source_url: url.to_string(),
+            response_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            response_bytes: bytes.len(),
+            versions,
+        });
+    }
+    let document = RegistrySnapshotDocument {
+        schema_version: 1,
+        ossf_commit: ossf_commit.to_string(),
+        retrieved_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        packages,
+    };
+    let bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|error| format!("cannot serialize registry snapshot: {error}"))?;
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("cannot stage registry snapshot: {error}"))?;
+    staged
+        .write_all(&bytes)
+        .and_then(|_| staged.as_file_mut().flush())
+        .and_then(|_| staged.as_file().sync_all())
+        .map_err(|error| format!("cannot durably stage registry snapshot: {error}"))?;
+    staged.persist_noclobber(output).map_err(|error| {
+        format!(
+            "cannot publish registry snapshot {}: {}",
+            output.display(),
+            error.error
+        )
+    })?;
+    Ok(())
 }
 
 fn main() {
@@ -2256,12 +3763,84 @@ fn main() {
         println!("{}", sign_payload(payload, &key));
         return;
     }
+    if let Some(Commands::FetchRegistrySnapshots {
+        ossf,
+        ossf_commit,
+        output,
+    }) = &cli.command
+    {
+        fetch_registry_snapshots(ossf, ossf_commit, output).unwrap_or_else(|error| {
+            eprintln!("error: cannot fetch registry snapshots: {error}");
+            std::process::exit(1);
+        });
+        eprintln!("registry snapshots written to {}", output.display());
+        return;
+    }
 
     eprintln!("tirith-threatdb-compile: starting compilation");
 
     let mut all_packages = Vec::new();
     let mut total_files_scanned = 0usize;
     let mut total_files_skipped = 0usize;
+
+    if cli.registry_snapshots.is_some() != cli.source_provenance.is_some() {
+        eprintln!("error: --registry-snapshots and --source-provenance must be supplied together");
+        std::process::exit(1);
+    }
+    let web3_anchor_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/data/web3_package_anchors.csv");
+    let source_inputs = if cli.source_provenance.is_some() {
+        match (
+            cli.ossf.as_deref(),
+            cli.datadog.as_deref(),
+            cli.typosquats.as_deref(),
+            cli.feodo.as_deref(),
+            cli.cisa_kev.as_deref(),
+        ) {
+            (Some(ossf), Some(datadog), Some(typosquats), Some(feodo), Some(cisa_kev)) => {
+                Some(SourceInputPaths {
+                    ossf,
+                    datadog,
+                    typosquats,
+                    feodo,
+                    cisa_kev,
+                    web3_anchors: &web3_anchor_path,
+                })
+            }
+            _ => {
+                eprintln!(
+                    "error: source provenance requires the exact OpenSSF, Datadog, typosquat, Feodo, CISA, and Web3-anchor inputs"
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let source_binding = cli
+        .source_provenance
+        .as_deref()
+        .zip(cli.registry_snapshots.as_deref())
+        .map(|(provenance, snapshot)| {
+            let inputs = source_inputs
+                .as_ref()
+                .expect("source input paths validated above");
+            feed_error(
+                "source provenance",
+                provenance,
+                SourceTransactionBinding::load(provenance, snapshot, inputs),
+            )
+        });
+    let mut registry_snapshots = cli.registry_snapshots.as_deref().map(|path| {
+        let binding = source_binding
+            .as_ref()
+            .expect("paired source provenance validated above");
+        feed_error(
+            "registry snapshots",
+            path,
+            RegistrySnapshotStore::load(path, binding),
+        )
+    });
 
     // 1. OSSF malicious-packages
     let ossf_stats;
@@ -2273,7 +3852,21 @@ fn main() {
             "  parsing OSSF malicious-packages from {}",
             ossf_dir.display()
         );
-        let (ossf_packages, stats, indicators) = feed_error("OSSF", ossf_dir, parse_ossf(ossf_dir));
+        let provider = registry_snapshots
+            .as_mut()
+            .map(|store| store as &mut dyn RegistryVersionProvider);
+        let (ossf_packages, stats, indicators) = feed_error(
+            "OSSF",
+            ossf_dir,
+            parse_ossf_with_provider(ossf_dir, provider),
+        );
+        if let Some(store) = registry_snapshots.as_ref() {
+            feed_error(
+                "registry snapshots",
+                ossf_dir,
+                store.ensure_fully_consumed(),
+            );
+        }
         let unique_packages = unique_package_count(&ossf_packages);
         feed_error(
             "OSSF",
@@ -2281,14 +3874,18 @@ fn main() {
             require_minimum("OSSF", unique_packages, MIN_OSSF_PACKAGES),
         );
         eprintln!(
-            "    {} entries scanned, {} unique packages ({} parsed claims), {} skipped (range-only), {} unknown ecosystem, {} unreadable, {} corrupt",
+            "    {} entries scanned, {} unique packages ({} parsed claims), {} whole-package claims, {} bounded intervals, {} exact versions, {} withdrawn, {} non-malicious, {} unknown ecosystem, {} unsupported shapes, {} snapshot failures",
             stats.total_entries,
             unique_packages,
             stats.parsed_packages,
-            stats.skipped_range_only_count,
+            stats.direct_whole_package_claims,
+            stats.bounded_intervals_materialized,
+            stats.exact_versions_emitted,
+            stats.skipped_withdrawn,
+            stats.skipped_non_malicious,
             stats.skipped_unknown_ecosystem,
-            stats.skipped_unreadable,
-            stats.skipped_corrupt,
+            stats.unsupported_confirmed_shapes,
+            stats.snapshot_failures,
         );
         eprintln!(
             "    {} indicators parsed across {} records ({} domains, {} IPv4 candidates, {} artifact sha256, {} urls; network IOCs persist in v1/v2, hashes and URLs in v2)",
@@ -2306,19 +3903,13 @@ fn main() {
         ossf_indicators = indicators;
         all_packages.extend(ossf_packages);
     } else {
-        ossf_stats = OssfStats {
-            total_entries: 0,
-            parsed_packages: 0,
-            skipped_range_only_count: 0,
-            skipped_unknown_ecosystem: 0,
-            skipped_unreadable: 0,
-            skipped_corrupt: 0,
-            records_with_indicators: 0,
-            total_indicators: 0,
-        };
+        ossf_stats = OssfStats::default();
     }
 
     // 2. Datadog
+    let mut datadog_unique_packages = 0usize;
+    let mut datadog_files_read = 0usize;
+    let mut datadog_rejected_files = 0usize;
     if let Some(ref dd_dir) = cli.datadog {
         eprintln!(
             "  parsing Datadog malicious-packages from {}",
@@ -2327,6 +3918,9 @@ fn main() {
         let (dd_packages, dd_skipped, dd_files_read) =
             feed_error("Datadog", dd_dir, parse_datadog(dd_dir));
         let unique_packages = unique_package_count(&dd_packages);
+        datadog_unique_packages = unique_packages;
+        datadog_files_read = dd_files_read;
+        datadog_rejected_files = dd_skipped;
         feed_error(
             "Datadog",
             dd_dir,
@@ -2394,10 +3988,23 @@ fn main() {
     };
 
     // 6. Typosquats
+    let mut typosquat_parse_stats = TyposquatStats::default();
     let typosquats = if let Some(ref typo_path) = cli.typosquats {
         eprintln!("  parsing typosquats from {}", typo_path.display());
-        let entries = feed_error("typosquats", typo_path, parse_typosquats_csv(typo_path));
-        eprintln!("    {} typosquat entries", entries.len());
+        let (entries, stats) = feed_error("typosquats", typo_path, parse_typosquats_csv(typo_path));
+        feed_error(
+            "typosquats",
+            typo_path,
+            require_minimum("typosquats", entries.len(), MIN_TYPOSQUAT_RECORDS),
+        );
+        eprintln!(
+            "    {} accepted, {} unsupported ecosystems, {} pseudo-packages, {} duplicates",
+            stats.accepted,
+            stats.rejected_unsupported_ecosystem,
+            stats.rejected_pseudo_package,
+            stats.deduplicated
+        );
+        typosquat_parse_stats = stats;
         entries
     } else {
         Vec::new()
@@ -2500,6 +4107,21 @@ fn main() {
         CuratedFileHashes::default()
     };
 
+    // All source-derived records are now in memory. Recompute the complete
+    // source transaction once more so a mutation racing the initial validation
+    // cannot influence parsed records and then escape the signed metadata.
+    if let (Some(binding), Some(inputs), Some(provenance)) = (
+        source_binding.as_ref(),
+        source_inputs.as_ref(),
+        cli.source_provenance.as_deref(),
+    ) {
+        feed_error(
+            "source provenance",
+            provenance,
+            binding.verify_inputs_unchanged(provenance, inputs),
+        );
+    }
+
     // Canonicalize network indicators once, before either writer or expectation
     // accounting. When feeds overlap, the numerically lowest stable source id is
     // the deterministic owner. Primary input floors are checked before this
@@ -2601,6 +4223,56 @@ fn main() {
             "warning: dual direct-path outputs requested without --generation-manifest; compatibility mode does not provide pair-atomic visibility"
         );
     }
+    if let Some(compiler_metadata) = cli.compiler_metadata.as_ref() {
+        if compiler_metadata == &cli.output
+            || cli
+                .output_v2
+                .as_ref()
+                .is_some_and(|output| output == compiler_metadata)
+            || cli
+                .generation_manifest
+                .as_ref()
+                .is_some_and(|output| output == compiler_metadata)
+            || cli
+                .source_provenance
+                .as_ref()
+                .is_some_and(|input| input == compiler_metadata)
+        {
+            eprintln!("error: --compiler-metadata must be distinct from inputs and DB outputs");
+            std::process::exit(1);
+        }
+    }
+    if let Some(source_integrity) = cli.source_integrity_manifest.as_ref() {
+        if source_integrity == &cli.output
+            || cli
+                .output_v2
+                .as_ref()
+                .is_some_and(|output| output == source_integrity)
+            || cli
+                .generation_manifest
+                .as_ref()
+                .is_some_and(|output| output == source_integrity)
+            || cli
+                .compiler_metadata
+                .as_ref()
+                .is_some_and(|output| output == source_integrity)
+        {
+            eprintln!(
+                "error: --source-integrity-manifest must be distinct from DB and metadata outputs"
+            );
+            std::process::exit(1);
+        }
+    }
+    if cli.generation_manifest.is_some()
+        && (source_binding.is_none()
+            || cli.compiler_metadata.is_none()
+            || cli.source_integrity_manifest.is_none())
+    {
+        eprintln!(
+            "error: a signed generation requires source provenance, compiler metadata, and a signed source-integrity sidecar"
+        );
+        std::process::exit(1);
+    }
 
     let timestamp = chrono::Utc::now().timestamp() as u64;
     let sequence = cli.sequence.unwrap_or(timestamp);
@@ -2615,6 +4287,139 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    let mut parser_sources = BTreeMap::new();
+    let ossf_rejected = ossf_stats.skipped_withdrawn
+        + ossf_stats.skipped_non_malicious
+        + ossf_stats.skipped_unknown_ecosystem
+        + ossf_stats.skipped_unreadable
+        + ossf_stats.skipped_corrupt
+        + ossf_stats.unsupported_confirmed_shapes
+        + ossf_stats.snapshot_failures;
+    parser_sources.insert(
+        "ossf_malicious_packages".to_string(),
+        CompilerParserCounts {
+            accepted: ossf_stats.parsed_packages,
+            rejected: ossf_rejected,
+            details: BTreeMap::from([
+                ("input_records".to_string(), ossf_stats.total_entries),
+                (
+                    "direct_whole_package_claims".to_string(),
+                    ossf_stats.direct_whole_package_claims,
+                ),
+                (
+                    "bounded_intervals_materialized".to_string(),
+                    ossf_stats.bounded_intervals_materialized,
+                ),
+                (
+                    "exact_versions_emitted".to_string(),
+                    ossf_stats.exact_versions_emitted,
+                ),
+                ("withdrawn".to_string(), ossf_stats.skipped_withdrawn),
+                (
+                    "non_malicious".to_string(),
+                    ossf_stats.skipped_non_malicious,
+                ),
+                (
+                    "unsupported_confirmed_shapes".to_string(),
+                    ossf_stats.unsupported_confirmed_shapes,
+                ),
+                (
+                    "snapshot_failures".to_string(),
+                    ossf_stats.snapshot_failures,
+                ),
+            ]),
+        },
+    );
+    parser_sources.insert(
+        "datadog_malicious_software_packages".to_string(),
+        CompilerParserCounts {
+            accepted: datadog_unique_packages,
+            rejected: datadog_rejected_files,
+            details: BTreeMap::from([
+                ("files_read".to_string(), datadog_files_read),
+                ("files_rejected".to_string(), datadog_rejected_files),
+            ]),
+        },
+    );
+    parser_sources.insert(
+        "ecosystems_typosquatting_dataset".to_string(),
+        CompilerParserCounts {
+            accepted: typosquat_parse_stats.accepted,
+            rejected: typosquat_parse_stats.rejected_unsupported_ecosystem
+                + typosquat_parse_stats.rejected_pseudo_package,
+            details: BTreeMap::from([
+                (
+                    "unsupported_ecosystem".to_string(),
+                    typosquat_parse_stats.rejected_unsupported_ecosystem,
+                ),
+                (
+                    "pseudo_package".to_string(),
+                    typosquat_parse_stats.rejected_pseudo_package,
+                ),
+                (
+                    "deduplicated".to_string(),
+                    typosquat_parse_stats.deduplicated,
+                ),
+            ]),
+        },
+    );
+    parser_sources.insert(
+        "feodo_tracker_ipblocklist".to_string(),
+        CompilerParserCounts {
+            accepted: ips.len(),
+            rejected: 0,
+            details: BTreeMap::new(),
+        },
+    );
+    parser_sources.insert(
+        "cisa_known_exploited_vulnerabilities".to_string(),
+        CompilerParserCounts {
+            accepted: kev_count,
+            rejected: 0,
+            details: BTreeMap::new(),
+        },
+    );
+    parser_sources.insert(
+        "popular_package_comparison_index".to_string(),
+        CompilerParserCounts {
+            accepted: popular.len(),
+            rejected: 0,
+            details: BTreeMap::new(),
+        },
+    );
+    let compiler_metadata = CompilerParseMetadata {
+        schema_version: 1,
+        compiler_version: env!("CARGO_PKG_VERSION").to_string(),
+        parsed_at: chrono::DateTime::from_timestamp(timestamp as i64, 0)
+            .expect("current timestamp is representable")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        source_transaction_sha256: source_binding
+            .as_ref()
+            .map(|binding| binding.provenance_sha256.clone()),
+        registry_snapshot_sha256: source_binding
+            .as_ref()
+            .map(|binding| binding.registry_snapshot_sha256.clone()),
+        sources: parser_sources,
+    };
+    let compiler_metadata_data = cli.compiler_metadata.as_ref().map(|_| {
+        let value = serde_json::to_value(&compiler_metadata).unwrap_or_else(|error| {
+            eprintln!("error: cannot serialize compiler parse metadata: {error}");
+            std::process::exit(1);
+        });
+        serde_json::to_vec(&value).unwrap_or_else(|error| {
+            eprintln!("error: cannot encode compiler parse metadata: {error}");
+            std::process::exit(1);
+        })
+    });
+    let source_integrity_digests = source_binding
+        .as_ref()
+        .zip(compiler_metadata_data.as_deref())
+        .map(|(binding, metadata)| SourceIntegrityDigests {
+            source_transaction_sha256: binding.provenance_sha256.clone(),
+            registry_snapshot_sha256: binding.registry_snapshot_sha256.clone(),
+            compiler_metadata_sha256: sha256_hex(metadata),
+        });
 
     let mut common_writer = ThreatDbWriter::new(timestamp, sequence);
 
@@ -2857,12 +4662,63 @@ fn main() {
                 std::process::exit(1);
             })
         });
+    let source_integrity_data = match (
+        cli.source_integrity_manifest.as_ref(),
+        cli.output_v2.as_ref(),
+        v2_data.as_deref(),
+        source_integrity_digests.as_ref(),
+    ) {
+        (Some(_), Some(v2_path), Some(v2_bytes), Some(digests)) => Some(
+            build_source_integrity_manifest(
+                sequence,
+                &cli.output,
+                &data,
+                v2_path,
+                v2_bytes,
+                digests,
+                &signing_key,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("error: cannot build signed source-integrity manifest: {error}");
+                std::process::exit(1);
+            }),
+        ),
+        (None, _, _, _) => None,
+        _ => {
+            eprintln!("error: incomplete source-integrity sidecar arguments");
+            std::process::exit(1);
+        }
+    };
+    let staged_source_integrity = cli
+        .source_integrity_manifest
+        .as_ref()
+        .zip(source_integrity_data.as_deref())
+        .map(|(path, bytes)| {
+            stage_source_integrity_manifest(path, bytes, &signing_key).unwrap_or_else(|error| {
+                eprintln!("error: source-integrity manifest validation failed: {error}");
+                std::process::exit(1);
+            })
+        });
+    let staged_compiler_metadata = cli
+        .compiler_metadata
+        .as_ref()
+        .zip(compiler_metadata_data.as_deref())
+        .map(|(path, bytes)| {
+            stage_compiler_metadata(path, bytes).unwrap_or_else(|error| {
+                eprintln!("error: compiler metadata validation failed: {error}");
+                std::process::exit(1);
+            })
+        });
 
     publish_compiled_generation(
         staged_v1,
         &cli.output,
         staged_v2.zip(cli.output_v2.as_deref()),
         staged_generation.zip(cli.generation_manifest.as_deref()),
+        StagedAuxiliaryArtifacts {
+            compiler_metadata: staged_compiler_metadata.zip(cli.compiler_metadata.as_deref()),
+            source_integrity: staged_source_integrity.zip(cli.source_integrity_manifest.as_deref()),
+        },
         publish_staged_immutable,
         publish_staged,
     )
@@ -2899,8 +4755,8 @@ fn main() {
     eprintln!("  popular packages:      {}", popular.len());
     eprintln!("  CISA KEV CVEs:         {}", kev_count);
     eprintln!(
-        "  skipped (range-only):  {}",
-        ossf_stats.skipped_range_only_count
+        "  OSSF whole/bounded:     {}/{}",
+        ossf_stats.direct_whole_package_claims, ossf_stats.bounded_intervals_materialized
     );
     eprintln!("  skipped (corrupt):     {}", total_files_skipped);
     eprintln!(
@@ -2919,6 +4775,27 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tirith_core::threatdb::BehaviorTag;
+
+    fn write_mal(root: &Path, file: &str, json: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join(file), json).unwrap();
+    }
+
+    #[derive(Default)]
+    struct SpyRegistryVersions {
+        calls: Vec<RegistryPackageKey>,
+        versions: BTreeMap<RegistryPackageKey, Vec<String>>,
+    }
+
+    impl RegistryVersionProvider for SpyRegistryVersions {
+        fn versions_for(&mut self, key: &RegistryPackageKey) -> FeedResult<Vec<String>> {
+            self.calls.push(key.clone());
+            self.versions
+                .get(key)
+                .cloned()
+                .ok_or_else(|| format!("missing spy universe for {}", key.name))
+        }
+    }
 
     #[test]
     fn test_v1_normalize_pypi_preserves_legacy_separator_bytes() {
@@ -3119,6 +4996,24 @@ mod tests {
             "expected at least 50 popular packages, got {}",
             entries.len()
         );
+        for anchor in [
+            "ethers",
+            "web3",
+            "viem",
+            "wagmi",
+            "@solana/kit",
+            "@solana/web3.js",
+            "hardhat",
+            "@openzeppelin/contracts",
+            "@ledgerhq/hw-app-eth",
+        ] {
+            assert!(entries
+                .iter()
+                .any(|entry| { entry.ecosystem == Ecosystem::Npm && entry.name == anchor }));
+        }
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.ecosystem == Ecosystem::Npm && entry.name == "foundry"));
     }
 
     #[test]
@@ -3239,6 +5134,31 @@ mod tests {
     // `malicious-packages-origins`, not `affected[].database_specific`).
     const MAL_2025_6812: &str = include_str!("fixtures/mal-2025-6812.json");
     const MAL_2026_2307: &str = include_str!("fixtures/mal-2026-2307.json");
+    const C01_WHOLE_PACKAGE: &str = include_str!("fixtures/threatdb-c01/MAL-whole-package.json");
+    const C01_SOLANA_BOUNDED: &str =
+        include_str!("fixtures/threatdb-c01/MAL-solana-web3-bounded.json");
+    const C01_REGISTRY_VERSIONS: &str =
+        include_str!("fixtures/threatdb-c01/registry-versions.json");
+
+    fn fixture_snapshot_binding(snapshot_path: &Path) -> SourceTransactionBinding {
+        let bytes = std::fs::read(snapshot_path).unwrap();
+        let document: RegistrySnapshotDocument = serde_json::from_slice(&bytes).unwrap();
+        SourceTransactionBinding {
+            provenance_sha256: "11".repeat(32),
+            registry_snapshot_sha256: sha256_hex(&bytes),
+            ossf_commit: document.ossf_commit,
+            registry_retrieved_at: document.retrieved_at,
+            registry_packages: document.packages.len(),
+        }
+    }
+
+    fn fixture_source_integrity_digests() -> SourceIntegrityDigests {
+        SourceIntegrityDigests {
+            source_transaction_sha256: "11".repeat(32),
+            registry_snapshot_sha256: "22".repeat(32),
+            compiler_metadata_sha256: "33".repeat(32),
+        }
+    }
 
     #[test]
     fn test_parse_real_ossf_record_indicators() {
@@ -3308,6 +5228,635 @@ mod tests {
                 "references must not be indicators"
             );
         }
+    }
+
+    #[test]
+    fn whole_package_range_bypasses_registry_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        write_mal(directory.path(), "MAL-2099-0001.json", C01_WHOLE_PACKAGE);
+        let mut spy = SpyRegistryVersions::default();
+        let (entries, stats, _) =
+            parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+        assert!(spy.calls.is_empty(), "whole-package claims must not fetch");
+        assert_eq!(stats.direct_whole_package_claims, 1);
+        assert_eq!(stats.bounded_intervals_materialized, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].all_versions_malicious);
+    }
+
+    #[test]
+    fn bounded_introduced_zero_closures_materialize_exactly() {
+        for (close_key, close_value, expected) in [
+            ("fixed", "1.2.0", vec!["0.9.0", "1.0.0", "1.1.9"]),
+            ("last_affected", "1.1.9", vec!["0.9.0", "1.0.0", "1.1.9"]),
+            ("limit", "1.2.0", vec!["0.9.0", "1.0.0", "1.1.9"]),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            write_mal(
+                directory.path(),
+                "MAL-2099-0002.json",
+                &format!(
+                    r#"{{
+                        "id":"MAL-2099-0002",
+                        "affected":[{{
+                            "package":{{"ecosystem":"npm","name":"bounded-package"}},
+                            "versions":["2.5.0"],
+                            "ranges":[{{"type":"ECOSYSTEM","events":[
+                                {{"introduced":"0"}},{{"{close_key}":"{close_value}"}}
+                            ]}}]
+                        }}]
+                    }}"#
+                ),
+            );
+            let key = RegistryPackageKey {
+                ecosystem: Ecosystem::Npm,
+                name: "bounded-package".to_string(),
+            };
+            let mut spy = SpyRegistryVersions::default();
+            spy.versions.insert(
+                key.clone(),
+                ["0.9.0", "1.0.0", "1.1.9", "1.2.0", "2.0.0"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            );
+            let (entries, stats, _) =
+                parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+            assert_eq!(spy.calls, vec![key]);
+            assert!(!entries[0].all_versions_malicious);
+            let mut expected = expected.into_iter().map(str::to_string).collect::<Vec<_>>();
+            expected.push("2.5.0".to_string());
+            expected.sort();
+            assert_eq!(entries[0].affected_versions, expected);
+            assert_eq!(stats.bounded_intervals_materialized, 1);
+        }
+    }
+
+    #[test]
+    fn pypi_bounded_ranges_use_core_pep440_precedence() {
+        let cases = [
+            (
+                r#"[{"introduced":"0"},{"fixed":"1.0"}]"#,
+                vec!["0.9", "1.0.dev1", "1.0a1", "1.0rc1"],
+            ),
+            (
+                r#"[{"introduced":"1.0"},{"last_affected":"1.0"}]"#,
+                vec!["1.0", "1.0+vendor.1"],
+            ),
+            (
+                r#"[{"introduced":"1.0.post1.dev1"},{"limit":"1.0.post2"}]"#,
+                vec!["1.0.post1.dev1", "1.0.post1"],
+            ),
+        ];
+        for (events, expected) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            write_mal(
+                directory.path(),
+                "MAL-2099-0010.json",
+                &format!(
+                    r#"{{
+                        "id":"MAL-2099-0010",
+                        "affected":[{{
+                            "package":{{"ecosystem":"PyPI","name":"Pep.Package"}},
+                            "ranges":[{{"type":"ECOSYSTEM","events":{events}}}]
+                        }}]
+                    }}"#
+                ),
+            );
+            let key = RegistryPackageKey {
+                ecosystem: Ecosystem::PyPI,
+                name: "pep-package".to_string(),
+            };
+            let mut spy = SpyRegistryVersions::default();
+            spy.versions.insert(
+                key.clone(),
+                [
+                    "0.9",
+                    "1.0.dev1",
+                    "1.0a1",
+                    "1.0rc1",
+                    "1.0",
+                    "1.0+vendor.1",
+                    "1.0.post1.dev1",
+                    "1.0.post1",
+                    "1.0.post2",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            );
+            let (entries, _, _) =
+                parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+            assert_eq!(spy.calls, vec![key]);
+            let mut expected = expected.into_iter().map(str::to_string).collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(entries[0].affected_versions, expected);
+        }
+    }
+
+    #[test]
+    fn bounded_multiple_intervals_prereleases_and_unique_request_set() {
+        let directory = tempfile::tempdir().unwrap();
+        for (file, id) in [
+            ("MAL-2099-0003.json", "MAL-2099-0003"),
+            ("MAL-2099-0004.json", "MAL-2099-0004"),
+        ] {
+            write_mal(
+                directory.path(),
+                file,
+                &format!(
+                    r#"{{
+                        "id":"{id}",
+                        "affected":[{{
+                            "package":{{"ecosystem":"npm","name":"multi-package"}},
+                            "ranges":[{{"type":"ECOSYSTEM","events":[
+                                {{"introduced":"1.0.0-beta.1"}},{{"fixed":"1.0.0"}},
+                                {{"introduced":"2.0.0"}},{{"limit":"2.1.0"}}
+                            ]}}]
+                        }}]
+                    }}"#
+                ),
+            );
+        }
+        let key = RegistryPackageKey {
+            ecosystem: Ecosystem::Npm,
+            name: "multi-package".to_string(),
+        };
+        let mut spy = SpyRegistryVersions::default();
+        spy.versions.insert(
+            key.clone(),
+            [
+                "1.0.0-alpha.1",
+                "1.0.0-beta.1",
+                "1.0.0-rc.1",
+                "1.0.0",
+                "2.0.0",
+                "2.0.5",
+                "2.1.0",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        );
+        let (entries, stats, _) =
+            parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+        assert_eq!(
+            spy.calls,
+            vec![key],
+            "duplicate bounded packages fetch once"
+        );
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            assert_eq!(
+                entry.affected_versions,
+                ["1.0.0-beta.1", "1.0.0-rc.1", "2.0.0", "2.0.5"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+            assert!(!entry.all_versions_malicious);
+        }
+        assert_eq!(stats.bounded_intervals_materialized, 4);
+    }
+
+    #[test]
+    fn confirmed_unrepresentable_range_shapes_fail_publication() {
+        for events_or_range in [
+            r#"{"type":"ECOSYSTEM","events":[{"introduced":"1.0.0"}]}"#,
+            r#"{"type":"GIT","events":[{"introduced":"0"},{"fixed":"abc"}]}"#,
+            r#"{"type":"ECOSYSTEM","events":[{"fixed":"1.0.0"}]}"#,
+            r#"{"type":"ECOSYSTEM","events":[{"introduced":"0","fixed":"1.0.0"}]}"#,
+            r#"{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"introduced":"1.0.0"}]}"#,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            write_mal(
+                directory.path(),
+                "MAL-2099-0005.json",
+                &format!(
+                    r#"{{
+                        "id":"MAL-2099-0005",
+                        "affected":[{{
+                            "package":{{"ecosystem":"npm","name":"unsupported-package"}},
+                            "ranges":[{events_or_range}]
+                        }}]
+                    }}"#
+                ),
+            );
+            assert!(parse_ossf(directory.path()).is_err(), "{events_or_range}");
+        }
+    }
+
+    #[test]
+    fn whole_package_interval_does_not_hide_contradictory_sibling_ranges() {
+        for close_key in ["fixed", "last_affected", "limit"] {
+            let directory = tempfile::tempdir().unwrap();
+            write_mal(
+                directory.path(),
+                "MAL-2099-0011.json",
+                &format!(
+                    r#"{{
+                        "id":"MAL-2099-0011",
+                        "affected":[{{
+                            "package":{{"ecosystem":"npm","name":"mixed-whole-package"}},
+                            "ranges":[
+                                {{"type":"ECOSYSTEM","events":[{{"introduced":"0"}}]}},
+                                {{"type":"ECOSYSTEM","events":[
+                                    {{"introduced":"2.0.0"}},{{"{close_key}":"1.0.0"}}
+                                ]}}
+                            ]
+                        }}]
+                    }}"#
+                ),
+            );
+            let error = parse_ossf(directory.path())
+                .expect_err("a whole-package sibling must not suppress interval validation");
+            assert!(
+                error.contains("contradictory affected interval"),
+                "{close_key}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_package_interval_does_not_hide_invalid_zero_based_closures() {
+        for close_key in ["fixed", "last_affected", "limit"] {
+            let directory = tempfile::tempdir().unwrap();
+            write_mal(
+                directory.path(),
+                "MAL-2099-0012.json",
+                &format!(
+                    r#"{{
+                        "id":"MAL-2099-0012",
+                        "affected":[{{
+                            "package":{{"ecosystem":"npm","name":"mixed-invalid-close"}},
+                            "ranges":[
+                                {{"type":"ECOSYSTEM","events":[{{"introduced":"0"}}]}},
+                                {{"type":"ECOSYSTEM","events":[
+                                    {{"introduced":"0"}},{{"{close_key}":"not-semver"}}
+                                ]}}
+                            ]
+                        }}]
+                    }}"#
+                ),
+            );
+            let error = parse_ossf(directory.path())
+                .expect_err("a whole-package sibling must not suppress close validation");
+            assert!(
+                error.contains("unsupported npm version boundary"),
+                "{close_key}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn withdrawn_records_are_counted_and_do_not_publish() {
+        let directory = tempfile::tempdir().unwrap();
+        write_mal(
+            directory.path(),
+            "MAL-2099-0006.json",
+            r#"{
+                "id":"MAL-2099-0006",
+                "withdrawn":"2099-01-01T00:00:00Z",
+                "affected":[{"package":{"ecosystem":"npm","name":"withdrawn"},"versions":["1.0.0"]}]
+            }"#,
+        );
+        write_mal(
+            directory.path(),
+            "MAL-2099-0007.json",
+            r#"{
+                "id":"MAL-2099-0007",
+                "affected":[{"package":{"ecosystem":"npm","name":"active"},"versions":["1.0.0"]}]
+            }"#,
+        );
+        let (entries, stats, _) = parse_ossf(directory.path()).unwrap();
+        assert_eq!(stats.skipped_withdrawn, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "active");
+    }
+
+    #[test]
+    fn solana_web3_bounded_versions_round_trip_without_false_whole_package_bit() {
+        let directory = tempfile::tempdir().unwrap();
+        write_mal(directory.path(), "MAL-2099-0008.json", C01_SOLANA_BOUNDED);
+        let snapshot_path = directory.path().join("registry-versions.json");
+        std::fs::write(&snapshot_path, C01_REGISTRY_VERSIONS).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        let mut snapshot = RegistrySnapshotStore::load(&snapshot_path, &binding).unwrap();
+        let (entries, _, _) =
+            parse_ossf_with_provider(directory.path(), Some(&mut snapshot)).unwrap();
+        snapshot.ensure_fully_consumed().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].affected_versions, ["1.95.6", "1.95.7"]);
+        assert!(!entries[0].all_versions_malicious);
+
+        let signing_key = SigningKey::from_bytes(&[49u8; 32]);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        add_packages(&mut writer, &entries);
+        let database = ThreatDb::from_bytes(
+            writer
+                .build_format(ThreatDbFormat::V1, &signing_key)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        assert!(database
+            .check_package(Ecosystem::Npm, "@solana/web3.js", Some("1.95.5"))
+            .is_none());
+        for bad in ["1.95.6", "1.95.7"] {
+            assert!(database
+                .check_package(Ecosystem::Npm, "@solana/web3.js", Some(bad))
+                .is_some());
+        }
+        assert!(database
+            .check_package(Ecosystem::Npm, "@solana/web3.js", Some("1.95.8"))
+            .is_none());
+        assert!(matches!(
+            database.assess_package(
+                Ecosystem::Npm,
+                "@solana/web3.js",
+                &tirith_core::version_intent::VersionIntent::Unspecified
+            ),
+            tirith_core::threatdb::PackageThreatAssessment::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn registry_snapshot_rejects_stale_commit_and_wrong_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot_path = directory.path().join("registry-versions.json");
+        std::fs::write(&snapshot_path, C01_REGISTRY_VERSIONS).unwrap();
+        let mut binding = fixture_snapshot_binding(&snapshot_path);
+        binding.ossf_commit = "22".repeat(20);
+        assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
+            .unwrap_err()
+            .contains("does not match expected"));
+
+        let mut binding = fixture_snapshot_binding(&snapshot_path);
+        binding.registry_snapshot_sha256 = "33".repeat(32);
+        assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
+            .unwrap_err()
+            .contains("digest changed"));
+    }
+
+    #[test]
+    fn registry_snapshot_rejects_wrong_url_and_response_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot_path = directory.path().join("registry-versions.json");
+        let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
+        document["packages"][0]["source_url"] =
+            serde_json::json!("https://registry.npmjs.org/@solana%2Fweb3.js/redirected");
+        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
+            .unwrap_err()
+            .contains("unexpected source URL"));
+
+        document["packages"][0]["source_url"] =
+            serde_json::json!("https://registry.npmjs.org/@solana%2Fweb3.js");
+        document["packages"][0]["response_bytes"] = serde_json::json!(0);
+        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
+            .unwrap_err()
+            .contains("outside caps"));
+    }
+
+    #[test]
+    fn source_provenance_binds_exact_snapshot_revision_digest_and_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot_path = directory.path().join("registry-versions.json");
+        std::fs::write(&snapshot_path, C01_REGISTRY_VERSIONS).unwrap();
+        let snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
+        let provenance_path = directory.path().join("source-provenance.json");
+        let provenance = serde_json::json!({
+            "schema_version": 2,
+            "retrieved_at": "2026-08-08T00:00:01Z",
+            "compiler_version": env!("CARGO_PKG_VERSION"),
+            "ossf_malicious_packages": {
+                "source_url": "https://github.com/ossf/malicious-packages.git",
+                "ref": "1ea2762d5fb415aef003a244d5aa83c5fc48cc6e",
+                "commit": "1ea2762d5fb415aef003a244d5aa83c5fc48cc6e",
+                "spdx": "CC-BY-4.0", "files": 1, "bytes": 1,
+                "content_sha256": "11".repeat(32)
+            },
+            "datadog_malicious_software_packages": {
+                "source_url": "https://github.com/DataDog/malicious-software-packages-dataset.git",
+                "ref": "ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc",
+                "commit": "ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc",
+                "spdx": "Apache-2.0", "files": 2, "bytes": 2,
+                "content_sha256": "22".repeat(32)
+            },
+            "ecosystems_typosquatting_dataset": {
+                "source_url": "https://github.com/ecosyste-ms/typosquatting-dataset.git",
+                "ref": "fd0bde98d200efe5c282a07edc4c68fba13252c6",
+                "commit": "fd0bde98d200efe5c282a07edc4c68fba13252c6",
+                "spdx": "CC0-1.0", "files": 1, "rows": 100, "bytes": 3,
+                "content_sha256": "33".repeat(32)
+            },
+            "registry_version_snapshot": {
+                "ossf_commit": "1ea2762d5fb415aef003a244d5aa83c5fc48cc6e",
+                "retrieved_at": "2026-08-08T00:00:00Z",
+                "source_urls": ["https://registry.npmjs.org/", "https://pypi.org/pypi/"],
+                "spdx": "LicenseRef-Registry-Metadata", "packages": 1,
+                "bytes": snapshot_bytes.len(), "sha256": sha256_hex(&snapshot_bytes)
+            },
+            "feodo_tracker_ipblocklist": {
+                "source_url": "https://feodotracker.abuse.ch/downloads/ipblocklist.txt",
+                "spdx": "LicenseRef-abuse-ch-terms", "files": 1, "bytes": 4,
+                "sha256": "44".repeat(32)
+            },
+            "cisa_known_exploited_vulnerabilities": {
+                "source_url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+                "spdx": "LicenseRef-US-Government-Work", "files": 1, "bytes": 5,
+                "sha256": "55".repeat(32)
+            },
+            "web3_package_anchors": {
+                "source_url": "repository:crates/tirith/assets/data/web3_package_anchors.csv",
+                "spdx": "LicenseRef-Package-Name-Facts", "files": 1, "bytes": 1,
+                "content_sha256": "66".repeat(32)
+            }
+        });
+        std::fs::write(&provenance_path, serde_json::to_vec(&provenance).unwrap()).unwrap();
+        let binding =
+            SourceTransactionBinding::load_provenance_only(&provenance_path, &snapshot_path)
+                .unwrap();
+        assert_eq!(
+            binding.registry_snapshot_sha256,
+            sha256_hex(&snapshot_bytes)
+        );
+        assert_eq!(binding.registry_packages, 1);
+
+        let mut altered = provenance;
+        altered["registry_version_snapshot"]["sha256"] = serde_json::json!("66".repeat(32));
+        std::fs::write(&provenance_path, serde_json::to_vec(&altered).unwrap()).unwrap();
+        assert!(
+            SourceTransactionBinding::load_provenance_only(&provenance_path, &snapshot_path)
+                .unwrap_err()
+                .contains("do not match source provenance")
+        );
+    }
+
+    #[test]
+    fn every_staged_source_mutation_breaks_canonical_provenance_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let ossf = directory.path().join("ossf");
+        let datadog = directory.path().join("datadog");
+        let typosquat_root = directory.path().join("typosquats");
+        let feodo = directory.path().join("feodo.txt");
+        let cisa = directory.path().join("cisa.json");
+        let anchors = directory.path().join("web3_package_anchors.csv");
+        std::fs::create_dir_all(ossf.join("osv/npm")).unwrap();
+        std::fs::create_dir_all(datadog.join("samples/npm")).unwrap();
+        std::fs::create_dir_all(datadog.join("samples/pypi")).unwrap();
+        std::fs::create_dir_all(&typosquat_root).unwrap();
+        let ossf_file = ossf.join("osv/npm/MAL-2099-0001.json");
+        let datadog_npm = datadog.join("samples/npm/manifest.json");
+        let datadog_pypi = datadog.join("samples/pypi/manifest.json");
+        let typosquats = typosquat_root.join("typosquats.csv");
+        let originals: Vec<(&Path, &[u8])> = vec![
+            (&ossf_file, br#"{"id":"MAL-2099-0001"}"#),
+            (&datadog_npm, br#"{"bad":null}"#),
+            (&datadog_pypi, br#"{"bad":null}"#),
+            (&typosquats, b"malicious_package,target_package\nbad,good\n"),
+            (&feodo, b"203.0.113.1\n"),
+            (&cisa, br#"{"vulnerabilities":[]}"#),
+            (&anchors, WEB3_PACKAGE_ANCHORS_CSV.as_bytes()),
+        ];
+        for (path, bytes) in &originals {
+            std::fs::write(path, bytes).unwrap();
+        }
+        let inputs = SourceInputPaths {
+            ossf: &ossf,
+            datadog: &datadog,
+            typosquats: &typosquats,
+            feodo: &feodo,
+            cisa_kev: &cisa,
+            web3_anchors: &anchors,
+        };
+        let ossf_summary =
+            canonical_source_summary(&ossf, &collect_tree_source_paths(&ossf, "osv").unwrap())
+                .unwrap();
+        let datadog_summary = canonical_source_summary(
+            &datadog,
+            &[
+                PathBuf::from("samples/npm/manifest.json"),
+                PathBuf::from("samples/pypi/manifest.json"),
+            ],
+        )
+        .unwrap();
+        let typosquat_summary =
+            canonical_source_summary(&typosquat_root, &[PathBuf::from("typosquats.csv")]).unwrap();
+        let anchor_summary = canonical_source_summary(
+            anchors.parent().unwrap(),
+            &[PathBuf::from("web3_package_anchors.csv")],
+        )
+        .unwrap();
+        let document: SourceProvenanceDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "retrieved_at": "2026-08-08T00:00:00Z",
+            "compiler_version": env!("CARGO_PKG_VERSION"),
+            "ossf_malicious_packages": {
+                "source_url": "https://github.com/ossf/malicious-packages.git",
+                "ref": "11".repeat(20), "commit": "11".repeat(20), "spdx": "CC-BY-4.0",
+                "files": ossf_summary.files, "bytes": ossf_summary.bytes,
+                "content_sha256": ossf_summary.content_sha256
+            },
+            "datadog_malicious_software_packages": {
+                "source_url": "https://github.com/DataDog/malicious-software-packages-dataset.git",
+                "ref": "22".repeat(20), "commit": "22".repeat(20), "spdx": "Apache-2.0",
+                "files": datadog_summary.files, "bytes": datadog_summary.bytes,
+                "content_sha256": datadog_summary.content_sha256
+            },
+            "ecosystems_typosquatting_dataset": {
+                "source_url": "https://github.com/ecosyste-ms/typosquatting-dataset.git",
+                "ref": "33".repeat(20), "commit": "33".repeat(20), "spdx": "CC0-1.0",
+                "files": typosquat_summary.files, "rows": 1, "bytes": typosquat_summary.bytes,
+                "content_sha256": typosquat_summary.content_sha256
+            },
+            "registry_version_snapshot": {
+                "ossf_commit": "11".repeat(20), "retrieved_at": "2026-08-08T00:00:00Z",
+                "source_urls": ["https://registry.npmjs.org/", "https://pypi.org/pypi/"],
+                "spdx": "LicenseRef-Registry-Metadata", "packages": 0, "bytes": 1,
+                "sha256": "44".repeat(32)
+            },
+            "feodo_tracker_ipblocklist": {
+                "source_url": "https://feodotracker.abuse.ch/downloads/ipblocklist.txt",
+                "spdx": "LicenseRef-abuse-ch-terms", "files": 1,
+                "bytes": std::fs::read(&feodo).unwrap().len(),
+                "sha256": sha256_hex(&std::fs::read(&feodo).unwrap())
+            },
+            "cisa_known_exploited_vulnerabilities": {
+                "source_url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+                "spdx": "LicenseRef-US-Government-Work", "files": 1,
+                "bytes": std::fs::read(&cisa).unwrap().len(),
+                "sha256": sha256_hex(&std::fs::read(&cisa).unwrap())
+            },
+            "web3_package_anchors": {
+                "source_url": "repository:crates/tirith/assets/data/web3_package_anchors.csv",
+                "spdx": "LicenseRef-Package-Name-Facts", "files": anchor_summary.files,
+                "bytes": anchor_summary.bytes, "content_sha256": anchor_summary.content_sha256
+            }
+        }))
+        .unwrap();
+        verify_source_contents(&document, &inputs).unwrap();
+
+        for (label, path, original) in [
+            ("OpenSSF", ossf_file.as_path(), originals[0].1),
+            ("Datadog", datadog_npm.as_path(), originals[1].1),
+            ("typosquat", typosquats.as_path(), originals[3].1),
+            ("Feodo", feodo.as_path(), originals[4].1),
+            ("CISA", cisa.as_path(), originals[5].1),
+            ("anchor", anchors.as_path(), originals[6].1),
+        ] {
+            let mut mutated = original.to_vec();
+            mutated.push(b'!');
+            std::fs::write(path, mutated).unwrap();
+            assert!(
+                verify_source_contents(&document, &inputs).is_err(),
+                "{label} mutation must fail before signing"
+            );
+            std::fs::write(path, original).unwrap();
+            verify_source_contents(&document, &inputs).unwrap();
+        }
+    }
+
+    #[test]
+    fn git_source_revision_and_tracked_cleanliness_are_enforced() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("input.txt"), b"clean\n").unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "input.txt"],
+            vec![
+                "-c",
+                "user.name=Tirith Test",
+                "-c",
+                "user.email=tirith@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(directory.path())
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let commit = std::str::from_utf8(&output.stdout).unwrap().trim();
+        verify_git_checkout(directory.path(), commit, "fixture").unwrap();
+        assert!(verify_git_checkout(directory.path(), &"77".repeat(20), "fixture").is_err());
+        std::fs::write(directory.path().join("input.txt"), b"dirty\n").unwrap();
+        assert!(verify_git_checkout(directory.path(), commit, "fixture").is_err());
     }
 
     #[test]
@@ -3552,16 +6101,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("typosquats.csv");
         let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "ecosystem,name,target_name").unwrap();
-        writeln!(f, "pypi,reqeusts,requests").unwrap();
-        writeln!(f, "npm,loadsh,lodash").unwrap();
+        writeln!(
+            f,
+            "malicious_package,target_package,ecosystem,registry,classification,source"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "reqeusts,requests,pypi,https://pypi.org,transposition,fixture"
+        )
+        .unwrap();
+        writeln!(f, "loadsh,lodash,npm,https://npmjs.org,omission,fixture").unwrap();
+        writeln!(
+            f,
+            "unsupported,target,github_actions,https://github.com,other,fixture"
+        )
+        .unwrap();
+        writeln!(f, "requests,requests,pypi,https://pypi.org,other,fixture").unwrap();
         drop(f);
 
-        let entries = parse_typosquats_csv(&path).unwrap();
+        let (entries, stats) = parse_typosquats_csv(&path).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].ecosystem, Ecosystem::PyPI);
-        assert_eq!(entries[0].name, "reqeusts");
-        assert_eq!(entries[0].target_name, "requests");
+        assert_eq!(stats.accepted, 2);
+        assert_eq!(stats.rejected_unsupported_ecosystem, 1);
+        assert_eq!(stats.rejected_pseudo_package, 1);
+        assert!(entries.iter().any(|entry| {
+            entry.ecosystem == Ecosystem::PyPI
+                && entry.name == "reqeusts"
+                && entry.target_name == "requests"
+        }));
+
+        std::fs::write(&path, "ecosystem,name,target_name\npypi,x,y\n").unwrap();
+        assert!(parse_typosquats_csv(&path).is_err());
+
+        std::fs::write(
+            &path,
+            "malicious_package,target_package,ecosystem,registry,classification,source\nreqeusts,requests,pypi,https://pypi.org,transposition,a\nreqeusts,request,pypi,https://pypi.org,transposition,b\n",
+        )
+        .unwrap();
+        assert!(parse_typosquats_csv(&path).is_err());
     }
 
     #[test]
@@ -3687,25 +6265,56 @@ mod tests {
     }
 
     #[test]
-    fn datadog_schema_dispatch_accepts_single_and_array_osv_records() {
+    fn datadog_real_manifest_shape_is_path_derived_stable_and_strict() {
         let dir = tempfile::tempdir().unwrap();
-        let single = r#"{
-            "id":"MAL-2099-1000",
-            "affected":[{"package":{"ecosystem":"npm","name":"single-osv"},"versions":["1.0.0"]}]
-        }"#;
-        let array = r#"[{
-            "id":"MAL-2099-1001",
-            "affected":[{"package":{"ecosystem":"PyPI","name":"array_osv"},"versions":["2.0.0"]}]
-        }]"#;
-        std::fs::write(dir.path().join("single.json"), single).unwrap();
-        std::fs::write(dir.path().join("array.json"), array).unwrap();
+        let npm = dir.path().join("samples/npm");
+        let pypi = dir.path().join("samples/pypi");
+        std::fs::create_dir_all(&npm).unwrap();
+        std::fs::create_dir_all(&pypi).unwrap();
+        std::fs::write(
+            npm.join("manifest.json"),
+            r#"{"z-package":["2.0.0","1.0.0","1.0.0"],"all-bad":null}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pypi.join("manifest.json"),
+            r#"{"Friendly_Bard":["3.0"],"other":null}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("unrelated.json"), r#"["ignored"]"#).unwrap();
 
         let (entries, skipped, files) = parse_datadog(dir.path()).unwrap();
         assert_eq!(files, 2);
         assert_eq!(skipped, 0);
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|entry| entry.name == "single-osv"));
-        assert!(entries.iter().any(|entry| entry.name == "array-osv"));
+        assert_eq!(entries.len(), 4);
+        let exact = entries
+            .iter()
+            .find(|entry| entry.name == "z-package")
+            .unwrap();
+        assert_eq!(exact.affected_versions, ["1.0.0", "2.0.0"]);
+        assert!(!exact.all_versions_malicious);
+        assert!(entries.iter().any(|entry| entry.name == "friendly-bard"));
+        assert!(
+            entries
+                .iter()
+                .find(|entry| entry.name == "all-bad")
+                .unwrap()
+                .all_versions_malicious
+        );
+
+        std::fs::write(npm.join("manifest.json"), r#"{"bad":[]}"#).unwrap();
+        assert!(parse_datadog(dir.path()).is_err());
+        std::fs::write(npm.join("manifest.json"), r#"{"bad":"1.0.0"}"#).unwrap();
+        assert!(parse_datadog(dir.path()).is_err());
+        std::fs::write(npm.join("manifest.json"), r#"{"dup":null,"dup":null}"#).unwrap();
+        assert!(parse_datadog(dir.path()).is_err());
+        std::fs::write(
+            pypi.join("manifest.json"),
+            r#"{"Friendly_Bard":["1.0"],"friendly-bard":["2.0"]}"#,
+        )
+        .unwrap();
+        std::fs::write(npm.join("manifest.json"), r#"{"ok":null}"#).unwrap();
+        assert!(parse_datadog(dir.path()).is_err());
     }
 
     #[test]
@@ -3979,6 +6588,10 @@ mod tests {
             &v1_path,
             Some((staged_v2, &v2_path)),
             Some((staged_pointer, &pointer_path)),
+            StagedAuxiliaryArtifacts {
+                compiler_metadata: None,
+                source_integrity: None,
+            },
             |staged, output| {
                 let call = calls.get() + 1;
                 calls.set(call);
@@ -3997,6 +6610,93 @@ mod tests {
             "first immutable asset may remain orphaned"
         );
         assert!(!v2_path.exists());
+    }
+
+    #[test]
+    fn generation_pointer_is_not_advanced_when_metadata_publish_fails() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let v1_path = dir.path().join("metadata-v1.dat");
+        let v2_path = dir.path().join("metadata-v2.dat");
+        let metadata_path = dir.path().join("compiler-metadata.json");
+        let pointer_path = dir.path().join("metadata-index.json");
+        std::fs::write(&pointer_path, b"old-generation\n").unwrap();
+        let mut staged_v1 = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        staged_v1.write_all(b"v1").unwrap();
+        let mut staged_v2 = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        staged_v2.write_all(b"v2").unwrap();
+        let mut staged_metadata = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        staged_metadata.write_all(b"metadata").unwrap();
+        let mut staged_pointer = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        staged_pointer.write_all(b"new-generation\n").unwrap();
+
+        let calls = Cell::new(0usize);
+        let error = publish_compiled_generation(
+            staged_v1,
+            &v1_path,
+            Some((staged_v2, &v2_path)),
+            Some((staged_pointer, &pointer_path)),
+            StagedAuxiliaryArtifacts {
+                compiler_metadata: Some((staged_metadata, &metadata_path)),
+                source_integrity: None,
+            },
+            |staged, output| {
+                let call = calls.get() + 1;
+                calls.set(call);
+                if call == 3 {
+                    return Err("injected metadata failure".to_string());
+                }
+                publish_staged(staged, output)
+            },
+            publish_staged,
+        )
+        .expect_err("metadata publication must fail before pointer commit");
+        assert!(error.contains("injected metadata failure"));
+        assert_eq!(std::fs::read(&pointer_path).unwrap(), b"old-generation\n");
+        assert!(!metadata_path.exists());
+    }
+
+    #[test]
+    fn generation_pointer_is_not_advanced_when_integrity_sidecar_publish_fails() {
+        use std::cell::Cell;
+
+        let directory = tempfile::tempdir().unwrap();
+        let v1_path = directory.path().join("sidecar-v1.dat");
+        let v2_path = directory.path().join("sidecar-v2.dat");
+        let metadata_path = directory.path().join("sidecar-metadata.json");
+        let integrity_path = directory.path().join("source-integrity.json");
+        let pointer_path = directory.path().join("sidecar-index.json");
+        std::fs::write(&pointer_path, b"old-generation\n").unwrap();
+        let staged = |bytes: &'static [u8]| {
+            let mut file = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+            file.write_all(bytes).unwrap();
+            file
+        };
+        let calls = Cell::new(0usize);
+        let error = publish_compiled_generation(
+            staged(b"v1"),
+            &v1_path,
+            Some((staged(b"v2"), &v2_path)),
+            Some((staged(b"new-generation\n"), &pointer_path)),
+            StagedAuxiliaryArtifacts {
+                compiler_metadata: Some((staged(b"metadata"), &metadata_path)),
+                source_integrity: Some((staged(b"integrity"), &integrity_path)),
+            },
+            |staged, output| {
+                let call = calls.get() + 1;
+                calls.set(call);
+                if call == 4 {
+                    return Err("injected sidecar failure".to_string());
+                }
+                publish_staged(staged, output)
+            },
+            publish_staged,
+        )
+        .expect_err("sidecar publication must fail before pointer commit");
+        assert!(error.contains("injected sidecar failure"));
+        assert_eq!(std::fs::read(&pointer_path).unwrap(), b"old-generation\n");
+        assert!(!integrity_path.exists());
     }
 
     #[test]
@@ -4022,6 +6722,139 @@ mod tests {
         assert_eq!(value["assets"].as_array().unwrap().len(), 2);
         assert_eq!(value["assets"][0]["format"], 1);
         assert_eq!(value["assets"][1]["format"], 2);
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "assets".to_string(),
+                "manifest_version".to_string(),
+                "sequence".to_string(),
+                "signature".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn base_schema_v2_reader_reconstructs_compiler_generation_signature() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[40u8; 32]);
+        let bytes = build_generation_manifest(
+            11,
+            &directory.path().join("tirith-threatdb-11-1.dat"),
+            b"v1",
+            &directory.path().join("tirith-threatdb-v2-11-1.dat"),
+            b"v2",
+            "https://example.invalid/threatdb-latest",
+            "0.3.4",
+            &key,
+        )
+        .unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let signature_b64 = document
+            .as_object_mut()
+            .unwrap()
+            .remove("signature")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            document
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "assets".to_string(),
+                "manifest_version".to_string(),
+                "sequence".to_string(),
+            ])
+        );
+        let base_reader_payload = serde_json::to_string(&document).unwrap();
+        let signature = Signature::from_slice(&BASE64.decode(signature_b64).unwrap()).unwrap();
+        key.verifying_key()
+            .verify(base_reader_payload.as_bytes(), &signature)
+            .expect("base schema-v2 reader must reconstruct the exact signed bytes");
+    }
+
+    #[test]
+    fn signed_source_integrity_sidecar_binds_generation_and_rejects_tampering() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[39u8; 32]);
+        let bytes = build_source_integrity_manifest(
+            7,
+            &directory.path().join("tirith-threatdb-7-1.dat"),
+            b"v1 bytes",
+            &directory.path().join("tirith-threatdb-v2-7-1.dat"),
+            b"v2 bytes",
+            &fixture_source_integrity_digests(),
+            &key,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["manifest_version"], SOURCE_INTEGRITY_MANIFEST_VERSION);
+        assert_eq!(value["sequence"], 7);
+        assert_eq!(value["v1_sha256"], sha256_hex(b"v1 bytes"));
+        assert_eq!(value["v2_sha256"], sha256_hex(b"v2 bytes"));
+        assert_eq!(value["compiler_metadata_sha256"], "33".repeat(32));
+
+        for field in ["source_transaction_sha256", "v1_sha256"] {
+            let mut tampered = value.clone();
+            tampered[field] = serde_json::json!("44".repeat(32));
+            let mut signed_region = tampered.clone();
+            signed_region.as_object_mut().unwrap().remove("signature");
+            let canonical = serde_json::to_string(&signed_region).unwrap();
+            let tampered_bytes = serde_json::to_vec(&tampered).unwrap();
+            assert!(
+                verify_source_integrity_manifest(&tampered_bytes, &canonical, &key)
+                    .unwrap_err()
+                    .contains("signature does not verify"),
+                "tampering {field} must invalidate the sidecar"
+            );
+        }
+    }
+
+    #[test]
+    fn compiler_parse_metadata_has_machine_readable_accepted_and_rejected_counts() {
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "ossf_malicious_packages".to_string(),
+            CompilerParserCounts {
+                accepted: 101,
+                rejected: 3,
+                details: BTreeMap::from([
+                    ("withdrawn".to_string(), 2),
+                    ("non_malicious".to_string(), 1),
+                ]),
+            },
+        );
+        let document = CompilerParseMetadata {
+            schema_version: 1,
+            compiler_version: env!("CARGO_PKG_VERSION").to_string(),
+            parsed_at: "2026-08-08T00:00:00Z".to_string(),
+            source_transaction_sha256: Some("11".repeat(32)),
+            registry_snapshot_sha256: Some("22".repeat(32)),
+            sources,
+        };
+        let bytes = serde_json::to_vec(&serde_json::to_value(&document).unwrap()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("compiler-metadata.json");
+        let staged = stage_compiler_metadata(&output, &bytes).unwrap();
+        publish_staged_immutable(staged, &output).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["sources"]["ossf_malicious_packages"]["accepted"], 101);
+        assert_eq!(value["sources"]["ossf_malicious_packages"]["rejected"], 3);
+        assert_eq!(
+            value["sources"]["ossf_malicious_packages"]["details"]["withdrawn"],
+            2
+        );
     }
 
     #[test]

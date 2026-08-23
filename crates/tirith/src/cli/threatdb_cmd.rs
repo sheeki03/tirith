@@ -3291,6 +3291,33 @@ mod tests {
     }
 
     #[test]
+    fn post_r3_signed_index_selection_contract_is_frozen() {
+        let key = SigningKey::from_bytes(&[0xc0; 32]);
+        let idx = signed_index_v2(181, vec![asset(2, Some("0.3.4")), asset(1, None)], &key);
+
+        for (client, expected_format, expected_filename) in [
+            ("0.3.3", 1, "tirith-threatdb-v1.dat"),
+            ("0.3.4", 2, "tirith-threatdb-v2.dat"),
+            ("0.4.0", 2, "tirith-threatdb-v2.dat"),
+        ] {
+            let selected = idx
+                .select_asset(client)
+                .unwrap_or_else(|| panic!("post-r3 client {client} must select an asset"));
+            assert_eq!(selected.format, expected_format, "client {client}");
+            assert_eq!(selected.filename, expected_filename, "client {client}");
+        }
+
+        let reversed = signed_index_v2(181, vec![asset(1, None), asset(2, Some("0.3.4"))], &key);
+        assert_eq!(
+            reversed
+                .select_asset("0.3.4")
+                .map(|asset| (asset.format, asset.filename.as_str())),
+            Some((2, "tirith-threatdb-v2.dat")),
+            "signed-index asset order must not affect the selected channel"
+        );
+    }
+
+    #[test]
     fn index_v2_select_skips_format_above_ceiling() {
         let key = SigningKey::from_bytes(&[1u8; 32]);
         // A hypothetical format 99 above MAX_FORMAT_VERSION must be skipped; the

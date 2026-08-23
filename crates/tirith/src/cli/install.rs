@@ -22,7 +22,7 @@ use tirith_core::runner::{self, RunOptions};
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use sha2::{Digest as _, Sha256};
 
@@ -93,8 +93,8 @@ impl InstallSource {
 }
 
 /// One completed install. Streaming (human) mode populates only `exit_code`;
-/// capture (JSON) mode buffers `stdout`/`stderr` so the JSON envelope can embed
-/// them rather than let them interleave on stdout.
+/// capture (JSON) mode drains `stdout`/`stderr` into bounded projections so the
+/// JSON envelope can embed them rather than let them interleave on stdout.
 #[derive(Debug, Clone, Default)]
 pub struct InstallRunOutput {
     /// Process exit code (`None` on signal-termination).
@@ -105,17 +105,158 @@ pub struct InstallRunOutput {
     pub stderr: Option<String>,
 }
 
+/// Final package-manager JSON is capped at 256 KiB. Retain at most 16 KiB from
+/// each child pipe while it is live: even worst-case JSON control-byte escaping
+/// across both streams remains below the transport budget with room for schema
+/// metadata. A stream that crosses the cap is drained to EOF but represented
+/// only by a categorical omission receipt, avoiding both unbounded memory and a
+/// redaction-defeating secret split at the retention boundary.
+const MAX_PACKAGE_MANAGER_JSON_CHILD_BYTES: usize = 256 * 1024;
+const MAX_PACKAGE_MANAGER_PIPE_BYTES: usize = MAX_PACKAGE_MANAGER_JSON_CHILD_BYTES / 16;
+
+fn read_package_manager_pipe_bounded(mut pipe: impl std::io::Read) -> std::io::Result<String> {
+    let mut retained = Vec::with_capacity(MAX_PACKAGE_MANAGER_PIPE_BYTES);
+    let mut source_bytes = 0usize;
+    let mut truncated = false;
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        let read = pipe.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        source_bytes = source_bytes.saturating_add(read);
+        if truncated {
+            continue;
+        }
+        let available = MAX_PACKAGE_MANAGER_PIPE_BYTES.saturating_sub(retained.len());
+        if read <= available {
+            retained.extend_from_slice(&chunk[..read]);
+        } else {
+            // Do not emit a prefix that may end midway through a credential or
+            // custom-DLP match. Continue draining, but discard all source bytes.
+            retained.clear();
+            truncated = true;
+        }
+    }
+    if truncated {
+        Ok(format!(
+            "[child output truncated: omitted_bytes={source_bytes}, max_stream_bytes={MAX_PACKAGE_MANAGER_PIPE_BYTES}]"
+        ))
+    } else {
+        Ok(String::from_utf8_lossy(&retained).into_owned())
+    }
+}
+
+fn join_package_manager_pipe(
+    reader: std::thread::JoinHandle<std::io::Result<String>>,
+) -> std::io::Result<String> {
+    reader
+        .join()
+        .map_err(|_| std::io::Error::other("package-manager output reader thread panicked"))?
+}
+
+fn capture_package_manager_output_bounded(
+    command: &mut Command,
+) -> std::io::Result<InstallRunOutput> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    // From this point onward execution definitely started. Never turn a
+    // capture/wait failure back into `Err`, because the caller reserves `Err`
+    // for a launch that did not occur and records it as `ran: false`.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (stdout, stderr) = match (stdout, stderr) {
+        (Some(stdout), Some(stderr)) => (stdout, stderr),
+        (stdout, stderr) => {
+            drop(stdout);
+            drop(stderr);
+            let exit_code = child.wait().ok().and_then(|status| status.code());
+            return Ok(InstallRunOutput {
+                exit_code,
+                stdout: Some(
+                    "[child stdout capture unavailable: pipe was not captured]".to_string(),
+                ),
+                stderr: Some(
+                    "[child stderr capture unavailable: pipe was not captured]".to_string(),
+                ),
+            });
+        }
+    };
+
+    let stdout_reader = match std::thread::Builder::new()
+        .name("tirith-install-stdout".to_string())
+        .spawn(move || read_package_manager_pipe_bounded(stdout))
+    {
+        Ok(reader) => reader,
+        Err(_error) => {
+            // Close the still-unread stderr pipe before waiting so the child
+            // cannot block forever on a full pipe after thread creation fails.
+            drop(stderr);
+            let exit_code = child.wait().ok().and_then(|status| status.code());
+            return Ok(InstallRunOutput {
+                exit_code,
+                stdout: Some(
+                    "[child stdout capture unavailable: reader could not start]".to_string(),
+                ),
+                stderr: Some(
+                    "[child stderr capture unavailable: reader could not start]".to_string(),
+                ),
+            });
+        }
+    };
+    let stderr_reader = match std::thread::Builder::new()
+        .name("tirith-install-stderr".to_string())
+        .spawn(move || read_package_manager_pipe_bounded(stderr))
+    {
+        Ok(reader) => reader,
+        Err(_error) => {
+            let exit_code = child.wait().ok().and_then(|status| status.code());
+            let stdout = join_package_manager_pipe(stdout_reader).unwrap_or_else(|_| {
+                "[child stdout capture unavailable: bounded reader failed]".to_string()
+            });
+            return Ok(InstallRunOutput {
+                exit_code,
+                stdout: Some(stdout),
+                stderr: Some(
+                    "[child stderr capture unavailable: reader could not start]".to_string(),
+                ),
+            });
+        }
+    };
+
+    // Readers drain concurrently so a child filling both pipes cannot deadlock.
+    // Always join them after wait, even if wait itself fails.
+    let status = child.wait();
+    let stdout = join_package_manager_pipe(stdout_reader);
+    let stderr = join_package_manager_pipe(stderr_reader);
+    let exit_code = status.ok().and_then(|status| status.code());
+    Ok(InstallRunOutput {
+        exit_code,
+        // The child status is authoritative once wait succeeds. A pipe-reader
+        // failure must not erase the fact that execution happened or its exit
+        // code; expose only a categorical marker because the I/O error text may
+        // itself contain an untrusted path.
+        stdout: Some(stdout.unwrap_or_else(|_| {
+            "[child stdout capture unavailable: bounded reader failed]".to_string()
+        })),
+        stderr: Some(stderr.unwrap_or_else(|_| {
+            "[child stderr capture unavailable: bounded reader failed]".to_string()
+        })),
+    })
+}
+
 /// Abstraction over running the real package-manager install. The production
 /// impl ([`ProcessInstallRunner`]) spawns the real process; tests inject a fake
 /// that never installs and never touches the network. Runs the resolved argv
 /// directly, never via a shell.
 ///
 /// Streaming inherits the terminal (live progress; captured fields `None`);
-/// capture buffers stdout/stderr for `--format json`.
+/// capture drains stdout/stderr into bounded projections for `--format json`.
 pub trait InstallRunner {
-    /// Run `program args...`. `capture` selects streaming vs capture. A spawn
-    /// failure is `Err`; the caller treats both `Err` and a `None` exit as
-    /// non-success.
+    /// Run `program args...`. `capture` selects streaming vs capture. Only a
+    /// launch failure is `Err`; after a successful spawn, capture/wait failures
+    /// return `Ok` with categorical output and/or a `None` exit so the caller
+    /// records that execution happened.
     fn run(
         &self,
         program: &str,
@@ -184,20 +325,16 @@ impl InstallRunner for ProcessInstallRunner<'_> {
             }
         }
         if capture {
-            // PR #121 fix-list item 3 — capture mode for `--format json` buffers
-            // child stdout/stderr so they don't interleave between JSON objects
-            // (which previously made the output unparseable).
-            let output = command.output()?;
-            Ok(InstallRunOutput {
-                exit_code: output.status.code(),
-                stdout: Some(String::from_utf8_lossy(&output.stdout).into_owned()),
-                stderr: Some(String::from_utf8_lossy(&output.stderr).into_owned()),
-            })
+            // Stream and drain both pipes under a hard live-memory cap. A bare
+            // `Command::output` retains attacker-sized manager output before the
+            // final JSON projection gets a chance to bound it.
+            capture_package_manager_output_bounded(&mut command)
         } else {
             // Streaming (human) mode — child stdio inherits the terminal.
-            let status = command.status()?;
+            let mut child = command.spawn()?;
+            let exit_code = child.wait().ok().and_then(|status| status.code());
             Ok(InstallRunOutput {
-                exit_code: status.code(),
+                exit_code,
                 stdout: None,
                 stderr: None,
             })
@@ -1678,7 +1815,14 @@ fn run_package_manager(
         args.to_vec()
     };
     let args = effective_args.as_slice();
+    let _policy_diagnostic_capture = tirith_core::policy::PolicyDiagnosticCapture::start();
     let policy = Policy::discover(cwd.as_deref());
+    tirith_core::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
+    let output_dlp =
+        tirith_core::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    if !json {
+        emit_install_policy_diagnostics_human(&output_dlp);
+    }
     let source_binding_result = match executable_binding.as_ref() {
         Some(executable) => {
             InstallSourceBinding::capture_for_execution(manager, Some(&cwd_path), args, executable)
@@ -1803,7 +1947,7 @@ fn run_package_manager(
     // analysis + outcome ship as ONE envelope `{"analysis":..,"outcome":..}`.
     // Writing it here let the child's stdout interleave between two JSON objects.
     if !json {
-        print_plan_human(&plan, use_online);
+        print_plan_human(&plan, use_online, &output_dlp);
     }
 
     // Decide the gate BEFORE the audit write so a `TIRITH=0`-bypassed BLOCK is
@@ -1813,7 +1957,7 @@ fn run_package_manager(
         if !json {
             eprintln!(
                 "tirith install: --no-exec — analysis only, '{}' was NOT run.",
-                install_command_for_human(&plan.argv),
+                install_command_for_human_with_compiled(&plan.argv, &output_dlp),
             );
         }
         match plan.verdict.action {
@@ -1844,7 +1988,10 @@ fn run_package_manager(
         if !json {
             eprintln!(
                 "tirith install: audit log not written (non-fatal): {}",
-                install_value_for_human(&e.to_string()),
+                tirith_core::output::sanitize_human_field_with_compiled(
+                    &e.to_string(),
+                    &output_dlp,
+                ),
             );
         }
     }
@@ -1853,7 +2000,9 @@ fn run_package_manager(
         ProceedDecision::Stop(code) => {
             // JSON Stop path (Block refused, Warn declined, --no-exec): emit the
             // combined envelope with a no-outcome marker so it stays parseable.
-            if json && !emit_combined_json(&plan, use_online, /* outcome = */ None) {
+            if json
+                && !emit_combined_json(&plan, use_online, /* outcome = */ None, &output_dlp)
+            {
                 return 1;
             }
             code
@@ -1868,7 +2017,7 @@ fn run_package_manager(
                         "tirith install: refusing to run '{}' — {} is Windows-only \
                          at the real-run step. Use `--no-exec` to analyze on this OS, \
                          or run the command from a Windows host.",
-                        install_command_for_human(&plan.argv),
+                        install_command_for_human_with_compiled(&plan.argv, &output_dlp),
                         plan.manager.label(),
                     );
                 } else {
@@ -1886,6 +2035,7 @@ fn run_package_manager(
                                 plan.manager.label()
                             )),
                         }),
+                        &output_dlp,
                     );
                 }
                 return 2;
@@ -1900,7 +2050,14 @@ fn run_package_manager(
                 executable,
                 source_binding: &source_binding,
             };
-            run_and_record(&plan, cwd.as_deref(), json, use_online, &runner)
+            run_and_record(
+                &plan,
+                cwd.as_deref(),
+                json,
+                use_online,
+                &runner,
+                &output_dlp,
+            )
         }
     }
 }
@@ -2459,8 +2616,9 @@ fn run_and_record(
     json: bool,
     online: bool,
     runner: &dyn InstallRunner,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
 ) -> i32 {
-    let command_display = install_command_for_human(&plan.argv);
+    let command_display = install_command_for_human_with_compiled(&plan.argv, compiled);
     // --- RECORD: before-install checkpoint ---
     let checkpoint_id = match cwd {
         Some(dir) => {
@@ -2471,7 +2629,7 @@ fn run_and_record(
                         eprintln!(
                             "tirith install: checkpoint {} taken ({} file(s)) — \
                              before/after record only, not a sandbox.",
-                            install_value_for_human(&meta.id),
+                            install_value_for_human_with_compiled(&meta.id, compiled),
                             meta.file_count,
                         );
                     }
@@ -2482,7 +2640,7 @@ fn run_and_record(
                     if !json {
                         eprintln!(
                             "tirith install: checkpoint skipped (non-fatal): {}",
-                            install_value_for_human(&e.to_string()),
+                            install_value_for_human_with_compiled(&e.to_string(), compiled),
                         );
                     }
                     None
@@ -2508,8 +2666,8 @@ fn run_and_record(
             if !json {
                 eprintln!(
                     "tirith install: failed to run '{}': {}",
-                    install_value_for_human(&plan.argv.program),
-                    install_value_for_human(&e.to_string()),
+                    install_value_for_human_with_compiled(&plan.argv.program, compiled),
+                    install_value_for_human_with_compiled(&e.to_string(), compiled),
                 );
             } else {
                 // Spawn failure still gets a single parseable envelope.
@@ -2524,6 +2682,7 @@ fn run_and_record(
                         stderr: None,
                         spawn_error: Some(e.to_string()),
                     }),
+                    compiled,
                 );
             }
             return 1;
@@ -2536,7 +2695,7 @@ fn run_and_record(
                 eprintln!(
                     "tirith install: '{}' did not return an exit code \
                      (terminated by signal).",
-                    install_value_for_human(&plan.argv.program),
+                    install_value_for_human_with_compiled(&plan.argv.program, compiled),
                 );
             }
             1
@@ -2556,7 +2715,7 @@ fn run_and_record(
         };
         // A JSON-write failure must not report `0` success — surface exit 1 if the
         // envelope didn't reach the consumer (a non-zero install exit is kept).
-        if !emit_combined_json(plan, online, Some(outcome)) && exit_code == 0 {
+        if !emit_combined_json(plan, online, Some(outcome), compiled) && exit_code == 0 {
             return 1;
         }
     } else {
@@ -2569,7 +2728,7 @@ fn run_and_record(
         if let Some(id) = &checkpoint_id {
             eprintln!(
                 "  before/after record: tirith checkpoint diff {}",
-                install_value_for_human(id),
+                install_value_for_human_with_compiled(id, compiled),
             );
         }
     }
@@ -2594,7 +2753,12 @@ struct OutcomeRecord<'a> {
 /// fix-list item 3). Returns `false` on a write failure. `outcome` is `None`
 /// when the install never ran (the field is still present as `null` for a
 /// stable shape).
-fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeRecord>) -> bool {
+fn emit_combined_json(
+    plan: &InstallPlan,
+    online: bool,
+    outcome: Option<OutcomeRecord>,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> bool {
     #[derive(Clone, Copy, serde::Serialize)]
     struct ArgvEnvelope<'a> {
         program: &'a str,
@@ -2654,6 +2818,9 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
     struct CombinedEnvelope<'a> {
         schema_version: u32,
         kind: &'a str,
+        status: &'a str,
+        executed: bool,
+        exit_code: Option<i32>,
         analysis: AnalysisEnvelope<'a>,
         // `null` when the install did not run; key always present for a stable shape.
         outcome: Option<OutcomeEnvelope<'a>>,
@@ -2696,6 +2863,14 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
 
     // Own `spawn_error` at this scope so its borrow outlives the closure below.
     let spawn_error_owned: Option<String> = outcome.as_ref().and_then(|o| o.spawn_error.clone());
+    let executed = outcome.as_ref().is_some_and(|outcome| outcome.ran);
+    let exit_code = outcome.as_ref().and_then(|outcome| outcome.exit_code);
+    let status = match outcome.as_ref() {
+        None => "not_run",
+        Some(outcome) if !outcome.ran => "spawn_failed",
+        Some(outcome) if outcome.exit_code.is_none() => "signal_terminated",
+        Some(_) => "exited",
+    };
     let outcome_env = outcome.map(|o| OutcomeEnvelope {
         kind: "install_outcome",
         manager: plan.manager.label(),
@@ -2717,10 +2892,26 @@ fn emit_combined_json(plan: &InstallPlan, online: bool, outcome: Option<OutcomeR
     let combined = CombinedEnvelope {
         schema_version: 2,
         kind: "install",
+        status,
+        executed,
+        exit_code,
         analysis,
         outcome: outcome_env,
     };
 
+    let mut combined = match serde_json::to_value(combined) {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({
+            "schema_version": 2,
+            "kind": "install",
+            "analysis_complete": false,
+            "analysis_incomplete": true,
+            "error": error.to_string(),
+        }),
+    };
+    append_install_policy_diagnostics_json(&mut combined, compiled);
+    tirith_core::redact::redact_json_strings(&mut combined, compiled);
+    let combined = tirith_core::verdict::bound_json_value_for_output(combined);
     write_json_stdout(&combined)
 }
 
@@ -2761,11 +2952,7 @@ fn run_url(
     // envelope. Refuse before preflight, DNS, download, or confirmation so this
     // mode emits exactly one Tirith-owned document.
     if json && !no_exec {
-        let _ = write_json_stdout(&serde_json::json!({
-            "schema_version": 2,
-            "kind": "install_url",
-            "error": "install URL JSON output is inspection-only; pass --no-exec or omit --format json before executing"
-        }));
+        let _ = write_json_stdout(&build_live_url_json_refusal());
         return 1;
     }
 
@@ -2773,6 +2960,7 @@ fn run_url(
         .ok()
         .map(|p| p.display().to_string());
     let interactive = is_terminal::is_terminal(std::io::stderr());
+    let _policy_diagnostic_capture = tirith_core::policy::PolicyDiagnosticCapture::start();
 
     // --- ANALYZE: URL preflight ---
     // Analyze the URL as a *download* (`curl -fsSL <url>`), NOT a pipe-to-shell
@@ -2784,6 +2972,12 @@ fn run_url(
     // audit calls below all run against the SAME snapshot (a second
     // `Policy::discover` opened a TOCTOU window).
     let (mut preflight, policy) = preflight_url(url, cwd.as_deref(), interactive);
+    tirith_core::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
+    let output_dlp =
+        tirith_core::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    if !json {
+        emit_install_policy_diagnostics_human(&output_dlp);
+    }
 
     // M4 item 8 chunk 3 — stamp the caller origin before the audit write, else
     // audit lines land in the "unknown" bucket.
@@ -2800,7 +2994,7 @@ fn run_url(
     }
 
     if !json {
-        print_url_preflight_human(url, &preflight);
+        print_url_preflight_human(url, &preflight, &output_dlp);
     }
 
     // Decide the block/bypass *before* auditing so a `TIRITH=0`-bypassed BLOCK
@@ -2830,9 +3024,13 @@ fn run_url(
         &policy.dlp_custom_patterns,
     ) {
         if !json {
+            let error = tirith_core::output::sanitize_human_field_with_compiled(
+                &e.to_string(),
+                &output_dlp,
+            );
             eprintln!(
                 "tirith install: audit log not written (non-fatal): {}",
-                install_value_for_human(&e.to_string()),
+                error,
             );
         }
     }
@@ -2840,7 +3038,13 @@ fn run_url(
     // A blocking preflight that was not bypassed refuses before any download.
     if blocked_and_refused {
         if json {
-            let _ = print_url_transaction_json(url, &preflight, None, None);
+            let _ = print_url_transaction_json(
+                url,
+                &preflight,
+                None,
+                None,
+                &policy.dlp_custom_patterns,
+            );
         } else {
             eprintln!(
                 "tirith install: refusing to download — the URL preflight \
@@ -2880,8 +3084,16 @@ fn run_url(
     };
     match runner::run_with_verified_executor(opts, Box::new(crate::cli::run::capsuled_exec)) {
         Ok(result) => {
+            let presentation_patterns =
+                tirith_core::policy::captured_policy_dlp_patterns_or(&policy.dlp_custom_patterns);
             let json_ok = if json {
-                print_url_transaction_json(url, &preflight, Some(&result), None)
+                print_url_transaction_json(
+                    url,
+                    &preflight,
+                    Some(&result),
+                    None,
+                    &presentation_patterns,
+                )
             } else {
                 if result.executed {
                     eprintln!(
@@ -2902,7 +3114,10 @@ fn run_url(
                 }
                 true
             };
-            let outcome_code = if result.executed || result.refused {
+            let effective_complete = runner_effective_complete(&result);
+            let outcome_code = if !effective_complete {
+                1
+            } else if result.executed || result.refused {
                 result.exit_code.unwrap_or(1)
             } else {
                 0
@@ -2916,14 +3131,45 @@ fn run_url(
             }
         }
         Err(e) => {
+            let presentation_patterns =
+                tirith_core::policy::captured_policy_dlp_patterns_or(&policy.dlp_custom_patterns);
+            let presentation_dlp =
+                tirith_core::redact::CompiledCustomPatterns::new_silent(&presentation_patterns);
             if json {
-                let _ = print_url_transaction_json(url, &preflight, None, Some(e.as_str()));
+                let _ = print_url_transaction_json(
+                    url,
+                    &preflight,
+                    None,
+                    Some(e.as_str()),
+                    &presentation_patterns,
+                );
             } else {
-                eprintln!("tirith install: {}", install_value_for_human(&e));
+                emit_install_policy_diagnostics_human(&presentation_dlp);
+                let error =
+                    tirith_core::output::sanitize_human_field_with_compiled(&e, &presentation_dlp);
+                eprintln!("tirith install: {error}");
             }
             1
         }
     }
+}
+
+#[cfg(unix)]
+fn build_live_url_json_refusal() -> serde_json::Value {
+    tirith_core::verdict::bound_json_value_for_output(serde_json::json!({
+        "schema_version": 2,
+        "kind": "install_url",
+        "action": Action::Block,
+        // No URL/body analysis ran: this is an operational protocol refusal,
+        // never a completed security verdict.
+        "analysis_complete": false,
+        "analysis_incomplete": true,
+        "runner_error": false,
+        "refused": true,
+        "executed": false,
+        "exit_code": Action::Block.exit_code(),
+        "error": "install URL JSON output is inspection-only; pass --no-exec or omit --format json before executing"
+    }))
 }
 
 /// On non-Unix the `url` form is unavailable (the safe runner is Unix-only);
@@ -2988,8 +3234,27 @@ fn install_value_for_human(value: &str) -> String {
 /// Quote each structured argv token, then apply the strict terminal display
 /// filter. Execution continues to use [`InstallArgv::program`] and
 /// [`InstallArgv::args`] directly; this string is display-only.
+#[cfg(test)]
 fn install_command_for_human(argv: &InstallArgv) -> String {
     install_value_for_human(&argv.display())
+}
+
+fn install_value_for_human_with_compiled(
+    value: &str,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> String {
+    tirith_core::output::sanitize_human_field_with_compiled(value, compiled)
+}
+
+fn install_command_for_human_with_compiled(
+    argv: &InstallArgv,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> String {
+    let command = tirith_core::redact::redact_sanitize_redact_command_with_compiled(
+        &argv.display(),
+        compiled,
+    );
+    tirith_core::output::sanitize_human_field_with_compiled(&command, compiled)
 }
 
 /// A short, well-known example package per manager, for the usage hint.
@@ -3010,11 +3275,15 @@ fn example_package(manager: PackageManager) -> &'static str {
 }
 
 /// Render the analysis verdict for a package-manager install (human form).
-fn print_plan_human(plan: &InstallPlan, online: bool) {
+fn print_plan_human(
+    plan: &InstallPlan,
+    online: bool,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) {
     let s = Stream::Stderr;
     eprintln!(
         "tirith install: analyzing '{}' before running it",
-        install_command_for_human(&plan.argv),
+        install_command_for_human_with_compiled(&plan.argv, compiled),
     );
     eprintln!("  (pre-execution install-risk analysis — not a sandbox)");
     // M6 ch1 — surface the weak-signals banner up front for adapter-less backends
@@ -3032,7 +3301,7 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
             eprintln!(
                 "    - {} {} — risk {}/100 ({})",
                 pkg.reference.ecosystem,
-                install_value_for_human(&pkg.reference.name),
+                install_value_for_human_with_compiled(&pkg.reference.name, compiled),
                 pkg.risk.score,
                 pkg.risk.risk_level,
             );
@@ -3078,11 +3347,11 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
             "    {} {} — {}",
             sev,
             finding.rule_id,
-            super::sanitize_for_human_output(&finding.title, false)
+            tirith_core::output::sanitize_human_field_with_compiled(&finding.title, compiled)
         );
         eprintln!(
             "      {}",
-            super::sanitize_for_human_output(&finding.description, true)
+            tirith_core::output::sanitize_human_field_with_compiled(&finding.description, compiled)
         );
     }
 
@@ -3090,7 +3359,10 @@ fn print_plan_human(plan: &InstallPlan, online: bool) {
         eprintln!();
         eprintln!("  notes:");
         for note in &plan.notes {
-            eprintln!("    - {}", install_value_for_human(note));
+            eprintln!(
+                "    - {}",
+                install_value_for_human_with_compiled(note, compiled)
+            );
         }
     }
     if !online && !plan.packages.is_empty() {
@@ -3111,10 +3383,17 @@ fn write_json_stdout<T: serde::Serialize>(value: &T) -> bool {
 }
 
 /// Render the URL-form preflight verdict (human form).
-fn print_url_preflight_human(url: &str, verdict: &Verdict) {
+fn print_url_preflight_human(
+    url: &str,
+    verdict: &Verdict,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) {
     let s = Stream::Stderr;
     eprintln!("tirith install: preflight analysis of install URL");
-    eprintln!("  url: {}", install_value_for_human(url));
+    eprintln!(
+        "  url: {}",
+        crate::cli::sanitize_provenance_url_with_compiled(url, compiled)
+    );
     eprintln!("  (pre-execution URL-risk analysis — the script body is analyzed after download; not a sandbox)");
     match verdict.action {
         Action::Allow => {
@@ -3145,11 +3424,11 @@ fn print_url_preflight_human(url: &str, verdict: &Verdict) {
             "    {} {} — {}",
             sev,
             finding.rule_id,
-            super::sanitize_for_human_output(&finding.title, false)
+            tirith_core::output::sanitize_human_field_with_compiled(&finding.title, compiled)
         );
         eprintln!(
             "      {}",
-            super::sanitize_for_human_output(&finding.description, true)
+            tirith_core::output::sanitize_human_field_with_compiled(&finding.description, compiled,)
         );
     }
 }
@@ -3163,27 +3442,188 @@ fn print_url_transaction_json(
     preflight: &Verdict,
     result: Option<&runner::RunResult>,
     error: Option<&str>,
+    dlp_custom_patterns: &[String],
 ) -> bool {
+    let out = build_url_transaction_json(url, preflight, result, error, dlp_custom_patterns);
+    write_json_stdout(&out)
+}
+
+#[cfg(unix)]
+fn build_url_transaction_json(
+    url: &str,
+    preflight: &Verdict,
+    result: Option<&runner::RunResult>,
+    error: Option<&str>,
+    dlp_custom_patterns: &[String],
+) -> serde_json::Value {
+    let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(dlp_custom_patterns);
+    let preflight_presentation = crate::cli::prepare_verdict_presentation(preflight, &compiled);
+    let outcome_presentation = result
+        .and_then(|result| result.verdict.as_ref())
+        .map(|verdict| crate::cli::prepare_verdict_presentation(verdict, &compiled));
+    let outcome_original = outcome_presentation
+        .as_ref()
+        .map(|presentation| presentation.original_findings_count)
+        .unwrap_or(0);
+    let outcome_presented = outcome_presentation
+        .as_ref()
+        .map(|presentation| presentation.presented_findings_count)
+        .unwrap_or(0);
+    let outcome_dropped = outcome_presentation
+        .as_ref()
+        .map(|presentation| presentation.dropped_findings_count)
+        .unwrap_or(0);
+    let effective_complete = result.map(runner_effective_complete);
+    let claimed_complete_without_verdict =
+        result.is_some_and(|result| result.analysis_complete && result.verdict.is_none());
     let outcome = result.map(|result| {
+        let effective_complete = effective_complete.unwrap_or(false);
+        let receipt = result
+            .presentation_receipt_with_compiled(&compiled)
+            .public_view();
+        let body_action = if effective_complete {
+            outcome_presentation
+                .as_ref()
+                .map(|presentation| presentation.verdict.action)
+                .unwrap_or(Action::Allow)
+        } else {
+            Action::Block
+        };
         serde_json::json!({
-            "receipt": &result.receipt,
-            "verdict": &result.verdict,
-            "analysis_complete": result.analysis_complete,
-            "refused": result.refused,
-            "executed": result.executed,
-            "exit_code": result.exit_code,
+            "receipt": receipt,
+            "verdict": outcome_presentation.as_ref().map(|presentation| &presentation.verdict),
+            "action": body_action,
+            "original_findings_count": outcome_original,
+            "presented_findings_count": outcome_presented,
+            "dropped_findings_count": outcome_dropped,
+            "analysis_complete": effective_complete,
+            "analysis_incomplete": !effective_complete,
+            // An incomplete --no-exec inspection is nonexecuting, not a
+            // refusal. Only preserve a real runner refusal or fail closed on
+            // the internally inconsistent complete-without-verdict claim.
+            "refused": result.refused || claimed_complete_without_verdict,
+            "executed": effective_complete && result.executed,
+            "exit_code": if effective_complete {
+                result.exit_code
+            } else {
+                Some(Action::Block.exit_code())
+            },
         })
     });
-    let out = serde_json::json!({
+    let original_findings_count = preflight_presentation
+        .original_findings_count
+        .saturating_add(outcome_original);
+    let presented_findings_count = preflight_presentation
+        .presented_findings_count
+        .saturating_add(outcome_presented);
+    let dropped_findings_count = preflight_presentation
+        .dropped_findings_count
+        .saturating_add(outcome_dropped);
+    let redacted_error = error
+        .map(|value| tirith_core::redact::redact_sanitize_redact_with_compiled(value, &compiled));
+    let runner_error = error.is_some();
+    let runner_incomplete = effective_complete.is_some_and(|complete| !complete);
+    let body_action = if runner_incomplete {
+        Action::Block
+    } else {
+        outcome_presentation
+            .as_ref()
+            .map(|presentation| presentation.verdict.action)
+            .unwrap_or(Action::Allow)
+    };
+    let mut transaction_action =
+        stronger_action(preflight_presentation.verdict.action, body_action);
+    if runner_error || runner_incomplete {
+        transaction_action = Action::Block;
+    }
+    let transaction_analysis_complete = !runner_error && !runner_incomplete;
+    let preflight_refused =
+        preflight_presentation.verdict.action == Action::Block && !preflight.bypass_honored;
+    let transaction_refused = if runner_error || claimed_complete_without_verdict {
+        true
+    } else {
+        result
+            .map(|result| result.refused)
+            .unwrap_or(preflight_refused)
+    };
+    let transaction_executed = !runner_error
+        && !runner_incomplete
+        && result.map(|result| result.executed).unwrap_or(false);
+    let transaction_exit_code = if runner_error || runner_incomplete {
+        Some(Action::Block.exit_code())
+    } else {
+        result
+            .and_then(|result| result.exit_code)
+            .or_else(|| transaction_refused.then_some(Action::Block.exit_code()))
+    };
+    let mut out = serde_json::json!({
         "schema_version": 2,
         "kind": "install_url",
-        "url": url,
+        "url": crate::cli::sanitize_provenance_url_with_compiled(url, &compiled),
         "execution_policy": "contained_by_default",
-        "preflight": preflight,
+        "action": transaction_action,
+        "analysis_complete": transaction_analysis_complete,
+        "analysis_incomplete": !transaction_analysis_complete,
+        "runner_error": runner_error,
+        "refused": transaction_refused,
+        "executed": transaction_executed,
+        "exit_code": transaction_exit_code,
+        "preflight": preflight_presentation.verdict,
         "outcome": outcome,
-        "error": error,
+        "error": redacted_error,
+        "original_findings_count": original_findings_count,
+        "presented_findings_count": presented_findings_count,
+        "dropped_findings_count": dropped_findings_count,
     });
-    write_json_stdout(&out)
+    append_install_policy_diagnostics_json(&mut out, &compiled);
+    tirith_core::redact::redact_json_strings(&mut out, &compiled);
+    tirith_core::verdict::bound_json_value_for_output(out)
+}
+
+fn emit_install_policy_diagnostics_human(compiled: &tirith_core::redact::CompiledCustomPatterns) {
+    for diagnostic in tirith_core::policy::drain_captured_policy_diagnostics_for_output(compiled) {
+        let diagnostic =
+            tirith_core::output::sanitize_human_field_with_compiled(&diagnostic, compiled);
+        eprintln!("tirith install: policy diagnostic: {diagnostic}");
+    }
+}
+
+fn append_install_policy_diagnostics_json(
+    value: &mut serde_json::Value,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) {
+    let diagnostics = tirith_core::policy::drain_captured_policy_diagnostics_for_output(compiled);
+    if diagnostics.is_empty() {
+        return;
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "policy_diagnostics_count".to_string(),
+            diagnostics.len().into(),
+        );
+        object.insert(
+            "policy_diagnostics".to_string(),
+            serde_json::json!(diagnostics),
+        );
+    }
+}
+
+#[cfg(unix)]
+fn runner_effective_complete(result: &runner::RunResult) -> bool {
+    result.analysis_complete && result.verdict.is_some()
+}
+
+#[cfg(unix)]
+fn stronger_action(left: Action, right: Action) -> Action {
+    if left.rank() > right.rank() {
+        left
+    } else if right.rank() > left.rank() {
+        right
+    } else if matches!(left, Action::WarnAck) || matches!(right, Action::WarnAck) {
+        Action::WarnAck
+    } else {
+        left
+    }
 }
 
 #[cfg(test)]
@@ -3191,6 +3631,404 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tirith_core::verdict::{Finding, RuleId, Severity};
+
+    #[test]
+    fn package_manager_pipe_reader_discards_prefix_after_cap_and_drains_exactly() {
+        let source = vec![b'x'; MAX_PACKAGE_MANAGER_PIPE_BYTES + 7_777];
+        let projected = read_package_manager_pipe_bounded(std::io::Cursor::new(source)).unwrap();
+        assert_eq!(
+            projected,
+            format!(
+                "[child output truncated: omitted_bytes={}, max_stream_bytes={MAX_PACKAGE_MANAGER_PIPE_BYTES}]",
+                MAX_PACKAGE_MANAGER_PIPE_BYTES + 7_777
+            )
+        );
+        assert!(!projected.contains("xxxxxxxx"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_manager_capture_drains_both_pipes_and_preserves_exit_status() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '%200000s' x; printf '%200000s' y >&2; exit 7"]);
+
+        let output = capture_package_manager_output_bounded(&mut command).unwrap();
+        assert_eq!(output.exit_code, Some(7));
+        let stdout = output.stdout.unwrap();
+        let stderr = output.stderr.unwrap();
+        assert!(stdout.contains("child output truncated"));
+        assert!(stderr.contains("child output truncated"));
+        assert!(stdout.len().saturating_add(stderr.len()) <= MAX_PACKAGE_MANAGER_JSON_CHILD_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_url_json_protocol_refusal_has_complete_nonexecution_schema() {
+        let value = build_live_url_json_refusal();
+        assert_eq!(value["action"], "block");
+        assert_eq!(value["analysis_complete"], false);
+        assert_eq!(value["analysis_incomplete"], true);
+        assert_eq!(value["runner_error"], false);
+        assert_eq!(value["refused"], true);
+        assert_eq!(value["executed"], false);
+        assert_eq!(value["exit_code"], 1);
+        assert!(
+            serde_json::to_vec(&value).unwrap().len()
+                <= tirith_core::verdict::MAX_PRESENTATION_BYTES
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_url_json_redacts_url_and_error_with_frozen_plan() {
+        let canary = "C02_INSTALL_URL_CANARY";
+        let github = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let provider_token = "provider-token-0123456789";
+        let patterns = vec![regex::escape(canary)];
+        let preflight = Verdict::allow_fast(1, Default::default());
+        let value = build_url_transaction_json(
+            &format!(
+                "https://user:password@mainnet.infura.io/v3/{provider_token}?token={canary}#fragment"
+            ),
+            &preflight,
+            None,
+            Some(&format!(
+                "download failed for {}\u{200b}{} and {}\u{1b}[31m{}",
+                &canary[..11],
+                &canary[11..],
+                &github[..18],
+                &github[18..]
+            )),
+            &patterns,
+        );
+        let serialized = serde_json::to_string(&value).unwrap();
+
+        for secret in [canary, provider_token, "user:password"] {
+            assert!(
+                !serialized.contains(secret),
+                "install URL JSON leaked {secret}"
+            );
+        }
+        assert!(!serialized.contains(&github));
+        assert_eq!(value["url"], "https://mainnet.infura.io/v3");
+        let error = value["error"].as_str().unwrap();
+        assert!(error.contains("[REDACTED:custom]"), "{error}");
+        assert!(error.contains("[REDACTED:GitHub PAT]"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_url_nested_receipt_uses_shared_url_dlp_and_body_block_wins() {
+        let canary = "C02_INSTALL_RECEIPT_CANARY";
+        let provider_token = "provider-token-0123456789";
+        let patterns = vec![regex::escape(canary)];
+        let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(&[]);
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(&patterns);
+        let presentation_patterns = tirith_core::policy::captured_policy_dlp_patterns_or(&[]);
+        let preflight = Verdict::allow_fast(1, Default::default());
+        let body = Verdict::from_findings(
+            vec![Finding {
+                rule_id: RuleId::PrivateKeyExposed,
+                severity: Severity::Critical,
+                title: "body block".to_string(),
+                description: "no-exec body decision".to_string(),
+                evidence: Vec::new(),
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            }],
+            3,
+            Default::default(),
+        );
+        let result = runner::RunResult {
+            receipt: tirith_core::receipt::Receipt {
+                url: format!(
+                    "https://user:password@mainnet.infura.io/v3/{provider_token}?token={canary}#fragment"
+                ),
+                final_url: Some(format!(
+                    "https://eth-mainnet.g.alchemy.com/v2/{provider_token}?token={canary}"
+                )),
+                redirects: vec![format!(
+                    "https://rpc.ankr.com/eth/{provider_token}?token={canary}"
+                )],
+                sha256: "d".repeat(64),
+                size: 1,
+                domains_referenced: vec!["example.test".to_string()],
+                paths_referenced: vec![format!("/private/{canary}/wallet.json")],
+                analysis_method: "policy-complete:sh".to_string(),
+                privilege: "normal".to_string(),
+                timestamp: "2026-08-09T00:00:00Z".to_string(),
+                cwd: Some(format!("/private/{canary}")),
+                git_repo: Some(format!(
+                    "https://user:password@github.com/org/repo?token={canary}#fragment"
+                )),
+                git_branch: Some(format!("branch-{canary}")),
+            },
+            verdict: Some(body),
+            analysis_complete: true,
+            refused: false,
+            executed: false,
+            exit_code: None,
+        };
+
+        let value = build_url_transaction_json(
+            "https://example.test/install.sh",
+            &preflight,
+            Some(&result),
+            None,
+            &presentation_patterns,
+        );
+        let serialized = serde_json::to_string(&value).unwrap();
+
+        assert_eq!(value["action"], "block");
+        assert_eq!(value["outcome"]["action"], "block");
+        assert_eq!(value["refused"], false);
+        assert_eq!(value["executed"], false);
+        for secret in [
+            canary,
+            provider_token,
+            "user:password",
+            "token=",
+            "#fragment",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "nested receipt leaked {secret}"
+            );
+        }
+        assert!(serialized.contains("[REDACTED:custom]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_url_runner_error_is_explicit_and_identical_after_fallback() {
+        let canary = "C02_INSTALL_RUNNER_ERROR_CANARY";
+        let patterns = vec![regex::escape(canary)];
+        let preflight = Verdict::allow_fast(1, Default::default());
+        let ordinary = build_url_transaction_json(
+            "https://example.test/install.sh",
+            &preflight,
+            None,
+            Some(&format!("runner failed for {canary}")),
+            &patterns,
+        );
+        let error = format!("runner failed for {canary}: {}", "flood".repeat(100_000));
+
+        let fallback = build_url_transaction_json(
+            "https://example.test/install.sh",
+            &preflight,
+            None,
+            Some(&error),
+            &patterns,
+        );
+        let ordinary_text = serde_json::to_string(&ordinary).unwrap();
+        let pretty = serde_json::to_string_pretty(&fallback).unwrap();
+
+        assert!(pretty.len() < tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        assert!(!ordinary_text.contains(canary));
+        assert!(!pretty.contains(canary));
+        for field in [
+            "action",
+            "analysis_complete",
+            "analysis_incomplete",
+            "runner_error",
+            "refused",
+            "executed",
+            "exit_code",
+        ] {
+            assert_eq!(
+                fallback["summary"][field], ordinary[field],
+                "compact fallback changed transaction field {field}"
+            );
+        }
+        assert_eq!(ordinary["action"], "block");
+        assert_eq!(ordinary["analysis_complete"], false);
+        assert_eq!(ordinary["analysis_incomplete"], true);
+        assert_eq!(ordinary["runner_error"], true);
+        assert_eq!(ordinary["refused"], true);
+        assert_eq!(ordinary["executed"], false);
+        assert_eq!(ordinary["exit_code"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_url_incomplete_no_exec_is_block_action_nonexecuted_and_exit_one() {
+        let preflight = Verdict::allow_fast(1, Default::default());
+        let patterns = vec!["C02_INSTALL_INCOMPLETE_PATTERN".to_string()];
+        let result = runner::RunResult {
+            receipt: tirith_core::receipt::Receipt {
+                url: "https://example.test/install.sh".to_string(),
+                final_url: None,
+                redirects: Vec::new(),
+                sha256: "e".repeat(64),
+                size: 1,
+                domains_referenced: Vec::new(),
+                paths_referenced: (0..2_000)
+                    .map(|index| format!("/incomplete-flood/{index}/{}", "x".repeat(200)))
+                    .collect(),
+                analysis_method: "static-incomplete:unsupported-interpreter".to_string(),
+                privilege: "normal".to_string(),
+                timestamp: "2026-08-09T00:00:00Z".to_string(),
+                cwd: None,
+                git_repo: None,
+                git_branch: None,
+            },
+            verdict: None,
+            analysis_complete: false,
+            refused: false,
+            executed: false,
+            exit_code: None,
+        };
+
+        let value = build_url_transaction_json(
+            "https://example.test/install.sh",
+            &preflight,
+            Some(&result),
+            None,
+            &patterns,
+        );
+
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+        assert!(pretty.len() < tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        assert_eq!(value["summary"]["action"], "block");
+        assert_eq!(value["summary"]["analysis_complete"], false);
+        assert_eq!(value["summary"]["analysis_incomplete"], true);
+        assert_eq!(value["summary"]["runner_error"], false);
+        assert_eq!(value["summary"]["refused"], false);
+        assert_eq!(value["summary"]["executed"], false);
+        assert_eq!(value["summary"]["exit_code"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_url_claimed_complete_without_verdict_fails_closed_everywhere() {
+        let preflight = Verdict::allow_fast(1, Default::default());
+        let result = runner::RunResult {
+            receipt: tirith_core::receipt::Receipt {
+                url: "https://example.test/install.sh".to_string(),
+                final_url: None,
+                redirects: Vec::new(),
+                sha256: "f".repeat(64),
+                size: 1,
+                domains_referenced: Vec::new(),
+                paths_referenced: Vec::new(),
+                analysis_method: "claimed-complete-without-verdict".to_string(),
+                privilege: "normal".to_string(),
+                timestamp: "2026-08-10T00:00:00Z".to_string(),
+                cwd: None,
+                git_repo: None,
+                git_branch: None,
+            },
+            verdict: None,
+            analysis_complete: true,
+            refused: false,
+            executed: true,
+            exit_code: Some(0),
+        };
+
+        assert!(!runner_effective_complete(&result));
+        let value = build_url_transaction_json(
+            "https://example.test/install.sh",
+            &preflight,
+            Some(&result),
+            None,
+            &[],
+        );
+
+        assert_eq!(value["action"], "block");
+        assert_eq!(value["analysis_complete"], false);
+        assert_eq!(value["analysis_incomplete"], true);
+        assert_eq!(value["refused"], true);
+        assert_eq!(value["executed"], false);
+        assert_eq!(value["exit_code"], 1);
+        assert_eq!(value["outcome"]["action"], "block");
+        assert_eq!(value["outcome"]["analysis_complete"], false);
+        assert_eq!(value["outcome"]["analysis_incomplete"], true);
+        assert_eq!(value["outcome"]["refused"], true);
+        assert_eq!(value["outcome"]["executed"], false);
+        assert_eq!(value["outcome"]["exit_code"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_url_json_is_bounded_and_keeps_late_critical_after_low_flood() {
+        let mut findings = (0..400)
+            .map(|index| Finding {
+                rule_id: RuleId::ConfigInjection,
+                severity: Severity::Low,
+                title: format!("low {index}"),
+                description: "low detail ".repeat(2_000),
+                evidence: Vec::new(),
+                human_view: None,
+                agent_view: None,
+                mitre_id: None,
+                custom_rule_id: None,
+            })
+            .collect::<Vec<_>>();
+        findings.push(Finding {
+            rule_id: RuleId::PrivateKeyExposed,
+            severity: Severity::Critical,
+            title: "late install critical".to_string(),
+            description: "must survive the URL transaction cap".to_string(),
+            evidence: Vec::new(),
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+        let preflight = Verdict::from_findings(findings, 3, Default::default());
+        let raw_count = preflight.findings.len();
+        let result = runner::RunResult {
+            receipt: tirith_core::receipt::Receipt {
+                url: "https://example.test/install.sh".to_string(),
+                final_url: None,
+                redirects: Vec::new(),
+                sha256: "b".repeat(64),
+                size: 1,
+                domains_referenced: Vec::new(),
+                paths_referenced: (0..2_000)
+                    .map(|index| format!("/receipt-flood/{index}/{}", "x".repeat(200)))
+                    .collect(),
+                analysis_method: "policy-complete:sh".to_string(),
+                privilege: "normal".to_string(),
+                timestamp: "2026-08-09T00:00:00Z".to_string(),
+                cwd: Some("/private/raw/cwd".to_string()),
+                git_repo: None,
+                git_branch: None,
+            },
+            verdict: Some(Verdict::allow_fast(1, Default::default())),
+            analysis_complete: true,
+            refused: true,
+            executed: false,
+            exit_code: Some(1),
+        };
+
+        let value = build_url_transaction_json(
+            "https://example.test/install.sh",
+            &preflight,
+            Some(&result),
+            None,
+            &[],
+        );
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+
+        assert!(pretty.len() < tirith_core::verdict::MAX_PRESENTATION_BYTES);
+        assert!(pretty.contains("private_key_exposed"), "{pretty}");
+        assert!(pretty.contains("late install critical"), "{pretty}");
+        assert_eq!(preflight.findings.len(), raw_count);
+        assert_eq!(
+            value["summary"]["original_findings_count"],
+            raw_count as u64
+        );
+        assert!(value["summary"]["dropped_findings_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+        assert_eq!(value["summary"]["refused"], true);
+        assert_eq!(value["summary"]["executed"], false);
+        assert_eq!(value["summary"]["exit_code"], 1);
+    }
 
     /// A fake [`InstallRunner`] — records the argv and returns a canned exit code,
     /// never spawning a process (installs nothing, no network).
@@ -4583,8 +5421,9 @@ mod tests {
             coverage: Default::default(),
         };
         let runner = FakeRunner::new(Some(0));
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
         // cwd=None so no checkpoint (hermetic); json=true exercises the capture path.
-        let code = run_and_record(&plan, None, true, false, &runner);
+        let code = run_and_record(&plan, None, true, false, &runner, &compiled);
         assert_eq!(code, 0);
         let seen = runner.seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "the runner must be called exactly once");
@@ -4610,7 +5449,8 @@ mod tests {
             coverage: Default::default(),
         };
         let runner = FakeRunner::new(Some(17));
-        let code = run_and_record(&plan, None, true, false, &runner);
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let code = run_and_record(&plan, None, true, false, &runner, &compiled);
         assert_eq!(code, 17, "the install's own exit code must propagate");
     }
 
@@ -4627,7 +5467,8 @@ mod tests {
             coverage: Default::default(),
         };
         let runner = FakeRunner::new(None); // signal-terminated → no code
-        let code = run_and_record(&plan, None, true, false, &runner);
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let code = run_and_record(&plan, None, true, false, &runner, &compiled);
         assert_eq!(code, 1);
     }
 
@@ -4649,7 +5490,10 @@ mod tests {
         };
         let runner = FakeRunner::new(Some(0))
             .with_capture("installing clean-pkg\nDone.\n", "warning: deprecated\n");
-        let _code = run_and_record(&plan, None, /* json = */ true, false, &runner);
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let _code = run_and_record(
+            &plan, None, /* json = */ true, false, &runner, &compiled,
+        );
         let seen = runner.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert!(

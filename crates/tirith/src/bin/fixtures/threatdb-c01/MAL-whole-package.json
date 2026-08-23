@@ -1,0 +1,14 @@
+{
+  "id": "MAL-2099-0001",
+  "affected": [
+    {
+      "package": { "ecosystem": "npm", "name": "whole-package" },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [{ "introduced": "0" }]
+        }
+      ]
+    }
+  ]
+}

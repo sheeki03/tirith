@@ -344,14 +344,19 @@ fn validate_injection_seeds(policy: &crate::policy::Policy, issues: &mut Vec<Pol
                 ),
                 field: Some(format!("injection_seeds_custom[{i}]")),
             });
-        } else if let Err(e) = crate::rules::prompt_injection::validate_seed_pattern(trimmed) {
+        } else if crate::rules::prompt_injection::validate_seed_pattern(trimmed).is_err() {
             // Regex must compile (checked last, after the cap, like custom rules).
             // Use the SAME compile path `compile_seeds` uses (placeholder
             // substitution + case-insensitive build), NOT a raw `Regex::new`, so a
             // pattern that passes here can never be silently dropped at runtime.
             issues.push(PolicyIssue {
                 level: IssueLevel::Error,
-                message: format!("injection_seeds_custom[{i}]: invalid regex '{trimmed}': {e}"),
+                // The regex compiler's Display text can echo the raw policy
+                // pattern. Keep validation categorical/indexed just like the
+                // runtime CLI/MCP warning boundary.
+                message: format!(
+                    "injection_seeds_custom[{i}]: invalid regex rejected by runtime compiler"
+                ),
                 field: Some(format!("injection_seeds_custom[{i}]")),
             });
         }

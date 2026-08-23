@@ -2243,12 +2243,9 @@ pub fn run_gateway_with_options(
     // silently dropped: a seed that passes `policy validate` but fails the real
     // compile would otherwise vanish.
     let filter_ctx: Arc<output_filter::OutputFilterContext> = Arc::new(if filter_output {
-        let (ctx, bad) = output_filter::OutputFilterContext::from_policy(&core_policy);
-        for (pattern, error) in &bad {
-            eprintln!(
-                "tirith gateway: warning: invalid injection_seeds_custom regex {pattern:?}: {error}"
-            );
-        }
+        let (ctx, bad) =
+            output_filter::OutputFilterContext::from_policy_with_diagnostics(&core_policy);
+        crate::cli::warn_invalid_injection_seed_diagnostics("tirith gateway", &bad, &core_policy);
         ctx
     } else {
         output_filter::OutputFilterContext::default()
@@ -5445,7 +5442,9 @@ fn write_response_inspect_audit(
 }
 
 /// Run the output filter over a typed tool result and re-emit a `result` Value
-/// LOSSLESSLY (C2). The text scan + structured scan + scrub reuse
+/// losslessly while it fits the final presentation budget (C2). Oversized
+/// results are scanned and sanitized in full, then replaced with a compact
+/// schema-valid tool result. The text scan + structured scan + scrub reuse
 /// [`output_filter::filter_tool_result`] over a text-only view; non-text and
 /// unknown blocks (image/audio/resource-link/embedded/unmodeled) are preserved
 /// verbatim and re-stitched in their original positions:
@@ -5616,6 +5615,8 @@ fn filter_typed_result(
             _ => {}
         }
     }
+
+    outcome.truncated |= output_filter::bound_tool_result_value_for_output(&mut new_result);
 
     (new_result, outcome)
 }

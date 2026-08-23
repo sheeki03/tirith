@@ -931,36 +931,13 @@ fn architecture_label(arch: object::Architecture) -> Option<String> {
 /// declines a buffer or when only a streaming header window is available. Never
 /// reads past the bytes it is given.
 fn classify_magic(bytes: &[u8]) -> NativeFormat {
-    // ELF: 0x7F 'E' 'L' 'F'.
-    if bytes.len() >= 4 && &bytes[..4] == b"\x7fELF" {
-        return NativeFormat::Elf;
+    match crate::content_kind::classify_native_prefix(bytes) {
+        crate::content_kind::NativeMagic::Elf => NativeFormat::Elf,
+        crate::content_kind::NativeMagic::MachO => NativeFormat::MachO,
+        crate::content_kind::NativeMagic::MachOFat => NativeFormat::MachOFat,
+        crate::content_kind::NativeMagic::Pe => NativeFormat::Pe,
+        crate::content_kind::NativeMagic::Unknown => NativeFormat::Unknown,
     }
-    if bytes.len() >= 4 {
-        let m = &bytes[..4];
-        // Fat/universal Mach-O magic (big-endian 0xCAFEBABE and the 64-bit
-        // 0xCAFEBABF). NOTE: 0xCAFEBABE is ALSO a Java class-file magic, but a member
-        // classified NativeModule by extension (`.dylib`/`.so`) being a Java class is
-        // not a case we need to disambiguate; the principal parser would reject it.
-        if m == [0xCA, 0xFE, 0xBA, 0xBE] || m == [0xCA, 0xFE, 0xBA, 0xBF] {
-            return NativeFormat::MachOFat;
-        }
-        // Thin Mach-O magic (LE/BE, 32/64-bit): 0xFEEDFACE / 0xFEEDFACF and the
-        // byte-swapped forms.
-        if m == [0xCE, 0xFA, 0xED, 0xFE]
-            || m == [0xCF, 0xFA, 0xED, 0xFE]
-            || m == [0xFE, 0xED, 0xFA, 0xCE]
-            || m == [0xFE, 0xED, 0xFA, 0xCF]
-        {
-            return NativeFormat::MachO;
-        }
-    }
-    // PE: starts with 'MZ' (the DOS stub). A real PE also has a `PE\0\0` at the
-    // offset in the DOS header, but for a fallback classifier the `MZ` magic is the
-    // recognized tell; the principal parser validates the rest.
-    if bytes.len() >= 2 && &bytes[..2] == b"MZ" {
-        return NativeFormat::Pe;
-    }
-    NativeFormat::Unknown
 }
 
 // ----------------------------------------------------------------------------
@@ -2456,6 +2433,11 @@ mod tests {
 
     #[test]
     fn magic_classifier_recognizes_each_format() {
+        let mut pe = vec![0u8; 0x58];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&(0x40u32).to_le_bytes());
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+
         assert_eq!(classify_magic(b"\x7fELFrest"), NativeFormat::Elf);
         assert_eq!(
             classify_magic(&[0xCA, 0xFE, 0xBA, 0xBE, 0, 0]),
@@ -2469,7 +2451,17 @@ mod tests {
             classify_magic(&[0xFE, 0xED, 0xFA, 0xCE, 0, 0]),
             NativeFormat::MachO
         );
-        assert_eq!(classify_magic(b"MZ\x90\x00"), NativeFormat::Pe);
+        assert_eq!(classify_magic(&pe), NativeFormat::Pe);
+        assert_eq!(classify_magic(b"MZ\x90\x00"), NativeFormat::Unknown);
+
+        let mut malformed_signature = pe.clone();
+        malformed_signature[0x40..0x44].copy_from_slice(b"PX\0\0");
+        assert_eq!(classify_magic(&malformed_signature), NativeFormat::Unknown);
+
+        let mut out_of_bounds = vec![0u8; 0x40];
+        out_of_bounds[..2].copy_from_slice(b"MZ");
+        out_of_bounds[0x3c..0x40].copy_from_slice(&(0x100u32).to_le_bytes());
+        assert_eq!(classify_magic(&out_of_bounds), NativeFormat::Unknown);
         assert_eq!(classify_magic(b"not-an-object"), NativeFormat::Unknown);
         assert_eq!(classify_magic(b""), NativeFormat::Unknown);
         assert_eq!(classify_magic(b"M"), NativeFormat::Unknown);
