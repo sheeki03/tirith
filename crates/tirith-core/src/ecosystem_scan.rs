@@ -639,6 +639,105 @@ fn parse_package_lock(text: &str) -> Option<Vec<DeclaredDependency>> {
     Some(out)
 }
 
+/// Most lockfile entries retained by [`npm_lock_integrity_index`]. A lockfile
+/// is attacker-influenced input, so the index it produces is bounded.
+const MAX_LOCK_INTEGRITY_ENTRIES: usize = 8192;
+
+/// Index a `package-lock.json` by resolved `(registry name, version)` to its
+/// recorded `integrity` string (C13).
+///
+/// Separate from [`parse_package_lock`] on purpose: that function answers "what
+/// does this project depend on", which every ecosystem scan needs, while this
+/// one answers "what bytes did the lockfile pin for that exact version", which
+/// only the provenance comparison needs. Entries with no `integrity` are simply
+/// absent from the index; absence is "not recorded", never "mismatch".
+///
+/// Identity comes from the same resolver the dependency parser uses, so an
+/// aliased entry indexes under the TARGET package rather than the alias, and a
+/// leaf `name` that contradicts its install path cannot re-key the entry. That
+/// last part is what keeps the index honest: trusting `meta.name` outright let
+/// a crafted lockfile put `"name": "lodash"` on `node_modules/evil`, so the
+/// attacker's digest was compared against lodash while the real `evil` entry
+/// went unrecorded and therefore unchecked.
+///
+/// Contradictory identity metadata is a malformed lockfile, not a reason to
+/// index part of it: the whole index is empty in that case, which reads as
+/// "nothing recorded" rather than as agreement.
+pub fn npm_lock_integrity_index(text: &str) -> BTreeMap<(String, String), String> {
+    let mut index = BTreeMap::new();
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+        return index;
+    };
+
+    if let Some(packages) = json.get("packages").and_then(|value| value.as_object()) {
+        let Some(aliases) = npm_lock_alias_claims(packages) else {
+            return BTreeMap::new();
+        };
+        for (path_key, meta) in packages {
+            let Some(installed_name) = package_lock_name_from_path(path_key) else {
+                continue;
+            };
+            let Some((name, _alias, _version)) =
+                npm_lock_v2_identity(path_key, &installed_name, meta, aliases.get(path_key))
+            else {
+                return BTreeMap::new();
+            };
+            insert_lock_integrity(&mut index, &name, meta);
+        }
+    }
+
+    if let Some(dependencies) = json.get("dependencies").and_then(|value| value.as_object()) {
+        collect_lock_v1_integrity(dependencies, &mut index);
+    }
+
+    index
+}
+
+fn collect_lock_v1_integrity(
+    dependencies: &serde_json::Map<String, serde_json::Value>,
+    index: &mut BTreeMap<(String, String), String>,
+) {
+    for (declared_name, meta) in dependencies {
+        let (name, _alias, _version) = npm_lock_identity(declared_name.trim(), meta);
+        insert_lock_integrity(index, &name, meta);
+        if let Some(nested) = meta.get("dependencies").and_then(|value| value.as_object()) {
+            collect_lock_v1_integrity(nested, index);
+        }
+    }
+}
+
+fn insert_lock_integrity(
+    index: &mut BTreeMap<(String, String), String>,
+    name: &str,
+    meta: &serde_json::Value,
+) {
+    if index.len() >= MAX_LOCK_INTEGRITY_ENTRIES {
+        return;
+    }
+    let Some(version) = meta.get("version").and_then(|value| value.as_str()) else {
+        return;
+    };
+    // An alias records `npm:target@version`; the resolved version is the tail.
+    let version = version
+        .strip_prefix("npm:")
+        .and_then(split_npm_name_version)
+        .and_then(|(_, version)| version)
+        .unwrap_or(version);
+    let Some(integrity) = meta.get("integrity").and_then(|value| value.as_str()) else {
+        return;
+    };
+    if name.is_empty() || version.is_empty() || integrity.trim().is_empty() {
+        return;
+    }
+    // First write wins. A v2 lockfile carries both `packages` and the legacy
+    // `dependencies` mirror, and only the `packages` pass corroborates identity
+    // against the install path. Overwriting would let the uncorroborated mirror
+    // replace an entry the hardened pass already resolved.
+    index
+        .entry((name.to_string(), version.to_string()))
+        .or_insert_with(|| integrity.trim().to_string());
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NpmLockAliasClaim {
     target_name: String,

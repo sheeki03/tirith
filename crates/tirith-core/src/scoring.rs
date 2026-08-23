@@ -187,6 +187,7 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::WorkflowRunTrigger
         | RuleId::WorkflowCheckoutUntrustedRef
         | RuleId::WorkflowCachePoisoning
+        | RuleId::WorkflowArtifactPoisoning
         | RuleId::DockerfileUnpinnedImage
         | RuleId::PackageScriptDangerous
         | RuleId::NotebookHiddenContent

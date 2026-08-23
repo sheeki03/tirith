@@ -1,0 +1,19 @@
+{
+  "invalid": [
+    {
+      "code": "EINTEGRITYSIGNATURE",
+      "message": "EINTEGRITYSIGNATURE: signature verification failed for chalk@5.4.1",
+      "integrity": "sha512-zgVZuo2WcZgfUEmsn6eO3kINexW8RAE4maiQ8QNs8CtpPCSyMiYsULR3HQYkm3w8FIA3SberyMJMSldGsW+U3w==",
+      "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA",
+      "location": "node_modules/chalk",
+      "name": "chalk",
+      "registry": "https://registry.npmjs.org/",
+      "resolved": "https://registry.npmjs.org/chalk/-/chalk-5.4.1.tgz",
+      "signature": "MEUCIQDcM0hgQmPqmWLuTsRGKNQfjQ7Bv1x5w4gG1uZC0QSbtQIgFB1Zk0v1M2z9v0k",
+      "type": "dependencies",
+      "version": "5.4.1"
+    }
+  ],
+  "missing": [],
+  "verified": []
+}

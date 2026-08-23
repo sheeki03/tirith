@@ -1551,11 +1551,16 @@ pub fn confirm(prompt: &str, yes: bool) -> bool {
 pub mod agent;
 pub mod ai;
 pub mod aliases;
+/// The `tirith attest` namespace (C18): point-in-time build and deployment
+/// receipts. Distinct from the nested `tirith pkg attest`, which binds PyPI
+/// publish attestations and is untouched by this surface.
+pub mod attest;
 pub mod audit;
 pub mod baseline;
 #[cfg(unix)]
 pub mod bash_capability;
 pub mod browser;
+pub mod browser_audit;
 pub mod browser_host;
 pub mod canary;
 /// Consumer-facing capsule launch surface (Stack E, unit E5): the single seam
@@ -1567,6 +1572,12 @@ pub mod canary;
 pub mod capsule;
 pub mod capsule_child;
 pub mod capsule_proxy;
+/// The `tirith capsule run --preset untrusted-project` surface (C14): copies an
+/// untrusted project into a held ephemeral directory, launches the operator's
+/// exact argv inside the fail-closed capsule seam, and emits one signed,
+/// content-addressed receipt. Refuses before any copy or spawn on every host
+/// that cannot deliver the preset's controls; there is no degraded fallback.
+pub mod capsule_run;
 /// Windows capsule executor (Stack E, unit E4): the `windows`-crate Win32 half that
 /// applies a `tirith_core::capsule::windows::WindowsLaunchPlan` (AppContainer +
 /// ACLs + Job Object + suspended `CreateProcessW`). `cfg(windows)`-gated so the
@@ -1610,6 +1621,15 @@ pub mod lsp;
 pub mod manpage;
 pub mod mcp;
 pub mod mcp_server;
+/// `tirith pkg attest-npm` (C17): resolve the operator's own npm through the
+/// trusted-child mechanism, discover its exact version, and run ONLY the argv a
+/// closed, fixture-backed contract table authorizes for that version, binding
+/// the answer to the project's `package-lock.json` digest, its installed
+/// `node_modules` inventory, and its registry hosts. Attestation evidence only:
+/// a clean receipt means npm's signature check passed, never that the package
+/// code is benign. The spawn / rendering half of
+/// [`tirith_core::provenance::npm`].
+pub mod npm_integrity;
 pub mod onboard;
 pub mod output_guard;
 pub mod package;

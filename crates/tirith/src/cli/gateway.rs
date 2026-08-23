@@ -12932,6 +12932,32 @@ policy:
     fn test_handle_guarded_call_duplicate_active_id_denies() {
         // End to end: a guarded forward whose id is already pending is denied with
         // a `duplicate_active_id` envelope and is NOT written upstream.
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = tempfile::tempdir().expect("isolate duplicate-id gateway state");
+        let _state = EnvGuard::set("XDG_STATE_HOME", root.path());
+        let _home = EnvGuard::set("HOME", root.path());
+
+        // The session resolver is intentionally cached for the whole process, so
+        // a test-local TIRITH_SESSION_ID assignment cannot reliably replace an ID
+        // selected by an earlier test. Use the authoritative resolved ID and
+        // isolate its storage root instead.
+        let session_id = tirith_core::session::resolve_session_id();
+        assert_eq!(tirith_core::session::resolve_session_id(), session_id);
+
+        let isolated_state_root = root.path().join("tirith");
+        assert_eq!(
+            tirith_core::policy::state_dir().as_deref(),
+            Some(isolated_state_root.as_path()),
+            "gateway state must resolve beneath the isolated XDG_STATE_HOME"
+        );
+        let isolated_state_path = tirith_core::session_warnings::session_state_path(&session_id)
+            .expect("isolated gateway session path");
+        assert!(isolated_state_path.starts_with(&isolated_state_root));
+
         let config = test_config();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let pending = Mutex::new(PendingRequests::new());

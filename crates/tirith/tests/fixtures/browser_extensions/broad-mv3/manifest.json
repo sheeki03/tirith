@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Synthetic Broad",
+  "version": "2.0.0",
+  "description": "Synthetic fixture. Not a real extension.",
+  "permissions": ["debugger", "nativeMessaging", "webRequestBlocking", "cookies"],
+  "host_permissions": ["<all_urls>", "*://*/*"],
+  "background": { "service_worker": "sw.js" }
+}

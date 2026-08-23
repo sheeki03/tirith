@@ -26,6 +26,7 @@ Inspected:
 | `tirith preview` | Partial | Simulates the filesystem blast radius of destructive commands; models the impact rather than inspecting content. | Yes |
 | `tirith watch` | Partial | Runs a command, then diffs filesystem, PATH, and shell-rc impact; observes effects, not the command bytes. | Yes |
 | `tirith temp-run` | Partial | Runs a command in a throwaway directory and diffs file impact. File isolation, not full containment, unless --capsule is set. | Partial |
+| `tirith capsule run` | Full | Copies the project with symlink-safe same-inode traversal (refusing symlinks, escapes, and case/Unicode collisions), digests every copied file, runs the exact argv in a fail-closed capsule, and diffs the tree afterwards. Enforceable only on x86_64 Linux; every other host refuses before any copy or spawn. | Yes |
 | `tirith taint` | None | Tracks provenance of files downloaded from risky sources; flags execution of a tainted file. Bookkeeping, not content inspection. | Yes |
 | `tirith intend` | Full | Inspects the command and flags high-impact behavior the stated intent does not justify (advisory). | Yes |
 | `tirith lab` | Full | Runs the detection engine against a curated, inert adversarial corpus to show what it catches. Offline. | Yes |
@@ -53,11 +54,11 @@ Inspected:
 | `tirith init` | None | Prints the shell hook for the active profile. Configuration surface. | Yes |
 | `tirith onboard` | None | Guided first-run wizard: detects the environment and recommends a policy template. Configuration surface. | Yes |
 | `tirith setup` | None | One-command AI-tool setup. Writes integration config; does not inspect content. | Yes |
-| `tirith install` | Partial | Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run. | Partial |
+| `tirith install` | Partial | Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run. For npm, --online also reports registry identity facts (origin, registry-bound tarball URL, parsed dist.integrity SRI, legacy shasum status, signature and provenance-attestation state) and, on an unpinned spec, a name-existence probe; those facts are parsed, never verified, and tirith does not download, inspect, or bind the tarball bytes npm installs. | Partial |
 | `tirith verify-self` | Full | Verifies the running binary and its build/install provenance against signed checksums. | Yes |
 | `tirith update` | Full | Signature-verified self-update: inspects the downloaded binary before replacing the running one. | Yes |
 | `tirith version` | None | Prints version and, with --provenance, build/install provenance. Reporting surface. | Yes |
-| `tirith browser` | None | Installs the Chrome native-messaging host that records clipboard provenance. Configuration surface. | Yes |
+| `tirith browser` | Partial | Installs the Chrome native-messaging host that records clipboard provenance (configuration surface). `browser audit` additionally reads bytes: it hashes every file under a profile's Extensions/<id>/<version> source tree, parses each manifest.json, and reads exactly three install-class fields (location, from_webstore, was_installed_by_default) from Preferences. It never reads cookies, history, saved passwords, Local Storage, IndexedDB, extension storage, wallet databases, or Local State, so it cannot see browsing data or the signed-in account, and profile identity is the profile directory name only. | Yes |
 | `tirith devcontainer` | Partial | Guards container operations and injects tirith into devcontainer.json. Inspects the guarded operation, not container contents. | Yes |
 | `tirith codespaces` | None | Sets up and injects tirith into Codespaces. Configuration surface. | Yes |
 | `tirith activate` | None | Activates a commercial license key. Licensing surface. | Yes |
@@ -92,7 +93,7 @@ Inspected:
 
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
-| `tirith package` | Partial | Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise. | Partial |
+| `tirith package` | Partial | Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise. For npm, --online reports dist identity facts and their verification state; no state can be verified here, and tirith does not download, inspect, or bind npm tarball bytes. | Partial |
 | `tirith ecosystem` | Partial | Scores every declared dependency in a project, slopsquat-aware. Inspects manifests and installed trees; registry depth needs --online. | Partial |
 | `tirith threat-db` | None | Manages the signed local threat database. Data management surface consumed by the inspecting commands. | Yes |
 | `tirith iac` | Full | Terraform / Pulumi / OpenTofu apply gates: inspects the saved-plan hash and blocks no-plan applies. | Yes |

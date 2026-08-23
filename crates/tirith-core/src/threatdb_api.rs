@@ -91,16 +91,28 @@ pub fn enrich_command(
     let mut seen = HashSet::new();
 
     let segments = crate::tokenize::tokenize(input, shell);
-    let packages = threatintel::extract_packages_for_shell(&segments, shell);
+    // `extract_packages_detail_for_shell`, not the bare variant: the detail form
+    // exists precisely so a consumer whose output is a security decision can see
+    // that the package list was cut. Discarding it made a runtime verdict read
+    // as a complete assessment of a command it had only partly looked at.
+    let extracted = threatintel::extract_packages_detail_for_shell(&segments, shell);
+    let extraction_truncated = extracted.truncated;
+    let packages = extracted.packages;
     let urls = extract::extract_urls(input, shell);
 
     // Deduplicate BEFORE the cap. Capping the raw list first let repeats
     // consume the budget, so a command padded with duplicates pushed a real
     // candidate out of the window without ever being looked up.
     let mut queried_packages: HashSet<(u8, String)> = HashSet::new();
-    let packages_by_first_use: Vec<_> = packages
+    let deduplicated_packages: Vec<_> = packages
         .into_iter()
         .filter(|package| queried_packages.insert((package.ecosystem as u8, package.name.clone())))
+        .collect();
+    // A second, independent cut. The extraction cap above is the grammar's; this
+    // one is the lookup budget, and it was equally silent.
+    let package_budget_truncated = deduplicated_packages.len() > MAX_ENRICH_PACKAGES;
+    let packages_by_first_use: Vec<_> = deduplicated_packages
+        .into_iter()
         .take(MAX_ENRICH_PACKAGES)
         .collect();
     for package in packages_by_first_use {
@@ -228,6 +240,7 @@ pub fn enrich_command(
         }
     }
 
+    let mut url_budget_truncated = false;
     if let Some(api_key) = config.google_safe_browsing_key.as_deref() {
         // Privacy scrub BEFORE anything is transmitted or cached: userinfo,
         // query (presigned tokens, reset links, bearer params), and fragments
@@ -241,6 +254,8 @@ pub fn enrich_command(
         // will actually be looked up, so repeats cannot displace a distinct URL.
         for url_info in urls {
             if candidates.len() >= MAX_ENRICH_URLS {
+                // Third silent cut, same class as the two package caps.
+                url_budget_truncated = true;
                 break;
             }
             if let Some(url) = safe_browsing_candidate_url(&url_info.parsed, &url_info.raw) {
@@ -275,6 +290,22 @@ pub fn enrich_command(
                 }
             }
         }
+    }
+
+    // Any cut above means this enrichment did not see the whole command. Say so
+    // rather than returning a list that reads as a complete assessment: the
+    // static rule path already discloses its own cap through
+    // `RuleId::AnalysisIncomplete`, and the runtime path silently did not.
+    //
+    // Inserted at the FRONT for the same reason the MCP projections sort
+    // completeness findings first: the presentation bound drops the tail, and
+    // the caveat is the last thing that should be dropped.
+    if let Some(finding) = incomplete_enrichment_finding(
+        extraction_truncated,
+        package_budget_truncated,
+        url_budget_truncated,
+    ) {
+        findings.insert(0, finding);
     }
 
     findings
@@ -795,6 +826,62 @@ fn build_osv_finding(
     }
 }
 
+/// Disclose that runtime enrichment did not look at the whole command.
+///
+/// Three independent caps can cut what gets assessed, and each one used to be
+/// silent: the extraction grammar's `MAX_PACKAGES_PER_INVOCATION`, the package
+/// lookup budget `MAX_ENRICH_PACKAGES`, and the URL lookup budget
+/// `MAX_ENRICH_URLS`. Returns `None` when nothing was cut, so a complete
+/// analysis carries no extra finding.
+fn incomplete_enrichment_finding(
+    extraction_truncated: bool,
+    package_budget_truncated: bool,
+    url_budget_truncated: bool,
+) -> Option<Finding> {
+    let mut reasons: Vec<String> = Vec::new();
+    if extraction_truncated {
+        reasons.push(format!(
+            "the command names more than {} distinct packages in one invocation, so package \
+             extraction stopped at that cap",
+            crate::npm_command::MAX_PACKAGES_PER_INVOCATION
+        ));
+    }
+    if package_budget_truncated {
+        reasons.push(format!(
+            "more than {MAX_ENRICH_PACKAGES} distinct packages were named, so only the first \
+             {MAX_ENRICH_PACKAGES} were looked up against live threat intelligence"
+        ));
+    }
+    if url_budget_truncated {
+        reasons.push(format!(
+            "more than {MAX_ENRICH_URLS} distinct URLs were named, so only the first \
+             {MAX_ENRICH_URLS} were checked against Safe Browsing"
+        ));
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(Finding {
+        rule_id: RuleId::AnalysisIncomplete,
+        severity: Severity::High,
+        title: "Threat-intelligence enrichment did not cover the whole command".to_string(),
+        description: format!(
+            "Tirith could not assess every candidate this command names: {}. The remainder was \
+             never looked up, so this result is reported as incompletely analyzed rather than \
+             clean. Split the command into smaller invocations to have everything assessed.",
+            reasons.join("; ")
+        ),
+        evidence: vec![Evidence::CommandPattern {
+            pattern: "bounded threat-intelligence enrichment budget exhausted".to_string(),
+            matched: "candidates omitted after the enrichment cap".to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    })
+}
+
 fn build_kev_finding(ecosystem: Ecosystem, name: &str, version: &str, cve_id: &str) -> Finding {
     Finding {
         rule_id: RuleId::ThreatCisaKev,
@@ -1108,6 +1195,57 @@ mod tests {
         assert!(
             findings.is_empty(),
             "should return empty when all APIs are disabled"
+        );
+    }
+
+    /// Runtime enrichment has three independent caps and every one of them used
+    /// to be silent, so a verdict could report a clean assessment of a command
+    /// it had only partly looked at. The static rule path already discloses its
+    /// cap through `RuleId::AnalysisIncomplete`; this is the runtime twin.
+    ///
+    /// The network paths are not reachable from a unit test, so this pins the
+    /// decision function itself across all eight flag combinations.
+    #[test]
+    fn every_enrichment_cap_is_disclosed_and_a_complete_run_is_not() {
+        assert!(
+            incomplete_enrichment_finding(false, false, false).is_none(),
+            "nothing was cut, so nothing may be disclosed"
+        );
+
+        for (extraction, package, url, expected) in [
+            (true, false, false, "package extraction stopped at that cap"),
+            (
+                false,
+                true,
+                false,
+                "were looked up against live threat intelligence",
+            ),
+            (false, false, true, "were checked against Safe Browsing"),
+        ] {
+            let finding = incomplete_enrichment_finding(extraction, package, url)
+                .expect("a cut must be disclosed");
+            assert_eq!(finding.rule_id, RuleId::AnalysisIncomplete);
+            assert_eq!(finding.severity, Severity::High);
+            assert!(
+                finding.description.contains(expected),
+                "{extraction}/{package}/{url} must name its cause: {}",
+                finding.description
+            );
+        }
+
+        // Several at once are reported together, not collapsed to the first.
+        let all = incomplete_enrichment_finding(true, true, true).expect("disclosed");
+        for expected in [
+            "package extraction stopped at that cap",
+            "were looked up against live threat intelligence",
+            "were checked against Safe Browsing",
+        ] {
+            assert!(all.description.contains(expected), "{}", all.description);
+        }
+        assert!(
+            all.description.contains("incompletely analyzed"),
+            "the verdict wording must say it is not clean: {}",
+            all.description
         );
     }
 }

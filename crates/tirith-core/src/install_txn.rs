@@ -219,6 +219,7 @@ pub enum InstallCoverageGapKind {
     ProvenanceUnavailable,
     ProvenanceMismatch,
     InstallScriptUnavailable,
+    PackageListTruncated,
     GapLimitReached,
 }
 
@@ -316,12 +317,28 @@ pub struct PlannedPackage {
 /// How the registry-API (`--online`) package signals are resolved. The CLI
 /// supplies this so the core never reaches the network itself.
 pub enum OnlineMode<'a> {
-    /// Offline — every package's API signals are [`ApiSignals::NotComputed`].
+    /// Offline: every package's API signals are [`ApiSignals::NotComputed`].
     Off,
-    /// `--online` — resolves only an exact `(ecosystem, name, version)` tuple.
-    /// Unpinned/ranged inputs never reach this seam, preventing latest-version
-    /// provenance from being attached to different installed bytes.
-    Resolver(&'a dyn Fn(Ecosystem, &str, &str) -> ApiSignals),
+    /// `--online`. Two seams, deliberately different in what they can return.
+    ///
+    /// C13 changed this variant from a single closure to a pair. The reason is
+    /// that the old shape could not express a name-existence question at all:
+    /// an unpinned spec returned before the closure was ever reached, so a
+    /// plausible but nonexistent package name was accepted without any registry
+    /// contact. Splitting the seam is what lets an unpinned install still be
+    /// rejected for not existing.
+    Resolver {
+        /// Resolves an exact `(ecosystem, name, version)` tuple to full
+        /// provenance. Unpinned/ranged inputs never reach this seam, which is
+        /// what prevents latest-version provenance from being attached to
+        /// different installed bytes.
+        exact: &'a dyn Fn(Ecosystem, &str, &str) -> ApiSignals,
+        /// Answers ONLY "does the registry claim this name exists". The return
+        /// type is deliberately [`PackageExistence`] and not [`ApiSignals`]:
+        /// an unpinned spec must not be able to acquire version-bound
+        /// provenance through this seam by construction, not by convention.
+        name_only: &'a dyn Fn(Ecosystem, &str) -> PackageExistence,
+    },
     /// The real manager has ambient/project source configuration that Tirith
     /// cannot bind to its official-registry client. No registry lookup runs;
     /// this becomes an explicit blocking-grade coverage finding.
@@ -417,13 +434,31 @@ fn plan_install_inner(
     // re-tokenizes `analysis_command`: a Segment is built directly from the
     // exact argv so spaces, empty values, quoting, and metacharacters retain
     // their original argument identity.
-    let extracted: Vec<PackageRef> = match manager {
-        PackageManager::Docker | PackageManager::Go => {
-            extract_packages_manager_specific(manager, request.user_args)
+    let (extracted, packages_truncated): (Vec<PackageRef>, bool) = match manager {
+        PackageManager::Docker | PackageManager::Go => (
+            extract_packages_manager_specific(manager, request.user_args),
+            false,
+        ),
+        _ => {
+            let detail = extract_packages_from_argv(manager, &argv);
+            (detail.packages, detail.truncated)
         }
-        _ => extract_packages_from_argv(manager, &argv),
     };
     let mut coverage = analyze_install_coverage(manager, request.user_args);
+    // A package the extractor dropped is never planned, never scored and never
+    // provenance-bound, so leaving coverage Complete would attach official
+    // provenance to a partially-read command line.
+    if packages_truncated {
+        coverage.push(InstallCoverageGap {
+            kind: InstallCoverageGapKind::PackageListTruncated,
+            argument: "<package operands beyond the extraction cap>".to_string(),
+            reason: format!(
+                "more than {} distinct packages were named in one invocation; the remainder was \
+                 not scored and must not be reported as covered",
+                crate::npm_command::MAX_PACKAGES_PER_INVOCATION
+            ),
+        });
+    }
     if manager == PackageManager::Npm {
         let manifest_gap = match npm_manifest_coverage {
             NpmProjectManifestCoverage::DiscoverFromDisk => {
@@ -811,7 +846,10 @@ pub fn build_argv(manager: PackageManager, user_args: &[String]) -> InstallArgv 
 /// Run the shared package extractor on an exact argv-backed segment. The
 /// extractor sees the same token vector that the CLI runner receives;
 /// `analysis_command` is deliberately not involved.
-fn extract_packages_from_argv(manager: PackageManager, argv: &InstallArgv) -> Vec<PackageRef> {
+fn extract_packages_from_argv(
+    manager: PackageManager,
+    argv: &InstallArgv,
+) -> threatintel::ExtractedPackages {
     let raw = argv.display();
     let segment = Segment {
         byte_range: 0..raw.len(),
@@ -820,7 +858,7 @@ fn extract_packages_from_argv(manager: PackageManager, argv: &InstallArgv) -> Ve
         args: argv.args.clone(),
         preceding_separator: None,
     };
-    threatintel::extract_packages(std::slice::from_ref(&segment))
+    threatintel::extract_packages_detail(std::slice::from_ref(&segment))
 }
 
 fn analyze_install_coverage(manager: PackageManager, user_args: &[String]) -> InstallCoverage {
@@ -2338,7 +2376,7 @@ fn gather_package_signals(
                 }),
             )
         }
-        OnlineMode::Resolver(_) if !registry_source_verified => {
+        OnlineMode::Resolver { .. } if !registry_source_verified => {
             let reason = "the install selects a local, direct, or unverified source, so official-registry provenance was not attached";
             notes.push(format!(
                 "registry-API provenance for '{}' was not used: {reason}",
@@ -2346,22 +2384,50 @@ fn gather_package_signals(
             ));
             (ApiSignals::unavailable(reason), None)
         }
-        OnlineMode::Resolver(_) if pkg.version.exact_version().is_none() => {
+        OnlineMode::Resolver { name_only, .. } if pkg.version.exact_version().is_none() => {
             let reason = "the requested version is not an exact pin, so the artifact selected by the package manager is unresolved";
-            notes.push(format!(
-                "registry-API provenance for '{}' was not used: {reason}",
-                pkg.name
-            ));
-            (
-                ApiSignals::unavailable(reason),
-                Some(InstallCoverageGap {
-                    kind: InstallCoverageGapKind::UnresolvedVersion,
-                    argument: pkg.name.clone(),
-                    reason: reason.to_string(),
-                }),
-            )
+            let gap = Some(InstallCoverageGap {
+                kind: InstallCoverageGapKind::UnresolvedVersion,
+                argument: pkg.name.clone(),
+                reason: reason.to_string(),
+            });
+            // Existence is not resolution. The unresolved-version gap stays
+            // exactly as it was; the probe below only adds the one question an
+            // unpinned spec CAN be answered: does this name exist at all.
+            let registry_name = canonical_registry_name(eco, &pkg.name);
+            match name_only(eco, &registry_name) {
+                PackageExistence::NotFound => {
+                    notes.push(format!(
+                        "the official registry reports that '{}' does not exist; the install was                          not exactly pinned, so no artifact provenance is attached either",
+                        pkg.name
+                    ));
+                    (
+                        // Existence-only provenance: every version-bound field
+                        // stays at its default, so nothing here can vouch for
+                        // the bytes the manager would install.
+                        ApiSignals::Available {
+                            provenance: ApiProvenance {
+                                source: expected_registry_source(eco)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                package_name: Some(registry_name),
+                                package_existence: PackageExistence::NotFound,
+                                ..Default::default()
+                            },
+                        },
+                        gap,
+                    )
+                }
+                _ => {
+                    notes.push(format!(
+                        "registry-API provenance for '{}' was not used: {reason}",
+                        pkg.name
+                    ));
+                    (ApiSignals::unavailable(reason), gap)
+                }
+            }
         }
-        OnlineMode::Resolver(resolve) => {
+        OnlineMode::Resolver { exact: resolve, .. } => {
             let exact_version = pkg
                 .version
                 .exact_version()
@@ -2905,6 +2971,13 @@ pub fn is_clear_to_proceed(verdict: &Verdict) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name-existence probe that answers "unknown" for every name. Existence
+    /// is a separate question from exact-version provenance, so a test that
+    /// does not exercise it must not accidentally assert on it.
+    fn existence_unknown(_eco: Ecosystem, _name: &str) -> PackageExistence {
+        PackageExistence::Unknown
+    }
     use crate::registry_api::{FetchError, RegistryClient, RegistryMetadata};
 
     fn empty_policy() -> Policy {
@@ -3064,6 +3137,58 @@ mod tests {
                 VersionIntent::Exact("2.31".to_string())
             );
         }
+    }
+
+    /// A package the extractor dropped is never planned, scored, or
+    /// provenance-bound. Coverage must say so; otherwise official provenance is
+    /// attached to a command line that was only partly read.
+    #[test]
+    fn a_truncated_package_list_is_a_coverage_gap_not_a_complete_install() {
+        let args: Vec<String> = (0..(crate::npm_command::MAX_PACKAGES_PER_INVOCATION + 5))
+            .map(|index| format!("tirith-synthetic-pkg-{index}"))
+            .collect();
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &args,
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert_eq!(plan.coverage.state, InstallCoverageState::Incomplete);
+        assert!(
+            plan.coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.kind == InstallCoverageGapKind::PackageListTruncated),
+            "the dropped operands must be disclosed: {:?}",
+            plan.coverage.gaps
+        );
+
+        // The same command under the cap stays complete, so the gap is a real
+        // signal rather than a permanent one.
+        let under: Vec<String> = (0..8)
+            .map(|index| format!("tirith-synthetic-pkg-{index}"))
+            .collect();
+        let clean = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &under,
+            db: None,
+            policy: &empty_policy(),
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Off,
+        });
+        assert!(
+            !clean
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.kind == InstallCoverageGapKind::PackageListTruncated),
+            "{:?}",
+            clean.coverage.gaps
+        );
     }
 
     #[test]
@@ -3445,7 +3570,10 @@ mod tests {
             policy: &policy,
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         });
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(plan.verdict.action, Action::Block);
@@ -3490,10 +3618,110 @@ mod tests {
             policy: &empty_policy(),
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         });
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(plan.verdict.action, Action::Warn);
+        assert!(plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == InstallCoverageGapKind::UnresolvedVersion));
+    }
+
+    /// C13: an unpinned spec still gets a NAME-EXISTENCE answer. The exact
+    /// resolver is never called (there is no version to bind), but a plausible
+    /// name the registry does not have is now rejected instead of accepted.
+    #[test]
+    fn online_unpinned_nonexistent_name_is_rejected_without_the_exact_resolver() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let exact_calls = AtomicUsize::new(0);
+        let name_calls = AtomicUsize::new(0);
+        let resolver = |_eco: Ecosystem, _name: &str, _version: &str| {
+            exact_calls.fetch_add(1, Ordering::SeqCst);
+            ApiSignals::offline()
+        };
+        let name_only = |_eco: Ecosystem, _name: &str| {
+            name_calls.fetch_add(1, Ordering::SeqCst);
+            PackageExistence::NotFound
+        };
+        let policy = Policy {
+            package_policy: crate::policy::PackagePolicy {
+                block_not_found: true,
+                ..Default::default()
+            },
+            ..Policy::default()
+        };
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["ghost-package".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &name_only,
+            },
+        });
+        assert_eq!(
+            exact_calls.load(Ordering::SeqCst),
+            0,
+            "an unpinned spec must never acquire version-bound provenance"
+        );
+        assert_eq!(name_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            plan.verdict
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::PackagePolicyNotFound),
+            "a nonexistent name is rejected even when the install is unpinned: {:?}",
+            plan.verdict.findings
+        );
+        // Existence is not resolution: the unresolved-version gap stays.
+        assert!(plan
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == InstallCoverageGapKind::UnresolvedVersion));
+    }
+
+    /// The complement: an unpinned spec whose name DOES exist is unchanged from
+    /// the pre-C13 behavior, so the probe adds a rejection and nothing else.
+    #[test]
+    fn online_unpinned_existing_name_keeps_the_unresolved_version_gap_only() {
+        let resolver = |_eco: Ecosystem, _name: &str, _version: &str| ApiSignals::offline();
+        let name_only = |_eco: Ecosystem, _name: &str| PackageExistence::Exists;
+        let policy = Policy {
+            package_policy: crate::policy::PackagePolicy {
+                block_not_found: true,
+                ..Default::default()
+            },
+            ..Policy::default()
+        };
+        let plan = plan_install(&PlanRequest {
+            manager: PackageManager::Npm,
+            user_args: &["real-package".to_string()],
+            db: None,
+            policy: &policy,
+            cwd: None,
+            interactive: false,
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &name_only,
+            },
+        });
+        assert!(
+            !plan
+                .verdict
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::PackagePolicyNotFound),
+            "an existing name is not rejected"
+        );
         assert!(plan
             .coverage
             .gaps
@@ -3519,7 +3747,10 @@ mod tests {
             policy: &empty_policy(),
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         });
         assert_eq!(plan.verdict.action, Action::Block);
         assert!(plan
@@ -3547,7 +3778,10 @@ mod tests {
             policy: &empty_policy(),
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         });
         assert_eq!(plan.verdict.action, Action::Block);
         assert!(plan
@@ -3579,7 +3813,10 @@ mod tests {
             policy: &policy,
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         });
         assert_eq!(plan.verdict.action, Action::Block);
         assert!(plan
@@ -3626,7 +3863,10 @@ mod tests {
             policy: &policy,
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         });
         assert_eq!(plan.verdict.action, Action::Block);
         assert!(plan.verdict.findings.iter().any(|finding| {
@@ -3657,7 +3897,10 @@ mod tests {
             policy: &empty_policy(),
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         });
         assert!(plan.packages[0].risk.score < crate::policy::DEFAULT_WARN_AGGREGATE_SCORE);
         assert_eq!(plan.verdict.action, Action::Warn);
@@ -3692,7 +3935,10 @@ mod tests {
             policy: &policy,
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         });
         assert!(!plan
             .verdict
@@ -3756,7 +4002,10 @@ mod tests {
             policy: &policy,
             cwd: Some(directory.path().display().to_string()),
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         });
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(plan.verdict.action, Action::Block);
@@ -4223,7 +4472,10 @@ mod tests {
             policy: &empty_policy(),
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         });
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(plan
@@ -4317,7 +4569,10 @@ mod tests {
             policy: &empty_policy(),
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         };
         let plan = plan_install(&req);
         // The aggregate-risk finding must be present and at least Warn.
@@ -4351,7 +4606,10 @@ mod tests {
             policy: &empty_policy(),
             cwd: None,
             interactive: false,
-            online: OnlineMode::Resolver(&resolver),
+            online: OnlineMode::Resolver {
+                exact: &resolver,
+                name_only: &existence_unknown,
+            },
         };
         let plan = plan_install(&req);
         assert_eq!(plan.verdict.action, Action::Warn);

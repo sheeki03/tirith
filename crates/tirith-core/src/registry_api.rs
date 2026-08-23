@@ -85,6 +85,12 @@ pub struct RegistryMetadata {
     /// suspicious lifecycle hook; `None` means the registry cannot provide it.
     #[serde(default)]
     pub install_script_signals: Option<InstallScriptSignals>,
+    /// C13: npm `dist` provenance FACTS for the selected version. Parsed, never
+    /// verified: no code path can raise a state to `Verified`, and the tarball
+    /// bytes are never downloaded, so nothing is bound to them. `None` for a
+    /// non-npm registry or a record with no `dist` object.
+    #[serde(default)]
+    pub npm_dist_facts: Option<crate::provenance::npm_facts::NpmDistFacts>,
 }
 
 /// Why a registry fetch could not produce usable metadata. Every variant is a
@@ -198,6 +204,22 @@ pub fn gather_api_signals(
     name: &str,
 ) -> (ApiSignals, PackageExistence) {
     gather_api_signals_result(client.fetch(ecosystem, name), ecosystem, name, true)
+}
+
+/// Resolve only whether `name` exists in its native registry.
+///
+/// This preserves the same response-identity validation and failure mapping as
+/// [`gather_api_signals`], but deliberately does not write a registry-history
+/// snapshot. Install authorization uses this narrow seam for unpinned package
+/// names: the approved effect is one registry request, not a filesystem write.
+pub fn gather_name_existence(
+    client: &dyn RegistryClient,
+    ecosystem: Ecosystem,
+    name: &str,
+) -> PackageExistence {
+    let (_signals, existence) =
+        gather_api_signals_result(client.fetch(ecosystem, name), ecosystem, name, false);
+    existence
 }
 
 /// Version-bound registry provenance for an install. A successful result is
@@ -345,6 +367,7 @@ pub fn provenance_from_metadata(meta: &RegistryMetadata) -> ApiProvenance {
             .or_else(|| meta.latest_version.clone()),
         install_script_signals: meta.install_script_signals.clone(),
         repository_url,
+        npm_dist: meta.npm_dist_facts.clone(),
         ..Default::default()
     }
 }
@@ -644,15 +667,24 @@ where
     if prior_hops >= MAX_REDIRECTS {
         return Err("too many registry redirects".to_string());
     }
-    if !allow_private_test_base {
-        validate_target(target.as_str())?;
-    }
+    // The origin comparison runs FIRST, and the ordering is load-bearing.
+    // `validate_target` resolves the host over DNS, while `target` is
+    // attacker-influenced text (a redirect `Location`, or a packument's
+    // `dist.tarball`). Validating first turned every off-origin host into a
+    // live lookup against the attacker's own nameserver: an out-of-band beacon,
+    // with an attacker-chosen label as payload, for a URL this function rejects
+    // on the very next line. Comparing first is pure and costs nothing.
+    // Targets that pass the origin rule are still fully validated below, so
+    // this is strictly a narrowing of what gets contacted.
     let same_origin = initial.scheme() == target.scheme()
         && initial.host_str().map(str::to_ascii_lowercase)
             == target.host_str().map(str::to_ascii_lowercase)
         && initial.port_or_known_default() == target.port_or_known_default();
     if !same_origin {
         return Err("registry redirect changed the validated origin".to_string());
+    }
+    if !allow_private_test_base {
+        validate_target(target.as_str())?;
     }
     Ok(())
 }
@@ -788,6 +820,9 @@ fn fetch_npm(
         .map(NpmVersion::deprecated_present)
         .unwrap_or(false);
     let install_script_signals = selected_record.map(NpmVersion::install_script_signals);
+    let npm_dist_facts = selected_record.and_then(|record| {
+        npm_dist_facts_from_record(record, &client.npm_base, !client.enforce_destination_guard)
+    });
 
     let repository_url = doc.repository.as_ref().and_then(|r| r.url_field());
 
@@ -807,7 +842,120 @@ fn fetch_npm(
         repository_url,
         yanked_or_deprecated,
         install_script_signals,
+        npm_dist_facts,
     })
+}
+
+/// Build the C13 provenance facts for one release record.
+///
+/// The only active check here is the tarball URL's ORIGIN. Tirith never fetches
+/// a tarball, but it does display the URL and a receipt may record it, so a
+/// packument that points its `dist.tarball` at a different host, a private or
+/// loopback address, or a plain-http scheme must not have that value pass
+/// through as if the registry vouched for it. The origin rule is the same one
+/// `registry_redirect_decision_with_validator` applies to a redirect: exact
+/// scheme + host + port match against the validated packument origin, plus
+/// `validate_server_url` on the target.
+///
+/// Returns `None` for a record with no `dist` object at all. That is a response
+/// shape Tirith never inspected, not a release with nothing published, and
+/// rendering it as a row of "not published" lines would state a fact about the
+/// registry that the response never carried.
+fn npm_dist_facts_from_record(
+    record: &NpmVersion,
+    registry_base: &str,
+    allow_private_test_base: bool,
+) -> Option<crate::provenance::npm_facts::NpmDistFacts> {
+    use crate::provenance::npm_facts::{
+        attestation_state_from_presence, signature_state_from_entries, NpmDistFacts, SriDigest,
+    };
+
+    let dist = record.dist.as_ref()?;
+
+    let mut facts = NpmDistFacts::default();
+    let base = url::Url::parse(registry_base).ok();
+    facts.registry_origin = base.as_ref().map(registry_origin_display);
+
+    let published_integrity = dist
+        .integrity
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    facts.integrity_sri = published_integrity.and_then(SriDigest::parse);
+    facts.integrity_unparsed = published_integrity.is_some() && facts.integrity_sri.is_none();
+    facts.legacy_shasum_present = dist
+        .shasum
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    let key_ids: Vec<String> = dist
+        .signatures
+        .iter()
+        .filter_map(|entry| entry.keyid.clone())
+        .collect();
+    // The ENTRY count, not the key-id count: a signature published without a
+    // `keyid` is still a published signature.
+    let (signature_state, signature_key_ids) =
+        signature_state_from_entries(dist.signatures.len(), &key_ids);
+    facts.signature_state = signature_state;
+    facts.signature_key_ids = signature_key_ids;
+    facts.attestation_state = attestation_state_from_presence(
+        dist.attestations
+            .as_ref()
+            .is_some_and(|value| !value.is_null()),
+    );
+
+    if let Some(raw) = dist.tarball.as_deref() {
+        match validate_registry_bound_tarball(raw, base.as_ref(), allow_private_test_base) {
+            Ok(url) => facts.tarball_url = Some(url),
+            Err(reason) => {
+                facts.tarball_url_rejected = true;
+                facts.tarball_rejection_reason = Some(reason);
+            }
+        }
+    }
+
+    Some(facts)
+}
+
+/// `scheme://host[:port]` for display, with no path or credentials.
+fn registry_origin_display(base: &url::Url) -> String {
+    match base.port() {
+        Some(port) => format!(
+            "{}://{}:{port}",
+            base.scheme(),
+            base.host_str().unwrap_or_default()
+        ),
+        None => format!(
+            "{}://{}",
+            base.scheme(),
+            base.host_str().unwrap_or_default()
+        ),
+    }
+}
+
+fn validate_registry_bound_tarball(
+    raw: &str,
+    base: Option<&url::Url>,
+    allow_private_test_base: bool,
+) -> Result<String, String> {
+    let accepted = crate::provenance::npm_facts::accept_tarball_url(raw)
+        .ok_or_else(|| "tarball URL is empty or over the retention cap".to_string())?;
+    let target =
+        url::Url::parse(&accepted).map_err(|_| "tarball URL is not a valid URL".to_string())?;
+    let base = base.ok_or_else(|| "the registry base URL could not be parsed".to_string())?;
+    // The redirect decision is reused verbatim rather than re-implemented so a
+    // future tightening of the origin rule applies to both at once. A tarball
+    // URL is a first hop, hence `prior_hops = 0`.
+    registry_redirect_decision_with_validator(
+        base,
+        &target,
+        0,
+        allow_private_test_base,
+        &crate::url_validate::validate_server_url,
+    )
+    .map_err(|reason| format!("tarball URL rejected: {reason}"))?;
+    Ok(accepted)
 }
 
 #[derive(Debug, Deserialize)]
@@ -840,6 +988,37 @@ struct NpmVersion {
     /// `preinstall`, npm synthesizes `node-gyp rebuild` at install time.
     #[serde(default)]
     gypfile: Option<bool>,
+    /// C13: the release's `dist` object. Absent on a minimal/abbreviated
+    /// packument, which is a real "no signal", not a zero value.
+    #[serde(default)]
+    dist: Option<NpmDist>,
+}
+
+/// The `dist` object of one npm release record. Every field is optional
+/// because a registry mirror may omit any of them, and an omitted field must
+/// read as "not published", never as a failed check.
+#[derive(Debug, Deserialize)]
+struct NpmDist {
+    #[serde(default)]
+    tarball: Option<String>,
+    #[serde(default)]
+    integrity: Option<String>,
+    /// npm's legacy SHA-1 of the tarball. Display status only.
+    #[serde(default)]
+    shasum: Option<String>,
+    #[serde(default)]
+    signatures: Vec<NpmDistSignature>,
+    /// Present when the release carries a Sigstore provenance bundle. The
+    /// pointer is NOT followed: fetching it would mean requesting a host the
+    /// packument named, and the bundle could not be verified on this MSRV.
+    #[serde(default)]
+    attestations: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NpmDistSignature {
+    #[serde(default)]
+    keyid: Option<String>,
 }
 
 impl NpmVersion {
@@ -997,6 +1176,8 @@ fn fetch_pypi(
         repository_url,
         yanked_or_deprecated,
         install_script_signals: None,
+        // npm-only provenance facts.
+        npm_dist_facts: None,
     })
 }
 
@@ -1146,6 +1327,8 @@ fn fetch_crates(
         repository_url: doc.krate.repository,
         yanked_or_deprecated,
         install_script_signals: None,
+        // npm-only provenance facts.
+        npm_dist_facts: None,
     })
 }
 
@@ -1512,6 +1695,44 @@ mod tests {
     }
 
     #[test]
+    fn name_existence_validates_identity_without_recording_registry_history() {
+        use crate::ssrf_guard::test_support::EnvironmentRestore;
+
+        let _environment = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let mut restore = EnvironmentRestore::new();
+        restore.set(
+            "XDG_STATE_HOME",
+            Some(state.path().to_str().expect("UTF-8 temp state path")),
+        );
+
+        let client = FakeClient {
+            result: Ok(meta_clean()),
+        };
+        assert_eq!(
+            gather_name_existence(&client, Ecosystem::Npm, "react"),
+            PackageExistence::Exists
+        );
+        assert!(
+            !state.path().join("tirith/registry_snapshots").exists(),
+            "an existence-only lookup must not create registry-history state"
+        );
+
+        let mut mismatched = meta_clean();
+        mismatched.package_name = Some("replacement".to_string());
+        let client = FakeClient {
+            result: Ok(mismatched),
+        };
+        assert_eq!(
+            gather_name_existence(&client, Ecosystem::Npm, "react"),
+            PackageExistence::Unknown,
+            "a successful response for another package cannot prove existence"
+        );
+    }
+
+    #[test]
     fn exact_lookup_never_reuses_different_latest_version() {
         let mut metadata = meta_clean();
         metadata.latest_version = Some("2.0.0".to_string());
@@ -1536,6 +1757,48 @@ mod tests {
         let insecure = url::Url::parse("http://registry.npmjs.org/demo").unwrap();
         assert!(registry_redirect_decision(&initial, &insecure, 0, true).is_err());
         assert!(registry_redirect_decision(&initial, &same_origin, 5, true).is_err());
+    }
+
+    /// A packument's `dist.tarball` and a redirect `Location` are untrusted
+    /// text. `validate_server_url` resolves the host over DNS, so running it
+    /// before the origin comparison turned a rejected off-origin URL into a
+    /// live query against the attacker's own nameserver: an out-of-band beacon
+    /// carrying an attacker-chosen label, emitted for a URL that is refused
+    /// anyway. The cheap comparison must come first.
+    #[test]
+    fn an_off_origin_target_is_refused_before_the_host_is_resolved() {
+        let resolved = std::cell::RefCell::new(Vec::<String>::new());
+        let spy = |url: &str| -> Result<(), String> {
+            resolved.borrow_mut().push(url.to_string());
+            Ok(())
+        };
+        let initial = url::Url::parse("https://registry.npmjs.org/demo").unwrap();
+
+        let off_origin = url::Url::parse("https://exfil-label.attacker.invalid/x.tgz").unwrap();
+        assert!(
+            registry_redirect_decision_with_validator(&initial, &off_origin, 0, false, &spy)
+                .is_err(),
+            "an off-origin target is refused"
+        );
+        assert!(
+            resolved.borrow().is_empty(),
+            "the host of a refused target must never be handed to the resolving validator: {:?}",
+            resolved.borrow()
+        );
+
+        // The validator is not bypassed; it still runs for every target the
+        // origin rule admits.
+        let same_origin =
+            url::Url::parse("https://registry.npmjs.org/demo/-/demo-1.0.0.tgz").unwrap();
+        assert!(
+            registry_redirect_decision_with_validator(&initial, &same_origin, 0, false, &spy)
+                .is_ok()
+        );
+        assert_eq!(
+            resolved.borrow().as_slice(),
+            &["https://registry.npmjs.org/demo/-/demo-1.0.0.tgz".to_string()],
+            "a same-origin target is still fully validated"
+        );
     }
 
     #[test]
@@ -1614,11 +1877,16 @@ mod tests {
             .send()
             .expect_err("private redirect must be refused");
         let messages = request_error_messages(&error);
+        // The refusal now comes from the origin rule rather than destination
+        // validation. An off-origin private target trips the pure comparison
+        // first, so it is refused without resolving or contacting anything;
+        // destination validation still runs for targets that pass the origin
+        // rule (see `an_off_origin_target_is_refused_before_the_host_is_resolved`).
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("non-public")),
-            "private redirect must fail in destination validation: {messages:?}"
+                .any(|message| message.contains("changed the validated origin")),
+            "private redirect must be refused: {messages:?}"
         );
         assert_eq!(
             fixture.finish().len(),

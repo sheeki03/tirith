@@ -227,6 +227,11 @@ help_example_tests! {
     help_incident_stop         => (["incident", "stop", "--help"], "tirith incident stop --yes");
     help_incident_status       => (["incident", "status", "--help"], "tirith incident status");
     help_incident_report       => (["incident", "report", "--help"], "tirith incident report --out");
+    help_attest                    => (["attest", "--help"], "tirith attest build --source . --output dist --out build.receipt.json");
+    help_attest_build              => (["attest", "build", "--help"], "tirith attest build --source . --output dist");
+    help_attest_verify_build       => (["attest", "verify-build", "--help"], "tirith attest verify-build build.receipt.json --source . --output dist");
+    help_attest_deployment         => (["attest", "deployment", "--help"], "tirith attest deployment --build-receipt build.receipt.json --base-url https://app.example");
+    help_attest_verify_deployment  => (["attest", "verify-deployment", "--help"], "tirith attest verify-deployment deployment.receipt.json");
     help_onboard               => (["onboard", "--help"], "tirith onboard --json");
     help_dashboard             => (["dashboard", "--help"], "tirith dashboard serve --port 8765");
     help_dashboard_export      => (["dashboard", "export", "--help"], "tirith dashboard export --out .");

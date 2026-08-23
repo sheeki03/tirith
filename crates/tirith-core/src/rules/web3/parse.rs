@@ -431,8 +431,13 @@ fn is_web3_tool_name(value: &str) -> bool {
     matches!(value, "cast" | "forge" | "hardhat" | "solana" | "anchor")
 }
 
+/// Launcher identity is a purely lexical question, so it comes from the shared
+/// npm grammar rather than a table private to the Web3 parser. The resolution
+/// semantics below (config-layer trust, project-local bin proof, cwd binding)
+/// stay here; only the "is this word an npm-family launcher" answer is shared.
+/// Sharing widens the set by `pnpx`, which tightens the nested-runner guard.
 fn is_package_runner_name(value: &str) -> bool {
-    matches!(value, "npx" | "npm" | "pnpm" | "yarn" | "bun" | "bunx")
+    crate::npm_command::is_package_runner_name(value)
 }
 
 fn is_project_local_bin_command(value: &str) -> bool {
@@ -4511,9 +4516,23 @@ fn parse_foundry_common(
 
 fn foundry_signer(
     parsed: &ParsedArgs,
+    environment: &EffectiveEnvironment,
+    context: &Web3ParseContextV2,
     completeness: &mut Completeness,
     fallback_span: SourceSpan,
 ) -> Option<SignerReferenceV2> {
+    let explicit_signer_requested = [
+        "private-key",
+        "mnemonic",
+        "keystore",
+        "account",
+        "ledger",
+        "trezor",
+        "aws",
+        "unlocked",
+    ]
+    .iter()
+    .any(|name| has_flag(parsed, name));
     let mut candidates = Vec::new();
     for value in values(parsed, "private-key") {
         candidates.push(SignerCandidate {
@@ -4563,7 +4582,34 @@ fn foundry_signer(
             });
         }
     }
-    choose_signer(candidates, completeness)
+    if explicit_signer_requested {
+        // Foundry's CLI flags take precedence over ETH_PRIVATE_KEY. Return
+        // before consulting the environment even when a value-taking flag is
+        // malformed, so a stale ambient key cannot replace the incomplete
+        // signer choice.
+        return choose_signer(candidates, completeness);
+    }
+
+    let selected = environment_value(environment, &["ETH_PRIVATE_KEY"], completeness)
+        .or_else(|| ambient_value(context, &["ETH_PRIVATE_KEY"], completeness));
+    if let Some(selected) = selected {
+        if selected.value.is_empty() {
+            completeness.add(IncompleteReason::SignerMissing);
+            return None;
+        }
+        // The value is signer material by contract, regardless of whether it
+        // happens to match a literal-key grammar. Never retain it for
+        // comparison, Debug, JSON, or a compatibility projection.
+        return Some(SignerReferenceV2::raw(
+            SignerKindV2::RawPrivateKey,
+            selected.source,
+            selected.span,
+        ));
+    }
+    if environment_unresolved(environment, &["ETH_PRIVATE_KEY"]) {
+        completeness.add(IncompleteReason::UnresolvedIndirection);
+    }
+    None
 }
 
 fn foundry_context(
@@ -4693,7 +4739,13 @@ fn parse_cast(
             Web3OperationV2::Send | Web3OperationV2::Create | Web3OperationV2::MakeTransaction
         )
     {
-        if let Some(signer) = foundry_signer(&parsed, &mut facts.completeness, facts.source_span) {
+        if let Some(signer) = foundry_signer(
+            &parsed,
+            environment,
+            context,
+            &mut facts.completeness,
+            facts.source_span,
+        ) {
             push_signer(&mut facts, SignerRole::Default, signer);
         }
     }
@@ -4790,7 +4842,13 @@ fn parse_forge(
         (context, profile, requested_rpc)
     });
     if uses_selectors {
-        if let Some(signer) = foundry_signer(&parsed, &mut facts.completeness, facts.source_span) {
+        if let Some(signer) = foundry_signer(
+            &parsed,
+            environment,
+            context,
+            &mut facts.completeness,
+            facts.source_span,
+        ) {
             push_signer(&mut facts, SignerRole::Default, signer);
         }
     }
@@ -9716,6 +9774,27 @@ mod tests {
         path.to_string_lossy().replace('\\', "/")
     }
 
+    fn assert_signer_secrets_absent(result: &Web3ParseResultV2, secrets: &[&str]) {
+        let v2_json = serde_json::to_string(result).unwrap();
+        let v2_debug = format!("{result:?}");
+        let legacy: Web3ParseResult = result.clone().into();
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        let legacy_debug = format!("{legacy:?}");
+        for secret in secrets {
+            for (projection, rendered) in [
+                ("v2 JSON", v2_json.as_str()),
+                ("v2 Debug", v2_debug.as_str()),
+                ("v1 JSON", legacy_json.as_str()),
+                ("v1 Debug", legacy_debug.as_str()),
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "{projection} retained signer material"
+                );
+            }
+        }
+    }
+
     fn only(command: &str) -> Web3CommandFactsV2 {
         let result = parse(command);
         assert_eq!(result.commands.len(), 1, "{result:?}");
@@ -10680,6 +10759,148 @@ mod tests {
                 .kind(),
             SignerKindV2::RawKeypair
         );
+    }
+
+    #[test]
+    fn foundry_eth_private_key_environment_is_privacy_safe_and_honors_unset() {
+        let leading_secret = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for command in [
+            format!(
+                "ETH_PRIVATE_KEY={leading_secret} cast send 0xabc --rpc-url https://rpc.example"
+            ),
+            format!(
+                "ETH_PRIVATE_KEY={leading_secret} forge script Deploy.s.sol --broadcast --rpc-url https://rpc.example"
+            ),
+        ] {
+            let result = parse(&command);
+            let signer = result.commands[0].signer(SignerRole::Default).unwrap();
+            assert_eq!(signer.kind(), SignerKindV2::RawPrivateKey, "{result:?}");
+            assert_eq!(
+                signer.source(),
+                SelectorSource::LeadingEnvironment,
+                "{result:?}"
+            );
+            assert!(signer.nonsecret_reference().is_none());
+            assert_signer_secrets_absent(&result, &[leading_secret]);
+        }
+
+        let ambient_secret = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut context = Web3ParseContextV2::without_filesystem();
+        context
+            .ambient_selectors
+            .insert("ETH_PRIVATE_KEY".into(), ambient_secret.into());
+        let ambient = parse_web3_commands(
+            "cast send 0xabc --rpc-url https://rpc.example",
+            ShellType::Posix,
+            &context,
+        );
+        let signer = ambient.commands[0].signer(SignerRole::Default).unwrap();
+        assert_eq!(signer.kind(), SignerKindV2::RawPrivateKey);
+        assert_eq!(signer.source(), SelectorSource::AmbientEnvironment);
+        assert!(signer.nonsecret_reference().is_none());
+        assert_signer_secrets_absent(&ambient, &[ambient_secret]);
+
+        context
+            .environment
+            .insert("ETH_PRIVATE_KEY".into(), ambient_secret.into());
+        let unset = parse_web3_commands(
+            "env -u ETH_PRIVATE_KEY cast send 0xabc --rpc-url https://rpc.example",
+            ShellType::Posix,
+            &context,
+        );
+        assert!(unset.commands[0].signer(SignerRole::Default).is_none());
+        assert_signer_secrets_absent(&unset, &[ambient_secret]);
+
+        let empty = parse("ETH_PRIVATE_KEY='' cast send 0xabc --rpc-url https://rpc.example");
+        assert!(empty.commands[0].signer(SignerRole::Default).is_none());
+        assert!(empty
+            .completeness
+            .gaps()
+            .any(|gap| gap == IncompleteReason::SignerMissing));
+
+        let unrelated = parse(&format!(
+            "PRIVATE_KEY={leading_secret} cast send 0xabc --rpc-url https://rpc.example"
+        ));
+        assert!(unrelated.commands[0].signer(SignerRole::Default).is_none());
+        assert_signer_secrets_absent(&unrelated, &[leading_secret]);
+    }
+
+    #[test]
+    fn foundry_explicit_signers_precede_eth_private_key_exhaustively() {
+        let ambient_secret = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let explicit_secret = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let cases = [
+            (
+                format!("--private-key {explicit_secret}"),
+                SignerKindV2::RawPrivateKey,
+                Some(explicit_secret),
+            ),
+            (
+                format!("--mnemonic '{mnemonic}'"),
+                SignerKindV2::Mnemonic,
+                Some(mnemonic),
+            ),
+            (
+                "--keystore wallet.json".into(),
+                SignerKindV2::Keystore,
+                None,
+            ),
+            (
+                "--account deployer".into(),
+                SignerKindV2::AccountAlias,
+                None,
+            ),
+            ("--ledger".into(), SignerKindV2::Ledger, None),
+            ("--trezor".into(), SignerKindV2::Trezor, None),
+            ("--aws".into(), SignerKindV2::AwsKms, None),
+            ("--unlocked".into(), SignerKindV2::UnlockedNode, None),
+        ];
+        for (arguments, expected_kind, explicit_material) in cases {
+            let result = parse(&format!(
+                "ETH_PRIVATE_KEY={ambient_secret} cast send 0xabc --rpc-url https://rpc.example {arguments}"
+            ));
+            let signer = result.commands[0].signer(SignerRole::Default).unwrap();
+            assert_eq!(signer.kind(), expected_kind, "{arguments}: {result:?}");
+            assert_eq!(
+                signer.source(),
+                SelectorSource::ExplicitFlag,
+                "{arguments}: {result:?}"
+            );
+            let mut secrets = vec![ambient_secret];
+            secrets.extend(explicit_material);
+            assert_signer_secrets_absent(&result, &secrets);
+        }
+
+        let conflict = parse(&format!(
+            "ETH_PRIVATE_KEY={ambient_secret} cast send 0xabc --rpc-url https://rpc.example --ledger --keystore wallet.json"
+        ));
+        let signer = conflict.commands[0].signer(SignerRole::Default).unwrap();
+        assert_eq!(signer.kind(), SignerKindV2::Unknown);
+        assert_eq!(signer.source(), SelectorSource::Unresolved);
+        assert!(conflict
+            .completeness
+            .gaps()
+            .any(|gap| gap == IncompleteReason::ConflictingSelector));
+        assert_signer_secrets_absent(&conflict, &[ambient_secret]);
+
+        for flag in ["--private-key", "--mnemonic", "--keystore", "--account"] {
+            let malformed = parse(&format!(
+                "ETH_PRIVATE_KEY={ambient_secret} cast send 0xabc --rpc-url https://rpc.example {flag}"
+            ));
+            assert!(
+                malformed.commands[0].signer(SignerRole::Default).is_none(),
+                "{flag}: {malformed:?}"
+            );
+            assert!(
+                malformed
+                    .completeness
+                    .gaps()
+                    .any(|gap| gap == IncompleteReason::MissingFlagValue),
+                "{flag}: {malformed:?}"
+            );
+            assert_signer_secrets_absent(&malformed, &[ambient_secret]);
+        }
     }
 
     #[test]
