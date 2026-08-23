@@ -55,6 +55,73 @@ fn yaml_key<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> &'a serde_yaml::
         .unwrap_or_else(|| panic!("release workflow is missing {key:?}"))
 }
 
+fn uses_is_immutably_pinned(uses: &str) -> bool {
+    if uses.starts_with("./") {
+        return true;
+    }
+    if let Some(image) = uses.strip_prefix("docker://") {
+        let digest = image
+            .rsplit_once("@sha256:")
+            .map(|(_, digest)| digest)
+            .unwrap_or_default();
+        return digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    let revision = uses
+        .rsplit_once('@')
+        .map(|(_, revision)| revision)
+        .unwrap_or_default();
+    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[test]
+fn composite_action_keeps_third_party_actions_pinned_to_full_commit_shas() {
+    let action_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("action.yml");
+    let action = std::fs::read_to_string(&action_path).expect("read composite action");
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(&action).expect("composite action must be valid YAML");
+    let root = document
+        .as_mapping()
+        .expect("composite action root mapping");
+    let runs = yaml_key(root, "runs")
+        .as_mapping()
+        .expect("composite action runs mapping");
+    let steps = yaml_key(runs, "steps")
+        .as_sequence()
+        .expect("composite action steps sequence");
+
+    for step in steps {
+        let step = step.as_mapping().expect("composite action step mapping");
+        // Skip only when the key is absent. Folding a non-string value into the
+        // same `continue` would let `uses: 123` pass the pinning gate unchecked.
+        let Some(value) = step.get(serde_yaml::Value::String("uses".to_string())) else {
+            continue;
+        };
+        let uses = value
+            .as_str()
+            .unwrap_or_else(|| panic!("composite-action `uses` must be a string, got {value:?}"));
+        assert!(
+            uses_is_immutably_pinned(uses),
+            "composite-action reference {uses:?} must be a local path, a full commit SHA, or a sha256-digest container"
+        );
+    }
+}
+
+#[test]
+fn mutable_docker_tags_are_not_immutable_pins() {
+    assert!(!uses_is_immutably_pinned(
+        "docker://ghcr.io/example/tool:latest"
+    ));
+    assert!(uses_is_immutably_pinned(&format!(
+        "docker://ghcr.io/example/tool@sha256:{}",
+        "ab".repeat(32)
+    )));
+    assert!(uses_is_immutably_pinned(
+        "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
+    ));
+}
+
 #[test]
 fn release_workflow_keeps_manual_dispatch_non_publishing() {
     let workflow_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
