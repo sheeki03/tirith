@@ -223,11 +223,11 @@ pub use task_receipt::{
     DurableReplayStore, EnforcementProjectionV1, GatewayEnforcementProjectionV1,
     McpToolIdentityProjectionV1, ProvenanceReceiptV2, ReceiptEffectiveShell,
     ReceiptGatewayFailMode, ReceiptGatewayWarnAction, ReceiptServerRequestPolicy, ReceiptV2Error,
-    ReplayOutcome, ReplayReservation, ReplayReservationOutcome, ReplayStore, ReplayStoreError,
-    ResourceCeilingsProjectionV1, SecureProfileFloorProjectionV1, TaskAuthorizationProjectionV1,
-    TaskGateAuthorizationProjectionV1, ToolIdentityProjectionV1, ValidatedReceiptV2,
-    PROVENANCE_RECEIPT_V2, RECEIPT_V2_CLOCK_SKEW_SECONDS, RECEIPT_V2_MAX_TTL_SECONDS,
-    TASK_AUTHORIZATION_PROJECTION_V1,
+    ReplayKnownZeroRollback, ReplayOutcome, ReplayReservation, ReplayReservationOutcome,
+    ReplayStore, ReplayStoreError, ResourceCeilingsProjectionV1, SecureProfileFloorProjectionV1,
+    TaskAuthorizationProjectionV1, TaskGateAuthorizationProjectionV1, ToolIdentityProjectionV1,
+    ValidatedReceiptV2, PROVENANCE_RECEIPT_V2, RECEIPT_V2_CLOCK_SKEW_SECONDS,
+    RECEIPT_V2_MAX_TTL_SECONDS, TASK_AUTHORIZATION_PROJECTION_V1,
 };
 pub(crate) use task_receipt::{
     validate_canonical_acquisition_identity, validate_receipt_context_identifier,
@@ -569,6 +569,55 @@ pub struct InferredEffects {
     pub complete: bool,
 }
 
+/// Whether a config-write path names Tirith's own policy document.
+///
+/// Policy writes control every later authorization answer and therefore carry
+/// [`CommandEffectKind::PolicyChange`] in addition to the generic persistent
+/// write effects. Classification is lexical because an envelope path is not
+/// resolved on this host: normalize separators and dot components, reject
+/// unresolved traversal and ambiguous/device roots, then match the terminal
+/// Tirith policy components using the input dialect's case rules.
+fn names_tirith_policy(path: &str) -> bool {
+    if path.is_empty() || path.ends_with('/') || path.ends_with('\\') {
+        return false;
+    }
+    let Ok(path) = crate::lexical_path::LexicalPath::parse_auto(path) else {
+        return false;
+    };
+    if !path.parent_state().is_clean() {
+        return false;
+    }
+    match path.root_class() {
+        crate::lexical_path::RootClass::Relative
+        | crate::lexical_path::RootClass::PosixRoot
+        | crate::lexical_path::RootClass::DriveAbsolute
+        | crate::lexical_path::RootClass::Unc => {}
+        crate::lexical_path::RootClass::Verbatim if path.is_fully_qualified() => {}
+        crate::lexical_path::RootClass::DriveRelative
+        | crate::lexical_path::RootClass::RootedNoDrive
+        | crate::lexical_path::RootClass::Verbatim
+        | crate::lexical_path::RootClass::Device => return false,
+    }
+
+    let components = path.components();
+    if components.len() < 2 {
+        return false;
+    }
+    let parent = &components[components.len() - 2];
+    let file = &components[components.len() - 1];
+    match path.dialect() {
+        crate::lexical_path::PathDialect::Posix => {
+            matches!(parent.as_str(), ".tirith" | "tirith")
+                && matches!(file.as_str(), "policy.yaml" | "policy.yml")
+        }
+        crate::lexical_path::PathDialect::Windows => {
+            // Windows components are already ASCII-folded by LexicalPath.
+            matches!(parent.as_str(), ".tirith" | "tirith")
+                && matches!(file.as_str(), "policy.yaml" | "policy.yml")
+        }
+    }
+}
+
 /// Infer the effects an action actually has.
 ///
 /// Deliberately ignores anything the envelope says about itself. A task that
@@ -719,6 +768,9 @@ pub fn infer_effects_detailed_with_context(
                 effects.insert(CommandEffectKind::SecretRead);
             }
             effects.insert(CommandEffectKind::PersistenceChange);
+            if names_tirith_policy(path) {
+                effects.insert(CommandEffectKind::PolicyChange);
+            }
         }
         // Natural language is not a grant and not an effect. It is recorded by
         // the caller as an unmodelled request, nothing more.
@@ -1266,6 +1318,57 @@ mod tests {
             !mixed.complete,
             "the exfiltration half is not modelled, so the line is not complete"
         );
+    }
+
+    #[test]
+    fn normalized_tirith_policy_writes_are_policy_changes() {
+        for path in [
+            ".tirith/policy.yaml",
+            ".tirith/policy.yml",
+            ".tirith/x/../policy.yaml",
+            "/repo/.tirith/policy.yaml",
+            "/etc/tirith/policy.yml",
+            "~/.config/tirith/policy.yaml",
+            r"C:\Users\dev\repo\.TIRITH\x\..\POLICY.YAML",
+            r"\\Server\Share\.TIRITH\POLICY.YML",
+            r"\\?\C:\repo\.TIRITH\POLICY.YAML",
+        ] {
+            let inferred = infer_effects(&ProposedAction::ConfigWrite { path: path.into() });
+            assert!(
+                inferred.contains(&CommandEffectKind::PolicyChange),
+                "normalized Tirith policy path {path:?} was not classified as a policy change"
+            );
+            assert!(inferred.contains(&CommandEffectKind::FilesystemWrite));
+            assert!(inferred.contains(&CommandEffectKind::PersistenceChange));
+        }
+    }
+
+    #[test]
+    fn escaped_ambiguous_or_nonpolicy_paths_are_not_policy_changes() {
+        for path in [
+            ".tirith/../policy.yaml",
+            ".TIRITH/policy.yaml",
+            ".tirith/Policy.yaml",
+            "tirith/POLICY.YAML",
+            "../repo/.tirith/policy.yaml",
+            "/../../repo/.tirith/policy.yaml",
+            r"..\repo\.tirith\policy.yaml",
+            r"C:repo\.tirith\policy.yaml",
+            r"\repo\.tirith\policy.yaml",
+            r"\\.\C:\repo\.tirith\policy.yaml",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\.tirith\policy.yaml",
+            ".tirith/policy.yaml/",
+            ".tirith/policy.yaml.bak",
+            "docs/policy.yaml",
+            "policy.yaml",
+            ".tirith/policy.yaml\0suffix",
+        ] {
+            let inferred = infer_effects(&ProposedAction::ConfigWrite { path: path.into() });
+            assert!(
+                !inferred.contains(&CommandEffectKind::PolicyChange),
+                "non-policy or unsafe path {path:?} was classified as a policy change"
+            );
+        }
     }
 
     #[test]

@@ -824,6 +824,9 @@ mod tests {
 
     #[test]
     fn a_missing_profile_directory_is_a_usage_error() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = tempfile::tempdir().expect("tempdir");
         let error = validate_profile_path(&root.path().join("absent"))
             .expect_err("an absent profile is refused");
@@ -841,6 +844,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_profile_argument_is_refused() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = tempfile::tempdir().expect("tempdir");
         let real = root.path().join("real");
         std::fs::create_dir(&real).expect("create");

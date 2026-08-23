@@ -29,6 +29,11 @@
 | Docker untrusted registry | Ecosystem rules | `docker_untrusted_registry` |
 | Git typosquatting | Levenshtein distance | `git_typosquat` |
 | Double-encoded paths | Normalization | `double_encoding` |
+| On-chain writes from a compromised or careless command | Bounded Cast / Forge / Hardhat / Solana / Anchor grammar | `web3_state_changing_command` |
+| Signer material on the command line | Same grammar, signer KIND only | `web3_signer_risk` |
+| An RPC endpoint or signer the operator did not trust | `web3_guard` comparison | `web3_network_policy_violation` |
+| Wallet, keystore, or seed material flowing to a remote sink | Source-to-sink dataflow over the reviewed asset catalog | `data_exfiltration`, `credential_file_sweep` |
+| CI build-artifact poisoning across workflows | Repository post-pass over `.github/workflows/` | `workflow_artifact_poisoning` |
 
 ## Explicit Non-Goals
 
@@ -54,7 +59,7 @@
   they stop nothing, and both declare `enforceability: observe_only` so the
   limit is visible in their own output rather than only in this document. An
   arbitrary shell, or an MCP client that does not route through `tirith gateway
-  run`, can ignore them entirely. The task gate ENFORCES at exactly five
+  run`, can ignore them entirely. The task gate ENFORCES at exactly six
   tirith-owned irreversible transitions, and nowhere else:
   - the MCP gateway's upstream forward, before pending registration;
   - `tirith pkg approve` / `tirith pkg install`, before resolver network and
@@ -66,7 +71,10 @@
   - a tirith-owned configuration write, before the final atomic rename. This
     covers every `.tirith/` file tirith publishes: the policy, the commands
     manifest, the MCP lock (from `tirith mcp lock` and from the gateway's
-    descriptor approval alike), and the MCP policy scaffold.
+    descriptor approval alike), and the MCP policy scaffold;
+  - `tirith capsule run --preset untrusted-project`, before the untrusted
+    project is copied into the held ephemeral directory and before anything is
+    spawned.
 
   Two consequences are stated rather than papered over. First, the `tirith run`
   download itself lives in `tirith-core`'s runner, so the gate sits in the CLI:
@@ -76,11 +84,45 @@
   through tirith, is not intercepted.
 - **Task-gate coverage of general shell**: task effect inference models the
   Web3 command grammar and reports every other shell segment as INCOMPLETE.
-  That is honest about coverage, but it means `task_gate.mode: enforce` combined
-  with `action_incomplete_analysis: block` refuses nearly every guarded command,
-  because nearly every guarded command is incompletely modelled. Leave
-  `action_incomplete_analysis` at its `warn` default and express enforcement
-  through `effects_denied_for_untrusted_sources` instead.
+  With `task_gate.mode: enforce`, `action_incomplete_analysis: block` therefore
+  refuses nearly every unmodelled shell command at the five boundaries that
+  submit a shell envelope. It changes nothing at the four that submit package or
+  config-write envelopes, which always assess as complete. `warn` is the
+  default. `effects_denied_for_untrusted_sources` is the alternative, but it
+  denies the named effect on EVERY call at every owned boundary, including
+  commands the operator typed, because no source at these boundaries is ever
+  trusted.
+- **Inert `web3_guard` fields**: `deny_destinations`, `require_command_card`,
+  `command_card_key_ids`, `selector_aliases`, and the `web3_guard` copies of
+  `action_incomplete_analysis` and `action_ambiguous_hardhat_production_run` are
+  parsed, validated, and merged, but no rule reads them. A denied destination is
+  not flagged and a required command card is not demanded. Treat them as
+  reserved configuration, not as controls.
+- **On-chain analysis**: the Web3 guard reads command GRAMMAR. It does not read
+  chain state, simulate or dry-run a transaction, resolve an ENS name, score an
+  address or a counterparty, audit a contract, watch a mempool, or attribute an
+  on-chain incident. An unrecognized RPC endpoint is reported as unclassified
+  and says in so many words that this is not a claim the host is malicious.
+- **An npm artifact firewall**: tirith parses npm command grammar and registry
+  identity facts, and it can ask the project's own npm to report its signature
+  and provenance state. It does **not** download, extract, quarantine, hash, or
+  bind the tarball bytes npm installs, and there is no npm install transaction
+  and no npm rollback. The artifact firewall with quarantined bytes and a
+  contained install remains Python-only.
+- **Browser forensics or monitoring**: `tirith browser audit` is an explicit,
+  one-shot, read-only integrity audit of extension SOURCE trees for Chrome,
+  Chromium, Brave, and Edge. It never reads cookies, history, saved passwords,
+  Local Storage, IndexedDB, extension storage, wallet databases, or
+  `Local State`, so it cannot see browsing data or the signed-in account. It
+  never removes, quarantines, or watches anything, has no daemon, and attributes
+  no infostealer. Firefox and XPI are refused by name.
+- **Reproducible builds**: `tirith attest build` records the bytes of two named
+  trees at one moment. Tirith does not run the build, does not observe the
+  compiler, and cannot say the output was produced from the source. Two receipts
+  over the same source with different outputs are both valid receipts. A
+  deployment receipt likewise proves only that the routes it fetched returned
+  those bytes at that timestamp; it is not continuous monitoring and says
+  nothing about routes it did not fetch.
 
 ### `tirith temp-run` is file isolation, NOT a sandbox
 
@@ -121,6 +163,12 @@ tirith-launched surfaces can route their child process through:
 - `tirith gateway run --capsule` spawns the upstream MCP server contained
   (deny-network).
 - `tirith pkg install` (a later milestone) installs only inside the capsule.
+- `tirith capsule run --preset untrusted-project` copies an untrusted project
+  into a held ephemeral directory and runs an exact argv there. It is
+  enforceable on x86_64 Linux with a usable Landlock ABI and refuses on every
+  other host before anything is copied or spawned, with no degraded fallback.
+  Domain allow-listing is not offered by the preset, because
+  `domain_proxy_enforced` is false in every backend.
 
 The capsule is **honest about what it enforces**. Every backend reports a
 per-capability coverage ledger and never claims a control it did not apply. The

@@ -1684,9 +1684,6 @@ mod tests {
     fn callback_sender_rejects_connect_time_private_dns_rebind() {
         use crate::ssrf_guard::test_support::EnvironmentRestore;
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut restore = EnvironmentRestore::new();
         restore.set("TIRITH_ALLOW_HTTP", Some("1"));
         let url = "http://callback-public.example.test:8080/canary";
@@ -1736,9 +1733,6 @@ mod tests {
             http_response, EnvironmentRestore, ScriptedHttpServer,
         };
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut restore = EnvironmentRestore::new();
         restore.set("TIRITH_ALLOW_HTTP", Some("1"));
         let location = "http://127.0.0.1:9/internal";
@@ -1798,9 +1792,6 @@ mod tests {
             http_response, EnvironmentRestore, ProxyTrap, ScriptedHttpServer,
         };
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = ScriptedHttpServer::start(vec![http_response("204 No Content", &[], b"")]);
         let proxy = ProxyTrap::start();
         let mut restore = EnvironmentRestore::new();

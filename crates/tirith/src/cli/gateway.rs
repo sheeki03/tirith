@@ -3999,6 +3999,7 @@ fn handle_unmatched_tool_call(
     ) {
         Ok(()) => Ok(()),
         Err(GuardedForwardError::Authorization(error)) => {
+            let error = complete_known_zero_replay_rollback(error);
             if let Ok(mut table) = pending.lock() {
                 table.discard_before_forward(direction, &registered.proxy_id);
             }
@@ -4828,6 +4829,7 @@ fn handle_guarded_call(
                         Ok(())
                     }
                     Err(GuardedForwardError::Authorization(error)) => {
+                        let error = complete_known_zero_replay_rollback(error);
                         if let Err(abort_error) = abort_pending_execution_known_zero(
                             pending,
                             direction,
@@ -7654,7 +7656,7 @@ fn forward(writer: &mut impl Write, line: &[u8]) -> io::Result<()> {
 
 #[derive(Debug)]
 enum GuardedForwardError {
-    Authorization(tirith_core::task_boundary::BoundaryAuthorizationError),
+    Authorization(tirith_core::task_boundary::BoundaryEffectCommitError),
     Transport(io::Error),
 }
 
@@ -7696,6 +7698,32 @@ fn complete_known_zero_execution_rollback(
             }
         }
     }
+}
+
+fn complete_known_zero_replay_rollback(
+    error: tirith_core::task_boundary::BoundaryEffectCommitError,
+) -> tirith_core::task_boundary::BoundaryAuthorizationError {
+    let (error, rollback) = error.into_parts();
+    let Some(mut rollback) = rollback else {
+        return error;
+    };
+    let mut attempts = 0_u64;
+    while !rollback.is_complete() {
+        match rollback.retry() {
+            Ok(()) => break,
+            Err(rollback_error) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts % 20 == 0 {
+                    eprintln!(
+                        "tirith gateway: known-zero replay rollback is still pending after \
+                         {attempts} attempt(s): {rollback_error}; forwarding remains stopped"
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    error
 }
 
 fn forward_guarded(
@@ -12932,11 +12960,17 @@ policy:
     fn test_handle_guarded_call_duplicate_active_id_denies() {
         // End to end: a guarded forward whose id is already pending is denied with
         // a `duplicate_active_id` envelope and is NOT written upstream.
+        // C19 isolation: this call reaches `prepare_execution`, which drafts a
+        // durable strict-execution ledger keyed by session id. Keep the ledger
+        // and its separate tamper-evidence sidecar beneath a per-run state root
+        // so an ambient newer-schema ledger cannot affect this test.
         use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
 
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_xdg = std::env::var_os("XDG_STATE_HOME");
+        let previous_home = std::env::var_os("HOME");
         let root = tempfile::tempdir().expect("isolate duplicate-id gateway state");
         let _state = EnvGuard::set("XDG_STATE_HOME", root.path());
         let _home = EnvGuard::set("HOME", root.path());
@@ -12957,6 +12991,23 @@ policy:
         let isolated_state_path = tirith_core::session_warnings::session_state_path(&session_id)
             .expect("isolated gateway session path");
         assert!(isolated_state_path.starts_with(&isolated_state_root));
+        let isolated_sessions = isolated_state_path
+            .parent()
+            .expect("gateway session path has a parent")
+            .to_path_buf();
+        let ambient_state_path = previous_xdg
+            .map(std::path::PathBuf::from)
+            .map(|root| {
+                root.join("tirith")
+                    .join("sessions")
+                    .join(format!("{session_id}.json"))
+            })
+            .or_else(|| {
+                previous_home.map(std::path::PathBuf::from).map(|home| {
+                    home.join(".local/state/tirith/sessions")
+                        .join(format!("{session_id}.json"))
+                })
+            });
 
         let config = test_config();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -13001,6 +13052,24 @@ policy:
             v["result"]["structuredContent"]["reason"],
             "duplicate_active_id"
         );
+
+        // Prove the isolation rather than assuming it: whatever this call
+        // drafted has to be inside the per-run directory. `state_dir()` is read
+        // while the guard is still live, so it resolves to the fresh root.
+        let state_root = tirith_core::policy::state_dir().expect("isolated state dir");
+        assert_eq!(
+            state_root, isolated_state_root,
+            "strict execution state must resolve to the shared guard's isolated root"
+        );
+        assert!(
+            isolated_sessions
+                .join(format!("{session_id}.execution"))
+                .exists(),
+            "strict execution preparation must stay inside the isolated state root"
+        );
+        if let Some(ambient_state_path) = ambient_state_path {
+            assert_ne!(ambient_state_path, isolated_state_path);
+        }
     }
 
     #[test]

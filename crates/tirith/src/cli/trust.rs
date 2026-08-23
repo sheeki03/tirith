@@ -3016,6 +3016,9 @@ mod tests {
 
     #[test]
     fn test_store_roundtrip() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trust.json");
 
@@ -3044,6 +3047,9 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn repo_store_roundtrip_is_atomic_and_leaves_no_temp_files() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join(".tirith/trust.json");
         assert!(load_repo_store(&path).unwrap().entries.is_empty());
@@ -3446,17 +3452,51 @@ mod tests {
         assert_eq!(removed, vec![&"A"]);
     }
 
-    /// Plant a `last_trigger.json` under a temp data dir and run `f` with
-    /// `data_dir()` pointed at it. Holds `ENV_LOCK` (process-global env mutation)
-    /// and restores `XDG_DATA_HOME` / `APPDATA` on Drop. `data_dir()` honors
-    /// `XDG_DATA_HOME` on Unix but `%APPDATA%` on Windows (etcetera), so set both.
+    /// Redirect every base directory this module resolves at runtime into one
+    /// temp root, and hand the root back so a caller can seed or inspect it.
+    ///
+    /// `data_dir()` (where `last_trigger.json` lives) is only half of it. The
+    /// trust store itself is `config_dir()/trust.json`, and
+    /// `from_last_trigger(--apply)` calls `add()`, so leaving `XDG_CONFIG_HOME`
+    /// alone appended a real allowlist entry to the operator's own
+    /// `~/.config/tirith/trust.json` on every `cargo test --workspace`. That
+    /// file is read on the analysis hot path by `Policy::load_trust_entries`,
+    /// so the residue suppresses a rule for the operator and for every later
+    /// test that analyzes a matching URL. Both values are returned so the
+    /// caller keeps them alive.
+    ///
+    /// Deliberately NOT `HOME`/`USERPROFILE`: every base directory this module
+    /// resolves goes through an XDG variable on unix and `%APPDATA%` on
+    /// Windows, so redirecting the home directory buys nothing here, and
+    /// `cli::daemon`'s tests remove `HOME` without holding `ENV_LOCK`. A second
+    /// unsynchronized writer of that variable would trade one race for another.
+    fn isolated_base_dirs() -> (tempfile::TempDir, Vec<crate::cli::test_harness::EnvGuard>) {
+        use crate::cli::test_harness::EnvGuard;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guards = [
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ]
+        .into_iter()
+        .map(|key| EnvGuard::set(key, dir.path()))
+        .collect();
+        (dir, guards)
+    }
+
+    /// Plant a `last_trigger.json` under a temp data dir and run `f` with every
+    /// base directory pointed at it. Holds `ENV_LOCK` (process-global env
+    /// mutation) and restores each variable on Drop. `data_dir()` honors
+    /// `XDG_DATA_HOME` on Unix but `%APPDATA%` on Windows (etcetera), so both
+    /// spellings are set.
     fn with_seeded_last_trigger<F: FnOnce()>(json: &str, f: F) {
-        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        use crate::cli::test_harness::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _xdg = EnvGuard::set("XDG_DATA_HOME", dir.path());
-        let _appdata = EnvGuard::set("APPDATA", dir.path());
+        let (dir, _guards) = isolated_base_dirs();
 
         let tirith_data = dir.path().join("tirith");
         fs::create_dir_all(&tirith_data).expect("create data dir");
@@ -3467,13 +3507,45 @@ mod tests {
 
     /// Same env isolation, but plant NO `last_trigger.json` (empty data dir).
     fn with_empty_data_dir<F: FnOnce()>(f: F) {
-        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        use crate::cli::test_harness::ENV_LOCK;
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _xdg = EnvGuard::set("XDG_DATA_HOME", dir.path());
-        let _appdata = EnvGuard::set("APPDATA", dir.path());
+        let (_dir, _guards) = isolated_base_dirs();
         f();
+    }
+
+    /// The harness has to move the STORE, not just the trigger file.
+    ///
+    /// `from_last_trigger_apply_partial_failure_returns_one` calls
+    /// `from_last_trigger(true)`, which calls `add()`, which writes
+    /// `config_dir()/trust.json`. While the harness redirected only
+    /// `XDG_DATA_HOME`/`APPDATA` that write landed in the operator's real
+    /// `~/.config/tirith/trust.json`, one live 30-day allowlist entry per
+    /// `cargo test --workspace`. `Policy::load_trust_entries` reads that file on
+    /// the analysis hot path, so the residue silently suppresses a rule for the
+    /// operator and for any later test that analyzes a matching URL.
+    #[test]
+    fn the_trust_harness_never_resolves_the_operators_own_store() {
+        use crate::cli::test_harness::ENV_LOCK;
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Resolved under the lock and BEFORE the guards, so this is the real
+        // path the binary would use on this machine.
+        let operator_store = trust_store_path("user").expect("operator trust store path");
+
+        let (dir, _guards) = isolated_base_dirs();
+        let harness_store = trust_store_path("user").expect("harness trust store path");
+
+        assert!(
+            harness_store.starts_with(dir.path()),
+            "the trust harness resolves {}, which is outside its temp root {}",
+            harness_store.display(),
+            dir.path().display()
+        );
+        assert_ne!(
+            harness_store, operator_store,
+            "the trust harness would write the operator's own store"
+        );
     }
 
     /// A full-URL evidence target is suggested NARROW: a copy/paste-ready

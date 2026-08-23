@@ -591,36 +591,6 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(name);
-            // SAFETY: every caller holds TEST_ENV_LOCK until Drop restores the
-            // previous value.
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds TEST_ENV_LOCK.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.name, value),
-                    None => std::env::remove_var(self.name),
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
     fn write_marker_executable(path: &Path, marker: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -664,12 +634,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terraform_show_rejects_path_shadowed_terraform_and_tofu() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global IaC test state");
         let temporary = tempfile::Builder::new()
             .prefix("tirith-iac-shadow-")
-            .tempdir_in(home::home_dir().expect("test account home"))
+            .tempdir_in(&global.roots().home)
             .unwrap();
         let shadow_bin = temporary.path().join("shadow-bin");
         std::fs::create_dir(&shadow_bin).unwrap();
@@ -681,7 +650,7 @@ mod tests {
         let inherited = std::env::var_os("PATH").unwrap_or_default();
         let mut path_entries = vec![shadow_bin];
         path_entries.extend(std::env::split_paths(&inherited));
-        let _path = EnvVarGuard::set("PATH", std::env::join_paths(path_entries).unwrap());
+        global.set_env("PATH", std::env::join_paths(path_entries).unwrap());
         let plan = temporary.path().join("reviewed.tfplan");
         std::fs::write(&plan, b"reviewed plan bytes").unwrap();
 

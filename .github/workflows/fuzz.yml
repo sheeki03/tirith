@@ -1,9 +1,11 @@
 name: Fuzz
 
 on:
+  pull_request:
   schedule:
     - cron: "0 3 * * 1" # Monday 3am UTC
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -23,6 +25,12 @@ jobs:
           - extractor
           - normalizer
           - byte_scanner
+          - artifact_wheel
+          - lexical_path
+          - npm_command
+          - task_envelope
+          - web3_command
+          - workflow_artifact
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -30,17 +38,28 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-06-01
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Preflight locked fuzz dependencies
+        run: |
+          git ls-files --error-unmatch fuzz/Cargo.lock
+          cargo +nightly fetch --manifest-path fuzz/Cargo.toml --locked
+          git diff --exit-code -- fuzz/Cargo.lock
 
       - name: Run fuzzer
         run: |
           cd fuzz
           cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
         env:
+          CARGO_NET_OFFLINE: "true"
           RUSTFLAGS: "-C debuginfo=0"
+
+      - name: Verify fuzz lockfile is unchanged
+        if: always()
+        run: git diff --exit-code -- fuzz/Cargo.lock
 
       - name: Upload crash artifacts
         if: failure()

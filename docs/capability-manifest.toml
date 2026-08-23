@@ -137,6 +137,13 @@ coverage = "Inspects the command and flags high-impact behavior the stated inten
 policy_complete = true
 
 [[command]]
+name = "task check"
+group = "Scan & analyze"
+inspected = "partial"
+coverage = "Preview, diagnostic. Parses a bounded untrusted task envelope in full and assigns each source's effective provenance from the tirith-owned ingress adapter rather than the document's own claim, but effect inference models the Web3 shell grammar and nothing else, so a proposed shell action outside that grammar is reported INCOMPLETE rather than understood. Executes nothing, fetches nothing, resolves no package, and writes nothing; it declares enforceability observe_only, so it reports what an envelope would be allowed to do and stops nothing."
+policy_complete = true
+
+[[command]]
 name = "lab"
 group = "Scan & analyze"
 inspected = "full"
@@ -485,6 +492,34 @@ inspected = "full"
 coverage = "Repo command manifest: a bounded allowlist plus an elevation-only dangerous[] list, inspected against the invoked command."
 policy_complete = true
 
+[[command]]
+name = "attest build"
+group = "Supply-chain"
+inspected = "full"
+coverage = "Hashes every regular file of a source tree and an output tree into one deterministic digest each, plus the commit and dirty state, lockfile digests, policy projection hash, a REDACTED argv digest, and the per-file output manifest. Every symlink, non-regular entry, non-UTF-8 path, case or Unicode collision, and mid-hash change is a REFUSAL, never a silently skipped entry. This is a point-in-time record, not a reproducible-build claim: tirith does not run the build, does not observe the compiler, and cannot say the output came from the source."
+policy_complete = true
+
+[[command]]
+name = "attest verify-build"
+group = "Supply-chain"
+inspected = "full"
+coverage = "Checks the receipt's signature against this installation's audit key, then re-scans and re-hashes both trees under the caps, exclusion set, and permission model the receipt itself records. It proves the trees are unchanged since the receipt was taken; it proves nothing about where either tree came from."
+policy_complete = true
+
+[[command]]
+name = "attest deployment"
+group = "Supply-chain"
+inspected = "full"
+coverage = "Verifies the build receipt first (a receipt that fails its own integrity rules makes ZERO requests), then fetches only the routes the build's output manifest names, from ONE https origin through the connect-time DNS guard, and hashes the exact returned bytes. A cross-origin redirect is a mismatch, not a follow. It proves only that those routes returned those bytes at that timestamp: not continuous monitoring, and nothing at all about routes it did not fetch."
+policy_complete = true
+
+[[command]]
+name = "attest verify-deployment"
+group = "Supply-chain"
+inspected = "none"
+coverage = "Re-checks the deployment receipt DOCUMENT: its content address, its signature, and its internal consistency. It makes no network request and re-measures no route, deliberately, because a second measurement presented as verification of the first would be the continuous-monitoring claim these receipts refuse to make."
+policy_complete = true
+
 # ---------------------------------------------------------------------------
 # AI-agent integrations
 # ---------------------------------------------------------------------------
@@ -628,6 +663,13 @@ name = "pkg attest"
 group = "Package firewall"
 inspected = "full"
 coverage = "Binds a PyPI provenance attestation subject digest to the quarantined sha256 and verifies it (optional sigstore feature). Missing or invalid attestation is evidence, never an auto-allow."
+policy_complete = true
+
+[[command]]
+name = "pkg attest-npm"
+group = "Package firewall"
+inspected = "partial"
+coverage = "Resolves npm through the trusted-executable mechanism, discovers its exact version, and runs one argv from a CLOSED fixture-backed contract table; an npm outside the table runs NO command. It reads the project's package-lock.json and node_modules inventory in full and binds npm's own answer to them, and it compares an attestation's in-toto subject digest against the lockfile integrity SRI. The signature verification is npm's, not tirith's: npm signs with ECDSA P-256 and this workspace has no P-256 backend, and the Sigstore closure is off on the workspace MSRV. Tirith does not download, inspect, or bind the tarball bytes npm installs. A non-public registry, an unsupported npm, Windows, or a project .npmrc that reconfigures the audit all return partial."
 policy_complete = true
 
 [[command]]

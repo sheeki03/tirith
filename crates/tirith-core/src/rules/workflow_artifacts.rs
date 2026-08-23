@@ -85,6 +85,8 @@ const MAX_UNRESOLVED_NOTES: usize = 32;
 pub enum WorkflowTruncationReason {
     /// The per-workflow job limit was exhausted before every job was visited.
     JobBudgetExhausted,
+    /// The per-job retained flow-event limit was exhausted.
+    EventBudgetExhausted,
     /// The caller-provided repository step allowance was exhausted.
     StepBudgetExhausted,
     /// The per-workflow retained-upload limit was exhausted.
@@ -294,6 +296,10 @@ enum FlowEvent {
 #[derive(Debug, Clone, Default)]
 struct JobModel {
     events: Vec<FlowEvent>,
+    /// More flow-relevant events existed than the bounded model could retain.
+    /// Kept separate from `unresolved` so the repository driver also emits its
+    /// typed truncation coverage gap.
+    events_truncated: bool,
     /// Static resolution failed somewhere in this job (an unresolvable shell, a
     /// truncated tokenizer budget, a reusable workflow, a composite action, or a
     /// matrix leg), so the job can neither prove nor disprove a chain.
@@ -458,6 +464,7 @@ pub fn build_model(path: &Path, content: &str, step_budget: usize) -> WorkflowMo
             ));
             model.jobs.push(JobModel {
                 events: Vec::new(),
+                events_truncated: false,
                 unresolved: true,
             });
             continue;
@@ -573,6 +580,9 @@ pub fn build_model(path: &Path, content: &str, step_budget: usize) -> WorkflowMo
             ));
         }
 
+        if job_model.events_truncated {
+            model.mark_truncated(WorkflowTruncationReason::EventBudgetExhausted);
+        }
         model.jobs.push(job_model);
     }
 
@@ -633,6 +643,7 @@ fn push_event(job: &mut JobModel, event: FlowEvent) {
         job.events.push(event);
     } else {
         job.unresolved = true;
+        job.events_truncated = true;
     }
 }
 
@@ -2798,6 +2809,40 @@ jobs:
         assert_eq!(
             job_limited.truncation_reasons().collect::<Vec<_>>(),
             vec![WorkflowTruncationReason::JobBudgetExhausted]
+        );
+
+        let download_step = r#"{"uses":"actions/download-artifact@v4","with":{"run-id":"${{ github.event.workflow_run.id }}"}}"#;
+        let event_steps = |count: usize| {
+            (0..count)
+                .map(|_| download_step)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let at_event_limit = build_model(
+            Path::new(".github/workflows/events-at-limit.json"),
+            &format!(
+                r#"{{"jobs":{{"consume":{{"steps":[{}]}}}}}}"#,
+                event_steps(MAX_EVENTS_PER_JOB)
+            ),
+            MAX_TOTAL_STEPS,
+        );
+        assert!(!at_event_limit.steps_truncated());
+        assert_eq!(at_event_limit.step_count(), MAX_EVENTS_PER_JOB);
+        assert!(at_event_limit.truncation_reasons().next().is_none());
+
+        let event_limited = build_model(
+            Path::new(".github/workflows/events-over-limit.json"),
+            &format!(
+                r#"{{"jobs":{{"consume":{{"steps":[{}]}}}}}}"#,
+                event_steps(MAX_EVENTS_PER_JOB + 1)
+            ),
+            MAX_TOTAL_STEPS,
+        );
+        assert!(event_limited.steps_truncated());
+        assert_eq!(event_limited.step_count(), MAX_EVENTS_PER_JOB + 1);
+        assert_eq!(
+            event_limited.truncation_reasons().collect::<Vec<_>>(),
+            vec![WorkflowTruncationReason::EventBudgetExhausted]
         );
 
         let upload_steps = (0..=MAX_UPLOADS_PER_WORKFLOW)

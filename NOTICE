@@ -72,6 +72,21 @@ Tirith Web3 package comparison anchors
 
 ---
 
+npm Registry: captured `npm audit signatures` output
+  Source: registry.npmjs.org, via `npm audit signatures --json
+           --include-attestations` on npm 11.17.0
+  Local files: crates/tirith/tests/fixtures/npm_audit_signatures/
+               npm11_clean.json and npm11_clean_package-lock.json
+  License basis: factual registry metadata (LicenseRef-Registry-Metadata)
+  Used for: The single fixture that backs the closed `npm audit signatures`
+            contract table. It carries registry-produced integrity digests,
+            key IDs, and Sigstore bundles for the published releases
+            chalk@5.4.1 and semver@7.8.5. Every other file in that directory is
+            synthesized from npm's own source and is original to this
+            repository; see the directory README for the split.
+
+---
+
 Bitcoin BIPs contributors — BIP-0039 English wordlist
   Copyright: Bitcoin BIPs contributors
   Source: https://github.com/bitcoin/bips/blob/ed4ffcb6a48d4dc4fdfc11cdba783c233db8c66e/bip-0039/english.txt

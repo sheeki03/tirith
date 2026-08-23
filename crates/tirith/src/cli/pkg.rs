@@ -421,9 +421,11 @@ fn prepare_plan(
     policy: &Policy,
     expiry: String,
     task_gate_binding: String,
+    mut authorize_effect: impl FnMut() -> Result<(), PrepareError>,
 ) -> Result<PreparedPlan, PrepareError> {
     // Resolve uv + python by executable provenance (never a bare PATH name in the
     // child), with the locked-down default allowances (no sdist/VCS/editable/...).
+    authorize_effect()?;
     let discovered =
         ResolverTools::discover(&request.allowances).map_err(PrepareError::Resolver)?;
     // The target was capability-bound before authorization. Move that exact
@@ -433,6 +435,7 @@ fn prepare_plan(
 
     // A fresh quarantine transaction under the real data dir. The id is a
     // timestamp-derived component; the store validates it.
+    authorize_effect()?;
     let store = QuarantineStore::open().map_err(PrepareError::Quarantine)?;
     let txn_id = new_transaction_id();
     let txn = store
@@ -440,6 +443,7 @@ fn prepare_plan(
         .map_err(PrepareError::Quarantine)?;
 
     // D2: resolve + download + ingest into the quarantine (re-hashing on the way in).
+    authorize_effect()?;
     let resolved = resolve_into_quarantine_with_bound_tools(request, &tools, &txn, artifact_origin)
         .map_err(PrepareError::Resolver)?;
 
@@ -450,6 +454,7 @@ fn prepare_plan(
 
     // D3/D4: firewall + re-bind. A swapped/missing blob or a now-known-malicious
     // wheel refuses here; a clean set yields the launch-ready plan.
+    authorize_effect()?;
     let plan = rebind_for_install(
         &resolved,
         &txn,
@@ -518,8 +523,8 @@ fn prepare_plan_authorized<B: ResolverPreparationBoundary>(
     let envelope = tirith_core::task_boundary::package_envelope(&package_binding)
         .map_err(|error| PrepareError::Authorization(error.to_string()))?;
     let operation = package_boundary_operation::<B>(&envelope);
-    permit
-        .authorize_effect_at(&operation, chrono::Utc::now())
+    let lease = permit
+        .into_effect_lease_at(&operation, chrono::Utc::now())
         .map_err(|error| PrepareError::Authorization(error.to_string()))?;
     prepare_plan(
         request,
@@ -528,6 +533,11 @@ fn prepare_plan_authorized<B: ResolverPreparationBoundary>(
         policy,
         expiry,
         task_gate_binding,
+        || {
+            lease
+                .authorize_effect_at(&operation, chrono::Utc::now())
+                .map_err(|error| PrepareError::Authorization(error.to_string()))
+        },
     )
 }
 
@@ -536,7 +546,7 @@ fn prepare_plan_authorized<B: ResolverPreparationBoundary>(
 /// because its permit is non-cloneable; a failed or completed publication
 /// cannot be retried through a reusable boolean authorization.
 struct AuthorizedPackageApprovalTransaction {
-    permit: TaskBoundaryPermit<PackageApprovalBoundary>,
+    lease: tirith_core::task_boundary::TaskBoundaryEffectLease<PackageApprovalBoundary>,
     envelope: tirith_core::task::TaskEnvelopeInput,
 }
 
@@ -551,7 +561,10 @@ impl AuthorizedPackageApprovalTransaction {
                 "task boundary permit does not bind this exact package approval".to_string(),
             ));
         }
-        Ok(Self { permit, envelope })
+        let lease = permit
+            .into_effect_lease_at(&operation, chrono::Utc::now())
+            .map_err(|error| PrepareError::Authorization(error.to_string()))?;
+        Ok(Self { lease, envelope })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -572,7 +585,7 @@ impl AuthorizedPackageApprovalTransaction {
             .map_err(|error| PrepareError::Authorization(error.to_string()))?;
         let actual_operation =
             package_boundary_operation::<PackageApprovalBoundary>(&actual_envelope);
-        if actual_envelope != self.envelope || !self.permit.binds_operation(&actual_operation) {
+        if actual_envelope != self.envelope {
             return Err(PrepareError::Authorization(
                 "task boundary permit does not bind this exact package approval".to_string(),
             ));
@@ -584,6 +597,11 @@ impl AuthorizedPackageApprovalTransaction {
             policy,
             expiry,
             task_gate_binding,
+            || {
+                self.lease
+                    .authorize_effect_at(&actual_operation, chrono::Utc::now())
+                    .map_err(|error| PrepareError::Authorization(error.to_string()))
+            },
         )?;
         Ok(AuthorizedPreparedApproval {
             authorization: self,
@@ -612,7 +630,7 @@ impl AuthorizedPreparedApproval {
         mut self,
         authority: &dyn PackageApprovalAuthority,
     ) -> Result<(PreparedPlan, PathBuf), ApprovalPublishError> {
-        let AuthorizedPackageApprovalTransaction { permit, envelope } = self.authorization;
+        let AuthorizedPackageApprovalTransaction { lease, envelope } = self.authorization;
         let operation = package_boundary_operation::<PackageApprovalBoundary>(&envelope);
         let record = authority
             .issue(&self.prepared.digest)
@@ -632,7 +650,7 @@ impl AuthorizedPreparedApproval {
         self.prepared.digest = record.digest().clone();
         let path = persist_approval_record_authorized(
             &record,
-            permit,
+            &lease,
             &operation,
             &trusted_keys,
             chrono::Utc::now(),
@@ -1470,7 +1488,7 @@ fn run_install(
             );
         }
     };
-    let outcome = match run_contained_install_with_policy(
+    let authorized_outcome = match run_contained_install_with_policy(
         &prepared.plan,
         &prepared.txn,
         &prepared.tools,
@@ -1518,6 +1536,7 @@ fn run_install(
             return 1;
         }
     };
+    let outcome = authorized_outcome.outcome();
 
     // The redacted resolver / package-manager provenance for the receipt. The
     // command strings carry only the flags, never an index credential (the resolver
@@ -1537,17 +1556,28 @@ fn run_install(
     // The finalised install verdict the receipt attests: the post-install RECORD
     // verdict when the install ran to completion, else a synthesized Block (a failed
     // install did not produce a trustworthy environment).
-    let verdict = enforcing_install_verdict(&outcome);
+    let verdict = enforcing_install_verdict(outcome);
 
     // D6 phase 1: while the target is still private and rollback-safe, record a
     // signed receipt for the exact contained execution + RECORD verdict. This is
     // deliberately NOT publication proof.
+    if let Err(error) = authorized_outcome.authorize_effect_at(chrono::Utc::now()) {
+        let rollback = environment_checkpoint.rollback();
+        return report_install_failure(
+            "authorization_expired_before_private_receipt",
+            &format!("{error}; private rollback result: {rollback:?}"),
+            true,
+            environment_checkpoint.publication_crossed(),
+            json,
+            1,
+        );
+    }
     let private_receipt =
-        build_install_receipt(&outcome, &policy, &provenance, artifact_sha256, &verdict);
+        build_install_receipt(outcome, &policy, &provenance, artifact_sha256, &verdict);
     let private_receipt_id = private_receipt.receipt_id.clone();
     let private_recorded = private_receipt.record_private_signed();
     let private_report = InstallReport::from_recorded_ref(
-        &outcome,
+        outcome,
         private_recorded.as_ref().map(|proof| proof.recorded()),
         false,
     );
@@ -1568,7 +1598,7 @@ fn run_install(
         }
         return report_install_outcome(
             &prepared.digest,
-            &outcome,
+            outcome,
             private_recorded.map(|proof| proof.into_recorded()),
             false,
             json,
@@ -1581,7 +1611,7 @@ fn run_install(
             // defensive fail-closed branch in case that reporting invariant ever
             // changes.
             let _ = environment_checkpoint.rollback();
-            return report_install_outcome(&prepared.digest, &outcome, Err(error), false, json);
+            return report_install_outcome(&prepared.digest, outcome, Err(error), false, json);
         }
     };
 
@@ -1589,6 +1619,17 @@ fn run_install(
     // public identity, fsync the parent, and durably mark it published-but-awaiting
     // its linked receipt. A pre-rename failure is rollback-safe; any post-rename
     // failure remains PublishedUnconfirmed and must never be auto-rolled back.
+    if let Err(error) = authorized_outcome.authorize_effect_at(chrono::Utc::now()) {
+        let rollback = environment_checkpoint.rollback();
+        return report_install_failure(
+            "authorization_expired_before_target_publication",
+            &format!("{error}; private rollback result: {rollback:?}"),
+            true,
+            environment_checkpoint.publication_crossed(),
+            json,
+            1,
+        );
+    }
     if let Err(publish_error) = environment_checkpoint.publish_verified() {
         let crossed = environment_checkpoint.publication_crossed();
         let rollback_detail = if crossed {
@@ -1625,6 +1666,17 @@ fn run_install(
         }
     };
     let committed_receipt_id = committed_receipt.receipt_id().to_string();
+    if let Err(error) = authorized_outcome.authorize_effect_at(chrono::Utc::now()) {
+        return report_install_transaction_failure(
+            "authorization_expired_before_committed_receipt",
+            &error.to_string(),
+            true,
+            &private_receipt_id,
+            Some(&committed_receipt_id),
+            "private_verified",
+            json,
+        );
+    }
     let committed_recorded = match committed_receipt.record_signed() {
         Ok(recorded) => recorded,
         Err(error) => {
@@ -1642,6 +1694,17 @@ fn run_install(
 
     // Only the linked, signed committed receipt lets the checkpoint transition
     // from PublishedUnconfirmed to Committed and release its recovery journal.
+    if let Err(error) = authorized_outcome.authorize_effect_at(chrono::Utc::now()) {
+        return report_install_transaction_failure(
+            "authorization_expired_before_commit_confirmation",
+            &error.to_string(),
+            true,
+            &private_receipt_id,
+            Some(&committed_receipt_id),
+            "committed",
+            json,
+        );
+    }
     let committed_recorded = match environment_checkpoint.confirm_committed(committed_recorded) {
         Ok(recorded) => Ok(recorded),
         Err(error) => {
@@ -1657,7 +1720,7 @@ fn run_install(
         }
     };
 
-    report_install_outcome(&prepared.digest, &outcome, committed_recorded, true, json)
+    report_install_outcome(&prepared.digest, outcome, committed_recorded, true, json)
 }
 
 /// Compatibility wrapper for the historical `--allow-degraded` flag. Enforcing
@@ -1675,7 +1738,7 @@ fn run_contained_install_with_policy(
     json: bool,
     degraded_policy: DegradedPolicy,
     task_denied_effects: &std::collections::BTreeSet<tirith_core::effects::CommandEffectKind>,
-) -> Result<crate::cli::pkg_install::ContainedInstallOutcome, ContainedInstallError> {
+) -> Result<crate::cli::pkg_install::AuthorizedContainedInstallOutcome, ContainedInstallError> {
     let _ = degraded_policy;
     run_contained_install(
         plan,
@@ -2315,12 +2378,12 @@ fn print_receipt_full(r: &ArtifactScanReceipt, json: bool) {
 /// permit live across resolver/quarantine and native-authority work.
 fn persist_approval_record_authorized(
     record: &PackageApprovalRecordV2,
-    permit: TaskBoundaryPermit<PackageApprovalBoundary>,
+    lease: &tirith_core::task_boundary::TaskBoundaryEffectLease<PackageApprovalBoundary>,
     operation: &BoundaryOperation<'_>,
     trusted_keys: &std::collections::BTreeMap<String, [u8; 32]>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<PathBuf, String> {
-    permit
+    lease
         .authorize_effect_at(operation, now)
         .map_err(|error| format!("task authorization expired before publication: {error}"))?;
     with_approval_store_lock(|dir| {
@@ -2863,6 +2926,9 @@ mod tests {
         .unwrap()
         .consume_default_for_operation(&approved_operation, chrono::Utc::now())
         .unwrap();
+        let lease = permit
+            .into_effect_lease_at(&approved_operation, chrono::Utc::now())
+            .unwrap();
         let changed_envelope = test_package_envelope(&["urllib3==2.2.0".to_string()]);
         let changed_operation =
             package_boundary_operation::<PackageApprovalBoundary>(&changed_envelope);
@@ -2871,7 +2937,7 @@ mod tests {
         let trusted_keys = TestAuthority::new().trusted_keys().unwrap();
         assert!(persist_approval_record_authorized(
             &record,
-            permit,
+            &lease,
             &changed_operation,
             &trusted_keys,
             chrono::Utc::now(),
@@ -3157,6 +3223,41 @@ mod tests {
             package_boundary_operation::<PackageInstallPreparationBoundary>(&canonical);
         PackageInstallApprovalChannel::from_native_authority(verified, &canonical_operation)
             .expect("the exact canonical signed-plan operation must authorize");
+    }
+
+    #[test]
+    fn install_preparation_lease_rechecks_native_approval_expiry_at_later_effects() {
+        let now = chrono::Utc::now();
+        let expires = now + chrono::Duration::minutes(1);
+        let requested = digest_with_expiry("");
+        let approved = digest_with_expiry(&expires.to_rfc3339());
+        let authority = TestAuthority::new();
+        let record = authority.record(&approved);
+        let trusted_keys = authority.trusted_keys().unwrap();
+        let verified = verify_package_approval(&record, &requested, &trusted_keys, now).unwrap();
+        let envelope =
+            tirith_core::task_boundary::package_install_plan_envelope(&requested).unwrap();
+        let operation = package_boundary_operation::<PackageInstallPreparationBoundary>(&envelope);
+        let channel =
+            PackageInstallApprovalChannel::from_native_authority(verified, &operation).unwrap();
+        let permit = prepare_package_boundary_authorization::<PackageInstallPreparationBoundary>(
+            &operation,
+            &Policy::default(),
+        )
+        .unwrap()
+        .with_package_install_approval(channel)
+        .unwrap()
+        .consume_default_for_operation(&operation, now)
+        .unwrap();
+        let lease = permit.into_effect_lease_at(&operation, now).unwrap();
+
+        assert!(lease.authorize_effect_at(&operation, now).is_ok());
+        assert!(matches!(
+            lease.authorize_effect_at(&operation, expires),
+            Err(BoundaryAuthorizationError::ReplayStore(
+                tirith_core::task::ReplayStoreError::Expired
+            ))
+        ));
     }
 
     #[test]

@@ -94,6 +94,76 @@ strict receipt channel. Even when a bash/zsh/fish receipt commits, it records a
 conservative shell-boundary observation, not proof that every component of a
 compound command executed.
 
+## Known issue: a full disk locks a zsh or fish shell out of every command
+
+**Who this affects.** zsh and fish. Bash is not affected: on the same failure it
+calls `_tirith_degrade_to_preexec` and keeps working in warn-only mode
+(`shell/lib/bash-hook.bash:1270-1276`). PowerShell has no strict receipt channel
+and is not affected either.
+
+**Symptom.** Every command you press Enter on is refused with
+
+```
+tirith: secure execution-receipt capture unavailable; command blocked
+```
+
+and every paste is refused with
+
+```
+tirith: secure paste capture unavailable; paste blocked for safety
+```
+
+You cannot run anything at all, including a command that would free space.
+
+Both messages are word-for-word identical under zsh and fish. Fish has one
+additional variant on its preflight path:
+
+```
+tirith: secure preflight capture unavailable; command blocked
+```
+
+**Cause.** The hook creates a scratch capture file through `mktemp` BEFORE it
+runs the tirith binary, and fails closed when that fails. A full or read-only
+`TMPDIR` makes `mktemp` fail, so the block happens without the binary ever being
+consulted.
+
+- zsh: `shell/lib/zsh-hook.zsh:275` and `:315` for the accept-line widget,
+  `:539` and `:556` for the bracketed-paste widget.
+- fish: `_tirith_v3_new_capture_file` (`shell/lib/fish-hook.fish:206-217`)
+  returns 1, and both the protocol-v3 and legacy branches then block
+  (`:403` and `:426`); the paste widget does the same at `:325`. Unlike bash,
+  fish has no degrade path.
+
+Failing closed is right for an ANALYSIS failure. It is the wrong answer for an
+INFRASTRUCTURAL one: a full disk is not an attack, and it is indistinguishable
+from one here only because the hook cannot tell the two apart.
+
+**The documented `TIRITH=0` bypass does not help.** That bypass is honoured
+inside the binary (`crates/tirith/src/cli/check.rs`), and the binary is never
+reached. There is also no keystroke recovery, because restoring the original
+widget requires pressing Enter, which is the blocked path.
+
+**Recovery.** The hooks only run inside the shell's interactive line editor, so
+anything that executes a command without going through one still works. In rough
+order of convenience:
+
+1. From another machine, `ssh <host> 'rm -rf <large-path>'`. A non-interactive
+   `ssh host 'command'` never installs the hook.
+2. Configure your terminal profile to launch a shell that reads no rc file, so
+   the hook is never sourced: `zsh -f`, `fish --no-config` (equivalently
+   `fish -N`), or `bash --norc --noprofile`. Then free space from there.
+3. Use a file manager, an editor's built-in task runner, or any GUI application
+   to delete files.
+
+Once one command can run, free space and the shell returns to normal
+immediately; nothing persistent was changed.
+
+**Prevention.** Keep `TMPDIR` on a filesystem with headroom, and treat a
+disk-space alert on a workstation as an availability issue for the shell itself.
+
+This is a defect in shipped hook code rather than in any particular release, and
+it is recorded here so an operator who hits it is not stranded.
+
 ## Brew upgrade applied but behavior did not change
 
 If `brew` reports a newer version but `tirith --version` is older, or shell behavior looks unchanged:

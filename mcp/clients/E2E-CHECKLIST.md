@@ -51,6 +51,19 @@ warn-level command (e.g., `curl http://example.com/file`).
 | Copilot CLI | | Warn-level command with default warn action | Allowed (silent exit 0) | |
 | Kiro CLI | | Warn-level command with default warn action | Allowed (exit 0) | |
 
+## MCP preview-tool advertisement
+
+The default `tools/list` is a frozen compatibility contract, so a preview tool
+must not appear in it. Run these against any MCP-capable client, or directly
+against `tirith mcp-server` over stdio.
+
+| Tool | Version | Test | Expected | Pass? |
+|---|---|---|---|---|
+| any MCP client | | `tools/list` against a default `tirith mcp-server` | Exactly the frozen list: `tirith_check_command`, `tirith_check_url`, `tirith_check_paste`, `tirith_scan_file`, `tirith_scan_directory`, `tirith_verify_mcp_config`, plus `tirith_fetch_cloaking` on Unix. `tirith_check_task` is ABSENT | |
+| any MCP client | | `tools/call` `tirith_check_task` with `TIRITH_MCP_PREVIEW` unset | Refused by name: "tirith_check_task is a preview tool; set TIRITH_MCP_PREVIEW=1 to enable it". Nothing is assessed | |
+| any MCP client | | `tools/list` with `TIRITH_MCP_PREVIEW=1` | The frozen list PLUS `tirith_check_task`, described as preview and diagnostic | |
+| any MCP client | | `tools/call` `tirith_check_task` with an unmodelled extra field in `envelope` | Refused by the schema (`additionalProperties: false`), not silently ignored | |
+
 ## Edge case tests
 
 Run these for ALL tools.

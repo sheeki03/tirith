@@ -13,6 +13,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+serde_json = "1"
 tirith-core = { path = "../crates/tirith-core" }
 
 [workspace]
@@ -56,4 +57,29 @@ doc = false
 [[bin]]
 name = "artifact_wheel"
 path = "fuzz_targets/artifact_wheel.rs"
+doc = false
+
+[[bin]]
+name = "lexical_path"
+path = "fuzz_targets/lexical_path.rs"
+doc = false
+
+[[bin]]
+name = "npm_command"
+path = "fuzz_targets/npm_command.rs"
+doc = false
+
+[[bin]]
+name = "web3_command"
+path = "fuzz_targets/web3_command.rs"
+doc = false
+
+[[bin]]
+name = "task_envelope"
+path = "fuzz_targets/task_envelope.rs"
+doc = false
+
+[[bin]]
+name = "workflow_artifact"
+path = "fuzz_targets/workflow_artifact.rs"
 doc = false

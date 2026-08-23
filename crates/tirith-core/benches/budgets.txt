@@ -1,0 +1,81 @@
+# Absolute per-benchmark ceilings, in nanoseconds per Criterion iteration.
+#
+# Enforced by `scripts/check-bench-budgets.sh` against the bencher-format output
+# of `cargo bench --bench perf -- --output-format bencher`. A benchmark listed
+# here that is missing from the run is an error, and a benchmark in the run that
+# is missing here is an error: a new hot path must arrive with a stated budget,
+# not slip in unmeasured.
+#
+# WHY ABSOLUTE, ON TOP OF THE RELATIVE ALERT
+#
+# The existing bench workflow compares each run to the previous one at a 115%
+# alert threshold and does not fail. That answers "did this get slower than last
+# week" and cannot answer "is this fast enough": eight consecutive 14% steps are
+# invisible to it and multiply latency by 2.9.
+#
+# HOW THESE NUMBERS WERE DERIVED
+#
+# Measured on the reference host (Apple aarch64, `--warm-up-time 1
+# --measurement-time 3`), then rounded UP to a ceiling with roughly 5x headroom
+# for the sub-millisecond cases. The headroom is deliberate: a shared CI runner
+# is slower and noisier than the reference host, and a gate that turns runner
+# noise into a merge block gets disabled within a week. This is a ceiling that
+# catches an order-of-magnitude regression, an accidentally quadratic loop, or a
+# filesystem read added to a hot path. Catching a 15% drift is the relative
+# alert's job, under human review.
+#
+# The four full-analysis budgets are set at the plan's p95 contract (5 ms)
+# rather than its p50 target (3 ms), because a shared runner is not a p50
+# reference machine. The p50 target is tracked by the relative gate.
+#
+# Format: <benchmark name> <max ns per iteration>. `#` comments, blank lines
+# ignored. Measured medians are recorded beside each budget so the next person
+# can see how much headroom they are spending.
+
+# ── Tier-1 gate ──────────────────────────────────────────────────────────
+# 10 inputs per iteration, so ~31 ns per scan measured.
+tier1_no_match                    2000        # measured 314
+tier1_match                       1000        # measured 106
+
+# ── Full analysis ────────────────────────────────────────────────────────
+# Dominated by policy discovery, which walks to the repository root.
+full_analysis_clean_command       5000000     # measured 936371
+full_analysis_with_url            5000000     # measured 1019571
+full_analysis_complex_pipeline    5000000     # measured 1269037
+paste_analysis                    5000000     # measured 789289
+web3_clean_command_full_analysis  5000000     # measured 692864
+full_analysis_obfuscated_output   200000      # measured 30936
+# The configuration production always runs in: `cli::check` supplies a cwd, so
+# the Web3 parse context is `for_cwd` and the static-config reads are ON. Every
+# other entry here measures the branch that never touches the filesystem, so a
+# read added to the ancestor walk would have been invisible to all of them.
+full_analysis_web3_with_cwd       5000000     # measured 1074309
+
+# ── Byte scanning ────────────────────────────────────────────────────────
+byte_scan_clean                   1000        # measured 116
+byte_scan_ansi                    1000        # measured 136
+# 64 KiB of hostile control bytes, the adversarial paste worst case.
+byte_scan_hostile_64k             5000000     # measured 1074031
+
+# ── Parsers this stack introduced ────────────────────────────────────────
+web3_parse_benign                 150000      # measured 22009
+web3_parse_state_changing         300000      # measured 54444
+# A command that names NO endpoint and NO signer, through
+# `Web3ParseContextV2::for_cwd`. That is the shape that actually reaches
+# `nearest_file` (up to MAX_ALIAS_RESOLUTIONS ancestor stats per config name)
+# and the config reads behind it. The baseline below is the identical input
+# with the filesystem branch off: 63119 vs 17136 ns is the walk's real cost, and
+# is why a regression in it has to be measurable somewhere.
+web3_parse_state_changing_with_cwd 350000     # measured 63119
+web3_parse_state_changing_no_cwd_baseline 100000 # measured 17136
+npm_command_extract               50000       # measured 6842
+workflow_artifact_model           120000      # measured 19056
+effect_inference_mixed_shell      200000      # measured 31875
+
+# ── Task boundary and policy ─────────────────────────────────────────────
+task_envelope_decide              10000       # measured 1404
+web3_guard_merge_repo_scoped      20000       # measured 2755
+task_decision_projection          5000        # measured 740
+
+# ── Rendering ────────────────────────────────────────────────────────────
+verdict_json_serialization        2000000     # measured 350504

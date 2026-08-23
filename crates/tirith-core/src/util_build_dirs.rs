@@ -36,19 +36,20 @@ pub fn should_skip_dir(name: &str) -> bool {
 /// before classification: a canceled `dist/..` must not exempt the real target,
 /// and an unresolved upward traversal is never trusted as generated output.
 pub fn is_build_artifact_path(path: &str) -> bool {
-    let mut components: Vec<&str> = Vec::new();
-    for component in path.split(['/', '\\']) {
-        match component {
-            "" | "." => {}
-            ".." => {
-                if components.pop().is_none() {
-                    return false;
-                }
-            }
-            name => components.push(name),
-        }
+    let Ok(path) = crate::lexical_path::LexicalPath::parse_auto(path) else {
+        return false;
+    };
+    if !path.parent_state().is_clean()
+        || matches!(
+            path.root_class(),
+            crate::lexical_path::RootClass::Verbatim | crate::lexical_path::RootClass::Device
+        )
+    {
+        return false;
     }
-    components.into_iter().any(should_skip_dir)
+    path.components()
+        .iter()
+        .any(|component| should_skip_dir(component))
 }
 
 #[cfg(test)]
@@ -95,6 +96,7 @@ mod tests {
     #[test]
     fn build_artifact_path_handles_backslashes() {
         assert!(is_build_artifact_path("a\\node_modules\\b.js"));
+        assert!(is_build_artifact_path(r"C:\Work\NODE_MODULES\b.js"));
     }
 
     #[test]
@@ -108,5 +110,16 @@ mod tests {
     fn build_artifact_path_rejects_unresolved_parent_traversal() {
         assert!(!is_build_artifact_path("../dist/bundle.js"));
         assert!(!is_build_artifact_path("dist/../../dist/bundle.js"));
+        assert!(!is_build_artifact_path("/../../dist/bundle.js"));
+        assert!(!is_build_artifact_path(r"\\server\share\..\dist\x"));
+    }
+
+    #[test]
+    fn build_artifact_path_preserves_root_integrity_and_dialect_case() {
+        assert!(!is_build_artifact_path(r"\\server\dist\x"));
+        assert!(is_build_artifact_path(r"\\server\share\dist\x"));
+        assert!(!is_build_artifact_path("/SRC/DIST/x"));
+        assert!(!is_build_artifact_path(r"\\?\C:\dist\x"));
+        assert!(!is_build_artifact_path(r"\\.\C:\dist\x"));
     }
 }

@@ -1,0 +1,101 @@
+# Six high-impact effects. Synthetic; see SOURCE.md.
+#
+# `action` is the operation the untrusted content asks for; `control_action` is
+# the paired benign request. `expected_inferred` is what
+# `task::infer_effects_detailed` derives and `expected_denied` is what the
+# corpus gate withholds. Both are asserted rather than assumed: an effect the
+# inferrer stops deriving, or a denial that quietly stops applying, must break
+# this file rather than silently widen what an untrusted source may do.
+#
+# The control's denied set must be a PROPER SUBSET of the attack's, or the
+# pairing proves nothing: a gate that refused both equally would pass a
+# same-denial pair while being useless. The one exception is
+# `resource_exhaustion`, where both denial sets are empty by construction and
+# the bounded output detector's obfuscated/control result is the discriminator.
+#
+# `expected_complete = false` is a first-class outcome, not a gap in the
+# fixture. An action the grammar does not model must leave the assessment
+# incomplete so an enforcing boundary fails closed.
+
+[[effect]]
+name = "package_install"
+action = { kind = "package_install", ecosystem = "npm", package = "example-telemetry-shim" }
+expected_inferred = ["package_install", "persistence_change", "network_egress", "filesystem_write"]
+expected_denied = ["package_install", "persistence_change"]
+expected_complete = true
+# Reading the dependency diff is the benign request in the same neighbourhood.
+control_action = { kind = "narrative", text = "summarize the dependency changes in this pull request" }
+control_expected_inferred = []
+control_expected_denied = []
+control_expected_complete = false
+
+[[effect]]
+name = "persistence"
+action = { kind = "config_write", path = "~/.config/example-agent/autorun.yaml" }
+expected_inferred = ["filesystem_write", "persistence_change"]
+expected_denied = ["persistence_change"]
+expected_complete = true
+control_action = { kind = "narrative", text = "explain what the autorun key in the agent config does" }
+control_expected_inferred = []
+control_expected_denied = []
+control_expected_complete = false
+
+# Writing Tirith's own policy is not the generic persistent write above: it is
+# the control that decides every later answer, so the inferrer derives
+# `policy_change` on top of the persistence effect and the gate denies both.
+# The control writes a document in the same repository, which keeps the pair
+# differing on exactly the policy effect rather than on the action shape.
+[[effect]]
+name = "policy_weakening"
+action = { kind = "config_write", path = ".tirith/policy.yaml" }
+expected_inferred = ["filesystem_write", "persistence_change", "policy_change"]
+expected_denied = ["persistence_change", "policy_change"]
+expected_complete = true
+control_action = { kind = "config_write", path = "docs/example-policy-notes.md" }
+control_expected_inferred = ["filesystem_write", "persistence_change"]
+control_expected_denied = ["persistence_change"]
+control_expected_complete = true
+
+# Resource exhaustion has no derivation in the shell grammar. The contract this
+# cell pins is that the absence of a derivation reads as INCOMPLETE, never as
+# "this command has no effects". Its control is a fully modelled read-only Web3
+# call. V1 shell actions have no Tirith-owned interpreter identity, so both
+# actions remain incomplete; the bounded output detector distinguishes the
+# obfuscated attack from the control instead.
+[[effect]]
+name = "resource_exhaustion"
+action = { kind = "shell", command = "yes | head -c 40000000000 > /tmp/example-fill" }
+expected_inferred = []
+expected_denied = []
+expected_complete = false
+control_action = { kind = "shell", command = "cast call 0x0000000000000000000000000000000000000001 'name()' --rpc-url https://rpc.example.invalid" }
+control_expected_inferred = ["network_egress"]
+control_expected_denied = []
+control_expected_complete = false
+
+# Writing into the credential file reads the credentials on the way past, so the
+# inferrer adds `secret_read`. The control writes a document instead: same
+# action shape, same filesystem and persistence effects, no secret.
+[[effect]]
+name = "secret_access"
+action = { kind = "config_write", path = "~/.aws/credentials" }
+expected_inferred = ["filesystem_write", "persistence_change", "secret_read"]
+expected_denied = ["persistence_change", "secret_read"]
+expected_complete = true
+control_action = { kind = "config_write", path = "docs/example-notes.md" }
+control_expected_inferred = ["filesystem_write", "persistence_change"]
+control_expected_denied = ["persistence_change"]
+control_expected_complete = true
+
+# A keystore-signed broadcast reads the keystore, reaches the network, uses a
+# signer, and writes on chain. The control is the same tool doing a read.
+[[effect]]
+name = "production_web3_write"
+action = { kind = "shell", command = "cast send 0x0000000000000000000000000000000000000002 --rpc-url https://rpc.example.invalid --keystore /tmp/example-keystore" }
+expected_inferred = ["network_egress", "secret_read", "web3_signer_use", "web3_write"]
+expected_denied = ["secret_read", "web3_signer_use", "web3_write"]
+expected_complete = false
+control_action = { kind = "shell", command = "cast call 0x0000000000000000000000000000000000000002 'totalSupply()' --rpc-url https://rpc.example.invalid" }
+control_expected_inferred = ["network_egress"]
+control_expected_denied = []
+control_expected_complete = false

@@ -872,70 +872,12 @@ fn normalize_ecosystem(s: &str) -> String {
     }
 }
 
-/// Heuristic: does this look like a Windows path? `true` for a leading drive
-/// letter (`C:…`, incl. drive-RELATIVE `C:rel`) or a `//`-rooted/UNC path. Used
-/// ONLY for case-normalization (Windows is case-insensitive) — NOT for
-/// root-containment, where drive-relative forms must be excluded; use
-/// [`is_windows_absolute_path`] there.
-fn looks_like_windows_path(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return true;
-    }
-    s.starts_with("//")
-}
-
-/// `true` only when `s` is an ABSOLUTE Windows path: drive letter + `:` +
-/// separator (`C:/…`, `c:\…`) or a leading `//` UNC root. Unlike
-/// [`looks_like_windows_path`], rejects drive-RELATIVE forms — both bare `C:` and
-/// `C:relative` are relative to the drive's cwd, so neither is root-contained
-/// (round-20, correcting round-19 which wrongly accepted bare `C:`).
-fn is_windows_absolute_path(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    // Drive ROOT requires drive letter, `:`, AND a separator (accept both forms
-    // independent of the back-slash→`/` pre-pass).
-    if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return bytes[2] == b'/' || bytes[2] == b'\\';
-    }
-    s.starts_with("//")
-}
-
-/// Normalize a path for lexical "is-under" matching: back-slashes → `/`, and
-/// (only when [`looks_like_windows_path`]) lowercased. POSIX paths keep case.
-fn normalize_for_lexical_path_match(s: &str) -> String {
-    let slashed = s.replace('\\', "/");
-    if looks_like_windows_path(&slashed) {
-        slashed.to_lowercase()
-    } else {
-        slashed
-    }
-}
-
 /// `true` when `path` is `base` or a descendant — compared as `/`-separated
-/// component sequences (lexical, no filesystem access), so `/home/x` is under
-/// `/home` but `/home-other` is not. Windows paths are back-slash-normalized and
-/// case-folded (findings B/R1); POSIX paths stay case-sensitive.
+/// component sequences by the shared, root-aware lexical parser (no filesystem
+/// access), so `/home/x` is under `/home` but `/home-other` is not. Ambiguous or
+/// unsafe Windows roots and unresolved parent traversal fail closed.
 fn path_is_under(path: &str, base: &str) -> bool {
-    let path = normalize_for_lexical_path_match(path);
-    let base = normalize_for_lexical_path_match(base);
-    // Trim the BASE only, to detect the root sentinel `cwd_in: ["/"]` (trims to
-    // empty). The absolute-path check below runs on the UNTRIMMED `path` because
-    // trimming would turn a bare drive ROOT `c:/` into `c:`, which
-    // `is_windows_absolute_path` rejects (round-25).
-    let base_trimmed = base.trim_end_matches('/');
-    if base_trimmed.is_empty() {
-        // Root sentinel contains every ABSOLUTE path. Strict
-        // `is_windows_absolute_path` (not the looser `looks_like_windows_path`)
-        // so drive-relative `c:rel` is NOT root-contained (round-15/19).
-        return path.starts_with('/') || is_windows_absolute_path(&path);
-    }
-    // Non-root base: trim the path too so `/home/user/` and `/home/user` match.
-    let path = path.trim_end_matches('/');
-    if path == base_trimmed {
-        return true;
-    }
-    path.strip_prefix(base_trimmed)
-        .is_some_and(|rest| rest.starts_with('/'))
+    crate::lexical_path::is_within(path, base)
 }
 
 /// `true` when `host` equals `domain` or is a sub-domain of it
@@ -1905,26 +1847,23 @@ any:
     }
 
     #[test]
-    fn test_is_windows_absolute_path() {
-        // Drive-letter ABSOLUTES require a SEPARATOR after the colon.
-        assert!(is_windows_absolute_path("C:/x"));
-        assert!(is_windows_absolute_path(r"C:\x"));
-        assert!(is_windows_absolute_path("c:/x")); // lower-case drive letter
-        assert!(is_windows_absolute_path("//host/share"));
-        // Verbatim `\\?\C:\x` is backslash-normalized to `//?/C:/x` first, caught
-        // by the leading `//` UNC arm.
-        assert!(is_windows_absolute_path("//?/C:/x"));
-        // round-20: bare `C:` and `C:relative` (no separator) are drive-RELATIVE,
-        // NOT absolute.
-        assert!(!is_windows_absolute_path("C:"));
-        assert!(!is_windows_absolute_path("C:relative"));
-        assert!(!is_windows_absolute_path("/home/x")); // POSIX, handled by starts_with('/')
-        assert!(!is_windows_absolute_path("relative"));
-        assert!(!is_windows_absolute_path(""));
-        // The looser `looks_like_windows_path` DOES match both — why the strict
-        // variant is needed for the sentinel.
-        assert!(looks_like_windows_path("C:"));
-        assert!(looks_like_windows_path("C:relative"));
+    fn test_shared_lexical_root_classes_drive_root_sentinel_behavior() {
+        use crate::lexical_path::{LexicalPath, RootClass};
+
+        assert_eq!(
+            LexicalPath::parse_auto("C:/x").unwrap().root_class(),
+            RootClass::DriveAbsolute
+        );
+        assert_eq!(
+            LexicalPath::parse_auto("C:relative").unwrap().root_class(),
+            RootClass::DriveRelative
+        );
+        assert_eq!(
+            LexicalPath::parse_auto(r"\\host\share\x")
+                .unwrap()
+                .root_class(),
+            RootClass::Unc
+        );
     }
 
     #[test]

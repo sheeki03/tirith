@@ -293,3 +293,106 @@ tirith trust gc --expired         # remove entries whose TTL has passed
 
 Use `--permanent` if an entry genuinely should never expire, and `--reason`
 to record why it was added — `tirith trust explain` shows it back to you.
+
+## 8. Web3 Guard (Foundry / Hardhat / Solana / Anchor)
+
+Both keys below are **grant-bearing**, so they only take effect from a user or
+org policy. A checked-in `.tirith/policy.yaml` that declares them has them
+dropped, and `tirith policy effective` names what it dropped.
+
+```yaml
+# ~/.config/tirith/policy.yaml
+web3_guard:
+  networks:
+    - name: ethereum-mainnet
+      family: evm
+      identity:
+        evm_chain_id: 1          # chain identity, so a fork cannot reuse a name
+      endpoints:
+        - scheme: https
+          host: eth-mainnet.example-rpc.invalid
+          subdomains: exact_host # widening to subdomains is a written decision
+  allowed_signers: [hardware_wallet, keystore_file]
+  deny_rpc:
+    - scheme: https
+      host: rpc.untrusted.invalid
+      subdomains: host_and_subdomains
+  action_unclassified_rpc: warn
+```
+
+Defaults are observational: with no `networks` declared, the
+unclassified-endpoint path does not fire at all, so adding the section is what
+turns endpoint checking on. `allowed_signers` has no spelling for a raw private
+key, keypair, or mnemonic, by design.
+
+Verify what a repository policy is allowed to contribute:
+
+```bash
+tirith policy effective   # prints the merged policy plus a "Neutralized (...)" line
+```
+
+A repo policy carrying `web3_guard.networks` and `web3_guard.allowed_signers`
+prints them as neutralized while keeping its `deny_rpc` and `deny_destinations`
+entries, because denial is the only direction a repository may move.
+
+Note that surviving the merge is not the same as being enforced. Of the
+`web3_guard` fields, only `networks`, `allowed_signers`, `deny_rpc`, and
+`action_unclassified_rpc` are read by a rule. `deny_destinations`,
+`require_command_card`, `command_card_key_ids`, `selector_aliases`,
+`action_incomplete_analysis`, and `action_ambiguous_hardhat_production_run` are
+parsed, validated, and merged, but no rule consults them, so a destination
+listed in `deny_destinations` is not flagged. See
+[web3-command-guard.md](security/web3-command-guard.md#declared-but-not-yet-wired).
+
+## 9. Untrusted-Task Gate (observation first)
+
+Start in `observe`. It decides without withholding, and an `off` gate does not
+even write an audit line. Be aware that only the `gateway_forward` boundary
+actually writes a record: the other eight decide and write nothing in any mode,
+so an observation burn-in cannot measure them.
+
+```yaml
+# ~/.config/tirith/policy.yaml
+task_gate:
+  mode: observe
+```
+
+Once the incomplete rate is understood, express enforcement through the denied
+effect set:
+
+```yaml
+task_gate:
+  mode: enforce
+  effects_denied_for_untrusted_sources: [policy_change, package_install]
+  action_incomplete_analysis: warn   # see both notes below
+```
+
+**That denied-effect set applies to YOUR commands too.** Every tirith-owned
+boundary reports its source as unattributed and untrusted, so the effect is
+denied on every call. With the snippet above, `tirith pkg approve` and
+`tirith policy init` both refuse. Under `mode: observe` they do not. Enable it
+knowing that.
+
+**`action_incomplete_analysis: block` is narrower than it sounds.** Task effect
+inference models the Web3 shell grammar and nothing else, so nearly every
+ordinary SHELL command is reported incomplete. But package-install and
+config-write envelopes always assess as complete, so `block` refuses unmodelled
+shell at five of the nine boundaries (`capsule_preset_run`, `gateway_forward`,
+`remote_script_run`, `package_manager_network`, and
+`package_manager_execution`) and changes nothing at `pkg approve`, the two
+`pkg install` stages, or config writes. `warn`
+is the conservative default; `block` is a real option once you have measured
+your own incomplete rate on those five.
+
+Unlike `web3_guard`, every `task_gate` field is restriction-shaped, so a
+repository may tighten all of them. A repo policy that tries to LOOSEN the mode
+is refused and reported as neutralized.
+
+Try an envelope against the policy without running anything:
+
+```bash
+tirith task check --file envelope.json --adapter github-issue --format json
+```
+
+See [task-envelope.md](task-envelope.md) for the envelope format and the nine
+transitions the gate actually enforces at.

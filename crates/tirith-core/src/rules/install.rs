@@ -367,24 +367,9 @@ fn is_apt_sources_path(value: &str) -> bool {
 
 fn lexical_posix_path(value: &str) -> String {
     let raw = strip_quotes(value).replace('\\', "/").to_ascii_lowercase();
-    let absolute = raw.starts_with('/');
-    let mut components: Vec<&str> = Vec::new();
-    for component in raw.split('/') {
-        match component {
-            "" | "." => {}
-            ".." if components.last().is_some_and(|last| *last != "..") => {
-                components.pop();
-            }
-            ".." if !absolute => components.push(component),
-            ".." => {}
-            _ => components.push(component),
-        }
-    }
-    format!(
-        "{}{}",
-        if absolute { "/" } else { "" },
-        components.join("/")
-    )
+    crate::lexical_path::LexicalPath::parse(&raw, crate::lexical_path::PathDialect::Posix)
+        .map(|path| path.to_slash_string())
+        .unwrap_or_default()
 }
 
 fn is_apt_sources_dir(value: &str) -> bool {
@@ -1983,6 +1968,26 @@ mod tests {
             r#"curl -H "X-Note: >/etc/apt/sources.list" https://example.test/r"#,
             ShellType::Posix,
         ));
+    }
+
+    #[test]
+    fn apt_path_normalization_uses_shared_lexical_components() {
+        assert_eq!(
+            lexical_posix_path("'/tmp/../etc//apt/./sources.list'"),
+            "/etc/apt/sources.list"
+        );
+        assert_eq!(
+            lexical_posix_path(r"ETC\APT\sources.list.d\repo.list"),
+            "etc/apt/sources.list.d/repo.list"
+        );
+        assert_eq!(
+            lexical_posix_path("../../etc/apt/sources.list"),
+            "../../etc/apt/sources.list"
+        );
+        assert_eq!(
+            lexical_posix_path("/../../etc/apt/sources.list"),
+            "/etc/apt/sources.list"
+        );
     }
 
     #[test]

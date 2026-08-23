@@ -1221,6 +1221,61 @@ pub(crate) fn write_prepared_config_file_permitted(
     commit_config_write_permit(permit, contents, policy)
 }
 
+/// Delete a Tirith-owned configuration file through the same retained
+/// ConfigWrite boundary used for publication. The domain-separated binding
+/// distinguishes deletion from writing the old bytes, while the permit also
+/// binds the exact present preimage identity and digest captured by the caller.
+pub(crate) fn delete_prepared_config_file_permitted(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    destination: tirith_core::util::ContainedAtomicFile,
+    expected_contents: &[u8],
+    policy: &tirith_core::policy::Policy,
+    policy_change: bool,
+) -> std::io::Result<()> {
+    let delete_binding = format!(
+        "tirith-config-delete:v1:present-sha256:{}:result-absent",
+        tirith_core::command_card::sha256_hex(expected_contents)
+    );
+    let permit = tirith_core::config_write::ConfigWritePermit::from_prepared(
+        destination,
+        root,
+        path,
+        delete_binding.as_bytes(),
+        true,
+        &policy.enforcement_projection_hash(),
+        policy_change,
+    )?;
+    let envelope = permit.operation_envelope();
+    let operation = tirith_core::task_boundary::BoundaryOperation {
+        boundary: tirith_core::task_boundary::OwnedBoundary::ConfigWrite,
+        envelope: &envelope,
+        adapter: tirith_core::task::IngressAdapter::Unattributed,
+        boundary_effects: permit.boundary_effects(),
+    };
+    let pending_authorization =
+        prepare_config_write_authorization_from_operation(&operation, policy)?;
+    if !permit.binds_publication(delete_binding.as_bytes(), &operation) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "configuration deletion no longer matches its exact authorization",
+        ));
+    }
+    let boundary_permit =
+        consume_config_write_authorization_with(pending_authorization, &operation, |pending| {
+            pending.consume_default(chrono::Utc::now())
+        })
+        .map_err(config_write_gate_error)?;
+    permit
+        .commit_delete_authorized(
+            delete_binding.as_bytes(),
+            expected_contents,
+            boundary_permit,
+            &operation,
+        )
+        .map_err(std::io::Error::from)
+}
+
 fn commit_config_write_permit(
     permit: tirith_core::config_write::ConfigWritePermit,
     contents: &[u8],

@@ -3047,6 +3047,9 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn bound_cwd_policy_canonicalizes_relative_roots_before_fchdir() {
+        let _global = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let inherited_cwd = std::env::current_dir()
             .and_then(std::fs::canonicalize)
             .expect("canonical inherited cwd");

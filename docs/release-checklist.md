@@ -1,5 +1,18 @@
 # Release Checklist
 
+## Feature-specific rollout playbooks
+
+Some releases carry their own staged-enablement and back-out procedure. Work
+through the playbook BEFORE the generic steps below, because a stage-0 item can
+block the merge window itself.
+
+- [Web3 and untrusted-task boundary](web3-task-rollout.md): pause and verify the
+  scheduled ThreatDB workflow, run the shadow build and the `@solana/web3.js`
+  boundary regression, confirm the frozen MCP tool list and the inert policy
+  defaults, then re-enable the workflow and monitor one deliberate run.
+- [ThreatDB v2 rollout](threatdb-v2-rollout.md): the separate database-format
+  playbook.
+
 ## crates.io publish order
 
 Publish `tirith-core` to crates.io **first**, then `tirith`. Run

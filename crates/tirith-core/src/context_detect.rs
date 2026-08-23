@@ -581,36 +581,6 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(name);
-            // SAFETY: every caller holds TEST_ENV_LOCK until Drop restores the
-            // previous value.
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds TEST_ENV_LOCK.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.name, value),
-                    None => std::env::remove_var(self.name),
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
     fn write_marker_executable(path: &std::path::Path, marker: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -634,12 +604,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cloud_context_callers_reject_path_shadowed_helpers() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global context detection state");
         let temporary = tempfile::Builder::new()
             .prefix("tirith-context-shadow-")
-            .tempdir_in(home::home_dir().expect("test account home"))
+            .tempdir_in(&global.roots().home)
             .unwrap();
         let shadow_bin = temporary.path().join("shadow-bin");
         std::fs::create_dir(&shadow_bin).unwrap();
@@ -651,7 +620,7 @@ mod tests {
         let inherited = std::env::var_os("PATH").unwrap_or_default();
         let mut path_entries = vec![shadow_bin.clone()];
         path_entries.extend(std::env::split_paths(&inherited));
-        let _path = EnvVarGuard::set("PATH", std::env::join_paths(path_entries).unwrap());
+        global.set_env("PATH", std::env::join_paths(path_entries).unwrap());
 
         for (helper, args) in [
             ("gcloud", &["config", "list", "--format=json"][..]),
@@ -703,48 +672,31 @@ mod tests {
 
     #[test]
     fn timeout_disables_detection_via_env() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // SAFETY: tests in this crate serialize env mutation via TEST_ENV_LOCK.
-        unsafe {
-            std::env::set_var("TIRITH_CONTEXT_DETECT_DISABLE", "1");
-        }
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global context detection state");
+        global.set_env("TIRITH_CONTEXT_DETECT_DISABLE", "1");
+        global.after_restore(invalidate_cache);
         invalidate_cache();
         let r = detect_all();
         assert!(r.is_empty(), "disable env must produce empty result");
-        unsafe {
-            std::env::remove_var("TIRITH_CONTEXT_DETECT_DISABLE");
-        }
-        invalidate_cache();
     }
 
     #[test]
     fn aws_env_precedence_aws_profile_wins() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        unsafe {
-            std::env::set_var("AWS_PROFILE", "prod");
-            std::env::set_var("AWS_DEFAULT_PROFILE", "dev");
-        }
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global context detection state");
+        global.set_env("AWS_PROFILE", "prod");
+        global.set_env("AWS_DEFAULT_PROFILE", "dev");
         let ctx = detect_aws().expect("aws detection");
         assert_eq!(ctx.context, "prod");
-        unsafe {
-            std::env::remove_var("AWS_PROFILE");
-            std::env::remove_var("AWS_DEFAULT_PROFILE");
-        }
     }
 
     #[test]
     fn aws_falls_back_to_default_profile_name() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        unsafe {
-            std::env::remove_var("AWS_PROFILE");
-            std::env::remove_var("AWS_DEFAULT_PROFILE");
-        }
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global context detection state");
+        global.remove_env("AWS_PROFILE");
+        global.remove_env("AWS_DEFAULT_PROFILE");
         // Result is non-deterministic (depends on whether ~/.aws exists); just
         // check it doesn't panic.
         let _ = detect_aws();
@@ -753,15 +705,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn timeout_triggers_on_slow_binary() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global context detection state");
         let path = std::env::join_paths([
             std::path::Path::new("/usr/bin"),
             std::path::Path::new("/bin"),
         ])
         .unwrap();
-        let _path = EnvVarGuard::set("PATH", path);
+        global.set_env("PATH", path);
         let result = run_with_timeout("sleep", &["10"]);
         assert!(
             matches!(result, Err(ContextDetectFailure::Timeout)),
@@ -787,17 +738,11 @@ mod tests {
             "apiVersion: v1\nkind: Config\ncurrent-context: my-cluster\ncontexts:\n  - name: my-cluster\n",
         )
         .unwrap();
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        unsafe {
-            std::env::set_var("KUBECONFIG", kube_path.display().to_string());
-        }
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global context detection state");
+        global.set_env("KUBECONFIG", &kube_path);
         let ctx = detect_kube().expect("kube detection");
         assert_eq!(ctx.context, "my-cluster");
-        unsafe {
-            std::env::remove_var("KUBECONFIG");
-        }
     }
 
     #[test]
@@ -815,18 +760,12 @@ mod tests {
             "apiVersion: v1\nkind: Config\ncurrent-context: second-ctx\n",
         )
         .unwrap();
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global context detection state");
         let sep = if cfg!(windows) { ";" } else { ":" };
         let joined = format!("{}{sep}{}", first.display(), second.display());
-        unsafe {
-            std::env::set_var("KUBECONFIG", joined);
-        }
+        global.set_env("KUBECONFIG", joined);
         let ctx = detect_kube().expect("kube detection");
         assert_eq!(ctx.context, "first-ctx");
-        unsafe {
-            std::env::remove_var("KUBECONFIG");
-        }
     }
 }

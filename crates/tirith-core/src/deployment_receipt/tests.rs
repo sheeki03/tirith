@@ -6,7 +6,8 @@ use crate::build_receipt::{
     BuildCoverage, BuildEvidence, BuildReceipt, BuildReceiptFacts, BuildSubject, ExecutionLink,
     GitBinding, SignatureAnchor, SignatureTrust, TreeDigest, TreeLimits,
 };
-use crate::ssrf_guard::test_support::{http_response, EnvironmentRestore, ScriptedHttpServer};
+use crate::ssrf_guard::test_support::{http_response, ScriptedHttpServer};
+use tirith_test_support::GlobalStateGuard;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -80,13 +81,10 @@ fn run_fixture(
     files: &[TreeFile],
     settings: FetchSettings,
 ) -> (Vec<RouteOutcome>, Vec<Vec<u8>>) {
-    let _environment = crate::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut environment = GlobalStateGuard::new().expect("isolate deployment receipt fixture");
     let fixture = ScriptedHttpServer::start(responses);
-    let mut restore = EnvironmentRestore::new();
     // The fixture speaks plain HTTP; the destination rules are unchanged.
-    restore.set("TIRITH_ALLOW_HTTP", Some("1"));
+    environment.set_env("TIRITH_ALLOW_HTTP", "1");
     let address = fixture.address();
     let base = url::Url::parse(&format!("http://{FIXTURE_HOST}:{}/", address.port()))
         .expect("parse the fixture base URL");
@@ -940,6 +938,27 @@ fn a_fresh_deployment_receipt_is_content_addressed_and_valid() {
     assert!(receipt.content_hash_matches());
     receipt.validate().expect("a coherent receipt validates");
     assert!(!receipt.coverage.audit_chain_anchored);
+}
+
+#[test]
+fn deployment_receipt_parsing_rejects_duplicate_members_before_validation() {
+    let receipt = assembled_receipt(vec![outcome(RouteState::Match)], true);
+    let duplicate = receipt.to_json().replacen(
+        "\"receipt_id\":",
+        "\"receipt_id\": \"attacker-selected\", \"receipt_id\":",
+        1,
+    );
+
+    let error = DeploymentReceipt::parse(&duplicate).expect_err("duplicate keys must be refused");
+    assert!(error.to_string().contains("duplicate JSON object key"));
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("receipt.json");
+    std::fs::write(&path, duplicate).expect("write duplicate-key receipt");
+    assert!(DeploymentReceipt::load_unvalidated(&path)
+        .expect_err("the public file loader must use the same strict parser")
+        .to_string()
+        .contains("duplicate JSON object key"));
 }
 
 #[test]

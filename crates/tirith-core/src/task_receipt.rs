@@ -91,6 +91,8 @@ enum OwnedBoundaryProjectionV1 {
     RemoteScriptRun,
     FetchCloaking,
     ConfigWrite,
+    VerifySelf,
+    SelfUpdate,
     CapsulePresetRun,
 }
 
@@ -106,6 +108,8 @@ impl From<OwnedBoundary> for OwnedBoundaryProjectionV1 {
             OwnedBoundary::RemoteScriptRun => Self::RemoteScriptRun,
             OwnedBoundary::FetchCloaking => Self::FetchCloaking,
             OwnedBoundary::ConfigWrite => Self::ConfigWrite,
+            OwnedBoundary::VerifySelf => Self::VerifySelf,
+            OwnedBoundary::SelfUpdate => Self::SelfUpdate,
             OwnedBoundary::CapsulePresetRun => Self::CapsulePresetRun,
         }
     }
@@ -123,6 +127,8 @@ impl From<OwnedBoundaryProjectionV1> for OwnedBoundary {
             OwnedBoundaryProjectionV1::RemoteScriptRun => Self::RemoteScriptRun,
             OwnedBoundaryProjectionV1::FetchCloaking => Self::FetchCloaking,
             OwnedBoundaryProjectionV1::ConfigWrite => Self::ConfigWrite,
+            OwnedBoundaryProjectionV1::VerifySelf => Self::VerifySelf,
+            OwnedBoundaryProjectionV1::SelfUpdate => Self::SelfUpdate,
             OwnedBoundaryProjectionV1::CapsulePresetRun => Self::CapsulePresetRun,
         }
     }
@@ -1091,6 +1097,54 @@ impl std::fmt::Debug for ReplayReservation {
                 &crate::command_card::sha256_hex(self.reservation_id.as_bytes()),
             )
             .finish_non_exhaustive()
+    }
+}
+
+/// Retryable ownership of replay state after a locally proven zero-effect
+/// outcome.
+///
+/// A replay commit can publish its replacement and then lose confirmation; its
+/// best-effort restore can fail too.  The exact reservation identity is still
+/// sufficient to reconcile either the old reservation or the newly committed
+/// entries, but dropping that identity after one failed abort would permanently
+/// burn a receipt even though no effect was attempted.  This opaque capability
+/// retains the store and reservation until durable reconciliation succeeds.
+#[must_use = "known-zero replay rollback ownership must be retried until durable cleanup succeeds"]
+pub struct ReplayKnownZeroRollback {
+    store: Box<dyn ReplayStore>,
+    reservation: Option<ReplayReservation>,
+}
+
+impl std::fmt::Debug for ReplayKnownZeroRollback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReplayKnownZeroRollback")
+            .field("pending", &self.reservation.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReplayKnownZeroRollback {
+    pub(crate) fn new(store: impl ReplayStore + 'static, reservation: ReplayReservation) -> Self {
+        Self {
+            store: Box::new(store),
+            reservation: Some(reservation),
+        }
+    }
+
+    /// Reconcile the exact reservation.  Failure leaves the capability intact
+    /// so its owner can retry without reconstructing or exposing replay keys.
+    pub fn retry(&mut self) -> Result<(), ReplayStoreError> {
+        let Some(reservation) = self.reservation.as_ref() else {
+            return Ok(());
+        };
+        self.store.abort_reservation(reservation)?;
+        self.reservation = None;
+        Ok(())
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.reservation.is_none()
     }
 }
 
@@ -2281,6 +2335,8 @@ mod tests {
             (OwnedBoundary::RemoteScriptRun, "remote_script_run"),
             (OwnedBoundary::FetchCloaking, "fetch_cloaking"),
             (OwnedBoundary::ConfigWrite, "config_write"),
+            (OwnedBoundary::VerifySelf, "verify_self"),
+            (OwnedBoundary::SelfUpdate, "self_update"),
             (OwnedBoundary::CapsulePresetRun, "capsule_preset_run"),
         ];
         for (boundary, wire_name) in cases {
@@ -3081,6 +3137,84 @@ mod tests {
             Err(ReplayStoreError::CommitUnknown)
         ));
         store.abort_reservation(&reservation).unwrap();
+        assert!(matches!(
+            store.reserve_batch(std::slice::from_ref(&validated), now()),
+            Ok(ReplayReservationOutcome::Reserved(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn known_zero_rollback_retains_ownership_across_a_failed_abort() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailFirstAbortStore {
+            inner: DurableReplayStore,
+            failures_remaining: AtomicUsize,
+        }
+
+        impl ReplayStore for FailFirstAbortStore {
+            fn consume(
+                &self,
+                receipt: &ValidatedReceiptV2,
+                now: DateTime<Utc>,
+            ) -> Result<ReplayOutcome, ReplayStoreError> {
+                self.inner.consume(receipt, now)
+            }
+
+            fn abort_reservation(
+                &self,
+                reservation: &ReplayReservation,
+            ) -> Result<(), ReplayStoreError> {
+                if self.failures_remaining.swap(0, Ordering::AcqRel) > 0 {
+                    return Err(ReplayStoreError::Unavailable(
+                        "injected first abort failure".to_string(),
+                    ));
+                }
+                self.inner.abort_reservation(reservation)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = DurableReplayStore::with_root(temp.path().join("replay"));
+        let expected = projection();
+        let (receipt, keys) = signed_receipt(
+            &expected,
+            now() - TimeDelta::minutes(1),
+            now() + TimeDelta::minutes(59),
+        );
+        let validated = verify_receipt_v2(&receipt, &expected, &keys, now()).unwrap();
+        let ReplayReservationOutcome::Reserved(reservation) = store
+            .reserve_batch(std::slice::from_ref(&validated), now())
+            .unwrap()
+        else {
+            panic!("fresh receipt was not reservable");
+        };
+        assert!(matches!(
+            store.commit_reservation_with_clock_and_failures(
+                &reservation,
+                now(),
+                &now,
+                ReplayCommitFailureInjection {
+                    fail_after_commit_publish: true,
+                    fail_restore_before_publish: true,
+                },
+            ),
+            Err(ReplayStoreError::CommitUnknown)
+        ));
+
+        let flaky = FailFirstAbortStore {
+            inner: store.clone(),
+            failures_remaining: AtomicUsize::new(1),
+        };
+        let mut rollback = ReplayKnownZeroRollback::new(flaky, reservation);
+        assert!(matches!(
+            rollback.retry(),
+            Err(ReplayStoreError::Unavailable(_))
+        ));
+        assert!(!rollback.is_complete());
+        rollback.retry().unwrap();
+        assert!(rollback.is_complete());
         assert!(matches!(
             store.reserve_batch(std::slice::from_ref(&validated), now()),
             Ok(ReplayReservationOutcome::Reserved(_))

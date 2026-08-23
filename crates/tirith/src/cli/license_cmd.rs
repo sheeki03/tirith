@@ -1,5 +1,86 @@
 use tirith_core::license;
 
+const LICENSE_FILE_READ_CAP: u64 = 1024 * 1024;
+
+fn retained_license_root(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    for ancestor in absolute.ancestors().skip(1) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Ok(ancestor.to_path_buf()),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "license path has no existing directory ancestor",
+    ))
+}
+
+fn write_license_key_with_policy(
+    path: &std::path::Path,
+    contents: &[u8],
+    policy: &tirith_core::policy::Policy,
+) -> std::io::Result<()> {
+    let root = retained_license_root(path)?;
+    // The shared helper performs its pure task-gate preflight before creating
+    // the config directory or taking the retained parent mutation lock.
+    let destination =
+        super::prepare_config_destination_permitted(&root, path, true, policy, false, true)?;
+    match destination.read_capped(LICENSE_FILE_READ_CAP) {
+        Ok(_) | Err(tirith_core::util::OpenRegularError::NotFound) => {}
+        Err(error) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("cannot inspect existing license key: {error:?}"),
+            ));
+        }
+    }
+    super::write_prepared_config_file_permitted(
+        &root,
+        path,
+        destination,
+        contents,
+        true,
+        policy,
+        false,
+    )
+}
+
+fn delete_license_key_with_policy(
+    path: &std::path::Path,
+    policy: &tirith_core::policy::Policy,
+) -> std::io::Result<bool> {
+    let root = retained_license_root(path)?;
+    let destination = match super::prepare_config_destination_permitted(
+        &root, path, true, policy, false, false,
+    ) {
+        Ok(destination) => destination,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let contents = match destination.read_capped(LICENSE_FILE_READ_CAP) {
+        Ok(contents) => contents,
+        Err(tirith_core::util::OpenRegularError::NotFound) => return Ok(false),
+        Err(error) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("cannot inspect existing license key: {error:?}"),
+            ));
+        }
+    };
+    super::delete_prepared_config_file_permitted(
+        &root,
+        path,
+        destination,
+        &contents,
+        policy,
+        false,
+    )?;
+    Ok(true)
+}
+
 #[cfg(unix)]
 struct RefreshCredentials {
     server_url: String,
@@ -82,15 +163,6 @@ fn normalize_refresh_pair(
     })
 }
 
-#[cfg(unix)]
-fn resolve_refresh_credentials() -> Result<RefreshCredentials, String> {
-    resolve_refresh_credentials_with(
-        std::env::var_os("TIRITH_SERVER_URL"),
-        std::env::var_os("TIRITH_API_KEY"),
-        || tirith_core::policy::Policy::discover_local_only(None),
-    )
-}
-
 /// Activate a license by validating and writing the signed token.
 pub fn activate(key: &str) -> i32 {
     if !license::validate_key_structure(key) {
@@ -118,20 +190,10 @@ pub fn activate(key: &str) -> i32 {
         }
     };
 
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("tirith: cannot create config directory: {e}");
-            return 1;
-        }
-    }
-
-    {
-        // repo-0222: atomic publish — a crash or full disk mid-write must not
-        // destroy the previously valid license key.
-        if let Err(e) = tirith_core::util::write_file_atomic_0600(&path, key.trim().as_bytes()) {
-            eprintln!("tirith: cannot write license key: {e}");
-            return 1;
-        }
+    let policy = tirith_core::policy::Policy::discover_local_only(None);
+    if let Err(e) = write_license_key_with_policy(&path, key.trim().as_bytes(), &policy) {
+        eprintln!("tirith: cannot write license key: {e}");
+        return 1;
     }
 
     eprintln!("License activated successfully.");
@@ -162,14 +224,17 @@ pub fn deactivate() -> i32 {
         }
     };
 
-    if !path.exists() {
-        eprintln!("No license key installed.");
-        return 0;
-    }
-
-    if let Err(e) = std::fs::remove_file(&path) {
-        eprintln!("tirith: cannot remove license key: {e}");
-        return 1;
+    let policy = tirith_core::policy::Policy::discover_local_only(None);
+    match delete_license_key_with_policy(&path, &policy) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("No license key installed.");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("tirith: cannot remove license key: {e}");
+            return 1;
+        }
     }
 
     eprintln!("License key removed. Baseline features remain available.");
@@ -186,7 +251,15 @@ pub fn refresh() -> i32 {
 
     #[cfg(unix)]
     {
-        let credentials = match resolve_refresh_credentials() {
+        // One trusted policy snapshot supplies both refresh credentials (when
+        // not overridden as an indivisible environment pair) and the exact
+        // ConfigWrite authorization used to publish the returned token.
+        let policy = tirith_core::policy::Policy::discover_local_only(None);
+        let credentials = match resolve_refresh_credentials_with(
+            std::env::var_os("TIRITH_SERVER_URL"),
+            std::env::var_os("TIRITH_API_KEY"),
+            || policy.clone(),
+        ) {
             Ok(credentials) => credentials,
             Err(reason) => {
                 eprintln!("tirith: cannot refresh license: {reason}");
@@ -215,22 +288,11 @@ pub fn refresh() -> i32 {
                     }
                 };
 
-                if let Some(parent) = path.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        eprintln!("tirith: cannot create config directory: {e}");
-                        return 1;
-                    }
-                }
-
+                if let Err(e) =
+                    write_license_key_with_policy(&path, token.trim().as_bytes(), &policy)
                 {
-                    // repo-0222: atomic publish — a crash mid-write must not
-                    // destroy the previously valid license key.
-                    if let Err(e) =
-                        tirith_core::util::write_file_atomic_0600(&path, token.trim().as_bytes())
-                    {
-                        eprintln!("tirith: cannot write license key: {e}");
-                        return 1;
-                    }
+                    eprintln!("tirith: cannot write license key: {e}");
+                    return 1;
                 }
 
                 eprintln!("License refreshed successfully.");
@@ -328,6 +390,17 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    fn denied_license_write_policy() -> tirith_core::policy::Policy {
+        let mut policy = tirith_core::policy::Policy::default();
+        policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
+        policy
+            .task_gate
+            .effects_denied_for_untrusted_sources
+            .insert(tirith_core::effects::CommandEffectKind::FilesystemWrite);
+        policy
+    }
 
     #[test]
     fn environment_credentials_are_an_indivisible_pair() {
@@ -418,5 +491,92 @@ mod tests {
             result.err().expect("non-Unicode override must fail"),
             "TIRITH_SERVER_URL must be valid UTF-8"
         );
+    }
+
+    #[test]
+    fn denied_license_mutations_preserve_present_bytes_and_absent_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let path = config.join("license.key");
+        let policy = denied_license_write_policy();
+
+        let error = write_license_key_with_policy(&path, b"new-token", &policy)
+            .expect_err("a denied absent write must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!config.exists(), "deny must happen before parent creation");
+
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(&path, b"original-token").unwrap();
+        write_license_key_with_policy(&path, b"new-token", &policy)
+            .expect_err("a denied overwrite must fail");
+        assert_eq!(std::fs::read(&path).unwrap(), b"original-token");
+
+        delete_license_key_with_policy(&path, &policy).expect_err("a denied deletion must fail");
+        assert_eq!(std::fs::read(&path).unwrap(), b"original-token");
+    }
+
+    #[test]
+    fn concurrent_license_writers_publish_only_one_complete_token() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("license.key");
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for token in [b"first-complete-token".as_slice(), b"second-complete-token"] {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let token = token.to_vec();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                write_license_key_with_policy(
+                    &path,
+                    &token,
+                    &tirith_core::policy::Policy::default(),
+                )
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+
+        let final_bytes = std::fs::read(&path).unwrap();
+        assert!(final_bytes == b"first-complete-token" || final_bytes == b"second-complete-token");
+    }
+
+    #[test]
+    fn concurrent_license_delete_and_write_are_parent_serialized() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("license.key");
+        std::fs::write(&path, b"original-token").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let delete_path = path.clone();
+        let delete_barrier = Arc::clone(&barrier);
+        let delete_thread = std::thread::spawn(move || {
+            delete_barrier.wait();
+            delete_license_key_with_policy(&delete_path, &tirith_core::policy::Policy::default())
+        });
+        let write_path = path.clone();
+        let write_barrier = Arc::clone(&barrier);
+        let write_thread = std::thread::spawn(move || {
+            write_barrier.wait();
+            write_license_key_with_policy(
+                &write_path,
+                b"replacement-token",
+                &tirith_core::policy::Policy::default(),
+            )
+        });
+        barrier.wait();
+        assert!(delete_thread.join().unwrap().unwrap());
+        write_thread.join().unwrap().unwrap();
+
+        match std::fs::read(&path) {
+            Ok(bytes) => assert_eq!(bytes, b"replacement-token"),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        }
     }
 }

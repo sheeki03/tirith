@@ -388,36 +388,6 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(name);
-            // SAFETY: the caller holds the crate-wide TEST_ENV_LOCK until this
-            // guard restores the previous value in Drop.
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds TEST_ENV_LOCK.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.name, value),
-                    None => std::env::remove_var(self.name),
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
     fn mkexec(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, b"#!/bin/sh\necho hi\n").unwrap();
@@ -429,12 +399,11 @@ mod tests {
     fn provenance_file_probe_rejects_a_same_uid_path_shadow_without_execution() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global provenance test state");
         let temporary = tempfile::Builder::new()
             .prefix("tirith-file-probe-shadow-")
-            .tempdir_in(home::home_dir().expect("test account home"))
+            .tempdir_in(&global.roots().home)
             .unwrap();
         let shadow_bin = temporary.path().join("shadow-bin");
         std::fs::create_dir(&shadow_bin).unwrap();
@@ -452,7 +421,7 @@ mod tests {
         let inherited = std::env::var_os("PATH").unwrap_or_default();
         let mut path_entries = vec![shadow_bin];
         path_entries.extend(std::env::split_paths(&inherited));
-        let _path = EnvVarGuard::set("PATH", std::env::join_paths(path_entries).unwrap());
+        global.set_env("PATH", std::env::join_paths(path_entries).unwrap());
         let inspected = temporary.path().join("candidate");
         std::fs::write(&inspected, b"candidate bytes").unwrap();
 
@@ -490,11 +459,10 @@ mod tests {
         if !Path::new("/usr/bin/file").is_file() && !Path::new("/bin/file").is_file() {
             return;
         }
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate process-global provenance test state");
         let path = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
-        let _path = EnvVarGuard::set("PATH", path);
+        global.set_env("PATH", path);
 
         assert!(
             file_brief(Path::new("/bin/sh")).is_some(),

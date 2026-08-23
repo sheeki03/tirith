@@ -1895,9 +1895,12 @@ mod tests {
     fn production_seccomp_parent_death_signal_kills_and_reaps_target() {
         const MODE: &str = "TIRITH_SECCOMP_GUARD_DEATH_MODE";
         const MARKER: &str = "TIRITH_SECCOMP_GUARD_DEATH_MARKER";
-        let marker_dir = tempfile::tempdir().expect("guard-death marker directory");
-        let marker = marker_dir.path().join("target-survived");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate seccomp subprocess test state");
+        let marker = global.roots().temp.join("target-survived");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        global.apply_to_command(&mut command);
+        let output = command
             .args(["seccomp_guard_death_subprocess", "--nocapture"])
             .env(MODE, "controller")
             .env(MARKER, &marker)

@@ -947,39 +947,19 @@ mod tests {
     }
 
     // `XDG_STATE_HOME` is process-global and cargo runs tests in parallel, so
-    // use the crate-wide mutex shared by every CLI test that repoints process
-    // environment; `StateHomeGuard` restores it (RAII) on every exit path.
+    // enter the shared global-state domain through the compatibility harness.
     use crate::cli::test_harness::ENV_LOCK;
 
-    struct StateHomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl StateHomeGuard {
-        fn set(dir: &Path) -> Self {
-            // Hold the lock for the guard's lifetime; recover from a poisoned
-            // mutex so one panicking test does not wedge the rest.
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("XDG_STATE_HOME");
-            std::env::set_var("XDG_STATE_HOME", dir);
-            Self { prev, _lock: lock }
-        }
-    }
-
-    impl Drop for StateHomeGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-        }
+    fn isolated_state_home(dir: &Path) -> tirith_test_support::GlobalStateGuard {
+        let mut environment = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        environment.set_env("XDG_STATE_HOME", dir);
+        environment
     }
 
     #[test]
     fn write_cache_is_atomic_and_readable() {
         let dir = tempfile::tempdir().unwrap();
-        let _guard = StateHomeGuard::set(dir.path());
+        let _guard = isolated_state_home(dir.path());
 
         let outcome = ProbeOutcome {
             capability: EnterCapability::Works,
@@ -1014,7 +994,7 @@ mod tests {
     #[test]
     fn read_cache_rejects_wrong_schema() {
         let dir = tempfile::tempdir().unwrap();
-        let _guard = StateHomeGuard::set(dir.path());
+        let _guard = isolated_state_home(dir.path());
 
         let state = dir.path().join("tirith");
         std::fs::create_dir_all(&state).unwrap();
@@ -1032,7 +1012,7 @@ mod tests {
     #[test]
     fn read_cache_rejects_oversized_file() {
         let dir = tempfile::tempdir().unwrap();
-        let _guard = StateHomeGuard::set(dir.path());
+        let _guard = isolated_state_home(dir.path());
 
         let state = dir.path().join("tirith");
         std::fs::create_dir_all(&state).unwrap();
@@ -1051,7 +1031,7 @@ mod tests {
         // is corrupt/hand-edited and must be rejected, not read with an empty
         // path — fail closed.
         let dir = tempfile::tempdir().unwrap();
-        let _guard = StateHomeGuard::set(dir.path());
+        let _guard = isolated_state_home(dir.path());
 
         let state = dir.path().join("tirith");
         std::fs::create_dir_all(&state).unwrap();

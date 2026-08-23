@@ -1,0 +1,11 @@
+[package]
+name = "tirith-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hermetic process-global state guard for tirith tests"
+publish = false
+
+[dependencies]
+tempfile = "3"

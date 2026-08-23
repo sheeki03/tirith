@@ -477,6 +477,27 @@ fn non_empty_version(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    struct TestEnvironment {
+        global: tirith_test_support::GlobalStateGuard,
+    }
+
+    impl TestEnvironment {
+        fn new() -> Self {
+            Self {
+                global: tirith_test_support::GlobalStateGuard::new()
+                    .expect("isolate process-global agent-origin state"),
+            }
+        }
+
+        fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            self.global.set_env(name, value);
+        }
+
+        fn unset(&mut self, name: &'static str) {
+            self.global.remove_env(name);
+        }
+    }
+
     #[test]
     fn kind_tags_are_stable() {
         assert_eq!(AgentOrigin::human(true).kind(), "human");
@@ -591,21 +612,17 @@ mod tests {
         }
     }
 
-    // env-driven resolver tests; hold the global env lock (they mutate env).
+    // Env-driven resolver tests use the shared panic-safe global state guard.
 
     #[test]
     fn resolve_cli_origin_prefers_tirith_integration() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
         // TIRITH_INTEGRATION wins over CI signals.
-        unsafe {
-            std::env::set_var("TIRITH_INTEGRATION", "claude-code");
-            std::env::set_var("TIRITH_INTEGRATION_VERSION", "1.2.3");
-            std::env::set_var("CI", "true");
-            std::env::set_var("GITHUB_ACTIONS", "true");
-        }
+        env.set("TIRITH_INTEGRATION", "claude-code");
+        env.set("TIRITH_INTEGRATION_VERSION", "1.2.3");
+        env.set("CI", "true");
+        env.set("GITHUB_ACTIONS", "true");
 
         let origin = resolve_cli_origin(false);
         assert_eq!(origin.kind(), "agent");
@@ -615,29 +632,18 @@ mod tests {
         } else {
             panic!("expected Agent");
         }
-
-        unsafe {
-            std::env::remove_var("TIRITH_INTEGRATION");
-            std::env::remove_var("TIRITH_INTEGRATION_VERSION");
-            std::env::remove_var("CI");
-            std::env::remove_var("GITHUB_ACTIONS");
-        }
     }
 
     #[test]
     fn resolve_cli_origin_detects_named_ci_when_no_integration() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
-        unsafe {
-            std::env::remove_var("TIRITH_INTEGRATION");
-            std::env::remove_var("TIRITH_INTEGRATION_VERSION");
-            std::env::set_var("GITHUB_ACTIONS", "true");
-            std::env::remove_var("CI");
-            std::env::remove_var("GITLAB_CI");
-            std::env::remove_var("BUILDKITE");
-        }
+        env.unset("TIRITH_INTEGRATION");
+        env.unset("TIRITH_INTEGRATION_VERSION");
+        env.set("GITHUB_ACTIONS", "true");
+        env.unset("CI");
+        env.unset("GITLAB_CI");
+        env.unset("BUILDKITE");
 
         let origin = resolve_cli_origin(false);
         assert_eq!(origin.kind(), "ci");
@@ -646,17 +652,11 @@ mod tests {
         } else {
             panic!("expected Ci");
         }
-
-        unsafe {
-            std::env::remove_var("GITHUB_ACTIONS");
-        }
     }
 
     #[test]
     fn resolve_cli_origin_detects_generic_ci_without_named_provider() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
         // Clear every named-provider variable we know about, then set only CI=true.
         let named = [
@@ -672,13 +672,11 @@ mod tests {
             "DRONE",
             "CODEBUILD_BUILD_ID",
         ];
-        unsafe {
-            std::env::remove_var("TIRITH_INTEGRATION");
-            for v in named {
-                std::env::remove_var(v);
-            }
-            std::env::set_var("CI", "true");
+        env.unset("TIRITH_INTEGRATION");
+        for v in named {
+            env.unset(v);
         }
+        env.set("CI", "true");
 
         let origin = resolve_cli_origin(false);
         assert_eq!(origin.kind(), "ci");
@@ -687,17 +685,11 @@ mod tests {
         } else {
             panic!("expected Ci");
         }
-
-        unsafe {
-            std::env::remove_var("CI");
-        }
     }
 
     #[test]
     fn resolve_cli_origin_falls_back_to_human() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
         let to_clear = [
             "TIRITH_INTEGRATION",
@@ -715,10 +707,8 @@ mod tests {
             "DRONE",
             "CODEBUILD_BUILD_ID",
         ];
-        unsafe {
-            for v in to_clear {
-                std::env::remove_var(v);
-            }
+        for v in to_clear {
+            env.unset(v);
         }
 
         let origin = resolve_cli_origin(true);
@@ -732,9 +722,7 @@ mod tests {
 
     #[test]
     fn resolve_cli_origin_treats_ci_false_as_not_ci() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
         // Some shells default `CI=false` — that should NOT trip the CI branch.
         let to_clear = [
@@ -751,26 +739,18 @@ mod tests {
             "DRONE",
             "CODEBUILD_BUILD_ID",
         ];
-        unsafe {
-            for v in to_clear {
-                std::env::remove_var(v);
-            }
-            std::env::set_var("CI", "false");
+        for v in to_clear {
+            env.unset(v);
         }
+        env.set("CI", "false");
 
         let origin = resolve_cli_origin(false);
         assert_eq!(origin.kind(), "human");
-
-        unsafe {
-            std::env::remove_var("CI");
-        }
     }
 
     #[test]
     fn resolve_cli_origin_ignores_hostile_tirith_integration() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut env = TestEnvironment::new();
 
         // A million-byte hostile value with control bytes must not crash, not
         // produce a multi-line audit-poisoning label, and cap at MAX_LABEL_LEN.
@@ -779,10 +759,8 @@ mod tests {
             "x".repeat(1_000_000),
             "y".repeat(1_000_000)
         );
-        unsafe {
-            std::env::set_var("TIRITH_INTEGRATION", &hostile);
-            std::env::remove_var("CI");
-        }
+        env.set("TIRITH_INTEGRATION", &hostile);
+        env.unset("CI");
 
         let origin = resolve_cli_origin(false);
         assert_eq!(origin.kind(), "agent");
@@ -792,10 +770,6 @@ mod tests {
             assert!(!tool.contains('\x1b'));
         } else {
             panic!("expected Agent");
-        }
-
-        unsafe {
-            std::env::remove_var("TIRITH_INTEGRATION");
         }
     }
 

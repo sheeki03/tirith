@@ -1008,7 +1008,7 @@ mod tests {
         // `.take()` them one at a time.
         home: Option<EnvGuard>,
         userprofile: Option<EnvGuard>,
-        lock: Option<std::sync::MutexGuard<'static, ()>>,
+        lock: Option<tirith_test_support::GlobalStateGuard>,
     }
 
     impl HomeGuard {

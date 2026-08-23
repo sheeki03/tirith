@@ -1,0 +1,1 @@
+$env:SOLANA_CONFIG_HOME = '.config/solana'; solana program deploy program.so --url https://api.mainnet-beta.solana.com

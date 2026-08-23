@@ -108,6 +108,30 @@ fn find_consumer(command: &str) -> String {
     )
 }
 
+fn event_budget_consumer(event_count: usize) -> String {
+    let mut workflow = String::from(concat!(
+        "name: Deploy\n",
+        "on:\n",
+        "  workflow_run:\n",
+        "    workflows: [CI]\n",
+        "    types: [completed]\n",
+        "jobs:\n",
+        "  ship:\n",
+        "    runs-on: ubuntu-latest\n",
+        "    steps:\n",
+    ));
+    for _ in 0..event_count {
+        workflow.push_str(concat!(
+            "      - uses: actions/download-artifact@v4\n",
+            "        with:\n",
+            "          name: build\n",
+            "          path: dist\n",
+            "          run-id: ${{ github.event.workflow_run.id }}\n",
+        ));
+    }
+    workflow
+}
+
 fn workflows_dir(root: &Path) -> PathBuf {
     let dir = root.join(".github").join("workflows");
     fs::create_dir_all(&dir).expect("create .github/workflows");
@@ -393,6 +417,58 @@ fn step_bound_records_a_truncated_gap_and_blocks_the_downgrade() {
     let trigger = findings_for(&result, RuleId::WorkflowRunTrigger);
     assert_eq!(trigger.len(), 1, "{trigger:?}");
     assert_eq!(trigger[0].1, Severity::High);
+}
+
+#[test]
+fn event_bound_is_exact_and_overflow_records_a_truncated_gap() {
+    const EVENT_LIMIT: usize = 512;
+
+    let at_limit = tempfile::tempdir().expect("at-limit tempdir");
+    let at_limit_dir = workflows_dir(at_limit.path());
+    fs::write(at_limit_dir.join("ci.yml"), PRODUCER).expect("write producer");
+    fs::write(
+        at_limit_dir.join("deploy.yml"),
+        event_budget_consumer(EVENT_LIMIT),
+    )
+    .expect("write at-limit consumer");
+
+    let result = scan_tree(at_limit.path());
+    assert!(
+        result.coverage_gaps.is_empty(),
+        "the exact event limit is complete: {:?}",
+        result.coverage_gaps
+    );
+    let trigger = findings_for(&result, RuleId::WorkflowRunTrigger);
+    assert_eq!(trigger.len(), 1, "{trigger:?}");
+    assert_eq!(
+        trigger[0].1,
+        Severity::Medium,
+        "a fully modelled benign consumer remains downgradeable"
+    );
+
+    let over_limit = tempfile::tempdir().expect("over-limit tempdir");
+    let over_limit_dir = workflows_dir(over_limit.path());
+    fs::write(over_limit_dir.join("ci.yml"), PRODUCER).expect("write producer");
+    fs::write(
+        over_limit_dir.join("deploy.yml"),
+        event_budget_consumer(EVENT_LIMIT + 1),
+    )
+    .expect("write over-limit consumer");
+
+    let result = scan_tree(over_limit.path());
+    let over_limit_consumer = over_limit_dir.join("deploy.yml");
+    assert!(result.coverage_gaps.iter().any(|gap| {
+        gap.kind == CoverageGapKind::Truncated
+            && gap.primary_path() == Some(over_limit_consumer.as_path())
+    }));
+    assert!(findings_for(&result, RuleId::WorkflowArtifactPoisoning).is_empty());
+    let trigger = findings_for(&result, RuleId::WorkflowRunTrigger);
+    assert_eq!(trigger.len(), 1, "{trigger:?}");
+    assert_eq!(
+        trigger[0].1,
+        Severity::High,
+        "an event-overflowed consumer must never be reported as chain-free"
+    );
 }
 
 // The 32 MiB aggregate-source ceiling is exercised by

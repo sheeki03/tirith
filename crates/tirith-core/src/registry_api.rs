@@ -1657,12 +1657,47 @@ mod tests {
 
     #[test]
     fn gather_available_on_success() {
+        let _global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate registry-history side effects");
         let client = FakeClient {
             result: Ok(meta_clean()),
         };
         let (sig, existence) = gather_api_signals(&client, Ecosystem::Npm, "react");
         assert!(matches!(sig, ApiSignals::Available { .. }));
         assert_eq!(existence, PackageExistence::Exists);
+    }
+
+    #[test]
+    fn successful_fixture_lookup_records_history_only_under_isolated_state() {
+        let global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate registry-history side effects");
+        let state = crate::policy::state_dir().expect("isolated state directory");
+        assert!(
+            state.starts_with(&global.roots().root),
+            "registry history resolved outside the shared isolated root: {}",
+            state.display()
+        );
+
+        let mut metadata = meta_clean();
+        metadata.package_name = Some("react-isolation-fixture".to_string());
+        let client = FakeClient {
+            result: Ok(metadata),
+        };
+        let (signals, existence) =
+            gather_api_signals(&client, Ecosystem::Npm, "react-isolation-fixture");
+        assert!(matches!(signals, ApiSignals::Available { .. }));
+        assert_eq!(existence, PackageExistence::Exists);
+
+        let row = state
+            .join("registry_snapshots")
+            .join("npm")
+            .join("react-isolation-fixture.jsonl");
+        assert!(
+            row.is_file(),
+            "fixture registry snapshot was not written below isolated state: {}",
+            row.display()
+        );
+        assert_eq!(crate::registry_history::read_rows(&row).len(), 1);
     }
 
     #[test]
@@ -1696,17 +1731,8 @@ mod tests {
 
     #[test]
     fn name_existence_validates_identity_without_recording_registry_history() {
-        use crate::ssrf_guard::test_support::EnvironmentRestore;
-
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = tempfile::tempdir().unwrap();
-        let mut restore = EnvironmentRestore::new();
-        restore.set(
-            "XDG_STATE_HOME",
-            Some(state.path().to_str().expect("UTF-8 temp state path")),
-        );
+        let global = tirith_test_support::GlobalStateGuard::new()
+            .expect("isolate registry-history side effects");
 
         let client = FakeClient {
             result: Ok(meta_clean()),
@@ -1716,7 +1742,11 @@ mod tests {
             PackageExistence::Exists
         );
         assert!(
-            !state.path().join("tirith/registry_snapshots").exists(),
+            !global
+                .roots()
+                .xdg_state
+                .join("tirith/registry_snapshots")
+                .exists(),
             "an existence-only lookup must not create registry-history state"
         );
 
@@ -1813,9 +1843,6 @@ mod tests {
     fn registry_client_rejects_connect_time_private_dns_rebind() {
         use crate::ssrf_guard::test_support::EnvironmentRestore;
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut restore = EnvironmentRestore::new();
         restore.set("TIRITH_ALLOW_HTTP", Some("1"));
         let url = "http://registry-public.example.test:8080/package";
@@ -1848,9 +1875,6 @@ mod tests {
             http_response, EnvironmentRestore, ScriptedHttpServer,
         };
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut restore = EnvironmentRestore::new();
         restore.set("TIRITH_ALLOW_HTTP", Some("1"));
         let fixture = ScriptedHttpServer::start(vec![http_response(
@@ -1902,9 +1926,6 @@ mod tests {
             http_response, EnvironmentRestore, ProxyTrap, ScriptedHttpServer,
         };
 
-        let _environment = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = ScriptedHttpServer::start(vec![
             http_response("302 Found", &[("Location", "/final")], b""),
             http_response("200 OK", &[("Content-Type", "application/json")], b"{}"),
