@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787572847998,
+  "lastUpdate": 1787615355292,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -2591,6 +2591,168 @@ window.BENCHMARK_DATA = {
             "name": "task_decision_projection",
             "value": 1285,
             "range": "± 3",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ed187b8c230edb2dff3df81f09f214a9ba40c291",
+          "message": "Merge pull request #216 from sheeki03/codex/fix-threatdb-ossf-parser\n\nfix(threatdb): parse the pinned OpenSSF corpus and restore publication",
+          "timestamp": "2026-08-25T05:12:13+05:30",
+          "tree_id": "d43b431a39bacfaefbf62a026645e74e1838b5c1",
+          "url": "https://github.com/sheeki03/tirith/commit/ed187b8c230edb2dff3df81f09f214a9ba40c291"
+        },
+        "date": 1787615354572,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 452,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 128,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 108651,
+            "range": "± 644",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 627861,
+            "range": "± 3239",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 883714,
+            "range": "± 3875",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 435658,
+            "range": "± 1858",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 33477,
+            "range": "± 152",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 82,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 101,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_clean_command_full_analysis",
+            "value": 107905,
+            "range": "± 933",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_benign",
+            "value": 18983,
+            "range": "± 94",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing",
+            "value": 31790,
+            "range": "± 357",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_with_cwd",
+            "value": 56843,
+            "range": "± 945",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_no_cwd_baseline",
+            "value": 18141,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_web3_with_cwd",
+            "value": 727135,
+            "range": "± 2830",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "npm_command_extract",
+            "value": 6378,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_envelope_decide",
+            "value": 1909,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_guard_merge_repo_scoped",
+            "value": 3380,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "workflow_artifact_model",
+            "value": 21062,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_hostile_64k",
+            "value": 998196,
+            "range": "± 12517",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "effect_inference_mixed_shell",
+            "value": 122647,
+            "range": "± 641",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "verdict_json_serialization",
+            "value": 642441,
+            "range": "± 2562",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_decision_projection",
+            "value": 1257,
+            "range": "± 11",
             "unit": "ns/iter"
           }
         ]
