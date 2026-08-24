@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787570219184,
+  "lastUpdate": 1787572847998,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -2429,6 +2429,168 @@ window.BENCHMARK_DATA = {
             "name": "task_decision_projection",
             "value": 1271,
             "range": "± 4",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f8ec865e11704a3452db8d85fadfdf3588cfa736",
+          "message": "Merge pull request #215 from sheeki03/codex/fix-threatdb-ossf-snapshot-cap\n\nfix(threatdb): calibrate pinned OpenSSF snapshot bounds",
+          "timestamp": "2026-08-24T17:23:39+05:30",
+          "tree_id": "9a71c7c5365670a4720d68452331ecd714eddd4a",
+          "url": "https://github.com/sheeki03/tirith/commit/f8ec865e11704a3452db8d85fadfdf3588cfa736"
+        },
+        "date": 1787572846928,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 458,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 128,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 107884,
+            "range": "± 5274",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 628477,
+            "range": "± 10670",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 877087,
+            "range": "± 3959",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 429192,
+            "range": "± 13127",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 32752,
+            "range": "± 793",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 83,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 101,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_clean_command_full_analysis",
+            "value": 107892,
+            "range": "± 403",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_benign",
+            "value": 18928,
+            "range": "± 324",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing",
+            "value": 32339,
+            "range": "± 844",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_with_cwd",
+            "value": 56804,
+            "range": "± 450",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_no_cwd_baseline",
+            "value": 18388,
+            "range": "± 88",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_web3_with_cwd",
+            "value": 724509,
+            "range": "± 12314",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "npm_command_extract",
+            "value": 6426,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_envelope_decide",
+            "value": 1945,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_guard_merge_repo_scoped",
+            "value": 3513,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "workflow_artifact_model",
+            "value": 21437,
+            "range": "± 553",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_hostile_64k",
+            "value": 1016791,
+            "range": "± 24725",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "effect_inference_mixed_shell",
+            "value": 124448,
+            "range": "± 879",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "verdict_json_serialization",
+            "value": 643372,
+            "range": "± 16479",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_decision_projection",
+            "value": 1285,
+            "range": "± 3",
             "unit": "ns/iter"
           }
         ]
