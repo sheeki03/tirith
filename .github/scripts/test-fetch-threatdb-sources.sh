@@ -113,7 +113,7 @@ while (( $# > 0 )); do
 done
 test -n "$output"
 retrieved_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-printf '{"schema_version":1,"ossf_commit":"1ea2762d5fb415aef003a244d5aa83c5fc48cc6e","retrieved_at":"%s","packages":[]}\n' "$retrieved_at" > "$output"
+printf '{"schema_version":2,"ossf_commit":"1ea2762d5fb415aef003a244d5aa83c5fc48cc6e","retrieved_at":"%s","packages":[]}\n' "$retrieved_at" > "$output"
 EOF
 
 cat > "$FAKE_BIN/curl" <<'EOF'

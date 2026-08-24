@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "ossf_commit": "1ea2762d5fb415aef003a244d5aa83c5fc48cc6e",
   "retrieved_at": "2026-08-08T00:00:00Z",
   "packages": [
@@ -7,6 +7,7 @@
       "ecosystem": "npm",
       "name": "@solana/web3.js",
       "source_url": "https://registry.npmjs.org/@solana%2Fweb3.js",
+      "media_type": "application/vnd.npm.install-v1+json",
       "response_sha256": "3cb47fe9e2db9ff023241a2f3089d8076da380094c6eb14385c127b59a76b6d3",
       "response_bytes": 128,
       "versions": ["1.95.5", "1.95.6", "1.95.7", "1.95.8"]

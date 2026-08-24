@@ -349,14 +349,19 @@ import json
 import pathlib
 import sys
 document = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert document.get("schema_version") == 1
+assert document.get("schema_version") == 2
 assert document.get("ossf_commit") == sys.argv[2]
 packages = document.get("packages")
-assert isinstance(packages, list) and len(packages) <= 1000
+assert isinstance(packages, list) and len(packages) <= 2000
+expected_media_type = {
+    "npm": "application/vnd.npm.install-v1+json",
+    "pypi": "application/json",
+}
 for package in packages:
     assert package.get("ecosystem") in {"npm", "pypi"}
     assert isinstance(package.get("name"), str) and package["name"]
     assert isinstance(package.get("source_url"), str) and package["source_url"].startswith("https://")
+    assert package.get("media_type") == expected_media_type[package["ecosystem"]]
     assert isinstance(package.get("response_sha256"), str) and len(package["response_sha256"]) == 64
     assert package["response_sha256"] != "0" * 64
     assert isinstance(package.get("response_bytes"), int) and 0 <= package["response_bytes"] <= 16 * 1024 * 1024
@@ -366,6 +371,8 @@ for package in packages:
     status = package.get("http_status")
     if resolution == "registry_versions":
         assert status == 200 and package["response_bytes"] > 0 and versions
+    elif resolution == "package_unpublished":
+        assert status == 200 and package["response_bytes"] > 0 and not versions
     else:
         assert resolution == "package_not_found"
         assert status == 404 and not versions
