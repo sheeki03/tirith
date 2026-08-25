@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787683539961,
+  "lastUpdate": 1787690457661,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -3077,6 +3077,168 @@ window.BENCHMARK_DATA = {
             "name": "task_decision_projection",
             "value": 1047,
             "range": "± 20",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e35a7614f284a43f6077cafc830ec826a2733ab3",
+          "message": "Merge pull request #220 from sheeki03/codex/recover-threatdb-rolling-release\n\nfix: migrate rolling ThreatDB release channel",
+          "timestamp": "2026-08-26T02:03:33+05:30",
+          "tree_id": "32d53b6b50a690b94bfe173b0403bccb384385ea",
+          "url": "https://github.com/sheeki03/tirith/commit/e35a7614f284a43f6077cafc830ec826a2733ab3"
+        },
+        "date": 1787690455379,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 511,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 124,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 100037,
+            "range": "± 3082",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 650801,
+            "range": "± 18399",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 908281,
+            "range": "± 12970",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 463344,
+            "range": "± 4935",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 32802,
+            "range": "± 688",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 93,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 105,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_clean_command_full_analysis",
+            "value": 101193,
+            "range": "± 5739",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_benign",
+            "value": 20095,
+            "range": "± 361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing",
+            "value": 33286,
+            "range": "± 431",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_with_cwd",
+            "value": 52093,
+            "range": "± 1506",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_no_cwd_baseline",
+            "value": 18822,
+            "range": "± 145",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_web3_with_cwd",
+            "value": 690862,
+            "range": "± 10507",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "npm_command_extract",
+            "value": 6645,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_envelope_decide",
+            "value": 1667,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_guard_merge_repo_scoped",
+            "value": 3232,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "workflow_artifact_model",
+            "value": 21280,
+            "range": "± 243",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_hostile_64k",
+            "value": 1009051,
+            "range": "± 12610",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "effect_inference_mixed_shell",
+            "value": 134976,
+            "range": "± 674",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "verdict_json_serialization",
+            "value": 631529,
+            "range": "± 10755",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_decision_projection",
+            "value": 1066,
+            "range": "± 31",
             "unit": "ns/iter"
           }
         ]
