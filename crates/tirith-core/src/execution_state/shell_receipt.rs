@@ -648,8 +648,19 @@ fn shell_process_identity(
 fn current_tirith_executable_identity() -> Result<TirithExecutableIdentity, String> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    let path = std::env::current_exe()
+    let launch_path = std::env::current_exe()
         .map_err(|error| format!("resolve current Tirith executable: {error}"))?;
+    // `current_exe()` returns the path the process was launched through, not
+    // the fully resolved binary. That path is legitimately a symlink under
+    // common install methods (Homebrew's Cellar symlink, cargo/npm shims,
+    // PATH entries pointing at a versioned binary), so opening it directly
+    // with O_NOFOLLOW below rejects every one of those installs with ELOOP.
+    // Canonicalize first to resolve the full chain the same way the zsh hook
+    // already does with `${_TIRITH_BIN:A}`, then let O_NOFOLLOW do its real
+    // job: refusing a symlink swapped in at the resolved location between
+    // this call and the open below.
+    let path = fs::canonicalize(&launch_path)
+        .map_err(|error| format!("resolve current Tirith executable path: {error}"))?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -4195,6 +4206,49 @@ mod tests {
             let directory = receipt_directory().expect("receipt directory");
             assert_eq!(capability_artifact_count(&directory, false), 2);
             assert_eq!(capability_artifact_count(&directory, true), 2);
+        });
+    }
+
+    #[test]
+    fn register_succeeds_when_the_tirith_binary_is_invoked_through_a_symlink() {
+        // Regression test for a Homebrew-symlink registration failure
+        // (`open current Tirith executable: Too many levels of symbolic
+        // links (os error 62)`, sheeki03/tirith#221): a package manager or
+        // PATH shim commonly exposes the binary through a symlink, and
+        // `current_tirith_executable_identity` must resolve that symlink
+        // before the O_NOFOLLOW open rather than reject it outright.
+        //
+        // `std::env::current_exe()` on Linux already reports the fully
+        // resolved path regardless of how the process was invoked (it reads
+        // `/proc/self/exe`), so this does not reproduce the macOS-specific
+        // launch-path behaviour the original report hit. It does exercise
+        // the `fs::canonicalize` call this fix adds and locks in that
+        // invoking the binary through a symlink keeps working.
+        isolated_state(|temporary, session_id| {
+            let real_exe = std::env::current_exe().expect("test executable path");
+            let symlink_dir = tempfile::tempdir().expect("symlink staging dir");
+            let symlinked_exe = symlink_dir.path().join("tirith-via-symlink");
+            std::os::unix::fs::symlink(&real_exe, &symlinked_exe)
+                .expect("symlink to test executable");
+
+            let output = std::process::Command::new(&symlinked_exe)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    CAPABILITY_PROCESS_HELPER,
+                    "--nocapture",
+                ])
+                .env("TIRITH_CAPABILITY_PROCESS_HELPER", "register")
+                .env("TIRITH_SESSION_ID", session_id)
+                .env("XDG_STATE_HOME", temporary.path())
+                .output()
+                .expect("run capability process helper through symlink");
+            assert!(
+                output.status.success(),
+                "registration through a symlinked executable failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         });
     }
 
