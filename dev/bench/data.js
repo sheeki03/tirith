@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788317788819,
+  "lastUpdate": 1788324057156,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -4211,6 +4211,168 @@ window.BENCHMARK_DATA = {
             "name": "task_decision_projection",
             "value": 1243,
             "range": "± 4",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6e5bc6816878eeb3ab8b1b463966b737985b670e",
+          "message": "Merge pull request #233 from sheeki03/release/v0.4.1",
+          "timestamp": "2026-09-02T10:03:50+05:30",
+          "tree_id": "0185b43c441214b809add2d469e320d7431a6cf9",
+          "url": "https://github.com/sheeki03/tirith/commit/6e5bc6816878eeb3ab8b1b463966b737985b670e"
+        },
+        "date": 1788324056090,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 491,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 121,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 98314,
+            "range": "± 1955",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 651224,
+            "range": "± 19922",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 899464,
+            "range": "± 3630",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 462015,
+            "range": "± 4150",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 34114,
+            "range": "± 131",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 93,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 105,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_clean_command_full_analysis",
+            "value": 98643,
+            "range": "± 1149",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_benign",
+            "value": 20341,
+            "range": "± 115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing",
+            "value": 33977,
+            "range": "± 120",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_with_cwd",
+            "value": 52594,
+            "range": "± 326",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_no_cwd_baseline",
+            "value": 19253,
+            "range": "± 151",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_web3_with_cwd",
+            "value": 687052,
+            "range": "± 9055",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "npm_command_extract",
+            "value": 6464,
+            "range": "± 151",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_envelope_decide",
+            "value": 1673,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_guard_merge_repo_scoped",
+            "value": 3233,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "workflow_artifact_model",
+            "value": 21332,
+            "range": "± 123",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_hostile_64k",
+            "value": 1101869,
+            "range": "± 24371",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "effect_inference_mixed_shell",
+            "value": 138177,
+            "range": "± 869",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "verdict_json_serialization",
+            "value": 643782,
+            "range": "± 6416",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_decision_projection",
+            "value": 1074,
+            "range": "± 5",
             "unit": "ns/iter"
           }
         ]
