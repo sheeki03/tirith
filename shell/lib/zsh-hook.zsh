@@ -67,22 +67,13 @@ unset _tirith_helper
 # One receipt protocol instance per sourced hook. It is deliberately
 # non-exported; only individual Tirith subprocesses receive it. Older binaries
 # fail the capability probe and keep the legacy check flow with an honest
-# degraded status instead of misparsing the hidden flag.
+# degraded status instead of misparsing the hidden flag. Registration itself
+# happens further down, after the capture-file helpers are defined.
 _TIRITH_RECEIPT_PROTOCOL=0
 _TIRITH_RECEIPT_INSTANCE=""
+_TIRITH_RECEIPT_REGISTER_ERROR=""
 _TIRITH_RECEIPT_SHELL_PID="$$"
 _TIRITH_RECEIPT_FAMILY="zsh"
-if [[ -o interactive ]] \
-   && [[ $_TIRITH_V3_HELPERS_READY -eq 1 ]] \
-   && [[ "$(command "$_TIRITH_BIN" __execution-receipt capability 2>/dev/null)" == "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3" ]]; then
-  _TIRITH_RECEIPT_INSTANCE="$(command "$_TIRITH_BIN" __execution-receipt register \
-    --family zsh --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" 2>/dev/null)"
-  if [[ ${#_TIRITH_RECEIPT_INSTANCE} -eq 64 && "$_TIRITH_RECEIPT_INSTANCE" != *[^0-9a-f]* ]]; then
-    _TIRITH_RECEIPT_PROTOCOL=3
-  else
-    _TIRITH_RECEIPT_INSTANCE=""
-  fi
-fi
 
 # M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
 # We exec a hidden tirith subcommand that reads ITS OWN inherited environment
@@ -204,6 +195,54 @@ _tirith_v3_remove_capture_files() {
   [[ "$_TIRITH_RM_BIN" == /* && "$#" -gt 0 ]] || return 1
   command "$_TIRITH_RM_BIN" -f -- "$@"
 }
+
+_tirith_v3_cleanup_registration_files() {
+  local file
+  for file in "$@"; do
+    [[ -n "$file" ]] || continue
+    _tirith_v3_remove_capture_files "$file" >/dev/null 2>&1 || :
+  done
+  return 0
+}
+
+# Protocol-v3 registration. The Rust side binds the receipt capability to its
+# immediate parent pid, so tirith MUST run as a direct child of this shell.
+# A command substitution breaks that whenever zsh's exec optimization is
+# suppressed (e.g. a prompt framework installed a WINCH trap earlier in the
+# rc): the substitution then runs through an intermediate forked subshell and
+# registration is rejected. Capture stdout/stderr through temp files from a
+# plain foreground command instead, and keep the failure reason for the
+# status warning below instead of discarding it.
+if [[ -o interactive ]] \
+   && [[ $_TIRITH_V3_HELPERS_READY -eq 1 ]] \
+   && [[ "$(command "$_TIRITH_BIN" __execution-receipt capability 2>/dev/null)" == "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3" ]]; then
+  _tirith_register_out="$(_tirith_v3_new_capture_file)" || _tirith_register_out=""
+  _tirith_register_err="$(_tirith_v3_new_capture_file)" || _tirith_register_err=""
+  if [[ -n "$_tirith_register_out" && -n "$_tirith_register_err" ]]; then
+    # Keep a rejected registration inside an explicit condition so a user's
+    # ERR_EXIT setting cannot abort hook initialization before we record the
+    # rejection and fall back honestly. The files already exist, so force the
+    # redirects through a user's NOCLOBBER setting.
+    if command "$_TIRITH_BIN" __execution-receipt register \
+         --family zsh --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" \
+         >|"$_tirith_register_out" 2>|"$_tirith_register_err"; then
+      :
+    fi
+    _TIRITH_RECEIPT_INSTANCE="$(<"$_tirith_register_out")"
+    _TIRITH_RECEIPT_INSTANCE="${_TIRITH_RECEIPT_INSTANCE%%$'\n'*}"
+    if [[ ${#_TIRITH_RECEIPT_INSTANCE} -eq 64 && "$_TIRITH_RECEIPT_INSTANCE" != *[^0-9a-f]* ]]; then
+      _TIRITH_RECEIPT_PROTOCOL=3
+    else
+      _TIRITH_RECEIPT_INSTANCE=""
+      _TIRITH_RECEIPT_REGISTER_ERROR="$(<"$_tirith_register_err")"
+      _TIRITH_RECEIPT_REGISTER_ERROR="${_TIRITH_RECEIPT_REGISTER_ERROR%%$'\n'*}"
+    fi
+    _tirith_v3_cleanup_registration_files "$_tirith_register_out" "$_tirith_register_err"
+  else
+    _tirith_v3_cleanup_registration_files "$_tirith_register_out" "$_tirith_register_err"
+  fi
+  unset _tirith_register_out _tirith_register_err
+fi
 
 
 _tirith_parse_approval() {
@@ -631,6 +670,8 @@ if [[ -o interactive ]]; then
   else
     TIRITH_STATUS="degraded"
     _tirith_output "tirith: execution receipts unavailable; shell protection is running in legacy mode"
+    [[ -n "${_TIRITH_RECEIPT_REGISTER_ERROR:-}" ]] \
+      && _tirith_output "$_TIRITH_RECEIPT_REGISTER_ERROR"
   fi
 fi
 

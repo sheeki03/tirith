@@ -77,21 +77,13 @@ for helper in "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" \
     end
 end
 
+# Receipt protocol state. Registration itself happens further down, after the
+# capture-file helpers are defined.
 set -g _TIRITH_RECEIPT_PROTOCOL 0
 set -g _TIRITH_RECEIPT_INSTANCE ""
+set -g _TIRITH_RECEIPT_REGISTER_ERROR ""
 set -g _TIRITH_RECEIPT_SHELL_PID "$fish_pid"
 set -g _TIRITH_RECEIPT_FAMILY fish
-if status is-interactive
-    and test $_TIRITH_V3_HELPERS_READY -eq 1
-    and test (command "$_TIRITH_BIN" __execution-receipt capability 2>/dev/null) = "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3"
-    set -g _TIRITH_RECEIPT_INSTANCE (command "$_TIRITH_BIN" __execution-receipt register \
-        --family fish --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" 2>/dev/null)
-    if string match -rq '^[0-9a-f]{64}$' -- "$_TIRITH_RECEIPT_INSTANCE"
-        set -g _TIRITH_RECEIPT_PROTOCOL 3
-    else
-        set -g _TIRITH_RECEIPT_INSTANCE ""
-    end
-end
 
 # M8 ch2 — surface "this shell is on the remote side of an SSH session" to
 # `tirith prompt-status` (planned for M8 ch6) and any other downstream
@@ -224,6 +216,45 @@ function _tirith_v3_remove_capture_files
         return 1
     end
     command "$_TIRITH_RM_BIN" -f -- $argv
+end
+
+function _tirith_v3_cleanup_registration_files
+    for file in $argv
+        if test -n "$file"
+            _tirith_v3_remove_capture_files "$file" >/dev/null 2>&1
+        end
+    end
+    return 0
+end
+
+# Protocol-v3 registration. The Rust side binds the receipt capability to its
+# immediate parent pid, so tirith must run as a direct child of this shell.
+# Register with a plain redirected foreground command rather than a command
+# substitution, matching the bash and zsh hooks, and keep the failure reason
+# for the status warning below instead of discarding it.
+if status is-interactive
+    and test $_TIRITH_V3_HELPERS_READY -eq 1
+    and test (command "$_TIRITH_BIN" __execution-receipt capability 2>/dev/null) = "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3"
+    set -l register_out (_tirith_v3_new_capture_file)
+    set -l out_status $status
+    set -l register_err (_tirith_v3_new_capture_file)
+    set -l err_status $status
+    if test $out_status -eq 0; and test $err_status -eq 0
+        and test -n "$register_out"; and test -n "$register_err"
+        command "$_TIRITH_BIN" __execution-receipt register \
+            --family fish --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" \
+            >"$register_out" 2>"$register_err"
+        read -g _TIRITH_RECEIPT_INSTANCE <"$register_out"
+        if string match -rq '^[0-9a-f]{64}$' -- "$_TIRITH_RECEIPT_INSTANCE"
+            set -g _TIRITH_RECEIPT_PROTOCOL 3
+        else
+            set -g _TIRITH_RECEIPT_INSTANCE ""
+            read -g _TIRITH_RECEIPT_REGISTER_ERROR <"$register_err"
+        end
+        _tirith_v3_cleanup_registration_files "$register_out" "$register_err"
+    else
+        _tirith_v3_cleanup_registration_files "$register_out" "$register_err"
+    end
 end
 
 function _tirith_receipt_exit --on-event fish_exit
@@ -718,6 +749,9 @@ if status is-interactive
     else
         set -g TIRITH_STATUS degraded
         _tirith_output "tirith: execution receipts unavailable; shell protection is running in legacy mode"
+        if test -n "$_TIRITH_RECEIPT_REGISTER_ERROR"
+            _tirith_output "$_TIRITH_RECEIPT_REGISTER_ERROR"
+        end
     end
 end
 

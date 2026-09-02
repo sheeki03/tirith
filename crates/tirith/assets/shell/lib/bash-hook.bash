@@ -293,17 +293,20 @@ _tirith_receipt_parent_context_is_valid() {
 }
 
 _tirith_receipt_capture_file=""
+_tirith_receipt_error_file=""
+_TIRITH_RECEIPT_REGISTER_ERROR=""
 if [[ $- == *i* ]]; then
   _tirith_receipt_capture_file="$(_tirith_new_capture_file 2>/dev/null)" || _tirith_receipt_capture_file=""
-  if [[ -n "$_tirith_receipt_capture_file" ]] \
+  _tirith_receipt_error_file="$(_tirith_new_capture_file 2>/dev/null)" || _tirith_receipt_error_file=""
+  if [[ -n "$_tirith_receipt_capture_file" && -n "$_tirith_receipt_error_file" ]] \
      && builtin command "$_TIRITH_BIN" __execution-receipt capability \
-          >"$_tirith_receipt_capture_file" 2>/dev/null \
+          >|"$_tirith_receipt_capture_file" 2>/dev/null \
      && _tirith_read_single_capture_line "$_tirith_receipt_capture_file" \
      && [[ "$_TIRITH_CAPTURE_LINE" == "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3" ]]; then
-    : > "$_tirith_receipt_capture_file"
+    : >| "$_tirith_receipt_capture_file"
     if builtin command "$_TIRITH_BIN" __execution-receipt register \
          --family bash --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" \
-         >"$_tirith_receipt_capture_file" 2>/dev/null \
+         >|"$_tirith_receipt_capture_file" 2>|"$_tirith_receipt_error_file" \
        && _tirith_read_single_capture_line "$_tirith_receipt_capture_file"; then
       _TIRITH_RECEIPT_INSTANCE="$_TIRITH_CAPTURE_LINE"
     fi
@@ -311,12 +314,18 @@ if [[ $- == *i* ]]; then
       _TIRITH_RECEIPT_PROTOCOL=3
     else
       _TIRITH_RECEIPT_INSTANCE=""
+      # Keep the first line of the rejection so the one-shot degrade warning
+      # can say WHY instead of silently downgrading (issue #221).
+      IFS= read -r _TIRITH_RECEIPT_REGISTER_ERROR \
+        < "$_tirith_receipt_error_file" 2>/dev/null || :
     fi
   fi
   [[ -n "$_tirith_receipt_capture_file" ]] \
     && _tirith_remove_capture_file "$_tirith_receipt_capture_file" >/dev/null 2>&1
+  [[ -n "$_tirith_receipt_error_file" ]] \
+    && _tirith_remove_capture_file "$_tirith_receipt_error_file" >/dev/null 2>&1
 fi
-unset _tirith_receipt_capture_file _TIRITH_CAPTURE_LINE
+unset _tirith_receipt_capture_file _tirith_receipt_error_file _TIRITH_CAPTURE_LINE
 
 # M8 ch2 — surface "this shell is on the remote side of an SSH session" to
 # `tirith prompt-status` (planned for M8 ch6) and any other downstream
@@ -1264,7 +1273,7 @@ _tirith_preexec_receipt_check() {
     _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
     builtin command "$_TIRITH_BIN" check --approval-check --execution-receipt bash-preexec \
     --non-interactive --interactive --shell posix "${render_args[@]}" -- "$scan_target" \
-    >"$stdout_file"
+    >|"$stdout_file"
   rc=$?
 
   local parse_rc token
@@ -1582,6 +1591,8 @@ _tirith_preexec() {
         if [[ -z "${_TIRITH_RECEIPT_DEGRADE_WARNED:-}" ]]; then
           _TIRITH_RECEIPT_DEGRADE_WARNED=1
           _tirith_output "tirith: execution receipts unavailable; legacy checks remain active but session execution evidence is degraded"
+          [[ -n "${_TIRITH_RECEIPT_REGISTER_ERROR:-}" ]] \
+            && _tirith_output "$_TIRITH_RECEIPT_REGISTER_ERROR"
         fi
       fi
     else
@@ -1759,7 +1770,7 @@ _TIRITH_DEBUG_CAPTURE_FILE=""
 _TIRITH_DEBUG_OWNERSHIP_FILE=""
 _TIRITH_DEBUG_TRAP_OWNERSHIP_OK=0
 _TIRITH_PREEXEC_ENFORCE_PENDING=0
-_TIRITH_PREEXEC_BOOTSTRAP_COMMAND='if [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]]; then builtin trap -p DEBUG >"$_TIRITH_DEBUG_CAPTURE_FILE" 2>/dev/null; _tirith_finalize_debug_trap_capture; fi; if [[ "${_TIRITH_DEBUG_TRAP_INSTALLED:-0}" == "1" ]]; then builtin trap -p DEBUG >"$_TIRITH_DEBUG_OWNERSHIP_FILE" 2>/dev/null; _tirith_verify_debug_trap_ownership; fi; _tirith_restore_prompt_status'
+_TIRITH_PREEXEC_BOOTSTRAP_COMMAND='if [[ "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" == "0" ]]; then builtin trap -p DEBUG >|"$_TIRITH_DEBUG_CAPTURE_FILE" 2>/dev/null; _tirith_finalize_debug_trap_capture; fi; if [[ "${_TIRITH_DEBUG_TRAP_INSTALLED:-0}" == "1" ]]; then builtin trap -p DEBUG >|"$_TIRITH_DEBUG_OWNERSHIP_FILE" 2>/dev/null; _tirith_verify_debug_trap_ownership; fi; _tirith_restore_prompt_status'
 
 
 if [[ -n "${TIRITH_BASH_MODE:-}" ]]; then
@@ -1944,6 +1955,8 @@ if [[ $- == *i* ]] && [[ $_TIRITH_RECEIPT_PROTOCOL -ne 3 ]]; then
   if [[ -z "${_TIRITH_RECEIPT_DEGRADE_WARNED:-}" ]]; then
     _TIRITH_RECEIPT_DEGRADE_WARNED=1
     _tirith_output "tirith: execution receipts unavailable; legacy checks remain active but session execution evidence is degraded"
+    [[ -n "${_TIRITH_RECEIPT_REGISTER_ERROR:-}" ]] \
+      && _tirith_output "$_TIRITH_RECEIPT_REGISTER_ERROR"
   fi
 fi
 
@@ -2083,7 +2096,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
         _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
         builtin command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
-        "${receipt_args[@]}" -- "$READLINE_LINE" >"$stdout_file" 2>"$errfile"
+        "${receipt_args[@]}" -- "$READLINE_LINE" >|"$stdout_file" 2>|"$errfile"
       rc=$?
       _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
       local output
@@ -2326,7 +2339,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         }
         local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
         _TIRITH_BASH_INTERNAL=1
-        printf '%s' "$pasted" | builtin command "$_TIRITH_BIN" paste --shell posix --interactive >"$tmpfile" 2>&1
+        printf '%s' "$pasted" | builtin command "$_TIRITH_BIN" paste --shell posix --interactive >|"$tmpfile" 2>&1
         local rc=$?
         _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
         local output=$(<"$tmpfile")

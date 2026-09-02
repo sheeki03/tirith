@@ -625,6 +625,41 @@ fn bash_noninteractive_source_installs_no_debug_trap() {
 // (forcing enter here would pass vacuously — a swallowed allowed and a swallowed
 // blocked command are indistinguishable).
 
+/// Receipt registration redirects into files returned by `mktemp`, so they
+/// must explicitly override a user's `noclobber` option. Otherwise an
+/// interactive shell silently loses protocol-v3 evidence before any command is
+/// checked.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bash_noclobber_keeps_protocol_v3_registration() {
+    let mut env = IsolatedEnv::new();
+    let bash = match modern_bash() {
+        Some(bash) => bash,
+        None => {
+            eprintln!("skipping: no modern bash (>= 5) found");
+            return;
+        }
+    };
+    env.set("TIRITH_BASH_MODE", "preexec");
+
+    let mut sess = PtySession::spawn(&env, &bash, &["--norc", "--noprofile", "-i"]);
+    sess.send_line("export PS1='TIRITH_PTY> '; set -o noclobber");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    let hook = embedded_hook("bash-hook.bash");
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    sess.send_line("printf 'TIRITH_NOCLOBBER_PROTOCOL<%s>\\n' \"$_TIRITH_RECEIPT_PROTOCOL\"");
+    let output = sess.expect("TIRITH_NOCLOBBER_PROTOCOL<3>");
+    sess.close();
+
+    assert!(
+        output.contains("TIRITH_NOCLOBBER_PROTOCOL<3>"),
+        "bash noclobber must not disable receipt registration, got:\n{output}"
+    );
+}
+
 /// Contract (f): a hook that can't deliver in enter mode must degrade VISIBLY,
 /// never silently — the safety floor. `TIRITH_BASH_MODE=enter` forces enter
 /// (overriding the gate's preexec pick here); the pending-not-consumed safety
@@ -1234,6 +1269,122 @@ fn zsh_session(env: &mut IsolatedEnv) -> Option<PtySession> {
         "zsh protocol-v3 probe must create durable shell-boundary evidence"
     );
     Some(sess)
+}
+
+/// Issue #221: protocol-v3 registration must succeed when the hook is sourced
+/// from an rc file whose earlier content suppressed zsh's command-substitution
+/// exec optimization (a prompt framework's WINCH trap is the common trigger).
+/// With a `$(...)` registration the register call then runs behind an
+/// intermediate forked subshell, the parent-pid binding is rejected, and the
+/// shell silently degrades to legacy mode. The capture-file registration runs
+/// tirith as a direct child of the main shell in both conditions. The WINCH
+/// trap below is load-bearing: without it, a bare rc is exec-optimized and the
+/// old registration path passes too.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn zsh_rc_file_registration_survives_suppressed_exec_optimization() {
+    let mut env = IsolatedEnv::new();
+    let zsh = match zsh_bin() {
+        Some(zsh) => zsh,
+        None => {
+            eprintln!("skipping: zsh not installed");
+            return;
+        }
+    };
+    let hook = embedded_hook("zsh-hook.zsh");
+    let zdotdir = env.workdir.join("zdot");
+    std::fs::create_dir_all(&zdotdir).expect("create ZDOTDIR");
+    std::fs::write(
+        zdotdir.join(".zshrc"),
+        format!(
+            "TRAPWINCH() {{ :; }}\nPROMPT='TIRITH_PTY> '; RPROMPT=''\nsource '{}'\n",
+            hook.display()
+        ),
+    )
+    .expect("write .zshrc");
+    env.set("ZDOTDIR", &zdotdir.display().to_string());
+    // `-d` skips global rc files; ZDOTDIR/.zshrc still loads.
+    let mut sess = PtySession::spawn(&env, &zsh, &["-d", "-i"]);
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    let startup = sess.output().to_string();
+    assert!(
+        !startup.contains("legacy mode"),
+        "rc-file hook init must not degrade to legacy mode, got:\n{startup}"
+    );
+    sess.clear_buffer();
+    sess.send_line("print -r -- \"TIRITH_RC_PROTOCOL=$_TIRITH_RECEIPT_PROTOCOL\"");
+    sess.expect("TIRITH_RC_PROTOCOL=3");
+    sess.close();
+}
+
+/// A pre-created private capture file is intentional. `NOCLOBBER` must not
+/// reject the registration redirects and silently force a legacy session.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn zsh_noclobber_keeps_protocol_v3_registration() {
+    let env = IsolatedEnv::new();
+    let zsh = match zsh_bin() {
+        Some(zsh) => zsh,
+        None => {
+            eprintln!("skipping: zsh not installed");
+            return;
+        }
+    };
+    let hook = embedded_hook("zsh-hook.zsh");
+    let mut sess = PtySession::spawn(&env, &zsh, &["-f", "-i"]);
+    sess.send_line("PROMPT='TIRITH_PTY> '; RPROMPT=''; setopt NOCLOBBER");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    sess.send_line("print -r -- \"TIRITH_NOCLOBBER_PROTOCOL<$_TIRITH_RECEIPT_PROTOCOL>\"");
+    let output = sess.expect("TIRITH_NOCLOBBER_PROTOCOL<3>");
+    sess.close();
+
+    assert!(
+        output.contains("TIRITH_NOCLOBBER_PROTOCOL<3>"),
+        "zsh noclobber must not disable receipt registration, got:\n{output}"
+    );
+}
+
+/// A registration rejection is an expected fail-closed downgrade, not a
+/// reason to terminate a user's shell when their rc enables `ERR_EXIT`.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn zsh_err_exit_survives_registration_rejection() {
+    let env = IsolatedEnv::new();
+    let zsh = match zsh_bin() {
+        Some(zsh) => zsh,
+        None => {
+            eprintln!("skipping: zsh not installed");
+            return;
+        }
+    };
+    let hook = embedded_hook("zsh-hook.zsh");
+    let mut sess = PtySession::spawn(&env, &zsh, &["-f", "-i"]);
+    sess.send_line("PROMPT='TIRITH_PTY> '; RPROMPT=''");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+
+    // Re-source with the same session identity so protocol registration is
+    // rejected as a duplicate. The hook guard is intentionally cleared to
+    // exercise registration itself.
+    sess.send_line(&format!(
+        "unset _TIRITH_ZSH_LOADED; setopt ERR_EXIT; source '{}'; print -r -- TIRITH_ERR_EXIT_SURVIVED",
+        hook.display()
+    ));
+    let output = sess.expect_within("TIRITH_ERR_EXIT_SURVIVED", Duration::from_secs(15));
+    sess.close();
+
+    assert!(
+        output.contains("TIRITH_ERR_EXIT_SURVIVED"),
+        "zsh ERR_EXIT must not terminate the shell on registration rejection, got:\n{output}"
+    );
 }
 
 /// ZLE must deliver allow/warn commands exactly once, block dangerous input,

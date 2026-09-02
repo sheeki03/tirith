@@ -3477,7 +3477,8 @@ export PATH
 capture="$(_tirith_v3_new_capture_file)" || exit 61
 command "$_TIRITH_WC_BIN" -c <"$capture" >/dev/null || exit 62
 command "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" -c ':' || exit 63
-_tirith_v3_remove_capture_files "$capture" || exit 64
+_tirith_v3_cleanup_registration_files "" "$capture" || exit 64
+[[ ! -e "$capture" ]] || exit 66
 command "$_TIRITH_BIN" __execution-receipt capability >/dev/null || exit 65
 print -r -- "$_TIRITH_MKTEMP_BIN|$_TIRITH_RM_BIN|$_TIRITH_WC_BIN|$_TIRITH_ENV_BIN|$_TIRITH_SH_BIN"
 "#,
@@ -3513,7 +3514,8 @@ set -gx PATH '{}'
 set capture (_tirith_v3_new_capture_file); or exit 71
 command "$_TIRITH_WC_BIN" -c <"$capture" >/dev/null; or exit 72
 command "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" -c ':'; or exit 73
-_tirith_v3_remove_capture_files "$capture"; or exit 74
+_tirith_v3_cleanup_registration_files "" "$capture"; or exit 74
+not test -e "$capture"; or exit 77
 command "$_TIRITH_BIN" __execution-receipt capability >/dev/null; or exit 75
 command "$_TIRITH_BASH_TIMEOUT_BIN" -c ':'; or exit 76
 builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" "$_TIRITH_BASH_TIMEOUT_BIN"
@@ -3582,7 +3584,8 @@ builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_
             source.contains("command \"$_TIRITH_ENV_BIN\"")
                 && source.contains("\"$_TIRITH_SH_BIN\" -c")
                 && source.contains("_tirith_v3_new_capture_file")
-                && source.contains("_tirith_v3_remove_capture_files"),
+                && source.contains("_tirith_v3_remove_capture_files")
+                && source.contains("_tirith_v3_cleanup_registration_files"),
             "v3 transport must route through pinned helpers: {}",
             hook.display()
         );
