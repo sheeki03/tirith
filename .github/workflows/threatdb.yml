@@ -622,7 +622,7 @@ jobs:
       # later v2-side failure (the version-tag preflight or an index validation
       # error) cannot skip the v1 publish that old clients depend on.
       - name: Publish release (v1 + legacy manifest)
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ env.THREATDB_RELEASE_TAG }}
           prerelease: true
@@ -896,7 +896,7 @@ jobs:
         # clients keep updating. The v2 index file is only generated when the gate
         # is on, so fail_on_unmatched_files stays meaningful here.
         if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ env.THREATDB_RELEASE_TAG }}
           prerelease: true
@@ -913,7 +913,7 @@ jobs:
       # anti-drop baseline needed for safe reactivation.
       - name: Publish release (retained non-discovery v2 baseline)
         if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ env.THREATDB_RELEASE_TAG }}
           prerelease: true
@@ -928,7 +928,7 @@ jobs:
       # the previous index untouched; clients never discover a partial generation.
       - name: Publish release (signed generation index commit point)
         if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ env.THREATDB_RELEASE_TAG }}
           prerelease: true
