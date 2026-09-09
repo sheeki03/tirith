@@ -34,28 +34,36 @@ if [[ -z "$_TIRITH_BIN" || ! -x "$_TIRITH_BIN" ]]; then
 fi
 
 # Protocol-v3 callbacks run after arbitrary commands may have changed PATH.
-# Pin every external helper they use to a fixed system location now, and only
-# advertise receipt support when the complete helper set is available.
-_TIRITH_MKTEMP_BIN=""
-[[ -f /usr/bin/mktemp && -x /usr/bin/mktemp ]] && _TIRITH_MKTEMP_BIN=/usr/bin/mktemp
-[[ -z "$_TIRITH_MKTEMP_BIN" && -f /bin/mktemp && -x /bin/mktemp ]] \
-  && _TIRITH_MKTEMP_BIN=/bin/mktemp
-_TIRITH_RM_BIN=""
-[[ -f /bin/rm && -x /bin/rm ]] && _TIRITH_RM_BIN=/bin/rm
-[[ -z "$_TIRITH_RM_BIN" && -f /usr/bin/rm && -x /usr/bin/rm ]] \
-  && _TIRITH_RM_BIN=/usr/bin/rm
-_TIRITH_WC_BIN=""
-[[ -f /usr/bin/wc && -x /usr/bin/wc ]] && _TIRITH_WC_BIN=/usr/bin/wc
-[[ -z "$_TIRITH_WC_BIN" && -f /bin/wc && -x /bin/wc ]] \
-  && _TIRITH_WC_BIN=/bin/wc
-_TIRITH_ENV_BIN=""
-[[ -f /usr/bin/env && -x /usr/bin/env ]] && _TIRITH_ENV_BIN=/usr/bin/env
-[[ -z "$_TIRITH_ENV_BIN" && -f /bin/env && -x /bin/env ]] \
-  && _TIRITH_ENV_BIN=/bin/env
-_TIRITH_SH_BIN=""
-[[ -f /bin/sh && -x /bin/sh ]] && _TIRITH_SH_BIN=/bin/sh
-[[ -z "$_TIRITH_SH_BIN" && -f /usr/bin/sh && -x /usr/bin/sh ]] \
-  && _TIRITH_SH_BIN=/usr/bin/sh
+# Pin every external helper they use to an absolute path now, and only
+# advertise receipt support when the complete helper set is available. A
+# conventional FHS location is preferred; when none exists (NixOS provides only
+# /bin/sh and /usr/bin/env), fall back to the PATH in effect while the hook is
+# sourced — the same trust already extended to _TIRITH_BIN above. Either way
+# the helper is resolved once here and never re-resolved per command.
+_tirith_resolve_helper() {
+  local name="$1" candidate
+  shift
+  for candidate in "$@"; do
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    print -r -- "$candidate"
+    return 0
+  done
+  # `commands` holds external commands only — never a builtin, function, or
+  # alias — so the fallback can only ever name a file.
+  candidate="${commands[$name]:-}"
+  [[ "$candidate" == /* && -f "$candidate" && -x "$candidate" ]] || return 1
+  print -r -- "$candidate"
+}
+_TIRITH_MKTEMP_BIN="$(_tirith_resolve_helper mktemp /usr/bin/mktemp /bin/mktemp)" \
+  || _TIRITH_MKTEMP_BIN=""
+_TIRITH_RM_BIN="$(_tirith_resolve_helper rm /bin/rm /usr/bin/rm)" \
+  || _TIRITH_RM_BIN=""
+_TIRITH_WC_BIN="$(_tirith_resolve_helper wc /usr/bin/wc /bin/wc)" \
+  || _TIRITH_WC_BIN=""
+_TIRITH_ENV_BIN="$(_tirith_resolve_helper env /usr/bin/env /bin/env)" \
+  || _TIRITH_ENV_BIN=""
+_TIRITH_SH_BIN="$(_tirith_resolve_helper sh /bin/sh /usr/bin/sh)" \
+  || _TIRITH_SH_BIN=""
 _TIRITH_V3_HELPERS_READY=1
 for _tirith_helper in "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" \
   "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN"; do
