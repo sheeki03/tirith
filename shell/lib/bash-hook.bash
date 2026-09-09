@@ -125,21 +125,32 @@ fi
 # long-lived interactive shell) Tirith's parent. Capture Tirith stdout in a
 # private temporary file instead: Tirith remains a direct child, parsing happens
 # in this shell, and every caller removes the file immediately.
-_TIRITH_MKTEMP_BIN=""
-[[ -f /usr/bin/mktemp && -x /usr/bin/mktemp ]] && _TIRITH_MKTEMP_BIN=/usr/bin/mktemp
-[[ -z "$_TIRITH_MKTEMP_BIN" && -f /bin/mktemp && -x /bin/mktemp ]] && _TIRITH_MKTEMP_BIN=/bin/mktemp
-_TIRITH_RM_BIN=""
-[[ -f /bin/rm && -x /bin/rm ]] && _TIRITH_RM_BIN=/bin/rm
-[[ -z "$_TIRITH_RM_BIN" && -f /usr/bin/rm && -x /usr/bin/rm ]] && _TIRITH_RM_BIN=/usr/bin/rm
-_TIRITH_MKDIR_BIN=""
-[[ -f /bin/mkdir && -x /bin/mkdir ]] && _TIRITH_MKDIR_BIN=/bin/mkdir
-[[ -z "$_TIRITH_MKDIR_BIN" && -f /usr/bin/mkdir && -x /usr/bin/mkdir ]] && _TIRITH_MKDIR_BIN=/usr/bin/mkdir
-_TIRITH_WC_BIN=""
-[[ -f /usr/bin/wc && -x /usr/bin/wc ]] && _TIRITH_WC_BIN=/usr/bin/wc
-[[ -z "$_TIRITH_WC_BIN" && -f /bin/wc && -x /bin/wc ]] && _TIRITH_WC_BIN=/bin/wc
-_TIRITH_STTY_BIN=""
-[[ -f /bin/stty && -x /bin/stty ]] && _TIRITH_STTY_BIN=/bin/stty
-[[ -z "$_TIRITH_STTY_BIN" && -f /usr/bin/stty && -x /usr/bin/stty ]] && _TIRITH_STTY_BIN=/usr/bin/stty
+#
+# Every external helper below is pinned to an absolute path while the hook is
+# sourced, so a later PATH change cannot swap it. A conventional FHS location is
+# preferred; when none exists (NixOS provides only /bin/sh and /usr/bin/env),
+# fall back to the PATH in effect now — the same trust already extended to
+# _TIRITH_BIN above. `type -P` only ever names a file, never a builtin,
+# function, or alias; the absolute-path check rejects a relative PATH entry.
+# The callers below test these variables with `-n` only, so this function is
+# the sole guarantee that a non-empty value is an absolute executable.
+_tirith_resolve_helper() {
+  local name="$1" candidate
+  shift
+  for candidate in "$@"; do
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    builtin printf '%s\n' "$candidate"
+    return 0
+  done
+  candidate="$(builtin type -P -- "$name" 2>/dev/null)" || return 1
+  [[ "$candidate" == /* && -f "$candidate" && -x "$candidate" ]] || return 1
+  builtin printf '%s\n' "$candidate"
+}
+_TIRITH_MKTEMP_BIN="$(_tirith_resolve_helper mktemp /usr/bin/mktemp /bin/mktemp)" || _TIRITH_MKTEMP_BIN=""
+_TIRITH_RM_BIN="$(_tirith_resolve_helper rm /bin/rm /usr/bin/rm)" || _TIRITH_RM_BIN=""
+_TIRITH_MKDIR_BIN="$(_tirith_resolve_helper mkdir /bin/mkdir /usr/bin/mkdir)" || _TIRITH_MKDIR_BIN=""
+_TIRITH_WC_BIN="$(_tirith_resolve_helper wc /usr/bin/wc /bin/wc)" || _TIRITH_WC_BIN=""
+_TIRITH_STTY_BIN="$(_tirith_resolve_helper stty /bin/stty /usr/bin/stty)" || _TIRITH_STTY_BIN=""
 
 _tirith_new_capture_file() {
   [[ -n "$_TIRITH_MKTEMP_BIN" && -n "$_TIRITH_RM_BIN" ]] || return 1
