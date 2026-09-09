@@ -24,15 +24,15 @@
 
 #![cfg(unix)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[path = "pty_support/mod.rs"]
 mod pty_support;
 
 use pty_support::{
-    bash_major_version, count_occurrences, embedded_hook, fish_bin, modern_bash, wait_for_marker,
-    wait_for_marker_count, zsh_bin, IsolatedEnv, PtySession,
+    bash_major_version, count_occurrences, embedded_hook, fish_bin, modern_bash, tirith_bin_dir,
+    wait_for_marker, wait_for_marker_count, zsh_bin, IsolatedEnv, PtySession,
 };
 
 // Shared timings: generous for a loaded CI box yet bounded so a hung shell
@@ -1633,6 +1633,186 @@ fn zsh_protocol_v3_delivery_and_ledger_conformance() {
         "only the allowed and warned zsh lines may enter shell-boundary history"
     );
     sess.close();
+}
+
+// === pinned-helper resolution (issue #239) ===
+// The bash, zsh, and fish hooks pin their external helpers (mktemp, rm, wc, …)
+// while they are sourced: a conventional FHS path when one exists, otherwise a
+// PATH-resolved absolute path. NixOS ships neither /usr/bin/mktemp nor
+// /bin/mktemp, and without the fallback every capture file failed and every
+// command was blocked. A CI host always has the FHS paths, so these tests call
+// `_tirith_resolve_helper` directly after a non-interactive source: a private
+// executable stands in for an FHS path, nonexistent paths force the fallback.
+
+/// A private executable standing in for an FHS helper location.
+fn fake_fixed_helper(env: &IsolatedEnv) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = env.workdir.join("fixed-mktemp");
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write fixed helper");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fixed helper");
+    path
+}
+
+/// Source the hook, then report four resolutions as `KEY=value` lines: an
+/// existing fixed path behind a missing candidate, no existing fixed path,
+/// the `printf` builtin name, and a name found nowhere. bash and zsh share
+/// this script; [`fish_helper_probe_script`] is the fish spelling.
+fn posix_helper_probe_script(hook: &Path, fixed: &Path) -> String {
+    format!(
+        "source '{hook}'\n\
+         printf 'FIXED=%s\\n' \"$(_tirith_resolve_helper mktemp /nonexistent/tirith-helper-a '{fixed}')\"\n\
+         printf 'FALLBACK=%s\\n' \"$(_tirith_resolve_helper mktemp /nonexistent/tirith-helper-a /nonexistent/tirith-helper-b)\"\n\
+         printf 'BUILTIN=%s\\n' \"$(_tirith_resolve_helper printf /nonexistent/tirith-helper-a)\"\n\
+         if out=\"$(_tirith_resolve_helper tirith-no-such-helper-7c1e /nonexistent/tirith-helper-a)\"; then \
+           printf 'MISSING=resolved\\n'; else printf 'MISSING=unresolved\\n'; fi\n\
+         printf 'MISSING_OUT=%s\\n' \"$out\"\n",
+        hook = hook.display(),
+        fixed = fixed.display(),
+    )
+}
+
+fn fish_helper_probe_script(hook: &Path, fixed: &Path) -> String {
+    format!(
+        "source '{hook}'\n\
+         printf 'FIXED=%s\\n' (_tirith_resolve_helper mktemp /nonexistent/tirith-helper-a '{fixed}')\n\
+         printf 'FALLBACK=%s\\n' (_tirith_resolve_helper mktemp /nonexistent/tirith-helper-a /nonexistent/tirith-helper-b)\n\
+         printf 'BUILTIN=%s\\n' (_tirith_resolve_helper printf /nonexistent/tirith-helper-a)\n\
+         if set out (_tirith_resolve_helper tirith-no-such-helper-7c1e /nonexistent/tirith-helper-a); \
+           printf 'MISSING=resolved\\n'; else; printf 'MISSING=unresolved\\n'; end\n\
+         printf 'MISSING_OUT=%s\\n' \"$out\"\n",
+        hook = hook.display(),
+        fixed = fixed.display(),
+    )
+}
+
+/// Run `body` through `shell` non-interactively. The freshly built tirith goes
+/// first on PATH because the zsh hook refuses to load without one.
+fn run_helper_probe(
+    env: &IsolatedEnv,
+    shell: &Path,
+    shell_args: &[&str],
+    body: &str,
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(shell);
+    cmd.args(shell_args).arg(body);
+    for (k, v) in [
+        ("HOME", env.home.display().to_string()),
+        ("XDG_STATE_HOME", env.state_home.display().to_string()),
+        ("XDG_DATA_HOME", env.data_home.display().to_string()),
+        ("XDG_CONFIG_HOME", env.config_home.display().to_string()),
+        ("TIRITH_LOG", "0".to_string()),
+    ] {
+        cmd.env(k, v);
+    }
+    let parent_path = std::env::var("PATH").unwrap_or_default();
+    cmd.env(
+        "PATH",
+        format!("{}:{parent_path}", tirith_bin_dir().display()),
+    );
+    for guard in [
+        "_TIRITH_BASH_LOADED",
+        "_TIRITH_ZSH_LOADED",
+        "_TIRITH_FISH_LOADED",
+    ] {
+        cmd.env_remove(guard);
+    }
+    cmd.current_dir(&env.workdir);
+    cmd.output().expect("run helper resolution probe")
+}
+
+fn probe_field<'a>(stdout: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key}=");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("helper probe output lacks {key}:\n{stdout}"))
+}
+
+fn assert_helper_resolution(label: &str, fixed: &Path, out: &std::process::Output) {
+    use std::os::unix::fs::PermissionsExt;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{label}: helper probe must exit 0\n---- stdout ----\n{stdout}\n---- stderr ----\n{stderr}"
+    );
+    assert_eq!(
+        probe_field(&stdout, "FIXED"),
+        fixed.display().to_string(),
+        "{label}: an existing fixed path must win over PATH, after skipping a missing candidate"
+    );
+    let fallback = probe_field(&stdout, "FALLBACK");
+    let executable = std::fs::metadata(fallback)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false);
+    assert!(
+        fallback.starts_with('/') && executable,
+        "{label}: with no fixed path the helper must resolve to an absolute executable via PATH, got {fallback:?}"
+    );
+    let builtin = probe_field(&stdout, "BUILTIN");
+    assert!(
+        builtin.starts_with('/'),
+        "{label}: the PATH fallback must never yield a bare builtin name, got {builtin:?}"
+    );
+    assert_eq!(
+        probe_field(&stdout, "MISSING"),
+        "unresolved",
+        "{label}: a helper found nowhere must fail"
+    );
+    assert_eq!(
+        probe_field(&stdout, "MISSING_OUT"),
+        "",
+        "{label}: a failed resolution must print nothing"
+    );
+}
+
+#[test]
+fn bash_helper_resolution_prefers_fixed_path_and_falls_back_to_path() {
+    let bash = match modern_bash() {
+        Some(bash) => bash,
+        None => {
+            eprintln!("skipping: no modern bash (>= 5) found");
+            return;
+        }
+    };
+    let env = IsolatedEnv::new();
+    let fixed = fake_fixed_helper(&env);
+    let script = posix_helper_probe_script(&embedded_hook("bash-hook.bash"), &fixed);
+    let out = run_helper_probe(&env, &bash, &["--norc", "--noprofile", "-c"], &script);
+    assert_helper_resolution("bash", &fixed, &out);
+}
+
+#[test]
+fn zsh_helper_resolution_prefers_fixed_path_and_falls_back_to_path() {
+    let zsh = match zsh_bin() {
+        Some(zsh) => zsh,
+        None => {
+            eprintln!("skipping: zsh not installed");
+            return;
+        }
+    };
+    let env = IsolatedEnv::new();
+    let fixed = fake_fixed_helper(&env);
+    let script = posix_helper_probe_script(&embedded_hook("zsh-hook.zsh"), &fixed);
+    let out = run_helper_probe(&env, &zsh, &["-f", "-c"], &script);
+    assert_helper_resolution("zsh", &fixed, &out);
+}
+
+#[test]
+fn fish_helper_resolution_prefers_fixed_path_and_falls_back_to_path() {
+    let fish = match fish_bin() {
+        Some(fish) => fish,
+        None => {
+            eprintln!("skipping: fish not installed");
+            return;
+        }
+    };
+    let env = IsolatedEnv::new();
+    let fixed = fake_fixed_helper(&env);
+    let script = fish_helper_probe_script(&embedded_hook("fish-hook.fish"), &fixed);
+    let out = run_helper_probe(&env, &fish, &["--no-config", "-c"], &script);
+    assert_helper_resolution("fish", &fixed, &out);
 }
 
 // === PowerShell / nushell follow-up stubs ===
