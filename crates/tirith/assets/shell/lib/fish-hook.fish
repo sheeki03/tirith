@@ -31,44 +31,35 @@ if not string match -q '/*' -- "$_TIRITH_BIN"; or not test -x "$_TIRITH_BIN"
 end
 
 # Protocol-v3 callbacks run after arbitrary commands may have changed PATH.
-# Pin every external helper they use to a fixed system location now, and only
-# advertise receipt support when the complete helper set is available.
-set -g _TIRITH_MKTEMP_BIN ""
-if test -f /usr/bin/mktemp; and test -x /usr/bin/mktemp
-    set -g _TIRITH_MKTEMP_BIN /usr/bin/mktemp
-else if test -f /bin/mktemp; and test -x /bin/mktemp
-    set -g _TIRITH_MKTEMP_BIN /bin/mktemp
+# Pin every external helper they use to an absolute path now, and only
+# advertise receipt support when the complete helper set is available. A
+# conventional FHS location is preferred; when none exists (NixOS provides only
+# /bin/sh and /usr/bin/env), fall back to the PATH in effect while the hook is
+# sourced — the same trust already extended to _TIRITH_BIN above. Either way
+# the helper is resolved once here and never re-resolved per command.
+function _tirith_resolve_helper
+    set -l name $argv[1]
+    set -l candidate
+    for candidate in $argv[2..-1]
+        if test -f "$candidate"; and test -x "$candidate"
+            builtin printf '%s\n' "$candidate"
+            return 0
+        end
+    end
+    # `command -s` searches PATH for an external command only — never a
+    # builtin or function — so the fallback can only ever name a file.
+    set candidate (command -s $name 2>/dev/null)[1]
+    if not string match -q '/*' -- "$candidate"; or not test -f "$candidate"; or not test -x "$candidate"
+        return 1
+    end
+    builtin printf '%s\n' "$candidate"
 end
-set -g _TIRITH_RM_BIN ""
-if test -f /bin/rm; and test -x /bin/rm
-    set -g _TIRITH_RM_BIN /bin/rm
-else if test -f /usr/bin/rm; and test -x /usr/bin/rm
-    set -g _TIRITH_RM_BIN /usr/bin/rm
-end
-set -g _TIRITH_WC_BIN ""
-if test -f /usr/bin/wc; and test -x /usr/bin/wc
-    set -g _TIRITH_WC_BIN /usr/bin/wc
-else if test -f /bin/wc; and test -x /bin/wc
-    set -g _TIRITH_WC_BIN /bin/wc
-end
-set -g _TIRITH_ENV_BIN ""
-if test -f /usr/bin/env; and test -x /usr/bin/env
-    set -g _TIRITH_ENV_BIN /usr/bin/env
-else if test -f /bin/env; and test -x /bin/env
-    set -g _TIRITH_ENV_BIN /bin/env
-end
-set -g _TIRITH_SH_BIN ""
-if test -f /bin/sh; and test -x /bin/sh
-    set -g _TIRITH_SH_BIN /bin/sh
-else if test -f /usr/bin/sh; and test -x /usr/bin/sh
-    set -g _TIRITH_SH_BIN /usr/bin/sh
-end
-set -g _TIRITH_BASH_TIMEOUT_BIN ""
-if test -f /bin/bash; and test -x /bin/bash
-    set -g _TIRITH_BASH_TIMEOUT_BIN /bin/bash
-else if test -f /usr/bin/bash; and test -x /usr/bin/bash
-    set -g _TIRITH_BASH_TIMEOUT_BIN /usr/bin/bash
-end
+set -g _TIRITH_MKTEMP_BIN (_tirith_resolve_helper mktemp /usr/bin/mktemp /bin/mktemp)
+set -g _TIRITH_RM_BIN (_tirith_resolve_helper rm /bin/rm /usr/bin/rm)
+set -g _TIRITH_WC_BIN (_tirith_resolve_helper wc /usr/bin/wc /bin/wc)
+set -g _TIRITH_ENV_BIN (_tirith_resolve_helper env /usr/bin/env /bin/env)
+set -g _TIRITH_SH_BIN (_tirith_resolve_helper sh /bin/sh /usr/bin/sh)
+set -g _TIRITH_BASH_TIMEOUT_BIN (_tirith_resolve_helper bash /bin/bash /usr/bin/bash)
 set -g _TIRITH_V3_HELPERS_READY 1
 for helper in "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" \
         "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN"
