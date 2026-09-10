@@ -1799,6 +1799,58 @@ fn zsh_helper_resolution_prefers_fixed_path_and_falls_back_to_path() {
     assert_helper_resolution("zsh", &fixed, &out);
 }
 
+/// zsh caches command lookups in its hash table, and `${commands[name]}`
+/// keeps reporting the cached path after the helper behind it is removed or
+/// replaced. Plant such an entry for a helper that really exists on PATH and
+/// check the resolver still returns the live absolute path. The entry must be
+/// planted after the PATH change, because assigning `path` empties the table.
+#[test]
+fn zsh_helper_resolution_ignores_stale_command_hash() {
+    use std::os::unix::fs::PermissionsExt;
+    let zsh = match zsh_bin() {
+        Some(zsh) => zsh,
+        None => {
+            eprintln!("skipping: zsh not installed");
+            return;
+        }
+    };
+    let env = IsolatedEnv::new();
+    let name = "tirith-stale-helper-91af";
+    let helper_dir = env.workdir.join("stale-helper-bin");
+    std::fs::create_dir_all(&helper_dir).expect("create helper dir");
+    let helper = helper_dir.join(name);
+    std::fs::write(&helper, "#!/bin/sh\nexit 0\n").expect("write helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod helper");
+    let stale = format!("/nonexistent/{name}");
+    let script = format!(
+        "source '{hook}'\n\
+         path=('{dir}' $path)\n\
+         hash {name}='{stale}'\n\
+         printf 'CACHED=%s\\n' \"${{commands[{name}]}}\"\n\
+         printf 'STALE=%s\\n' \"$(_tirith_resolve_helper {name} /nonexistent/tirith-helper-a)\"\n",
+        hook = embedded_hook("zsh-hook.zsh").display(),
+        dir = helper_dir.display(),
+    );
+    let out = run_helper_probe(&env, &zsh, &["-f", "-c"], &script);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "zsh: stale-hash probe must exit 0\n---- stdout ----\n{stdout}\n---- stderr ----\n{stderr}"
+    );
+    assert_eq!(
+        probe_field(&stdout, "CACHED"),
+        stale,
+        "zsh: the probe must plant a stale hash entry, otherwise it proves nothing"
+    );
+    assert_eq!(
+        probe_field(&stdout, "STALE"),
+        helper.display().to_string(),
+        "zsh: a stale hash entry must not hide a helper that is live on PATH"
+    );
+}
+
 #[test]
 fn fish_helper_resolution_prefers_fixed_path_and_falls_back_to_path() {
     let fish = match fish_bin() {
