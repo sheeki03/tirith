@@ -48,9 +48,11 @@ _tirith_resolve_helper() {
     print -r -- "$candidate"
     return 0
   done
-  # `commands` holds external commands only — never a builtin, function, or
-  # alias — so the fallback can only ever name a file.
-  candidate="${commands[$name]:-}"
+  # `whence -p` performs a fresh PATH search every time: it does not consult
+  # the command hash table, which can still hold an entry for a helper that
+  # was removed or replaced since it was hashed, and it never names a
+  # builtin, function, or alias — so the fallback can only ever name a file.
+  candidate="$(builtin whence -p -- "$name")"
   [[ "$candidate" == /* && -f "$candidate" && -x "$candidate" ]] || return 1
   print -r -- "$candidate"
 }
