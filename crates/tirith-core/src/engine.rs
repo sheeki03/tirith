@@ -2822,8 +2822,14 @@ fn analyze_inner_with_policy_and_pdf_coverage(
     // A regex-only organization rule can intentionally match an otherwise-clean
     // command, just as a semantic DSL rule can. Never return Allow before the
     // complete rule pass merely because the built-in coarse scan was clean.
-    let custom_rules_triggered = gate_policy.as_ref().is_some_and(|policy| {
-        crate::rules::custom::compile_rules(&policy.custom_rules)
+    // Retain this request's compilation for the full pass. The gate and rule
+    // evaluation use the same effective policy, including when compilation
+    // drops every rule, so neither validation nor diagnostics need to run twice.
+    let gate_custom_rules = gate_policy
+        .as_ref()
+        .map(|policy| crate::rules::custom::compile_rules(&policy.custom_rules));
+    let custom_rules_triggered = gate_custom_rules.as_ref().is_some_and(|compiled| {
+        compiled
             .iter()
             .any(|rule| rule.contexts.contains(&ctx.scan_context))
     });
@@ -3543,7 +3549,9 @@ fn analyze_inner_with_policy_and_pdf_coverage(
     }
 
     if !policy.custom_rules.is_empty() {
-        let compiled = crate::rules::custom::compile_rules(&policy.custom_rules);
+        // FileScan has no gate compilation; Exec/Paste reuse its exact matchers.
+        let compiled = gate_custom_rules
+            .unwrap_or_else(|| crate::rules::custom::compile_rules(&policy.custom_rules));
         // `analyzed_input` is prelude-stripped (Exec) / verbatim (Paste/FileScan),
         // so custom regex rules match the real command, not the card wrapper.
         let mut custom_findings =
@@ -5385,6 +5393,47 @@ mod tests {
              fast-exit; got tier {}",
             v_dead.tier_reached
         );
+    }
+
+    #[test]
+    fn custom_rule_policy_changes_do_not_reuse_previous_matchers() {
+        let _state = isolate_state();
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = Policy::try_parse_yaml(
+            "custom_rules:\n  \
+             - id: changing-rule\n    \
+             pattern: '^whoami$'\n    \
+             severity: critical\n    \
+             title: changing rule\n    \
+             context: [exec, paste, file]\n",
+        )
+        .unwrap();
+        let mut changed_policy = policy.clone();
+        changed_policy.custom_rules[0].pattern = Some("^hostname$".into());
+
+        for context in [ScanContext::Exec, ScanContext::Paste, ScanContext::FileScan] {
+            let mut ctx = exec_ctx_in("whoami", dir.path());
+            ctx.scan_context = context;
+            ctx.file_path = Some(dir.path().join("notes.txt"));
+            let matched = analyze_with_policy_without_bypass(&ctx, &policy);
+            assert!(matched
+                .findings
+                .iter()
+                .any(|finding| { finding.custom_rule_id.as_deref() == Some("changing-rule") }));
+
+            // Keep the same rule ID and update only its regex. A compilation
+            // retained beyond this analysis must not apply the previous policy.
+            let unmatched = analyze_with_policy_without_bypass(&ctx, &changed_policy);
+            assert!(unmatched
+                .findings
+                .iter()
+                .all(|finding| { finding.custom_rule_id.as_deref() != Some("changing-rule") }));
+        }
+
+        // A rule removed from the effective policy must restore the clean gate.
+        policy.custom_rules.clear();
+        let clean = analyze_with_policy_without_bypass(&exec_ctx_in("whoami", dir.path()), &policy);
+        assert_eq!(clean.tier_reached, 1);
     }
 
     #[test]

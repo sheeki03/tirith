@@ -17,6 +17,15 @@ fn diagnostic_text(value: &str) -> String {
     .replace('\t', "\\t")
 }
 
+/// Redact only when a warning is formatted; valid rules emit no diagnostics.
+struct DiagnosticRuleId<'a>(&'a str);
+
+impl std::fmt::Display for DiagnosticRuleId<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&diagnostic_text(self.0))
+    }
+}
+
 /// The matcher half of a compiled custom rule: a regex or a `when:` clause
 /// (M13 ch4 DSL). A rule carries exactly one.
 pub enum CompiledMatcher {
@@ -76,7 +85,7 @@ fn parse_contexts(rule: &CustomRule) -> Vec<ScanContext> {
 pub fn compile_rules(rules: &[CustomRule]) -> Vec<CompiledCustomRule> {
     let mut compiled = Vec::new();
     for rule in rules {
-        let rule_id = diagnostic_text(&rule.id);
+        let rule_id = DiagnosticRuleId(&rule.id);
         if let Err(e) = rule.validate_shape() {
             let error = diagnostic_text(&e.to_string());
             eprintln!("tirith: warning: custom rule '{rule_id}' {error}, skipping");
@@ -409,6 +418,24 @@ mod tests {
         assert!(diagnostic.contains("REDACTED"), "{diagnostic}");
 
         assert_eq!(diagnostic_text("ordinary-rule"), "ordinary-rule");
+    }
+
+    #[test]
+    fn lazy_rule_id_diagnostics_keep_secrets_paths_and_controls_redacted() {
+        let secret = format!("ghp_{}", "R".repeat(36));
+        let id = format!("rule={secret} /Users/alice/private/config.yaml\n\t\x1b[31m");
+        let warning = format!(
+            "tirith: warning: custom rule '{}' has no valid contexts, skipping",
+            DiagnosticRuleId(&id)
+        );
+        assert!(!warning.contains(&secret), "{warning}");
+        assert!(!warning.contains("/Users/alice"), "{warning}");
+        assert!(!warning.contains(['\n', '\r', '\t', '\x1b']), "{warning}");
+        assert!(warning.contains("REDACTED"), "{warning}");
+        assert_eq!(
+            DiagnosticRuleId("ordinary-rule").to_string(),
+            "ordinary-rule"
+        );
     }
 
     #[test]

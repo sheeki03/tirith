@@ -935,6 +935,15 @@ pub fn canonical_package_name(eco: Ecosystem, name: &str) -> String {
     }
 }
 
+/// These registries use the same key bytes in both database formats. Other
+/// ecosystems need the legacy canonical index to include spelling aliases.
+fn package_name_preserves_spelling(eco: Ecosystem) -> bool {
+    matches!(
+        eco,
+        Ecosystem::Npm | Ecosystem::RubyGems | Ecosystem::Go | Ecosystem::Maven
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VersionEquivalence {
     Equal,
@@ -1765,13 +1774,14 @@ impl ThreatDb {
     /// canonical v2 key may intentionally retain multiple evidence claims:
     /// combining their versions, scope, and metadata into one physical record
     /// would let an unrelated broad claim overwrite stronger exact evidence.
-    /// v1 records must retain their historical spellings for old readers, so a
-    /// new reader performs a bounded linear fallback and canonicalizes each
-    /// stored key at comparison time. There can be more than one v1 spelling of
+    /// v1 records must retain their historical spellings for old readers. For
+    /// registries whose identity preserves spelling, the same hash search is
+    /// valid in v1. Other registries need a lazily built canonical index, since
+    /// there can be more than one v1 spelling of
     /// one modern identity (`foo.bar`, `foo__bar`), and every physical claim in
     /// either format must participate in assessment.
     fn package_record_indices(&self, eco: Ecosystem, canonical_name: &str) -> Vec<u32> {
-        if self.format_version >= 2 {
+        if self.format_version >= 2 || package_name_preserves_spelling(eco) {
             let target_hash = pkg_key_hash(eco, canonical_name.as_bytes());
             let mut lo = 0;
             let mut hi = self.pkg_index_count;
@@ -1811,10 +1821,21 @@ impl ThreatDb {
             .get_or_init(|| {
                 let mut index = std::collections::HashMap::new();
                 for idx in 0..self.pkg_index_count {
-                    let Some(record) = self
-                        .pkg_index_entry(idx)
-                        .and_then(|(data_off, _)| self.parse_pkg_record(data_off as usize))
-                    else {
+                    let Some((data_off, _)) = self.pkg_index_entry(idx) else {
+                        continue;
+                    };
+                    // Skip direct-index ecosystems before parsing their version
+                    // lists or allocating canonical names. They never use this
+                    // map, and can comprise most of a legacy database.
+                    if self
+                        .data
+                        .get(data_off as usize)
+                        .and_then(|&value| Ecosystem::from_u8(value))
+                        .is_some_and(package_name_preserves_spelling)
+                    {
+                        continue;
+                    }
+                    let Some(record) = self.parse_pkg_record(data_off as usize) else {
                         continue;
                     };
                     index
@@ -2999,23 +3020,57 @@ fn merge_assessments(
 static CACHE: OnceLock<ThreatDbCache> = OnceLock::new();
 
 struct ThreatDbCache {
-    db: RwLock<Option<Arc<ThreatDb>>>,
+    state: RwLock<Option<CachedThreatDb>>,
     last_mtime_check: AtomicU64,
-    loaded_mtime: AtomicU64,
 }
 
+struct CachedThreatDb {
+    db: Arc<ThreatDb>,
+    source: CacheSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheFile {
+    path: PathBuf,
+    modified: std::time::SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl CacheFile {
+    fn from_path(path: PathBuf) -> Option<Self> {
+        let metadata = std::fs::metadata(&path).ok()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            path,
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
+
+/// Compare complete source metadata, retaining subsecond changes and resolved
+/// paths. A seconds-only combined stamp misses rapid overlay replacements and
+/// switches to a different DB file with the same timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheSource {
-    primary_path: PathBuf,
-    supplemental_path: Option<PathBuf>,
-    combined_mtime: u64,
+    primary: CacheFile,
+    supplemental: Option<CacheFile>,
 }
 
 impl ThreatDbCache {
     fn new() -> Self {
         let cache = Self {
-            db: RwLock::new(None),
+            state: RwLock::new(None),
             last_mtime_check: AtomicU64::new(0),
-            loaded_mtime: AtomicU64::new(0),
         };
         // Attempt initial load
         cache.force_reload();
@@ -3029,14 +3084,21 @@ impl ThreatDbCache {
             self.last_mtime_check.store(now, Ordering::Relaxed);
             match current_cache_source() {
                 Some(source) => {
-                    if source.combined_mtime != self.loaded_mtime.load(Ordering::Relaxed) {
+                    let changed = self.state.read().ok().is_some_and(|guard| {
+                        guard.as_ref().is_none_or(|cached| cached.source != source)
+                    });
+                    if changed {
                         self.reload(&source, false);
                     }
                 }
                 None => self.clear(),
             }
         }
-        self.db.read().ok()?.clone()
+        self.state
+            .read()
+            .ok()?
+            .as_ref()
+            .map(|cached| Arc::clone(&cached.db))
     }
 
     fn force_reload(&self) {
@@ -3048,15 +3110,7 @@ impl ThreatDbCache {
     }
 
     fn reload(&self, source: &CacheSource, allow_downgrade: bool) {
-        let current_seq = self
-            .db
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|db| db.build_sequence))
-            .unwrap_or(0);
-        let loaded_mtime = self.loaded_mtime.load(Ordering::Relaxed);
-
-        match ThreatDb::load_from_path(&source.primary_path, 0) {
+        match ThreatDb::load_from_path(&source.primary.path, 0) {
             Ok(primary_db) => {
                 if let Err(e) = primary_db.verify_signature() {
                     eprintln!(
@@ -3067,31 +3121,38 @@ impl ThreatDbCache {
                 // Supplemental overlays are intentionally NOT signature-verified
                 // (authenticity is anchored to local machine policy, not CI);
                 // `load_from_path` still validates binary structure/header/version.
-                let supplemental_db =
-                    source.supplemental_path.as_ref().and_then(
-                        |path| match ThreatDb::load_from_path(path, 0) {
-                            Ok(db) => Some(db),
-                            Err(e) => {
-                                eprintln!(
+                let supplemental_db = source.supplemental.as_ref().and_then(|file| {
+                    match ThreatDb::load_from_path(&file.path, 0) {
+                        Ok(db) => Some(db),
+                        Err(e) => {
+                            eprintln!(
                                 "tirith: warning: failed to load supplemental threat DB {}: {e}",
-                                path.display()
+                                file.path.display()
                             );
-                                None
-                            }
-                        },
-                    );
+                            None
+                        }
+                    }
+                });
                 let new_db = primary_db.with_supplemental(supplemental_db);
-                if should_replace_cached_db(
-                    current_seq,
-                    new_db.build_sequence,
-                    loaded_mtime,
-                    source.combined_mtime,
-                    allow_downgrade,
-                ) {
-                    if let Ok(mut guard) = self.db.write() {
-                        *guard = Some(Arc::new(new_db));
-                        self.loaded_mtime
-                            .store(source.combined_mtime, Ordering::Relaxed);
+                if let Ok(mut guard) = self.state.write() {
+                    // Read the currently accepted sequence under the publication
+                    // lock: another reload may have completed during validation.
+                    let current_seq = guard.as_ref().map_or(0, |cached| cached.db.build_sequence);
+                    let source_changed =
+                        guard.as_ref().is_none_or(|cached| cached.source != *source);
+                    if should_replace_cached_db(
+                        current_seq,
+                        new_db.build_sequence,
+                        source_changed,
+                        allow_downgrade,
+                    ) {
+                        // Publish the DB and its accepted source together. A bad
+                        // signature, malformed primary DB, or rollback never
+                        // advances it. Invalid supplemental data is still omitted.
+                        *guard = Some(CachedThreatDb {
+                            db: Arc::new(new_db),
+                            source: source.clone(),
+                        });
                     }
                 }
             }
@@ -3102,24 +3163,22 @@ impl ThreatDbCache {
     }
 
     fn clear(&self) {
-        if let Ok(mut guard) = self.db.write() {
+        if let Ok(mut guard) = self.state.write() {
             *guard = None;
         }
-        self.loaded_mtime.store(0, Ordering::Relaxed);
     }
 }
 
 fn should_replace_cached_db(
     current_sequence: u64,
     new_sequence: u64,
-    loaded_mtime: u64,
-    new_mtime: u64,
+    source_changed: bool,
     allow_downgrade: bool,
 ) -> bool {
     allow_downgrade
         || current_sequence == 0
         || new_sequence > current_sequence
-        || (new_sequence == current_sequence && new_mtime != loaded_mtime)
+        || (new_sequence == current_sequence && source_changed)
 }
 
 fn unix_now() -> u64 {
@@ -3127,15 +3186,6 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-fn path_mtime_epoch(path: &Path) -> Option<u64> {
-    let meta = std::fs::metadata(path).ok()?;
-    meta.modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs())
 }
 
 /// Derive the `*-v2.dat` sibling of a `.dat` path: replace a trailing `.dat`
@@ -3186,28 +3236,12 @@ fn resolve_preferring_v2(
 fn current_cache_source() -> Option<CacheSource> {
     // Prefer the v2 primary/supplemental files when present and parseable; an
     // old binary never reaches this code and only ever reads the v1 names.
-    let primary_path = ThreatDb::resolve_primary_path()?;
-    let primary_mtime = path_mtime_epoch(&primary_path)?;
-    let supplemental_path = ThreatDb::resolve_supplemental_path().filter(|path| path.exists());
-    let supplemental_mtime = supplemental_path
-        .as_ref()
-        .and_then(|path| path_mtime_epoch(path))
-        .unwrap_or(0);
-
+    let primary = CacheFile::from_path(ThreatDb::resolve_primary_path()?)?;
+    let supplemental = ThreatDb::resolve_supplemental_path().and_then(CacheFile::from_path);
     Some(CacheSource {
-        primary_path,
-        supplemental_path,
-        combined_mtime: combined_mtime_from_parts(primary_mtime, supplemental_mtime),
+        primary,
+        supplemental,
     })
-}
-
-fn combined_mtime_from_parts(primary_mtime: u64, supplemental_mtime: u64) -> u64 {
-    primary_mtime.rotate_left(13) ^ supplemental_mtime.rotate_left(29) ^ 0x5448_5245_4154_4442
-}
-
-#[cfg(test)]
-fn combined_mtime_epoch() -> Option<u64> {
-    current_cache_source().map(|source| source.combined_mtime)
 }
 
 /// Builder for creating threat DB files (used by the compiler binary to
@@ -4549,6 +4583,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn package_index_matches_linear_identity_lookup_in_both_formats() {
+        let key = SigningKey::from_bytes(&[23u8; 32]);
+        let identities = [
+            (Ecosystem::Npm, "CasePkg", "casepkg"),
+            (Ecosystem::RubyGems, "CaseGem", "casegem"),
+            (Ecosystem::Go, "example.org/CaseMod", "example.org/casemod"),
+            (
+                Ecosystem::Maven,
+                "org.example:CaseJar",
+                "org.example:casejar",
+            ),
+            (Ecosystem::PyPI, "Case.Pkg", "case__pkg"),
+            (Ecosystem::Crates, "Case_Crate", "case-crate"),
+            (Ecosystem::NuGet, "Case.Pkg", "case.pkg"),
+            (
+                Ecosystem::Npm,
+                "collision-dceuwm5peg8j",
+                "collision-8mseactbvp7x",
+            ),
+        ];
+        // The equal-hash run must compare the actual names as well. These are
+        // distinct npm identities with a frozen FNV-1a collision.
+        assert_eq!(
+            pkg_key_hash(Ecosystem::Npm, b"collision-dceuwm5peg8j"),
+            pkg_key_hash(Ecosystem::Npm, b"collision-8mseactbvp7x")
+        );
+        for format in [ThreatDbFormat::V1, ThreatDbFormat::V2] {
+            let mut writer = ThreatDbWriter::new(1_700_000_000, 46);
+            for &(eco, name, alternate) in &identities {
+                for (name, source, version) in [
+                    (name, ThreatSource::OssfMalicious, "1.0.0"),
+                    (name, ThreatSource::DatadogMalicious, "2.0.0"),
+                    (alternate, ThreatSource::OssfMalicious, "3.0.0"),
+                ] {
+                    writer.add_package(
+                        eco,
+                        name,
+                        &[version],
+                        source,
+                        Confidence::Confirmed,
+                        false,
+                        None,
+                    );
+                }
+            }
+            let db = ThreatDb::from_bytes(writer.build_format(format, &key).unwrap(), 0).unwrap();
+            // A cold miss and a hit in each spelling-preserving registry must
+            // not initialize the map covering unrelated legacy registries.
+            for &(eco, name, alternate) in &identities[..4] {
+                assert!(db.package_record_indices(eco, "absent").is_empty());
+                assert!(!db.package_record_indices(eco, name).is_empty());
+                assert!(!db.package_record_indices(eco, alternate).is_empty());
+                assert!(db.legacy_package_index.get().is_none());
+            }
+            // Compare with all physical records, including separate evidence
+            // claims in v2 and the multiple legacy spellings of one identity.
+            for &(eco, name, alternate) in &identities {
+                for query in [name, alternate, "absent"] {
+                    let canonical = canonical_package_name(eco, query);
+                    let expected: Vec<_> = (0..db.pkg_index_count)
+                        .filter(|&idx| {
+                            db.pkg_index_entry(idx)
+                                .and_then(|(off, _)| db.parse_pkg_record(off as usize))
+                                .is_some_and(|record| {
+                                    record.ecosystem == eco
+                                        && canonical_package_name(eco, record.name) == canonical
+                                })
+                        })
+                        .collect();
+                    assert_eq!(db.package_record_indices(eco, &canonical), expected);
+                }
+            }
+            if let Some(index) = db.legacy_package_index.get() {
+                assert!(index
+                    .keys()
+                    .all(|(eco, _)| !package_name_preserves_spelling(*eco)));
+            }
+        }
+    }
+
     /// Simulate the exact package lookup shipped by a v1-only reader: raw key
     /// hash plus literal affected-version comparison, with no canonicalization.
     fn legacy_v1_exact_package_lookup(
@@ -5420,23 +5535,193 @@ mod tests {
     }
 
     #[test]
-    fn test_combined_mtime_requires_primary_db() {
+    fn test_cache_source_requires_primary_db() {
         let guard = isolated_global_state();
         let primary = guard.roots().threatdb.clone();
         let supplemental = guard.roots().threatdb_supplemental.clone();
 
-        assert_eq!(combined_mtime_epoch(), None);
+        assert_eq!(current_cache_source(), None);
 
         std::fs::write(&supplemental, b"overlay").unwrap();
-        assert_eq!(combined_mtime_epoch(), None);
+        assert_eq!(current_cache_source(), None);
 
         std::fs::remove_file(&supplemental).unwrap();
         std::fs::write(&primary, b"primary").unwrap();
-        let primary_only = combined_mtime_epoch().expect("primary mtime");
+        let primary_only = current_cache_source().expect("primary mtime");
 
         std::fs::write(&supplemental, b"overlay-updated").unwrap();
-        let combined = combined_mtime_epoch().expect("combined mtime");
+        let combined = current_cache_source().expect("combined mtime");
         assert_ne!(primary_only, combined);
+    }
+
+    fn set_cache_test_mtime(path: &Path, nanos: u32) {
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, nanos);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    fn write_cache_test_overlay(path: &Path, name: &str, nanos: u32) {
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 1);
+        writer.add_package(
+            Ecosystem::Npm,
+            name,
+            &["1.0.0"],
+            ThreatSource::OssfMalicious,
+            Confidence::Confirmed,
+            true,
+            None,
+        );
+        writer
+            .write_to(path, &SigningKey::from_bytes(&[7u8; 32]))
+            .unwrap();
+        set_cache_test_mtime(path, nanos);
+    }
+
+    #[test]
+    fn periodic_cache_check_detects_same_second_overlay_replacement() {
+        let guard = isolated_global_state();
+        let primary = &guard.roots().threatdb;
+        let supplemental = &guard.roots().threatdb_supplemental;
+        std::fs::copy(signed_fixture_db_path(), primary).unwrap();
+        write_cache_test_overlay(supplemental, "old-package", 100_000_000);
+        let cache = ThreatDbCache::new();
+        let before = cache.get().unwrap();
+        let old_source = cache.state.read().unwrap().as_ref().unwrap().source.clone();
+
+        write_cache_test_overlay(supplemental, "new-package", 200_000_000);
+        let new_source = current_cache_source().unwrap();
+        assert_eq!(old_source.primary, new_source.primary);
+        let old_overlay = old_source.supplemental.unwrap();
+        let new_overlay = new_source.supplemental.unwrap();
+        assert_eq!(old_overlay.len, new_overlay.len);
+        assert_eq!(
+            old_overlay
+                .modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            new_overlay
+                .modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        );
+        assert_ne!(old_overlay.modified, new_overlay.modified);
+
+        cache.last_mtime_check.store(0, Ordering::Relaxed);
+        let after = cache.get().unwrap();
+        assert!(after
+            .check_package(Ecosystem::Npm, "new-package", None)
+            .is_some());
+        assert!(after
+            .check_package(Ecosystem::Npm, "old-package", None)
+            .is_none());
+        assert!(before
+            .check_package(Ecosystem::Npm, "old-package", None)
+            .is_some());
+    }
+
+    #[test]
+    fn periodic_cache_check_detects_resolved_primary_and_overlay_path_changes() {
+        let guard = isolated_global_state();
+        let primary = &guard.roots().threatdb;
+        let supplemental = &guard.roots().threatdb_supplemental;
+        std::fs::copy(signed_fixture_db_path(), primary).unwrap();
+        set_cache_test_mtime(primary, 100_000_000);
+        write_cache_test_overlay(supplemental, "old-package", 100_000_000);
+        let cache = ThreatDbCache::new();
+        let before = cache.get().unwrap();
+
+        // An identical signed file at the preferred path is still a different
+        // source. Resolution accepts either format at the preferred v2 name.
+        let preferred_primary = ThreatDb::default_path_v2().unwrap();
+        std::fs::hard_link(primary, &preferred_primary).unwrap();
+        cache.last_mtime_check.store(0, Ordering::Relaxed);
+        let after_primary = cache.get().unwrap();
+        assert!(!Arc::ptr_eq(&before, &after_primary));
+        assert_eq!(
+            cache
+                .state
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .source
+                .primary
+                .path,
+            preferred_primary
+        );
+
+        let preferred_overlay = ThreatDb::supplemental_path_v2().unwrap();
+        write_cache_test_overlay(&preferred_overlay, "new-package", 100_000_000);
+        cache.last_mtime_check.store(0, Ordering::Relaxed);
+        let after_overlay = cache.get().unwrap();
+        assert!(after_overlay
+            .check_package(Ecosystem::Npm, "new-package", None)
+            .is_some());
+        assert!(after_overlay
+            .check_package(Ecosystem::Npm, "old-package", None)
+            .is_none());
+        assert_eq!(
+            cache
+                .state
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .source
+                .supplemental
+                .as_ref()
+                .unwrap()
+                .path,
+            preferred_overlay
+        );
+    }
+
+    #[test]
+    fn invalid_signature_does_not_advance_accepted_cache_source() {
+        let guard = isolated_global_state();
+        let primary = &guard.roots().threatdb;
+        std::fs::copy(signed_fixture_db_path(), primary).unwrap();
+        set_cache_test_mtime(primary, 100_000_000);
+        let cache = ThreatDbCache::new();
+        let before = cache.get().unwrap();
+        let accepted_source = cache.state.read().unwrap().as_ref().unwrap().source.clone();
+
+        // A valid binary structure signed with an untrusted key must retain the
+        // old DB and fingerprint, so a later corrected update is still retried.
+        write_cache_test_overlay(primary, "untrusted-package", 200_000_000);
+        cache.last_mtime_check.store(0, Ordering::Relaxed);
+        let rejected = cache.get().unwrap();
+        assert!(Arc::ptr_eq(&before, &rejected));
+        assert_eq!(
+            cache.state.read().unwrap().as_ref().unwrap().source,
+            accepted_source
+        );
+
+        std::fs::copy(signed_fixture_db_path(), primary).unwrap();
+        set_cache_test_mtime(primary, 200_000_000);
+        cache.last_mtime_check.store(0, Ordering::Relaxed);
+        let corrected = cache.get().unwrap();
+        assert!(!Arc::ptr_eq(&before, &corrected));
+        assert_eq!(
+            cache.state.read().unwrap().as_ref().unwrap().source,
+            current_cache_source().unwrap()
+        );
+    }
+
+    #[test]
+    fn cache_source_changes_preserve_sequence_rollback_rules() {
+        assert!(!should_replace_cached_db(42, 41, true, false));
+        assert!(!should_replace_cached_db(42, 42, false, false));
+        assert!(should_replace_cached_db(42, 42, true, false));
+        assert!(should_replace_cached_db(42, 43, false, false));
+        assert!(should_replace_cached_db(42, 41, true, true));
+        assert!(should_replace_cached_db(0, 0, false, false));
     }
 
     #[test]

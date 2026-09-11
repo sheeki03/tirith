@@ -38,7 +38,7 @@
 //!   (install/add commands plus Docker image refs as the `docker` ecosystem).
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use regex::Regex;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
@@ -685,22 +685,40 @@ fn check_regex(field: &str, pattern: &str) -> Result<(), String> {
         .map_err(|e| format!("{field}: invalid regex: {e}"))
 }
 
-thread_local! {
-    /// Per-thread compiled-regex cache for the DSL `*_matches` predicates,
-    /// avoiding recompiling the same pattern on every `evaluate()`.
-    static REGEX_CACHE: RefCell<HashMap<String, Regex>> = RefCell::new(HashMap::new());
+const MAX_CACHED_REGEXES: usize = 128;
+
+#[derive(Default)]
+struct RegexCache {
+    patterns: HashMap<String, Regex>,
+    insertion_order: VecDeque<String>,
 }
 
-/// Compile `pat` once per thread and return a cheap clone of the cached `Regex`.
+thread_local! {
+    /// Per-thread compiled-regex cache for the DSL `*_matches` predicates,
+    /// avoiding recompiling the same pattern on every `evaluate()`. Bound its
+    /// retained entries so policy changes in a long-lived process cannot retain
+    /// every previously evaluated pattern. FIFO eviction keeps hits constant-time.
+    static REGEX_CACHE: RefCell<RegexCache> = RefCell::new(RegexCache::default());
+}
+
+/// Return a cheap clone while `pat` remains in this thread's cache; compile it
+/// again after eviction without changing match semantics.
 /// `None` if it fails to compile (validated patterns never hit that path).
 fn cached_regex(pat: &str) -> Option<Regex> {
     REGEX_CACHE.with(|cache| {
-        if let Some(re) = cache.borrow().get(pat) {
+        if let Some(re) = cache.borrow().patterns.get(pat) {
             return Some(re.clone());
         }
         match Regex::new(pat) {
             Ok(re) => {
-                cache.borrow_mut().insert(pat.to_string(), re.clone());
+                let mut cache = cache.borrow_mut();
+                if cache.patterns.len() == MAX_CACHED_REGEXES {
+                    if let Some(oldest) = cache.insertion_order.pop_front() {
+                        cache.patterns.remove(&oldest);
+                    }
+                }
+                cache.insertion_order.push_back(pat.to_string());
+                cache.patterns.insert(pat.to_string(), re.clone());
                 Some(re)
             }
             Err(_) => None,
@@ -1138,6 +1156,111 @@ any:
                 !evaluate(&clause, &miss),
                 "non-matching host should not fire"
             );
+        }
+    }
+
+    #[test]
+    fn regex_cache_bounds_policy_churn_and_recompiles_evicted_patterns() {
+        REGEX_CACHE.with(|cache| *cache.borrow_mut() = RegexCache::default());
+        let first = r"^/repo_0/[a-z0-9]+\.rs$";
+        let ctx = DslEvalContext {
+            file_path: Some("/repo_0/main.rs"),
+            ..Default::default()
+        };
+        assert!(evaluate(&WhenClause::FilePathMatches(first.into()), &ctx));
+
+        // Simulate successive policy revisions; old clauses have been dropped
+        // before each next evaluation, so only the cache can retain them.
+        for i in 1..=MAX_CACHED_REGEXES * 3 {
+            let clause = WhenClause::FilePathMatches(format!(r"^/repo_{i}/[a-z0-9]+\.rs$"));
+            assert!(!evaluate(&clause, &ctx));
+            REGEX_CACHE.with(|cache| {
+                let cache = cache.borrow();
+                assert!(cache.patterns.len() <= MAX_CACHED_REGEXES);
+                assert_eq!(cache.patterns.len(), cache.insertion_order.len());
+            });
+        }
+        REGEX_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.patterns.len(), MAX_CACHED_REGEXES);
+            assert!(!cache.patterns.contains_key(first));
+        });
+
+        // Invalid patterns neither evict a valid entry nor become cache entries.
+        let before = REGEX_CACHE.with(|cache| cache.borrow().insertion_order.clone());
+        assert!(cached_regex("(").is_none());
+        REGEX_CACHE.with(|cache| assert_eq!(cache.borrow().insertion_order, before));
+
+        assert!(evaluate(&WhenClause::FilePathMatches(first.into()), &ctx));
+        REGEX_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert!(cache.patterns.contains_key(first));
+            assert_eq!(cache.patterns.len(), MAX_CACHED_REGEXES);
+        });
+    }
+
+    #[test]
+    fn regex_eviction_preserves_all_predicates_and_unknown_contexts() {
+        let hit = DslEvalContext {
+            urls: vec![DslUrl {
+                host: "api.evil.com",
+                scheme: "https",
+                reputation: Reputation::Unknown,
+            }],
+            packages: vec![DslPackage {
+                ecosystem: "npm".into(),
+                name: "Left-Pad",
+                reputation: PkgReputation::Unknown,
+            }],
+            file_path: Some("/repo/.env"),
+            ..Default::default()
+        };
+        let miss = DslEvalContext {
+            file_path: Some("/repo/main.rs"),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                WhenClause::UrlHostMatches(r"\.evil\.com$".into()),
+                ScanContext::Exec,
+            ),
+            (
+                WhenClause::PackageNameMatches("^left-pad$".into()),
+                ScanContext::Paste,
+            ),
+            (
+                WhenClause::FilePathMatches(r"/\.env$".into()),
+                ScanContext::FileScan,
+            ),
+        ];
+        for (clause, context) in cases {
+            let negated = WhenClause::Not(Box::new(clause.clone()));
+            for _ in 0..2 {
+                assert!(evaluate(&clause, &hit));
+                assert!(!evaluate(&clause, &miss));
+                assert_eq!(
+                    evaluate_in_context(&clause, &hit, context),
+                    TruthValue::True
+                );
+                assert_eq!(
+                    evaluate_in_context(&negated, &miss, context),
+                    TruthValue::True
+                );
+                let unavailable = if context == ScanContext::FileScan {
+                    ScanContext::Exec
+                } else {
+                    ScanContext::FileScan
+                };
+                assert_eq!(
+                    evaluate_in_context(&negated, &hit, unavailable),
+                    TruthValue::Unknown
+                );
+
+                // Evict every pattern above between the first and second pass.
+                for i in 0..MAX_CACHED_REGEXES {
+                    assert!(cached_regex(&format!("^cache-churn-{i}$")).is_some());
+                }
+            }
         }
     }
 
