@@ -854,7 +854,11 @@ fn validate_commit(value: &str, label: &str) -> FeedResult<()> {
 fn validate_utc_timestamp(value: &str, label: &str) -> FeedResult<()> {
     let parsed = chrono::DateTime::parse_from_rfc3339(value)
         .map_err(|error| format!("{label} is not RFC3339: {error}"))?;
-    if parsed.to_rfc3339_opts(chrono::SecondsFormat::Secs, true) != value {
+    if parsed
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        != value
+    {
         return Err(format!(
             "{label} must be canonical UTC whole-second RFC3339"
         ));
@@ -1036,6 +1040,29 @@ fn verify_expected_summary(
     Ok(())
 }
 
+fn verify_git_commit_timestamp(
+    timestamp: &str,
+    expected_timestamp: &str,
+    label: &str,
+) -> FeedResult<()> {
+    validate_utc_timestamp(
+        expected_timestamp,
+        &format!("{label} source commit timestamp"),
+    )?;
+    let actual = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|error| format!("{label} Git commit time is not RFC3339: {error}"))?;
+    let expected = chrono::DateTime::parse_from_rfc3339(expected_timestamp)
+        .expect("timestamp validated above");
+    // Git preserves the committer's offset; provenance records UTC. Compare
+    // instants rather than their spellings, without discarding subsecond data.
+    if actual != expected {
+        return Err(format!(
+            "{label} Git commit time {timestamp} does not match provenance {expected_timestamp}"
+        ));
+    }
+    Ok(())
+}
+
 fn verify_git_checkout(
     root: &Path,
     expected_commit: &str,
@@ -1060,10 +1087,6 @@ fn verify_git_checkout(
         ));
     }
     if let Some(expected_timestamp) = expected_timestamp {
-        validate_utc_timestamp(
-            expected_timestamp,
-            &format!("{label} source commit timestamp"),
-        )?;
         let timestamp = std::process::Command::new("git")
             .arg("-C")
             .arg(root)
@@ -1076,14 +1099,7 @@ fn verify_git_checkout(
         let timestamp = std::str::from_utf8(&timestamp.stdout)
             .map_err(|_| format!("{label} Git commit time is not UTF-8"))?
             .trim();
-        let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp)
-            .map_err(|error| format!("{label} Git commit time is not RFC3339: {error}"))?
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        if timestamp != expected_timestamp {
-            return Err(format!(
-                "{label} Git commit time {timestamp} does not match provenance {expected_timestamp}"
-            ));
-        }
+        verify_git_commit_timestamp(timestamp, expected_timestamp, label)?;
     }
     let status = std::process::Command::new("git")
         .arg("-C")
@@ -7562,6 +7578,50 @@ mod tests {
     }
 
     #[test]
+    fn git_commit_timestamps_compare_instants_and_require_canonical_provenance() {
+        let expected = "2026-09-11T08:15:54Z";
+        for timestamp in [
+            expected,
+            "2026-09-11T08:15:54+00:00",
+            "2026-09-11T10:15:54+02:00",
+            "2026-09-11T03:15:54-05:00",
+            "2026-09-11T13:45:54+05:30",
+            "2026-09-10T23:15:54-09:00",
+        ] {
+            verify_git_commit_timestamp(timestamp, expected, "fixture").unwrap();
+        }
+        for timestamp in [
+            "2026-09-11T10:15:55+02:00",
+            "2026-09-11T10:15:54+03:00",
+            "2026-09-11T10:15:54.500+02:00",
+        ] {
+            assert!(verify_git_commit_timestamp(timestamp, expected, "fixture")
+                .unwrap_err()
+                .contains("does not match provenance"));
+        }
+        for timestamp in [
+            "not-a-timestamp",
+            "2026-09-11T10:15:54",
+            "2026-09-11T10:15:54+24:00",
+            "2026-09-11T10:15:54+02:60",
+        ] {
+            assert!(verify_git_commit_timestamp(timestamp, expected, "fixture")
+                .unwrap_err()
+                .contains("not RFC3339"));
+        }
+        for provenance in [
+            "2026-09-11T08:15:54+00:00",
+            "2026-09-11T10:15:54+02:00",
+            "2026-09-11T03:15:54-05:00",
+            "2026-09-11T08:15:54.000Z",
+        ] {
+            assert!(verify_git_commit_timestamp(expected, provenance, "fixture")
+                .unwrap_err()
+                .contains("canonical UTC whole-second RFC3339"));
+        }
+    }
+
+    #[test]
     fn git_source_revision_and_tracked_cleanliness_are_enforced() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("input.txt"), b"clean\n").unwrap();
@@ -7583,6 +7643,8 @@ mod tests {
                 .arg("-C")
                 .arg(directory.path())
                 .args(args)
+                .env("GIT_AUTHOR_DATE", "2026-09-11T10:15:54+02:00")
+                .env("GIT_COMMITTER_DATE", "2026-09-11T10:15:54+02:00")
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -7604,7 +7666,9 @@ mod tests {
             std::str::from_utf8(&output.stdout).unwrap().trim(),
         )
         .unwrap()
+        .with_timezone(&chrono::Utc)
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert_eq!(timestamp, "2026-09-11T08:15:54Z");
         verify_git_checkout(directory.path(), commit, Some(&timestamp), "fixture").unwrap();
         assert!(verify_git_checkout(
             directory.path(),
