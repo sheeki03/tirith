@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Legacy session correlation reuses one privacy-projected event window when expiring warning markers, avoiding repeated redaction of every event for each retained signature.
 - Fuzz and packaging workflows cancel superseded pull-request checks so current changes reach runners sooner. Release-tag and other non-PR runs remain independent.
 
+### Maintenance
+
+- Refresh the reviewed OpenSSF and DataDog source snapshots to September 11 revisions and synchronize their `NOTICE` attribution entries (#245).
+- Update pinned QEMU setup, GitHub release, and SARIF upload actions to their reviewed upstream patch/minor releases (#242).
+
 ## [0.4.1] - 2026-09-02
 
 ### Added

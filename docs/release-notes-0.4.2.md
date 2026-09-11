@@ -52,6 +52,11 @@ supports the repository workflow token, and finds existing proposals reliably.
 Generated manifest transitions reject stale publication pointers. Source-pin
 proposals still require review before adoption.
 
+The reviewed OpenSSF and DataDog snapshots advance to September 11 revisions,
+with matching attribution entries in `NOTICE`. The candidate snapshots passed
+source fetching and compilation before adoption; upstream scripts are not run.
+The ecosyste.ms pin remains unchanged.
+
 Dual-mode clients quietly use the supported v1 channel when the server has not
 published a v2 index. Authentication, signature, integrity, and other server
 failures remain visible
