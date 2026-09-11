@@ -1357,11 +1357,15 @@ fn record_fresh_correlation_warnings(
     }
 
     // Expire presentation markers in lockstep with the persisted event window.
-    let live_events: Vec<crate::event_buffer::TypedEvent> =
-        session.typed_events.iter().cloned().collect();
-    session
-        .surfaced_correlations
-        .retain(|sig| crate::event_buffer::signature_references_live_event(sig, &live_events));
+    // Only warning/presentation state changed above, so `events` is still the
+    // current window. Project it once for the entire marker batch, rather than
+    // redoing full event redaction for each of up to 800 retained signatures.
+    if !session.surfaced_correlations.is_empty() {
+        let live_events = crate::event_buffer::LiveCorrelationEvents::new(&events);
+        session
+            .surfaced_correlations
+            .retain(|sig| live_events.references_signature(sig));
+    }
     while session.surfaced_correlations.len() > MAX_SURFACED_CORRELATIONS {
         session.surfaced_correlations.pop_front();
     }

@@ -1024,32 +1024,52 @@ pub fn signature_event_timestamps(sig: &str) -> impl Iterator<Item = &str> {
 /// sequence allocation is unique within the owning session, while accepting the
 /// old id as an output/matching authority would preserve a secret-bearing value.
 pub fn signature_references_live_event(sig: &str, events: &[TypedEvent]) -> bool {
-    let events: Vec<TypedEvent> = events
-        .iter()
-        .map(privacy_project_correlation_event)
-        .collect();
-    sig.split('|').skip(1).any(|part| {
-        if let Some(rest) = part.strip_prefix("e:") {
-            let Some((_, sequence)) = rest.rsplit_once(':') else {
-                return false;
-            };
-            let Ok(sequence) = sequence.parse::<u64>() else {
-                return false;
-            };
-            events
+    LiveCorrelationEvents::new(events).references_signature(sig)
+}
+
+/// One request's privacy-projected event window for marker expiry. Keep the
+/// owned events private: every construction must cross the same projection as
+/// the public single-signature helper, including directly constructed events.
+/// Reusing this snapshot avoids redoing secret/metadata redaction for every
+/// retained signature while the session lock keeps the source window unchanged.
+pub(crate) struct LiveCorrelationEvents {
+    events: Vec<TypedEvent>,
+}
+
+impl LiveCorrelationEvents {
+    pub(crate) fn new(events: &[TypedEvent]) -> Self {
+        Self {
+            events: events
                 .iter()
-                .any(|event| event.sequence > 0 && event.sequence == sequence)
-        } else {
-            let timestamp = part.strip_prefix("t:").unwrap_or(part);
-            let Some(timestamp) = canonical_correlation_timestamp(timestamp) else {
-                return false;
-            };
-            events.iter().any(|event| {
-                canonical_correlation_timestamp(&event.timestamp).as_deref()
-                    == Some(timestamp.as_str())
-            })
+                .map(privacy_project_correlation_event)
+                .collect(),
         }
-    })
+    }
+
+    pub(crate) fn references_signature(&self, sig: &str) -> bool {
+        sig.split('|').skip(1).any(|part| {
+            if let Some(rest) = part.strip_prefix("e:") {
+                let Some((_, sequence)) = rest.rsplit_once(':') else {
+                    return false;
+                };
+                let Ok(sequence) = sequence.parse::<u64>() else {
+                    return false;
+                };
+                self.events
+                    .iter()
+                    .any(|event| event.sequence > 0 && event.sequence == sequence)
+            } else {
+                let timestamp = part.strip_prefix("t:").unwrap_or(part);
+                let Some(timestamp) = canonical_correlation_timestamp(timestamp) else {
+                    return false;
+                };
+                self.events.iter().any(|event| {
+                    canonical_correlation_timestamp(&event.timestamp).as_deref()
+                        == Some(timestamp.as_str())
+                })
+            }
+        })
+    }
 }
 
 /// SecretWrite THEN Network within 30s -> CRITICAL.
@@ -1965,6 +1985,65 @@ mod tests {
             &hit.signature,
             &[secret, network]
         ));
+    }
+
+    #[test]
+    fn batch_signature_expiry_matches_single_calls_for_private_and_legacy_events() {
+        let secret = format!("ghp_{}", "Q".repeat(36));
+        let mut current = ev("2026-01-01T02:00:00+02:00".into(), EventKind::Network);
+        current.sequence = 41;
+        current.event_id = secret.clone();
+        current.metadata.insert(
+            "host".into(),
+            format!("https://operator:{secret}@mainnet.infura.io/v3/providerToken123456789"),
+        );
+        current.metadata.insert(
+            "path".into(),
+            format!("/Users/alice/private/{secret}/config.yaml"),
+        );
+        let legacy = ev("2026-01-02T00:00:00Z".into(), EventKind::FileWrite);
+        // Projection strips terminal controls before timestamp matching. A
+        // batch must not accidentally index unprojected timestamps instead.
+        let mut projected_timestamp = ev("2026-01-03T00:00:00Z".into(), EventKind::FileWrite);
+        projected_timestamp.timestamp = "\x1b[31m2026-01-03T00:00:00Z".into();
+        let mut invalid_timestamp = ev("not a timestamp".into(), EventKind::FileDelete);
+        invalid_timestamp.sequence = 7;
+        let events = vec![current, legacy, projected_timestamp, invalid_timestamp];
+        let original = events.clone();
+        let batch = LiveCorrelationEvents::new(&events);
+        assert_eq!(events, original, "projection must not mutate caller events");
+        assert_eq!(batch.events[0].event_id, "legacy-event-41");
+        assert!(batch.events[0]
+            .metadata
+            .values()
+            .all(|value| !value.contains(&secret) && !value.contains("/Users/alice")));
+
+        for (signature, expected) in [
+            ("MassFileDeletion|e:legacy-event-41:41", true),
+            ("MassFileDeletion|e:old:opaque:id:41", true),
+            ("MassFileDeletion|e::7", true),
+            ("MassFileDeletion|e:zero:0", false),
+            ("MassFileDeletion|e:dead:999", false),
+            ("MassFileDeletion|t:2026-01-01T00:00:00Z", true),
+            ("MassFileDeletion|2026-01-02T02:00:00+02:00", true),
+            ("MassFileDeletion|t:2026-01-03T00:00:00Z", true),
+            ("MassFileDeletion|t:2025-01-01T00:00:00Z", false),
+            ("MassFileDeletion|e:missing-separator", false),
+            ("MassFileDeletion|e:bad:not-a-number", false),
+            ("MassFileDeletion|e:bad:18446744073709551616", false),
+            ("MassFileDeletion|t:not a timestamp", false),
+            ("MassFileDeletion|not a timestamp", false),
+            ("MassFileDeletion|e:bad:no|t:bad|e:live:41", true),
+            ("MassFileDeletion|e:dead:999|e:live:7", true),
+            ("MassFileDeletion|", false),
+            ("MassFileDeletion", false),
+            ("", false),
+        ] {
+            let single = signature_references_live_event(signature, &events);
+            assert_eq!(single, expected, "single: {signature}");
+            assert_eq!(batch.references_signature(signature), single, "{signature}");
+            assert!(!LiveCorrelationEvents::new(&[]).references_signature(signature));
+        }
     }
 
     #[test]
