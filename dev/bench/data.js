@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789127348784,
+  "lastUpdate": 1789136918553,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -4697,6 +4697,168 @@ window.BENCHMARK_DATA = {
             "name": "task_decision_projection",
             "value": 783,
             "range": "± 2",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9f2c652a8378ac78913fadfca7a4960397b33047",
+          "message": "Fix shell receipt activation, database reloads, and costly runtime paths (#246)\n\n* Avoid repeated rule compilation and stale ThreatDB cache state\n\n* Bound diagnostic log reads and retain the resolved daemon policy\n\n* Restore native shell receipts through npm and reduce prompt overhead\n\n* Allow entitled trial subscriptions to refresh license tokens\n\n* Document unreleased reliability and performance fixes\n\n* Reuse the projected event window when expiring correlation markers\n\n* Verify the existing endpoint redaction contract in the batch regression\n\n* Preserve shell executable resolution on non-Unix platforms\n\n* Cancel superseded pull request fuzz and packaging checks",
+          "timestamp": "2026-09-11T19:51:36+05:30",
+          "tree_id": "a8ff50ba3bf364f18a4f24dcc5298961964fffe9",
+          "url": "https://github.com/sheeki03/tirith/commit/9f2c652a8378ac78913fadfca7a4960397b33047"
+        },
+        "date": 1789136917425,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 490,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 123,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 98398,
+            "range": "± 904",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 654424,
+            "range": "± 6171",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 901845,
+            "range": "± 3653",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 469040,
+            "range": "± 2723",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 33181,
+            "range": "± 436",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 92,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 105,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_clean_command_full_analysis",
+            "value": 98008,
+            "range": "± 1421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_benign",
+            "value": 19750,
+            "range": "± 134",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing",
+            "value": 33546,
+            "range": "± 156",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_with_cwd",
+            "value": 51936,
+            "range": "± 3618",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_no_cwd_baseline",
+            "value": 19282,
+            "range": "± 168",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_web3_with_cwd",
+            "value": 688622,
+            "range": "± 3627",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "npm_command_extract",
+            "value": 6550,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_envelope_decide",
+            "value": 1699,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_guard_merge_repo_scoped",
+            "value": 3043,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "workflow_artifact_model",
+            "value": 21288,
+            "range": "± 346",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_hostile_64k",
+            "value": 1023242,
+            "range": "± 35027",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "effect_inference_mixed_shell",
+            "value": 134391,
+            "range": "± 798",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "verdict_json_serialization",
+            "value": 641934,
+            "range": "± 1916",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_decision_projection",
+            "value": 993,
+            "range": "± 4",
             "unit": "ns/iter"
           }
         ]
