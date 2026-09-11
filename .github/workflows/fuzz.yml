@@ -7,6 +7,14 @@ on:
   workflow_dispatch:
   workflow_call:
 
+# Replace only superseded PR checks. Other events get a unique run group so
+# neither running nor pending scheduled, dispatched, or release-gate work is
+# replaced. The file-specific prefix also separates this reusable workflow
+# from its Release caller, whose github.workflow value it inherits.
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 

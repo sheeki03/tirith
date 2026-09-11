@@ -24,6 +24,13 @@ on:
   # option could enable publication and offering one would only imply otherwise.
   workflow_dispatch:
 
+# Replace only superseded PR validation. Tag pushes and manual dispatches keep
+# distinct run groups, including their pending jobs and publication gates.
+# Keep this prefix distinct from the reusable Fuzz workflow's group.
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 

@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recent-log commands seek backward through a bounded suffix instead of parsing the entire audit history. Both the inspected bytes and individual line lengths are capped.
 - Bash prompt callbacks avoid unnecessary history capture subprocesses while preserving typed-command and history-change checks.
 - Legacy session correlation reuses one privacy-projected event window when expiring warning markers, avoiding repeated redaction of every event for each retained signature.
+- Fuzz and packaging workflows cancel superseded pull-request checks so current changes reach runners sooner. Release-tag and other non-PR runs remain independent.
 
 ## [0.4.1] - 2026-09-02
 
