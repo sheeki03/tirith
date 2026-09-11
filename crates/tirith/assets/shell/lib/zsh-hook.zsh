@@ -23,7 +23,14 @@ fi
 
 # Pin the executable before any repository command can mutate PATH. All hook
 # callbacks use this absolute path for the lifetime of the shell session.
-_TIRITH_BIN="${commands[tirith]:-}"
+if [[ "$#" -eq 2 && "$1" == "--tirith-executable" ]]; then
+  # Bind native CLI source arguments from `tirith init`, bypassing launchers
+  # that would otherwise break the direct-parent receipt registration.
+  _TIRITH_BIN="$2"
+  [[ "$_TIRITH_BIN" == /* && -f "$_TIRITH_BIN" && -x "$_TIRITH_BIN" ]] || _TIRITH_BIN=""
+else
+  _TIRITH_BIN="${commands[tirith]:-}"
+fi
 if [[ -n "$_TIRITH_BIN" ]]; then
   _TIRITH_BIN="${_TIRITH_BIN:A}"
 fi

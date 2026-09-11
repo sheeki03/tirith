@@ -85,6 +85,134 @@ fn fixture() -> tempfile::TempDir {
 }
 
 #[test]
+fn explicit_native_source_argument_bypasses_launchers_without_changing_path() {
+    for (family, shell) in shells() {
+        let root = fixture();
+        let native = root.path().join("native's binary");
+        executable(&native, "printf 'NATIVE_EXECUTED\\n'");
+        let bin = quote(&root.path().join("good bin"));
+        let hook = quote(&pty_support::embedded_hook(&format!(
+            "{family}-hook.{family}"
+        )));
+        let native = quote(&native);
+        let script = if family == "fish" {
+            format!(
+                r#"set -gx PATH {bin}; set argv caller arguments
+source {hook} --tirith-executable {native}
+test "$argv[1]" = caller; and test "$argv[2]" = arguments; or exit 1
+test "$PATH" = {bin}; or exit 2
+command "$_TIRITH_BIN"
+"#
+            )
+        } else {
+            format!(
+                r#"PATH={bin}; set -- caller arguments
+source {hook} --tirith-executable {native}
+[[ "$1" == caller && "$2" == arguments ]] || exit 1
+[[ "$PATH" == {bin} ]] || exit 2
+command "$_TIRITH_BIN"
+"#
+            )
+        };
+        let output = run(&shell, family, root.path(), false, &script);
+        assert_eq!(output.stdout, b"NATIVE_EXECUTED\n", "{family}");
+    }
+}
+
+#[test]
+fn source_loader_resolves_itself_independently_of_caller_and_cdpath() {
+    let mut candidates = shells();
+    if !candidates
+        .iter()
+        .any(|(_, path)| path == Path::new("/bin/bash"))
+    {
+        candidates.push(("bash", PathBuf::from("/bin/bash")));
+    }
+    for (family, shell) in candidates {
+        if family == "fish" {
+            continue;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("hook's directory");
+        fs::create_dir_all(directory.join("lib")).unwrap();
+        let loader = directory.join("tirith.sh");
+        fs::copy(pty_support::embedded_hook("../tirith.sh"), &loader).unwrap();
+        fs::write(
+            directory.join(format!("lib/{family}-hook.{family}")),
+            "builtin printf 'LOADED_FROM_SOURCE\\n'\n",
+        )
+        .unwrap();
+        for source in [&loader, &PathBuf::from("hook's directory/tirith.sh")] {
+            let script = format!(
+                "PATH=/missing; CDPATH=/does/not/exist; {}; source {}",
+                if family == "zsh" {
+                    "unsetopt functionargzero"
+                } else {
+                    ":"
+                },
+                quote(source)
+            );
+            let output = run(&shell, family, root.path(), false, &script);
+            assert_eq!(output.stdout, b"LOADED_FROM_SOURCE\n", "{family}");
+            assert!(output.stderr.is_empty(), "{family}: {output:?}");
+        }
+    }
+}
+
+#[test]
+fn bash_prompt_fast_path_preserves_typed_sentinels_and_history_drift() {
+    for shell in [
+        PathBuf::from("/bin/bash"),
+        pty_support::modern_bash().unwrap_or_else(|| PathBuf::from("/bin/bash")),
+    ] {
+        let root = fixture();
+        let history_log = root.path().join("history.log");
+        let check_log = root.path().join("check.log");
+        executable(
+            &root.path().join("good bin/tirith"),
+            &format!("printf '%s\\n' \"$*\" >> {}", quote(&check_log)),
+        );
+        let script = format!(
+            r#"PATH={bin}:/usr/bin:/bin
+source {hook}
+_TIRITH_PREEXEC_PROMPT_GUARDS=1
+_TIRITH_RECEIPT_PROTOCOL=0
+_tirith_read_history_entry() {{ printf 'read\n' >> {history_log}; printf '%s\n' "$_TEST_HISTORY"; }}
+_tirith_preexec_prompt_guards_attached() {{ return 0; }}
+_tirith_preexec_block_current_line() {{ printf 'DRIFT_BLOCKED\n'; return 1; }}
+for phase in startup prompt off; do
+    _TIRITH_PREEXEC_PHASE="$phase"
+    _tirith_preexec 1 1 'automatic_prompt_work'
+    _tirith_preexec 1 1 '_tirith_preexec_prompt_begin'
+done
+[[ ! -e {history_log} ]] || exit 11
+_TIRITH_PREEXEC_PHASE=user
+_TIRITH_PREEXEC_ACTIVE_DECISION=''
+_TEST_HISTORY='1|_tirith_preexec_prompt_begin'
+_tirith_preexec 2 1 '_tirith_preexec_prompt_begin'
+[[ "$_TIRITH_PREEXEC_PHASE" == user ]] || exit 12
+_TIRITH_PREEXEC_PHASE=user
+_TIRITH_PREEXEC_ENFORCE=1
+_TIRITH_PREEXEC_ACTIVE_DECISION=''
+_TEST_HISTORY='2|echo prior_command'
+_tirith_preexec 3 1 'echo changed_command'
+[[ $? == 1 ]] || exit 13
+"#,
+            bin = quote(&root.path().join("good bin")),
+            hook = quote(&pty_support::embedded_hook("bash-hook.bash")),
+            history_log = quote(&history_log),
+        );
+        let output = run(&shell, "bash", root.path(), false, &script);
+        assert_eq!(fs::read_to_string(history_log).unwrap(), "read\nread\n");
+        assert_eq!(
+            fs::read_to_string(check_log).unwrap(),
+            "check --shell posix --warn-only -- _tirith_preexec_prompt_begin\n"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("DRIFT_BLOCKED"));
+    }
+}
+
+#[test]
 fn helper_resolution_ignores_hashes_functions_and_relative_path_entries() {
     for (family, shell) in shells() {
         let root = fixture();

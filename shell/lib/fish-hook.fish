@@ -20,8 +20,14 @@ end
 
 # Pin the executable before any repository command can mutate PATH. Refuse an
 # interactive hook when fish cannot resolve an absolute executable path.
-set -g _TIRITH_BIN (command -s tirith 2>/dev/null)
-if not string match -q '/*' -- "$_TIRITH_BIN"; or not test -x "$_TIRITH_BIN"
+if test (count $argv) -eq 2; and test "$argv[1]" = --tirith-executable
+    # `tirith init` passes the native CLI as temporary source arguments. Do not
+    # put an npm/version-manager launcher between the shell and its receipts.
+    set -g _TIRITH_BIN "$argv[2]"
+else
+    set -g _TIRITH_BIN (command -s tirith 2>/dev/null)
+end
+if not string match -q '/*' -- "$_TIRITH_BIN"; or not test -f "$_TIRITH_BIN"; or not test -x "$_TIRITH_BIN"
     if status is-interactive
         printf '%s\n' 'tirith: executable not found; fish hooks disabled' >&2
         set -g TIRITH_STATUS off

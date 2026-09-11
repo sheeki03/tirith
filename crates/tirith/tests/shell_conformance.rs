@@ -1082,6 +1082,114 @@ fn bash_enter_degradation_restores_custom_ctrl_o_bindings() {
 }
 
 // === fish ===
+
+/// npm's Node launcher must only run `init`; subsequent receipt operations
+/// must run the native binary directly under each interactive shell.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn npm_init_preserves_native_shell_receipts_and_allow_block_delivery() {
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+    let node = match std::process::Command::new("node")
+        .args(["-p", "process.platform + '-' + process.arch"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => {
+            eprintln!("skipping npm shell integration: Node is not installed");
+            return;
+        }
+    };
+    let platform = String::from_utf8(node.stdout).unwrap();
+    let mut shells = Vec::new();
+    if let Some(shell) = modern_bash() {
+        shells.push(("bash", shell, vec!["--noprofile", "--norc", "-i"]));
+    }
+    if let Some(shell) = zsh_bin() {
+        shells.push(("zsh", shell, vec!["-f", "-i"]));
+    }
+    if let Some(shell) = fish_bin() {
+        shells.push(("fish", shell, vec!["--no-config", "-i"]));
+    }
+    for (family, shell, arguments) in shells {
+        let mut env = IsolatedEnv::new();
+        let bin = env.workdir.join("npm bin");
+        std::fs::create_dir(&bin).unwrap();
+        let launcher = bin.join("tirith");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../npm/tirith/bin/tirith"),
+            &launcher,
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let package = bin
+            .join("node_modules/@sheeki03")
+            .join(format!("tirith-{}", platform.trim()));
+        std::fs::create_dir_all(package.join("bin")).unwrap();
+        std::fs::write(package.join("package.json"), "{}").unwrap();
+        symlink(pty_support::tirith_bin(), package.join("bin/tirith")).unwrap();
+        env.set(
+            "PATH",
+            &format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+        if family == "bash" {
+            env.set("TIRITH_BASH_MODE", "enter");
+            env.seed_bash_enter_capability(
+                "works",
+                &pty_support::bash_version_string(&shell).unwrap(),
+                &shell,
+            );
+        }
+        let allowed = env.workdir.join("npm-allowed");
+        let blocked = env.workdir.join("npm-blocked");
+        let mut sess = PtySession::spawn(&env, &shell, &arguments);
+        sess.send_line(match family {
+            "fish" => "function fish_prompt; printf 'TIRITH_PTY> '; end",
+            "zsh" => "PROMPT='TIRITH_PTY> '; RPROMPT=''",
+            _ => "PS1='TIRITH_PTY> '",
+        });
+        sess.expect("TIRITH_PTY> ");
+        sess.wait_idle(QUIET, SETTLE_MAX);
+        sess.clear_buffer();
+        sess.send_line(&if family == "fish" {
+            "tirith init --shell fish | source".to_string()
+        } else {
+            format!("eval \"$(tirith init --shell {family})\"")
+        });
+        sess.expect("TIRITH_PTY> ");
+        sess.wait_idle(QUIET, SETTLE_MAX);
+        sess.clear_buffer();
+        sess.send_line("printf 'NPM_PROTOCOL<%s>\\n' \"$_TIRITH_RECEIPT_PROTOCOL\"");
+        sess.expect("NPM_PROTOCOL<3>");
+        sess.wait_idle(QUIET, SETTLE_MAX);
+        let before = strict_ledger_counts(&env);
+        assert!(
+            before.1 >= 1,
+            "{family}: protocol probe must create a receipt"
+        );
+        sess.clear_buffer();
+        sess.send_line(&format!("printf 'ALLOWED\\n' >> '{}'", allowed.display()));
+        let body = wait_for_marker(&allowed, "ALLOWED", MARKER_MAX);
+        assert_eq!(count_occurrences(&body, "ALLOWED"), 1, "{family}");
+        let after_allowed = strict_ledger_counts(&env);
+        assert_eq!(after_allowed, (0, before.1 + 1), "{family}");
+        sess.clear_buffer();
+        sess.send_line(&format!(
+            "printf 'true' | bash && touch '{}'",
+            blocked.display()
+        ));
+        sess.expect("BLOCKED");
+        sess.wait_idle(QUIET, SETTLE_MAX);
+        assert!(!blocked.exists(), "{family}: rejected command executed");
+        assert_eq!(strict_ledger_counts(&env), after_allowed, "{family}");
+        sess.close();
+    }
+}
+
 // The fish hook binds Enter to `_tirith_check_command`, ending with
 // `commandline -f execute` (fish's supported line-accept). Delivery is reliable;
 // the harness answers fish 4.x's terminal probes so startup doesn't hang.

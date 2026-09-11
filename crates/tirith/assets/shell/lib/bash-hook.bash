@@ -101,7 +101,16 @@ case "$_TIRITH_BASH_BIN" in
   /*) [[ -x "$_TIRITH_BASH_BIN" ]] || _TIRITH_BASH_BIN="" ;;
   *) _TIRITH_BASH_BIN="" ;;
 esac
-_tirith_resolved_bin="$(type -P tirith 2>/dev/null || true)"
+if [[ "$#" -eq 2 && "$1" == "--tirith-executable" ]]; then
+  # `tirith init` supplies its native executable as source arguments, so npm
+  # and version-manager launchers do not become receipt-operation parents.
+  # Source arguments are temporary and do not trust an inherited env override.
+  _tirith_resolved_bin="$2"
+  [[ "$_tirith_resolved_bin" == /* && -f "$_tirith_resolved_bin" && -x "$_tirith_resolved_bin" ]] \
+    || _tirith_resolved_bin=""
+else
+  _tirith_resolved_bin="$(type -P tirith 2>/dev/null || true)"
+fi
 _TIRITH_BIN=""
 if [[ -n "$_tirith_resolved_bin" ]]; then
   _tirith_bin_name="${_tirith_resolved_bin##*/}"
@@ -1351,10 +1360,19 @@ _tirith_preexec() {
   [[ "${_TIRITH_BASH_INTERNAL:-0}" == "1" ]] && return 0
   local bash_cmd="${3:-$BASH_COMMAND}"
   local entry history_index="" history_line=""
-  if entry="$(_tirith_read_history_entry)"; then
-    history_index="${entry%%|*}"
-    history_line="${entry#*|}"
-  fi
+  # Startup and bracketed prompt callbacks never inspect a typed history line.
+  # Avoid two command-substitution forks on every automatic DEBUG fire. Keep
+  # reading in user/unbracketed phases, including typed prompt-sentinel names,
+  # so the origin and history-drift checks below retain their exact inputs.
+  case "${_TIRITH_PREEXEC_PHASE:-startup}" in
+    startup|prompt|off) ;;
+    *)
+      if entry="$(_tirith_read_history_entry)"; then
+        history_index="${entry%%|*}"
+        history_line="${entry#*|}"
+      fi
+      ;;
+  esac
 
   # Exact prompt sentinels are internal only when Bash reached them through the
   # installed prompt bracket. A user who types the private function name gets a

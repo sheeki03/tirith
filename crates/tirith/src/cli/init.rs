@@ -12,6 +12,31 @@ fn powershell_single_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "''"))
 }
 
+fn fish_single_quote(path: &str) -> String {
+    // Fish interprets backslash escapes inside single quotes, unlike POSIX
+    // shells. Escape backslashes before apostrophes to preserve exact bytes.
+    format!("'{}'", path.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn native_hook_source_line(shell: &str, hook: &Path, executable: &Path) -> Result<String, String> {
+    let hook = hook
+        .to_str()
+        .ok_or_else(|| "shell hook path is not valid UTF-8".to_string())?;
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| "native executable path is not valid UTF-8".to_string())?;
+    let quote = if shell == "fish" {
+        fish_single_quote
+    } else {
+        posix_single_quote
+    };
+    Ok(format!(
+        "source {} --tirith-executable {}",
+        quote(hook),
+        quote(executable)
+    ))
+}
+
 /// Render an exact Nushell string literal. Nushell's single-quoted strings do
 /// not support embedded apostrophes or escapes, so paths are always emitted as
 /// double-quoted literals with every special/control character encoded.
@@ -107,14 +132,36 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
     };
 
     let hook_dir = find_hook_dir();
+    // npm and version-manager launchers add a process between the shell and
+    // Tirith. Receipt registration requires the native binary to be the shell's
+    // direct child. Bind each new initialization to this running installation,
+    // rather than resolving the launcher again from PATH inside the hook.
+    let native_executable = if matches!(shell, "bash" | "zsh" | "fish") {
+        match std::env::current_exe().and_then(std::fs::canonicalize) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("tirith: cannot locate the native executable for shell hooks: {error}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
 
     match shell {
         "zsh" => {
             if let Some(dir) = &hook_dir {
-                println!(
-                    "source {}",
-                    posix_single_quote(&dir.join("lib/zsh-hook.zsh").display().to_string())
-                );
+                match native_hook_source_line(
+                    shell,
+                    &dir.join("lib/zsh-hook.zsh"),
+                    native_executable.as_ref().unwrap(),
+                ) {
+                    Ok(line) => println!("{line}"),
+                    Err(error) => {
+                        eprintln!("tirith: {error}");
+                        return 1;
+                    }
+                }
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -129,10 +176,17 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
         }
         "bash" => {
             if let Some(dir) = &hook_dir {
-                println!(
-                    "source {}",
-                    posix_single_quote(&dir.join("lib/bash-hook.bash").display().to_string())
-                );
+                match native_hook_source_line(
+                    shell,
+                    &dir.join("lib/bash-hook.bash"),
+                    native_executable.as_ref().unwrap(),
+                ) {
+                    Ok(line) => println!("{line}"),
+                    Err(error) => {
+                        eprintln!("tirith: {error}");
+                        return 1;
+                    }
+                }
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -147,10 +201,17 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
         }
         "fish" => {
             if let Some(dir) = &hook_dir {
-                println!(
-                    "source {}",
-                    posix_single_quote(&dir.join("lib/fish-hook.fish").display().to_string())
-                );
+                match native_hook_source_line(
+                    shell,
+                    &dir.join("lib/fish-hook.fish"),
+                    native_executable.as_ref().unwrap(),
+                ) {
+                    Ok(line) => println!("{line}"),
+                    Err(error) => {
+                        eprintln!("tirith: {error}");
+                        return 1;
+                    }
+                }
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -661,14 +722,85 @@ fn materialize_hooks_at(data_dir: &Path) -> Result<(PathBuf, bool), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        materialize_hooks_at, materialized_hooks_match_at, normalize_shell_name,
-        nushell_string_literal, posix_single_quote, powershell_single_quote,
+        materialize_hooks_at, materialized_hooks_match_at, native_hook_source_line,
+        normalize_shell_name, nushell_string_literal, posix_single_quote, powershell_single_quote,
         prompt_status_snippet_for,
     };
     use std::path::Path;
 
     fn prompt_status_snippet(shell: &str) -> String {
         prompt_status_snippet_for(shell, Path::new("/opt/Tirith Bin/tirith"))
+    }
+
+    #[test]
+    fn native_hook_binding_quotes_both_paths_as_literal_source_arguments() {
+        let line = native_hook_source_line(
+            "bash",
+            Path::new("/hook's dir/$hook\nfile"),
+            Path::new("/native's dir/$(not-a-command)/tirith"),
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            "source '/hook'\\''s dir/$hook\nfile' --tirith-executable '/native'\\''s dir/$(not-a-command)/tirith'"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_hook_binding_rejects_lossy_path_identity() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let invalid = Path::new(std::ffi::OsStr::from_bytes(b"/bin/non-utf8-\xff"));
+        for shell in ["bash", "zsh", "fish"] {
+            assert!(native_hook_source_line(shell, invalid, Path::new("/bin/tirith")).is_err());
+            assert!(native_hook_source_line(shell, Path::new("/shell/hook"), invalid).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_hook_binding_preserves_fish_source_argument_identity() {
+        use std::process::Command;
+
+        let root = tempfile::tempdir().unwrap();
+        for component in [
+            r"double\\backslash",
+            "mixed\\'apostrophe",
+            "trailing\\",
+            "white space\tand\nnewline",
+        ] {
+            let directory = root.path().join(component);
+            std::fs::create_dir(&directory).unwrap();
+            let hook = directory.join("hook.fish");
+            std::fs::write(&hook, "builtin printf '%s\\0' \"$argv[1]\" \"$argv[2]\"\n").unwrap();
+            // Include a trailing backslash in the executable argument as well
+            // as its directory: the closing quote must remain unambiguous.
+            let executable = directory.join("native's binary\\");
+            let line = native_hook_source_line("fish", &hook, &executable).unwrap();
+            let output = match Command::new("fish")
+                .args(["--no-config", "-c", &line])
+                .env("HOME", root.path())
+                .output()
+            {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("skipping fish source argument test: fish is not installed");
+                    return;
+                }
+                Err(error) => panic!("could not execute fish: {error}"),
+            };
+            assert!(
+                output.status.success(),
+                "component={component:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = format!("--tirith-executable\0{}\0", executable.to_str().unwrap());
+            assert_eq!(
+                output.stdout,
+                expected.as_bytes(),
+                "component={component:?}"
+            );
+        }
     }
 
     #[test]

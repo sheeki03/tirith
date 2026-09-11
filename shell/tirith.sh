@@ -4,22 +4,34 @@
 # Usage: eval "$(tirith init)" or `. /path/to/tirith.sh`
 
 _tirith_detect_shell() {
-  if [ -n "$ZSH_VERSION" ]; then
+  if [ -n "${ZSH_VERSION:-}" ]; then
     echo "zsh"
-  elif [ -n "$BASH_VERSION" ]; then
+  elif [ -n "${BASH_VERSION:-}" ]; then
     echo "bash"
-  elif [ -n "$FISH_VERSION" ]; then
+  elif [ -n "${FISH_VERSION:-}" ]; then
     echo "fish"
-  elif [ -n "$PSVersionTable" ]; then
+  elif [ -n "${PSVersionTable:-}" ]; then
     echo "powershell"
   else
     echo "unknown"
   fi
 }
 
-_tirith_dir="$(cd "$(dirname "$0")" && pwd)"
-
 _tirith_shell="$(_tirith_detect_shell)"
+
+# This file is sourced: in Bash, $0 still identifies the caller, and zsh's
+# FUNCTION_ARGZERO option can change it too. Locate the source itself, without
+# invoking PATH helpers or allowing CDPATH to alter the captured directory.
+case "$_tirith_shell" in
+  bash) _tirith_source="${BASH_SOURCE[0]}" ;;
+  zsh) _tirith_source="${(%):-%x}" ;;
+  *) return 0 ;;
+esac
+case "$_tirith_source" in
+  */*) _tirith_dir="${_tirith_source%/*}" ;;
+  *) _tirith_dir="." ;;
+esac
+_tirith_dir="$(CDPATH= builtin cd -P -- "$_tirith_dir" && builtin pwd)" || return 1
 
 case "$_tirith_shell" in
   zsh)
@@ -38,4 +50,4 @@ case "$_tirith_shell" in
     ;;
 esac
 
-unset _tirith_dir _tirith_shell
+unset _tirith_dir _tirith_shell _tirith_source

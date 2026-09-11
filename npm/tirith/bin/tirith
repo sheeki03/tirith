@@ -39,8 +39,21 @@ try {
 try {
   execFileSync(binPath, process.argv.slice(2), { stdio: "inherit" });
 } catch (e) {
-  if (e.status !== undefined) {
+  if (typeof e.status === "number") {
     process.exit(e.status);
   }
-  throw e;
+  if (e.signal) {
+    // execFileSync reports a signalled child with status=null. Passing null to
+    // process.exit would turn a crash or interruption into successful exit 0.
+    // Preserve the signal for calling shells, with a failure fallback on
+    // platforms that cannot deliver that signal to the launcher.
+    process.exitCode = 1;
+    try {
+      process.kill(process.pid, e.signal);
+    } catch {
+      process.exit(1);
+    }
+  } else {
+    throw e;
+  }
 }

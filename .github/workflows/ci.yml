@@ -124,6 +124,8 @@ jobs:
         run: node tests/openclaw-shell-resolver.mjs
       - name: IPython execution-vector extraction contract
         run: node tests/ipython-vector-extraction.mjs
+      - name: npm launcher exit and signal contract
+        run: node tests/npm-launcher.mjs
       - name: Install interactive shell conformance dependencies
         if: matrix.name == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes fish zsh
