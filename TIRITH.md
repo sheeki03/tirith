@@ -7,7 +7,7 @@
 > capability contract. Use the [README](README.md),
 > [changelog](CHANGELOG.md), [capability matrix](docs/capability-matrix.md),
 > [enforcement coverage](docs/enforcement-coverage.md), and
-> [0.4.1 release notes](docs/release-notes-0.4.1.md) for current behavior.
+> [0.4.2 release notes](docs/release-notes-0.4.2.md) for current behavior.
 
 > Browsers solved homograph attacks years ago. Terminals haven't. tirith is the browser-equivalent safety net for the terminal.
 

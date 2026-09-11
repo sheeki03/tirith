@@ -1246,7 +1246,7 @@ Disable: `export TIRITH_LOG=0`
 - [Cookbook](docs/cookbook.md), policy examples for common setups
 - [Troubleshooting](docs/troubleshooting.md), shell quirks, latency, false positives
 - [Compatibility](docs/compatibility.md), stable vs experimental surface
-- [0.4.1 release notes](docs/release-notes-0.4.1.md), what the current patch release changes, and the [0.4.0 release notes](docs/release-notes-0.4.0.md) for the 0.4 line's highlights, limitations, and publication contract
+- [0.4.2 release notes](docs/release-notes-0.4.2.md), what the current patch release changes, and the [0.4.0 release notes](docs/release-notes-0.4.0.md) for the 0.4 line's highlights, limitations, and publication contract
 - [Release checklist](docs/release-checklist.md), protected publication sequence and registry verification
 - [Security policy](SECURITY.md), vulnerability reporting
 - [Uninstall](docs/uninstall.md), clean removal per shell and package manager

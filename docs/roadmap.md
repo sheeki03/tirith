@@ -91,6 +91,15 @@ Hermes installs as self-replaceable, and move ThreatDB source pinning onto one
 reviewed manifest with a proposal-only watcher. The
 [0.4.1 release notes](release-notes-0.4.1.md) carry the upgrade guidance.
 
+## Published: 0.4.2
+
+A reliability and performance patch. It fixes NixOS helper resolution, npm
+shell receipt activation, several ordinary-command false positives, ThreatDB
+publication and cache reloads, and misleading update/diagnostic messages.
+Custom-rule compilation, regex retention, recent-log reads, and legacy session
+correlation perform less repeated work. The
+[0.4.2 release notes](release-notes-0.4.2.md) describe the fixes and upgrade steps.
+
 ## Publication contract
 
 A release is cut only from the final default-branch tree after the cross-platform

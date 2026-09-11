@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-11
+
 ### Fixed
 
+- Shell hooks resolve and pin trusted helpers on NixOS and other systems without standard FHS helper paths instead of discarding ordinary commands (#239).
+- `doctor` recognizes mise shims that resolve to the current executable instead of warning that they shadow it (#240).
+- Shell and paste analysis no longer misclassify Go `./...` package patterns, ordinary home-directory paths, or Codex zsh environment snapshots using `[[` and `alias -L` as incomplete analysis (#235, #236, #237).
+- ThreatDB updates quietly use the supported v1 channel when a dual-mode deployment has not published its v2 index. Authentication, integrity, and other server failures still surface (#238).
+- ThreatDB source fetching accepts npm metadata served as `application/octet-stream` only after strict JSON-object and exact package-name validation, preventing a legitimate registry response from stopping publication.
+- ThreatDB provenance compares timestamps as instants, accepting equivalent timezone offsets from Git while retaining canonical UTC provenance and chronological checks.
+- The source-pin watcher isolates write permissions, supports the repository workflow token, finds existing proposal PRs reliably, and rejects stale generated manifest transitions.
 - On Unix, shell initialization binds Bash, zsh, and fish hooks to the running native executable, so npm and other process-spawning launchers no longer prevent strict receipt registration. Other platforms retain shell PATH resolution. The npm launcher also preserves signal termination instead of reporting success.
 - Sourcing `shell/tirith.sh` locates its own directory correctly in Bash and zsh, including installations with spaces or apostrophes in the path.
 - Long-running processes detect ThreatDB replacements within the same second and changes to the selected database path. Reloads retain signature verification and rollback protection.

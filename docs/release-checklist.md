@@ -2,8 +2,8 @@
 
 ## Release sequence
 
-Substitute the release version for `<VERSION>` throughout (for example `0.4.1`,
-tagged `v0.4.1`). The changelog and release notes describe the final tree. The
+Substitute the release version for `<VERSION>` throughout (for example `0.4.2`,
+tagged `v0.4.2`). The changelog and release notes describe the final tree. The
 workspace version stays on the previous release until the integration tree is
 known, then the release commit performs the version and documentation
 transition below:
@@ -189,10 +189,16 @@ serving the new version everywhere.
 
 ## Post-publication verification
 
-- Verify the GitHub Release contains every expected platform archive, Debian
-  and RPM package, installer, checksums, signature, certificate, SBOM, and
-  provenance artifact. Re-run verification against the downloaded public
-  bytes, not the runner workspace.
+- Verify the GitHub Release contains all six platform archives, the Debian
+  and RPM packages, the installer, and the checksum manifest with its detached
+  signature and certificate. Re-run verification against the downloaded public
+  bytes, not the runner workspace. The current pipeline does not publish an
+  SBOM attachment.
+- Verify Debian and RPM build provenance through GitHub's artifact attestation
+  service, binding the downloaded package digest to this repository's
+  `release.yml`, the exact release tag, and its commit. These attestations are
+  stored by GitHub, not attached as release files. npm provenance is published
+  with each registry package and must be checked through that registry.
 - Verify `tirith` and `tirith-core` at `<VERSION>` on crates.io and all six
   exact `<VERSION>` npm packages (the unscoped root `tirith` plus the five
   scoped `@sheeki03/tirith-*` platform packages; a scoped `@sheeki03/tirith` is
