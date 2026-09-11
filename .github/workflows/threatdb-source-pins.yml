@@ -9,9 +9,9 @@ concurrency:
   group: threatdb-source-pin-watcher
   cancel-in-progress: false
 
-# Discovery uses this read-only token. Publishing the reviewed candidate branch
-# requires the separately scoped THREATDB_PIN_PR_TOKEN and happens only after a
-# real fetch and compile. This workflow has no signing key or release permission.
+# Discovery and compilation use a read-only token. Branch publication runs on a
+# fresh runner only after the exact candidate passes a real fetch and compile.
+# Neither job receives the production signing key.
 permissions:
   contents: read
 
@@ -20,6 +20,8 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      changed: ${{ steps.pins.outputs.changed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -88,21 +90,62 @@ jobs:
             --sign-key-env TIRITH_WATCHER_SIGNING_KEY \
             --output "$RUNNER_TEMP/tirith-threatdb-candidate.dat"
 
-      - name: Require the dedicated PR token
+      - name: Stage the validated proposal
         if: steps.pins.outputs.changed == 'true'
         env:
-          PIN_PR_TOKEN: ${{ secrets.THREATDB_PIN_PR_TOKEN }}
+          REPORT: ${{ steps.pins.outputs.report }}
         run: |
-          if [ -z "$PIN_PR_TOKEN" ]; then
-            echo "::error::THREATDB_PIN_PR_TOKEN is required (contents + pull requests for this repository only)"
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pin-candidate"
+          cp .github/threatdb-source-pins.json "$RUNNER_TEMP/pin-candidate/pins.json"
+          cp "$REPORT" "$RUNNER_TEMP/pin-candidate/report.md"
+
+      - name: Upload the validated proposal
+        if: steps.pins.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: threatdb-pin-candidate
+          path: ${{ runner.temp }}/pin-candidate
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: propose
+    if: github.ref == 'refs/heads/main' && needs.propose.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: threatdb-pin-candidate
+          path: ${{ runner.temp }}/pin-candidate
+      - name: Validate and install the proposed pin manifest
+        run: |
+          set -euo pipefail
+          # The rolling publisher may advance main while candidate compilation
+          # runs. Base the PR on its current manifest, but never publish a
+          # proposal validated against superseded code or source pins.
+          git fetch --quiet --no-tags --depth=1 origin main
+          if ! git diff --quiet HEAD origin/main -- . \
+            ':!threatdb-manifest.json' ':!threatdb-index-v2.json'; then
+            echo "::error::main changed beyond generated ThreatDB pointers during validation; run the watcher again"
             exit 1
           fi
+          git switch --detach origin/main
+          python3 .github/scripts/threatdb_source_pins.py validate \
+            "$RUNNER_TEMP/pin-candidate/pins.json"
+          cp "$RUNNER_TEMP/pin-candidate/pins.json" .github/threatdb-source-pins.json
 
       - name: Publish the automation-owned candidate branch
-        if: steps.pins.outputs.changed == 'true'
         id: branch
         env:
-          PIN_PR_TOKEN: ${{ secrets.THREATDB_PIN_PR_TOKEN }}
+          PIN_PR_TOKEN: ${{ secrets.THREATDB_PIN_PR_TOKEN || github.token }}
         run: |
           set -euo pipefail
           branch="automation/threatdb-source-pins"
@@ -131,20 +174,21 @@ jobs:
           echo "name=$branch" >> "$GITHUB_OUTPUT"
 
       - name: Open or refresh the review PR
-        if: steps.pins.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.THREATDB_PIN_PR_TOKEN }}
-          REPORT: ${{ steps.pins.outputs.report }}
+          GH_TOKEN: ${{ secrets.THREATDB_PIN_PR_TOKEN || github.token }}
+          REPORT: ${{ runner.temp }}/pin-candidate/report.md
           SOURCE_BRANCH: ${{ steps.branch.outputs.name }}
         run: |
           set -euo pipefail
-          head="$GITHUB_REPOSITORY_OWNER:$SOURCE_BRANCH"
+          # gh pr list --head accepts a branch name, not owner:branch. Keep the
+          # owner check separate so repeat runs refresh the existing proposal.
           number=$(gh pr list \
             --repo "$GITHUB_REPOSITORY" \
             --state open \
-            --head "$head" \
-            --json number \
-            --jq '.[0].number // empty')
+            --head "$SOURCE_BRANCH" \
+            --json number,headRepositoryOwner | \
+            jq -r --arg owner "$GITHUB_REPOSITORY_OWNER" \
+              'map(select(.headRepositoryOwner.login == $owner)) | .[0].number // empty')
           if [ -z "$number" ]; then
             gh pr create \
               --repo "$GITHUB_REPOSITORY" \
@@ -157,4 +201,12 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --title "chore(threatdb): refresh source pins" \
               --body-file "$REPORT"
+          fi
+
+      - name: Explain review requirements
+        env:
+          CUSTOM_PR_TOKEN: ${{ secrets.THREATDB_PIN_PR_TOKEN }}
+        run: |
+          if [ -z "$CUSTOM_PR_TOKEN" ]; then
+            echo "The proposal was opened with GITHUB_TOKEN. Approve its pending workflow runs before merging. An optional THREATDB_PIN_PR_TOKEN can trigger those runs without manual approval." >> "$GITHUB_STEP_SUMMARY"
           fi

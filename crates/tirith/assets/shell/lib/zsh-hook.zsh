@@ -34,28 +34,34 @@ if [[ -z "$_TIRITH_BIN" || ! -x "$_TIRITH_BIN" ]]; then
 fi
 
 # Protocol-v3 callbacks run after arbitrary commands may have changed PATH.
-# Pin every external helper they use to a fixed system location now, and only
-# advertise receipt support when the complete helper set is available.
-_TIRITH_MKTEMP_BIN=""
-[[ -f /usr/bin/mktemp && -x /usr/bin/mktemp ]] && _TIRITH_MKTEMP_BIN=/usr/bin/mktemp
-[[ -z "$_TIRITH_MKTEMP_BIN" && -f /bin/mktemp && -x /bin/mktemp ]] \
-  && _TIRITH_MKTEMP_BIN=/bin/mktemp
-_TIRITH_RM_BIN=""
-[[ -f /bin/rm && -x /bin/rm ]] && _TIRITH_RM_BIN=/bin/rm
-[[ -z "$_TIRITH_RM_BIN" && -f /usr/bin/rm && -x /usr/bin/rm ]] \
-  && _TIRITH_RM_BIN=/usr/bin/rm
-_TIRITH_WC_BIN=""
-[[ -f /usr/bin/wc && -x /usr/bin/wc ]] && _TIRITH_WC_BIN=/usr/bin/wc
-[[ -z "$_TIRITH_WC_BIN" && -f /bin/wc && -x /bin/wc ]] \
-  && _TIRITH_WC_BIN=/bin/wc
-_TIRITH_ENV_BIN=""
-[[ -f /usr/bin/env && -x /usr/bin/env ]] && _TIRITH_ENV_BIN=/usr/bin/env
-[[ -z "$_TIRITH_ENV_BIN" && -f /bin/env && -x /bin/env ]] \
-  && _TIRITH_ENV_BIN=/bin/env
-_TIRITH_SH_BIN=""
-[[ -f /bin/sh && -x /bin/sh ]] && _TIRITH_SH_BIN=/bin/sh
-[[ -z "$_TIRITH_SH_BIN" && -f /usr/bin/sh && -x /usr/bin/sh ]] \
-  && _TIRITH_SH_BIN=/usr/bin/sh
+# Prefer system helpers, then search the source-time PATH for non-FHS systems
+# (NixOS/Guix). Inspect files directly to ignore stale command hashes, aliases
+# and functions. Relative/empty PATH entries must never become helper pins.
+_tirith_resolve_helper() {
+  local name="$1" candidate directory
+  shift
+  for candidate in "$@"; do
+    if [[ "$candidate" == /* && -f "$candidate" && -x "$candidate" ]]; then
+      builtin print -r -- "$candidate"
+      return 0
+    fi
+  done
+  for directory in "${path[@]}"; do
+    [[ "$directory" == /* ]] || continue
+    candidate="${directory%/}/$name"
+    if [[ -f "$candidate" && -x "$candidate" ]]; then
+      builtin print -r -- "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_TIRITH_MKTEMP_BIN="$(_tirith_resolve_helper mktemp /usr/bin/mktemp /bin/mktemp)" || _TIRITH_MKTEMP_BIN=""
+_TIRITH_RM_BIN="$(_tirith_resolve_helper rm /bin/rm /usr/bin/rm)" || _TIRITH_RM_BIN=""
+_TIRITH_WC_BIN="$(_tirith_resolve_helper wc /usr/bin/wc /bin/wc)" || _TIRITH_WC_BIN=""
+_TIRITH_ENV_BIN="$(_tirith_resolve_helper env /usr/bin/env /bin/env)" || _TIRITH_ENV_BIN=""
+_TIRITH_SH_BIN="$(_tirith_resolve_helper sh /bin/sh /usr/bin/sh)" || _TIRITH_SH_BIN=""
 _TIRITH_V3_HELPERS_READY=1
 for _tirith_helper in "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" \
   "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN"; do
@@ -63,6 +69,17 @@ for _tirith_helper in "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" 
     || _TIRITH_V3_HELPERS_READY=0
 done
 unset _tirith_helper
+
+# Legacy preflight also requires private capture files. If these prerequisites
+# are absent at startup, leave the user's Enter/paste bindings intact instead
+# of installing a hook that discards every command. Runtime capture failures
+# still block: they must not provide a way to bypass an already-active hook.
+if [[ -o interactive && ( -z "$_TIRITH_MKTEMP_BIN" || -z "$_TIRITH_RM_BIN" ) ]]; then
+  builtin print -u2 -r -- "tirith: mktemp or rm unavailable; zsh hooks disabled — install these helpers and restart the shell"
+  TIRITH_STATUS=off
+  unset _TIRITH_ZSH_LOADED
+  return 0
+fi
 
 # One receipt protocol instance per sourced hook. It is deliberately
 # non-exported; only individual Tirith subprocesses receive it. Older binaries

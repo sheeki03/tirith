@@ -4177,7 +4177,7 @@ pub(crate) fn executable_substitution_scan(
     for segment in tokenize::tokenize(scan_input, shell) {
         if shell != ShellType::PowerShell
             && segment.command.as_deref().is_some_and(|command| {
-                !crate::rules::command::command_word_is_statically_bound(command, shell)
+                !crate::rules::command::command_name_is_statically_bound(command, shell)
             })
             && !(shell == ShellType::Posix
                 && segment
@@ -5617,7 +5617,7 @@ pub(crate) fn posix_current_scope_dispatch_scan(
 ) -> Option<ExecutableSubstitutionScan> {
     let leader_raw = segment.command.as_deref()?;
     let leader = Some(leader_raw).and_then(|command| {
-        crate::rules::command::command_word_is_statically_bound(command, ShellType::Posix)
+        crate::rules::command::command_name_is_statically_bound(command, ShellType::Posix)
             .then(|| crate::rules::command::normalize_cmd_base(command, ShellType::Posix))
     })?;
     let reserved_time = leader == "time" && posix_segment_uses_reserved_time(segment);
@@ -5709,7 +5709,7 @@ fn posix_body_calls_parent_alias(
                 if state.aliases.contains_key(&command) || state.unresolved.contains(&command) {
                     return true;
                 }
-            } else if !crate::rules::command::command_word_is_statically_bound(
+            } else if !crate::rules::command::command_name_is_statically_bound(
                 command_raw,
                 ShellType::Posix,
             ) && (!state.aliases.is_empty() || !state.unresolved.is_empty())
@@ -5786,7 +5786,7 @@ fn recover_posix_parent_dispatch_body(
                     recovered = true;
                     continue;
                 }
-            } else if !crate::rules::command::command_word_is_statically_bound(
+            } else if !crate::rules::command::command_name_is_statically_bound(
                 command_raw,
                 ShellType::Posix,
             ) && (!aliases.aliases.is_empty()
@@ -5855,7 +5855,7 @@ fn expand_literal_alias_body(
         };
         let command = if shell == ShellType::Posix {
             let Some(command) = posix_alias_invocation_name(command_raw) else {
-                if crate::rules::command::command_word_is_statically_bound(command_raw, shell) {
+                if crate::rules::command::command_name_is_statically_bound(command_raw, shell) {
                     return Some(body);
                 }
                 record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
@@ -5890,10 +5890,17 @@ fn expand_literal_alias_body(
     None
 }
 
-fn posix_alias_builtin_operands(args: &[String], unalias: bool) -> Result<(Vec<String>, bool), ()> {
+struct PosixAliasOperands {
+    operands: Vec<String>,
+    clear_all: bool,
+    listing_only: bool,
+}
+
+fn posix_alias_builtin_operands(args: &[String], unalias: bool) -> Result<PosixAliasOperands, ()> {
     let mut operands = Vec::new();
     let mut options = true;
     let mut clear_all = false;
+    let mut listing_only = false;
     for raw in args {
         let word = static_wrapper_word(raw, ShellType::Posix).ok_or(())?;
         if options {
@@ -5902,10 +5909,11 @@ fn posix_alias_builtin_operands(args: &[String], unalias: bool) -> Result<(Vec<S
                 continue;
             }
             if let Some(cluster) = word.strip_prefix('-').filter(|cluster| !cluster.is_empty()) {
-                if (!unalias && cluster.chars().all(|option| option == 'p'))
+                if (!unalias && cluster.chars().all(|option| matches!(option, 'p' | 'L')))
                     || (unalias && cluster.chars().all(|option| option == 'a'))
                 {
                     clear_all |= unalias;
+                    listing_only |= !unalias;
                     continue;
                 }
             }
@@ -5916,7 +5924,11 @@ fn posix_alias_builtin_operands(args: &[String], unalias: bool) -> Result<(Vec<S
         }
         operands.push(word);
     }
-    Ok((operands, clear_all))
+    Ok(PosixAliasOperands {
+        operands,
+        clear_all,
+        listing_only,
+    })
 }
 
 fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
@@ -6276,7 +6288,11 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
             }
             let alias_operands = if shell == ShellType::Posix {
                 match posix_alias_builtin_operands(alias_args, false) {
-                    Ok((operands, _)) => operands,
+                    // Bash `-p` and Zsh `-L` only print aliases, even when an
+                    // operand contains `=`. Never let a listing overwrite a
+                    // previously tracked executable alias body.
+                    Ok(parsed) if parsed.listing_only => continue,
+                    Ok(parsed) => parsed.operands,
                     Err(()) => {
                         record_shell_execution_gap(
                             scan,
@@ -6334,7 +6350,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
                 continue;
             }
             let (names, clear_all) = match posix_alias_builtin_operands(alias_args, true) {
-                Ok(parsed) => parsed,
+                Ok(parsed) => (parsed.operands, parsed.clear_all),
                 Err(()) => {
                     record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
                     continue;
@@ -6377,7 +6393,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
             (command_raw == command).then(|| command.clone())
         };
         let Some(alias_command) = alias_command else {
-            if !crate::rules::command::command_word_is_statically_bound(command_raw, shell) {
+            if !crate::rules::command::command_name_is_statically_bound(command_raw, shell) {
                 record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
             }
             continue;
@@ -6440,7 +6456,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
                 };
                 literal_rewrites.push((range, command_raw.to_string(), input));
             }
-        } else if !crate::rules::command::command_word_is_statically_bound(command_raw, shell) {
+        } else if !crate::rules::command::command_name_is_statically_bound(command_raw, shell) {
             // A glob/brace/tilde-shaped command is deterministic only when an
             // exact alias expansion happens before those later shell phases.
             record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
@@ -12460,6 +12476,17 @@ fn parse_schemeless_destination_inner(s: &str, apply_noise_heuristic: bool) -> O
     {
         return None;
     }
+    // In generic command argv, explicitly relative/home paths (including Go's
+    // `./...` package pattern) are filesystem operands. The stricter parser for
+    // proven network positions keeps the client's interpretation unchanged.
+    if apply_noise_heuristic
+        && (matches!(raw, "." | "..")
+            || raw.starts_with("./")
+            || raw.starts_with("../")
+            || raw.starts_with("~/"))
+    {
+        return None;
+    }
 
     let candidate = if raw.starts_with("//") {
         format!("http:{raw}")
@@ -13589,6 +13616,27 @@ mod tests {
                 .iter()
                 .all(|url| url.raw != "archive.zip")
         );
+    }
+
+    #[test]
+    fn schemeless_local_paths_are_only_filtered_in_generic_argv() {
+        for input in ["./...", "../...", "./pkg/...", "~/.local/lib/python3.11"] {
+            assert!(parse_schemeless_destination(input).is_none(), "{input}");
+        }
+        // When the client's grammar proves this is a URL operand, retain its
+        // host interpretation so network policy cannot be bypassed by `./`.
+        assert_eq!(
+            parse_schemeless_network_destination("./...")
+                .and_then(|url| url.host().map(str::to_owned)),
+            Some(".".to_string())
+        );
+        for input in [
+            "evil.example/payload",
+            "//evil.example/payload",
+            "evil.zip/payload",
+        ] {
+            assert!(parse_schemeless_destination(input).is_some(), "{input}");
+        }
     }
 
     #[test]

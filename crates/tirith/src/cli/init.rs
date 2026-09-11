@@ -47,9 +47,9 @@ fn check_path_shadow() -> Option<String> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
     Some(format!(
-        "tirith: WARNING: '{}' shadows this binary ({})\n\
+        "tirith: WARNING: '{}' may shadow this binary ({})\n\
          tirith: This may be a different package (e.g. pip-installed).\n\
-         tirith: Run '{}' to inspect, and remove the conflicting binary.",
+         tirith: Run '{}' to inspect these installations before removing anything.",
         shadows[0],
         our_exe,
         super::tirith_path_lookup_command(),

@@ -366,9 +366,9 @@ enum UpdateOutcome {
     Installed,
     /// The installed DB is already current; nothing was written.
     AlreadyCurrent,
-    /// The v2-index path found no compatible asset and declined cleanly, so the
-    /// caller should fall back to the legacy manifest. (Never returned by the
-    /// legacy path itself.)
+    /// The optional v2 channel is unpublished or has no compatible asset, so
+    /// the caller should use the legacy manifest. Never returned by the legacy
+    /// path itself.
     NoCompatibleAsset,
 }
 
@@ -380,8 +380,7 @@ enum UpdateOutcome {
 fn do_update(force: bool) -> Result<(), String> {
     let outcome = match try_v2_index_update(force) {
         Ok(UpdateOutcome::NoCompatibleAsset) => {
-            // The index was valid but offered no compatible asset: fall back to
-            // the legacy manifest (v1).
+            // The optional index is unpublished or offers no compatible asset.
             do_update_legacy(force)?
         }
         Ok(other) => other,
@@ -424,15 +423,19 @@ where
 /// Attempt the v2-index update path. Returns:
 /// - `Ok(Installed)`: a compatible asset was fetched, verified, and installed;
 /// - `Ok(AlreadyCurrent)`: the selected asset is already the installed version;
-/// - `Ok(NoCompatibleAsset)`: the index was valid but offered no compatible
-///   asset, so the caller should fall back to the legacy manifest;
+/// - `Ok(NoCompatibleAsset)`: both index URLs returned 404, or a valid index
+///   offered no compatible asset; use the legacy manifest;
 /// - `Err(_)`: the index could not be fetched / verified / parsed, also a
 ///   fall-back trigger (the caller logs and continues to legacy).
 fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
     // `fetch_index_v2` returns only a signature- and schema-validated candidate;
     // an invalid primary has already caused the independently published release
     // candidate to be tried.
-    let index = fetch_index_v2()?;
+    let Some(index) = fetch_index_v2()? else {
+        // Both discovery surfaces returned 404: the optional v2 channel has
+        // not been published (or was retired). This is an expected v1 state.
+        return Ok(UpdateOutcome::NoCompatibleAsset);
+    };
 
     let current_tirith_version = env!("CARGO_PKG_VERSION");
     let asset = match index.select_asset(current_tirith_version) {
@@ -1680,7 +1683,8 @@ fn download_url(url: &str, declared_size: u64) -> Result<Vec<u8>, String> {
 /// then the independently published release-asset fallback. A candidate is not
 /// selected merely because its JSON parsed: signature, signed schema version,
 /// and generation shape all have to validate first.
-fn fetch_index_v2() -> Result<IndexV2, String> {
+/// `Ok(None)` means both discovery surfaces returned HTTP 404.
+fn fetch_index_v2() -> Result<Option<IndexV2>, String> {
     let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
         .map_err(|error| format!("invalid embedded public key: {error}"))?;
     fetch_index_v2_with(fetch_index_v2_from, &verify_key)
@@ -1690,27 +1694,29 @@ fn fetch_verified_index_candidate<F>(
     fetch: &mut F,
     url: &str,
     verify_key: &VerifyingKey,
-) -> Result<IndexV2, String>
+) -> Result<Option<IndexV2>, String>
 where
-    F: FnMut(&str) -> Result<IndexV2, String>,
+    F: FnMut(&str) -> Result<Option<IndexV2>, String>,
 {
-    let index = fetch(url)?;
+    let Some(index) = fetch(url)? else {
+        return Ok(None);
+    };
     index.verify_signature_with_key(verify_key)?;
-    Ok(index)
+    Ok(Some(index))
 }
 
 /// Candidate-selection core, split from HTTP so the primary-invalid/fallback-
 /// valid security boundary is directly regression-testable with signed fixtures.
-fn fetch_index_v2_with<F>(mut fetch: F, verify_key: &VerifyingKey) -> Result<IndexV2, String>
+fn fetch_index_v2_with<F>(mut fetch: F, verify_key: &VerifyingKey) -> Result<Option<IndexV2>, String>
 where
-    F: FnMut(&str) -> Result<IndexV2, String>,
+    F: FnMut(&str) -> Result<Option<IndexV2>, String>,
 {
     let primary = fetch_verified_index_candidate(&mut fetch, INDEX_V2_URL_PRIMARY, verify_key);
     let fallback = fetch_verified_index_candidate(&mut fetch, INDEX_V2_URL_FALLBACK, verify_key);
     match (primary, fallback) {
-        (Ok(primary), Ok(fallback)) => match primary.sequence.cmp(&fallback.sequence) {
-            std::cmp::Ordering::Greater => Ok(primary),
-            std::cmp::Ordering::Less => Ok(fallback),
+        (Ok(Some(primary)), Ok(Some(fallback))) => match primary.sequence.cmp(&fallback.sequence) {
+            std::cmp::Ordering::Greater => Ok(Some(primary)),
+            std::cmp::Ordering::Less => Ok(Some(fallback)),
             std::cmp::Ordering::Equal => {
                 if primary.canonical_payload() != fallback.canonical_payload() {
                     return Err(format!(
@@ -1718,21 +1724,29 @@ where
                         primary.sequence
                     ));
                 }
-                Ok(primary)
+                Ok(Some(primary))
             }
         },
-        (Ok(primary), Err(fallback_err)) => {
+        (Ok(Some(primary)), Err(fallback_err)) => {
             eprintln!(
                 "tirith: v2 index fallback unavailable or invalid ({fallback_err}); using verified primary"
             );
-            Ok(primary)
+            Ok(Some(primary))
         }
-        (Err(primary_err), Ok(fallback)) => {
+        (Err(primary_err), Ok(Some(fallback))) => {
             eprintln!(
                 "tirith: v2 index primary unavailable or invalid ({primary_err}); using verified fallback"
             );
-            Ok(fallback)
+            Ok(Some(fallback))
         }
+        (Ok(primary), Ok(None)) => Ok(primary),
+        (Ok(None), Ok(fallback)) => Ok(fallback),
+        (Err(error), Ok(None)) => Err(format!(
+            "v2 index fetch/verification failed: primary: {error}; fallback: HTTP 404 Not Found"
+        )),
+        (Ok(None), Err(error)) => Err(format!(
+            "v2 index fetch/verification failed: primary: HTTP 404 Not Found; fallback: {error}"
+        )),
         (Err(primary_err), Err(fallback_err)) => Err(format!(
             "v2 index fetch/verification failed: primary: {primary_err}; fallback: {fallback_err}"
         )),
@@ -1741,7 +1755,7 @@ where
 
 /// Fetch and parse a v2 index from one URL (no ETag cache: the index is small
 /// and fetched at most once per update). Size-bounded to [`MAX_MANIFEST_SIZE`].
-fn fetch_index_v2_from(url: &str) -> Result<IndexV2, String> {
+fn fetch_index_v2_from(url: &str) -> Result<Option<IndexV2>, String> {
     validate_remote_url(url, "threat DB index")?;
     let client = guarded_http_client(MANIFEST_TIMEOUT_SECS)?;
     let resp = client
@@ -1752,6 +1766,9 @@ fn fetch_index_v2_from(url: &str) -> Result<IndexV2, String> {
         )
         .send()
         .map_err(|e| format!("v2 index fetch failed: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !resp.status().is_success() {
         return Err(format!("v2 index HTTP {}", resp.status()));
     }
@@ -1765,7 +1782,9 @@ fn fetch_index_v2_from(url: &str) -> Result<IndexV2, String> {
     let body_bytes = read_bounded_bytes(resp, "v2-index", None, MAX_MANIFEST_SIZE)?;
     let body = String::from_utf8(body_bytes)
         .map_err(|e| format!("v2 index body is not valid UTF-8: {e}"))?;
-    serde_json::from_str::<IndexV2>(&body).map_err(|e| format!("invalid v2 index JSON: {e}"))
+    serde_json::from_str::<IndexV2>(&body)
+        .map(Some)
+        .map_err(|e| format!("invalid v2 index JSON: {e}"))
 }
 
 /// Durable atomic write: write and sync a temp file in the same directory,
@@ -3484,16 +3503,17 @@ mod tests {
         let selected = fetch_index_v2_with(
             |url| {
                 if url == INDEX_V2_URL_PRIMARY {
-                    Ok(primary.clone())
+                    Ok(Some(primary.clone()))
                 } else if url == INDEX_V2_URL_FALLBACK {
-                    Ok(fallback.clone())
+                    Ok(Some(fallback.clone()))
                 } else {
                     Err(format!("unexpected URL: {url}"))
                 }
             },
             &key.verifying_key(),
         )
-        .expect("a valid release index must survive an invalid primary");
+        .expect("a valid release index must survive an invalid primary")
+        .expect("a verified index is present");
         assert_eq!(selected.sequence, 9);
         assert!(selected
             .verify_signature_with_key(&key.verifying_key())
@@ -3508,14 +3528,15 @@ mod tests {
         let selected = fetch_index_v2_with(
             |url| {
                 if url == INDEX_V2_URL_PRIMARY {
-                    Ok(primary.clone())
+                    Ok(Some(primary.clone()))
                 } else {
-                    Ok(fallback.clone())
+                    Ok(Some(fallback.clone()))
                 }
             },
             &key.verifying_key(),
         )
-        .expect("a replayed older primary must not outrank the release pointer");
+        .expect("a replayed older primary must not outrank the release pointer")
+        .expect("a verified index is present");
         assert_eq!(selected.sequence, 9);
     }
 
@@ -3530,15 +3551,81 @@ mod tests {
         let error = fetch_index_v2_with(
             |url| {
                 if url == INDEX_V2_URL_PRIMARY {
-                    Ok(primary.clone())
+                    Ok(Some(primary.clone()))
                 } else {
-                    Ok(fallback.clone())
+                    Ok(Some(fallback.clone()))
                 }
             },
             &key.verifying_key(),
         )
         .expect_err("one sequence cannot identify two signed generations");
         assert!(error.contains("equivocation"), "{error}");
+    }
+
+    #[test]
+    fn unpublished_v2_channel_is_a_clean_fallback() {
+        let key = SigningKey::from_bytes(&[16u8; 32]);
+        let mut requests = Vec::new();
+        let index = fetch_index_v2_with(
+            |url| {
+                requests.push(url.to_string());
+                Ok(None)
+            },
+            &key.verifying_key(),
+        )
+        .unwrap();
+        assert!(index.is_none());
+        assert_eq!(requests, [INDEX_V2_URL_PRIMARY, INDEX_V2_URL_FALLBACK]);
+    }
+
+    #[test]
+    fn missing_v2_surface_does_not_hide_integrity_or_transport_errors() {
+        let key = SigningKey::from_bytes(&[17u8; 32]);
+        let mut tampered = signed_index_v2(9, vec![asset(1, None), asset(2, None)], &key);
+        tampered.sequence += 1;
+        for missing_primary in [false, true] {
+            for invalid_signature in [false, true] {
+                let error = fetch_index_v2_with(
+                    |url| {
+                        if (url == INDEX_V2_URL_PRIMARY) == missing_primary {
+                            Ok(None)
+                        } else if invalid_signature {
+                            Ok(Some(tampered.clone()))
+                        } else {
+                            Err("v2 index HTTP 503 Service Unavailable".to_string())
+                        }
+                    },
+                    &key.verifying_key(),
+                )
+                .unwrap_err();
+                assert!(error.contains("404"), "{error}");
+                assert!(
+                    error.contains(if invalid_signature { "signature" } else { "503" }),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_verified_v2_surface_survives_an_unpublished_peer() {
+        let key = SigningKey::from_bytes(&[18u8; 32]);
+        let valid = signed_index_v2(9, vec![asset(1, None), asset(2, None)], &key);
+        for missing_primary in [false, true] {
+            let selected = fetch_index_v2_with(
+                |url| {
+                    if (url == INDEX_V2_URL_PRIMARY) == missing_primary {
+                        Ok(None)
+                    } else {
+                        Ok(Some(valid.clone()))
+                    }
+                },
+                &key.verifying_key(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(selected.sequence, 9);
+        }
     }
 
     #[test]

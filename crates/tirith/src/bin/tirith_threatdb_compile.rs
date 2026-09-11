@@ -210,11 +210,12 @@ const MAX_BOUNDED_PACKAGE_REQUESTS: usize = 2_000;
 const REGISTRY_FETCH_CONCURRENCY: usize = 8;
 // npm's abbreviated metadata keeps every `versions` key while dropping READMEs
 // and per-version manifests (@solana/web3.js: 11,975,695 -> 4,688,592 bytes).
-// PyPI has no abbreviated representation. The requested media type is recorded
+// PyPI has no abbreviated representation. The served media type is recorded
 // per package in the snapshot and verified on load, so the reviewed response
 // shape is part of the provenance rather than an ambient client default.
 const NPM_REGISTRY_MEDIA_TYPE: &str = "application/vnd.npm.install-v1+json";
 const JSON_MEDIA_TYPE: &str = "application/json";
+const NPM_REGISTRY_BINARY_MEDIA_TYPE: &str = "application/octet-stream";
 const PYPI_REGISTRY_MEDIA_TYPE: &str = JSON_MEDIA_TYPE;
 const REGISTRY_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 // The largest reviewed response was @solana/web3.js at 11,975,695 bytes as a
@@ -3947,8 +3948,7 @@ fn registry_metadata_url(key: &RegistryPackageKey) -> FeedResult<url::Url> {
 }
 
 /// The exact `Accept` value sent for one ecosystem's metadata request. It is
-/// recorded in the snapshot and verified on load so the reviewed response
-/// shape is bound into provenance.
+/// independent of the served Content-Type recorded in the snapshot.
 fn registry_media_type(ecosystem: Ecosystem) -> FeedResult<&'static str> {
     match ecosystem {
         Ecosystem::Npm => Ok(NPM_REGISTRY_MEDIA_TYPE),
@@ -4059,6 +4059,21 @@ fn parse_registry_document(key: &RegistryPackageKey, bytes: &[u8]) -> FeedResult
     let document = document
         .as_object()
         .ok_or_else(|| format!("registry response for {} is not a JSON object", key.name))?;
+    // Bind a positive version list to the requested package as well as its
+    // registry URL. In particular, npm's occasional octet-stream metadata
+    // response must still be a recognizable packument for this package.
+    let name = match key.ecosystem {
+        Ecosystem::Npm => document.get("name"),
+        Ecosystem::PyPI => document.get("info").and_then(|info| info.get("name")),
+        _ => None,
+    }
+    .and_then(serde_json::Value::as_str);
+    if !name.is_some_and(|name| canonical_package_name(key.ecosystem, name) == key.name) {
+        return Err(format!(
+            "registry response for {} has missing or mismatched package identity",
+            key.name
+        ));
+    }
     let Some(value) = document.get(field) else {
         if key.ecosystem == Ecosystem::Npm && npm_unpublished_stub_is_authentic(key, document) {
             return Ok(RegistryDocument::NpmUnpublishedStub);
@@ -4116,7 +4131,9 @@ fn registry_not_found_body_is_authentic(ecosystem: Ecosystem, bytes: &[u8]) -> b
 /// recorded value is what the registry actually served (the Content-Type
 /// essence), which is what the hashed bytes are, not what was requested. npm
 /// may ignore `Accept` and serve the full document; both shapes parse and the
-/// per-response byte cap still bounds them.
+/// per-response byte cap still bounds them. Some npm edges label HTTP 200
+/// metadata as octet-stream; it is accepted only for npm, with the same JSON
+/// shape and package identity validation as a JSON-labelled response.
 fn registry_media_type_is_allowed(
     ecosystem: Ecosystem,
     http_status: u16,
@@ -4124,7 +4141,9 @@ fn registry_media_type_is_allowed(
 ) -> bool {
     match (ecosystem, http_status) {
         (Ecosystem::Npm, 200) => {
-            media_type == NPM_REGISTRY_MEDIA_TYPE || media_type == JSON_MEDIA_TYPE
+            media_type == NPM_REGISTRY_MEDIA_TYPE
+                || media_type == JSON_MEDIA_TYPE
+                || media_type == NPM_REGISTRY_BINARY_MEDIA_TYPE
         }
         (Ecosystem::Npm, 404) | (Ecosystem::PyPI, 200) | (Ecosystem::PyPI, 404) => {
             media_type == JSON_MEDIA_TYPE
@@ -4191,6 +4210,15 @@ fn fetch_registry_snapshot_package(
     let accept = registry_media_type(key.ecosystem)?;
     let (http_status, media_type, bytes) =
         fetch_registry_document(client, &url, accept, &key.name)?;
+    registry_snapshot_package_from_response(key, http_status, media_type, &bytes)
+}
+
+fn registry_snapshot_package_from_response(
+    key: &RegistryPackageKey,
+    http_status: u16,
+    media_type: String,
+    bytes: &[u8],
+) -> FeedResult<RegistrySnapshotPackage> {
     if !registry_media_type_is_allowed(key.ecosystem, http_status, &media_type) {
         return Err(format!(
             "registry response for {} has unexpected media type {media_type:?} for HTTP {http_status}",
@@ -4198,7 +4226,7 @@ fn fetch_registry_snapshot_package(
         ));
     }
     let (resolution, versions) = if http_status == 404 {
-        if !registry_not_found_body_is_authentic(key.ecosystem, &bytes) {
+        if !registry_not_found_body_is_authentic(key.ecosystem, bytes) {
             return Err(format!(
                 "registry 404 for {} does not carry the registry's own not-found document",
                 key.name
@@ -4206,7 +4234,7 @@ fn fetch_registry_snapshot_package(
         }
         (RegistrySnapshotResolution::PackageNotFound, Vec::new())
     } else {
-        match parse_registry_document(key, &bytes)? {
+        match parse_registry_document(key, bytes)? {
             RegistryDocument::Versions(versions) => {
                 (RegistrySnapshotResolution::RegistryVersions, versions)
             }
@@ -4218,11 +4246,11 @@ fn fetch_registry_snapshot_package(
     Ok(RegistrySnapshotPackage {
         ecosystem: key.ecosystem.to_string(),
         name: key.name.clone(),
-        source_url: url.to_string(),
+        source_url: registry_metadata_url(key)?.to_string(),
         media_type,
         http_status,
         resolution,
-        response_sha256: format!("{:x}", Sha256::digest(&bytes)),
+        response_sha256: format!("{:x}", Sha256::digest(bytes)),
         response_bytes: bytes.len(),
         versions,
     })
@@ -5985,7 +6013,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_snapshot_binds_the_requested_media_type_and_schema() {
+    fn registry_snapshot_binds_the_served_media_type_and_schema() {
         let directory = tempfile::tempdir().unwrap();
         let snapshot_path = directory.path().join("registry-versions.json");
         let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
@@ -5996,6 +6024,12 @@ mod tests {
 
         // npm may ignore Accept and serve the full document: still valid.
         document["packages"][0]["media_type"] = serde_json::json!(JSON_MEDIA_TYPE);
+        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        RegistrySnapshotStore::load(&snapshot_path, &binding).unwrap();
+
+        // npm edges may serve validated JSON bytes with an octet-stream label.
+        document["packages"][0]["media_type"] = serde_json::json!(NPM_REGISTRY_BINARY_MEDIA_TYPE);
         std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
         let binding = fixture_snapshot_binding(&snapshot_path);
         RegistrySnapshotStore::load(&snapshot_path, &binding).unwrap();
@@ -6346,7 +6380,11 @@ mod tests {
             RegistryDocument::NpmUnpublishedStub
         );
         assert_eq!(
-            parse_registry_document(&key, br#"{"versions":{"1.0.0":{},"0.9.0":{}}}"#).unwrap(),
+            parse_registry_document(
+                &key,
+                br#"{"name":"ab-test-wordpress","versions":{"1.0.0":{},"0.9.0":{}}}"#
+            )
+            .unwrap(),
             RegistryDocument::Versions(vec!["0.9.0".to_string(), "1.0.0".to_string()])
         );
         // Everything else must fail closed rather than be read as "no versions".
@@ -6357,6 +6395,8 @@ mod tests {
             br#"{"name":"ab-test-wordpress","modified":"2025-10-10T10:44:23.849Z","error":"internal error"}"#,
             br#"{"name":"ab-test-wordpress","modified":"not-a-timestamp"}"#,
             br#"{"name":"some-other-package","modified":"2025-10-10T10:44:23.849Z"}"#,
+            br#"{"name":"some-other-package","versions":{"1.0.0":{}}}"#,
+            br#"{"versions":{"1.0.0":{}}}"#,
             br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"modified":"2025-10-10T10:44:23.849Z","unpublished":{"time":"2025-10-10T10:44:23.849Z","versions":["1.18.3"]}}}"#,
             br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"modified":"2025-10-10T10:44:23.849Z","unpublished":{"time":"2025-10-10T10:45:23.849Z","versions":["1.18.3"]}},"_rev":"2-b9dd1da47486cec5bb948497a8f1ba6d"}"#,
             br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"modified":"2025-10-10T10:44:23.849Z","unpublished":{"time":"2025-10-10T10:44:23.849Z","versions":[]}},"_rev":"2-b9dd1da47486cec5bb948497a8f1ba6d"}"#,
@@ -6378,9 +6418,18 @@ mod tests {
         };
         assert!(parse_registry_document(&pypi, br#"{"name":"ab-test-wordpress"}"#).is_err());
         assert_eq!(
-            parse_registry_document(&pypi, br#"{"releases":{"1.0":{}}}"#).unwrap(),
+            parse_registry_document(
+                &pypi,
+                br#"{"info":{"name":"Ab_Test.Wordpress"},"releases":{"1.0":{}}}"#
+            )
+            .unwrap(),
             RegistryDocument::Versions(vec!["1.0".to_string()])
         );
+        assert!(parse_registry_document(
+            &pypi,
+            br#"{"info":{"name":"another-package"},"releases":{"1.0":{}}}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -6421,6 +6470,22 @@ mod tests {
             200,
             JSON_MEDIA_TYPE
         ));
+        assert!(registry_media_type_is_allowed(
+            Ecosystem::Npm,
+            200,
+            NPM_REGISTRY_BINARY_MEDIA_TYPE
+        ));
+        for (ecosystem, status) in [
+            (Ecosystem::Npm, 404),
+            (Ecosystem::PyPI, 200),
+            (Ecosystem::PyPI, 404),
+        ] {
+            assert!(!registry_media_type_is_allowed(
+                ecosystem,
+                status,
+                NPM_REGISTRY_BINARY_MEDIA_TYPE
+            ));
+        }
         assert!(registry_media_type_is_allowed(
             Ecosystem::Npm,
             404,
@@ -6510,6 +6575,81 @@ mod tests {
         let error =
             fetch_registry_document(&client, &url, NPM_REGISTRY_MEDIA_TYPE, "broken").unwrap_err();
         assert!(error.contains("returned 503"), "{error}");
+    }
+
+    #[test]
+    fn registry_octet_stream_metadata_requires_valid_json_for_the_requested_package() {
+        let key = RegistryPackageKey {
+            ecosystem: Ecosystem::Npm,
+            name: "web3-plugin-swisstronik".to_string(),
+        };
+        let body = br#"{"name":"web3-plugin-swisstronik","versions":{"0.0.1-security":{}}}"#;
+        let mut server = mockito::Server::new();
+        let served = server
+            .mock("GET", "/web3-plugin-swisstronik")
+            .match_header("accept", NPM_REGISTRY_MEDIA_TYPE)
+            .with_status(200)
+            .with_header("content-type", "Application/Octet-Stream; charset=utf-8")
+            .with_body(body)
+            .create();
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let url = url::Url::parse(&format!("{}/{}", server.url(), key.name)).unwrap();
+        let (status, media_type, bytes) =
+            fetch_registry_document(&client, &url, NPM_REGISTRY_MEDIA_TYPE, &key.name).unwrap();
+        served.assert();
+        let snapshot =
+            registry_snapshot_package_from_response(&key, status, media_type, &bytes).unwrap();
+        assert_eq!(snapshot.media_type, NPM_REGISTRY_BINARY_MEDIA_TYPE);
+        assert_eq!(snapshot.response_sha256, sha256_hex(body));
+        assert_eq!(snapshot.response_bytes, body.len());
+        assert_eq!(snapshot.versions, ["0.0.1-security"]);
+        assert!(matches!(
+            snapshot.resolution,
+            RegistrySnapshotResolution::RegistryVersions
+        ));
+
+        for body in [
+            br#"<html>temporary registry outage</html>"#.as_slice(),
+            b"\x1f\x8b\x08\x00",
+            br#"{"error":"Not found"}"#,
+            br#"{"name":"another-package","versions":{"0.0.1-security":{}}}"#,
+            br#"{"versions":{"0.0.1-security":{}}}"#,
+            br#"{"name":"web3-plugin-swisstronik","versions":{}}"#,
+            br#"{"name":"web3-plugin-swisstronik","versions":[]}"#,
+        ] {
+            assert!(
+                registry_snapshot_package_from_response(
+                    &key,
+                    200,
+                    NPM_REGISTRY_BINARY_MEDIA_TYPE.to_string(),
+                    body,
+                )
+                .is_err(),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert!(registry_snapshot_package_from_response(
+            &key,
+            404,
+            NPM_REGISTRY_BINARY_MEDIA_TYPE.to_string(),
+            br#"{"error":"Not found"}"#,
+        )
+        .is_err());
+
+        let _oversized = server
+            .mock("GET", "/oversized")
+            .with_status(200)
+            .with_header("content-type", NPM_REGISTRY_BINARY_MEDIA_TYPE)
+            .with_body(vec![b' '; MAX_REGISTRY_RESPONSE_BYTES + 1])
+            .create();
+        let url = url::Url::parse(&format!("{}/oversized", server.url())).unwrap();
+        let error =
+            fetch_registry_document(&client, &url, NPM_REGISTRY_MEDIA_TYPE, &key.name).unwrap_err();
+        assert!(error.contains("exceeds byte cap"), "{error}");
     }
 
     #[test]

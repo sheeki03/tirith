@@ -423,9 +423,11 @@ packages = document.get("packages")
 assert isinstance(packages, list) and len(packages) <= 2000
 # The recorded media type is what the registry served (Content-Type essence).
 # npm serves the abbreviated form for 200s but may ignore Accept and serve the
-# full document; a 404 and everything from PyPI is plain application/json.
+# full document or label valid JSON metadata application/octet-stream. The
+# compiler validates the body and package identity before emitting an entry.
+# A 404 and everything from PyPI is plain application/json.
 allowed_media_types = {
-    ("npm", 200): {"application/vnd.npm.install-v1+json", "application/json"},
+    ("npm", 200): {"application/vnd.npm.install-v1+json", "application/json", "application/octet-stream"},
     ("npm", 404): {"application/json"},
     ("pypi", 200): {"application/json"},
     ("pypi", 404): {"application/json"},

@@ -1888,21 +1888,66 @@ fn resolve_tirith_on_path_from(path: &std::ffi::OsStr) -> Vec<std::path::PathBuf
     tirith_core::path_audit::which_all_os("tirith", path)
 }
 
+/// mise (formerly rtx) shims are symlinks to the manager executable, not to
+/// tirith. Recognize that launcher only when it sits in the same data root's
+/// `shims` directory as our managed `installs` tree. The data-root name is
+/// deliberately unrestricted for custom MISE_DATA_DIR/RTX_DATA_DIR locations.
+/// Never execute the launcher, or ignore arbitrary programs named mise/rtx.
+#[cfg(unix)]
+fn is_mise_shim_for_install(
+    path: &std::path::Path,
+    target: &std::path::Path,
+    current_exe: &std::path::Path,
+) -> bool {
+    if !matches!(
+        target.file_name().and_then(|name| name.to_str()),
+        Some("mise" | "rtx")
+    ) || !std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Some(shims) = path.parent().and_then(|parent| parent.canonicalize().ok()) else {
+        return false;
+    };
+    if shims.file_name() != Some(std::ffi::OsStr::new("shims")) {
+        return false;
+    }
+    let Some(installs) = shims
+        .parent()
+        .and_then(|root| root.join("installs").canonicalize().ok())
+    else {
+        return false;
+    };
+    current_exe.starts_with(installs)
+}
+
 /// Find `tirith` executables on PATH that aren't the current binary, deduped by
 /// logical target path so duplicate PATH entries and shim aliases don't repeat.
 pub fn find_shadow_binaries() -> Vec<String> {
     let our_canonical = std::env::current_exe()
         .ok()
         .and_then(|p| resolve_effective_tirith_target(&p));
+    find_shadow_binaries_in(resolve_tirith_on_path(), our_canonical.as_deref())
+}
 
+fn find_shadow_binaries_in(
+    paths: Vec<std::path::PathBuf>,
+    our_canonical: Option<&std::path::Path>,
+) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut shadows = Vec::new();
 
-    for path in resolve_tirith_on_path() {
+    for path in paths {
         let canonical = resolve_effective_tirith_target(&path);
-        // Skip if it resolves to our own binary.
-        if let (Some(ours), Some(ref theirs)) = (&our_canonical, &canonical) {
+        // Skip if it resolves to our own binary or its managed launcher.
+        if let (Some(ours), Some(theirs)) = (our_canonical, canonical.as_deref()) {
             if ours == theirs {
+                continue;
+            }
+            #[cfg(unix)]
+            if is_mise_shim_for_install(&path, theirs, ours) {
                 continue;
             }
         }
@@ -2243,6 +2288,99 @@ mod tests {
             resolve_shim_target(&shim).unwrap().canonicalize().unwrap(),
             real.canonicalize().unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    mod mise_shim_tests {
+        use super::super::find_shadow_binaries_in;
+        use std::fs;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::path::{Path, PathBuf};
+
+        fn file(path: &Path) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"test executable").unwrap();
+        }
+
+        fn layout(root: &Path, manager: &str) -> (PathBuf, PathBuf) {
+            let current = root.join("custom-data/installs/github-sheeki03-tirith/0.4.1/tirith");
+            file(&current);
+            let launcher = root.join("bin").join(manager);
+            // If shadow detection ever executes this PATH-selected launcher,
+            // the sentinel makes that regression observable.
+            file(&launcher);
+            fs::write(
+                &launcher,
+                format!(
+                    "#!/bin/sh\nprintf BAD > '{}'\n",
+                    root.join("executed").display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+            let shim = root.join("custom-data/shims/tirith");
+            fs::create_dir_all(shim.parent().unwrap()).unwrap();
+            symlink(&launcher, &shim).unwrap();
+            (shim, current.canonicalize().unwrap())
+        }
+
+        #[test]
+        fn same_mise_and_rtx_data_roots_are_not_conflicting_installs() {
+            for manager in ["mise", "rtx"] {
+                let root = tempfile::tempdir().unwrap();
+                let (shim, current) = layout(root.path(), manager);
+                assert!(find_shadow_binaries_in(
+                    vec![current.clone(), shim.clone(), shim],
+                    Some(&current)
+                )
+                .is_empty());
+                assert!(!root.path().join("executed").exists());
+            }
+        }
+
+        #[test]
+        fn unrelated_mise_launchers_and_real_conflicts_still_warn_once() {
+            let root = tempfile::tempdir().unwrap();
+            let (shim, current) = layout(root.path(), "mise");
+            let unrelated = root.path().join("other-data/installs/tirith/0.4.1/tirith");
+            file(&unrelated);
+            let unrelated = unrelated.canonicalize().unwrap();
+            assert_eq!(
+                find_shadow_binaries_in(vec![shim.clone(), shim.clone()], Some(&unrelated)),
+                vec![shim.display().to_string()]
+            );
+
+            // Merely pointing at a manager is insufficient outside shims/.
+            let fake = root.path().join("bin/tirith");
+            symlink(root.path().join("bin/mise"), &fake).unwrap();
+            let conflict = root.path().join("pip/bin/tirith");
+            file(&conflict);
+            let alias = root.path().join("pip/bin/tirith-alias");
+            symlink(&conflict, &alias).unwrap();
+            assert_eq!(
+                find_shadow_binaries_in(
+                    vec![shim, fake.clone(), conflict.clone(), alias],
+                    Some(&current)
+                ),
+                vec![fake.display().to_string(), conflict.display().to_string()]
+            );
+        }
+
+        #[test]
+        fn arbitrary_shim_targets_and_non_symlink_wrappers_are_not_suppressed() {
+            let root = tempfile::tempdir().unwrap();
+            let (shim, current) = layout(root.path(), "other-launcher");
+            assert_eq!(
+                find_shadow_binaries_in(vec![shim.clone()], Some(&current)),
+                vec![shim.display().to_string()]
+            );
+            fs::remove_file(&shim).unwrap();
+            file(&shim);
+            assert_eq!(
+                find_shadow_binaries_in(vec![shim.clone()], Some(&current)),
+                vec![shim.display().to_string()]
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -652,11 +652,25 @@ pub(crate) fn normalize_cmd_base(raw: &str, shell: ShellType) -> String {
     basename_from_normalized(normalized, shell)
 }
 
-/// Whether a command-position word has one statically determined post-lexing
-/// value. Quotes and deterministic escape sequences are allowed; expansion,
-/// globbing, and splatting are not. This is deliberately separate from
-/// normalization: normalizing `$COMMAND` produces a string, but does not prove
-/// which executable the shell will select at runtime.
+/// Whether a command-position word has a statically determined command name.
+/// Exact POSIX test operators are syntax, not glob patterns. Expanding `~/`
+/// changes only a path prefix; the remaining path must still be static so its
+/// executable basename and arguments receive ordinary command analysis.
+pub(crate) fn command_name_is_statically_bound(raw: &str, shell: ShellType) -> bool {
+    if shell == ShellType::Posix {
+        if matches!(raw, "[" | "[[") {
+            return true;
+        }
+        if raw.starts_with("~/") {
+            return command_word_is_statically_bound(&raw[1..], shell);
+        }
+    }
+    command_word_is_statically_bound(raw, shell)
+}
+
+/// Prove the complete post-lexing value, including its path prefix. Consumers
+/// that reparse argv (such as `env -S`) or resolve a working directory need
+/// this stricter proof: a known executable basename is not enough there.
 pub(crate) fn command_word_is_statically_bound(raw: &str, shell: ShellType) -> bool {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
@@ -1972,7 +1986,7 @@ fn resolve_effective_command_with_environment(
         };
         let base = normalize_cmd_base(command, shell);
         if !is_execution_wrapper(&base, shell) {
-            if !command_word_is_statically_bound(command, shell) {
+            if !command_name_is_statically_bound(command, shell) {
                 return Err(EffectiveCommandError::MissingOrAmbiguousCommand);
             }
             return Ok(EffectiveCommand {
@@ -4656,7 +4670,7 @@ pub fn check_network_policy(
                 let dynamic_leader = segment
                     .command
                     .as_deref()
-                    .is_some_and(|command| !command_word_is_statically_bound(command, shell));
+                    .is_some_and(|command| !command_name_is_statically_bound(command, shell));
                 if unresolved_wrapper || dynamic_leader {
                     findings.push(unresolved_execution_finding(segment, "network policy"));
                 }
@@ -11614,6 +11628,21 @@ fn check_data_exfiltration_depth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_home_command_names_do_not_prove_argv_values() {
+        for word in ["~/bin/bash", "~/.local/lib/python3.11", "[", "[["] {
+            assert!(command_name_is_statically_bound(word, ShellType::Posix));
+            assert!(
+                !command_word_is_statically_bound(word, ShellType::Posix),
+                "command-name proof must not relax config paths or reparsed argv: {word}"
+            );
+        }
+        for word in ["~/$COMMAND", "~/bin/*", "~/bin/ba[sh]", "~other/bin/bash"] {
+            assert!(!command_name_is_statically_bound(word, ShellType::Posix));
+            assert!(!command_word_is_statically_bound(word, ShellType::Posix));
+        }
+    }
 
     /// Helper: run `check()` with no cwd and Exec context (the common case for tests).
     fn check_default(input: &str, shell: ShellType) -> Vec<Finding> {

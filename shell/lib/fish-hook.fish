@@ -31,50 +31,53 @@ if not string match -q '/*' -- "$_TIRITH_BIN"; or not test -x "$_TIRITH_BIN"
 end
 
 # Protocol-v3 callbacks run after arbitrary commands may have changed PATH.
-# Pin every external helper they use to a fixed system location now, and only
-# advertise receipt support when the complete helper set is available.
-set -g _TIRITH_MKTEMP_BIN ""
-if test -f /usr/bin/mktemp; and test -x /usr/bin/mktemp
-    set -g _TIRITH_MKTEMP_BIN /usr/bin/mktemp
-else if test -f /bin/mktemp; and test -x /bin/mktemp
-    set -g _TIRITH_MKTEMP_BIN /bin/mktemp
+# Prefer system helpers, then search the source-time PATH for non-FHS systems
+# (NixOS/Guix). Inspect files directly to ignore aliases, functions and command
+# caches. Relative/empty PATH entries must never become helper pins.
+function _tirith_resolve_helper
+    set -l name "$argv[1]"
+    for candidate in $argv[2..-1]
+        if string match -q '/*' -- "$candidate"; and test -f "$candidate"; and test -x "$candidate"
+            builtin printf '%s\n' "$candidate"
+            return 0
+        end
+    end
+    for directory in $PATH
+        string match -q '/*' -- "$directory"; or continue
+        set -l candidate "$directory/$name"
+        if test -f "$candidate"; and test -x "$candidate"
+            builtin printf '%s\n' "$candidate"
+            return 0
+        end
+    end
+    return 1
 end
-set -g _TIRITH_RM_BIN ""
-if test -f /bin/rm; and test -x /bin/rm
-    set -g _TIRITH_RM_BIN /bin/rm
-else if test -f /usr/bin/rm; and test -x /usr/bin/rm
-    set -g _TIRITH_RM_BIN /usr/bin/rm
-end
-set -g _TIRITH_WC_BIN ""
-if test -f /usr/bin/wc; and test -x /usr/bin/wc
-    set -g _TIRITH_WC_BIN /usr/bin/wc
-else if test -f /bin/wc; and test -x /bin/wc
-    set -g _TIRITH_WC_BIN /bin/wc
-end
-set -g _TIRITH_ENV_BIN ""
-if test -f /usr/bin/env; and test -x /usr/bin/env
-    set -g _TIRITH_ENV_BIN /usr/bin/env
-else if test -f /bin/env; and test -x /bin/env
-    set -g _TIRITH_ENV_BIN /bin/env
-end
-set -g _TIRITH_SH_BIN ""
-if test -f /bin/sh; and test -x /bin/sh
-    set -g _TIRITH_SH_BIN /bin/sh
-else if test -f /usr/bin/sh; and test -x /usr/bin/sh
-    set -g _TIRITH_SH_BIN /usr/bin/sh
-end
-set -g _TIRITH_BASH_TIMEOUT_BIN ""
-if test -f /bin/bash; and test -x /bin/bash
-    set -g _TIRITH_BASH_TIMEOUT_BIN /bin/bash
-else if test -f /usr/bin/bash; and test -x /usr/bin/bash
-    set -g _TIRITH_BASH_TIMEOUT_BIN /usr/bin/bash
-end
+
+set -g _TIRITH_MKTEMP_BIN (_tirith_resolve_helper mktemp /usr/bin/mktemp /bin/mktemp)
+set -g _TIRITH_RM_BIN (_tirith_resolve_helper rm /bin/rm /usr/bin/rm)
+set -g _TIRITH_WC_BIN (_tirith_resolve_helper wc /usr/bin/wc /bin/wc)
+set -g _TIRITH_ENV_BIN (_tirith_resolve_helper env /usr/bin/env /bin/env)
+set -g _TIRITH_SH_BIN (_tirith_resolve_helper sh /bin/sh /usr/bin/sh)
+set -g _TIRITH_BASH_TIMEOUT_BIN (_tirith_resolve_helper bash /bin/bash /usr/bin/bash)
 set -g _TIRITH_V3_HELPERS_READY 1
 for helper in "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" \
         "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN"
     if not string match -q '/*' -- "$helper"; or not test -f "$helper"; or not test -x "$helper"
         set -g _TIRITH_V3_HELPERS_READY 0
     end
+end
+
+# Legacy preflight also requires private capture files. If these prerequisites
+# are absent at startup, leave Enter/paste bindings intact instead of installing
+# a hook that discards every command. Runtime capture failures still block.
+if status is-interactive
+    and begin
+        test -z "$_TIRITH_MKTEMP_BIN"; or test -z "$_TIRITH_RM_BIN"
+    end
+    builtin printf '%s\n' 'tirith: mktemp or rm unavailable; fish hooks disabled — install these helpers and restart the shell' >&2
+    set -g TIRITH_STATUS off
+    set -e _TIRITH_FISH_LOADED
+    return 0
 end
 
 # Receipt protocol state. Registration itself happens further down, after the

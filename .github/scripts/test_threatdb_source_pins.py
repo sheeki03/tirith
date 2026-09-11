@@ -12,7 +12,7 @@ import unittest
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-MANIFEST = SCRIPT_DIR.parent / "threatdb-source-pins.json"
+MANIFEST = SCRIPT_DIR / "fixtures" / "threatdb-source-pins.json"
 SPEC = importlib.util.spec_from_file_location(
     "threatdb_source_pins", SCRIPT_DIR / "threatdb_source_pins.py"
 )
@@ -103,6 +103,9 @@ class ThreatDbSourcePinsTests(unittest.TestCase):
         for source_name in PINS.SOURCE_ORDER:
             source = self.manifest["sources"][source_name]
             self.assertRegex(source["commit"], r"^[0-9a-f]{40}$")
+
+    def test_production_manifest_is_valid_independently_of_fixture_revisions(self) -> None:
+        PINS.load_manifest(SCRIPT_DIR.parent / "threatdb-source-pins.json")
 
     def test_update_skips_transient_ossf_ingestion_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

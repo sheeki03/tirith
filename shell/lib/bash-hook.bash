@@ -125,21 +125,40 @@ fi
 # long-lived interactive shell) Tirith's parent. Capture Tirith stdout in a
 # private temporary file instead: Tirith remains a direct child, parsing happens
 # in this shell, and every caller removes the file immediately.
-_TIRITH_MKTEMP_BIN=""
-[[ -f /usr/bin/mktemp && -x /usr/bin/mktemp ]] && _TIRITH_MKTEMP_BIN=/usr/bin/mktemp
-[[ -z "$_TIRITH_MKTEMP_BIN" && -f /bin/mktemp && -x /bin/mktemp ]] && _TIRITH_MKTEMP_BIN=/bin/mktemp
-_TIRITH_RM_BIN=""
-[[ -f /bin/rm && -x /bin/rm ]] && _TIRITH_RM_BIN=/bin/rm
-[[ -z "$_TIRITH_RM_BIN" && -f /usr/bin/rm && -x /usr/bin/rm ]] && _TIRITH_RM_BIN=/usr/bin/rm
-_TIRITH_MKDIR_BIN=""
-[[ -f /bin/mkdir && -x /bin/mkdir ]] && _TIRITH_MKDIR_BIN=/bin/mkdir
-[[ -z "$_TIRITH_MKDIR_BIN" && -f /usr/bin/mkdir && -x /usr/bin/mkdir ]] && _TIRITH_MKDIR_BIN=/usr/bin/mkdir
-_TIRITH_WC_BIN=""
-[[ -f /usr/bin/wc && -x /usr/bin/wc ]] && _TIRITH_WC_BIN=/usr/bin/wc
-[[ -z "$_TIRITH_WC_BIN" && -f /bin/wc && -x /bin/wc ]] && _TIRITH_WC_BIN=/bin/wc
-_TIRITH_STTY_BIN=""
-[[ -f /bin/stty && -x /bin/stty ]] && _TIRITH_STTY_BIN=/bin/stty
-[[ -z "$_TIRITH_STTY_BIN" && -f /usr/bin/stty && -x /usr/bin/stty ]] && _TIRITH_STTY_BIN=/usr/bin/stty
+# Prefer system helpers, then search the PATH present when this hook is sourced
+# for non-FHS systems (NixOS/Guix). Inspect files directly to ignore command
+# hashes, aliases and functions. Skip relative/empty entries so changing cwd or
+# PATH later cannot redirect a pinned helper to a repository executable.
+_tirith_resolve_helper() {
+  local name="$1" candidate directory remaining="${PATH-}"
+  shift
+  for candidate in "$@"; do
+    if [[ "$candidate" == /* && -f "$candidate" && -x "$candidate" ]]; then
+      builtin printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  while [[ -n "$remaining" ]]; do
+    directory="${remaining%%:*}"
+    case "$remaining" in
+      *:*) remaining="${remaining#*:}" ;;
+      *) remaining="" ;;
+    esac
+    [[ "$directory" == /* ]] || continue
+    candidate="${directory%/}/$name"
+    if [[ -f "$candidate" && -x "$candidate" ]]; then
+      builtin printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_TIRITH_MKTEMP_BIN="$(_tirith_resolve_helper mktemp /usr/bin/mktemp /bin/mktemp)" || _TIRITH_MKTEMP_BIN=""
+_TIRITH_RM_BIN="$(_tirith_resolve_helper rm /bin/rm /usr/bin/rm)" || _TIRITH_RM_BIN=""
+_TIRITH_MKDIR_BIN="$(_tirith_resolve_helper mkdir /bin/mkdir /usr/bin/mkdir)" || _TIRITH_MKDIR_BIN=""
+_TIRITH_WC_BIN="$(_tirith_resolve_helper wc /usr/bin/wc /bin/wc)" || _TIRITH_WC_BIN=""
+_TIRITH_STTY_BIN="$(_tirith_resolve_helper stty /bin/stty /usr/bin/stty)" || _TIRITH_STTY_BIN=""
 
 _tirith_new_capture_file() {
   [[ -n "$_TIRITH_MKTEMP_BIN" && -n "$_TIRITH_RM_BIN" ]] || return 1

@@ -138,11 +138,13 @@ now records when each pinned commit was authored and when its pin was selected,
 and the compiler verifies both against the checked-out tree rather than
 trusting the document.
 
-**Operator action for anyone running this pipeline in their own fork:** the
-watcher needs a `THREATDB_PIN_PR_TOKEN` repository secret (contents plus pull
-requests, that repository only) to push its branch and open the review pull
-request. Until it is set, the watcher fails at the token check the first time a
-pin actually changes.
+**Pipeline configuration:** validation runs with a read-only token. A separate
+publication job uses the repository's `GITHUB_TOKEN` to open the review PR;
+enable “Allow GitHub Actions to create and approve pull requests” in repository
+Actions settings. Approve the resulting pending workflow runs before merging.
+An optional `THREATDB_PIN_PR_TOKEN` secret (contents plus pull requests, scoped
+to this repository) lets those PR workflows start automatically. Neither job
+receives the production signing key, and pins still require human review.
 
 ## Upgrade and installation
 
