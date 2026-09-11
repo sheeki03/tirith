@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Shell initialization binds Bash, zsh, and fish hooks to the running native executable, so npm and other process-spawning launchers no longer prevent strict receipt registration. The npm launcher also preserves signal termination instead of reporting success.
+- On Unix, shell initialization binds Bash, zsh, and fish hooks to the running native executable, so npm and other process-spawning launchers no longer prevent strict receipt registration. Other platforms retain shell PATH resolution. The npm launcher also preserves signal termination instead of reporting success.
 - Sourcing `shell/tirith.sh` locates its own directory correctly in Bash and zsh, including installations with spaces or apostrophes in the path.
 - Long-running processes detect ThreatDB replacements within the same second and changes to the selected database path. Reloads retain signature verification and rollback protection.
 - Trial subscriptions can refresh license tokens, consistently with the database's authorization checks.

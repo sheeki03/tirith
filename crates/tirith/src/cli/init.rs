@@ -22,14 +22,20 @@ fn native_hook_source_line(shell: &str, hook: &Path, executable: &Path) -> Resul
     let hook = hook
         .to_str()
         .ok_or_else(|| "shell hook path is not valid UTF-8".to_string())?;
-    let executable = executable
-        .to_str()
-        .ok_or_else(|| "native executable path is not valid UTF-8".to_string())?;
     let quote = if shell == "fish" {
         fish_single_quote
     } else {
         posix_single_quote
     };
+    // Native Windows paths do not satisfy the POSIX hooks' absolute-path
+    // contract. Strict receipts are unavailable there, so preserve each
+    // shell's existing PATH resolution instead of passing a native path.
+    if !cfg!(unix) {
+        return Ok(format!("source {}", quote(hook)));
+    }
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| "native executable path is not valid UTF-8".to_string())?;
     Ok(format!(
         "source {} --tirith-executable {}",
         quote(hook),
@@ -733,6 +739,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn native_hook_binding_quotes_both_paths_as_literal_source_arguments() {
         let line = native_hook_source_line(
             "bash",
@@ -744,6 +751,25 @@ mod tests {
             line,
             "source '/hook'\\''s dir/$hook\nfile' --tirith-executable '/native'\\''s dir/$(not-a-command)/tirith'"
         );
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn native_hook_binding_preserves_non_unix_shell_path_resolution() {
+        for (shell, expected) in [
+            ("bash", "source 'C:/hook'\\''s dir/hook'"),
+            ("zsh", "source 'C:/hook'\\''s dir/hook'"),
+            ("fish", "source 'C:/hook\\'s dir/hook'"),
+        ] {
+            let line = native_hook_source_line(
+                shell,
+                Path::new("C:/hook's dir/hook"),
+                Path::new(r"\\?\C:\native\tirith.exe"),
+            )
+            .unwrap();
+            assert_eq!(line, expected, "shell={shell}");
+            assert!(!line.contains("--tirith-executable"));
+        }
     }
 
     #[test]
