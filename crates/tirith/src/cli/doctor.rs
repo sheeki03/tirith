@@ -932,6 +932,7 @@ pub(super) fn create_policy_contained(
 /// Findings hidden by the current paranoia level.
 #[derive(Debug, Clone, serde::Serialize)]
 struct DetectionGapInfo {
+    audit_history_truncated: bool,
     total_commands: usize,
     blocked: usize,
     warned: usize,
@@ -1049,6 +1050,7 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
     let current_paranoia = policy.paranoia;
 
     Some(DetectionGapInfo {
+        audit_history_truncated: read_result.truncated,
         total_commands,
         blocked,
         warned,
@@ -2850,6 +2852,9 @@ fn print_human(info: &DoctorInfo) {
     if let Some(ref gaps) = info.detection_gaps {
         println!();
         println!("Detection coverage (last 7 days)");
+        if gaps.audit_history_truncated {
+            println!("  Recent audit tail only; older history was not inspected.");
+        }
         println!(
             "  {} commands scanned, {} blocked, {} warned",
             gaps.total_commands, gaps.blocked, gaps.warned
@@ -2866,9 +2871,7 @@ fn print_human(info: &DoctorInfo) {
         );
 
         if gaps.hidden_findings == 0 && gaps.records_with_raw > 0 {
-            println!(
-                "  No hidden findings — detection coverage is complete at current paranoia level"
-            );
+            println!("  No hidden findings in the analyzed records at current paranoia level");
         } else if gaps.hidden_findings == 0 && gaps.records_with_raw == 0 {
             println!(
                 "  No raw detection data available (all records are pre-upgrade). Cannot assess hidden findings."

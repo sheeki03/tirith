@@ -519,7 +519,12 @@ fn append_timeline(s: &mut String, since: Option<u64>) {
     // repo-0481: bounded tail read (the incident window only needs the newest
     // records; the full log can be arbitrarily large).
     let records = match tirith_core::audit_aggregator::read_log_tail(&path, 10_000) {
-        Ok(r) => r.records,
+        Ok(r) => {
+            if r.truncated {
+                s.push_str("_Recent audit tail only; older history was not inspected._\n\n");
+            }
+            r.records
+        }
         Err(e) => {
             s.push_str(&format!("_Could not read audit log: {e}_\n\n"));
             return;
@@ -603,7 +608,12 @@ fn append_top_findings(s: &mut String, since: Option<u64>) {
     // repo-0481: bounded tail read (the incident window only needs the newest
     // records; the full log can be arbitrarily large).
     let records = match tirith_core::audit_aggregator::read_log_tail(&path, 10_000) {
-        Ok(r) => r.records,
+        Ok(r) => {
+            if r.truncated {
+                s.push_str("_Recent audit tail only; older history was not inspected._\n\n");
+            }
+            r.records
+        }
         Err(e) => {
             s.push_str(&format!("_Could not read audit log: {e}_\n\n"));
             return;

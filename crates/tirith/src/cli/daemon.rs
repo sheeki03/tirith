@@ -434,6 +434,16 @@ pub fn try_daemon_check(
 
 #[cfg(unix)]
 fn handle_request(req: &DaemonRequest) -> DaemonResponse {
+    handle_request_with_analysis(req, engine::analyze_returning_policy)
+}
+
+#[cfg(unix)]
+fn handle_request_with_analysis(
+    req: &DaemonRequest,
+    analyze: impl FnOnce(
+        &AnalysisContext,
+    ) -> (tirith_core::verdict::Verdict, tirith_core::policy::Policy),
+) -> DaemonResponse {
     let empty_resp = |error: Option<String>, code: i32| DaemonResponse {
         action: Action::Allow,
         findings: vec![],
@@ -528,8 +538,10 @@ fn handle_request(req: &DaemonRequest) -> DaemonResponse {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
 
-    let mut verdict = engine::analyze(&ctx);
-    let policy = tirith_core::policy::Policy::discover(ctx.cwd.as_deref());
+    // Retain the engine's resolved policy, including remote policy and local
+    // overlays. Rediscovery costs another read/fetch and can give enrichment a
+    // different policy if configuration changes during the request.
+    let (mut verdict, policy) = analyze(&ctx);
 
     let mut late_findings = tirith_core::threatdb_api::enrich_command_with_network(
         &req.input,
@@ -1478,6 +1490,57 @@ mod tests {
             .expect("offline runtime finding");
         assert_eq!(runtime.severity, tirith_core::verdict::Severity::Critical);
         assert_eq!(resp.action, Action::Block);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_enrichment_retains_engine_policy_when_configuration_changes() {
+        let global = GlobalStateGuard::new().expect("isolated daemon policy state");
+        let policy_dir = global.roots().policy.join(".tirith");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        let policy_path = policy_dir.join("policy.yaml");
+        std::fs::write(
+            &policy_path,
+            "severity_overrides:\n  analysis_incomplete: CRITICAL\n",
+        )
+        .unwrap();
+        let req = super::DaemonRequest {
+            command: "check".into(),
+            input: "pip install tirith-daemon-policy-snapshot-fixture==9.9.9".into(),
+            context: "exec".into(),
+            cwd: Some(global.roots().cwd.display().to_string()),
+            shell: Some("posix".into()),
+            interactive: false,
+            bypass_requested: false,
+            offline: true,
+        };
+
+        let response = super::handle_request_with_analysis(&req, |ctx| {
+            let analyzed = tirith_core::engine::analyze_returning_policy(ctx);
+            assert_eq!(
+                analyzed
+                    .1
+                    .severity_override(&tirith_core::verdict::RuleId::AnalysisIncomplete),
+                Some(tirith_core::verdict::Severity::Critical)
+            );
+            // Model a policy deployment immediately after initial analysis.
+            // A second discovery would weaken the late offline-coverage finding.
+            std::fs::write(
+                &policy_path,
+                "severity_overrides:\n  analysis_incomplete: INFO\n",
+            )
+            .unwrap();
+            analyzed
+        });
+        let runtime = response
+            .raw_findings
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .find(|finding| finding.description.contains("skipped by offline mode"))
+            .expect("offline runtime finding");
+        assert_eq!(runtime.severity, tirith_core::verdict::Severity::Critical);
+        assert_eq!(response.action, Action::Block);
     }
 
     fn base_response() -> DaemonResponse {

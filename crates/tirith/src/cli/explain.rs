@@ -79,10 +79,11 @@ fn resolve_finding_id(id: &str) -> Result<RuleId, String> {
         .find(|r| r.event_id.as_deref() == Some(event_id));
 
     let Some(entry) = entry else {
-        if read.records.len() > AUDIT_SCAN_LIMIT {
+        if read.truncated {
             return Err(format!(
-                "finding ID {id:?} not found in the {scanned} most-recent audit entries (cap is {AUDIT_SCAN_LIMIT}); \
-                 narrow via `tirith audit export --since <duration>` and re-run"
+                "finding ID {id:?} not found in the {scanned} most-recent audit entries inspected \
+                 (limit is {AUDIT_SCAN_LIMIT} records or the bounded recent tail); older history was not searched. \
+                 Use `tirith audit export --since <duration>` to locate the rule ID, then `tirith explain --rule <rule_id>`"
             ));
         }
         return Err(format!(

@@ -115,7 +115,10 @@ pub struct HookStats {
 /// Result of reading an audit log, including accounting for skipped lines.
 pub struct ReadLogResult {
     pub records: Vec<AuditRecord>,
+    /// Malformed JSON lines in the portion actually inspected.
     pub skipped_lines: usize,
+    /// Older history was not inspected because a tail limit was reached.
+    pub truncated: bool,
 }
 
 /// Read and parse all records from a JSONL audit log, STREAMING line-by-line via
@@ -130,38 +133,139 @@ pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
     parse_log_from_reader(reader, Some(path))
 }
 
-/// repo-0479/0480/0481: bounded variant for diagnostic consumers — keeps only
-/// the NEWEST `max_records` parsed records, so a huge or attacker-inflated
-/// audit log cannot hang or OOM `doctor`, `explain`, or `incident`.
+const AUDIT_TAIL_BYTES: u64 = 16 * 1024 * 1024;
+const AUDIT_TAIL_LINE_BYTES: usize = 1024 * 1024;
+const AUDIT_TAIL_LINES: usize = 100_000;
+const AUDIT_TAIL_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Read the newest `max_records` valid records, returned in file order.
+///
+/// Diagnostic consumers inspect at most 16 MiB / 100,000 physical lines from
+/// the end of a regular file, stopping as soon as enough records are found.
+/// Individual lines are limited to 1 MiB, matching the audit writer. Malformed
+/// JSON is warned about and skipped; invalid UTF-8 and read errors are terminal.
+/// Only the inspected suffix contributes to `skipped_lines`. When a limit leaves
+/// older history unread, `truncated` and a stderr warning report partial coverage.
+/// The input is never modified. Concurrent appends are deferred to the next read.
 pub fn read_log_tail(path: &Path, max_records: usize) -> Result<ReadLogResult, String> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
-    let mut records: std::collections::VecDeque<AuditRecord> =
-        std::collections::VecDeque::with_capacity(max_records.min(1024));
-    let mut skipped_lines = 0usize;
-    for (idx, line) in reader.lines().enumerate() {
-        let line_num = idx + 1;
-        match line {
-            Ok(line) => {
-                let mut one = Vec::new();
-                parse_log_line(&line, line_num, Some(path), &mut one, &mut skipped_lines);
-                if let Some(record) = one.into_iter().next() {
-                    if records.len() >= max_records {
-                        records.pop_front();
-                    }
-                    records.push_back(record);
+    // Allow arbitrarily large history while rejecting FIFOs/devices before a
+    // blocking read. The bound applies to bytes read, not the file's total size.
+    let mut file = crate::util::open_regular_capped(path, u64::MAX)
+        .map_err(|e| format!("Failed to read {}: {e:?}", path.display()))?;
+    let result = read_log_tail_from_reader(&mut file, max_records, Some(path))
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    if result.truncated {
+        eprintln!(
+            "tirith: warning: audit history in {} was limited to its recent tail \
+             ({} records; at most {max_records} records, 16 MiB, or {AUDIT_TAIL_LINES} lines); \
+             older history was not inspected",
+            path.display(),
+            result.records.len(),
+        );
+    }
+    Ok(result)
+}
+
+fn read_log_tail_from_reader(
+    reader: &mut (impl std::io::Read + std::io::Seek),
+    max_records: usize,
+    source: Option<&Path>,
+) -> std::io::Result<ReadLogResult> {
+    use std::io::SeekFrom;
+
+    let end = reader.seek(SeekFrom::End(0))?;
+    let mut result = ReadLogResult {
+        records: Vec::with_capacity(max_records.min(1024)),
+        skipped_lines: 0,
+        truncated: false,
+    };
+    if max_records == 0 {
+        result.truncated = end != 0;
+        return Ok(result);
+    }
+
+    let start = end.saturating_sub(AUDIT_TAIL_BYTES);
+    let mut position = end;
+    let mut buffer = Vec::new();
+    let mut lines = 0;
+    while position > start {
+        let size = (position - start).min(AUDIT_TAIL_CHUNK_BYTES as u64) as usize;
+        position -= size as u64;
+        // Carry only the incomplete line at the beginning of the last chunk.
+        // Complete lines are parsed directly from slices, without copying or
+        // reversing every byte in ordinary audit records.
+        let carried = buffer.len();
+        buffer.resize(size + carried, 0);
+        buffer.copy_within(..carried, size);
+        reader.seek(SeekFrom::Start(position))?;
+        // A concurrent truncate is an error, rather than accepting a partial
+        // read or spinning. Reads never extend beyond the initial EOF snapshot.
+        reader.read_exact(&mut buffer[..size])?;
+        let mut remaining = buffer.len();
+        while let Some(index) = buffer[..remaining].iter().rposition(|&byte| byte == b'\n') {
+            let offset = position + index as u64;
+            // A final newline terminates the preceding physical line; it
+            // does not create an extra empty line after EOF.
+            if offset + 1 != end {
+                parse_tail_line(
+                    &buffer[index + 1..remaining],
+                    offset + 1,
+                    source,
+                    &mut result,
+                )?;
+                lines += 1;
+                if result.records.len() == max_records || lines == AUDIT_TAIL_LINES {
+                    result.truncated = offset != 0;
+                    result.records.reverse();
+                    return Ok(result);
                 }
             }
-            Err(e) => {
-                return Err(format!("Failed to read {}: {e}", path.display()));
-            }
+            remaining = index;
+        }
+        buffer.truncate(remaining);
+        if buffer.len() > AUDIT_TAIL_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "audit line exceeds 1 MiB limit",
+            ));
         }
     }
-    Ok(ReadLogResult {
-        records: records.into_iter().collect(),
-        skipped_lines,
-    })
+
+    if start == 0 {
+        parse_tail_line(&buffer, 0, source, &mut result)?;
+    } else {
+        // The byte budget may end inside a line. Do not parse a fragment as a
+        // record or report it as malformed JSON.
+        result.truncated = true;
+    }
+    result.records.reverse();
+    Ok(result)
+}
+
+fn parse_tail_line(
+    line: &[u8],
+    offset: u64,
+    source: Option<&Path>,
+    result: &mut ReadLogResult,
+) -> std::io::Result<()> {
+    if line.len() > AUDIT_TAIL_LINE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit line exceeds 1 MiB limit",
+        ));
+    }
+    let line = std::str::from_utf8(line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // Absolute line numbers require scanning all older history. The known byte
+    // offset locates malformed tail records without that unbounded scan.
+    parse_log_line(
+        line,
+        format_args!("at byte {offset}"),
+        source,
+        &mut result.records,
+        &mut result.skipped_lines,
+    );
+    Ok(())
 }
 
 /// Streaming counterpart of [`parse_log`]: pulls one line at a time from
@@ -193,6 +297,7 @@ pub fn parse_log_from_reader(
     Ok(ReadLogResult {
         records,
         skipped_lines,
+        truncated: false,
     })
 }
 
@@ -208,6 +313,7 @@ pub fn parse_log(content: &str, source: Option<&Path>) -> ReadLogResult {
     ReadLogResult {
         records,
         skipped_lines,
+        truncated: false,
     }
 }
 
@@ -215,7 +321,7 @@ pub fn parse_log(content: &str, source: Option<&Path>) -> ReadLogResult {
 /// Shared by [`parse_log`] and [`parse_log_from_reader`] for identical results.
 fn parse_log_line(
     line: &str,
-    line_num: usize,
+    line_num: impl std::fmt::Display,
     source: Option<&Path>,
     records: &mut Vec<AuditRecord>,
     skipped_lines: &mut usize,
@@ -235,7 +341,11 @@ fn parse_log_line(
 
 /// One-line stderr warning for a skipped audit line, shared so both paths emit
 /// identical text.
-fn warn_malformed_line(line_num: usize, source: Option<&Path>, e: &dyn std::fmt::Display) {
+fn warn_malformed_line(
+    line_num: impl std::fmt::Display,
+    source: Option<&Path>,
+    e: &dyn std::fmt::Display,
+) {
     match source {
         Some(path) => eprintln!(
             "tirith: warning: skipping malformed audit line {} in {}: {e}",
@@ -754,6 +864,183 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tail_record(id: &str, command: &str) -> String {
+        serde_json::json!({
+            "timestamp": "2026-09-11T00:00:00Z",
+            "action": "Block",
+            "event_id": id,
+            "command_redacted": command,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn tail_preserves_order_and_skips_only_inspected_malformed_lines() {
+        let a = tail_record("a", "");
+        let b = tail_record("b", "");
+        let c = tail_record("c", "");
+        for ending in ["", "\n", "\r\n"] {
+            let content = format!("old invalid JSON\n{a}\r\n{b}\n\ninvalid JSON\r\n{c}{ending}");
+            let mut reader = std::io::Cursor::new(content.as_bytes());
+            let tail = read_log_tail_from_reader(&mut reader, 2, None).unwrap();
+            assert_eq!(tail.records.len(), 2);
+            assert_eq!(tail.records[0].event_id.as_deref(), Some("b"));
+            assert_eq!(tail.records[1].event_id.as_deref(), Some("c"));
+            assert_eq!(tail.skipped_lines, 1);
+            assert!(tail.truncated);
+
+            let tail = read_log_tail_from_reader(&mut reader, 10, None).unwrap();
+            let full = parse_log(&content, None);
+            assert_eq!(export_json(&tail.records), export_json(&full.records));
+            assert_eq!(tail.skipped_lines, full.skipped_lines);
+            assert!(!tail.truncated);
+        }
+    }
+
+    #[test]
+    fn tail_handles_empty_zero_and_exact_record_limits() {
+        for content in [String::new(), "\n\r\n".into()] {
+            let tail =
+                read_log_tail_from_reader(&mut std::io::Cursor::new(content), 1, None).unwrap();
+            assert!(tail.records.is_empty());
+            assert!(!tail.truncated);
+        }
+        let content = format!("{}\n", tail_record("only", ""));
+        let mut reader = std::io::Cursor::new(content);
+        let zero = read_log_tail_from_reader(&mut reader, 0, None).unwrap();
+        assert!(zero.records.is_empty());
+        assert!(zero.truncated);
+        let one = read_log_tail_from_reader(&mut reader, 1, None).unwrap();
+        assert_eq!(one.records.len(), 1);
+        assert!(!one.truncated);
+    }
+
+    struct CountedReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        bytes_read: usize,
+    }
+
+    impl std::io::Read for CountedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = std::io::Read::read(&mut self.inner, buffer)?;
+            self.bytes_read += count;
+            Ok(count)
+        }
+    }
+
+    impl std::io::Seek for CountedReader {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            std::io::Seek::seek(&mut self.inner, position)
+        }
+    }
+
+    #[test]
+    fn tail_reads_only_recent_chunks_independent_of_history_size() {
+        let suffix = format!("{}\n{}\n", tail_record("b", ""), tail_record("c", ""));
+        for history_size in [AUDIT_TAIL_CHUNK_BYTES, 10 * AUDIT_TAIL_CHUNK_BYTES] {
+            let mut bytes = vec![b'x'; history_size];
+            bytes.push(b'\n');
+            bytes.extend_from_slice(suffix.as_bytes());
+            let mut reader = CountedReader {
+                inner: std::io::Cursor::new(bytes),
+                bytes_read: 0,
+            };
+            let tail = read_log_tail_from_reader(&mut reader, 2, None).unwrap();
+            assert_eq!(tail.records.len(), 2);
+            assert_eq!(tail.skipped_lines, 0);
+            assert!(tail.truncated);
+            assert_eq!(reader.bytes_read, AUDIT_TAIL_CHUNK_BYTES);
+        }
+    }
+
+    #[test]
+    fn tail_reassembles_unicode_lines_across_chunk_boundaries() {
+        let command = "é🦀".repeat(AUDIT_TAIL_CHUNK_BYTES / 3);
+        let content = format!("{}\r\n", tail_record("unicode", &command));
+        let tail = read_log_tail_from_reader(&mut std::io::Cursor::new(content), 1, None).unwrap();
+        assert_eq!(tail.records[0].command_redacted, command);
+        assert!(!tail.truncated);
+    }
+
+    #[test]
+    fn tail_byte_limit_discards_partial_record_without_counting_it_malformed() {
+        let line = format!("{}\n", tail_record("large", &"x".repeat(1024)));
+        let count = AUDIT_TAIL_BYTES as usize / line.len() + 2;
+        let mut reader = CountedReader {
+            inner: std::io::Cursor::new(line.repeat(count).into_bytes()),
+            bytes_read: 0,
+        };
+        let tail = read_log_tail_from_reader(&mut reader, usize::MAX, None).unwrap();
+        assert!(tail.truncated);
+        assert_eq!(tail.skipped_lines, 0);
+        assert_eq!(tail.records.len(), AUDIT_TAIL_BYTES as usize / line.len());
+        assert_eq!(reader.bytes_read, AUDIT_TAIL_BYTES as usize);
+    }
+
+    #[test]
+    fn tail_bounds_work_even_when_no_valid_records_exist() {
+        let mut reader = std::io::Cursor::new(vec![b'\n'; AUDIT_TAIL_LINES + 2]);
+        let tail = read_log_tail_from_reader(&mut reader, 10, None).unwrap();
+        assert!(tail.records.is_empty());
+        assert_eq!(tail.skipped_lines, 0);
+        assert!(tail.truncated);
+    }
+
+    #[test]
+    fn tail_rejects_oversized_lines_and_invalid_utf8() {
+        for bytes in [vec![b'x'; AUDIT_TAIL_LINE_BYTES + 1], vec![0xff, b'\n']] {
+            let error = read_log_tail_from_reader(&mut std::io::Cursor::new(bytes), 1, None)
+                .err()
+                .expect("invalid input must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn tail_reads_regular_file_without_modifying_it_and_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let content = format!("{}\n{}\n", tail_record("a", ""), tail_record("b", ""));
+        std::fs::write(&path, &content).unwrap();
+        let result = read_log_tail(&path, 1).unwrap();
+        assert_eq!(result.records[0].event_id.as_deref(), Some("b"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        assert!(read_log_tail(dir.path(), 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tail_rejects_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(read_log_tail(&path, 1).is_err());
+    }
+
+    #[test]
+    fn tail_read_errors_are_terminal() {
+        struct FailedReader;
+        impl std::io::Seek for FailedReader {
+            fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+                Ok(1024)
+            }
+        }
+        impl std::io::Read for FailedReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "read failed",
+                ))
+            }
+        }
+        let error = read_log_tail_from_reader(&mut FailedReader, 1, None)
+            .err()
+            .expect("read errors must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
 
     fn sample_records() -> Vec<AuditRecord> {
         vec![
