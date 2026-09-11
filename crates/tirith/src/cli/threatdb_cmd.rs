@@ -1707,7 +1707,10 @@ where
 
 /// Candidate-selection core, split from HTTP so the primary-invalid/fallback-
 /// valid security boundary is directly regression-testable with signed fixtures.
-fn fetch_index_v2_with<F>(mut fetch: F, verify_key: &VerifyingKey) -> Result<Option<IndexV2>, String>
+fn fetch_index_v2_with<F>(
+    mut fetch: F,
+    verify_key: &VerifyingKey,
+) -> Result<Option<IndexV2>, String>
 where
     F: FnMut(&str) -> Result<Option<IndexV2>, String>,
 {
@@ -3600,7 +3603,11 @@ mod tests {
                 .unwrap_err();
                 assert!(error.contains("404"), "{error}");
                 assert!(
-                    error.contains(if invalid_signature { "signature" } else { "503" }),
+                    error.contains(if invalid_signature {
+                        "signature"
+                    } else {
+                        "503"
+                    }),
                     "{error}"
                 );
             }
