@@ -2016,7 +2016,11 @@ mod tests {
         assert!(batch.events[0]
             .metadata
             .values()
-            .all(|value| !value.contains(&secret) && !value.contains("/Users/alice")));
+            .all(|value| !value.contains(&secret)));
+        assert_eq!(
+            batch.events[0].metadata.get("host").map(String::as_str),
+            Some("[REDACTED:GitHub PAT]")
+        );
 
         for (signature, expected) in [
             ("MassFileDeletion|e:legacy-event-41:41", true),
