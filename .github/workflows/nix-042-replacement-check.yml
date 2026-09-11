@@ -1,0 +1,132 @@
+name: Nix 0.4.2 replacement package verification
+
+on:
+  push:
+    branches: [codex/nix-042-replacement-check]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-042-replacement-check
+  cancel-in-progress: true
+
+env:
+  # Published nixpkgs-unstable snapshot; its Tirith expression matches master.
+  NIXPKGS_REV: aff8a0b28396750446e5537a96461bc4facdb287
+  TIRITH_RELEASE_COMMIT: 7fd35101568bb06ee0d361dc1d4a4d193c5f60fd
+
+jobs:
+  verify:
+    if: github.repository == 'sheeki03/tirith' && github.ref == 'refs/heads/codex/nix-042-replacement-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tirith
+          persist-credentials: false
+
+      - name: Require the public tag and exact reviewed commit
+        working-directory: tirith
+        run: |
+          set -euo pipefail
+          mkdir -p ../evidence
+          [[ "$TIRITH_RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags --depth=1 origin refs/tags/v0.4.2
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$TIRITH_RELEASE_COMMIT"
+          printf '%s\n' "$TIRITH_RELEASE_COMMIT" > ../evidence/tirith-commit.txt
+          git rev-parse HEAD > ../evidence/verification-workflow-commit.txt
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NixOS/nixpkgs
+          ref: aff8a0b28396750446e5537a96461bc4facdb287
+          path: nixpkgs
+          persist-credentials: false
+          show-progress: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1; Nix 2.35.2
+        with:
+          enable_kvm: false
+          extra_nix_config: |
+            sandbox = true
+            max-jobs = 2
+            cores = 2
+            access-tokens =
+
+      - name: Prepare pinned updater and runtime shells
+        run: |
+          set -euo pipefail
+          test "$(git -C nixpkgs rev-parse HEAD)" = "$NIXPKGS_REV"
+          printf '%s\n' "$NIXPKGS_REV" > evidence/nixpkgs-commit.txt
+          nix --version > evidence/nix-version.txt
+          cp nixpkgs/pkgs/by-name/ti/tirith/package.nix evidence/package.before.nix
+          mkdir -p "$RUNNER_TEMP/nix-042-tools"
+          for attribute in nix-update bash zsh fish coreutils; do
+            nix-build nixpkgs -A "$attribute" \
+              --out-link "$RUNNER_TEMP/nix-042-tools/$attribute"
+          done 2>&1 | tee evidence/tool-builds.log
+          "$RUNNER_TEMP/nix-042-tools/nix-update/bin/nix-update" --help \
+            > evidence/nix-update-help.txt
+
+      - name: Generate the minimal upstream package bump
+        working-directory: nixpkgs
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/nix-042-tools/nix-update/bin/nix-update" \
+            --version=0.4.2 --write-commit-message ../evidence/commit-message.txt \
+            tirith 2>&1 | tee ../evidence/nix-update.log
+          python3 ../tirith/.github/scripts/verify-nix-042-package.py patch \
+            "$GITHUB_WORKSPACE/nixpkgs" "$GITHUB_WORKSPACE/evidence"
+          # Independently bind the generated tag hash to the reviewed commit.
+          nix store prefetch-file --unpack --json \
+            "https://github.com/sheeki03/tirith/archive/$TIRITH_RELEASE_COMMIT.tar.gz" \
+            > ../evidence/reviewed-source.json
+          python3 - <<'PY'
+          import json, pathlib
+          evidence = pathlib.Path('../evidence')
+          fields = json.loads((evidence / 'package-fields.json').read_text())
+          reviewed = json.loads((evidence / 'reviewed-source.json').read_text())
+          assert fields['hash'] == reviewed['hash'], 'tag source differs from reviewed commit'
+          PY
+          nix-instantiate . -A tirith 2> ../evidence/evaluation.log \
+            | tee ../evidence/derivation-path.txt
+          nix derivation show "$(cat ../evidence/derivation-path.txt)" \
+            > ../evidence/derivation.json
+
+      - name: Build the updated package with its install check
+        run: |
+          set -euo pipefail
+          nix-build nixpkgs -A tirith --out-link result \
+            2>&1 | tee evidence/package-build.log
+          nix-build nixpkgs -A tirith.src --out-link release-source \
+            2>&1 | tee evidence/source-build.log
+          nix-store --query --requisites ./result > evidence/closure.txt
+          nix path-info --closure-size ./result > evidence/closure-size.txt
+
+      - name: Check installed binaries and non-FHS shell helpers
+        run: |
+          set -euo pipefail
+          python3 tirith/.github/scripts/verify-nix-042-package.py runtime \
+            "$GITHUB_WORKSPACE/result" "$GITHUB_WORKSPACE/release-source" \
+            "$RUNNER_TEMP/nix-042-tools" "$GITHUB_WORKSPACE/evidence" \
+            2>&1 | tee evidence/runtime.log
+
+      - name: Record completed verification
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'PASS: pinned nixpkgs update, evaluation, x86_64-linux sandbox build, install check, installed CLI and shell-helper probes.' \
+            'This is an Ubuntu runner with Nix-built shells and binaries. Missing FHS paths are simulated only in private copies of the installed hooks.' \
+            'This verification workflow does not publish or update upstream pull requests. The package patch was generated by nix-update.' \
+            > evidence/RESULT.txt
+
+      - name: Preserve patch and verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tirith-0.4.2-nixpkgs-replacement-verification
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
