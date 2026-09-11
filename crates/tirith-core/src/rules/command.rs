@@ -13151,7 +13151,8 @@ mod tests {
             "command $NET_CLIENT https://denied.example/b",
             "nohup ${CLIENT} https://denied.example/c",
             "exec =curl https://denied.example/d",
-            "~/bin/curl https://denied.example/e",
+            "~/bin/c*rl https://denied.example/e",
+            "~/$NET_CLIENT https://denied.example/e2",
             "./c*rl https://denied.example/f",
         ] {
             let findings = check_network_policy(input, ShellType::Posix, &deny, &[]);
@@ -13173,6 +13174,32 @@ mod tests {
         assert!(escaped
             .iter()
             .any(|finding| finding.rule_id == RuleId::CommandNetworkDeny));
+    }
+
+    #[test]
+    fn network_policy_resolves_home_relative_command_identity() {
+        let deny = vec!["denied.example".to_string()];
+        for input in [
+            "~/bin/curl https://denied.example/e",
+            "exec ~/bin/curl https://denied.example/e",
+            "command ~/bin/curl https://denied.example/e",
+            "nohup ~/bin/curl https://denied.example/e",
+        ] {
+            let findings = check_network_policy(input, ShellType::Posix, &deny, &[]);
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::CommandNetworkDeny
+                        && finding.severity == Severity::Critical
+                }),
+                "known home-relative leader bypassed the deny boundary: {input:?} -> {findings:?}"
+            );
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+                "known home-relative leader was treated as dynamic: {input:?} -> {findings:?}"
+            );
+        }
     }
 
     #[test]
