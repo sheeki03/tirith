@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Shell initialization binds Bash, zsh, and fish hooks to the running native executable, so npm and other process-spawning launchers no longer prevent strict receipt registration. The npm launcher also preserves signal termination instead of reporting success.
+- Sourcing `shell/tirith.sh` locates its own directory correctly in Bash and zsh, including installations with spaces or apostrophes in the path.
+- Long-running processes detect ThreatDB replacements within the same second and changes to the selected database path. Reloads retain signature verification and rollback protection.
+- Trial subscriptions can refresh license tokens, consistently with the database's authorization checks.
+- Daemon enrichment uses the same resolved policy as initial analysis, avoiding inconsistent decisions when configuration changes during a request.
+- Recent-log diagnostics report when older history was not searched. `explain` provides usable guidance for finding entries outside that window.
+
+### Performance
+
+- Legacy ThreatDB lookups for npm, RubyGems, Go, and Maven use the sorted package index directly. Registries with spelling aliases retain canonical lookup behavior.
+- Command analysis compiles custom rules once per request and only redacts diagnostic rule IDs when a warning is emitted. The per-thread DSL regex cache has a bounded number of retained entries.
+- Recent-log commands seek backward through a bounded suffix instead of parsing the entire audit history. Both the inspected bytes and individual line lengths are capped.
+- Bash prompt callbacks avoid unnecessary history capture subprocesses while preserving typed-command and history-change checks.
+
 ## [0.4.1] - 2026-09-02
 
 ### Added
