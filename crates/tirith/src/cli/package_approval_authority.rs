@@ -234,34 +234,6 @@ impl PackageApprovalIssuer for NativePackageApprovalAuthority {
     }
 }
 
-#[cfg(test)]
-mod availability_tests {
-    use super::PackageApprovalAvailability;
-
-    #[test]
-    fn capability_is_explicit_and_missing_prerequisites_do_not_disable_protection() {
-        for platform in [false, true] {
-            for sudo in [false, true] {
-                for helper in [false, true] {
-                    let report =
-                        PackageApprovalAvailability::from_prerequisites(platform, sudo, helper);
-                    assert!(!report.automatic_elevation);
-                    assert!(!report.ordinary_protection_requires_sudo);
-                    assert_eq!(
-                        report.require_explicit_issuance().is_ok(),
-                        platform && sudo && helper
-                    );
-                    if platform && !sudo {
-                        assert!(report.detail.contains("off"));
-                        assert!(report.detail.contains("/usr/bin/sudo"));
-                        assert!(report.next_action.contains("Only if you need"));
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(not(unix))]
 impl PackageApprovalIssuer for NativePackageApprovalAuthority {
     fn issue(
@@ -353,5 +325,33 @@ mod tests {
             .unwrap_err()
             .to_string()
             .starts_with("blocked_native:"));
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::PackageApprovalAvailability;
+
+    #[test]
+    fn capability_is_explicit_and_missing_prerequisites_do_not_disable_protection() {
+        for platform in [false, true] {
+            for sudo in [false, true] {
+                for helper in [false, true] {
+                    let report =
+                        PackageApprovalAvailability::from_prerequisites(platform, sudo, helper);
+                    assert!(!report.automatic_elevation);
+                    assert!(!report.ordinary_protection_requires_sudo);
+                    assert_eq!(
+                        report.require_explicit_issuance().is_ok(),
+                        platform && sudo && helper
+                    );
+                    if platform && !sudo {
+                        assert!(report.detail.contains("off"));
+                        assert!(report.detail.contains("/usr/bin/sudo"));
+                        assert!(report.next_action.contains("Only if you need"));
+                    }
+                }
+            }
+        }
     }
 }
