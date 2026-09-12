@@ -81,26 +81,38 @@ build pass. The real exited-leader Windows control must retain the known child's
 PID, creation time and image before cleanup and still confirm its termination.
 
 
-## Compiler telemetry during CI builds
+## Compiler tools during CI builds
 
-Native job 103588206856 at `8fb0fbe9` retained a live owned `vctip.exe` after
-Cargo exited successfully. Microsoft documents this as the VC++ telemetry
-uploader. The hosted controller temporarily opts out of optional Visual Studio
-telemetry through the documented `OptIn=0` DWORD at
-`HKLM\Software\Policies\Microsoft\VisualStudio\SQM`, in both explicit registry
-views. The policy is scoped separately around Cargo build and doctests; original
-key/value existence, value type and unexpanded data are restored in `finally`
-before the ordinary or standard-account product harnesses run.
+Native jobs at `8fb0fbe9` and `aa530138` retained a live owned MSVC
+`vctip.exe` after Cargo exited successfully. The temporary Visual Studio
+telemetry policy applied/restored correctly but did not prevent that lifecycle;
+it has been removed. Every surviving descendant still fails the build.
 
-`compiler_telemetry` evidence includes documentation URLs, the two fixed key
-readbacks, and restoration results. Arbitrary prior registry contents are retained
-only in memory for exact restoration. Restoration errors fail qualification. The
-native runner contract checks readback and restoration; the next actual native
-build must prove that the telemetry helper no longer survives. There is no
-process-name exception, detached child, executable deletion or relaxed timeout/
-cleanup gate. A remaining descendant, including `vctip.exe`, still fails.
+This hosted qualification job explicitly uses the installed LLVM `clang-cl`,
+`llvm-lib`, and `lld-link` at `C:\Program Files\LLVM\bin` while retaining the
+`x86_64-pc-windows-msvc` Rust target and Windows SDK/runtime. It therefore
+qualifies Windows/MSVC ABI behavior with LLVM C compilation and linking, and
+does not claim to qualify Microsoft's `cl.exe` or `link.exe` implementations.
+Missing tools, reparse-point inputs, inconsistent versions, unexpected driver
+output, or a non-MSVC compiler target refuse before compilation. No PATH or
+project compiler preference supplies a replacement executable.
 
-Microsoft's Build Tools documentation specifies HKLM settings; no unsupported
-per-user opt-out is assumed for VS18. This temporary setting is restricted to
-the existing disposable hosted Windows controller and does not change product
-installer or account defaults.
+`compiler-tools.json` records fixed absolute paths, sizes, SHA256 hashes, PE
+versions, bounded driver probes, selected child environment and source URLs.
+Read-only handles pin these tools through build and doctests. `llvm-lib` has no
+version command, so its PE VERSIONINFO version is combined with the documented
+LLVM Lib help marker; all three versions must agree. Native probes themselves
+must pass the same owned Job, exit, EOF, and cleanup checks as all other runs.
+
+The child-only environment sets every documented `cc` 1.2.55 CC/CXX/AR
+host/target spelling, a fixed Cargo target linker, and encoded Rust/rustdoc
+linker flags. This explicit CI profile replaces ambient/project rustflags and
+compiler wrappers. Native host mode (no `--target` and no inherited `CARGO_BUILD_TARGET`) ensures
+linker flags also cover build-script and proc-macro compilation. Project,
+ancestor and Cargo-home configuration files refuse instead of overriding this
+fixed profile; the controller explicitly selects the installed stable MSVC Rust
+toolchain and verifies its verbose host identity before Cargo runs. It does not change
+process-wide environment, installed tools, registry, product account defaults,
+Cargo.lock, or product harness cleanup. Compiler debug output is bounded by the
+existing build log limits. The next full native build must still prove absence
+of surviving helpers; portable fixture success is not that proof.

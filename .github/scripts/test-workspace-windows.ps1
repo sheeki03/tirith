@@ -14,14 +14,14 @@ if (-not [Security.Principal.WindowsPrincipal]::new($identity).IsInRole([Securit
     throw 'CI provisioning requires its existing administrator token'
 }
 . (Join-Path $PSScriptRoot 'windows-test-common.ps1')
-. (Join-Path $PSScriptRoot 'windows-compiler-telemetry.ps1')
+. (Join-Path $PSScriptRoot 'windows-compiler-tools.ps1')
 Add-Type -Path (Join-Path $PSScriptRoot 'windows-test-process.cs')
 $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
 if ((Get-Location).Path -ine $workspace) { throw 'Run this controller from the checked-out workspace root' }
 if (Test-Path -LiteralPath $EvidenceDirectory) { throw 'Evidence destination must be fresh' }
 New-Item -ItemType Directory -Path $EvidenceDirectory | Out-Null
 $EvidenceDirectory = (Get-Item -LiteralPath $EvidenceDirectory).FullName
-$report = [ordered]@{ schema = 1; success = $false; build = $null; compiler_telemetry = @(); harnesses = @(); doctests = $null; standard_account = $null; cleanup = @(); errors = @() }
+$report = [ordered]@{ schema = 1; success = $false; build = $null; compiler_tools = $null; harnesses = @(); doctests = $null; standard_account = $null; cleanup = @(); errors = @() }
 $leases = [Collections.Generic.List[IO.FileStream]]::new()
 $aclPaths = [Collections.Generic.List[string]]::new()
 $newUser = $null
@@ -30,6 +30,7 @@ $profile = $null
 $stage = $null
 $jobsClean = $true
 $buildSucceeded = $false
+$compilerTools = $null
 
 function Add-CiAccountReadAccess([string]$Path, [Security.Principal.SecurityIdentifier]$Sid) {
     $acl = Get-Acl -LiteralPath $Path
@@ -63,21 +64,18 @@ try {
     $cargo = (Get-Command cargo.exe -CommandType Application -ErrorAction Stop).Source
     $rustc = (Get-Command rustc.exe -CommandType Application -ErrorAction Stop).Source
     $powershell = Get-CiFilePin (Join-Path $PSHOME 'pwsh.exe')
-    $metadataRun = [TirithCi.ProcessRunner]::Run($cargo, @('metadata', '--format-version', '1', '--no-deps', '--locked'), $workspace, $null, 120, 16777216)
+    $compilerTools = Get-CiCompilerTools $EvidenceDirectory $workspace $leases
+    $report.compiler_tools = $compilerTools.Evidence
+    $metadataRun = [TirithCi.ProcessRunner]::Run($cargo, @('metadata', '--format-version', '1', '--no-deps', '--locked'), $workspace, $compilerTools.Environment, 120, 16777216)
     Assert-CiProcessSucceeded $metadataRun
     $metadata = $metadataRun.Stdout | ConvertFrom-Json -Depth 60
-    $buildTelemetry = New-CiCompilerTelemetryScope 'cargo-build'
-    $report.compiler_telemetry += $buildTelemetry.Evidence
-    try {
-        Set-CiCompilerTelemetryOptOut $buildTelemetry
-        $build = [TirithCi.ProcessRunner]::Run($cargo, @('test', '--workspace', '--locked', '--no-run', '--message-format=json'), $workspace, $null, 1800, 67108864)
-        $report.build = Save-CiProcessResult $EvidenceDirectory 'cargo-build' $build
-    } finally { Restore-CiCompilerTelemetryScope $buildTelemetry }
+    $build = [TirithCi.ProcessRunner]::Run($cargo, [string[]]($compilerTools.CargoArguments + @('test', '--workspace', '--locked', '--no-run', '--message-format=json')), $workspace, $compilerTools.Environment, 1800, 67108864)
+    $report.build = Save-CiProcessResult $EvidenceDirectory 'cargo-build' $build
     Assert-CiProcessSucceeded $build
     $inventory = @(Get-CiArtifactInventory $build.Stdout $metadata)
     $cli = Get-CiCompanionArtifact $build.Stdout $metadata
     $dashboard = @($inventory | Where-Object { $_.package_name -eq 'tirith' -and $_.target -eq 'control_dashboard' -and 'test' -in $_.kind })[0]
-    $libdir = [TirithCi.ProcessRunner]::Run($rustc, @('--print', 'target-libdir'), $workspace, $null, 30, 65536)
+    $libdir = [TirithCi.ProcessRunner]::Run($rustc, @('--print', 'target-libdir'), $workspace, $compilerTools.Environment, 30, 65536)
     Assert-CiProcessSucceeded $libdir
     $binaryDirectory = [IO.Path]::GetDirectoryName($cli.path)
     $runtimePaths = @(Get-CiRuntimePaths $build.Stdout $metadata.target_directory $binaryDirectory $libdir.Stdout.Trim())
@@ -226,20 +224,17 @@ try {
     if ($report.harnesses.Count -ne $inventory.Count) { throw 'Workspace execution omitted a retained test artifact' }
 } catch { $report.errors += $_.Exception.Message }
 finally {
-    foreach ($lease in $leases) { $lease.Dispose() }
+    # Keep compiler input leases through the final doctest build as well.
     # Doctests are not present in --no-run compiler-artifact output. Preserve
     # their coverage even when a build, harness or account qualification fails.
     try {
         $cargoForDocs = (Get-Command cargo.exe -CommandType Application -ErrorAction Stop).Source
-        $docsTelemetry = New-CiCompilerTelemetryScope 'cargo-doctests'
-        $report.compiler_telemetry += $docsTelemetry.Evidence
-        try {
-            Set-CiCompilerTelemetryOptOut $docsTelemetry
-            $docs = [TirithCi.ProcessRunner]::Run($cargoForDocs, @('test', '--workspace', '--doc', '--locked', '--no-fail-fast'), $workspace, $null, 900, 33554432)
-            $report.doctests = Save-CiProcessResult $EvidenceDirectory 'cargo-doctests' $docs
-        } finally { Restore-CiCompilerTelemetryScope $docsTelemetry }
+        if ($null -eq $compilerTools) { throw 'Required LLVM compiler profile was not qualified; refusing fallback tools' }
+        $docs = [TirithCi.ProcessRunner]::Run($cargoForDocs, [string[]]($compilerTools.CargoArguments + @('test', '--workspace', '--doc', '--locked', '--no-fail-fast')), $workspace, $compilerTools.Environment, 900, 33554432)
+        $report.doctests = Save-CiProcessResult $EvidenceDirectory 'cargo-doctests' $docs
         Assert-CiProcessSucceeded $docs
     } catch { $report.errors += ('Doctests: ' + $_.Exception.Message) }
+    foreach ($lease in $leases) { $lease.Dispose() }
     if ($null -ne $newUser) {
         try {
             if (-not $jobsClean) { throw 'Native job cleanup was not confirmed; account/profile cleanup withheld' }

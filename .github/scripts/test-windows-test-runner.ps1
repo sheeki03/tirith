@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-test-common.ps1')
-. (Join-Path $PSScriptRoot 'windows-compiler-telemetry.ps1')
+. (Join-Path $PSScriptRoot 'windows-compiler-tools.ps1')
 Add-Type -Path (Join-Path $PSScriptRoot 'windows-test-process.cs')
 $passed = 0
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
@@ -11,32 +11,44 @@ function Assert-Refuses([scriptblock]$Action, [string]$Message) {
     Assert-True $refused $Message
 }
 
-if ($IsWindows -and $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_OS -ceq 'Windows' -and
-    $env:RUNNER_ENVIRONMENT -ceq 'github-hosted') {
-    $telemetryScope = New-CiCompilerTelemetryScope 'native-runner-contract'
-    try {
-        Set-CiCompilerTelemetryOptOut $telemetryScope
-        Assert-True $telemetryScope.Evidence.applied 'Compiler telemetry opt-out did not apply'
-        Assert-True ($telemetryScope.Evidence.settings.Count -eq 2) 'Compiler telemetry registry views omitted'
-        foreach ($setting in $telemetryScope.Evidence.settings) {
-            Assert-True ($setting.readback_kind -ceq 'DWord' -and $setting.readback_value -eq 0) 'Compiler telemetry readback was not DWORD zero'
-        }
-    } finally { Restore-CiCompilerTelemetryScope $telemetryScope }
-    Assert-True $telemetryScope.Evidence.restored 'Compiler telemetry prior state was not restored'
+$compilerPlan = Get-CiCompilerToolPlan
+Assert-True ($compilerPlan.Tools.Count -eq 3) 'Compiler tool inventory changed'
+foreach ($entry in @(@('CC', 'clang-cl.exe'), @('CXX', 'clang-cl.exe'), @('AR', 'llvm-lib.exe'))) {
+    foreach ($name in @(($entry[0] + '_x86_64-pc-windows-msvc'), ($entry[0] + '_x86_64_pc_windows_msvc'), ('HOST_' + $entry[0]), ('TARGET_' + $entry[0]), $entry[0])) {
+        Assert-True ($compilerPlan.Environment[$name] -ceq ('C:\Program Files\LLVM\bin\' + $entry[1])) ('Compiler environment omitted ' + $name)
+    }
+}
+Assert-True ($compilerPlan.Environment['CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER'] -ceq 'C:\Program Files\LLVM\bin\lld-link.exe') 'Rust linker selection changed'
+Assert-True ($compilerPlan.Environment['CARGO_ENCODED_RUSTFLAGS'] -ceq '-Clinker=C:\Program Files\LLVM\bin\lld-link.exe') 'Encoded linker argument split its path'
+Assert-True ($compilerPlan.Environment['CARGO_ENCODED_RUSTDOCFLAGS'] -ceq $compilerPlan.Environment['CARGO_ENCODED_RUSTFLAGS']) 'Doctest linker differs'
+Assert-True ($compilerPlan.Environment['RUSTC_WRAPPER'] -ceq '' -and $compilerPlan.Environment['RUSTC_WORKSPACE_WRAPPER'] -ceq '') 'Ambient compiler wrapper accepted'
+Assert-True ($compilerPlan.CargoArguments.Count -eq 0 -and $null -eq $compilerPlan.Environment['CARGO_BUILD_TARGET']) 'Compiler profile did not retain native host build mode'
+Assert-True ($compilerPlan.Environment['RUSTUP_TOOLCHAIN'] -ceq 'stable-x86_64-pc-windows-msvc') 'Project Rust toolchain preference accepted'
+$passed++
+$tool = $compilerPlan.Tools[0]
+$toolPin = [ordered]@{ path = $tool.path; size = 100; sha256 = ('a' * 64) }
+$toolOutput = "clang version 20.1.8`nTarget: x86_64-pc-windows-msvc`n"
+Assert-CiCompilerToolIdentity $tool $toolPin '20.1.8' $toolOutput
+$passed++
+foreach ($index in @(1, 2)) {
+    $otherTool = $compilerPlan.Tools[$index]
+    $otherPin = [ordered]@{ path = $otherTool.path; size = 100; sha256 = ('b' * 64) }
+    $otherOutput = if ($index -eq 1) { "OVERVIEW: LLVM Lib`nUSAGE: llvm-lib [options] file...`n" } else { 'LLD 20.1.8' }
+    Assert-CiCompilerToolIdentity $otherTool $otherPin '20.1.8' $otherOutput
+    Assert-Refuses { Assert-CiCompilerToolIdentity $otherTool $otherPin '20.1.8' 'unrelated tool' } 'Wrong LLVM driver accepted'
+    $passed += 2
+}
+foreach ($bad in @('0.0.0', '', '20.1.9')) {
+    Assert-Refuses { Assert-CiCompilerToolIdentity $tool $toolPin $bad $toolOutput } 'Missing or inconsistent tool version accepted'
     $passed++
-    $failedTelemetryScope = New-CiCompilerTelemetryScope 'native-runner-failure-contract'
-    Assert-Refuses {
-        try {
-            Set-CiCompilerTelemetryOptOut $failedTelemetryScope
-            throw 'Injected compiler-phase failure'
-        } finally { Restore-CiCompilerTelemetryScope $failedTelemetryScope }
-    } 'Injected compiler-phase failure was lost'
-    Assert-True ($failedTelemetryScope.Evidence.applied -and $failedTelemetryScope.Evidence.restored) 'Compiler failure did not restore telemetry state'
-    $passed++
-} elseif (-not $IsWindows) {
-    $telemetryScope = New-CiCompilerTelemetryScope 'non-windows-refusal'
-    Assert-Refuses { Set-CiCompilerTelemetryOptOut $telemetryScope } 'Non-Windows compiler telemetry mutation accepted'
-    Assert-True ($telemetryScope.States.Count -eq 0) 'Non-Windows compiler telemetry changed state'
+}
+Assert-Refuses { Assert-CiCompilerToolIdentity $tool $toolPin '20.1.8' 'unrelated tool' } 'Wrong compiler driver accepted'
+Assert-Refuses { Assert-CiCompilerToolIdentity $tool $toolPin '20.1.8' $toolOutput.Replace('x86_64-pc-windows-msvc', 'x86_64-w64-windows-gnu') } 'Wrong compiler target accepted'
+$toolPin.path = 'C:\project\clang-cl.exe'
+Assert-Refuses { Assert-CiCompilerToolIdentity $tool $toolPin '20.1.8' $toolOutput } 'Project compiler path accepted'
+$passed += 3
+if (-not $IsWindows) {
+    Assert-Refuses { Get-CiCompilerTools '' '' $null } 'Non-Windows compiler profile accepted'
     $passed++
 }
 
@@ -127,6 +139,29 @@ $tempBase = if ($IsMacOS) { '/private/tmp' } else { [IO.Path]::GetTempPath() }
 $temp = Join-Path $tempBase ('tirith-ci-contract-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $temp | Out-Null
 try {
+    Assert-CiCompilerConfiguration $temp
+    $passed++
+    $configDirectory = Join-Path $temp '.cargo'
+    New-Item -ItemType Directory -Path $configDirectory | Out-Null
+    foreach ($configName in @('config', 'config.toml')) {
+        $configPath = Join-Path $configDirectory $configName
+        [IO.File]::WriteAllText($configPath, '[build]')
+        try { Assert-Refuses { Assert-CiCompilerConfiguration $temp } 'Project Cargo compiler configuration accepted' }
+        finally { Remove-Item -LiteralPath $configPath }
+        $passed++
+    }
+    Remove-Item -LiteralPath $configDirectory -Force
+    if ($IsWindows -and $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted') {
+        $compilerLeases = [Collections.Generic.List[IO.FileStream]]::new()
+        try {
+            $nativeTools = Get-CiCompilerTools $temp $temp $compilerLeases
+            Assert-True ($nativeTools.Evidence.tools.Count -eq 3) 'Native compiler tool probes were omitted'
+            foreach ($entry in $nativeTools.Evidence.tools) {
+                Assert-True ($entry.probe.native_job -and $entry.probe.job_empty -and $entry.probe.leader_reaped -and $entry.probe.output_drained -and -not $entry.probe.descendants_leaked) 'Native compiler probe bypassed process cleanup'
+            }
+        } finally { foreach ($lease in $compilerLeases) { $lease.Dispose() } }
+        $passed++
+    }
     $target = Join-Path $temp 'target'
     New-Item -ItemType Directory -Path $target | Out-Null
     $file = Join-Path $target 'control_dashboard.exe'
@@ -265,10 +300,11 @@ exit 0
 } finally { Remove-Item -LiteralPath $temp -Recurse -Force }
 
 # Parse all entry points without invoking account provisioning on this host.
-foreach ($name in @('test-workspace-windows.ps1', 'windows-standard-test-worker.ps1', 'windows-test-common.ps1', 'windows-compiler-telemetry.ps1')) {
+foreach ($name in @('test-workspace-windows.ps1', 'windows-standard-test-worker.ps1', 'windows-test-common.ps1', 'windows-compiler-tools.ps1')) {
     $tokens = $null; $errors = $null
     [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $name), [ref]$tokens, [ref]$errors) | Out-Null
     Assert-True ($errors.Count -eq 0) ("PowerShell syntax error in $name`: " + ($errors -join '; '))
     $passed++
 }
-Write-Host "$passed Windows runner parser and bounded-process contracts passed; native Windows token/logon/job/ACL gates are not exercised by this script."
+Write-Host "$passed Windows runner parser and bounded-process contracts passed; token/logon/account/ACL qualification requires the separate Windows controller."
+if (-not $IsWindows) { Write-Host 'Portable result only: native Windows Job and installed compiler-tool probes were not executed.' }
