@@ -2315,7 +2315,53 @@ fn normalize_bound_target_policy(
     Ok((filesystem, requested_target_policy))
 }
 
-/// Production `pkg install` seam: execute a content-bound program against immutable
+/// Qualification refusal for the package-only private named-input backend.
+/// Generic capsule coverage does not establish this additional input-lifetime
+/// guarantee. There is deliberately no environment, flag, or test override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrivateInputExecutionRefusal {
+    InputLifetimeUnqualified,
+}
+
+impl std::fmt::Display for PrivateInputExecutionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputLifetimeUnqualified => f.write_str(
+                "private_input_execution_unqualified: contained package execution is disabled; \
+                 the private-input backend has not been qualified to keep package inputs \
+                 unchanged throughout execution against another process owned by the same user. \
+                 Sudo or administrator access does not qualify this backend. Package inspection \
+                 and ordinary command protection remain available.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PrivateInputExecutionRefusal {}
+
+impl PrivateInputExecutionRefusal {
+    pub(crate) fn into_capsule_refusal(self, spec: &CapsuleSpec) -> CapsuleRefused {
+        CapsuleRefused {
+            backend_id: select_backend(spec).backend_id,
+            reason: self.to_string(),
+        }
+    }
+}
+
+/// A single production decision shared by the public install command, its
+/// side-effect seam, and both sides of the hidden private-input launcher.
+/// Re-enabling requires a reviewed implementation and native qualification of
+/// immutable named inputs for the complete target lifetime.
+pub(crate) fn require_private_input_execution_qualification(
+) -> Result<(), PrivateInputExecutionRefusal> {
+    Err(PrivateInputExecutionRefusal::InputLifetimeUnqualified)
+}
+
+/// Disabled production `pkg install` seam. Qualification refuses before target
+/// binding, input staging, or hidden-launcher creation. The retained implementation
+/// below is not an enabled capability.
+///
+/// Intended contract: execute a content-bound program against immutable
 /// named inputs and one held writable target directory. x86_64 Linux constructs a
 /// private user+mount namespace in the hidden launcher, exposes only sealed
 /// bind-mounted input names, installs the target Landlock WRITE rule from the
@@ -2332,6 +2378,8 @@ pub fn run_to_completion_bound_inputs(
     extra_env: &[(String, String)],
     output_presentation: BoundOutputPresentation,
 ) -> Result<CapsuleExecutionOutcome, CapsuleExecutionError> {
+    require_private_input_execution_qualification()
+        .map_err(|error| error.into_capsule_refusal(spec))?;
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (

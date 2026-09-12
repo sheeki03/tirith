@@ -130,6 +130,23 @@ pub struct ParsedArgs {
     pub program_args: Vec<OsString>,
 }
 
+impl ParsedArgs {
+    fn require_private_input_execution_qualification(
+        &self,
+    ) -> Result<(), crate::cli::capsule::PrivateInputExecutionRefusal> {
+        if self.staging_root.is_some()
+            || self.staging_fd.is_some()
+            || !self.inputs.is_empty()
+            || self.target_dir_fd.is_some()
+            || self.target_dir_root.is_some()
+            || self.target_dir_visible_root.is_some()
+        {
+            crate::cli::capsule::require_private_input_execution_qualification()?;
+        }
+        Ok(())
+    }
+}
+
 /// Parse `tirith __capsule-child <spec-json> [internal options] -- <prog>
 /// <arg>...` from the full process argv. Internal options are closed and may
 /// appear at most once: `--target-argv0 <value>`, `--target-fd <number>`,
@@ -490,6 +507,13 @@ pub fn run_on_main_thread(args: &[OsString]) -> ! {
             std::process::exit(2);
         }
     };
+    // The hidden CLI is callable independently of the parent launch helper.
+    // Check before dispatch on every OS: accepting private-input operands must
+    // never silently downgrade them to an ordinary pathname-based launch.
+    if let Err(error) = parsed.require_private_input_execution_qualification() {
+        eprintln!("tirith __capsule-child: {error}");
+        std::process::exit(2);
+    }
     #[cfg(target_os = "linux")]
     {
         linux_launch(&parsed)
@@ -957,6 +981,10 @@ fn enter_private_input_namespace(
 ) -> Result<(), String> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
+    // Recheck at the namespace boundary so a later internal refactor cannot
+    // bypass the qualification decision made by hidden-command dispatch.
+    crate::cli::capsule::require_private_input_execution_qualification()
+        .map_err(|error| error.to_string())?;
     let host_uid = unsafe { libc::geteuid() };
     let host_gid = unsafe { libc::getegid() };
     if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
@@ -2542,6 +2570,7 @@ mod tests {
             "pip",
         ]);
         let p = parse_args(&a).expect("parse");
+        assert!(p.require_private_input_execution_qualification().is_ok());
         assert_eq!(p.spec_json, "{\"network\":{\"mode\":\"deny_all\"}}");
         assert_eq!(p.program, "/usr/bin/python3");
         assert_eq!(
@@ -2554,6 +2583,7 @@ mod tests {
     fn parse_args_program_with_no_args() {
         let a = argv(&["tirith", "__capsule-child", "{}", "--", "ls"]);
         let p = parse_args(&a).expect("parse");
+        assert!(p.require_private_input_execution_qualification().is_ok());
         assert_eq!(p.program, "ls");
         assert!(p.program_args.is_empty());
     }
@@ -2624,6 +2654,9 @@ mod tests {
             &[&base[..], &["--", "/bin/sh", "-c", "npm test"]].concat(),
         ))
         .expect("parse a bound work directory");
+        assert!(parsed
+            .require_private_input_execution_qualification()
+            .is_ok());
         assert_eq!(parsed.work_fd, Some(57));
         assert_eq!(
             parsed.work_root.as_deref(),
@@ -2710,6 +2743,10 @@ mod tests {
             "pip",
         ]);
         let parsed = parse_args(&a).expect("parse sealed-input capabilities");
+        assert_eq!(
+            parsed.require_private_input_execution_qualification(),
+            Err(crate::cli::capsule::PrivateInputExecutionRefusal::InputLifetimeUnqualified)
+        );
         assert_eq!(parsed.coverage_status_fd, Some(61));
         assert_eq!(parsed.staging_fd, Some(57));
         assert_eq!(
@@ -2732,6 +2769,14 @@ mod tests {
             parsed.target_dir_visible_root.as_deref(),
             Some(OsStr::new("/tmp/pending-venv"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_input_namespace_refuses_before_descriptor_or_namespace_operations() {
+        let error = enter_private_input_namespace(-1, &[])
+            .expect_err("unqualified backend must refuse before opening descriptors");
+        assert!(error.starts_with("private_input_execution_unqualified:"));
     }
 
     #[test]
