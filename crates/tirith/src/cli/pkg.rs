@@ -1015,13 +1015,10 @@ fn run_approve(
     artifact_origin: &[String],
     json: bool,
 ) -> i32 {
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return report_approve_error(
-            "native_authority",
-            "blocked_native: package approvals are redeemable only on x86_64 Linux",
-            json,
-            1,
-        );
+    if let Err(error) =
+        super::package_approval_authority::availability().require_explicit_issuance()
+    {
+        return report_approve_error("native_authority", &error.to_string(), json, 1);
     }
     if let Some(failure) = precheck(ecosystem, requirements) {
         return report_approve_error("precheck", &failure.reason, json, failure.exit_code);

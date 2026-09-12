@@ -7,7 +7,6 @@ arch=('x86_64' 'aarch64')
 url='https://github.com/sheeki03/tirith'
 license=('AGPL-3.0-only')
 depends=('gcc-libs')
-optdepends_x86_64=('sudo: fresh administrator confirmation for tirith pkg approve')
 makedepends=('cargo' 'base-devel')
 options=(!lto)
 install=tirith.install
