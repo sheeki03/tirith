@@ -601,9 +601,13 @@ main() {
   info "To uninstall:"
   info "  rm ${INSTALL_DIR}/tirith"
   if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
-    info "  sudo rm /usr/local/libexec/tirith-package-approval-authority"
-    info "  sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous"
-    info "  sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent"
+    helper_remove_command="rm"
+    if [ "$(id -u)" -ne 0 ]; then
+      helper_remove_command="sudo rm"
+    fi
+    info "  ${helper_remove_command} /usr/local/libexec/tirith-package-approval-authority"
+    info "  ${helper_remove_command} -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous"
+    info "  ${helper_remove_command} -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent"
   fi
 }
 
