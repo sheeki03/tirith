@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-test-common.ps1')
+. (Join-Path $PSScriptRoot 'windows-compiler-telemetry.ps1')
 Add-Type -Path (Join-Path $PSScriptRoot 'windows-test-process.cs')
 $passed = 0
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
@@ -9,6 +10,36 @@ function Assert-Refuses([scriptblock]$Action, [string]$Message) {
     try { & $Action | Out-Null } catch { $refused = $true }
     Assert-True $refused $Message
 }
+
+if ($IsWindows -and $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_OS -ceq 'Windows' -and
+    $env:RUNNER_ENVIRONMENT -ceq 'github-hosted') {
+    $telemetryScope = New-CiCompilerTelemetryScope 'native-runner-contract'
+    try {
+        Set-CiCompilerTelemetryOptOut $telemetryScope
+        Assert-True $telemetryScope.Evidence.applied 'Compiler telemetry opt-out did not apply'
+        Assert-True ($telemetryScope.Evidence.settings.Count -eq 2) 'Compiler telemetry registry views omitted'
+        foreach ($setting in $telemetryScope.Evidence.settings) {
+            Assert-True ($setting.readback_kind -ceq 'DWord' -and $setting.readback_value -eq 0) 'Compiler telemetry readback was not DWORD zero'
+        }
+    } finally { Restore-CiCompilerTelemetryScope $telemetryScope }
+    Assert-True $telemetryScope.Evidence.restored 'Compiler telemetry prior state was not restored'
+    $passed++
+    $failedTelemetryScope = New-CiCompilerTelemetryScope 'native-runner-failure-contract'
+    Assert-Refuses {
+        try {
+            Set-CiCompilerTelemetryOptOut $failedTelemetryScope
+            throw 'Injected compiler-phase failure'
+        } finally { Restore-CiCompilerTelemetryScope $failedTelemetryScope }
+    } 'Injected compiler-phase failure was lost'
+    Assert-True ($failedTelemetryScope.Evidence.applied -and $failedTelemetryScope.Evidence.restored) 'Compiler failure did not restore telemetry state'
+    $passed++
+} elseif (-not $IsWindows) {
+    $telemetryScope = New-CiCompilerTelemetryScope 'non-windows-refusal'
+    Assert-Refuses { Set-CiCompilerTelemetryOptOut $telemetryScope } 'Non-Windows compiler telemetry mutation accepted'
+    Assert-True ($telemetryScope.States.Count -eq 0) 'Non-Windows compiler telemetry changed state'
+    $passed++
+}
+
 $names = @(
     'activity_starts_with_newest_checks_and_pages_older_without_shifting_on_append',
     'real_service_reuses_identity_and_rejects_unauthorized_mutations',
@@ -234,7 +265,7 @@ exit 0
 } finally { Remove-Item -LiteralPath $temp -Recurse -Force }
 
 # Parse all entry points without invoking account provisioning on this host.
-foreach ($name in @('test-workspace-windows.ps1', 'windows-standard-test-worker.ps1', 'windows-test-common.ps1')) {
+foreach ($name in @('test-workspace-windows.ps1', 'windows-standard-test-worker.ps1', 'windows-test-common.ps1', 'windows-compiler-telemetry.ps1')) {
     $tokens = $null; $errors = $null
     [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $name), [ref]$tokens, [ref]$errors) | Out-Null
     Assert-True ($errors.Count -eq 0) ("PowerShell syntax error in $name`: " + ($errors -join '; '))

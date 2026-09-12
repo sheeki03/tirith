@@ -79,3 +79,28 @@ A compiler/PDB server is a hypothesis until its owned image is observed. Do not
 allowlist a process name, detach it, or lengthen the grace period merely to make a
 build pass. The real exited-leader Windows control must retain the known child's
 PID, creation time and image before cleanup and still confirm its termination.
+
+
+## Compiler telemetry during CI builds
+
+Native job 103588206856 at `8fb0fbe9` retained a live owned `vctip.exe` after
+Cargo exited successfully. Microsoft documents this as the VC++ telemetry
+uploader. The hosted controller temporarily opts out of optional Visual Studio
+telemetry through the documented `OptIn=0` DWORD at
+`HKLM\Software\Policies\Microsoft\VisualStudio\SQM`, in both explicit registry
+views. The policy is scoped separately around Cargo build and doctests; original
+key/value existence, value type and unexpanded data are restored in `finally`
+before the ordinary or standard-account product harnesses run.
+
+`compiler_telemetry` evidence includes documentation URLs, the two fixed key
+readbacks, and restoration results. Arbitrary prior registry contents are retained
+only in memory for exact restoration. Restoration errors fail qualification. The
+native runner contract checks readback and restoration; the next actual native
+build must prove that the telemetry helper no longer survives. There is no
+process-name exception, detached child, executable deletion or relaxed timeout/
+cleanup gate. A remaining descendant, including `vctip.exe`, still fails.
+
+Microsoft's Build Tools documentation specifies HKLM settings; no unsupported
+per-user opt-out is assumed for VS18. This temporary setting is restricted to
+the existing disposable hosted Windows controller and does not change product
+installer or account defaults.
