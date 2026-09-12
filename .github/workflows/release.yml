@@ -1534,7 +1534,7 @@ jobs:
             rpm -qlp "${rpms[0]}" | grep -qx /usr/libexec/tirith-package-approval-authority
             for relation in requires recommends suggests supplements enhances; do
               if rpm -qp "--${relation}" "${rpms[0]}" \
-                  | grep -Eq '(^|[[:space:]])sudo([[:space:]]|$)'; then
+                  | grep -Eq "(^|[[:space:]])sudo([[:space:]]|$)"; then
                 echo "ERROR: RPM must neither depend on nor suggest sudo"
                 exit 1
               fi
