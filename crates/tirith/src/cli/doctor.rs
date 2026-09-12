@@ -2494,11 +2494,11 @@ fn print_protection_status(status: Option<&str>) {
 }
 
 fn print_human(info: &DoctorInfo) {
+    println!("tirith {}", info.version);
+    println!("  binary:       {}", info.binary_path);
     println!("  pkg approval: {} (optional)", info.package_approval.state);
     println!("    {}", info.package_approval.detail);
     println!("    {}", info.package_approval.next_action);
-    println!("tirith {}", info.version);
-    println!("  binary:       {}", info.binary_path);
     // Low-value advisory: the noisy shadow-binary warning is suppressed under
     // `--quiet` (the `--fix` guidance block remains a separate, always-shown path).
     if !info.shadow_binaries.is_empty() && !crate::cli::is_quiet() {
