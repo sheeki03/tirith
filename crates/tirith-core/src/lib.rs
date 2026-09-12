@@ -68,6 +68,7 @@ pub mod policy;
 pub mod policy_client;
 mod policy_ignored;
 pub mod policy_migrations;
+pub mod policy_snapshot;
 pub mod policy_validate;
 pub mod provenance;
 pub mod receipt;

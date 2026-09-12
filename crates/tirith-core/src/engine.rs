@@ -2586,15 +2586,7 @@ pub(crate) fn analyze_file_with_pdf_coverage(ctx: &AnalysisContext) -> (Verdict,
 
 /// Resolve the effective policy and every read-only enforcement overlay once.
 fn discover_fully_resolved_policy(ctx: &AnalysisContext) -> Policy {
-    let mut policy = Policy::discover(ctx.cwd.as_deref());
-    policy.load_user_lists();
-    policy.load_org_lists(ctx.cwd.as_deref());
-    policy.load_trust_entries(ctx.cwd.as_deref());
-    // M8 ch1/ch2 — context-labels + SSH host-labels files (NOT policy.yaml),
-    // each merging a user-scope and a repo-scope file.
-    policy.load_context_labels(ctx.cwd.as_deref());
-    policy.load_ssh_host_labels(ctx.cwd.as_deref());
-    policy
+    crate::policy_snapshot::resolve_runtime_policy(ctx.cwd.as_deref())
 }
 
 /// Like [`analyze`] but also returns the loaded policy, for enforcement callers

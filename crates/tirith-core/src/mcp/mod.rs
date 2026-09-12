@@ -10,6 +10,7 @@ pub(crate) const MAX_STRUCTURED_DEPTH: usize = 128;
 pub mod content;
 pub mod dispatcher;
 pub mod origin;
+mod output_contract;
 pub mod output_filter;
 pub mod resources;
 pub mod response_inspect;

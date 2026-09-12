@@ -6439,14 +6439,20 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Show the fully-resolved effective policy for the current directory: source
-    /// path, scope, and (for a repo-scoped policy) which weakening fields were
-    /// neutralized. Local discovery only — never a network fetch.
+    /// Show local policy diagnostics, or resolve the enforcement policy with --runtime.
+    /// The default stays offline and excludes separate trust/list overlays.
     #[command(after_help = "\
 Examples:
   tirith policy effective
-  tirith policy effective --format json")]
+  tirith policy effective --local-only
+  tirith policy effective --runtime --format json")]
     Effective {
+        /// Use the enforcement resolver, including configured remote policy and overlays
+        #[arg(long, conflicts_with = "local_only")]
+        runtime: bool,
+        /// Explicit offline diagnostic (the default); excludes separate overlays
+        #[arg(long)]
+        local_only: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -8422,9 +8428,14 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::policy::validate(path_pos.or(path).as_deref(), json)
             }
-            PolicyAction::Effective { format, json } => {
+            PolicyAction::Effective {
+                format,
+                json,
+                runtime,
+                local_only: _,
+            } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::policy::effective(json)
+                cli::policy::effective(json, runtime)
             }
             PolicyAction::Test {
                 command,

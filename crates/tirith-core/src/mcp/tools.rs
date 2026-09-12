@@ -7,6 +7,7 @@ use crate::extract::ScanContext;
 use crate::scan;
 use crate::tokenize::ShellType;
 
+use super::output_contract::{redact_projection, Projection};
 use super::types::{ContentItem, ToolCallResult, ToolDefinition};
 
 /// Validate a path is within the cwd (path-traversal protection).
@@ -482,14 +483,14 @@ fn call_check_task(arguments: &Value) -> ToolCallResult {
     // The same projection the CLI prints. C11 requires the two to be equal, so
     // they render from one function instead of two that happen to agree today.
     let rejections = crate::task::validate_envelope(envelope);
-    let structured = crate::task::document_decision_projection(&document, &decision, &rejections);
+    let mut structured =
+        crate::task::document_decision_projection(&document, &decision, &rejections);
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    redact_projection(&mut structured, Projection::Task, &compiled);
 
     // The text and structured views must agree after redaction, so the text is
     // rendered FROM the same structured value rather than assembled separately.
-    let text = format!(
-        "tirith_check_task (diagnostic; nothing was executed)\n{}",
-        serde_json::to_string_pretty(&structured).unwrap_or_default()
-    );
+    let text = task_projection_text(&structured);
     ToolCallResult {
         content: vec![ContentItem {
             content_type: "text".into(),
@@ -498,6 +499,13 @@ fn call_check_task(arguments: &Value) -> ToolCallResult {
         is_error: false,
         structured_content: Some(structured),
     }
+}
+
+pub(super) fn task_projection_text(structured: &Value) -> String {
+    format!(
+        "tirith_check_task (diagnostic; nothing was executed)\n{}",
+        serde_json::to_string_pretty(structured).unwrap_or_default()
+    )
 }
 
 fn call_check_command(args: &Value) -> ToolCallResult {
@@ -804,7 +812,7 @@ fn file_scan_structured(
         "coverage_gaps": &result.coverage_gaps,
         "dlp_redaction_incomplete": compiled.incomplete_reason().is_some(),
     });
-    crate::redact::redact_json_strings(&mut structured, compiled);
+    redact_projection(&mut structured, Projection::FileScan, compiled);
     crate::verdict::bound_json_value_for_output(structured)
 }
 
@@ -1019,7 +1027,7 @@ fn build_mcp_config_response(
         "analysis_incomplete": analysis_incomplete,
         "dlp_redaction_incomplete": compiled.incomplete_reason().is_some(),
     });
-    crate::redact::redact_json_strings(&mut structured, compiled);
+    redact_projection(&mut structured, Projection::FileScan, compiled);
     let structured = crate::verdict::bound_json_value_for_output(structured);
 
     ToolCallResult {
@@ -1074,7 +1082,7 @@ fn redacted_task_boundary_projection(
     compiled: &crate::redact::CompiledCustomPatterns,
 ) -> Value {
     let mut projection = assessment.projection();
-    crate::redact::redact_json_strings(&mut projection, compiled);
+    redact_projection(&mut projection, Projection::Task, compiled);
     crate::verdict::bound_json_value_for_output(projection)
 }
 
@@ -1176,7 +1184,7 @@ fn build_cloaking_response_with_boundary(
     if let Some(task_boundary) = task_boundary {
         structured["task_boundary"] = task_boundary.clone();
     }
-    crate::redact::redact_json_strings(&mut structured, compiled);
+    redact_projection(&mut structured, Projection::Cloaking, compiled);
     // Bound AFTER redaction, like every other structured projection in this
     // module. `to_json(true)` embeds every diff plus its optional `diff_text`,
     // all of it remote-controlled, so an oversized upstream diff would otherwise

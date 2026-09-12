@@ -61,7 +61,7 @@ covers the everyday subset; this is the complete reference.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith policy {init,validate,test,tune,effective}` | Scaffold (`--template`), validate, dry-run, suggest from audit, and show the resolved effective policy with any neutralized repo fields |
+| `tirith policy {init,validate,test,tune,effective}` | Scaffold (`--template`), validate, dry-run, suggest from audit, and inspect policy. `effective` defaults to a local-only diagnostic; `effective --runtime` uses the enforcement resolver, including configured remote policy and separate overlays ([coverage](next-cycle/policy-snapshot.md)) |
 | `tirith trust {add,list,explain,diff,remove,gc,last,from-last-trigger}` | Manage trusted patterns (narrow scope, 30-day TTL by default); `from-last-trigger` turns a block into a targeted trust |
 | `tirith rule {test,validate,explain}` | Author and test custom detection rules (regex or the `when:` semantic DSL) |
 | `tirith output wrap {on,off,status}` | Install or remove the `tirith-out` wrapper that runs a command's output through `tirith view` |

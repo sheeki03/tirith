@@ -726,28 +726,45 @@ pub fn tune(from_audit: bool, json: bool) -> i32 {
 
 fn print_tune_human(report: &tirith_core::audit_tune::TuneReport) {
     eprintln!(
-        "tirith policy tune: analyzed {} audit record(s)",
+        "tirith policy tune: analyzed {} audit check record(s)",
         report.records_analyzed
     );
+    eprintln!("  Counts describe recorded decisions, not confirmed execution or validated false positives.");
+
+    let recurring = report.recurring_blocks();
+    if !recurring.is_empty() {
+        eprintln!("  Recurring blocked checks (a check can contain several rules):");
+        for stats in recurring.iter().take(10) {
+            let rule_id = tirith_core::output::sanitize_human_field(&stats.rule_id, &[]);
+            eprintln!(
+                "    {}: {} blocked / {} checks containing this rule ({} total checks analyzed)",
+                rule_id, stats.blocked, stats.total, report.records_analyzed
+            );
+        }
+        if recurring.len() > 10 {
+            eprintln!(
+                "    {} more rules; see --format json for the complete counts.",
+                recurring.len() - 10
+            );
+        }
+        eprintln!("  No safe relaxation is established for these blocked checks. Review their findings and applicable policy restrictions.");
+    }
 
     if report.data_is_thin {
         eprintln!(
-            "  not enough audit history to suggest anything yet (need at least {}).",
+            "  not enough audit history to suggest policy changes yet (need at least {}).",
             tirith_core::audit_tune::MIN_OBSERVATIONS
         );
-        eprintln!("  keep using tirith and re-run this once more commands have been analyzed.");
         return;
     }
 
     if report.suggestions.is_empty() {
-        eprintln!(
-            "  no policy changes suggested — your current policy looks well matched to your usage."
-        );
+        eprintln!("  No policy changes suggested: this history does not establish a safe relaxation. Review recurring interruptions separately.");
         return;
     }
 
     eprintln!(
-        "  {} suggestion(s) — these are SUGGESTIONS only; review each, then edit your policy yourself:",
+        "  {} suggestion(s) for review; allowed or bypassed checks do not prove a command was safe:",
         report.suggestions.len()
     );
     eprintln!();
@@ -757,72 +774,74 @@ fn print_tune_human(report: &tirith_core::audit_tune::TuneReport) {
             tirith_core::audit_tune::Confidence::Strong => "strong",
             tirith_core::audit_tune::Confidence::Moderate => "moderate",
         };
-        eprintln!("  {}. [{}] {}", i + 1, conf, s.observation);
-        eprintln!("     {}", s.recommendation);
+        let observation = tirith_core::output::sanitize_human_field(&s.observation, &[]);
+        let recommendation = tirith_core::output::sanitize_human_field(&s.recommendation, &[]);
+        eprintln!("  {}. [{}] {}", i + 1, conf, observation);
+        eprintln!("     {}", recommendation);
         if let Some(snippet) = &s.policy_snippet {
             eprintln!("     suggested policy snippet:");
             for line in snippet.lines() {
+                let line = tirith_core::output::sanitize_human_field(line, &[]);
                 eprintln!("       {line}");
             }
         }
         eprintln!();
     }
 
-    eprintln!("  tirith did not change your policy. Apply any suggestion by editing your .tirith/policy.yaml.");
+    eprintln!("  tirith did not change your policy. Check `tirith policy effective --runtime` before choosing an authorized policy target.");
+    eprintln!("  Repository policy cannot lower severity or suppress findings; user changes can still be overridden by repository, remote, organization, or incident restrictions.");
 }
 
 /// The fully-resolved local policy plus its provenance, as gathered for
-/// `tirith policy effective`. Factored out of [`effective`] so the gathering is
-/// unit-testable without capturing stdout (the rendering is a thin function of
-/// these fields).
+/// Diagnostic data captured from one resolver invocation. Source and scope come
+/// from the resulting policy, never from a second filesystem discovery.
 struct EffectivePolicy {
-    /// Source file the policy was loaded from, or `None` for built-in defaults.
     source_path: Option<String>,
-    /// Discovery scope (which branch matched) — drives the trust framing below.
     scope: tirith_core::policy::PolicyScope,
-    /// The resolved policy itself (repo-scope sanitization already applied).
     policy: Policy,
+    resolution_mode: tirith_core::policy_snapshot::ResolutionMode,
+    policy_posture_sha256: String,
 }
 
-/// Map a [`PolicyScope`] to its lowercase label for output. The single mapping
-/// point shared by both the JSON `scope` field and the human framing.
-///
-/// [`PolicyScope`]: tirith_core::policy::PolicyScope
 fn scope_label(scope: tirith_core::policy::PolicyScope) -> &'static str {
     scope.as_str()
 }
 
-/// Gather the effective local policy for `cwd`: its source path + scope (via
-/// [`discover_local_policy_path_scoped`]) and the fully-resolved policy (via
-/// [`Policy::discover_local_only`], which runs LOCAL resolution + repo-scope
-/// sanitize and NEVER fetches remotely). Discovery-only; no network.
-///
-/// [`discover_local_policy_path_scoped`]: tirith_core::policy::discover_local_policy_path_scoped
-fn gather_effective(cwd: Option<&str>) -> EffectivePolicy {
-    let (source_path, scope) = match tirith_core::policy::discover_local_policy_path_scoped(cwd) {
-        Some((path, scope)) => (Some(path.display().to_string()), scope),
-        None => (None, tirith_core::policy::PolicyScope::Default),
-    };
-    let policy = Policy::discover_local_only(cwd);
+fn gather_effective(cwd: Option<&str>, runtime: bool) -> EffectivePolicy {
+    use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
+    let snapshot = EffectivePolicySnapshot::resolve(
+        cwd,
+        if runtime {
+            ResolutionMode::Runtime
+        } else {
+            ResolutionMode::LocalOnly
+        },
+    );
     EffectivePolicy {
-        source_path,
-        scope,
-        policy,
+        source_path: snapshot.policy.path.clone(),
+        scope: snapshot.policy.scope,
+        policy: snapshot.policy,
+        resolution_mode: snapshot.resolution_mode,
+        policy_posture_sha256: snapshot.policy_posture_sha256,
     }
 }
 
-/// `tirith policy effective` — a transparency surface that prints the FULLY-
-/// RESOLVED effective policy for the current directory, where it came from, and
-/// (for a repo-scoped policy) which weakening fields were neutralized down to
-/// tightening-only. Discovery-only: no path argument, no network fetch (uses
-/// [`Policy::discover_local_only`], not [`Policy::discover`]).
-pub fn effective(json: bool) -> i32 {
+/// Keep the historic network-free default, but label its limited coverage.
+/// `--runtime` uses exactly the engine's resolver, including remote resolution
+/// and read-only overlays; neither mode analyzes or executes a command.
+pub fn effective(json: bool, runtime: bool) -> i32 {
+    let _diagnostics = tirith_core::policy::PolicyDiagnosticCapture::start();
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
-
-    let info = gather_effective(cwd.as_deref());
-
+    let info = gather_effective(cwd.as_deref(), runtime);
+    // Diagnostics are projected with the resolved policy's custom patterns.
+    // stdout remains one machine-readable document, even on remote failure.
+    let compiled =
+        tirith_core::redact::CompiledCustomPatterns::new(&info.policy.dlp_custom_patterns);
+    for message in tirith_core::policy::drain_captured_policy_diagnostics_for_output(&compiled) {
+        eprintln!("{message}");
+    }
     if json {
         print_effective_json(&info)
     } else {
@@ -830,78 +849,189 @@ pub fn effective(json: bool) -> i32 {
     }
 }
 
-fn print_effective_json(info: &EffectivePolicy) -> i32 {
-    #[derive(serde::Serialize)]
-    struct Output<'a> {
-        source_path: Option<&'a str>,
-        scope: &'a str,
-        neutralized_fields: &'a [&'static str],
-        policy: &'a Policy,
+/// The legacy `policy` field is a display projection, not a document to apply.
+/// Credentials have field-owned redaction even when their contents do not look
+/// like a known secret. Protocol metadata is built separately below.
+fn effective_policy_display(
+    info: &EffectivePolicy,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut display_policy = info.policy.clone();
+    if display_policy.policy_server_api_key.is_some() {
+        display_policy.policy_server_api_key = Some("[REDACTED]".into());
     }
+    for webhook in &mut display_policy.webhooks {
+        for value in webhook.headers.values_mut() {
+            *value = "[REDACTED]".into();
+        }
+    }
+    let mut value = serde_json::to_value(&display_policy)?;
+    project_policy_cli_json(&mut value);
+    let compiled =
+        tirith_core::redact::CompiledCustomPatterns::new(&info.policy.dlp_custom_patterns);
+    tirith_core::redact::redact_json_strings(&mut value, &compiled);
+    // These objects are user-named maps, unlike static serde field names.
+    // Project their keys too; otherwise aliases and header names bypass DLP.
+    for pointer in [
+        "/severity_overrides",
+        "/action_overrides",
+        "/context_destructive_verbs",
+        "/context_labels",
+        "/ssh_host_labels",
+        "/scan/mcp_allowed_tools",
+        "/scan/profiles",
+    ] {
+        if let Some(map) = value.pointer_mut(pointer) {
+            redact_policy_map_keys(map, &compiled);
+        }
+    }
+    if let Some(webhooks) = value
+        .get_mut("webhooks")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for webhook in webhooks {
+            if let Some(headers) = webhook.get_mut("headers") {
+                redact_policy_map_keys(headers, &compiled);
+            }
+        }
+    }
+    if let Some(aliases) = value.pointer_mut("/web3_guard/selector_aliases") {
+        if let Some(tools) = aliases.as_object_mut() {
+            for entries in tools.values_mut() {
+                redact_policy_map_keys(entries, &compiled);
+            }
+        }
+        redact_policy_map_keys(aliases, &compiled);
+    }
+    Ok(value)
+}
 
-    let output = Output {
-        source_path: info.source_path.as_deref(),
-        scope: scope_label(info.scope),
-        neutralized_fields: &info.policy.neutralized_fields,
-        policy: &info.policy,
+fn redact_policy_map_keys(
+    value: &mut serde_json::Value,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) {
+    let Some(map) = value.as_object_mut() else {
+        return;
     };
+    let mut entries: Vec<_> = std::mem::take(map).into_iter().collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut next_suffix = std::collections::BTreeMap::<String, usize>::new();
+    for (key, value) in entries {
+        let projected = tirith_core::redact::redact_sanitize_redact_with_compiled(
+            &project_policy_cli_text(&key),
+            compiled,
+        );
+        let mut unique = projected.clone();
+        let suffix = next_suffix.entry(projected.clone()).or_insert(2);
+        while map.contains_key(&unique) {
+            unique = format!("{projected} [display entry {suffix}]");
+            *suffix += 1;
+        }
+        // Keep every display entry when multiple private keys redact alike.
+        // The ordinal is not an identifier and confers no configuration scope.
+        map.insert(unique, value);
+    }
+}
 
-    if super::write_json_stdout(
-        &output,
-        "tirith policy effective: failed to write JSON output",
-    ) {
-        0
-    } else {
-        1
+fn effective_json(info: &EffectivePolicy) -> Result<serde_json::Value, serde_json::Error> {
+    use tirith_core::policy_snapshot::ResolutionMode;
+    let policy = effective_policy_display(info)?;
+    let source = info.source_path.as_deref().map(|path| {
+        tirith_core::output::sanitize_human_field(path, &info.policy.dlp_custom_patterns)
+    });
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "source_path": source,
+        "scope": scope_label(info.scope),
+        "neutralized_fields": info.policy.neutralized_fields,
+        "policy": policy,
+        "resolution": {
+            "mode": info.resolution_mode,
+            "remote_configuration_resolved": info.resolution_mode == ResolutionMode::Runtime,
+            "separate_overlay_loading_enabled": info.resolution_mode == ResolutionMode::Runtime,
+            "policy_posture_sha256": info.policy_posture_sha256,
+            "effective_fail_mode": info.policy.fail_mode,
+            "effective_allow_bypass_env": info.policy.allow_bypass_env,
+            "effective_allow_bypass_env_noninteractive": info.policy.allow_bypass_env_noninteractive,
+            "policy_is_redacted_display": true,
+            "unavailable_evidence": [
+                "field_level_provenance", "input_revisions", "trust_expiry_deadline",
+                "remote_fetch_timestamp", "profile_identity", "per_overlay_availability"
+            ]
+        }
+    }))
+}
+
+fn print_effective_json(info: &EffectivePolicy) -> i32 {
+    match effective_json(info) {
+        Ok(output)
+            if super::write_json_stdout(
+                &output,
+                "tirith policy effective: failed to write JSON output",
+            ) =>
+        {
+            0
+        }
+        _ => {
+            eprintln!("tirith policy effective: could not render policy");
+            1
+        }
     }
 }
 
 fn print_effective_human(info: &EffectivePolicy) -> i32 {
-    use tirith_core::policy::PolicyScope;
-
+    use tirith_core::policy_snapshot::ResolutionMode;
+    match info.resolution_mode {
+        ResolutionMode::Runtime => {
+            eprintln!("tirith policy effective: runtime resolution (configured remote policy and separate overlays evaluated)");
+        }
+        ResolutionMode::LocalOnly => {
+            eprintln!("tirith policy effective: local-only diagnostic (remote policy and separate overlays excluded)");
+            eprintln!("  Use `tirith policy effective --runtime` to resolve the policy used by enforcement.");
+        }
+    }
+    let source = info.source_path.as_deref().map(|path| {
+        tirith_core::output::sanitize_human_field(path, &info.policy.dlp_custom_patterns)
+    });
     eprintln!(
-        "tirith policy effective: source = {}",
-        info.source_path
+        "  primary source: {}",
+        source
             .as_deref()
-            .unwrap_or("(none — built-in defaults)")
+            .unwrap_or("(no source path; defaults or failure policy)")
     );
-    eprintln!("  scope: {}", scope_label(info.scope));
-    eprintln!();
-
-    // Render the resolved policy as readable YAML (the crate already depends on
-    // serde_yaml; the policy is `Serialize`). On the unlikely serialize error,
-    // fall back to a note rather than failing the command — the provenance and
-    // neutralization sections below are the load-bearing transparency output.
-    match serde_yaml::to_string(&info.policy) {
+    eprintln!("  primary scope: {}", scope_label(info.scope));
+    eprintln!(
+        "  fail mode: {:?}; interactive bypass permitted: {}; noninteractive bypass permitted: {}",
+        info.policy.fail_mode,
+        info.policy.allow_bypass_env,
+        info.policy.allow_bypass_env_noninteractive
+    );
+    let display = match effective_policy_display(info) {
+        Ok(display) => display,
+        Err(_) => {
+            eprintln!("tirith policy effective: could not render policy");
+            return 1;
+        }
+    };
+    match serde_yaml::to_string(&display) {
         Ok(yaml) => {
-            eprintln!("  effective policy:");
+            eprintln!("  policy (redacted display; do not apply this output as configuration):");
             for line in yaml.lines() {
                 eprintln!("    {line}");
             }
         }
-        Err(e) => {
-            eprintln!("  (could not render effective policy as YAML: {e})");
+        Err(_) => {
+            eprintln!("tirith policy effective: could not render policy");
+            return 1;
         }
     }
-    eprintln!();
-
     let neutralized = &info.policy.neutralized_fields;
-    match info.scope {
-        PolicyScope::Repo if !neutralized.is_empty() => {
-            eprintln!(
-                "  Neutralized (this repo policy is tightening-only; these weakening fields \
-                 were ignored): {}",
-                neutralized.join(", ")
-            );
-        }
-        PolicyScope::Repo => {
-            eprintln!("  No weakening fields — this repo policy only tightens.");
-        }
-        _ => {
-            eprintln!("  Operator-scoped policy — all fields honored (nothing neutralized).");
-        }
+    if !neutralized.is_empty() {
+        eprintln!(
+            "  Neutralized repository fields (tightening-only): {}",
+            neutralized.join(", ")
+        );
     }
-
+    eprintln!("  Field-level provenance, input revisions, trust-expiry deadlines, profile identity, and remote-cache freshness are not yet available.");
     0
 }
 
@@ -1444,6 +1574,30 @@ mod tests {
         assert!(!p.escalation.is_empty());
     }
 
+    #[test]
+    fn effective_display_large_key_collision_group_retains_every_entry() {
+        let mut values = serde_json::Map::new();
+        // Include an original key which already occupies a generated display
+        // suffix: the collision resolver must retain it and advance past it.
+        values.insert(
+            "[REDACTED:custom] [display entry 2]".into(),
+            serde_json::json!(-1),
+        );
+        for index in 0..5_000 {
+            values.insert(format!("customer-{index:06}"), serde_json::json!(index));
+        }
+        let mut value = serde_json::Value::Object(values);
+        let compiled =
+            tirith_core::redact::CompiledCustomPatterns::new_silent(&["customer-[0-9]+".into()]);
+        redact_policy_map_keys(&mut value, &compiled);
+        let map = value.as_object().unwrap();
+        assert_eq!(map.len(), 5_001);
+        assert_eq!(map["[REDACTED:custom] [display entry 2]"], -1);
+        assert_eq!(map["[REDACTED:custom]"], 0);
+        assert_eq!(map["[REDACTED:custom] [display entry 5001]"], 4_999);
+        assert!(map.keys().all(|key| !key.contains("customer-")));
+    }
+
     /// `policy effective` transparency contract: for a REPO-scoped policy that
     /// declares a weakening field (a non-empty `allowlist`), the gathered data
     /// must name the source path, classify the scope as `repo`, and list
@@ -1471,7 +1625,7 @@ mod tests {
             )
             .unwrap();
 
-            let info = gather_effective(cwd.to_str());
+            let info = gather_effective(cwd.to_str(), false);
 
             // Source path: the repo-root policy we just wrote.
             let expected_path = cwd
