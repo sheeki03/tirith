@@ -187,7 +187,7 @@ def run_case(binary, host, case):
         project = root / "project"
         project.mkdir()
         setup, setup_stdout, setup_stderr = execute(
-            [str(binary), "setup", "claude-code", "--scope", "user"], project, env,
+            [str(binary), "setup", "claude-code", "--scope", "user"], project, env, timeout=120,
         )
         if setup["exit"] != 0:
             return {"case": case, "passed": False, "stage": "setup", **setup,

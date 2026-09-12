@@ -38,6 +38,47 @@ fn fixture() -> (GlobalStateGuard, String, String) {
 }
 
 #[test]
+fn feedback_can_select_the_latest_incident_after_more_than_500_records() {
+    let (state, id, last) = fixture();
+    let old = format!(
+        "{}\n",
+        json!({"timestamp":"2026-09-11T00:00:00Z", "action":"Block", "command_redacted":"old check"})
+    );
+    let bytes = format!("{}{last}", old.repeat(600));
+    let log = tirith_core::audit::audit_log_path().unwrap();
+    std::fs::write(&log, &bytes).unwrap();
+    let result = success(run(
+        &state,
+        &[
+            "audit",
+            "feedback",
+            "--event-id",
+            &id,
+            "--expectation",
+            "expected",
+            "--json",
+        ],
+    ));
+    assert!(matches!(
+        result["state"].as_str(),
+        Some("completed" | "completed-with-recovery")
+    ));
+    let saved: Value = serde_json::from_slice(
+        &std::fs::read(
+            tirith_core::policy::state_dir()
+                .unwrap()
+                .join("feedback")
+                .join(format!("{id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["event_id"], id);
+    assert_eq!(saved["expectation"], "expected");
+    assert_eq!(std::fs::read_to_string(log).unwrap(), bytes);
+}
+
+#[test]
 fn accepted_timestamp_fraction_is_normalized_before_feedback_storage() {
     let (state, id, _) = fixture();
     let timestamp = format!("2026-09-12T00:00:00.{}Z", "0".repeat(100_000));

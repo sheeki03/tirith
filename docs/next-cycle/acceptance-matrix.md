@@ -54,7 +54,7 @@ decision, not a reduction of existing manual workflows.
 | PowerShell 5.1/7, Unix PowerShell | Trusted helper probes and config tests; ignored PTY follow-up stub | No next-cycle native blocking certification; target resolution and interception evidence required |
 | Nushell | Hook/config source; ignored PTY follow-up stub | No next-cycle native blocking certification |
 | Real agents and MCP clients | Adapter tests and unfilled E2E checklist | No selected agent certified here; record actual host version, enabled configuration, invocation and refusal separately |
-| Linux containment | Existing x86_64 release enforcement; native ARM GNU candidate passes nine installed-binary cases | ARM musl, cancellation and final release-artifact qualification remain separate gates; see containment-aarch64.md |
+| Linux containment | Native ARM GNU and musl local archives each pass all 16 cases from source manifest `7d9788bf…5d317`; independent GNU/musl CI archives at `71070bbb` also pass all 16, including supervisor/guard interruption | These are distinct exact-source and exact-commit proofs. Final tag-produced release artifacts and later npm boundary changes require separate qualification; see containment-aarch64.md |
 
 ## Reproducible starting commands
 

@@ -117,8 +117,8 @@
       if (query !== querySequence) return;
       if (data.availability === 'refresh_required') { rows.clear(); cursor = null; result.replaceChildren(paragraph('The history source changed or this cursor expired. Refresh the filter to start a new view.', 'notice')); return; }
       const annotations = new Map((data.annotations?.entries || []).map(entry => [entry.event_id, entry]));
-      for (const event of data.events || []) { event.annotation = annotations.get(event.record?.event_id); rows.set(event.record_id, event); }
-      while (rows.size > 1000) rows.delete(rows.keys().next().value);
+      for (const event of [...(data.events || [])].reverse()) { event.annotation = annotations.get(event.record?.event_id); rows.set(event.record_id, event); }
+      while (rows.size > 1000) rows.delete([...rows.keys()].pop());
       cursor = data.next_cursor; result.replaceChildren();
       const coverage = panel('Collection coverage'); coverage.append(badge(data.availability), paragraph(`${[...rows.values()].filter(event => event.semantics === 'recorded_check').length} recorded checks among ${rows.size} loaded records (at most 1,000 retained in the browser). These counts do not establish execution or attacks prevented.`),
         paragraph(data.detail || (data.earlier_history_uninspected ? 'Older history has not been inspected in this bounded view.' : 'Coverage is limited to the inspected records.')),
@@ -126,7 +126,7 @@
       result.append(coverage);
       if (!rows.size) result.append(paragraph('No recorded activity is available for this selection.', 'empty'));
       const list = panel('Recorded activity'); const counts = new Map();
-      for (const event of [...rows.values()].reverse()) {
+      for (const event of rows.values()) {
         const record = event.record || event.event || event;
         if (event.semantics === 'recorded_check') for (const ruleId of new Set(record.rule_ids || [])) counts.set(ruleId, (counts.get(ruleId) || 0) + 1);
         const item = element('div', undefined, 'row'); const copy = element('div'); copy.append(element('strong', record.timestamp || 'Timestamp unavailable'), element('code', record.command_redacted || record.input || record.command || record.command_preview || 'Command text not retained'), rawDetails('Inspect recorded evidence', record));
@@ -143,7 +143,9 @@
         list.append(item);
       }
       if (rows.size) { const summary = panel('Rules in these loaded records'); summary.append(paragraph([...counts].sort((a,b) => b[1]-a[1]).map(([name, count]) => `${name}: ${count}`).join(' · ') || 'No rule IDs in these records.')); result.append(summary, list); }
-      if (cursor) result.append(button(data.more_available ? 'Load next bounded page' : 'Check for appended records', () => load(false)));
+      result.append(button('Refresh recent activity', () => load(true)));
+      if (cursor && rows.size < 1000) result.append(button('Load older bounded page', () => load(false)));
+      else if (cursor) result.append(paragraph('The browser has reached its 1,000-record limit. Narrow the filter to inspect other records.', 'muted'));
     }
     tools.addEventListener('submit', event => { event.preventDefault(); load(true).catch(showError); }); await load(true); return [wrapper];
   }

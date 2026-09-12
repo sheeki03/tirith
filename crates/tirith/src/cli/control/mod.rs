@@ -30,6 +30,7 @@ struct Service {
     directory_identity: identity::DirectoryIdentity,
     binary_identity: identity::BinaryIdentity,
     project_anchor: tirith_core::util::ContainedAtomicFile,
+    project_anchor_path: std::path::PathBuf,
 }
 
 impl Service {
@@ -37,7 +38,7 @@ impl Service {
         let root = std::path::Path::new(&self.record.cwd);
         if self
             .project_anchor
-            .matches_visible(root, &root.join(".tirith-project-anchor"))
+            .matches_visible(root, &self.project_anchor_path)
             .unwrap_or(false)
         {
             Ok(())
@@ -165,9 +166,13 @@ pub(crate) fn serve(startup_id: &str) -> i32 {
         let binary_identity = identity::BinaryIdentity::capture_current()?;
         let record = lifecycle::ServiceRecord::new(startup_id, port, &binary_identity)?;
         let project_root = std::path::Path::new(&record.cwd);
+        // The retained-directory witness must not depend on a project file.
+        // This unique logical leaf is never created, read, or published.
+        let project_anchor_path =
+            project_root.join(format!(".tirith-control-anchor-{}", uuid::Uuid::new_v4()));
         let project_anchor = tirith_core::util::ContainedAtomicFile::prepare(
             project_root,
-            &project_root.join(".tirith-project-anchor"),
+            &project_anchor_path,
             false,
         )
         .map_err(|_| "cannot retain the dashboard project directory")?;
@@ -194,6 +199,7 @@ pub(crate) fn serve(startup_id: &str) -> i32 {
             directory_identity,
             binary_identity,
             project_anchor,
+            project_anchor_path,
         });
         paths.publish(&service.record, &service.directory_identity)?;
         let mut last_identity_check = Instant::now();

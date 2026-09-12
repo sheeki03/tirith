@@ -371,6 +371,7 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
         "build",
         "smoke-test",
         "linux-runtime-compat",
+        "native-arm-runtime",
         "build-deb",
         "build-rpm",
         "rpm-runtime-compat",

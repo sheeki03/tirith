@@ -9,8 +9,7 @@ pub(crate) fn review(cwd: Option<&str>) -> Result<Value, String> {
     let _capture = PolicyDiagnosticCapture::start();
     let snapshot = EffectivePolicySnapshot::resolve(cwd, ResolutionMode::Runtime);
     let path = tirith_core::audit::audit_log_path().ok_or("audit history location unavailable")?;
-    let history = HistoryReader::new(path).query(
-        None,
+    let history = HistoryReader::new(path).recent(
         HistoryFilter::default(),
         500,
         std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),

@@ -33,7 +33,9 @@ def request(origin, token, csrf, path, body=None):
 def run(binary, output):
     output.mkdir(parents=True, exist_ok=True)
     report = {"schema_version": 1, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-              "checks": [], "execution_claim": "local_control_workflow_only"}
+              "checks": [], "operation_observations": [], "api_observations": [],
+              "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "execution_claim": "local_control_workflow_only"}
     with tempfile.TemporaryDirectory(prefix="tirith-browser-fixture-") as raw_root:
         root = Path(raw_root).resolve()
         names = {"HOME": "home", "USERPROFILE": "home", "XDG_CONFIG_HOME": "home/.config",
@@ -61,7 +63,9 @@ def run(binary, output):
         hostile = '<img src=x onerror="window.__tirithInjected=true">'
         audit = audit_dir / "log.jsonl"
         event_id = str(uuid.uuid4())
-        audit.write_text(json.dumps({"timestamp": "2026-09-12T00:00:00Z", "action": "WarnAck",
+        prior_checks = "".join(json.dumps({"timestamp": "2026-09-11T00:00:00Z", "action": "Block",
+                                            "command_redacted": f"history-check-{index}"}) + "\n" for index in range(600))
+        audit.write_text(prior_checks + json.dumps({"timestamp": "2026-09-12T00:00:00Z", "action": "WarnAck",
                                     "event_id": event_id,
                                     "command_redacted": hostile, "rule_ids": ["curl_pipe_shell"]}) + "\n")
         launched = subprocess.run([str(binary), "dashboard", "--no-browser", "--json"], cwd=project,
@@ -80,6 +84,22 @@ def run(binary, output):
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page(viewport={"width": 1440, "height": 1050})
                 page.on("pageerror", lambda error: errors.append(str(error)))
+                observed_started = time.monotonic()
+                def observe_response(response):
+                    path = urllib.parse.urlsplit(response.url).path
+                    if path not in ("/api/plans", "/api/operations") or len(report["api_observations"]) >= 512:
+                        return
+                    try:
+                        body = response.json()
+                        sent = response.request.post_data_json or {}
+                        operation = body.get("operation") or body
+                        report["api_observations"].append({"elapsed_seconds":time.monotonic() - observed_started,
+                            "path":path, "status":response.status, "action":sent.get("action"),
+                            "operation_id":sent.get("operation_id"), "state":operation.get("state"),
+                            "active_action":operation.get("active_action"), "error_present":bool(body.get("error"))})
+                    except Exception as error:
+                        report["api_observations"].append({"path":path, "observation_error":type(error).__name__})
+                page.on("response", observe_response)
                 try:
                     page.goto(launch["url"])
                     page.wait_for_load_state("networkidle")
@@ -129,6 +149,19 @@ def run(binary, output):
                     assert page.evaluate("window.__tirithInjected === undefined")
                     assert page.locator("#content img").count() == 0
                     report["checks"].append("hostile_history_is_text_not_markup")
+                    activity_rows = page.locator("#content .row code")
+                    assert activity_rows.first.inner_text() == hostile
+                    assert activity_rows.nth(1).inner_text() == "history-check-599"
+                    assert activity_rows.count() == 100
+                    page.get_by_role("button", name="Load older bounded page", exact=True).click()
+                    page.get_by_text("history-check-401", exact=True).wait_for()
+                    assert activity_rows.count() == 200
+                    assert activity_rows.first.inner_text() == hostile
+                    assert activity_rows.nth(100).inner_text() == "history-check-500"
+                    page.get_by_role("button", name="Refresh recent activity", exact=True).click()
+                    page.get_by_text("100 recorded checks among 100 loaded records", exact=False).wait_for()
+                    assert activity_rows.count() == 100
+                    report["checks"].append("activity_opens_newest_pages_older_and_refreshes_without_reordering")
                     page.get_by_role("button", name="Record expectation", exact=True).click()
                     page.get_by_role("button", name="Review expectation label", exact=True).click()
                     page.get_by_role("button", name="Apply reviewed change", exact=True).click()
@@ -216,6 +249,8 @@ def run(binary, output):
                     page.get_by_role("button", name="Close change details").click()
                     report["checks"].append("reviewed_audit_rotation_preserves_and_restores_exact_history")
                     page.get_by_role("button", name="Review audit rotation", exact=True).click()
+                    page.get_by_role("button", name="Apply reviewed change", exact=True).wait_for()
+                    page.get_by_text("Stored operation and recovery details", exact=True).click()
                     segment_id = json.loads(page.locator("#operation-content details pre").last.inner_text())["operation_id"]
                     page.get_by_role("button", name="Apply reviewed change", exact=True).click()
                     page.get_by_role("button", name="Undo owned change", exact=True).wait_for(timeout=40000)
@@ -223,6 +258,8 @@ def run(binary, output):
                     page.get_by_role("button", name="Close change details").click()
                     page.get_by_label("Retained segment ID", exact=True).fill(segment_id)
                     page.get_by_role("button", name="Review segment export", exact=True).click()
+                    page.get_by_role("button", name="Apply reviewed change", exact=True).wait_for()
+                    page.get_by_text("Stored operation and recovery details", exact=True).click()
                     export_id = json.loads(page.locator("#operation-content details pre").last.inner_text())["operation_id"]
                     page.get_by_role("button", name="Apply reviewed change", exact=True).click()
                     page.get_by_role("button", name="Undo owned change", exact=True).wait_for(timeout=40000)
@@ -272,12 +309,21 @@ def run(binary, output):
                     report["checks"].append("shell_setup_plan_apply_undo_uses_owned_startup_blocks")
                     page.get_by_label("Personal setup shell", exact=True).select_option("bash")
                     page.get_by_role("button", name="Review personal setup", exact=True).click()
+                    combined_started = time.monotonic()
                     page.get_by_role("button", name="Apply reviewed change", exact=True).click()
-                    page.get_by_role("button", name="Undo owned change", exact=True).wait_for(timeout=40000)
+                    # The first three-step debug run was still making recorded
+                    # progress at the old 40s fixture deadline. Preserve the
+                    # observed duration; this deadline is not a product SLO.
+                    page.get_by_role("button", name="Undo owned change", exact=True).wait_for(timeout=120000)
+                    report["operation_observations"].append({"kind":"combined_personal_setup_apply",
+                        "elapsed_seconds":time.monotonic() - combined_started, "fixture_deadline_seconds":120})
                     assert "balanced" in policy.read_text() and "preserve-browser-fixture" in policy.read_text()
                     assert any("BEGIN tirith-hook" in path.read_text() for path in (root / "home").glob(".bash*"))
+                    combined_undo_started = time.monotonic()
                     page.get_by_role("button", name="Undo owned change", exact=True).click()
-                    page.locator("#operation-content .badge").filter(has_text="undone").wait_for(timeout=40000)
+                    page.locator("#operation-content .badge").filter(has_text="undone").wait_for(timeout=120000)
+                    report["operation_observations"].append({"kind":"combined_personal_setup_undo",
+                        "elapsed_seconds":time.monotonic() - combined_undo_started, "fixture_deadline_seconds":120})
                     assert "protection_profile" not in policy.read_text()
                     assert all("BEGIN tirith-hook" not in path.read_text() for path in (root / "home").glob(".bash*"))
                     page.get_by_role("button", name="Close change details").click()
@@ -289,7 +335,9 @@ def run(binary, output):
                     page.screenshot(path=str(output / "overview-narrow.png"), full_page=True)
                     report["checks"].append("narrow_layout_has_no_horizontal_overflow")
                     assert not errors, errors
-                except Exception:
+                except Exception as error:
+                    report.update(passed=False, error=str(error), browser_errors=errors)
+                    (output / "browser-results.json").write_text(json.dumps(report, indent=2) + "\n")
                     page.screenshot(path=str(output / "failure.png"), full_page=True)
                     (output / "failure-view.txt").write_text(page.locator("body").inner_text())
                     (output / "failure-details.json").write_text(json.dumps(page.locator("#operation-content pre").all_text_contents(), indent=2))
@@ -303,6 +351,8 @@ def run(binary, output):
             # Give the service a bounded opportunity to release open Windows
             # directory handles before the temporary fixture is removed.
             time.sleep(1)
+        report["binary_unchanged_during_run"] = report["binary_sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+        assert report["binary_unchanged_during_run"], "candidate binary changed during browser run"
         report["passed"] = True
         (output / "browser-results.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"passed": True, "checks": report["checks"], "binary_sha256": report["binary_sha256"]}))

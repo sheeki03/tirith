@@ -45,8 +45,7 @@ pub fn recent(
             cwd.as_deref(),
             tirith_core::policy_snapshot::ResolutionMode::Runtime,
         );
-        let history = HistoryReader::new(path).query(
-            None,
+        let history = HistoryReader::new(path).recent(
             HistoryFilter {
                 since,
                 until,

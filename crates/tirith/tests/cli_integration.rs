@@ -3132,6 +3132,7 @@ fn policy_tune_requires_from_audit() {
 fn policy_tune_no_audit_log_is_handled() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let out = tirith()
+        .env("TIRITH_LOG", "1")
         .env("XDG_DATA_HOME", data_dir.path())
         // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows (etcetera's Windows
         // base strategy); set both so the audit-log path is isolated on every platform — without
@@ -3169,6 +3170,7 @@ fn policy_tune_suggests_for_always_allowed_rule_without_writing_policy() {
     fs::write(&log_path, &log).expect("write audit log");
 
     let out = tirith()
+        .env("TIRITH_LOG", "1")
         .env("XDG_DATA_HOME", data_dir.path())
         // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows (etcetera's Windows
         // base strategy); set both so the audit-log path is isolated on every platform — without
@@ -3218,6 +3220,7 @@ fn policy_tune_does_not_suggest_downgrade_for_blocked_rule() {
     fs::write(&log_path, &log).expect("write audit log");
 
     let out = tirith()
+        .env("TIRITH_LOG", "1")
         .env("XDG_DATA_HOME", data_dir.path())
         // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows (etcetera's Windows
         // base strategy); set both so the audit-log path is isolated on every platform — without
@@ -3257,6 +3260,7 @@ fn policy_tune_thin_data_makes_no_suggestions() {
     fs::write(&log_path, &log).expect("write audit log");
 
     let out = tirith()
+        .env("TIRITH_LOG", "1")
         .env("XDG_DATA_HOME", data_dir.path())
         // `data_dir()` honors XDG_DATA_HOME on Unix but %APPDATA% on Windows (etcetera's Windows
         // base strategy); set both so the audit-log path is isolated on every platform — without

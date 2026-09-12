@@ -196,7 +196,7 @@ mod native {
 
     #[test]
     fn policy_disk_hook_loaded_hook_and_cwd_drift_invalidate_observations() {
-        fixture(|root, configs, _, guard| {
+        fixture(|root, configs, secret, guard| {
             let challenge = start_shell_verification(CHANNEL, configs, LOADED).unwrap();
             allowed(&challenge);
             assert_eq!(
@@ -225,14 +225,27 @@ mod native {
                 ShellVerificationStatus::Stale
             );
             let challenge = start_shell_verification(CHANNEL, configs, LOADED).unwrap();
+            let record = VerificationStore::open(secret)
+                .unwrap()
+                .load(secret, unix_time_ms().unwrap())
+                .unwrap()
+                .unwrap();
             std::fs::create_dir(root.join("other-cwd")).unwrap();
             guard.set_cwd(root.join("other-cwd")).unwrap();
+            // Prove the verification's own cwd witness independently of the
+            // earlier capability gate. In a fixture without a shell-exported
+            // session ID, the existing fallback session also changes with cwd.
             assert_eq!(
-                finish_shell_verification(&challenge.id, CHANNEL, LOADED)
-                    .unwrap()
-                    .status,
-                ShellVerificationStatus::Stale
+                context_status(&record, secret, Some(LOADED), unix_time_ms().unwrap()).unwrap(),
+                Some(ShellVerificationStatus::Stale)
             );
+            match finish_shell_verification(&challenge.id, CHANNEL, LOADED) {
+                Ok(observation) => assert_eq!(observation.status, ShellVerificationStatus::Stale),
+                Err(error) => assert_eq!(
+                    error,
+                    "shell hook capability belongs to a different session"
+                ),
+            }
         });
     }
 

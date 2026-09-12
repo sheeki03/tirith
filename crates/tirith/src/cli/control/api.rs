@@ -439,7 +439,7 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
                 .history
                 .lock()
                 .map_err(|_| "history reader is unavailable")?
-                .query(
+                .newest_page(
                     query.cursor.as_deref(),
                     query.filter,
                     query.limit,

@@ -1725,7 +1725,9 @@ mod platform {
     use std::fs::File;
     use std::io::{self, Read as _, Write as _};
     use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, RawHandle};
+    use std::os::windows::io::{
+        AsRawHandle as _, FromRawHandle as _, OwnedHandle as NativeOwnedHandle, RawHandle,
+    };
     use std::path::{Component, Path, PathBuf};
     use std::ptr::{null, null_mut};
 
@@ -1737,9 +1739,8 @@ mod platform {
         FILE_SYNCHRONOUS_IO_NONALERT,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, DuplicateHandle, RtlNtStatusToDosError, DUPLICATE_SAME_ACCESS,
-        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
-        HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+        RtlNtStatusToDosError, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
+        ERROR_PATH_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileBasicInfo, FileDispositionInfo, GetFileInformationByHandle,
@@ -1750,7 +1751,6 @@ mod platform {
         FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, SYNCHRONIZE,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     use windows_sys::Win32::System::WindowsProgramming::{
         FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
     };
@@ -1941,7 +1941,11 @@ mod platform {
                 "NtCreateFile succeeded without returning a valid handle",
             ));
         }
-        Ok(OwnedHandle(handle))
+        // SAFETY: NtCreateFile returned a fresh non-null, non-invalid handle;
+        // its ownership transfers exactly once to the standard RAII container.
+        Ok(OwnedHandle(unsafe {
+            NativeOwnedHandle::from_raw_handle(handle as RawHandle)
+        }))
     }
 
     fn inspect_directory(handle: HANDLE, path: &Path) -> io::Result<()> {
@@ -1996,8 +2000,10 @@ mod platform {
             }
             return Err(with_context("open directory", path.display(), error));
         }
-        let handle = OwnedHandle(handle);
-        inspect_directory(handle.0, path)?;
+        // SAFETY: CreateFileW returned a fresh valid owned handle above.
+        let handle =
+            OwnedHandle(unsafe { NativeOwnedHandle::from_raw_handle(handle as RawHandle) });
+        inspect_directory(handle.raw(), path)?;
         Ok(Some(handle))
     }
 
@@ -2073,7 +2079,7 @@ mod platform {
         let path = parent.path.join(name);
         let directory_access = FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES;
         let child = match nt_open_relative(
-            parent.handle.0,
+            parent.handle.raw(),
             &parent.path,
             name,
             directory_access,
@@ -2084,7 +2090,7 @@ mod platform {
             Ok(child) => child,
             Err(error) if is_not_found(&error) && !create => return Ok(None),
             Err(error) if is_not_found(&error) => match nt_open_relative(
-                parent.handle.0,
+                parent.handle.raw(),
                 &parent.path,
                 name,
                 directory_access | DELETE,
@@ -2094,7 +2100,7 @@ mod platform {
             ) {
                 Ok(child) => child,
                 Err(collision) if is_already_exists(&collision) => nt_open_relative(
-                    parent.handle.0,
+                    parent.handle.raw(),
                     &parent.path,
                     name,
                     directory_access,
@@ -2106,7 +2112,7 @@ mod platform {
             },
             Err(error) => return Err(error),
         };
-        inspect_directory(child.0, &path)?;
+        inspect_directory(child.raw(), &path)?;
         Ok(Some(HeldDirectory {
             handle: child,
             path,
@@ -2201,7 +2207,7 @@ mod platform {
             RelativeFileDisposition::CreateNew => FILE_CREATE,
         };
         match nt_open_relative_with_share(
-            parent.handle.0,
+            parent.handle.raw(),
             &parent.path,
             name,
             access,
@@ -2228,7 +2234,7 @@ mod platform {
     /// back to the original error.
     fn non_regular_leaf(parent: &HeldDirectory, name: &OsStr, display: &Path) -> bool {
         match nt_open_relative(
-            parent.handle.0,
+            parent.handle.raw(),
             &parent.path,
             name,
             FILE_READ_ATTRIBUTES,
@@ -2236,7 +2242,7 @@ mod platform {
             0,
             FILE_ATTRIBUTE_NORMAL,
         ) {
-            Ok(probe) => inspect_regular(probe.0, display)
+            Ok(probe) => inspect_regular(probe.raw(), display)
                 .err()
                 .is_some_and(|error| error.kind() == io::ErrorKind::InvalidInput),
             Err(_) => false,
@@ -2353,7 +2359,7 @@ mod platform {
         else {
             return Ok(false);
         };
-        inspect_regular(handle.0, display)?;
+        inspect_regular(handle.raw(), display)?;
         Ok(true)
     }
 
@@ -2387,11 +2393,11 @@ mod platform {
                 _held: None,
             });
         };
-        inspect_regular(handle.0, display)?;
+        inspect_regular(handle.raw(), display)?;
 
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: handle is live and `info` is writable.
-        if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
+        if unsafe { GetFileInformationByHandle(handle.raw(), &mut info) } == 0 {
             return Err(with_context(
                 "inspect publication destination",
                 display.display(),
@@ -2539,7 +2545,7 @@ mod platform {
                     return Err(OpenRegularError::Io(error));
                 }
             };
-            let before = read_generation(handle.0, &self.display).map_err(|error| {
+            let before = read_generation(handle.raw(), &self.display).map_err(|error| {
                 if error.kind() == io::ErrorKind::InvalidInput {
                     OpenRegularError::NotRegularFile
                 } else {
@@ -2571,8 +2577,8 @@ mod platform {
 
         pub(super) fn binding_identity(&self) -> io::Result<(String, String)> {
             use std::os::windows::ffi::OsStrExt as _;
-            let root = handle_identity(self._root.0, &self.display)?;
-            let parent = handle_identity(self.parent.handle.0, &self.parent.path)?;
+            let root = handle_identity(self._root.raw(), &self.display)?;
+            let parent = handle_identity(self.parent.handle.raw(), &self.parent.path)?;
             let mut name_bytes = Vec::new();
             for unit in self.name.encode_wide() {
                 name_bytes.extend_from_slice(&unit.to_le_bytes());
@@ -2610,7 +2616,7 @@ mod platform {
                     Err(error) => return Err(error),
                 },
             };
-            inspect_regular(handle.0, &self.display)?;
+            inspect_regular(handle.raw(), &self.display)?;
             let file = handle.into_file();
             fs2::FileExt::lock_exclusive(&file)?;
             Ok(file)
@@ -2654,7 +2660,7 @@ mod platform {
                 },
             };
             let display = self.parent.path.join(name);
-            inspect_regular(handle.0, &display)?;
+            inspect_regular(handle.raw(), &display)?;
             let file = handle.into_file();
             fs2::FileExt::lock_exclusive(&file)?;
             Ok(file)
@@ -2679,7 +2685,7 @@ mod platform {
                 RelativeFileDisposition::OpenExisting,
             )?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "rollback file is absent"))?;
-            inspect_regular(handle.0, &self.display)?;
+            inspect_regular(handle.raw(), &self.display)?;
             let mut file = handle.into_file();
             before_remove()?;
             let mut bytes = Vec::new();
@@ -2776,7 +2782,7 @@ mod platform {
             }
             rename_held_file(
                 raw_handle(&temp.file),
-                self.parent.handle.0,
+                self.parent.handle.raw(),
                 &self.name,
                 overwrite,
             )?;
@@ -2868,48 +2874,22 @@ mod platform {
         }
     }
 
-    struct OwnedHandle(HANDLE);
+    /// A uniquely owned kernel handle. Standard OwnedHandle supplies native
+    /// ownership, close-on-drop and Send/Sync semantics; raw HANDLE pointers do
+    /// not carry those guarantees. No borrowed or pseudo handle enters this type.
+    struct OwnedHandle(NativeOwnedHandle);
 
     impl OwnedHandle {
+        fn raw(&self) -> HANDLE {
+            self.0.as_raw_handle() as HANDLE
+        }
+
         fn try_clone(&self) -> io::Result<Self> {
-            let process = unsafe { GetCurrentProcess() };
-            let mut duplicate = null_mut();
-            // SAFETY: source belongs to this process and the returned handle is
-            // written into `duplicate` with identical access rights.
-            if unsafe {
-                DuplicateHandle(
-                    process,
-                    self.0,
-                    process,
-                    &mut duplicate,
-                    0,
-                    0,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            } == 0
-            {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(Self(duplicate))
-            }
+            self.0.try_clone().map(Self)
         }
 
         fn into_file(self) -> File {
-            let handle = self.0;
-            std::mem::forget(self);
-            // SAFETY: the handle is valid, uniquely owned, and forgotten above.
-            unsafe { File::from_raw_handle(handle as RawHandle) }
-        }
-    }
-
-    impl Drop for OwnedHandle {
-        fn drop(&mut self) {
-            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-                // SAFETY: this value owns exactly one live handle.
-                unsafe {
-                    let _ = CloseHandle(self.0);
-                }
-            }
+            File::from(self.0)
         }
     }
 
@@ -2920,6 +2900,21 @@ mod platform {
         use std::rc::Rc;
 
         use super::*;
+
+        #[test]
+        fn retained_atomic_capability_crosses_threads_without_reopening() {
+            fn require_send_sync<T: Send + Sync>() {}
+            require_send_sync::<ContainedAtomicFile>();
+            require_send_sync::<super::super::ContainedAtomicFile>();
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("thread-owned.bin");
+            let writer = ContainedAtomicFile::prepare(temp.path(), &destination, false).unwrap();
+            std::thread::spawn(move || writer.write_atomic(b"held across threads", false))
+                .join()
+                .unwrap()
+                .unwrap();
+            assert_eq!(std::fs::read(destination).unwrap(), b"held across threads");
+        }
 
         fn clear_relative_open_hook() {
             RELATIVE_OPEN_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);

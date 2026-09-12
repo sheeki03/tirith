@@ -1435,6 +1435,69 @@ mod tests {
         assert!(snapshot.revalidate_inputs().is_ok());
     }
     #[test]
+    fn external_guard_survives_owned_policy_creation_but_detects_unowned_fallback_creation() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = crate::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let yaml = config.join("policy.yaml");
+        let yml = config.join("policy.yml");
+        let excluded = BTreeSet::from([yaml.clone()]);
+        let before = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
+        std::fs::write(&yaml, "paranoia: 2\n").unwrap();
+        let after = before.refresh_runtime();
+        assert_eq!(after.policy.scope, PolicyScope::User);
+        assert_eq!(after.policy.paranoia, 2);
+        assert_eq!(
+            before.private_external_inputs_guard(&excluded),
+            after.private_external_inputs_guard(&excluded)
+        );
+        assert_ne!(before.private_replay_guard(), after.private_replay_guard());
+
+        // The newly shadowed sibling is still an external discovery input.
+        // Creating it cannot disappear behind the owned YAML publication.
+        std::fs::write(&yml, "paranoia: 3\n").unwrap();
+        let sibling = after.refresh_runtime();
+        assert_eq!(sibling.policy.path.as_deref(), yaml.to_str());
+        assert_eq!(sibling.policy.paranoia, 2);
+        assert_ne!(
+            after.private_external_inputs_guard(&excluded),
+            sibling.private_external_inputs_guard(&excluded)
+        );
+        assert!(after.revalidate_inputs().is_err());
+    }
+
+    #[test]
+    fn external_guard_preserves_selected_unowned_yml_content_and_precedence() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = crate::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let yaml = config.join("policy.yaml");
+        let yml = config.join("policy.yml");
+        std::fs::write(&yml, "paranoia: 2\n").unwrap();
+        let excluded = BTreeSet::from([yaml.clone()]);
+        let before = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
+        assert_eq!(before.policy.path.as_deref(), yml.to_str());
+        std::fs::write(&yml, "paranoia: 3\n").unwrap();
+        let changed = before.refresh_runtime();
+        assert_eq!(changed.policy.paranoia, 3);
+        assert_ne!(
+            before.private_external_inputs_guard(&excluded),
+            changed.private_external_inputs_guard(&excluded)
+        );
+
+        // Shadowing an already-selected external policy changes the read graph
+        // and still requires a new plan; exact-path exclusion cannot bless it.
+        std::fs::write(&yaml, "paranoia: 1\n").unwrap();
+        let shadowed = changed.refresh_runtime();
+        assert_eq!(shadowed.policy.path.as_deref(), yaml.to_str());
+        assert_eq!(shadowed.policy.paranoia, 1);
+        assert_ne!(
+            changed.private_external_inputs_guard(&excluded),
+            shadowed.private_external_inputs_guard(&excluded)
+        );
+    }
+
+    #[test]
     fn external_replay_guard_excludes_only_exact_owned_inputs_and_preserves_scope() {
         let state = GlobalStateGuard::new().unwrap();
         let config = crate::policy::config_dir().unwrap();

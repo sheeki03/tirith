@@ -186,12 +186,19 @@ fn find_policy_in_dir(dir: &Path) -> Option<PathBuf> {
     // can diagnose it and fail closed instead of silently using defaults.
     let yaml_exists = std::fs::symlink_metadata(&yaml).is_ok();
     snapshot::observe_discovery(&yaml, false, yaml_exists);
-    if yaml_exists {
+    if yaml_exists && !snapshot::is_capturing() {
         return Some(yaml);
     }
+    // Capture the complete named-candidate set even when YAML wins. An owned
+    // absent-to-present YAML publication must not remove an unrelated YML
+    // discovery witness from a multi-step operation's external-input guard.
+    // This observes only entry presence; an unselected document is not read.
     let yml = dir.join("policy.yml");
     let yml_exists = std::fs::symlink_metadata(&yml).is_ok();
     snapshot::observe_discovery(&yml, false, yml_exists);
+    if yaml_exists {
+        return Some(yaml);
+    }
     if yml_exists {
         return Some(yml);
     }

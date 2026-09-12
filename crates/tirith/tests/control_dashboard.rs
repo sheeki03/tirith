@@ -90,6 +90,62 @@ fn state() -> GlobalStateGuard {
 }
 
 #[test]
+fn activity_starts_with_newest_checks_and_pages_older_without_shifting_on_append() {
+    let state = state();
+    let path = tirith_core::audit::audit_log_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let record = |index: usize| {
+        format!(
+            "{}\n",
+            json!({"timestamp":"2026-09-12T00:00:00Z", "action":"Block", "command_redacted":format!("check-{index}")})
+        )
+    };
+    let original = (0..600).map(record).collect::<String>();
+    std::fs::write(&path, &original).unwrap();
+    let (server, _) = service(&state);
+    let (status, newest) = server.request("POST", "/api/history", Some(json!({"limit":100})));
+    assert_eq!(status, 200);
+    assert_eq!(
+        newest["events"][0]["record"]["command_redacted"],
+        "check-500"
+    );
+    assert_eq!(
+        newest["events"][99]["record"]["command_redacted"],
+        "check-599"
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(record(600).as_bytes())
+        .unwrap();
+    let (status, older) = server.request(
+        "POST",
+        "/api/history",
+        Some(json!({"cursor":newest["next_cursor"], "limit":100})),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        older["events"][0]["record"]["command_redacted"],
+        "check-400"
+    );
+    assert_eq!(
+        older["events"][99]["record"]["command_redacted"],
+        "check-499"
+    );
+    let (status, refreshed) = server.request("POST", "/api/history", Some(json!({"limit":100})));
+    assert_eq!(status, 200);
+    assert_eq!(
+        refreshed["events"][99]["record"]["command_redacted"],
+        "check-600"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        format!("{original}{}", record(600))
+    );
+}
+
+#[test]
 fn real_service_reuses_identity_and_rejects_unauthorized_mutations() {
     let state = state();
     let (server, first) = service(&state);

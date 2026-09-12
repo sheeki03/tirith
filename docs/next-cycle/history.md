@@ -6,11 +6,20 @@ never a filesystem path or byte offset. Each request reads at most 2 MiB plus
 bounded generation anchors, retains at most 500 records, and rejects individual
 lines over 1 MiB. At most 128 opaque cursor capabilities remain live.
 
-The first request inspects a recent suffix. `earlier_history_uninspected` reports
-the omitted prefix even when all retained records match the query. A continuation
-reads forward, including later appends. A partial last line retains its starting
-offset until it is complete. Malformed records, oversized lines, unknown source,
-disabled logging and unavailable data are separate from an empty result.
+CLI recent-history, tuning and incident feedback select the newest matching
+records within a bounded suffix. Activity opens on the newest page and offers
+older pages. These cursors retain their upper byte boundary when new records
+arrive; explicit refresh reads the latest records. Each returned page is
+chronological, and Activity renders the newest records first. A record cut by
+the byte-window boundary is recovered on the older page when it is within the
+per-record size limit.
+
+`earlier_history_uninspected` reports the omitted prefix even when all retained
+records match the query. The separate forward-reader interface retains its
+append-aware cursors, including incomplete last lines until the writer finishes
+them. Cursors are bound to their read direction and filter. Malformed records,
+oversized lines, unknown source, disabled logging and unavailable data are
+separate from an empty result.
 
 Record IDs combine a random reader generation with the original byte position.
 Retries within that generation return the same IDs. Replacing/truncating the
@@ -31,8 +40,8 @@ observation; a task-boundary entry is an assessment. None is silently promoted t
 proof that execution happened or was prevented. Recorded actions and policy
 paths retain their historical attribution.
 
-The initial implementation and deterministic regressions are pending current
-build verification. Integration into the live dashboard, incremental aggregates,
-append-failure health, and rotation/retention transactions remain WP12 work.
-Rotation must preserve signed segment/head evidence and explicitly address
-older writers; this reader does not rotate or delete anything.
+The live dashboard, incremental aggregates and retention transactions use shared
+core and CLI services. Retention preserves signed segment/head evidence and
+explicitly addresses older writers; this reader does not rotate or delete
+anything. Append-failure health and final candidate verification remain WP12
+work. The newest-page regressions await the next coordinated candidate build.

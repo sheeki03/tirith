@@ -15,6 +15,7 @@ Inspected:
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
 | `tirith check` | Full | Tokenizes the command and inspects every extracted URL, path, and Docker ref through the full rule pipeline. | Yes |
+| `tirith review` | Partial | Explicit offline review of bounded project-relative dependency declarations, hooks, AI instructions and MCP configuration. Retains file identities and reports uninspected surfaces; never starts tooling, installs packages or establishes runtime safety. | Partial |
 | `tirith paste` | Full | Scans the pasted bytes and rich-text HTML for injection, invisible characters, and homograph attacks. | Yes |
 | `tirith scan` | Full | Walks files, directories, and configs; inspects bytes, embedded URLs, and wheel/native artifact members. | Yes |
 | `tirith run` | Full | Downloads and inspects the script and interpreter shebang. Live execution is Linux-only and uses the exact reviewed bytes from a sealed anonymous descriptor; --no-exec remains inspection-only on Unix. | Yes |
@@ -29,7 +30,7 @@ Inspected:
 | `tirith capsule run` | Full | Copies the project with symlink-safe same-inode traversal (refusing symlinks, escapes, and case/Unicode collisions), digests every copied file, runs the exact argv in a fail-closed capsule, and diffs the tree afterwards. Available on native x86_64 or aarch64 Linux when the kernel provides every requested Landlock/seccomp control; unavailable controls or other hosts refuse before any copy or spawn. ARM GNU candidate acceptance is recorded separately from pending final release-artifact qualification. | Yes |
 | `tirith taint` | None | Tracks provenance of files downloaded from risky sources; flags execution of a tainted file. Bookkeeping, not content inspection. | Yes |
 | `tirith intend` | Full | Inspects the command and flags high-impact behavior the stated intent does not justify (advisory). | Yes |
-| `tirith task check` | Partial | Preview, diagnostic. Parses a bounded untrusted task envelope in full and assigns each source's effective provenance from the tirith-owned ingress adapter rather than the document's own claim, but effect inference models the Web3 shell grammar and nothing else, so a proposed shell action outside that grammar is reported INCOMPLETE rather than understood. Executes nothing, fetches nothing, resolves no package, and writes nothing; it declares enforceability observe_only, so it reports what an envelope would be allowed to do and stops nothing. | Yes |
+| `tirith task check` | Partial | Preview, diagnostic. Parses a bounded untrusted task envelope in full and assigns each source's effective provenance from the tirith-owned ingress adapter rather than the document's own claim, but effect inference models recognized Web3 and package-command families with bounded syntax, while unsupported or dynamic runtime effects remain explicitly INCOMPLETE. Executes nothing, fetches nothing, resolves no package, and writes nothing; it declares enforceability observe_only, so it reports what an envelope would be allowed to do and stops nothing. | Yes |
 | `tirith lab` | Full | Runs the detection engine against a curated, inert adversarial corpus to show what it catches. Offline. | Yes |
 | `tirith explain` | None | Prints rule documentation, examples, remediation, and MITRE mapping. Documentation surface. | Yes |
 | `tirith why` | None | Explains the last rule that triggered. Reporting surface over an existing verdict. | Yes |
@@ -42,7 +43,7 @@ Inspected:
 | `tirith status` | None | Reports protection mode, hook health, active policy, and threat-DB freshness. Reporting surface. | Yes |
 | `tirith doctor` | None | Diagnoses install, hooks, policy, and per-OS capsule coverage. Reports state and can --fix configuration. | Yes |
 | `tirith prompt-status` | None | One-line protection and active-context indicator for the shell prompt. Reporting surface (30s cache). | Yes |
-| `tirith dashboard` | None | Renders a local-only HTML dashboard from the audit log, policy, and trust store. Reporting surface. | Yes |
+| `tirith dashboard` | None | Loopback-only authenticated local controls share typed CLI plans for personal setup, policy, grants, retention and lifecycle changes. History, project and artifact evidence have explicit limits; a running service does not prove shell interception. | Partial |
 | `tirith warnings` | None | Shows accumulated session warnings. Reporting surface over prior verdicts. | Yes |
 | `tirith receipt` | None | Tracks and verifies scripts run through tirith run against the audit hash-chain. Verification surface. | Yes |
 | `tirith logs` | Full | Inspects agent and CLI logs for injection seeds, secrets, and escape bytes. | Yes |
@@ -54,7 +55,7 @@ Inspected:
 |---------|-----------|----------|-----------------|
 | `tirith init` | None | Prints the shell hook for the active profile. Configuration surface. | Yes |
 | `tirith onboard` | None | Guided first-run wizard: detects the environment and recommends a policy template. Configuration surface. | Yes |
-| `tirith setup` | None | One-command AI-tool setup. Writes integration config; does not inspect content. | Yes |
+| `tirith setup` | None | Personal recommended setup combines a selected shell and profile in one owned journal; explicit host setup writes selected integration configuration. Configuration does not establish observed interception. Unsupported or uncertified automatic selections refuse. | Yes |
 | `tirith install` | Partial | Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run. For npm, --online also reports registry identity facts (origin, registry-bound tarball URL, parsed dist.integrity SRI, legacy shasum status, signature and provenance-attestation state) and, on an unpinned spec, a name-existence probe; those facts are parsed, never verified, and tirith does not download, inspect, or bind the tarball bytes npm installs. | Partial |
 | `tirith verify-self` | Full | Verifies the running binary and its build/install provenance against signed checksums. | Yes |
 | `tirith update` | Full | Signature-verified self-update: inspects the downloaded binary before replacing the running one. | Yes |
@@ -94,7 +95,7 @@ Inspected:
 
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
-| `tirith package` | Partial | Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise. For npm, --online reports dist identity facts and their verification state; no state can be verified here, and tirith does not download, inspect, or bind npm tarball bytes. | Partial |
+| `tirith package` | Partial | Scores supply-chain evidence offline or with explicit registry provenance. The local npm artifact route inspects exact bounded tarball bytes, metadata, scripts and selected code/native signals without extraction or execution; artifact comparison reports identity and coverage changes. Provenance and inspection do not approve installation. | Partial |
 | `tirith ecosystem` | Partial | Scores every declared dependency in a project, slopsquat-aware. Inspects manifests and installed trees; registry depth needs --online. | Partial |
 | `tirith threat-db` | None | Manages the signed local threat database. Data management surface consumed by the inspecting commands. | Yes |
 | `tirith iac` | Full | Terraform / Pulumi / OpenTofu apply gates: inspects the saved-plan hash and blocks no-plan applies. | Yes |
@@ -122,7 +123,7 @@ Inspected:
 
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
-| `tirith audit` | None | Audit-log management; verify checks the tamper-evident hash chain. Verification and export surface. | Yes |
+| `tirith audit` | None | Bounded recent checks and intention labels, signed-chain verification, reviewed rotation, exact private segment export and acknowledged irreversible segment deletion. Deleted history remains unavailable; recorded checks and labels do not establish execution or command safety. | Yes |
 | `tirith incident` | None | Declares an under-attack posture: fail-closed, bypass disabled, key rules elevated. Posture control. | Yes |
 | `tirith checkpoint` | Full | Snapshots files before risky operations; restore sha256-verifies each blob and reports per-file outcomes. | Yes |
 | `tirith pending` | None | Pending-decision registry for deferred blocks and suppressed-finding rollups. Bookkeeping surface. | Yes |

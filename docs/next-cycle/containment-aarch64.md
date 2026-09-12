@@ -4,8 +4,8 @@ WP27 selects native, little-endian Linux aarch64 with deny-all networking as the
 additional qualification target. Tirith already distributes GNU and musl aarch64
 binaries, and native ARM Linux test access is available. This addresses an
 existing distribution gap; it is not evidence that users requested a particular
-new sandbox API. Qualification remains pending until the native acceptance
-matrix below passes on the implementation and release artifacts.
+new sandbox API. Native GNU and musl candidate acceptance now passes as recorded
+below; qualification of the final tag-produced release artifacts remains separate.
 
 ## Existing mechanisms to preserve
 
@@ -28,7 +28,8 @@ The implementation adds a native aarch64 syscall policy to the existing Linux la
 already locked rust-vmm seccompiler generation rather than copying extrasafe's
 x86_64 syscall numbers or writing a separate hand-assembled BPF compiler. The
 seccompiler project supports aarch64; extrasafe 0.5 does not. Keep the dependency
-target-specific and retain the current x86_64 policy unchanged. Sources:
+target-specific and preserve the existing x86_64 restrictions. Shared lifetime
+and observed local readiness fixes apply to both Linux policies. Sources:
 [extrasafe 0.5 architecture limit](https://docs.rs/crate/extrasafe/0.5.1/source/README.md)
 and [seccompiler 0.4 implementation](https://github.com/rust-vmm/seccompiler/blob/v0.4.0/src/lib.rs).
 
@@ -160,3 +161,39 @@ exec, supervisor SIGTERM/SIGKILL and guard SIGKILL with a live fork descendant.
 The regular native Linux CI job runs these interruption cases too. Abrupt outer
 process death cannot produce a completed cleanup receipt; preserved temporary
 residue must not be reported as confirmed cleanup.
+
+Both local GNU and musl candidates pass all 16 exact-archive cases: the earlier nine,
+both sleep APIs through an actual shell utility, the per-real-UID process limit,
+descriptor-local epoll/eventfd/ppoll readiness, and four interruption cases
+(before exec, supervisor SIGTERM, supervisor SIGKILL and guard SIGKILL). The
+last three start a live target and fork descendant and require the guard and
+entire target tree to stop; guard death also completes without waiting forever
+on inherited output pipes. The source manifest is
+`7d9788bfe34462c745b252038ac6d045265d08d940759fc82f9620c882b5d317`;
+both builds consume that exact immutable source. The GNU binary SHA256 is
+`a3995ae1760775e4252273736b82c0a4f69f2bafe0d4b175cf7713402f4a67e6`;
+the static musl ELF SHA256 is
+`6013cbf85aef4ea21a95659da92cbba6cf298392721b7b050da19da28709da5f`.
+Each archive was independently extracted and ran the complete 16-case gate on
+Linux 6.12.76-linuxkit, aarch64, UID 65534, using Rust 1.83 with debug symbols
+and incremental compilation disabled. These exact local candidate archives
+are separate evidence from the CI builds below and from published releases.
+
+The readiness additions follow observed EPERM failures in a native syscall
+probe and Node's libuv loop initialization. They allow nanosleep,
+clock_nanosleep, epoll_create1, epoll_ctl, epoll_pwait, eventfd2 and ppoll. A
+production-policy subprocess regression verifies these local operations while
+socket creation, io_uring, namespace/group escape and signals to other processes
+still fail. Passing a Node prerequisite or this generic project-copy capsule
+does not qualify the separate sealed-input package-install authority boundary.
+
+Native CI also passes both [GNU](https://github.com/sheeki03/tirith/actions/runs/34689197992/job/103541375574)
+and [musl](https://github.com/sheeki03/tirith/actions/runs/34689197992/job/103541375613)
+archive qualification at commit `71070bbbb02a3a6e5f96d335a048e92a7f048679`.
+These jobs build their own release-profile candidates and execute the complete
+16-case gate on native ARM. The tag-triggered final release-artifact lane was
+not run for this pull request, so publication qualification remains separate.
+Later changes to the syscall or launcher contract require fresh evidence.
+
+Neither source-manifest-bound local result nor the commit-bound CI result
+qualifies later npm runtime-pack, stdio-policy or namespace changes.

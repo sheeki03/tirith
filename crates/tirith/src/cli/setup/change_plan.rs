@@ -2368,11 +2368,13 @@ fn read_step(step: &Step) -> Result<Option<String>, String> {
 
 fn step_update(step: &Step, text: String) -> FileUpdate {
     let update = FileUpdate::write_text(text, 0o600).with_backup(true);
+    #[cfg(unix)]
     if matches!(&step.edit, OwnedEdit::PrivateFile { .. }) {
-        update.with_exact_mode()
-    } else {
-        update
+        return update.with_exact_mode();
     }
+    #[cfg(not(unix))]
+    let _ = step;
+    update
 }
 
 fn segment_state_matches(step: StepState, state: super::audit_segments::SegmentState) -> bool {

@@ -665,7 +665,11 @@ fn process_arguments(pid: libc::pid_t) -> Option<Vec<String>> {
             .map(|arg| String::from_utf8(arg.to_vec()).ok())
             .collect()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_process_arguments(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         use tirith_core::trusted_child::{ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable};
         let program = TrustedExecutable::from_system_candidates(&[
@@ -675,7 +679,7 @@ fn process_arguments(pid: libc::pid_t) -> Option<Vec<String>> {
         .ok()?;
         let pid = pid.to_string();
         let spec = ChildSpec::new(
-            ["-p", pid.as_str(), "-o", "args="],
+            ["-ww", "-p", pid.as_str(), "-o", "args="],
             ChildLimits::new(std::time::Duration::from_secs(1), 16 * 1024, 1024),
         );
         let ChildOutcome::Completed { status, stdout, .. } =
@@ -727,7 +731,88 @@ fn process_executable(pid: libc::pid_t) -> Option<PathBuf> {
     }
 }
 
-#[cfg(unix)]
+// macOS ps truncates comm to its output width, which can hide a Homebrew
+// shell's basename. Use native process metadata instead of flattened output.
+#[cfg(target_os = "macos")]
+fn read_process(pid: libc::pid_t) -> Option<(String, libc::pid_t)> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: proc_pidinfo receives a correctly sized writable native struct.
+    let count = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected as libc::c_int,
+        )
+    };
+    if count != expected as libc::c_int {
+        return None;
+    }
+    // SAFETY: the API initialized the complete struct above.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != u32::try_from(pid).ok()? {
+        return None;
+    }
+    let path = process_executable(pid)?;
+    Some((
+        path.to_str()?.to_owned(),
+        libc::pid_t::try_from(info.pbi_ppid).ok()?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_arguments(pid: libc::pid_t) -> Option<Vec<String>> {
+    // PROCARGS2 contains argc, executable path, argv, then environment. Bound
+    // the native buffer; decode only argv and never retain or display env.
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut bytes = vec![0u8; 256 * 1024];
+    let mut size = bytes.len();
+    // SAFETY: MIB and byte buffer are valid for their supplied lengths.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size > bytes.len() {
+        return None;
+    }
+    decode_macos_process_arguments(&bytes[..size])
+}
+
+#[cfg(target_os = "macos")]
+fn decode_macos_process_arguments(bytes: &[u8]) -> Option<Vec<String>> {
+    let count = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+    if !(1..=4096).contains(&count) {
+        return None;
+    }
+    let remaining = bytes.get(4..)?;
+    let executable_end = remaining.iter().position(|byte| *byte == 0)?;
+    let mut remaining = remaining.get(executable_end + 1..)?;
+    // The executable pathname is padded with NUL bytes before argv[0].
+    let start = remaining.iter().position(|byte| *byte != 0)?;
+    remaining = &remaining[start..];
+    let mut args = Vec::new();
+    let mut total = 0usize;
+    for _ in 0..count {
+        let end = remaining.iter().position(|byte| *byte == 0)?;
+        total = total.checked_add(end + 1)?;
+        if total > 16 * 1024 {
+            return None;
+        }
+        args.push(std::str::from_utf8(&remaining[..end]).ok()?.to_owned());
+        remaining = &remaining[end + 1..];
+    }
+    Some(args)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn read_process(pid: libc::pid_t) -> Option<(String, libc::pid_t)> {
     use tirith_core::trusted_child::{ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable};
 
@@ -738,7 +823,7 @@ fn read_process(pid: libc::pid_t) -> Option<(String, libc::pid_t)> {
     .ok()?;
     let pid = pid.to_string();
     let spec = ChildSpec::new(
-        ["-p", pid.as_str(), "-o", "comm=", "-o", "ppid="],
+        ["-ww", "-p", pid.as_str(), "-o", "comm=", "-o", "ppid="],
         ChildLimits::new(std::time::Duration::from_secs(1), 16 * 1024, 16 * 1024),
     );
     let ChildOutcome::Completed { status, stdout, .. } =
@@ -1080,6 +1165,42 @@ mod tests {
 
     fn prompt_status_snippet(shell: &str) -> String {
         prompt_status_snippet_for(shell, Path::new("/opt/Tirith Bin/tirith"))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_process_identity_keeps_the_full_executable_path() {
+        let (name, parent) = super::read_process(std::process::id() as libc::pid_t).unwrap();
+        assert_eq!(
+            std::path::Path::new(&name),
+            std::env::current_exe().unwrap().canonicalize().unwrap()
+        );
+        assert_eq!(parent, unsafe { libc::getppid() });
+        let args = super::process_arguments(std::process::id() as libc::pid_t).unwrap();
+        assert!(!args.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_arguments_preserve_boundaries_and_exclude_environment() {
+        let mut bytes = 4i32.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(b"/long/installed/shell/bash\0\0bash\0--rcfile\0/a profile with spaces\0-i\0PRIVATE_ENV=value\0");
+        let args = super::decode_macos_process_arguments(&bytes).unwrap();
+        assert_eq!(args, ["bash", "--rcfile", "/a profile with spaces", "-i"]);
+        assert_eq!(
+            super::startup_mode_from_args("bash", &args),
+            "custom-profile"
+        );
+        assert!(super::decode_macos_process_arguments(&[0; 4]).is_none());
+        assert!(super::decode_macos_process_arguments(
+            &bytes[..bytes.len() - b"-i\0PRIVATE_ENV=value\0".len() + 1]
+        )
+        .is_none());
+        let mut oversized = 1i32.to_ne_bytes().to_vec();
+        oversized.extend_from_slice(b"/bin/bash\0");
+        oversized.extend(std::iter::repeat_n(b'x', 16385));
+        oversized.push(0);
+        assert!(super::decode_macos_process_arguments(&oversized).is_none());
     }
 
     #[test]

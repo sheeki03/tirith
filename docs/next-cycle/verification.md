@@ -230,3 +230,165 @@ regressions; they do not replace actual receipt/caller-shell PTY tests on the
 next linked executable. A later independent status-proof review also required
 a fresh intercepted status command for every verified result; its newly added
 core regression still awaits the next candidate.
+
+## Integrated review and resource measurements
+
+The integrated `reviewed-shell-cache-browser-lifetime-inputs` snapshot passed
+`cargo fmt --all --check` and strict
+`cargo clippy --workspace --all-targets --locked -- -D warnings` (6m31s).
+This includes the bounded cache capture, retained project-root checks, fresh
+shell-status proof and complete npm/privacy diagnostic capture. A corrected
+failed-rollback integration fixture then passed its targeted Clippy check.
+The subsequent offline-probe and Linux readiness additions are included in
+commit `71070bbbb02a3a6e5f96d335a048e92a7f048679`; their complete linked
+recertification is in progress.
+
+The exact ARM readiness policy and tests from source snapshot
+`7d9788bfe34462c745b252038ac6d045265d08d940759fc82f9620c882b5d317`
+compiled with Rust 1.83 and passed six native tests as UID 65534. They exercised
+eventfd/epoll readiness, polling and timers while retaining socket, io_uring,
+namespace and arbitrary-signal denial. These are isolated production-policy
+tests; the complete launcher and interruption cases require separate results.
+
+`scripts/measure-local-control.py` accepts `--binary`, `--output`, `--samples`,
+`--history-rows` and an optional `--baseline` executable. It measures identical
+version, quick-doctor, local-policy and ordinary-check commands against both
+executables, alternating order, plus candidate-only policy/profile and service
+requests. The report records exact executable hashes, first and subsequent
+samples, median/p95 distributions and enforced history/response bounds. First
+samples do not imply cold OS caches. Ambient host contention is uncontrolled,
+and debug-versus-release ratios do not define release regression budgets.
+
+A three-sample runner validation against the previously linked `e811d8cc`
+candidate and signed 0.4.2 baseline passed all eleven measurements and bounds
+with a 10,000-row, 3,940,000-byte history fixture. It is recorded in
+`performance-runner-checkpoint.json`; final packaged resource measurements,
+peak memory/CPU/allocation measurements and reviewed budgets remain pending.
+
+## Linked offline-readiness candidate and follow-up regressions
+
+The `offline-probe-readiness-test-build-inputs` capture linked successfully in
+10m52s. Its executable SHA-256 is
+`b2ba2d23c8091eaac111cbaefa3fa877617d2716aca20be808a92db838f360de`.
+The selected core/CLI/integration run passed 173 tests and failed seven. The
+failures identified root anchoring to a linked manifest, newest-record selection
+in busy small logs, and fresh recommended-setup policy discovery, plus three
+fixture problems (canonical pip version, stale-shell refusal precedence and
+explicit history logging). These are recorded failures, not a passing candidate.
+Fixes and expanded regressions await integrated recertification.
+
+The same executable passed all 17 actual Chromium workflows in
+`offline-readiness-browser-expanded-details/browser-results.json`, including
+retained-root project review, npm inspection/comparison, six pages, hostile text,
+feedback apply/undo, tuning, profiles, exceptions, saved operations, selected
+support download, rotation/undo, segment export and irreversible deletion,
+impact activation/undo, shell setup and combined setup with an existing policy.
+Screenshots were visually inspected; no browser JavaScript errors occurred.
+An expanded busy-history browser case is prepared for the next candidate.
+
+The new history module, SHA-256
+`84f252f14a7a3bd2c79b2d9eab9f6ea5aefe89f3cd92bc46dce4e177b13dcb79`,
+passed ten isolated native tests linked against the frozen dependency graph.
+They cover newest selection, forward compatibility, older pages, append/retry,
+filter/direction invalidation, split-record recovery and progress over giant
+records. Evidence is in `history-module-current`; this does not replace the
+integrated CLI/API/browser run.
+
+CI on `71070bbbb` passed strict Clippy, formatting, dependency policy, installer
+fixtures, native ARM GNU/musl qualification and the performance workflow. Native
+Linux/macOS/MSRV tests found the recommended-setup and completion-generation
+regressions; Windows compilation found retained-handle thread ownership and an
+unconditional Unix permission API. The Bash hook job found a fixture mutation
+blocked by the actual hook. The release check found its read-only ARM job missing
+from the validation-job classification. Fuzz preflight found one missing direct
+dependency edge in its lockfile. Each failure is being fixed and rerun; none is
+waived by the passing jobs.
+
+## Resource runner validation and corrective candidate
+
+The resource runner now accepts `--resources`. Each measured command runs under
+one fresh wrapper that collects kernel child CPU time and peak RSS; the timed
+interval excludes wrapper startup. CPU and memory records stay attached to the
+same command and candidate/baseline role. Detached service memory, concurrent
+process-tree totals and allocator activity are explicitly not measured by this
+method. The fixture report records regular-file bytes before and after the run.
+
+The retained `b2ba2d23` checkpoint passed a three-sample resource-runner check
+with 10,000 history rows and all eleven request/response bounds. Fixture growth
+was 2,481 bytes. A second self-comparison using the same executable for both
+roles confirmed three separate resource samples per role for all four paired
+commands; fixture growth was 4,362 bytes. Every completed-child RSS sample was
+positive and CPU samples were nonnegative. Reports are
+`resource-runner-checkpoint.json` and `resource-runner-self-comparison.json`.
+The final checked runner SHA-256 is
+`dcdd99ab38209aac758894ebdbc62b4d6ed88a2dacf5b400f866f2a547d4bc82`.
+These validate the measurement tool; concurrent compilation made host contention
+uncontrolled and these samples establish no release regression budget.
+
+The `history-setup-native-fixes-inputs` capture passed formatting and strict
+workspace/all-targets Clippy in 11m49s. Its selected test executables were linked
+for integrated runtime verification. The capture includes a separately
+hashed shell-conformance supplement: native Zsh binding changes now prepare the
+helper-drift fixture without asking the active security hook to execute a
+command it correctly blocks.
+
+## History, setup and native-target corrective candidate
+
+The corrected source capture linked in 16m20s. Candidate SHA-256 is
+`11fde156220c6e9bf2cbfd7e26af0b7929b3850bc6c3cdabbdbb37f38bc04172`.
+The focused run initially passed 307 tests and found one error in a newly added
+feedback test: apply returns the stored operation status, whereas the test read
+the dry-run preview shape. The corrected test now checks completed state, the
+persisted event UUID and expectation, and unchanged audit bytes. All four feedback
+tests passed on the same candidate. The reconciled selection passes **308 tests**
+with no failures or ignored tests; the initial failure report and separately
+hashed test supplement are retained. The complete core suite passed **5,892 tests**
+with two existing ignored tests; the complete CLI unit suite passed **1,899 tests**
+with two existing ignored tests. Both had zero failures. The report collector
+initially selected an embedded child-test summary; the retained raw logs and
+`*-verified-results.json` reconcile counts against the final anchored libtest
+result without rerunning or discarding the original reports.
+
+Five actual native caller-shell cases passed on this candidate: Bash allow/block
+verification, Bash interceptor removal, Fish verification, Zsh helper replacement
+and Zsh disabled interception. These confirm the full Darwin executable-identity
+fix and actual helper-drift preparation. Packaged Bash/Zsh/Fish qualification
+separately passed 32 cases. Four additional cases passed: three controlling-terminal
+confirmation/refusal cases and the npm launcher across all three shells. Native
+Claude 2.1.268 baseline checks passed allowed, blocked and explicitly disabled
+cases; the binary and each executed configuration stayed unchanged. These results
+do not qualify the separately prepared guarded-hook changes.
+
+The first browser attempt reached the combined three-step setup but exceeded its
+40-second fixture wait while two steps were applied and the third was applying.
+The fixture now allows a bounded 120-second wait for combined apply/undo and
+records both elapsed times; this is not a release latency budget. A second attempt
+correctly refused mutation after a test relink replaced the build-path executable
+identity. Final browser recertification uses a retained candidate outside Cargo's
+mutable output path. Both failed attempts remain recorded; neither is counted as
+a successful browser run. A third retained-binary attempt passed fourteen checks
+but remained at a planned impact operation after Apply; its request timeline was
+not recorded and the cause remains unresolved. The instrumented focused five-flow
+reproduction passed impact apply/undo, shell setup, combined setup and narrow
+layout with actual operation transitions recorded. The full instrumented run is
+pending; focused success does not replace that remaining browser qualification.
+
+## Bounded npm-reader fuzz checkpoint
+
+The npm artifact reader completed **36,320 executions in 301 seconds** with
+AddressSanitizer, eleven inert seeds, a 256 KiB input ceiling, a 1 GiB RSS limit
+and a ten-second per-input timeout. No crash artifact was produced; final reported
+RSS was 453 MiB. The source was exactly `71070bbbb` plus the one-line fuzz lockfile
+dependency correction. The isolated development build used Rust nightly
+`1.100.0-nightly (0fc141305 2026-09-11)` and cargo-fuzz 0.13.2; the workflow uses
+its separately pinned nightly. `npm-fuzz-71070/qualification.json` preserves the
+source/lock/target hashes, seed hashes, executable identity, corpus and full log.
+This is bounded fuzz evidence, not an exhaustive claim or a closed G2 gate.
+
+A separate allocation-counter prototype linked against the corrective candidate's
+core dependency graph and passed its known-layout counter self-check plus six
+isolated three-sample workloads. It records thread-local Rust allocation requests
+and full reallocation request sizes, excluding native allocation bypasses, other
+threads, children and live-heap size. The 10,000-record fixture was 4,360,000 bytes.
+Evidence is `allocation-runner-prototype-v2`; the production benchmark registration
+and release-profile measurements remain pending.

@@ -79,6 +79,7 @@ pub struct ProjectReview {
     id: String,
     root: PathBuf,
     root_anchor: ContainedAtomicFile,
+    root_anchor_path: PathBuf,
     files: Vec<FileReview>,
     witnesses: Vec<Witness>,
     inspected_bytes: u64,
@@ -131,12 +132,17 @@ impl ProjectReview {
                     .into(),
             );
         }
-        let root_anchor = ContainedAtomicFile::prepare(root, &root.join("package.json"), false)
+        let id = uuid::Uuid::new_v4().to_string();
+        // Retain the directory independently of every selected file. This
+        // unique logical leaf is never created, read, or published.
+        let root_anchor_path = root.join(format!(".tirith-review-anchor-{id}"));
+        let root_anchor = ContainedAtomicFile::prepare(root, &root_anchor_path, false)
             .map_err(|_| "project root cannot be retained without following links")?;
         let mut review = Self {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             root: root.into(),
             root_anchor,
+            root_anchor_path,
             files: Vec::new(),
             witnesses: Vec::new(),
             inspected_bytes: 0,
@@ -252,7 +258,7 @@ impl ProjectReview {
         let expired = self.captured.elapsed() >= Duration::from_secs(600);
         let root_changed = !self
             .root_anchor
-            .matches_visible(&self.root, &self.root.join("package.json"))
+            .matches_visible(&self.root, &self.root_anchor_path)
             .unwrap_or(false);
         let mut rows = self.files.clone();
         for witness in &self.witnesses {
@@ -657,9 +663,15 @@ mod tests {
         )
         .unwrap();
         std::os::unix::fs::symlink(outside.path(), root.join("linked")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[dependencies]\nserde = \"1\"\n").unwrap();
+        let entries_before = std::fs::read_dir(&root).unwrap().count();
         let report = ProjectReview::capture(
             &root,
-            &["package.json".into(), "linked/package.json".into()],
+            &[
+                "package.json".into(),
+                "linked/package.json".into(),
+                "Cargo.toml".into(),
+            ],
             &Policy::default(),
             None,
         )
@@ -667,11 +679,11 @@ mod tests {
         .projection(&[])
         .unwrap();
         assert!(!report.to_string().contains("outside-never-read"));
-        assert!(report["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|file| file["status"] == "unavailable"));
+        assert_eq!(report["root_changed"], false);
+        assert_eq!(report["files"][0]["status"], "unavailable");
+        assert_eq!(report["files"][1]["status"], "unavailable");
+        assert_eq!(report["files"][2]["status"], "inspected");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), entries_before);
     }
 
     #[test]

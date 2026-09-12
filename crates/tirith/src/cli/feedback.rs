@@ -57,8 +57,7 @@ fn intent<'a>(change: &'a FeedbackRequest, cwd: Option<&str>) -> Result<Intent<'
 
 fn observed_incident(id: &str) -> Result<String, String> {
     let path = tirith_core::audit::audit_log_path().ok_or("history is unavailable")?;
-    let report = tirith_core::history::HistoryReader::new(path).query(
-        None,
+    let report = tirith_core::history::HistoryReader::new(path).recent(
         Default::default(),
         500,
         std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),

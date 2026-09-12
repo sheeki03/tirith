@@ -2323,6 +2323,7 @@ dependencies = [
  "regex-syntax",
  "reqwest",
  "rust-mcp-schema",
+ "seccompiler",
  "serde",
  "serde_json",
  "serde_yaml",

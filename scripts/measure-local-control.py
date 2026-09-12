@@ -14,6 +14,7 @@ from pathlib import Path
 import platform
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -40,7 +41,50 @@ def distribution(samples):
             "p95_ms": values[min(len(values) - 1, int(len(values) * .95))], "max_ms": values[-1]}
 
 
-def run(binary, output, samples, history_rows, baseline=None):
+def resource_child(report_path, command):
+    """One fresh wrapper gives getrusage an independent completed-child sample.
+
+    The measured interval excludes this Python interpreter's startup. Kernel RSS
+    is the largest completed child, not a sum of concurrent process-tree memory.
+    Live detached descendants (such as the dashboard) are outside this sample.
+    """
+    try:
+        import resource
+    except ImportError:
+        resource = None
+    before = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
+    started = time.perf_counter()
+    result = subprocess.run(command, capture_output=True, timeout=45)
+    metrics = {"elapsed_ms": (time.perf_counter() - started) * 1000,
+               "availability": "available" if resource else "unsupported"}
+    if resource:
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        metrics.update({"cpu_user_ms": (after.ru_utime - before.ru_utime) * 1000,
+                        "cpu_system_ms": (after.ru_stime - before.ru_stime) * 1000,
+                        "peak_rss_bytes": int(after.ru_maxrss * (1 if sys.platform == "darwin" else 1024))})
+    Path(report_path).write_text(json.dumps(metrics) + "\n")
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    return result.returncode
+
+
+def fixture_storage(root):
+    """Count regular-file bytes in only this private, bounded fixture tree."""
+    import stat
+    total, files = 0, 0
+    for directory, subdirs, names in os.walk(root, followlinks=False):
+        subdirs[:] = [name for name in subdirs if not (Path(directory) / name).is_symlink()]
+        for name in names:
+            metadata = (Path(directory) / name).lstat()
+            if stat.S_ISREG(metadata.st_mode):
+                total += metadata.st_size
+                files += 1
+                if files > 20000:
+                    raise AssertionError("fixture storage measurement exceeded its file bound")
+    return {"regular_file_bytes": total, "regular_files": files}
+
+
+def run(binary, output, samples, history_rows, baseline=None, resources=False):
     assert 3 <= samples <= 100
     assert 1000 <= history_rows <= 500000
     report = {"schema_version": 1, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
@@ -51,6 +95,14 @@ def run(binary, output, samples, history_rows, baseline=None):
                            "cold_cache_claim": False,
                            "first_sample": "first invocation in this fixture; OS caches are not cleared",
                            "contention": "ambient host activity is not controlled"}}
+    if resources:
+        report["resource_method"] = {
+            "source": "RUSAGE_CHILDREN in one fresh wrapper per command",
+            "wrapper_startup_included": False,
+            "peak_memory": "kernel maximum for completed children; not simultaneous process-tree total",
+            "detached_service_resources": "not_measured",
+            "allocations": "not_measured",
+            "resource_samples": "same measured commands; baseline and candidate alternate as above"}
     if baseline is not None:
         report["baseline"] = {"binary_sha256": hashlib.sha256(baseline.read_bytes()).hexdigest(),
                               "measurements": {}, "comparison": {}}
@@ -85,11 +137,24 @@ def run(binary, output, samples, history_rows, baseline=None):
                 file.write(line)
         report["history_fixture"] = {"rows": history_rows, "bytes": audit.stat().st_size}
 
-        def cli(args, executable=binary):
+        resource_samples = {}
+        storage_before = fixture_storage(root)
+
+        def cli(args, executable=binary, role="candidate"):
+            command = [str(executable), *args]
+            metrics_path = root / "resource-sample.json"
+            if resources:
+                command = [sys.executable, str(Path(__file__).resolve()), "--resource-child", str(metrics_path), *command]
             start = time.perf_counter()
-            result = subprocess.run([str(executable), *args], cwd=cwd, env=env, capture_output=True, timeout=45)
+            result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, timeout=60 if resources else 45)
+            elapsed = (time.perf_counter() - start) * 1000
             assert result.returncode == 0, (args, result.stderr.decode(errors="replace"))
-            return result.stdout, (time.perf_counter() - start) * 1000
+            if resources:
+                metrics = json.loads(metrics_path.read_text())
+                metrics_path.unlink()
+                elapsed = metrics.pop("elapsed_ms")
+                resource_samples.setdefault((role, tuple(args)), []).append(metrics)
+            return result.stdout, elapsed
 
         common = [("cli_version", ["--version"]), ("quick_status", ["doctor", "--quick", "--json"]),
                   ("local_policy", ["policy", "effective", "--json"]),
@@ -103,19 +168,23 @@ def run(binary, output, samples, history_rows, baseline=None):
                 # Alternate the order to reduce systematic advantage from warmed
                 # filesystem caches; this is still a serial local comparison.
                 if baseline is not None and (name, args) in common and index % 2 == 0:
-                    _, elapsed = cli(args, baseline)
+                    _, elapsed = cli(args, baseline, role="baseline")
                     baseline_timings.append(elapsed)
                 _, elapsed = cli(args)
                 timings.append(elapsed)
                 if baseline is not None and (name, args) in common and index % 2 == 1:
-                    _, elapsed = cli(args, baseline)
+                    _, elapsed = cli(args, baseline, role="baseline")
                     baseline_timings.append(elapsed)
             report["measurements"][name] = {**distribution(timings), "first_ms": timings[0],
                                              "subsequent": distribution(timings[1:])}
+            if resources:
+                report["measurements"][name]["resources"] = resource_samples[("candidate", tuple(args))]
             if baseline_timings:
                 prior = distribution(baseline_timings)
                 report["baseline"]["measurements"][name] = {**prior, "first_ms": baseline_timings[0],
                                                              "subsequent": distribution(baseline_timings[1:])}
+                if resources:
+                    report["baseline"]["measurements"][name]["resources"] = resource_samples[("baseline", tuple(args))]
                 report["baseline"]["comparison"][name] = {
                     "candidate_to_baseline_median_ratio": statistics.median(timings) / prior["median_ms"],
                     "same_argv": args, "same_fixture": True, "regression_budget_enforced": False}
@@ -127,6 +196,8 @@ def run(binary, output, samples, history_rows, baseline=None):
         session, _, _ = http(origin, token, "", "/api/session")
         csrf = session["csrf"]
         report["measurements"]["service_launch"] = {"ms": launch_ms}
+        if resources:
+            report["measurements"]["service_launch"]["resources"] = resource_samples[("candidate", ("dashboard", "--no-browser", "--json"))]
         try:
             for name, route, body in [("service_policy", "/api/policy", None), ("service_health", "/api/state", None),
                                       ("recent_operations", "/api/jobs", None), ("aggregate_incremental", "/api/activity/summary", None)]:
@@ -150,18 +221,25 @@ def run(binary, output, samples, history_rows, baseline=None):
                 http(origin, token, csrf, "/api/quiesce", {})
             finally:
                 time.sleep(1)
+        storage_after = fixture_storage(root)
+        report["fixture_storage"] = {"before": storage_before, "after": storage_after,
+                                     "growth_bytes": storage_after["regular_file_bytes"] - storage_before["regular_file_bytes"],
+                                     "scope": "all fixture runs combined, including baseline when selected; live user data excluded"}
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--resource-child":
+        raise SystemExit(resource_child(sys.argv[2], sys.argv[3:]))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--history-rows", type=int, default=250000)
     parser.add_argument("--baseline", type=Path, help="Optional earlier release for identical CLI comparisons")
+    parser.add_argument("--resources", action="store_true", help="Measure per-command CPU and peak RSS with isolated native child accounting")
     args = parser.parse_args()
     run(args.binary.resolve(strict=True), args.output.resolve(), args.samples, args.history_rows,
-        args.baseline.resolve(strict=True) if args.baseline else None)
+        args.baseline.resolve(strict=True) if args.baseline else None, args.resources)

@@ -1909,10 +1909,25 @@ fn zsh_caller_shell_verification_observes_actual_blocking_and_helper_drift() {
     };
     let id = verification_challenge(&mut session);
     verification_complete(&mut session, &id);
-    // This function still calls the same binary but its loaded body changed.
-    session.send_line(
-        "functions[_tirith_verification_probe]=\"${functions[_tirith_verification_probe]}; :\"",
+    // Ordinary analysis correctly refuses this dynamic function assignment.
+    // Deliberately turn interception off inside this disposable fixture, prove
+    // the redefinition executed, then restore protection before testing drift.
+    session.send_line("zle -A .accept-line accept-line");
+    session.expect("TIRITH_PTY> ");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+    let changed = env.workdir.join("helper-definition-changed");
+    session.send_line(&format!(
+        "functions[_tirith_verification_probe]=\"${{functions[_tirith_verification_probe]}}; :\" && builtin print -r -- changed > '{}'",
+        changed.display()
+    ));
+    assert_eq!(
+        wait_for_marker(&changed, "changed", MARKER_MAX),
+        "changed\n"
     );
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+    session.send_line("zle -N accept-line _tirith_accept_line");
     session.expect("TIRITH_PTY> ");
     session.wait_idle(QUIET, SETTLE_MAX);
     session.clear_buffer();

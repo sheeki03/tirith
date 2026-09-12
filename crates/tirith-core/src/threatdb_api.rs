@@ -1871,7 +1871,9 @@ mod tests {
     fn frozen_cached_threat_uses_candidate_policy_and_never_rereads_changed_cache() {
         let guard = tirith_test_support::GlobalStateGuard::new().unwrap();
         let name = "tirith-frozen-cache-regression";
-        let key = format!("pypi:{name}:1.0.0");
+        // The existing PEP440 contract canonicalizes ==1.0.0 to exact version
+        // "1" before choosing a registry/cache identity.
+        let key = format!("pypi:{name}:1");
         store_cache(
             "osv",
             &key,
@@ -1918,10 +1920,14 @@ mod tests {
             )),
         );
         let before = frozen.evaluate_current();
-        assert!(!before
-            .explanation
-            .gaps
-            .contains(&crate::evaluation::EvidenceGap::RuntimeThreatEnrichmentNotCaptured));
+        assert!(
+            !before
+                .explanation
+                .gaps
+                .contains(&crate::evaluation::EvidenceGap::RuntimeThreatEnrichmentNotCaptured),
+            "{:?}",
+            before.verdict.findings
+        );
         assert!(before
             .verdict
             .findings

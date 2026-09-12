@@ -85,3 +85,29 @@ fn broad_current_dlp_redacts_history_without_rewriting_signed_source() {
     assert!(value.get("next_cursor").is_none());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
+
+#[test]
+fn recent_cli_selects_the_newest_records_in_a_small_busy_log() {
+    let state = GlobalStateGuard::new().unwrap();
+    let path = tirith_core::audit::audit_log_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bytes = (0..600).map(|i| format!("{}\n", serde_json::json!({"timestamp":"2026-09-12T00:00:00Z", "action":"Block", "command_redacted":format!("check-{i}")}))).collect::<String>();
+    std::fs::write(&path, &bytes).unwrap();
+    let output = run(&state, &["--limit", "10"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["events"][0]["record"]["command_redacted"],
+        "check-590"
+    );
+    assert_eq!(
+        result["events"][9]["record"]["command_redacted"],
+        "check-599"
+    );
+    assert_eq!(result["earlier_history_uninspected"], true);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
+}
