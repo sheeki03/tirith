@@ -14,15 +14,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # Bounded reference cohort on the existing PR. Retain the first resulting
-      # run, then rerun only its Performance job twice at the same frozen SHA.
-      # Other PRs and main retain ten samples and the ordinary stable toolchain.
+      # Separate EPYC 7763 reference cohort on the existing PR. Its product and
+      # measurement source stay frozen even as the workflow or PR advances.
+      # Retain three admitted executions; never pool these with EPYC 9V74.
+      # Other PRs and main retain their event source, ten samples and stable.
       RESOURCE_REFERENCE_COHORT: ${{ github.event_name == 'pull_request' && github.event.pull_request.number == 250 }}
+      RESOURCE_REFERENCE_SOURCE: 150e753a0adf8f9f13c8cc2b38f7a9325de40d91
+      RESOURCE_REFERENCE_TREE: 53123b9d0aa615d4135ce6c42f37abe6a5cdca16
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.sha }}
+          # The PR reference measures this explicit retained source, not its
+          # newer workflow/event revision. Provenance records both separately.
+          ref: ${{ env.RESOURCE_REFERENCE_COHORT == 'true' && env.RESOURCE_REFERENCE_SOURCE || github.sha }}
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
@@ -31,7 +36,7 @@ jobs:
       - name: Retain build and runner provenance; admit comparable PR 250 references
         run: |
           python3 - <<'PYCODE'
-          import hashlib, json, os, pathlib, platform, subprocess, sys
+          import hashlib, json, os, pathlib, platform, subprocess, sys, uuid
           def command(*args):
               return subprocess.check_output(args, text=True).strip()
           def sha(path):
@@ -43,32 +48,56 @@ jobs:
                       'logical_cpus': os.cpu_count()}
           expected = {'system': 'Linux', 'release': '6.17.0-1022-azure', 'machine': 'x86_64',
                       'image': 'ubuntu24', 'image_version': '20260907.300.1',
-                      'cpu_model': 'AMD EPYC 9V74 80-Core Processor', 'logical_cpus': 4}
+                      'cpu_model': 'AMD EPYC 7763 64-Core Processor', 'logical_cpus': 4}
           reference = os.environ['RESOURCE_REFERENCE_COHORT'] == 'true'
           revision = command('git', 'rev-parse', 'HEAD')
+          source_tree = command('git', 'rev-parse', 'HEAD^{tree}')
+          selected_source = os.environ['RESOURCE_REFERENCE_SOURCE'] if reference else os.environ['GITHUB_SHA']
+          selected_tree = os.environ['RESOURCE_REFERENCE_TREE'] if reference else None
+          manifest_hashes = {'Cargo.toml': sha('Cargo.toml'), 'Cargo.lock': sha('Cargo.lock')}
+          expected_manifests = {
+              'Cargo.toml': 'd382d1e50d73b3062a3bec5a461bd17017b8417444258559e014173fa47fb9e5',
+              'Cargo.lock': '6bed94688b407f844a026ac8550b463faab265ec4453f1d408621f1692f16264'}
+          boot_id = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
           rustc = command('rustc', '-Vv')
+          expected_rustc = ('rustc 1.98.1 (48a229cea 2026-09-01)\n'
+                            'binary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\n'
+                            'commit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\n'
+                            'release: 1.98.1\nLLVM version: 22.1.8')
           clean = not command('git', 'status', '--porcelain', '--untracked-files=no')
           issues = []
           if not clean:
               issues.append('tracked source is not clean before compilation')
-          if reference and revision != os.environ['GITHUB_SHA']:
-              issues.append('checkout differs from the reviewed reference')
+          if revision != selected_source:
+              issues.append('checkout differs from the explicitly selected measurement source')
+          if reference and source_tree != selected_tree:
+              issues.append('measurement source tree differs from the reviewed reference')
+          if reference and manifest_hashes != expected_manifests:
+              issues.append('build manifests differ from the reviewed reference')
+          try:
+              boot = uuid.UUID(boot_id)
+              if str(boot) != boot_id or boot.int == 0:
+                  raise ValueError('noncanonical or zero boot ID')
+          except ValueError:
+              issues.append('native runner boot identity is unavailable or invalid')
           if reference and observed != expected:
               issues.append('runner class changed; retain this run and review a separate cohort')
-          if reference and not rustc.startswith('rustc 1.98.1 (48a229cea 2026-09-01)\n'):
+          if reference and rustc != expected_rustc:
               issues.append('compiler differs from the reviewed reference')
           value = {'schema_version': 1, 'source_revision': revision,
-                   'source_tree': command('git', 'rev-parse', 'HEAD^{tree}'),
+                   'source_tree': source_tree, 'selected_measurement_source': selected_source,
+                   'expected_measurement_tree': selected_tree, 'event_revision': os.environ['GITHUB_SHA'],
                    'run_id': os.environ['GITHUB_RUN_ID'] + '/' + os.environ['GITHUB_RUN_ATTEMPT'],
                    'workflow_ref': os.environ['GITHUB_WORKFLOW_REF'],
                    'workflow_sha': os.environ['GITHUB_WORKFLOW_SHA'],
                    'runner_name': os.environ['RUNNER_NAME'],
-                   'runner_boot_id': pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                   'runner_boot_id': boot_id,
                    'runner_class': observed, 'expected_reference_class': expected if reference else None,
                    'source_clean_before_build': clean, 'rustc_verbose': rustc,
                    'cargo_verbose': command('cargo', '-Vv'), 'build_profile': 'release',
-                   'build_manifest_sha256': {'Cargo.toml': sha('Cargo.toml'), 'Cargo.lock': sha('Cargo.lock')},
-                   'reference_cohort': 'pr250-release100' if reference else None,
+                   'build_manifest_sha256': manifest_hashes,
+                   'expected_build_manifest_sha256': expected_manifests if reference else None,
+                   'reference_cohort': 'pr250-release100-epyc7763-source150e753a' if reference else None,
                    'workload_samples': 100 if reference else 10, 'admission_issues': issues}
           with open('resource-build-provenance.json', 'x') as output:
               json.dump(value, output, indent=2, allow_nan=False)
