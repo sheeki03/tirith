@@ -7,9 +7,9 @@ sudo is one way to obtain that access, and an existing root session also works.
 
 | Channel | Install, update, and removal | Native package approval |
 | --- | --- | --- |
-| Debian / Ubuntu `.deb` | Administrator manages the system package database. Sudo is suggested, not required. | The package ships a root-owned helper on x86_64 Linux. Issuance also needs trusted `/usr/bin/sudo`. |
-| RPM | Administrator manages the system package database. Sudo is suggested, not required. | The x86_64 package ships the helper; issuance needs trusted `/usr/bin/sudo`. |
-| AUR | Build as the normal user; package installation/removal needs an administrator. Sudo is an optional x86_64 dependency. | The x86_64 package ships the helper. The aarch64 package does not support issuance. |
+| Debian / Ubuntu `.deb` | Administrator manages the system package database. No sudo dependency or suggestion. | The package ships an inert root-owned helper on x86_64 Linux. Explicit issuance also needs trusted `/usr/bin/sudo`. |
+| RPM | Administrator manages the system package database. No sudo dependency or suggestion. | The x86_64 package ships an inert helper; explicit issuance needs trusted `/usr/bin/sudo`. |
+| AUR | Build as the normal user; package installation/removal needs an administrator. No sudo dependency or suggestion. | The x86_64 package ships an inert helper. The aarch64 package does not support issuance. |
 | Shell installer | Defaults to the user's `~/.local/bin` and needs no elevation for a fresh install. An existing helper is updated as a protected pair. | Explicitly opt in with `TIRITH_INSTALL_APPROVAL_HELPER=1`; see below. |
 | Manual release archive | Copy the CLI into a user-writable directory without elevation. A protected system destination requires administrator access. | A helper copied into a home directory cannot issue approvals. |
 | Cargo | A user-owned Cargo prefix needs no elevation. Update with Cargo. | User-installed helper binaries are not trusted native authorities. |
@@ -22,6 +22,12 @@ sudo is one way to obtain that access, and an existing root session also works.
 | Docker | Image construction installs system dependencies; the released runtime runs as the `tirith` user and contains no sudo dependency. | The runtime image does not install the native authority. |
 
 ## Optional helper for manual Linux installs
+
+Tirith never installs sudo, grants passwordless sudo access, creates a sudoers
+rule, starts an elevated approval service, or invokes the approval authority
+as part of ordinary command checks. The packaged helper has ordinary executable
+permissions, with no setuid/setgid bits. Its private key is created only during
+an explicitly requested, freshly confirmed `tirith pkg approve` operation.
 
 The shell installer accepts `TIRITH_INSTALL_APPROVAL_HELPER=0` (the default)
 or `TIRITH_INSTALL_APPROVAL_HELPER=1`. Other values are rejected. On a fresh
@@ -57,6 +63,16 @@ to require the protected public keyring.
 user/project integration files with ownership and symlink checks. They do not
 invoke sudo. A protected destination must be configured by its administrator.
 Doctor and ordinary command checks remain usable without the approval helper.
+
+`tirith status --json` and the full `tirith doctor --json` report the separate
+`package_approval` capability. `unavailable` means protected helper or sudo
+prerequisites are missing or untrusted; `unsupported` identifies other
+platforms. `available_on_explicit_request` means filesystem prerequisites are
+present, not that any approval was issued or administrator access was verified.
+All states report `automatic_elevation: false` and
+`ordinary_protection_requires_sudo: false`. `pkg approve` refuses missing native
+prerequisites before policy-server access, resolver execution, or quarantine
+work, with an explanation of the optional feature and how to enable it.
 
 Uninstall the CLI with its owning package manager or remove its user-owned
 binary, then remove the shell/integration entries and user data. Only remove a

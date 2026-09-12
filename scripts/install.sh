@@ -580,8 +580,9 @@ main() {
   info ""
   info "tirith installed to ${INSTALL_DIR}/tirith"
   if [ "$TARGET" = "x86_64-unknown-linux-gnu" ] && [ "$PAIRED_HELPER_MANAGED" = "0" ]; then
-    info "Native package approval is unavailable; command checks and shell protection are ready."
-    info "To enable package approval, rerun with TIRITH_INSTALL_APPROVAL_HELPER=1."
+    info "Native package approval is unavailable; ordinary command checks and shell protection do not require it."
+    info "Only if you need package approval, rerun with TIRITH_INSTALL_APPROVAL_HELPER=1."
+    info "Helper provisioning needs a root session or trusted /usr/bin/sudo; issuing approvals needs sudo and fresh interactive administrator confirmation."
   fi
 
   # PATH advice
