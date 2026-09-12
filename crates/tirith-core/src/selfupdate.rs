@@ -84,10 +84,10 @@ impl InstallMethod {
             InstallMethod::Apt => {
                 // Not in the Debian/Ubuntu archives; the .deb is a GitHub release
                 // artifact, so `apt upgrade` won't find it.
-                Some("download the latest tirith_*.deb from the GitHub releases page and `sudo dpkg -i` it")
+                Some("download the latest tirith_*.deb from the GitHub releases page and install it with `dpkg -i` from a root session, or use `sudo dpkg -i`")
             }
             InstallMethod::Dnf => {
-                Some("download the latest tirith-*.rpm from the GitHub releases page and `sudo rpm -U` it")
+                Some("download the latest tirith-*.rpm from the GitHub releases page and install it with `rpm -U` from a root session, or use `sudo rpm -U`")
             }
             InstallMethod::SelfManaged | InstallMethod::Unknown => None,
         }

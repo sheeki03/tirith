@@ -606,6 +606,8 @@ use. On x86_64 Linux, only `tirith pkg approve` requires a trusted
 `/usr/bin/sudo` and the root-owned approval helper for fresh administrator
 confirmation. If that authority is unavailable, approval remains blocked;
 ordinary command checks and shell protection continue to work.
+The [installation privileges guide](docs/install-privileges.md) covers all
+package formats, manual installs, updates, and removal.
 
 The Linux GNU release binaries target a GLIBC 2.28 ceiling. CI runs both
 x86_64 and aarch64 tarballs on AlmaLinux 8, Amazon Linux 2023, and Rocky Linux

@@ -29,6 +29,50 @@ PAIRED_HELPER_BACKUP=""
 PAIRED_HELPER_HAD_PREVIOUS=0
 PAIRED_HELPER_PREVIOUS_SHA256=""
 PAIRED_HELPER_NEW_SHA256=""
+PAIRED_HELPER_MANAGED=0
+
+package_approval_helper_state_present() {
+  for helper_path in "$PAIRED_HELPER_DEST" \
+      "${PAIRED_HELPER_DEST}.tirith-previous" \
+      "${PAIRED_HELPER_DEST}.tirith-previous.absent"; do
+    if [ -e "$helper_path" ] || [ -L "$helper_path" ]; then
+      return 0
+    fi
+  done
+  helper_parent="${PAIRED_HELPER_DEST%/*}"
+  while :; do
+    if { [ -e "$helper_parent" ] || [ -L "$helper_parent" ]; } &&
+       { [ ! -d "$helper_parent" ] || [ ! -x "$helper_parent" ]; }; then
+      return 0
+    fi
+    [ "$helper_parent" = / ] && break
+    helper_parent="${helper_parent%/*}"
+    [ -n "$helper_parent" ] || helper_parent=/
+  done
+  return 1
+}
+
+select_package_approval_helper() {
+  case "${TIRITH_INSTALL_APPROVAL_HELPER:-0}" in
+    0|1) ;;
+    *) err "TIRITH_INSTALL_APPROVAL_HELPER must be 0 or 1" ;;
+  esac
+  PAIRED_HELPER_MANAGED=0
+  if [ "$TARGET" != "x86_64-unknown-linux-gnu" ]; then
+    if [ "${TIRITH_INSTALL_APPROVAL_HELPER:-0}" = "1" ]; then
+      err "native package approval is supported only on x86_64 Linux"
+    fi
+    return 0
+  fi
+  if [ "${TIRITH_INSTALL_APPROVAL_HELPER:-0}" = "1" ] ||
+     package_approval_helper_state_present; then
+    PAIRED_HELPER_MANAGED=1
+  fi
+  if [ "$PAIRED_HELPER_MANAGED" = "1" ] &&
+     [ "$(id -u)" -ne 0 ] && [ ! -x /usr/bin/sudo ]; then
+    err "updating or installing the root-owned package-approval helper requires administrator privileges; run from a root session or use /usr/bin/sudo"
+  fi
+}
 
 err() {
   printf 'error: %s\n' "$1" >&2
@@ -106,7 +150,7 @@ paired_exit_handler() {
     fi
     # Always attempt the helper restoration even if the main restoration
     # failed. The two results are combined only after both attempts finish.
-    if [ "${TARGET:-}" = "x86_64-unknown-linux-gnu" ]; then
+    if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
       if restore_package_approval_helper; then
         helper_restore_ok=1
       fi
@@ -425,6 +469,7 @@ install_package_approval_helper() {
 
 main() {
   detect_platform
+  select_package_approval_helper
   resolve_version
 
   local tmpdir
@@ -477,7 +522,12 @@ main() {
     [ "$main_backup_sum" = "$PAIRED_MAIN_PREVIOUS_SHA256" ] \
       || err "the Tirith backup did not match the installed binary"
   fi
-  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+  if [ "$PAIRED_HELPER_MANAGED" = "0" ] &&
+     [ "$TARGET" = "x86_64-unknown-linux-gnu" ] &&
+     package_approval_helper_state_present; then
+    err "package-approval helper state changed during installation; retry before replacing either binary"
+  fi
+  if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
     if [ -f "$PAIRED_HELPER_DEST" ]; then
       PAIRED_HELPER_HAD_PREVIOUS=1
       helper_previous_sum="$(run_root /usr/bin/sha256sum "$PAIRED_HELPER_DEST")" \
@@ -498,7 +548,7 @@ main() {
   # From this point through both exact readbacks, EXIT and signal paths restore
   # and verify both preimages. Arm before the helper is the first published.
   PAIRED_ROLLBACK_ARMED=1
-  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+  if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
     archive_sha256="${CHECKSUM_LINE%% *}"
     if ! install_package_approval_helper "${tmpdir}/${ARCHIVE}" "$archive_sha256"; then
       err "could not install the root-owned package-approval helper"
@@ -517,7 +567,7 @@ main() {
     || err "could not read back the installed Tirith binary"
   [ "$main_installed_sum" = "$PAIRED_MAIN_NEW_SHA256" ] \
     || err "installed Tirith binary failed exact readback verification"
-  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+  if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
     [ -n "$PAIRED_HELPER_NEW_SHA256" ] \
       || err "installed package-approval helper was not read back and verified"
   fi
@@ -529,6 +579,10 @@ main() {
 
   info ""
   info "tirith installed to ${INSTALL_DIR}/tirith"
+  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ] && [ "$PAIRED_HELPER_MANAGED" = "0" ]; then
+    info "Native package approval is unavailable; command checks and shell protection are ready."
+    info "To enable package approval, rerun with TIRITH_INSTALL_APPROVAL_HELPER=1."
+  fi
 
   # PATH advice
   case ":${PATH}:" in
@@ -546,7 +600,7 @@ main() {
   info ""
   info "To uninstall:"
   info "  rm ${INSTALL_DIR}/tirith"
-  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+  if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
     info "  sudo rm /usr/local/libexec/tirith-package-approval-authority"
     info "  sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous"
     info "  sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent"
