@@ -16,6 +16,10 @@ use tirith_core::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayG
 use super::fs_helpers;
 use super::fs_transaction::{FileUpdate, TransactionOutcome, MAX_SETUP_FILE_BYTES};
 
+#[path = "change_plan_setup_binding.rs"]
+mod setup_binding;
+pub(crate) use setup_binding::{SetupVerificationDocument, SetupVerificationIntent};
+
 const SCHEMA: u32 = 1;
 const MAX_STEPS: usize = 64;
 const MAX_ACTIVE_JOBS: usize = 4;
@@ -50,6 +54,7 @@ pub(crate) fn active_job_count() -> usize {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum OperationKind {
     SetProfile,
+    SetManagedProfile,
     RecordFeedback,
     ExportSupport,
     ExportAudit,
@@ -70,6 +75,7 @@ impl OperationKind {
         matches!(
             self,
             Self::SetProfile
+                | Self::SetManagedProfile
                 | Self::RecommendedSetup
                 | Self::SetPersonalSetting
                 | Self::ImportPolicy
@@ -85,6 +91,9 @@ pub(super) fn preflight_target(
     target: &Path,
     policy: &EffectivePolicySnapshot,
 ) -> Result<(), String> {
+    if kind == OperationKind::SetManagedProfile {
+        crate::cli::managed_policy::authorize_target(root, target, policy).map_err(refresh)?;
+    }
     crate::cli::preflight_config_write_authorization(
         root,
         target,
@@ -104,6 +113,9 @@ pub(super) fn authorize_publication(
 ) -> Result<(), String> {
     use tirith_core::config_write::ConfigWritePermit;
     use tirith_core::task_boundary::{BoundaryOperation, ConfigWriteBoundary, OwnedBoundary};
+    if kind == OperationKind::SetManagedProfile {
+        crate::cli::managed_policy::authorize_target(root, target, policy).map_err(refresh)?;
+    }
     let envelope = ConfigWritePermit::operation_envelope_for(
         root,
         target,
@@ -347,6 +359,10 @@ struct Journal {
     shell_precondition: Option<super::shell_service::ShellPrecondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_precondition: Option<super::claude_service::AgentPrecondition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    setup_verification: Option<SetupVerificationIntent>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    setup_verification_cancelled: bool,
     created_at: u64,
     updated_at: u64,
     state: JobState,
@@ -464,16 +480,22 @@ fn validate_review(
     identity: &str,
 ) -> Result<(), String> {
     let Some(review) = review else {
-        return Ok(());
+        return if kind == OperationKind::SetManagedProfile {
+            Err("managed profile operations require a bound impact review".into())
+        } else {
+            Ok(())
+        };
     };
     uuid::Uuid::parse_str(id).map_err(|_| "review operation ID must be a UUID")?;
-    if kind != OperationKind::SetProfile
-        || review.scope != RolloutScope::PersonalUser
-        || review.candidate_id.as_str() != id
+    if !matches!(
+        (kind, review.scope),
+        (OperationKind::SetProfile, RolloutScope::PersonalUser)
+            | (OperationKind::SetManagedProfile, RolloutScope::LocalManaged)
+    ) || review.candidate_id.as_str() != id
         || review.baseline_policy_identity.as_str() != identity
     {
         return Err(
-            "impact review does not match its personal profile operation and baseline".into(),
+            "impact review does not match its profile authority, operation and baseline".into(),
         );
     }
     review.validate_stored()?;
@@ -516,6 +538,7 @@ struct PlanMetadata {
     caller_intent_digest: Option<String>,
     shell_precondition: Option<super::shell_service::ShellPrecondition>,
     agent_precondition: Option<super::claude_service::AgentPrecondition>,
+    setup_verification: Option<SetupVerificationIntent>,
     no_op: bool,
     impact_review: Option<ImpactReport>,
 }
@@ -724,6 +747,7 @@ impl MutationService {
                 caller_intent_digest: None,
                 shell_precondition: None,
                 agent_precondition: None,
+                setup_verification: None,
                 no_op: false,
                 impact_review: None,
             },
@@ -787,6 +811,7 @@ impl MutationService {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
                 agent_precondition: None,
+                setup_verification: None,
                 no_op: false,
                 impact_review: None,
             },
@@ -824,12 +849,14 @@ impl MutationService {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: Some(precondition),
                 agent_precondition: None,
+                setup_verification: None,
                 no_op: false,
                 impact_review: None,
             },
         )
     }
 
+    #[cfg(all(test, unix))]
     pub(crate) fn plan_integrations_with_intent(
         &self,
         operation_id: &str,
@@ -850,7 +877,43 @@ impl MutationService {
                 ),
                 shell_precondition: preconditions.shell,
                 agent_precondition: preconditions.agent,
+                setup_verification: None,
                 no_op: false,
+                impact_review: None,
+            },
+        )
+    }
+
+    /// A versioned verification request is retained even when configuration
+    /// needs no edits. This still publishes only a file-mutation journal; it
+    /// does not start a shell or alter apply's established exit semantics.
+    pub(crate) fn plan_recommended_with_verification_intent(
+        &self,
+        operation_id: &str,
+        changes: PlanChanges<'_>,
+        policy: &EffectivePolicySnapshot,
+        intent: &impl Serialize,
+        preconditions: IntegrationPreconditions,
+        verification: SetupVerificationIntent,
+    ) -> Result<OperationStatus, String> {
+        if !uuid::Uuid::parse_str(operation_id).is_ok_and(|id| id.to_string() == operation_id) {
+            return Err("recommended setup ID must be a canonical UUID".into());
+        }
+        let no_op = changes.requests.is_empty();
+        self.plan_inner(
+            operation_id,
+            OperationKind::RecommendedSetup,
+            changes.requests,
+            policy,
+            changes.preimages,
+            PlanMetadata {
+                caller_intent_digest: Some(
+                    self.intent_digest(OperationKind::RecommendedSetup, intent)?,
+                ),
+                shell_precondition: preconditions.shell,
+                agent_precondition: preconditions.agent,
+                setup_verification: Some(verification),
+                no_op,
                 impact_review: None,
             },
         )
@@ -883,6 +946,7 @@ impl MutationService {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
                 agent_precondition: None,
+                setup_verification: None,
                 no_op: true,
                 impact_review: None,
             },
@@ -914,6 +978,7 @@ impl MutationService {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
                 agent_precondition: None,
+                setup_verification: None,
                 no_op: false,
                 impact_review: Some(review),
             },
@@ -938,6 +1003,7 @@ impl MutationService {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
                 agent_precondition: None,
+                setup_verification: None,
                 no_op: true,
                 impact_review: Some(review),
             },
@@ -970,6 +1036,7 @@ impl MutationService {
             caller_intent_digest,
             shell_precondition,
             agent_precondition,
+            mut setup_verification,
             no_op,
             impact_review,
         } = metadata;
@@ -1005,6 +1072,8 @@ impl MutationService {
             bind_review_digest(request_digest, &impact_review)?,
             &agent_precondition,
         )?;
+        let request_digest =
+            setup_binding::bind_verification_digest(request_digest, &setup_verification)?;
         if let Some(existing) = fs_helpers::read_to_string_scoped(&path, &self.scope)? {
             let record: Journal = serde_json::from_str(&existing)
                 .map_err(|_| "existing operation journal is malformed")?;
@@ -1020,6 +1089,18 @@ impl MutationService {
             return Ok(record.public());
         }
         validate_review(&impact_review, operation_id, kind, &policy.identity)?;
+        if let Some(verification) = &setup_verification {
+            verification.validate_for(
+                kind,
+                shell_precondition.as_ref(),
+                requests.iter().map(|request| request.target.clone()),
+            )?;
+        }
+        let verification_inputs = setup_verification
+            .as_ref()
+            .map(|intent| intent.retain_unchanged())
+            .transpose()?
+            .unwrap_or_default();
         policy.revalidate_for_mutation().map_err(refresh)?;
         let shell_inputs = shell_precondition
             .as_ref()
@@ -1181,15 +1262,21 @@ impl MutationService {
             {
                 return Err("planned output exceeds setup file limit".into());
             }
-            if policy.input_revisions.iter().any(|input| {
-                input
-                    .source
-                    .path
-                    .as_ref()
-                    .is_some_and(|path| Path::new(path) == step.target)
-            }) {
+            if kind == OperationKind::SetManagedProfile
+                || policy.input_revisions.iter().any(|input| {
+                    input
+                        .source
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| Path::new(path) == step.target)
+                })
+            {
                 let after = transformed.or(current.clone());
-                let compensation = transform(&step.edit, after.as_deref(), true)?.or(after.clone());
+                let compensation = if kind == OperationKind::SetManagedProfile {
+                    current.clone()
+                } else {
+                    transform(&step.edit, after.as_deref(), true)?.or(after.clone())
+                };
                 step.authority_document = Some(AuthorityDocument {
                     before: current.clone(),
                     after,
@@ -1199,6 +1286,9 @@ impl MutationService {
             steps.push(step);
         }
         steps.sort_by_key(|step| step.activation);
+        if let Some(verification) = &mut setup_verification {
+            verification.bind_planned_postconditions(&steps, expected_documents)?;
+        }
         // The digest includes private owned preimages and payload, never public output.
         let original_payload_digest = digest(&(
             kind,
@@ -1220,6 +1310,8 @@ impl MutationService {
             bind_review_digest(payload_digest, &impact_review)?,
             &agent_precondition,
         )?;
+        let payload_digest =
+            setup_binding::bind_verification_digest(payload_digest, &setup_verification)?;
         let record = Journal {
             schema_version: SCHEMA,
             operation_id: operation_id.into(),
@@ -1240,6 +1332,8 @@ impl MutationService {
             undo_external_authorization: None,
             shell_precondition,
             agent_precondition,
+            setup_verification,
+            setup_verification_cancelled: false,
             created_at: now(),
             updated_at: now(),
             state: if no_op {
@@ -1308,6 +1402,9 @@ impl MutationService {
                     .map_err(refresh)?;
                 validate_agent_lease(record.agent_precondition.as_ref(), agent_inputs.as_ref())
                     .map_err(refresh)?;
+                for input in &verification_inputs {
+                    input.revalidate().map_err(refresh)?;
+                }
                 for step in &record.steps {
                     preflight_target(record.kind, &step.scope_root, &step.target, policy)?;
                     step.scope_identity.validate()?;
@@ -1375,6 +1472,9 @@ impl MutationService {
     pub(crate) fn cancel(&self, operation_id: &str) -> Result<OperationStatus, String> {
         Ok(self
             .update(operation_id, |record| {
+                if record.setup_verification.is_some() {
+                    record.setup_verification_cancelled = true;
+                }
                 if !record.state.completed() && record.state != JobState::Cancelled {
                     record.state = if record
                         .steps
@@ -1869,6 +1969,19 @@ impl MutationService {
                     return Ok(None);
                 }
                 let current = read_step(step)?;
+                if record.kind == OperationKind::SetManagedProfile {
+                    let authority = step.authority_document.as_ref()
+                        .ok_or_else(|| refresh("managed operation lacks its authority document"))?;
+                    let unchanged = match step.state {
+                        StepState::Pending => current == authority.before,
+                        StepState::Applying => current == authority.before || current == authority.after,
+                        StepState::Applied | StepState::AppliedWithRecovery => current == authority.after,
+                        _ => false,
+                    };
+                    if !unchanged {
+                        return Err(refresh("newer managed authority document prevents rollback"));
+                    }
+                }
                 let valid = match step.state {
                     StepState::Pending => owned_matches(&step.edit, current.as_deref(), false)?,
                     StepState::Applying => {
@@ -1883,7 +1996,11 @@ impl MutationService {
                 if !valid {
                     return Err(refresh("owned fields changed before undo authorization"));
                 }
-                let compensation = if step.state == StepState::Pending {
+                let compensation = if record.kind == OperationKind::SetManagedProfile {
+                    step.authority_document.as_ref()
+                        .ok_or_else(|| refresh("managed operation lacks its authority document"))?
+                        .before.clone()
+                } else if step.state == StepState::Pending {
                     current.clone()
                 } else {
                     transform(&step.edit, current.as_deref(), true)?.or(current.clone())
@@ -1938,6 +2055,7 @@ impl MutationService {
                 "segment deletion is irreversible; checkpoint and deletion record remain".into(),
             );
         }
+        self.invalidate_setup_verification(operation_id)?;
         if record.no_op {
             return Ok(record.public());
         }
@@ -2095,6 +2213,26 @@ impl MutationService {
                         if matches!(&step.edit, OwnedEdit::PrivateFile { .. }) {
                             snapshot.require_private()?;
                         }
+                        if live.kind == OperationKind::SetManagedProfile {
+                            let document = step.undo_document.as_ref().ok_or_else(|| {
+                                refresh("managed rollback lacks its captured document")
+                            })?;
+                            let restored = document.compensation.as_deref().ok_or_else(|| {
+                                refresh("managed rollback cannot remove its authority file")
+                            })?;
+                            let current = snapshot.text(&step.target)?;
+                            if current == Some(restored) {
+                                return Ok(FileUpdate::unchanged());
+                            }
+                            if current != document.after.as_deref() {
+                                return Err(refresh(
+                                    "newer managed authority document prevents rollback",
+                                ));
+                            }
+                            // Whole-document generation checks authorize restoring
+                            // the original bytes, including absent keys and comments.
+                            return Ok(step_update(&step, restored.to_owned()));
+                        }
                         match transform(&step.edit, snapshot.text(&step.target)?, true)? {
                             Some(text) => Ok(step_update(&step, text)),
                             None => Ok(FileUpdate::unchanged()),
@@ -2224,6 +2362,7 @@ impl MutationService {
                 "segment deletion is irreversible; checkpoint and deletion record remain".into(),
             );
         }
+        self.invalidate_setup_verification(&operation_id)?;
         self.spawn_job(operation_id, policy, true)
     }
 
@@ -2957,6 +3096,59 @@ mod tests {
             now: chrono::Utc::now(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn impact_attachment_binds_the_exact_personal_or_managed_authority_kind() {
+        with_fake_env(true, |_, _| {
+            let snapshot = policy();
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut report = impact_fixture(&id, &snapshot);
+            assert!(validate_review(
+                &Some(report.clone()),
+                &id,
+                OperationKind::SetProfile,
+                &snapshot.identity
+            )
+            .is_ok());
+            assert!(validate_review(
+                &Some(report.clone()),
+                &id,
+                OperationKind::SetManagedProfile,
+                &snapshot.identity
+            )
+            .is_err());
+            report.scope = RolloutScope::LocalManaged;
+            assert!(validate_review(
+                &Some(report.clone()),
+                &id,
+                OperationKind::SetManagedProfile,
+                &snapshot.identity
+            )
+            .is_ok());
+            assert!(validate_review(
+                &Some(report.clone()),
+                &id,
+                OperationKind::SetProfile,
+                &snapshot.identity
+            )
+            .is_err());
+            assert!(validate_review(
+                &None,
+                &id,
+                OperationKind::SetManagedProfile,
+                &snapshot.identity
+            )
+            .is_err());
+            report.scope = RolloutScope::RemoteManaged;
+            assert!(validate_review(
+                &Some(report),
+                &id,
+                OperationKind::SetManagedProfile,
+                &snapshot.identity
+            )
+            .is_err());
+        });
     }
 
     #[test]
@@ -3960,6 +4152,156 @@ mod tests {
                 .unwrap()
                 .contains("changed after undo began"));
         });
+    }
+
+    #[cfg(unix)]
+    mod managed_undo_restart {
+        use super::*;
+        use crate::cli::test_harness::EnvGuard;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        fn resume_compensation(publication_finished: bool, later_edit: bool) {
+            with_fake_env(true, |home, _| {
+                let organization = home.join("organization");
+                let directory = organization.join(".tirith");
+                std::fs::create_dir_all(&directory).unwrap();
+                for path in [&organization, &directory] {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                let target = directory.join("policy.yml");
+                let original =
+                    "# retained organization comment\norganization_note: \"original spelling\"\n";
+                std::fs::write(&target, original).unwrap();
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let _organization = EnvGuard::set("TIRITH_POLICY_ROOT", &organization);
+                let service = fixture(home);
+                let id = uuid::Uuid::new_v4().to_string();
+                let snapshot = policy();
+                let mut review = impact_fixture(&id, &snapshot);
+                review.scope = RolloutScope::LocalManaged;
+                let preimages =
+                    std::collections::BTreeMap::from([(target.clone(), Some(original.to_owned()))]);
+                let planned = service.plan_with_preimages_intent_and_review(
+                    &id,
+                    OperationKind::SetManagedProfile,
+                    PlanChanges {
+                        requests: vec![RequestedChange {
+                            target: target.clone(),
+                            scope_root: directory,
+                            edit: Edit::YamlFields(std::collections::BTreeMap::from([
+                                (
+                                    "/protection_profile/name".into(),
+                                    Some(serde_json::json!("balanced")),
+                                ),
+                                (
+                                    "/protection_profile/version".into(),
+                                    Some(serde_json::json!(1)),
+                                ),
+                            ])),
+                            activation: true,
+                            description: "Set the selected organization profile".into(),
+                        }],
+                        preimages: &preimages,
+                    },
+                    &snapshot,
+                    &serde_json::json!({"scope": "org", "profile": "balanced"}),
+                    review,
+                );
+                if unsafe { libc::geteuid() } == 0 || unsafe { libc::geteuid() != libc::getuid() } {
+                    assert!(planned.is_err());
+                    assert_eq!(std::fs::read(&target).unwrap(), original.as_bytes());
+                    eprintln!("managed undo restart requires an ordinary owner; this host exercised privileged refusal only");
+                    return;
+                }
+                assert_eq!(planned.unwrap().state, JobState::Planned);
+                assert_eq!(
+                    service.apply(&id, &snapshot).unwrap().state,
+                    JobState::Completed
+                );
+                let applied = std::fs::read_to_string(&target).unwrap();
+                let document: serde_yaml::Value = serde_yaml::from_str(&applied).unwrap();
+                assert_eq!(document["protection_profile"]["name"], "balanced");
+                assert_ne!(applied, original);
+
+                // Retain the real new-plan undo baseline, then simulate a crash
+                // after Compensating was journaled but before its completion.
+                let journal = service.read(&id).unwrap();
+                let documents = service.capture_undo_documents(&journal).unwrap();
+                let authorization = policy();
+                let excluded = std::iter::once(target.clone()).collect();
+                service
+                    .update(&id, |record| {
+                        record.undo_external_authorization =
+                            Some(authorization.private_external_inputs_guard(&excluded));
+                        record.steps[0].undo_document = documents[0].clone();
+                        record.steps[0].state = StepState::Compensating;
+                        record.state = JobState::Running;
+                        record.active_action = Some(JobAction::Undo);
+                        Ok(())
+                    })
+                    .unwrap();
+                if publication_finished {
+                    std::fs::write(&target, original).unwrap();
+                }
+                if later_edit {
+                    let current = std::fs::read_to_string(&target).unwrap();
+                    std::fs::write(&target, format!("{current}# later managed generation\n"))
+                        .unwrap();
+                }
+                let retained_bytes = std::fs::read(&target).unwrap();
+                let retained_inode = std::fs::metadata(&target).unwrap().ino();
+                drop(service);
+
+                // A fresh service must recover solely from the private journal.
+                let reopened = fixture(home);
+                assert_eq!(
+                    reopened.read(&id).unwrap().steps[0].state,
+                    StepState::Compensating
+                );
+                let resumed = reopened.undo(&id, &policy());
+                if later_edit {
+                    assert!(resumed
+                        .unwrap_err()
+                        .contains("owned generation or authorization document changed"));
+                    assert_eq!(std::fs::read(&target).unwrap(), retained_bytes);
+                    assert_eq!(std::fs::metadata(&target).unwrap().ino(), retained_inode);
+                    assert_eq!(
+                        reopened.read(&id).unwrap().steps[0].state,
+                        StepState::Compensating
+                    );
+                    return;
+                }
+                assert_eq!(resumed.unwrap().state, JobState::Undone);
+                assert_eq!(std::fs::read(&target).unwrap(), original.as_bytes());
+                if publication_finished {
+                    // Reconciliation must not rewrite the already-restored file.
+                    assert_eq!(std::fs::metadata(&target).unwrap().ino(), retained_inode);
+                }
+                let restored_inode = std::fs::metadata(&target).unwrap().ino();
+                assert_eq!(
+                    fixture(home).undo(&id, &policy()).unwrap().state,
+                    JobState::Undone
+                );
+                assert_eq!(std::fs::read(&target).unwrap(), original.as_bytes());
+                assert_eq!(std::fs::metadata(&target).unwrap().ino(), restored_inode);
+            });
+        }
+
+        #[test]
+        fn compensating_restart_before_publication_restores_exact_managed_bytes() {
+            resume_compensation(false, false);
+        }
+
+        #[test]
+        fn compensating_restart_after_publication_preserves_the_restored_generation() {
+            resume_compensation(true, false);
+        }
+
+        #[test]
+        fn compensating_restart_refuses_later_edits_to_applied_or_restored_documents() {
+            resume_compensation(false, true);
+            resume_compensation(true, true);
+        }
     }
 
     #[test]

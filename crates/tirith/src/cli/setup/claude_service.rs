@@ -485,6 +485,30 @@ impl PreparedClaude {
         })
     }
 
+    /// Bind unchanged agent documents in a combined shell-verification intent.
+    /// This does not certify agent activation or execute an agent host.
+    pub(super) fn unchanged_verification_inputs(
+        &self,
+    ) -> Result<Vec<super::change_plan::SetupVerificationDocument>, String> {
+        if !self.handler.is_noop()
+            || self.before_hook.as_deref() != Some(crate::assets::TIRITH_CHECK_PY)
+        {
+            return Ok(Vec::new());
+        }
+        Ok(vec![
+            super::change_plan::SetupVerificationDocument::observed(
+                &self.settings,
+                &self.home,
+                self.before_settings.as_deref(),
+            )?,
+            super::change_plan::SetupVerificationDocument::observed(
+                &self.hook,
+                &self.home,
+                self.before_hook.as_deref(),
+            )?,
+        ])
+    }
+
     pub(crate) fn setup_parts(&self) -> Result<PreparedClaudeParts, String> {
         self.snapshot
             .revalidate_inputs()

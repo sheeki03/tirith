@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
 use tirith_core::protection_profiles::{self, ProfileChange, ProfilePreview, ProtectionProfile};
 
+use super::managed_policy::ProfileScope;
 use super::setup::change_plan::{
     Edit, MutationService, OperationKind, OperationStatus, RequestedChange,
 };
@@ -29,6 +30,7 @@ pub(crate) struct PreparedProfile {
     original: serde_yaml::Value,
     original_text: Option<String>,
     intent: ProfileIntent,
+    scope: ProfileScope,
 }
 
 fn intent(name: &str, cwd: Option<&str>) -> ProfileIntent {
@@ -45,6 +47,14 @@ fn intent(name: &str, cwd: Option<&str>) -> ProfileIntent {
 
 impl PreparedProfile {
     pub fn capture(name: &str, cwd: Option<&str>) -> Result<Self, String> {
+        Self::capture_scoped(name, cwd, ProfileScope::User)
+    }
+
+    pub(crate) fn capture_scoped(
+        name: &str,
+        cwd: Option<&str>,
+        scope: ProfileScope,
+    ) -> Result<Self, String> {
         if cwd.is_some_and(|value| !Path::new(value).is_absolute()) {
             return Err("profile project scope must be absolute".into());
         }
@@ -58,26 +68,35 @@ impl PreparedProfile {
         };
         let operator = super::shell_target::resolve_for_shell("unknown")?;
         super::shell_target::require_personal_writer(&operator)?;
-        let config = tirith_core::policy::config_dir()
-            .ok_or("cannot locate the operator policy directory")?;
-        let intent = intent(name, cwd);
+        let mut intent = intent(name, cwd);
+        intent.scope = scope.as_str();
         let snapshot =
             EffectivePolicySnapshot::resolve(intent.cwd.as_deref(), ResolutionMode::Runtime);
-        let path = personal_policy_path(&config)?;
+        let (config, path) = match scope {
+            ProfileScope::User => {
+                let config = tirith_core::policy::config_dir()
+                    .ok_or("cannot locate the operator policy directory")?;
+                let path = personal_policy_path(&config)?;
+                (config, path)
+            }
+            ProfileScope::Org => super::managed_policy::selected_target(&snapshot)?,
+        };
         let original_text = match tirith_core::util::read_text_no_follow_capped(&path, 1024 * 1024)
         {
-            Ok(bytes) => {
-                Some(String::from_utf8(bytes).map_err(|_| "existing user policy is not UTF-8")?)
-            }
+            Ok(bytes) => Some(
+                String::from_utf8(bytes).map_err(|_| "existing selected policy is not UTF-8")?,
+            ),
             Err(tirith_core::util::OpenRegularError::NotFound) => None,
-            Err(_) => return Err("user policy is unreadable, non-regular, or exceeds 1 MiB".into()),
+            Err(_) => {
+                return Err("selected policy is unreadable, non-regular, or exceeds 1 MiB".into())
+            }
         };
         let original = original_text
             .as_deref()
             .map(serde_yaml::from_str::<serde_yaml::Value>)
             .transpose()
             .map_err(|_| {
-                "existing user policy is invalid YAML; repair it before applying a profile"
+                "existing selected policy is invalid YAML; repair it before applying a profile"
             })?
             .unwrap_or_else(|| serde_yaml::Value::Mapping(Default::default()));
         let mut patterns = tirith_core::policy::captured_policy_dlp_patterns_or(
@@ -113,6 +132,7 @@ impl PreparedProfile {
             original,
             original_text,
             intent,
+            scope,
         })
     }
 
@@ -169,7 +189,7 @@ impl PreparedProfile {
         review: Option<tirith_core::policy_rollout::ImpactReport>,
     ) -> Result<Option<OperationStatus>, String> {
         let service = MutationService::current()?;
-        if let Some(status) = service.status_for_intent(id, OperationKind::SetProfile, intent)? {
+        if let Some(status) = service.status_for_intent(id, self.scope.operation_kind(), intent)? {
             return Ok(Some(status));
         }
         let (changes, expected) = self.setup_parts()?;
@@ -178,7 +198,7 @@ impl PreparedProfile {
                 return service
                     .complete_noop_with_intent_and_review(
                         id,
-                        OperationKind::SetProfile,
+                        self.scope.operation_kind(),
                         &self.snapshot,
                         intent,
                         review,
@@ -186,13 +206,13 @@ impl PreparedProfile {
                     .map(Some);
             }
             return service
-                .complete_noop_with_intent(id, OperationKind::SetProfile, &self.snapshot, intent)
+                .complete_noop_with_intent(id, self.scope.operation_kind(), &self.snapshot, intent)
                 .map(Some);
         }
         let result = if let Some(review) = review {
             service.plan_with_preimages_intent_and_review(
                 id,
-                OperationKind::SetProfile,
+                self.scope.operation_kind(),
                 super::setup::change_plan::PlanChanges {
                     requests: changes,
                     preimages: &expected,
@@ -204,7 +224,7 @@ impl PreparedProfile {
         } else {
             service.plan_with_preimages_and_intent(
                 id,
-                OperationKind::SetProfile,
+                self.scope.operation_kind(),
                 changes,
                 &self.snapshot,
                 &expected,
@@ -256,7 +276,14 @@ impl PreparedProfile {
             scope_root: self.config.clone(),
             edit: Edit::YamlFields(fields),
             activation: true,
-            description: format!("Apply personal profile: {}", self.intent.profile),
+            description: format!(
+                "Apply {} profile: {}",
+                match self.scope {
+                    ProfileScope::User => "personal",
+                    ProfileScope::Org => "organization",
+                },
+                self.intent.profile
+            ),
         }];
         Ok((changes, expected))
     }
@@ -281,7 +308,7 @@ impl PreparedProfile {
             .snapshot
             .operator_targets
             .iter()
-            .find(|target| target.scope == "user")
+            .find(|target| target.scope == self.scope.as_str())
             .is_some_and(|target| target.effective)
             && self.snapshot.remote.availability == "not_configured";
         for change in &self.preview.changes {
@@ -292,7 +319,8 @@ impl PreparedProfile {
                     .get(&change.field)
                     .is_some_and(|provenance| {
                         provenance.contributions.iter().any(|contribution| {
-                            !matches!(contribution.source.kind.as_str(), "default" | "user")
+                            contribution.source.kind != "default"
+                                && contribution.source.kind != self.scope.as_str()
                         })
                     });
             if constrained {

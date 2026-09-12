@@ -1684,6 +1684,7 @@ pub mod last_trigger;
 pub mod license_cmd;
 pub mod logs;
 pub mod lsp;
+pub(crate) mod managed_policy;
 pub mod manpage;
 pub mod mcp;
 pub mod mcp_server;

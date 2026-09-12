@@ -144,36 +144,33 @@ pub(crate) fn prepare(
     } else {
         None
     };
+    let mut verification = shell.verification_intent()?;
+    if let Some(agent) = &agent {
+        verification.add_unchanged_inputs(agent.unchanged_verification_inputs()?)?;
+    }
     let preview = serde_json::json!({"schema_version":1,"kind":"recommended_setup_preview",
         "scope":"user","profile":profile.projection(),"shell":shell.projection(),
         "selected_agents":request.agents,"agent":agent.as_ref().map(|agent| agent.projection()),"step_count":changes.len(),"applied":false,
         "activation_required":true,"current_shell_verified":false,
+        "verification_intent":verification.request(),
         "next_action":"Open a fresh terminal and run the current-shell verification handshake after loading the configured integration."});
     if dry_run {
         return Ok(preview);
     }
-    let status = if changes.is_empty() {
-        service.complete_noop_with_intent(
-            id,
-            OperationKind::RecommendedSetup,
-            &profile.snapshot,
-            &intent,
-        )?
-    } else {
-        service.plan_integrations_with_intent(
-            id,
-            super::change_plan::PlanChanges {
-                requests: changes,
-                preimages: &expected,
-            },
-            &profile.snapshot,
-            &intent,
-            super::change_plan::IntegrationPreconditions {
-                shell: Some(precondition),
-                agent: agent_precondition,
-            },
-        )?
-    };
+    let status = service.plan_recommended_with_verification_intent(
+        id,
+        super::change_plan::PlanChanges {
+            requests: changes,
+            preimages: &expected,
+        },
+        &profile.snapshot,
+        &intent,
+        super::change_plan::IntegrationPreconditions {
+            shell: Some(precondition),
+            agent: agent_precondition,
+        },
+        verification,
+    )?;
     result(status, Some(preview), cwd.as_deref())
 }
 fn result(
@@ -185,10 +182,12 @@ fn result(
     let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(
         &tirith_core::policy::captured_policy_dlp_patterns_or(&snapshot.policy.dlp_custom_patterns),
     );
+    let verification =
+        MutationService::current()?.setup_verification_request(&status.operation_id)?;
     Ok(
         serde_json::json!({"schema_version":1,"kind":"recommended_setup_plan","preview":preview,
         "operation":crate::cli::profile::status_projection(&status,&compiled)?,"executed":false,
-        "current_shell_verified":false,"activation_required":true}),
+        "current_shell_verified":false,"activation_required":true,"verification_intent":verification}),
     )
 }
 
@@ -268,6 +267,43 @@ mod tests {
                 .unwrap()
                 .read_status(&id)
                 .is_err());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_recommended_setup_keeps_explicit_verification_intent_without_claiming_activation()
+    {
+        with_fake_env(true, |home, _| {
+            let _zdotdir = crate::cli::test_harness::EnvGuard::remove("ZDOTDIR");
+            let first = uuid::Uuid::new_v4().to_string();
+            prepare(&first, request(), None, false).unwrap();
+            let cwd = std::env::current_dir().unwrap().display().to_string();
+            let service = MutationService::current().unwrap();
+            let policy = EffectivePolicySnapshot::resolve(Some(&cwd), ResolutionMode::Runtime);
+            assert_eq!(
+                service.apply(&first, &policy).unwrap().state,
+                JobState::Completed
+            );
+            let before = std::fs::read(home.join(".zshrc")).unwrap();
+            let second = uuid::Uuid::new_v4().to_string();
+            let result = prepare(&second, request(), None, false).unwrap();
+            assert_eq!(result["operation"]["no_op"], true);
+            assert_eq!(result["operation"]["state"], "completed");
+            assert_eq!(
+                result["verification_intent"],
+                serde_json::json!({"schema_version":1,"scope":"fresh_terminal_activation","shell":"zsh"})
+            );
+            assert_eq!(result["current_shell_verified"], false);
+            assert_eq!(result["activation_required"], true);
+            assert_eq!(result["executed"], false);
+            assert_eq!(std::fs::read(home.join(".zshrc")).unwrap(), before);
+            let policy = EffectivePolicySnapshot::resolve(Some(&cwd), ResolutionMode::Runtime);
+            let lease = service
+                .completed_setup_lease(&second, policy)
+                .unwrap()
+                .unwrap();
+            lease.revalidate().unwrap();
         });
     }
 }

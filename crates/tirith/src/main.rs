@@ -6791,6 +6791,9 @@ enum PolicyRolloutAction {
     Prepare {
         #[arg(value_parser = ["comfortable", "balanced", "strict"])]
         profile: String,
+        /// Personal policy, or the existing operator-owned organization authority
+        #[arg(long, default_value = "user", value_parser = ["user", "org"])]
+        scope: String,
         /// Command to analyze without execution; repeat for each workflow
         #[arg(long = "command", required = true)]
         commands: Vec<String>,
@@ -6816,7 +6819,7 @@ enum PolicyRolloutAction {
         #[arg(long)]
         json: bool,
     },
-    /// Undo the owned changes without overwriting unrelated edits
+    /// Undo owned changes; organization rollback refuses any newer policy document
     Undo {
         id: String,
         #[arg(long)]
@@ -8920,6 +8923,7 @@ fn run() {
             PolicyAction::Rollout { action } => match action {
                 PolicyRolloutAction::Prepare {
                     profile,
+                    scope,
                     commands,
                     shell,
                     interactive,
@@ -8928,6 +8932,11 @@ fn run() {
                 } => cli::rollout::prepare_cli(
                     tirith_core::protection_profiles::ProtectionProfile::parse(&profile)
                         .expect("clap validates profile"),
+                    match scope.as_str() {
+                        "org" => cli::managed_policy::ProfileScope::Org,
+                        "user" => cli::managed_policy::ProfileScope::User,
+                        _ => unreachable!("clap validates rollout scope"),
+                    },
                     commands,
                     shell,
                     interactive,

@@ -707,6 +707,26 @@ mod tests {
         assert_eq!(value["omitted_diagnostics"], 11);
     }
     #[test]
+    fn rollout_plan_uses_explicit_authority_scope_without_a_destination_field() {
+        let mut value = json!({"kind":"policy_rollout",
+            "operation_id":uuid::Uuid::new_v4().to_string(),
+            "change":{"profile":"balanced", "scope":"org", "commands":["echo ready"],
+                "shell":"posix", "interactive":false}});
+        assert!(
+            matches!(serde_json::from_value::<PlanRequest>(value.clone()).unwrap(),
+            PlanRequest::PolicyRollout { change, .. }
+                if change.scope == super::super::super::managed_policy::ProfileScope::Org)
+        );
+        for scope in ["repo", "remote", "incident"] {
+            value["change"]["scope"] = scope.into();
+            assert!(serde_json::from_value::<PlanRequest>(value.clone()).is_err());
+        }
+        value["change"]["scope"] = "org".into();
+        value["change"]["path"] = "/unselected/policy.yaml".into();
+        assert!(serde_json::from_value::<PlanRequest>(value).is_err());
+    }
+
+    #[test]
     fn plan_schema_cannot_carry_paths_commands_or_write_payloads() {
         for value in [
             json!({"kind":"profile","operation_id":uuid::Uuid::new_v4().to_string(),"profile":"balanced","path":"/tmp/policy"}),

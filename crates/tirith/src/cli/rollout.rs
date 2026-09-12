@@ -1,7 +1,8 @@
 //! Local reviewed profile rollout. The shared mutation journal owns both the
 //! immutable typed intent and canonical impact attachment; activation is explicit.
+use super::managed_policy::ProfileScope;
 use super::profile_service::PreparedProfile;
-use super::setup::change_plan::{MutationService, OperationKind};
+use super::setup::change_plan::MutationService;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,7 +10,7 @@ use std::path::Path;
 use tirith_core::evaluation::{FrozenEvaluation, SessionEvidence};
 use tirith_core::policy::{captured_policy_dlp_patterns_or, PolicyDiagnosticCapture};
 use tirith_core::policy_rollout::{
-    self, ClientObservation, Exception, ExceptionOwner, RecordId, RolloutScope, Workflow,
+    self, ClientObservation, Exception, ExceptionOwner, RecordId, Workflow,
 };
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
 use tirith_core::protection_profiles::ProtectionProfile;
@@ -21,6 +22,9 @@ use tirith_core::trust_grants::{ProjectIdentity, TrustGrant, TrustGrantStore};
 #[serde(deny_unknown_fields)]
 pub(crate) struct RolloutRequest {
     pub profile: ProtectionProfile,
+    // Keep the original personal intent serialization for durable retry compatibility.
+    #[serde(default, skip_serializing_if = "ProfileScope::is_user")]
+    pub scope: ProfileScope,
     pub commands: Vec<String>,
     pub shell: ShellType,
     pub interactive: bool,
@@ -68,19 +72,23 @@ impl RolloutService {
         }
         let intent = Intent {
             kind: "profile_rollout_v1",
-            scope: "user",
+            scope: request.scope.as_str(),
             cwd: &self.cwd,
             request: &request,
         };
         let writer = MutationService::current()?;
         if writer
-            .status_for_intent(id, OperationKind::SetProfile, &intent)?
+            .status_for_intent(id, request.scope.operation_kind(), &intent)?
             .is_some()
         {
             return self.show(id);
         }
         let _capture = PolicyDiagnosticCapture::start();
-        let prepared = PreparedProfile::capture(request.profile.as_str(), Some(&self.cwd))?;
+        let prepared = PreparedProfile::capture_scoped(
+            request.profile.as_str(),
+            Some(&self.cwd),
+            request.scope,
+        )?;
         let (candidate, coverage) = prepared.rollout_candidate()?;
         let owner = RecordId::parse(&uuid::Uuid::new_v4().to_string())?;
         let frozen: Vec<_> = request
@@ -138,13 +146,14 @@ impl RolloutService {
         let report = policy_rollout::review(policy_rollout::ImpactRequest {
             id: RecordId::parse(&uuid::Uuid::new_v4().to_string())?,
             candidate_id: RecordId::parse(id)?,
-            scope: RolloutScope::PersonalUser,
+            scope: request.scope.report_scope(),
             baseline: &prepared.snapshot,
             candidate: &candidate,
             candidate_coverage: coverage,
             workflows: &workflows,
             exceptions: &exceptions,
-            exception_inventory_complete,
+            // This process observes only its operator's grants, not an organization inventory.
+            exception_inventory_complete: exception_inventory_complete && request.scope.is_user(),
             clients: &clients,
             now,
         })?;
@@ -278,6 +287,7 @@ fn project_output(
     };
     let mut output = json!({"schema_version":1,"kind":"policy_rollout","operation":operation,"impact":report,
         "live":{"observed_at":now,"impact_freshness":freshness,"historical_client_observations":true,"policy_identity":snapshot.identity,"selected_profile":selected,"personal_target_effective":snapshot.operator_targets.iter().find(|target|target.scope=="user").is_some_and(|target|target.effective),
+            "organization_target_effective":snapshot.operator_targets.iter().find(|target|target.scope=="org").is_some_and(|target|target.effective),
             "selection_is_not_adoption_proof":true,"remote_publication":"unavailable","fleet_adoption":"unavailable"},
         "diagnostics":diagnostics.iter().take(32).map(|value|{let redacted=tirith_core::redact::redact_sanitize_redact_with_compiled(value,compiled);if redacted.len()>1024 {"[withheld: diagnostic exceeds display limit]".into()}else{redacted}}).collect::<Vec<String>>(),"omitted_diagnostics":diagnostics.len().saturating_sub(32)});
     let oversized = |value: &Value| {
@@ -309,8 +319,9 @@ fn project_output(
     Ok(output)
 }
 
-pub fn prepare_cli(
+pub(crate) fn prepare_cli(
     profile: ProtectionProfile,
+    scope: ProfileScope,
     commands: Vec<String>,
     shell: ShellType,
     interactive: bool,
@@ -325,6 +336,7 @@ pub fn prepare_cli(
             &id,
             RolloutRequest {
                 profile,
+                scope,
                 commands,
                 shell,
                 interactive,
@@ -419,8 +431,36 @@ fn operation_exit(value: &serde_json::Value) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::setup::change_plan::OperationKind;
     use super::super::setup::change_plan::{JobState, OperationStatus, StepState, StepStatus};
     use super::*;
+    use tirith_core::policy_rollout::RolloutScope;
+
+    #[test]
+    fn personal_request_keeps_its_original_intent_bytes_and_scope_is_explicit() {
+        let old = json!({"profile":"balanced", "commands":["echo ready"],
+            "shell":"posix", "interactive":false});
+        let request: RolloutRequest = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(request.scope, ProfileScope::User);
+        assert_eq!(serde_json::to_value(request).unwrap(), old);
+        let mut explicit = old.clone();
+        explicit["scope"] = "user".into();
+        let request: RolloutRequest = serde_json::from_value(explicit).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), old);
+        let mut managed = old.clone();
+        managed["scope"] = "org".into();
+        let request: RolloutRequest = serde_json::from_value(managed.clone()).unwrap();
+        assert_eq!(request.scope, ProfileScope::Org);
+        assert_eq!(serde_json::to_value(request).unwrap(), managed);
+        for scope in ["repo", "remote", "incident"] {
+            let mut unsupported = old.clone();
+            unsupported["scope"] = scope.into();
+            assert!(serde_json::from_value::<RolloutRequest>(unsupported).is_err());
+        }
+        let mut path = old;
+        path["path"] = "/unselected/policy.yaml".into();
+        assert!(serde_json::from_value::<RolloutRequest>(path).is_err());
+    }
 
     #[test]
     fn operation_exit_preserves_completed_recovery_and_refuses_unfinished_states() {

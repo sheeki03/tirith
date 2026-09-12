@@ -186,13 +186,14 @@
   function rolloutPanel() {
     const section = panel('Review profile impact'); const form = element('form');
     const profile = select('Candidate profile', [['comfortable','Comfortable'],['balanced','Balanced'],['strict','Strict']]); profile.input.value = 'balanced';
+    const scope = select('Policy authority', [['user','Personal policy'],['org','Selected organization policy (file owner only)']]);
     const shell = select('Workflow shell', [['posix','Bash / Zsh / POSIX'],['fish','Fish'],['powershell','PowerShell']]);
     const commandsLabel = element('label','Representative commands, one per line'); const commands = element('textarea'); commands.rows = 5; commands.required = true; commands.maxLength = 12000; commandsLabel.append(commands);
     const interactive = field('Model interactive operation', 'checkbox'); interactive.input.checked = true;
     const submit = element('button','Prepare impact review','primary'); submit.type='submit';
-    form.append(profile.label, shell.label, commandsLabel, interactive.label, submit);
-    form.addEventListener('submit', event => { event.preventDefault(); plan({kind:'policy_rollout', change:{profile:profile.input.value, commands:commands.value.split('\n').filter(value => value.trim()), shell:shell.input.value, interactive:interactive.input.checked}}).catch(showError); });
-    section.append(paragraph('Compare explicit workflows against one captured policy context before changing your personal profile. Commands are analyzed without execution. Missing runtime evidence remains unavailable; this review cannot establish fleet adoption or approve an operation.'), form); return section;
+    form.append(profile.label, scope.label, shell.label, commandsLabel, interactive.label, submit);
+    form.addEventListener('submit', event => { event.preventDefault(); plan({kind:'policy_rollout', change:{profile:profile.input.value, scope:scope.input.value, commands:commands.value.split('\n').filter(value => value.trim()), shell:shell.input.value, interactive:interactive.input.checked}}).catch(showError); });
+    section.append(paragraph('Compare explicit workflows against one captured policy context before explicitly changing a personal profile or the selected organization policy. Organization changes require the file-owning operator and refuse newer documents during activation or rollback. Commands are analyzed without execution. Missing runtime evidence remains unavailable; this review cannot establish fleet adoption or approve an operation.'), form); return section;
   }
   function advancedSettings(effective) {
     const section = panel('Advanced personal settings'); const form = element('form');
@@ -451,7 +452,8 @@
     if (operation.irreversible) operationContent.append(paragraph('This operation permanently deletes retained records. A checkpoint and tombstone remain, but these records cannot be restored by undo.', 'notice'));
     if (operation.impact_review) {
       const impact = operation.impact_review;
-      operationContent.append(paragraph(`Personal profile impact: ${impact.counts.unchanged} unchanged, ${impact.counts.more_restrictive} more restrictive, ${impact.counts.less_restrictive} less restrictive, ${impact.counts.unavailable} comparisons unavailable.`),
+      const authority = {personal_user:'Personal', local_managed:'Organization', remote_managed:'Remote organization'}[impact.scope] || 'Selected authority';
+      operationContent.append(paragraph(`${authority} profile impact: ${impact.counts.unchanged} unchanged, ${impact.counts.more_restrictive} more restrictive, ${impact.counts.less_restrictive} less restrictive, ${impact.counts.unavailable} comparisons unavailable.`),
         paragraph(`Exception review: ${impact.counts.expired_exceptions} expired; ${impact.counts.unowned_exceptions} without verified ownership. Review captured ${impact.evaluated_at}.`, 'muted'),
         paragraph('This historical review does not prove execution, remote publication, or adoption by other clients. Missing evidence remains unavailable.', 'notice'),
         rawDetails('Inspect workflow impact, exception ownership and unavailable evidence', impact));

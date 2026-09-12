@@ -718,3 +718,77 @@ evidence manifest `durable-boundaries-reviewed-native-v7` has digest
 This qualifies the named macOS process-death/storage cases only. Power loss,
 actual ENOSPC, every write boundary, signed recovery, Windows and signed binary
 publication still need separate evidence.
+
+### Managed policy, setup intent and curl diagnostics
+
+The ordinary macOS ARM development candidate
+`d9e3ce9ed178e3405f5865c811b30ead4a78378ae34bc5ac946b74bfcbf408ca`
+is retained as `managed-exact-undo-native-v14`, with source capture
+`managed-exact-undo-inputs-v14`. Strict workspace/all-target Clippy passed.
+All 64 focused harness tests passed: fifteen setup-binding fixtures, four
+recommended-setup fixtures, 32 journal tests, nine rollout lifecycle tests and
+four reader-contract groups covering sixteen CLI cases. The preceding candidate
+also passed the six unchanged managed-authority, rollout API and rollout-unit
+checks. These counts do not count nested commands as additional unit tests.
+
+The actual embedded dashboard passed all six managed-policy browser checks:
+public launcher reuse of an identified owned service, explicit organization
+review without executing representative commands, complete materialized policy
+agreement with the CLI, exact original-document rollback, refusal after a later
+organization edit, and actual service exit with all four native cleanup facts.
+The run used Chromium 149.0.7827.55 and PyYAML 6.0.3; no asset override was used.
+Seventeen independently reviewed harness fixtures passed. Both resulting views
+were visually inspected. Remote publication, fleet adoption, Windows managed
+writes and first detached dashboard launch are outside this journey's evidence.
+
+The stronger rollback check initially failed on candidate
+`27f732345d81ff7ce80178d14903d6330c03a39c3a7360aa191393b2b2323726`:
+an empty `severity_overrides` map remained after reported undo. Both failures
+and the actual residual document are retained. Managed rollback now restores
+the original bytes only after complete-generation checks; personal rollback
+continues preserving unrelated later edits. No existing completed journal is
+silently replayed or repaired. Three additional native restart fixtures pass
+across four compensating-state scenarios: before publication, after exact
+restoration, and later edits to either generation. These simulate persisted
+restart boundaries; they do not inject a process death. The separately retained
+`managed-undo-restart-native-v15` harness has digest
+`8bca36e9aab46656cb79731b3cacbd3cd7dd41623ca150deaeec6d25664d3135`.
+
+Recommended setup now retains a private versioned verification intent even
+when no files change. A completed-file lease holds operation ownership, native
+input identities and complete planned postimages while revalidating policy,
+cancellation, undo and drift. Its public request scope is
+`fresh_terminal_activation`; it is not an execution or protection proof.
+Historical file-only records never acquire startup behavior on replay.
+Automatic verification in the real newly opened terminal remains under
+implementation; no new automatic shell row is certified by these fixtures.
+
+The focused current-main curl correction is [PR 256](https://github.com/sheeki03/tirith/pull/256),
+head `3998ed261b08db782811c03c6293784b5e149058`. All seventeen new native
+extraction/diagnostic regressions and 5,744 core unit tests passed, with two
+existing ignores. CI Clippy, Rustfmt and the Windows workspace job passed;
+other platform jobs were still running at this snapshot. The fix distinguishes
+numeric URL operands from real option values, retains original host spelling,
+and excludes userinfo from host evidence. Existing special-scheme empty-hex
+curl/generic-parser differences remain a separately tracked authority issue.
+
+The Windows controller's temporary telemetry policy did not stop the actual
+owned MSVC helper in `aa530138`. Commit `012a4d59` instead selects and retains
+explicit LLVM C/archive/linker inputs for the Windows MSVC ABI job. All 62
+portable contracts pass. Native compilation and doctests now pass with complete
+owned-process and pipe cleanup. The subsequent test run exposes Windows fixture
+and account-setup failures; standard-account qualification remains open. Process
+success, descendant, EOF and cleanup requirements are unchanged.
+
+The first native release resource run validated 293 metrics without enabling
+thresholds. Two later reference attempts refused a changed CPU class before
+measurement. The separate EPYC 7763 cohort pins measured source
+`150e753a0adf8f9f13c8cc2b38f7a9325de40d91`, tree
+`53123b9d0aa615d4135ce6c42f37abe6a5cdca16`, compiler, manifests and 100 samples;
+workflow/event revisions are recorded separately. The first admitted 100-sample
+reference, run `34709899626` attempt 1, passes all 293 metric validations. The
+retained artifact digest is
+`39da04ffc040767bac371c0dd0944b2ba0d5a3e14093982aaa66949d381b679d`;
+local reevaluation is byte-identical to the CI evaluation. Two further independent
+admitted measurements and reviewed limits are still required. CPU classes are
+not pooled.

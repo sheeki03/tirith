@@ -203,6 +203,10 @@ pub(crate) struct ShellPrecondition {
 }
 
 impl ShellPrecondition {
+    pub(super) fn selected_shell(&self) -> ShellKind {
+        self.shell
+    }
+
     fn capture(target: &ShellTarget) -> Result<Self, String> {
         Ok(Self {
             shell: ShellKind::parse(&target.shell)?,
@@ -356,6 +360,7 @@ pub(crate) struct PreparedShell {
     retained: RetainedShellInputs,
     steps: Vec<PreparedStep>,
     profiles: Vec<ProfilePreview>,
+    verification_profile_inputs: Vec<super::change_plan::SetupVerificationDocument>,
     changed: bool,
 }
 
@@ -401,6 +406,7 @@ impl PreparedShell {
             compiled,
             steps: Vec::new(),
             profiles: Vec::new(),
+            verification_profile_inputs: Vec::new(),
             changed: false,
         };
         let desired = match &prepared.intent.change {
@@ -445,6 +451,15 @@ impl PreparedShell {
         before: Option<String>,
         desired: Option<&str>,
     ) -> Result<(), String> {
+        if matches!(&self.intent.change, ShellChange::Install { .. }) {
+            self.verification_profile_inputs.push(
+                super::change_plan::SetupVerificationDocument::observed(
+                    &profile.path,
+                    &profile.scope,
+                    before.as_deref(),
+                )?,
+            );
+        }
         let original = before.as_deref().unwrap_or_default();
         validate_marker_pairing(original)?;
         let blocks = block_ranges(original);
@@ -620,6 +635,27 @@ impl PreparedShell {
                 .collect(),
             self.retained.expected.clone(),
         ))
+    }
+
+    pub(crate) fn verification_intent(
+        &self,
+    ) -> Result<super::change_plan::SetupVerificationIntent, String> {
+        if !matches!(&self.intent.change, ShellChange::Install { .. }) {
+            return Err("removal cannot request fresh-shell activation".into());
+        }
+        self.retained.revalidate()?;
+        let unchanged = self
+            .verification_profile_inputs
+            .iter()
+            .filter(|input| {
+                !self.changed || !self.steps.iter().any(|step| input.is_path(&step.target))
+            })
+            .cloned()
+            .collect();
+        super::change_plan::SetupVerificationIntent::for_shell(
+            self.intent.change.shell(),
+            unchanged,
+        )
     }
 
     pub(crate) fn plan(&self, id: &str) -> Result<Option<OperationStatus>, String> {
