@@ -4514,25 +4514,43 @@ fn push_fetch_option_destinations(
     destinations: &mut Vec<String>,
     kind: FetchOptionValueKind,
     value: &str,
+    include_mapped_peers: bool,
 ) {
     match kind {
         FetchOptionValueKind::Destination => destinations.push(value.to_string()),
         FetchOptionValueKind::HttpieProxy => {
             destinations.push(httpie_proxy_peer(value).to_string())
         }
-        FetchOptionValueKind::CurlConnectTo => {
+        FetchOptionValueKind::CurlConnectTo if include_mapped_peers => {
             if let Some(peer) = curl_connect_to_peer(value) {
                 destinations.push(peer.to_string());
             }
         }
-        FetchOptionValueKind::CurlResolve => {
+        FetchOptionValueKind::CurlResolve if include_mapped_peers => {
             destinations.extend(curl_resolve_peers(value).into_iter().map(str::to_string))
         }
-        FetchOptionValueKind::NonDestination => {}
+        FetchOptionValueKind::CurlConnectTo
+        | FetchOptionValueKind::CurlResolve
+        | FetchOptionValueKind::NonDestination => {}
     }
 }
 
+/// URL-like curl operands for extraction. Connection/DNS mapping fields remain
+/// network-policy peers, but are not themselves scheme-less URL operands.
+pub(crate) fn curl_url_operands(args: &[String], shell: ShellType) -> Vec<String> {
+    fetch_destination_operands("curl", args, shell, false)
+}
+
 fn url_fetch_destination_operands(command: &str, args: &[String], shell: ShellType) -> Vec<String> {
+    fetch_destination_operands(command, args, shell, true)
+}
+
+fn fetch_destination_operands(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+    include_mapped_peers: bool,
+) -> Vec<String> {
     let mut destinations = Vec::new();
     let mut pending = None;
     let mut options_terminated = false;
@@ -4540,7 +4558,12 @@ fn url_fetch_destination_operands(command: &str, args: &[String], shell: ShellTy
     for arg in args {
         let normalized = normalize_shell_token(arg, shell);
         if let Some(kind) = pending.take() {
-            push_fetch_option_destinations(&mut destinations, kind, &normalized);
+            push_fetch_option_destinations(
+                &mut destinations,
+                kind,
+                &normalized,
+                include_mapped_peers,
+            );
             continue;
         }
         if !options_terminated && normalized == "--" {
@@ -4556,9 +4579,12 @@ fn url_fetch_destination_operands(command: &str, args: &[String], shell: ShellTy
         if !options_terminated && option_spelling.starts_with('-') && option_spelling != "-" {
             if let Some(option) = fetch_option_value(command, &option_spelling) {
                 match (option.kind, option.attached) {
-                    (kind, Some(value)) if !value.is_empty() => {
-                        push_fetch_option_destinations(&mut destinations, kind, value)
-                    }
+                    (kind, Some(value)) if !value.is_empty() => push_fetch_option_destinations(
+                        &mut destinations,
+                        kind,
+                        value,
+                        include_mapped_peers,
+                    ),
                     (_, Some(_)) => {}
                     (kind, None) => pending = Some(kind),
                 }

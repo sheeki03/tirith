@@ -3260,7 +3260,11 @@ fn analyze_inner_with_policy_and_pdf_coverage(
             let raw_path = extract_raw_path_from_url(&url_info.raw);
             let normalized_path = url_info.parsed.path().map(normalize::normalize_path);
 
-            let hostname_findings = crate::rules::hostname::check(&url_info.parsed, &policy);
+            let hostname_findings = crate::rules::hostname::check_with_raw_url(
+                &url_info.parsed,
+                &policy,
+                Some(&url_info.raw),
+            );
             findings.extend(hostname_findings);
 
             let path_findings = crate::rules::path::check(
@@ -3270,8 +3274,11 @@ fn analyze_inner_with_policy_and_pdf_coverage(
             );
             findings.extend(path_findings);
 
-            let transport_findings =
-                crate::rules::transport::check(&url_info.parsed, url_info.in_sink_context);
+            let transport_findings = crate::rules::transport::check_with_raw_url(
+                &url_info.parsed,
+                url_info.in_sink_context,
+                Some(&url_info.raw),
+            );
             findings.extend(transport_findings);
 
             let ecosystem_findings = crate::rules::ecosystem::check_with_extraction_index(
