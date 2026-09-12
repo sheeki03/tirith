@@ -10,6 +10,16 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+#[path = "shell_verification.rs"]
+mod shell_verification;
+pub use shell_verification::{
+    execute_shell_verification_probe, finish_shell_verification,
+    finish_shell_verification_authenticated, observe_shell_verification_hook,
+    start_shell_verification, ShellVerificationChallenge, ShellVerificationHookDecision,
+    ShellVerificationObservation, ShellVerificationProbe, ShellVerificationProof,
+    ShellVerificationStatus,
+};
+
 const RECEIPT_SCHEMA_VERSION: u32 = 3;
 const LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION: u32 = 2;

@@ -1860,8 +1860,25 @@ pub fn redact_verdict_with_compiled(
 ) {
     redact_findings_with_compiled(&mut verdict.findings, compiled);
     redact_optional_string(&mut verdict.policy_path_used, compiled);
-    redact_optional_string(&mut verdict.approval_fallback, compiled);
-    redact_optional_string(&mut verdict.approval_rule, compiled);
+    // These are string-backed protocol fields. Preserve only valid generated
+    // tokens; an arbitrary caller-supplied value still receives full DLP.
+    if !verdict
+        .approval_fallback
+        .as_deref()
+        .is_some_and(|value| matches!(value, "allow" | "warn" | "block"))
+    {
+        redact_optional_string(&mut verdict.approval_fallback, compiled);
+    }
+    if !verdict.approval_rule.as_deref().is_some_and(|value| {
+        serde_json::from_value::<crate::verdict::RuleId>(serde_json::Value::String(
+            value.to_string(),
+        ))
+        .ok()
+        .and_then(|rule| serde_json::to_value(rule).ok())
+            == Some(serde_json::Value::String(value.to_string()))
+    }) {
+        redact_optional_string(&mut verdict.approval_rule, compiled);
+    }
     redact_optional_string(&mut verdict.approval_description, compiled);
     redact_optional_string(&mut verdict.escalation_reason, compiled);
     redact_optional_string(&mut verdict.manifest_allowed_match, compiled);
@@ -1913,8 +1930,10 @@ pub fn redact_findings_with_compiled(
 }
 
 /// Recursively apply redact-sanitize-redact to every string value in a
-/// machine-readable projection while preserving keys, schema, booleans, and
-/// numeric decision metadata. Call this before any presentation bound.
+/// content value while preserving keys, booleans and numeric metadata. This is
+/// NOT suitable for entire machine responses: string enums, identifiers, MIME
+/// types and signed material are also strings. Classify those fields at the
+/// producing boundary (see `mcp::output_contract`) before presentation bounding.
 pub fn redact_json_strings(value: &mut serde_json::Value, compiled: &CompiledCustomPatterns) {
     match value {
         serde_json::Value::String(text) => {

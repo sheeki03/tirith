@@ -1,6 +1,10 @@
 //! Filesystem helpers for `tirith setup` — atomic writes, hook scripts,
 //! directory validation, CLI subprocess runner, and backup management.
 
+#[path = "fs_retention_unix.rs"]
+mod retention;
+pub(crate) use retention::{open_existing_in_place, InPlaceLease};
+
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
@@ -583,6 +587,13 @@ fn errno_slot() -> Option<*mut libc::c_int> {
 }
 
 fn directory_names(directory: &fs::File) -> Result<Vec<CString>, String> {
+    directory_names_bounded(directory, usize::MAX).map(|(names, _)| names)
+}
+
+fn directory_names_bounded(
+    directory: &fs::File,
+    limit: usize,
+) -> Result<(Vec<CString>, bool), String> {
     let dot = c".";
     // `dup` would share the directory-stream offset with the long-lived
     // capability. Re-open `.` relative to that capability so every scan gets
@@ -634,13 +645,44 @@ fn directory_names(directory: &fs::File) -> Result<Vec<CString>, String> {
                     std::io::Error::from_raw_os_error(readdir_errno)
                 ));
             }
-            return Ok(names);
+            return Ok((names, false));
         }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
         if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            if names.len() == limit {
+                if unsafe { libc::closedir(stream) } < 0 {
+                    return Err("cannot close bounded private directory inventory".into());
+                }
+                return Ok((names, true));
+            }
             names.push(name.to_owned());
         }
     }
+}
+
+pub(crate) fn private_directory_names(
+    directory: &Path,
+    scope: &Path,
+    limit: usize,
+) -> Result<(Vec<OsString>, bool), String> {
+    let Some(parent) = scoped_parent(&directory.join(".inventory"), scope, false)? else {
+        return Ok((Vec::new(), false));
+    };
+    let metadata = parent
+        .dir
+        .metadata()
+        .map_err(|_| "cannot inspect private journal directory")?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err("journal inventory requires a private current-user-owned directory".into());
+    }
+    let (names, limited) = directory_names_bounded(&parent.dir, limit)?;
+    Ok((
+        names
+            .into_iter()
+            .map(|name| OsStr::from_bytes(name.to_bytes()).to_owned())
+            .collect(),
+        limited,
+    ))
 }
 
 fn normalize_tombstone_name(
@@ -707,6 +749,20 @@ pub(crate) struct PlatformSnapshot {
 }
 
 impl PlatformSnapshot {
+    /// Validate privacy from the same retained-handle generation as the bytes.
+    /// An absent destination is safe for a new private publication.
+    pub(crate) fn require_private(&self) -> Result<(), String> {
+        if let SnapshotGeneration::Present(generation) = &self.generation {
+            if generation.owner != unsafe { libc::geteuid() }
+                || generation.links != 1
+                || self.mode.is_none_or(|mode| mode & 0o077 != 0)
+            {
+                return Err("private file must be current-user-owned, single-link and inaccessible to other users".into());
+            }
+        }
+        Ok(())
+    }
+
     fn absent() -> Self {
         Self {
             bytes: None,
@@ -719,6 +775,18 @@ impl PlatformSnapshot {
 fn snapshot_from_parent(
     parent: &ScopedParent,
     display_path: &Path,
+) -> Result<PlatformSnapshot, String> {
+    snapshot_from_parent_capped(
+        parent,
+        display_path,
+        super::fs_transaction::MAX_SETUP_FILE_BYTES,
+    )
+}
+
+fn snapshot_from_parent_capped(
+    parent: &ScopedParent,
+    display_path: &Path,
+    limit: usize,
 ) -> Result<PlatformSnapshot, String> {
     // A non-cooperating writer may mutate while we read. Retry a bounded
     // number of times until the same handle has stable generation metadata
@@ -768,17 +836,17 @@ fn snapshot_from_parent(
                 before.nlink()
             ));
         }
-        if before.len() > super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 {
+        if before.len() > limit as u64 {
             return Err(format!(
                 "{} exceeds setup file limit of {} bytes",
                 display_path.display(),
-                super::fs_transaction::MAX_SETUP_FILE_BYTES
+                limit
             ));
         }
 
         let mut bytes = Vec::with_capacity(before.len() as usize);
         (&mut file)
-            .take(super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 + 1)
+            .take(limit as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| {
                 format!(
@@ -786,11 +854,11 @@ fn snapshot_from_parent(
                     display_path.display()
                 )
             })?;
-        if bytes.len() > super::fs_transaction::MAX_SETUP_FILE_BYTES {
+        if bytes.len() > limit {
             return Err(format!(
                 "{} exceeds setup file limit of {} bytes",
                 display_path.display(),
-                super::fs_transaction::MAX_SETUP_FILE_BYTES
+                limit
             ));
         }
         let after = file.metadata().map_err(|error| {
@@ -826,6 +894,23 @@ pub(crate) fn read_snapshot_scoped(
     snapshot_from_parent(&parent, path)
 }
 
+/// Read through the retained native boundary with a caller-selected smaller cap.
+/// No parents are created. The normal snapshot still carries privacy and generation proof.
+pub(crate) fn read_snapshot_scoped_capped(
+    path: &Path,
+    scope_root: &Path,
+    limit: usize,
+) -> Result<PlatformSnapshot, String> {
+    let Some(parent) = scoped_parent(path, scope_root, false)? else {
+        return Ok(PlatformSnapshot::absent());
+    };
+    snapshot_from_parent_capped(
+        &parent,
+        path,
+        limit.min(super::fs_transaction::MAX_SETUP_FILE_BYTES),
+    )
+}
+
 /// Read a setup-managed text file through the same root-confined, no-follow
 /// boundary used for writes. Missing files or parents return `None` without
 /// creating directories; unsafe components are errors even for dry runs and
@@ -840,10 +925,25 @@ pub fn read_to_string_scoped(path: &Path, scope_root: &Path) -> Result<Option<St
         .transpose()
 }
 
-/// Return whether a destination's complete parent chain currently exists and
-/// is safe beneath `scope_root`, without creating anything.
-pub fn parent_exists_scoped(path: &Path, scope_root: &Path) -> Result<bool, String> {
-    scoped_parent(path, scope_root, false).map(|parent| parent.is_some())
+/// Create a private journal directory using the same no-follow parent walk as
+/// setup files. Permissions are changed through the held directory descriptor.
+pub(crate) fn ensure_private_directory(path: &Path, scope_root: &Path) -> Result<(), String> {
+    let parent = scoped_parent(&path.join(".journal-entry"), scope_root, true)?
+        .ok_or("cannot create private journal directory")?;
+    let metadata = parent.dir.metadata().map_err(|e| e.to_string())?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err("private journal directory is not owned by the current operator".into());
+    }
+    if unsafe { libc::fchmod(parent.dir.as_raw_fd(), 0o700) } != 0 {
+        return Err(format!(
+            "make journal directory private: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    parent
+        .dir
+        .sync_all()
+        .map_err(|e| format!("sync private journal directory: {e}"))
 }
 
 /// Write `content` to `path` atomically via temp+rename.
@@ -879,6 +979,41 @@ pub(crate) struct PlatformLock {
     _anchor: fs::File,
 }
 
+/// Per-operation execution lock, separate from the writer lock. It prevents an
+/// apply/undo pair or two workers from interleaving one durable operation.
+pub(crate) fn try_lock_operation(
+    path: &Path,
+    scope: &Path,
+) -> Result<Option<PlatformLock>, String> {
+    let parent =
+        scoped_parent(path, scope, false)?.ok_or("operation journal directory is missing")?;
+    let fd = unsafe {
+        libc::openat(
+            parent.dir.as_raw_fd(),
+            parent.name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "open private operation lock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err("operation lock ownership or file identity is unsafe".into());
+    }
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(PlatformLock { _anchor: file })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(format!("lock operation: {error}")),
+    }
+}
+
 pub(crate) struct PlatformTransaction {
     parent: ScopedParent,
     path: PathBuf,
@@ -888,17 +1023,22 @@ pub(crate) struct PlatformTransaction {
 
 impl PlatformTransaction {
     pub(crate) fn lock(_path: &Path, scope_root: &Path) -> Result<PlatformLock, String> {
-        // NOTE: this wait is unbounded. The anchor is `/`, so any local process
-        // that flocks it can stall setup indefinitely. A deadline is the right
-        // answer, but the bound has to be chosen against real contention: the
-        // `/` anchor already serializes every setup transaction, and the test
-        // suite alone spends ~23s waiting here, so a bound picked by intuition
-        // trades a hang for a spurious failure. Left blocking until that number
-        // is measured.
+        Self::lock_for(_path, scope_root, super::fs_transaction::SETUP_LOCK_TIMEOUT)
+    }
+
+    pub(crate) fn lock_for(
+        _path: &Path,
+        scope_root: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<PlatformLock, String> {
         let anchor = open_lock_anchor(scope_root)?;
-        anchor
-            .lock_exclusive()
-            .map_err(|error| format!("lock setup scope without creating a lock file: {error}"))?;
+        super::fs_transaction::wait_for_lock(timeout, || match anchor.try_lock_exclusive() {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(format!(
+                "lock setup scope without creating a lock file: {error}"
+            )),
+        })?;
         Ok(PlatformLock { _anchor: anchor })
     }
 
@@ -939,7 +1079,8 @@ impl PlatformTransaction {
     }
 
     pub(crate) fn validate_snapshot(&self, expected: &PlatformSnapshot) -> Result<(), String> {
-        let live = self.read_snapshot()?;
+        let limit = expected.bytes.as_ref().map_or(0, Vec::len);
+        let live = snapshot_from_parent_capped(&self.parent, &self.path, limit)?;
         if &live != expected {
             return Err(format!(
                 "{} changed while setup was preparing the update; no changes were published",
@@ -2205,6 +2346,29 @@ fn run_cli_bounded<S: AsRef<OsStr>>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn smaller_snapshot_cap_is_enforced_before_read_and_preserves_private_proof() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("annotation.json");
+        std::fs::write(&path, b"12345").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(super::read_snapshot_scoped_capped(&path, root.path(), 4).is_err());
+        let exact = super::read_snapshot_scoped_capped(&path, root.path(), 5).unwrap();
+        exact.require_private().unwrap();
+        assert_eq!(exact.bytes.as_deref(), Some(&b"12345"[..]));
+        std::os::unix::fs::symlink(&path, root.path().join("linked")).unwrap();
+        assert!(
+            super::read_snapshot_scoped_capped(&root.path().join("linked"), root.path(), 5)
+                .is_err()
+        );
+        let absent = root.path().join("missing/entry");
+        assert!(super::read_snapshot_scoped_capped(&absent, root.path(), 5)
+            .unwrap()
+            .bytes
+            .is_none());
+        assert!(!absent.parent().unwrap().exists());
+    }
     use super::super::fs_transaction::{transactional_update_with_hook, FileUpdate, TestStage};
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -2989,23 +3153,29 @@ mod tests {
 
     #[test]
     fn non_cooperating_generation_change_is_rejected_and_temp_is_scrubbed() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("config.json");
-        fs::write(&path, "before").unwrap();
-        let result = transactional_update_with_hook(
-            &path,
-            root.path(),
-            |_| Ok(FileUpdate::write_text("ours".into(), 0o644)),
-            |stage| {
-                if stage == TestStage::TempSynced {
-                    fs::write(&path, "editor-change").unwrap();
-                }
-                Ok(())
-            },
-        );
-        assert!(result.unwrap_err().contains("changed while setup"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "editor-change");
-        assert!(nonempty(temporary_setup_paths(root.path())).is_empty());
+        for (editor_bytes, expected_refusal) in [
+            ("editor", "changed while setup"),
+            ("editor-change", "exceeds setup file limit of 6 bytes"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("config.json");
+            fs::write(&path, "before").unwrap();
+            let result = transactional_update_with_hook(
+                &path,
+                root.path(),
+                |_| Ok(FileUpdate::write_text("ours".into(), 0o644)),
+                |stage| {
+                    if stage == TestStage::TempSynced {
+                        fs::write(&path, editor_bytes).unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            let refusal = result.unwrap_err();
+            assert!(refusal.contains(expected_refusal), "{refusal}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), editor_bytes);
+            assert!(nonempty(temporary_setup_paths(root.path())).is_empty());
+        }
     }
 
     #[test]

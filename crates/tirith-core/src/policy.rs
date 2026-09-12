@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::agent_origin::AgentOrigin;
+use crate::policy_snapshot::{self as snapshot, InputReader, PolicySource};
 
 std::thread_local! {
     static POLICY_DIAGNOSTIC_CAPTURES: std::cell::RefCell<Vec<PolicyDiagnosticCaptureState>> =
@@ -183,11 +184,22 @@ fn find_policy_in_dir(dir: &Path) -> Option<PathBuf> {
     // `Path::exists` follows the final symlink and therefore treats a dangling
     // named policy as absent. Retain the directory entry so the scoped loader
     // can diagnose it and fail closed instead of silently using defaults.
-    if std::fs::symlink_metadata(&yaml).is_ok() {
+    let yaml_exists = std::fs::symlink_metadata(&yaml).is_ok();
+    snapshot::observe_discovery(&yaml, false, yaml_exists);
+    if yaml_exists && !snapshot::is_capturing() {
         return Some(yaml);
     }
+    // Capture the complete named-candidate set even when YAML wins. An owned
+    // absent-to-present YAML publication must not remove an unrelated YML
+    // discovery witness from a multi-step operation's external-input guard.
+    // This observes only entry presence; an unselected document is not read.
     let yml = dir.join("policy.yml");
-    if std::fs::symlink_metadata(&yml).is_ok() {
+    let yml_exists = std::fs::symlink_metadata(&yml).is_ok();
+    snapshot::observe_discovery(&yml, false, yml_exists);
+    if yaml_exists {
+        return Some(yaml);
+    }
+    if yml_exists {
         return Some(yml);
     }
     None
@@ -243,7 +255,9 @@ enum PolicyReadMode {
 /// root. A checkout controls both entries, so either becoming a symlink is a
 /// fail-closed read error; trusted User/Org policy uses a separate reader and
 /// may still be a deliberate Nix/Home Manager final symlink.
-fn read_repository_policy(path: &Path) -> Result<Vec<u8>, crate::util::OpenRegularError> {
+pub(crate) fn read_repository_policy(
+    path: &Path,
+) -> Result<Vec<u8>, crate::util::OpenRegularError> {
     let invalid_shape = || {
         crate::util::OpenRegularError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -302,6 +316,12 @@ pub struct Policy {
     /// migrations in [`crate::policy_migrations`] run on raw YAML pre-deserialize.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+
+    /// Requested personal preset and reset ownership. Its concrete settings
+    /// are materialized by the shared profile preview; this marker itself
+    /// never changes enforcement and may not be supplied by a repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection_profile: Option<crate::protection_profiles::ProfileSelection>,
 
     /// Fail mode: "open" (default) or "closed".
     pub fail_mode: FailMode,
@@ -1335,6 +1355,7 @@ impl Default for Policy {
             path: None,
             scope: PolicyScope::default(),
             schema_version: default_schema_version(),
+            protection_profile: None,
             web3_guard: crate::web3_policy::Web3GuardPolicy::default(),
             task_gate: crate::web3_policy::TaskGatePolicy::default(),
             fail_mode: FailMode::Open,
@@ -1667,22 +1688,30 @@ impl Policy {
     /// regardless of which remote-fetch branch produced the policy).
     fn discover_resolved(cwd: Option<&str>) -> Self {
         let local = Self::discover_local(cwd);
+        // A remote replacement must not discard the local diagnostic DLP
+        // protection for errors that have already observed trusted local data.
+        freeze_captured_policy_dlp_patterns(&local.dlp_custom_patterns);
 
         // Treat the endpoint and credential as one provenance-aware pair. In
         // particular, an environment-selected origin must never inherit a
         // stored user/org credential: changing only TIRITH_SERVER_URL would
         // otherwise send that credential to an attacker-selected public host.
-        let url_from_env = std::env::var("TIRITH_SERVER_URL")
-            .ok()
+        let url_from_env = snapshot::observe_env("TIRITH_SERVER_URL")
+            .and_then(|value| value.into_string().ok())
             .filter(|s| !s.is_empty());
-        let key_from_env = std::env::var("TIRITH_API_KEY")
-            .ok()
+        let key_from_env = snapshot::observe_env("TIRITH_API_KEY")
+            .and_then(|value| value.into_string().ok())
             .filter(|s| !s.is_empty());
         let (server_url, api_key) = match (url_from_env, key_from_env) {
             // A complete ambient pair is operator-controlled as one unit.
             (Some(url), Some(key)) => (url, key),
             // Never reuse a file credential after an ambient origin change.
             (Some(_), None) => {
+                snapshot::observe_remote(|remote| {
+                    remote.availability = "configuration_incomplete".into();
+                    remote.fallback = Some("local".into());
+                    remote.failure = Some("ambient_endpoint_requires_paired_credential".into());
+                });
                 policy_diagnostic!(
                     "tirith: warning: TIRITH_SERVER_URL requires a paired TIRITH_API_KEY; refusing to reuse a stored policy credential"
                 );
@@ -1716,15 +1745,28 @@ impl Policy {
 
         let fail_mode = local.policy_fetch_fail_mode.as_deref().unwrap_or("open");
 
-        match crate::policy_client::fetch_remote_policy(&server_url, &api_key) {
-            Ok(yaml) => {
+        snapshot::observe_remote(|remote| remote.availability = "fetching".into());
+        let resolved = match crate::policy_client::fetch_remote_policy_with_metadata(
+            &server_url,
+            &api_key,
+        ) {
+            Ok(response) => {
+                let yaml = response.yaml;
+                snapshot::observe_remote_bytes(yaml.as_bytes());
                 // Migrations run on remote YAML the same as local (M5.5 F3).
                 match Self::try_parse_yaml(&yaml) {
                     Ok(mut p) => {
                         // Never replace a known-good cache with malformed remote
                         // bytes. The envelope is also bound to this exact
                         // endpoint/credential identity.
-                        if let Err(error) = cache_remote_policy(&server_url, &api_key, &yaml) {
+                        let validated_at = chrono::Utc::now().to_rfc3339();
+                        if let Err(error) = cache_remote_policy_with_metadata(
+                            &server_url,
+                            &api_key,
+                            &yaml,
+                            &response.metadata,
+                            &validated_at,
+                        ) {
                             policy_diagnostic!(
                                 "tirith: warning: could not cache validated remote policy: {error}"
                             );
@@ -1740,72 +1782,131 @@ impl Policy {
                         if p.policy_server_api_key.is_none() {
                             p.policy_server_api_key = Some(api_key.clone());
                         }
+                        snapshot::observe_replacement(&p, PolicySource::new("remote", None), None,
+                            "validated remote policy replaces the complete local baseline and repository policy");
+                        snapshot::observe_remote(|remote| {
+                            remote.availability = "available".into();
+                            remote.fetched_at = Some(response.metadata.fetched_at.clone());
+                            remote.validated_at = Some(validated_at);
+                            remote.server_date = response.metadata.server_date;
+                            remote.etag = response.metadata.etag;
+                            remote.last_modified = response.metadata.last_modified;
+                            remote.cache_age_seconds = Some(0);
+                            remote.freshness = "fresh_fetch".into();
+                        });
                         p
                     }
-                    Err(e) => match fail_mode {
-                        "closed" => {
-                            policy_diagnostic!(
+                    Err(e) => {
+                        snapshot::observe_remote(|remote| {
+                            remote.availability = "invalid_response".into();
+                            remote.failure = Some("policy_parse_failed".into());
+                        });
+                        match fail_mode {
+                            "closed" => {
+                                policy_diagnostic!(
                                 "tirith: error: remote policy parse error ({e}), failing closed"
                             );
-                            Self::fail_closed_policy()
-                        }
-                        "cached" => {
-                            policy_diagnostic!(
+                                Self::fail_closed_policy()
+                            }
+                            "cached" => {
+                                policy_diagnostic!(
                                 "tirith: warning: remote policy parse error ({e}), trying cache"
                             );
-                            match load_cached_remote_policy(&server_url, &api_key) {
-                                Some(p) => p,
-                                None => {
-                                    policy_diagnostic!(
-                                        "tirith: warning: no cached remote policy, using local"
-                                    );
-                                    local
+                                match load_cached_remote_policy(&server_url, &api_key) {
+                                    Some(p) => p,
+                                    None => {
+                                        policy_diagnostic!(
+                                            "tirith: warning: no cached remote policy, using local"
+                                        );
+                                        local
+                                    }
                                 }
                             }
+                            _ => {
+                                policy_diagnostic!(
+                                    "tirith: warning: remote policy parse error: {e}"
+                                );
+                                local
+                            }
                         }
-                        _ => {
-                            policy_diagnostic!("tirith: warning: remote policy parse error: {e}");
-                            local
-                        }
-                    },
+                    }
                 }
             }
             Err(crate::policy_client::PolicyFetchError::AuthError(code)) => {
+                snapshot::observe_remote(|remote| {
+                    remote.availability = "authentication_failed".into();
+                    remote.failure = Some(format!("http_{code}"));
+                });
                 // Auth errors always fail closed regardless of fail_mode.
                 policy_diagnostic!(
                     "tirith: error: policy server auth failed (HTTP {code}), failing closed"
                 );
                 Self::fail_closed_policy()
             }
-            Err(e) => match fail_mode {
-                "closed" => {
-                    policy_diagnostic!(
-                        "tirith: error: remote policy fetch failed ({e}), failing closed"
+            Err(e) => {
+                snapshot::observe_remote(|remote| {
+                    remote.availability = "unavailable".into();
+                    remote.failure = Some(
+                        match &e {
+                            crate::policy_client::PolicyFetchError::NetworkError(_) => {
+                                "network_error"
+                            }
+                            crate::policy_client::PolicyFetchError::ServerError(_) => {
+                                "server_error"
+                            }
+                            crate::policy_client::PolicyFetchError::InvalidResponse(_) => {
+                                "invalid_response"
+                            }
+                            crate::policy_client::PolicyFetchError::AuthError(_) => {
+                                "authentication_failed"
+                            }
+                        }
+                        .into(),
                     );
-                    Self::fail_closed_policy()
-                }
-                "cached" => {
-                    policy_diagnostic!(
-                        "tirith: warning: remote policy fetch failed ({e}), trying cache"
-                    );
-                    match load_cached_remote_policy(&server_url, &api_key) {
-                        Some(p) => p,
-                        None => {
-                            policy_diagnostic!(
-                                "tirith: warning: no cached remote policy, using local"
-                            );
-                            local
+                });
+                match fail_mode {
+                    "closed" => {
+                        policy_diagnostic!(
+                            "tirith: error: remote policy fetch failed ({e}), failing closed"
+                        );
+                        Self::fail_closed_policy()
+                    }
+                    "cached" => {
+                        policy_diagnostic!(
+                            "tirith: warning: remote policy fetch failed ({e}), trying cache"
+                        );
+                        match load_cached_remote_policy(&server_url, &api_key) {
+                            Some(p) => p,
+                            None => {
+                                policy_diagnostic!(
+                                    "tirith: warning: no cached remote policy, using local"
+                                );
+                                local
+                            }
                         }
                     }
+                    _ => {
+                        policy_diagnostic!(
+                            "tirith: warning: remote policy fetch failed ({e}), using local policy"
+                        );
+                        local
+                    }
                 }
-                _ => {
-                    policy_diagnostic!(
-                        "tirith: warning: remote policy fetch failed ({e}), using local policy"
-                    );
-                    local
-                }
-            },
+            }
+        };
+        if resolved.path.as_deref() == Some("fail-closed") {
+            snapshot::observe_remote(|remote| remote.fallback = Some("fail_closed".into()));
+            snapshot::observe_replacement(
+                &resolved,
+                PolicySource::new("remote_failure", None),
+                None,
+                "remote failure policy requires fail-closed replacement",
+            );
+        } else if resolved.scope != PolicyScope::Remote {
+            snapshot::observe_remote(|remote| remote.fallback = Some("local".into()));
         }
+        freeze_captured_policy_dlp_patterns(&resolved.dlp_custom_patterns);
+        resolved
     }
 
     /// Discover local policy only (no remote fetch). An operator-controlled org
@@ -1815,22 +1916,49 @@ impl Policy {
     /// mere presence of `.tirith/policy.yaml` from shadowing trusted settings or
     /// suppressing the baseline's remote-policy configuration.
     fn discover_local(cwd: Option<&str>) -> Self {
+        if snapshot::is_capturing() {
+            let _ = config_dir();
+        }
         let trusted = discover_trusted_local_policy_path_scoped();
         let trusted_path = trusted.as_ref().map(|(path, _)| path.clone());
         let mut baseline = match trusted {
             Some((path, scope)) => {
-                let mut policy = Self::load_from_path(&path, PolicyReadMode::TrustedBaseline);
+                snapshot::observe_policy_target(&path, scope);
+                let (mut policy, document) =
+                    Self::load_from_path_with_document(&path, PolicyReadMode::TrustedBaseline);
                 policy.scope = scope;
+                snapshot::observe_replacement(
+                    &policy,
+                    PolicySource::new(scope.as_str(), Some(&path)),
+                    document.migrated.as_ref(),
+                    if document.parse_failed {
+                        "named trusted policy could not be loaded; fail-closed replacement"
+                    } else {
+                        "selected trusted baseline"
+                    },
+                );
                 policy
             }
-            None => Policy::default(),
+            None => {
+                let policy = Policy::default();
+                snapshot::observe_replacement(
+                    &policy,
+                    PolicySource::new("default", None),
+                    None,
+                    "built-in default",
+                );
+                policy
+            }
         };
 
+        freeze_captured_policy_dlp_patterns(&baseline.dlp_custom_patterns);
         if let Some(repo_path) = discover_policy_path(cwd) {
             // TIRITH_POLICY_ROOT may intentionally point at this checkout. Do
             // not parse and append the same document a second time under a
             // different scope.
             if trusted_path.as_ref() != Some(&repo_path) {
+                snapshot::observe_policy_target(&repo_path, PolicyScope::Repo);
+                let before = snapshot::values(&baseline);
                 let (mut repo, document) = Self::load_from_path_with_document(
                     &repo_path,
                     PolicyReadMode::UntrustedRepository,
@@ -1841,12 +1969,28 @@ impl Policy {
                 // policy. Do not turn that parse failure into a partial overlay
                 // whose fields depend on serde defaults.
                 if document.parse_failed {
+                    snapshot::observe_replacement(
+                        &repo,
+                        PolicySource::new("repo", Some(&repo_path)),
+                        None,
+                        "named repository policy could not be loaded; fail-closed replacement",
+                    );
                     return repo;
                 }
                 // F9 — neutralize weakening, suppression, exfiltration, and
                 // remote-redirection fields before the total monotonic merge.
                 repo.sanitize_repo_scoped();
+                snapshot::observe_neutralized(
+                    &repo.neutralized_fields,
+                    PolicySource::new("repo", Some(&repo_path)),
+                );
                 baseline.merge_repo_tightening(repo, &document);
+                snapshot::observe_neutralized(
+                    &baseline.neutralized_fields,
+                    PolicySource::new("repo", Some(&repo_path)),
+                );
+                snapshot::observe_overlay(before, &baseline, PolicySource::new("repo", Some(&repo_path)), document.migrated.as_ref(),
+                    "repository tightening overlay; unchanged or weaker declarations do not replace the trusted value");
             }
         }
         baseline
@@ -1861,6 +2005,7 @@ impl Policy {
             path,
             scope: _,
             schema_version: _,
+            protection_profile: _,
             fail_mode,
             allow_bypass_env,
             allow_bypass_env_noninteractive,
@@ -2108,7 +2253,11 @@ impl Policy {
         // historical behavior — recording NEVER alters a final field value.
         // `neutralized_fields` is reset first so a re-sanitize is idempotent.
         self.neutralized_fields.clear();
+        let ignored_profile = self.protection_profile.take().is_some();
         let mut neutralized: Vec<&'static str> = Vec::new();
+        if ignored_profile {
+            neutralized.push("protection_profile");
+        }
         macro_rules! record {
             // Field-equality form: reset target is the default's value for the
             // field, so "changed" == "differs from default".
@@ -2642,10 +2791,6 @@ impl Policy {
         }
     }
 
-    fn load_from_path(path: &Path, read_mode: PolicyReadMode) -> Self {
-        Self::load_from_path_with_document(path, read_mode).0
-    }
-
     /// Load once and retain the migrated document for repository-overlay
     /// presence checks. Returning the document from the same bounded read avoids
     /// a second-read TOCTOU between policy values and the field-presence
@@ -2661,12 +2806,22 @@ impl Policy {
         // Nix store symlink; follow it open-first, then require the target to be
         // a bounded regular file. Both readers reject FIFO/device, directory,
         // broken/looping link, and oversize targets without blocking.
-        let bytes = match match read_mode {
+        let read = match read_mode {
             PolicyReadMode::TrustedBaseline => {
                 crate::util::read_regular_capped(path, POLICY_FILE_READ_CAP)
             }
             PolicyReadMode::UntrustedRepository => read_repository_policy(path),
-        } {
+        };
+        snapshot::observe_read(
+            path,
+            "policy",
+            match read_mode {
+                PolicyReadMode::TrustedBaseline => InputReader::Trusted(POLICY_FILE_READ_CAP),
+                PolicyReadMode::UntrustedRepository => InputReader::Repository,
+            },
+            &read,
+        );
+        let bytes = match read {
             Ok(b) => b,
             Err(e) => {
                 policy_diagnostic!(
@@ -2721,6 +2876,9 @@ impl Policy {
     }
 
     fn validate_loaded_policy(policy: &Policy) -> Result<(), String> {
+        if let Some(selection) = &policy.protection_profile {
+            crate::protection_profiles::validate_selection(selection)?;
+        }
         // Enforce the pattern-XOR-when invariant at LOAD time (CodeRabbit M13
         // R3): a both/neither rule is a silent no-op, so reject the whole policy
         // here — the single chokepoint every load path routes through.
@@ -2794,9 +2952,12 @@ impl Policy {
     /// is a near-noop behind a 5s per-process stat cache.
     pub fn apply_runtime_overrides(&mut self) {
         // Near-noop fast path: no active incident → leave the policy untouched.
-        if crate::incident::active_cached().is_none() {
+        let incident = crate::incident::active_cached();
+        snapshot::observe_incident(incident.as_ref());
+        if incident.is_none() {
             return;
         }
+        let before = snapshot::values(self);
 
         // Incident active: force fail-closed and disable the env bypass in both
         // modes (this is what makes `tirith check` ignore `TIRITH=0`).
@@ -2818,6 +2979,35 @@ impl Policy {
                 // No override, or a lower one: raise to the incident level.
                 _ => {
                     self.severity_overrides.insert(key, *elevated);
+                }
+            }
+        }
+        snapshot::observe_overlay(before, self,
+            PolicySource::new("incident", crate::incident::flag_path().as_deref()), None,
+            "active incident requires fail-closed behavior, disables bypass, and raises curated rule severities");
+        if snapshot::is_capturing() {
+            let source = PolicySource::new("incident", crate::incident::flag_path().as_deref());
+            for field in [
+                "fail_mode",
+                "allow_bypass_env",
+                "allow_bypass_env_noninteractive",
+            ] {
+                snapshot::observe_constraint(
+                    field,
+                    source.clone(),
+                    "active incident prevents relaxation of this setting",
+                );
+            }
+            for (rule, _) in crate::incident::INCIDENT_ELEVATED_RULES {
+                if let Some(key) = serde_json::to_value(rule)
+                    .ok()
+                    .and_then(|value| value.as_str().map(String::from))
+                {
+                    snapshot::observe_constraint(
+                        &format!("severity_overrides.{key}"),
+                        source.clone(),
+                        "active incident sets a minimum severity for this rule",
+                    );
                 }
             }
         }
@@ -2897,23 +3087,44 @@ impl Policy {
     /// Load and merge user-level lists (allowlist/blocklist flat text files).
     pub fn load_user_lists(&mut self) {
         if let Some(config) = crate::policy::config_dir() {
-            let allowlist_path = config.join("allowlist");
-            if let Ok(content) = std::fs::read_to_string(&allowlist_path) {
-                for line in content.lines() {
-                    let line = line.trim();
-                    if !line.is_empty() && !line.starts_with('#') {
-                        self.allowlist.push(line.to_string());
+            for name in ["allowlist", "blocklist"] {
+                let path = config.join(name);
+                let before = snapshot::values(self);
+                let read = std::fs::read(&path).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        crate::util::OpenRegularError::NotFound
+                    } else {
+                        crate::util::OpenRegularError::Io(error)
+                    }
+                });
+                snapshot::observe_read(&path, "user_list", InputReader::UserList, &read);
+                if let Ok(content) = read.and_then(|bytes| {
+                    String::from_utf8(bytes).map_err(|error| {
+                        crate::util::OpenRegularError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            error,
+                        ))
+                    })
+                }) {
+                    let into = if name == "allowlist" {
+                        &mut self.allowlist
+                    } else {
+                        &mut self.blocklist
+                    };
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if !line.is_empty() && !line.starts_with('#') {
+                            into.push(line.to_string());
+                        }
                     }
                 }
-            }
-            let blocklist_path = config.join("blocklist");
-            if let Ok(content) = std::fs::read_to_string(&blocklist_path) {
-                for line in content.lines() {
-                    let line = line.trim();
-                    if !line.is_empty() && !line.starts_with('#') {
-                        self.blocklist.push(line.to_string());
-                    }
-                }
+                snapshot::observe_overlay(
+                    before,
+                    self,
+                    PolicySource::new("user_list", Some(&path)),
+                    None,
+                    "operator list overlay",
+                );
             }
         }
     }
@@ -2930,17 +3141,113 @@ impl Policy {
     /// allowlist file ([`Self::load_org_lists`]), both already skipped. To trust
     /// an entry, add it at user scope (`tirith trust --scope user`); committed
     /// `--scope repo` entries are recorded but no longer auto-suppress.
-    pub fn load_trust_entries(&mut self, _cwd: Option<&str>) {
+    pub fn load_trust_entries(&mut self, cwd: Option<&str>) {
         if let Some(config) = config_dir() {
             let user_trust = config.join("trust.json");
+            let before = snapshot::values(self);
             self.merge_trust_store(&user_trust);
+            snapshot::observe_overlay(
+                before,
+                self,
+                PolicySource::new("user_trust", Some(&user_trust)),
+                None,
+                "valid unexpired operator trust grant",
+            );
+            let project = crate::trust_grants::ProjectIdentity::capture(cwd).ok();
+            if let Some(project) = &project {
+                snapshot::observe_project_identity(project);
+            }
+            let grants_path = config.join(crate::trust_grants::STORE_FILE);
+            let before = snapshot::values(self);
+            self.merge_operator_grants(&grants_path, project.as_ref());
+            snapshot::observe_overlay(
+                before,
+                self,
+                PolicySource::new("operator_trust", Some(&grants_path)),
+                None,
+                "valid unexpired operator grant with matching user or checkout identity",
+            );
+        }
+    }
+
+    fn merge_operator_grants(
+        &mut self,
+        path: &Path,
+        project: Option<&crate::trust_grants::ProjectIdentity>,
+    ) {
+        use crate::trust_grants::{Expiry, TrustGrantStore, STORE_READ_CAP};
+        let read = crate::util::read_text_no_follow_capped(path, STORE_READ_CAP);
+        snapshot::observe_read(
+            path,
+            "operator_trust",
+            InputReader::NoFollow(STORE_READ_CAP),
+            &read,
+        );
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(crate::util::OpenRegularError::NotFound) => return,
+            Err(_) => {
+                policy_diagnostic!(
+                    "tirith: operator trust grant store is unreadable or unsafe; grants skipped"
+                );
+                return;
+            }
+        };
+        let store = match TrustGrantStore::parse(&bytes) {
+            Ok(store) => store,
+            Err(reason) => {
+                policy_diagnostic!("tirith: operator trust grants skipped: {reason}");
+                return;
+            }
+        };
+        let now = chrono::Utc::now();
+        for grant in store.applicable(project, now) {
+            if let Expiry::Active(deadline) =
+                crate::trust_grants::expiry(grant.expires_at.as_deref(), now)
+            {
+                snapshot::observe_trust_expiry(deadline);
+            }
+            self.merge_trust_pattern(grant.pattern, grant.rule_id);
+        }
+    }
+
+    fn merge_trust_pattern(&mut self, pattern: String, rule_id: Option<String>) {
+        match rule_id {
+            Some(rid) => {
+                if let Some(existing) = self
+                    .allowlist_rules
+                    .iter_mut()
+                    .find(|rule| rule.rule_id.eq_ignore_ascii_case(&rid))
+                {
+                    if !existing.patterns.contains(&pattern) {
+                        existing.patterns.push(pattern);
+                    }
+                } else {
+                    self.allowlist_rules.push(AllowlistRule {
+                        rule_id: rid,
+                        patterns: vec![pattern],
+                    });
+                }
+            }
+            None => {
+                if !self.allowlist.contains(&pattern) {
+                    self.allowlist.push(pattern);
+                }
+            }
         }
     }
 
     /// Read a trust.json file and merge non-expired entries into the policy.
     fn merge_trust_store(&mut self, path: &Path) {
         const TRUST_STORE_READ_CAP: u64 = 1024 * 1024;
-        let bytes = match crate::util::read_text_no_follow_capped(path, TRUST_STORE_READ_CAP) {
+        let read = crate::util::read_text_no_follow_capped(path, TRUST_STORE_READ_CAP);
+        snapshot::observe_read(
+            path,
+            "user_trust",
+            InputReader::NoFollow(TRUST_STORE_READ_CAP),
+            &read,
+        );
+        let bytes = match read {
             Ok(bytes) => bytes,
             Err(crate::util::OpenRegularError::NotFound) => return,
             Err(error) => {
@@ -2971,13 +3278,12 @@ impl Policy {
         let now = chrono::Utc::now();
 
         for entry in entries {
-            // Unparseable or past-expiry timestamps are treated as expired.
-            if let Some(exp_str) = entry.get("ttl_expires").and_then(|v| v.as_str()) {
-                match chrono::DateTime::parse_from_rfc3339(exp_str) {
-                    Ok(expiry) if expiry < now => continue,
-                    Ok(_) => {}
-                    Err(_) => continue,
-                }
+            let expiry = crate::trust_grants::expiry_value(entry.get("ttl_expires"), now);
+            if matches!(
+                expiry,
+                crate::trust_grants::Expiry::Expired | crate::trust_grants::Expiry::Invalid
+            ) {
+                continue;
             }
 
             let pattern = match entry.get("pattern").and_then(|v| v.as_str()) {
@@ -2995,29 +3301,11 @@ impl Policy {
                 },
             };
 
-            match rule_id {
-                Some(rid) => {
-                    if let Some(existing) = self
-                        .allowlist_rules
-                        .iter_mut()
-                        .find(|r| r.rule_id.eq_ignore_ascii_case(&rid))
-                    {
-                        if !existing.patterns.contains(&pattern) {
-                            existing.patterns.push(pattern);
-                        }
-                    } else {
-                        self.allowlist_rules.push(AllowlistRule {
-                            rule_id: rid,
-                            patterns: vec![pattern],
-                        });
-                    }
-                }
-                None => {
-                    if !self.allowlist.contains(&pattern) {
-                        self.allowlist.push(pattern);
-                    }
-                }
+            if let crate::trust_grants::Expiry::Active(deadline) = expiry {
+                snapshot::observe_trust_expiry(deadline);
             }
+
+            self.merge_trust_pattern(pattern, rule_id);
         }
     }
 
@@ -3038,7 +3326,13 @@ impl Policy {
             let org_dir = repo_root.join(".tirith");
             // F9 — repo allowlist (suppression) is intentionally NOT loaded.
             let allowlist_path = org_dir.join("allowlist");
-            if allowlist_path.exists() {
+            let allowlist_exists = allowlist_path.exists();
+            snapshot::observe_discovery(&allowlist_path, true, allowlist_exists);
+            if allowlist_exists {
+                snapshot::observe_neutralized(
+                    &["allowlist"],
+                    PolicySource::new("repo_list", Some(&allowlist_path)),
+                );
                 policy_diagnostic!(
                     "tirith: ignoring repo-scoped allowlist at {} (repo policy may tighten but not suppress)",
                     allowlist_path.display()
@@ -3049,8 +3343,16 @@ impl Policy {
             // load it through the hardened no-follow, capped reader — a
             // committed symlink to a huge/endless file (e.g. /dev/zero) must
             // not hang or OOM every analysis. Entries are also count-capped.
-            match crate::util::read_text_no_follow_capped(&blocklist_path, REPO_BLOCKLIST_READ_CAP)
-            {
+            let before = snapshot::values(self);
+            let read =
+                crate::util::read_text_no_follow_capped(&blocklist_path, REPO_BLOCKLIST_READ_CAP);
+            snapshot::observe_read(
+                &blocklist_path,
+                "repo_list",
+                InputReader::NoFollow(REPO_BLOCKLIST_READ_CAP),
+                &read,
+            );
+            match read {
                 Ok(bytes) => {
                     let content = String::from_utf8_lossy(&bytes);
                     policy_diagnostic!(
@@ -3090,6 +3392,13 @@ impl Policy {
                     );
                 }
             }
+            snapshot::observe_overlay(
+                before,
+                self,
+                PolicySource::new("repo_list", Some(&blocklist_path)),
+                None,
+                "repository blocklist may only add restrictions",
+            );
         }
     }
 }
@@ -3498,7 +3807,9 @@ fn discover_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
 
         // `.git` may be a dir or a file (worktrees); `.exists()` handles both.
         let git_dir = current.join(".git");
-        if git_dir.exists() {
+        let git_exists = git_dir.exists();
+        snapshot::observe_discovery(&git_dir, true, git_exists);
+        if git_exists {
             return None;
         }
 
@@ -3565,7 +3876,9 @@ pub fn find_repo_root(cwd: Option<&str>) -> Option<PathBuf> {
     let mut current = start.as_path();
     loop {
         let git = current.join(".git");
-        if git.exists() {
+        let git_exists = git.exists();
+        snapshot::observe_discovery(&git, true, git_exists);
+        if git_exists {
             return Some(current.to_path_buf());
         }
         match current.parent() {
@@ -3597,8 +3910,7 @@ pub fn find_workspace_kiro_dir(start: &Path) -> Option<PathBuf> {
 
 /// Get user-level policy path.
 fn user_policy_path() -> Option<PathBuf> {
-    let base = etcetera::choose_base_strategy().ok()?;
-    find_policy_in_dir(&base.config_dir().join("tirith"))
+    find_policy_in_dir(&config_dir()?)
 }
 
 /// Get tirith data directory.
@@ -3610,7 +3922,9 @@ pub fn data_dir() -> Option<PathBuf> {
 /// Get tirith config directory.
 pub fn config_dir() -> Option<PathBuf> {
     let base = etcetera::choose_base_strategy().ok()?;
-    Some(base.config_dir().join("tirith"))
+    let path = base.config_dir().join("tirith");
+    snapshot::observe_config_dir(&path);
+    Some(path)
 }
 
 /// Get tirith state directory. MUST match bash-hook.bash
@@ -3652,7 +3966,7 @@ pub fn iac_plans_dir() -> Option<PathBuf> {
 }
 
 /// Maximum size of a policy file (`.tirith/policy.yaml`) we will read in
-/// [`Policy::load_from_path`]. Policies are small; 1 MiB is far above any
+/// [`Policy::load_from_path_with_document`]. Policies are small; 1 MiB is far above any
 /// legitimate file and caps a hostile/oversized (or FIFO/symlink) repo file
 /// consumed before repo-scope sanitization runs.
 const POLICY_FILE_READ_CAP: u64 = 1024 * 1024;
@@ -3677,7 +3991,18 @@ enum LabelMergeMode {
 }
 
 fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>, mode: LabelMergeMode) {
-    let bytes = match crate::util::read_text_no_follow_capped(path, LABELS_FILE_READ_CAP) {
+    let read = crate::util::read_text_no_follow_capped(path, LABELS_FILE_READ_CAP);
+    let kind = match mode {
+        LabelMergeMode::Trusted | LabelMergeMode::TrustedSsh => "user_labels",
+        _ => "repo_labels",
+    };
+    snapshot::observe_read(
+        path,
+        kind,
+        InputReader::NoFollow(LABELS_FILE_READ_CAP),
+        &read,
+    );
+    let bytes = match read {
         Ok(b) => b,
         Err(crate::util::OpenRegularError::NotFound) => return,
         Err(e) => {
@@ -3691,7 +4016,15 @@ fn merge_context_labels(path: &Path, into: &mut BTreeMap<String, String>, mode: 
             return;
         }
     };
+    let before = snapshot::is_capturing().then(|| into.clone());
     merge_context_label_bytes(path, bytes, into, mode);
+    if let Some(before) = before {
+        let field = match mode {
+            LabelMergeMode::TrustedSsh | LabelMergeMode::RepoSshTightening => "ssh_host_labels",
+            _ => "context_labels",
+        };
+        snapshot::observe_labels(&before, into, field, PolicySource::new(kind, Some(path)));
+    }
 }
 
 fn merge_context_label_bytes(
@@ -3893,8 +4226,46 @@ fn remote_policy_cache_fingerprint(server_url: &str, api_key: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
-/// Cache validated remote YAML in an origin/credential-bound envelope.
+/// Cache fetch metadata separately so older binaries with deny_unknown_fields
+/// continue accepting the original version-one policy envelope.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemotePolicyCacheReceipt {
+    schema: u8,
+    cache_sha256: String,
+    fetch: crate::policy_client::RemoteFetchMetadata,
+    validated_at: String,
+}
+
+fn remote_cache_receipt_path(cache_path: &Path) -> PathBuf {
+    cache_path.with_file_name("remote-policy-fetch.json")
+}
+
+#[cfg(test)]
 fn cache_remote_policy(server_url: &str, api_key: &str, yaml: &str) -> std::io::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    cache_remote_policy_with_metadata(
+        server_url,
+        api_key,
+        yaml,
+        &crate::policy_client::RemoteFetchMetadata {
+            fetched_at: now.clone(),
+            server_date: None,
+            etag: None,
+            last_modified: None,
+        },
+        &now,
+    )
+}
+
+fn cache_remote_policy_with_metadata(
+    server_url: &str,
+    api_key: &str,
+    yaml: &str,
+    fetch: &crate::policy_client::RemoteFetchMetadata,
+    validated_at: &str,
+) -> std::io::Result<()> {
+    use sha2::{Digest, Sha256};
     if let Some(path) = remote_policy_cache_path() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -3910,9 +4281,70 @@ fn cache_remote_policy(server_url: &str, api_key: &str, yaml: &str) -> std::io::
                 format!("serialize remote policy cache: {error}"),
             )
         })?;
+        let receipt = RemotePolicyCacheReceipt {
+            schema: 1,
+            cache_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            fetch: fetch.clone(),
+            validated_at: validated_at.into(),
+        };
+        let receipt_bytes = serde_json::to_vec(&receipt).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("serialize remote fetch receipt: {error}"),
+            )
+        })?;
+        // Replacing the cache before its receipt is safe: a crash/race can only
+        // yield unknown freshness, because the receipt must match exact bytes.
         crate::util::write_file_atomic_0600(&path, &bytes)?;
+        crate::util::write_file_atomic_0600(&remote_cache_receipt_path(&path), &receipt_bytes)?;
     }
     Ok(())
+}
+
+fn observe_cached_fetch_metadata(path: &Path, cache_bytes: &[u8]) {
+    use sha2::{Digest, Sha256};
+    // Metadata never affects enforcement; avoid an extra hot-path read unless
+    // a consumer has requested the authoritative diagnostic snapshot.
+    if !snapshot::is_capturing() {
+        return;
+    }
+    let receipt_path = remote_cache_receipt_path(path);
+    let read = crate::util::read_text_no_follow_capped(&receipt_path, 16 * 1024);
+    snapshot::observe_read(
+        &receipt_path,
+        "remote_fetch_receipt",
+        InputReader::NoFollow(16 * 1024),
+        &read,
+    );
+    let Ok(bytes) = read else {
+        return;
+    };
+    let Ok(receipt) = serde_json::from_slice::<RemotePolicyCacheReceipt>(&bytes) else {
+        return;
+    };
+    if receipt.schema != 1 || receipt.cache_sha256 != format!("{:x}", Sha256::digest(cache_bytes)) {
+        return;
+    }
+    let Ok(fetched) = chrono::DateTime::parse_from_rfc3339(&receipt.fetch.fetched_at) else {
+        return;
+    };
+    let Ok(validated) = chrono::DateTime::parse_from_rfc3339(&receipt.validated_at) else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    if fetched > now || validated > now || validated < fetched {
+        return;
+    }
+    snapshot::observe_remote(|remote| {
+        remote.fetched_at = Some(receipt.fetch.fetched_at);
+        remote.validated_at = Some(receipt.validated_at);
+        remote.server_date = receipt.fetch.server_date;
+        remote.etag = receipt.fetch.etag;
+        remote.last_modified = receipt.fetch.last_modified;
+        remote.cache_age_seconds =
+            Some((now - fetched.with_timezone(&chrono::Utc)).num_seconds() as u64);
+        remote.freshness = "recorded_fetch".into();
+    });
 }
 
 /// Load a cached remote policy, running the same migrations as the direct
@@ -3921,7 +4353,14 @@ fn cache_remote_policy(server_url: &str, api_key: &str, yaml: &str) -> std::io::
 /// relocated fields).
 fn load_cached_remote_policy(server_url: &str, api_key: &str) -> Option<Policy> {
     let path = remote_policy_cache_path()?;
-    let bytes = match crate::util::read_text_no_follow_capped(&path, REMOTE_POLICY_CACHE_READ_CAP) {
+    let read = crate::util::read_text_no_follow_capped(&path, REMOTE_POLICY_CACHE_READ_CAP);
+    snapshot::observe_read(
+        &path,
+        "remote_cache",
+        InputReader::NoFollow(REMOTE_POLICY_CACHE_READ_CAP),
+        &read,
+    );
+    let bytes = match read {
         Ok(bytes) => bytes,
         Err(error) => {
             policy_diagnostic!(
@@ -3961,6 +4400,14 @@ fn load_cached_remote_policy(server_url: &str, api_key: &str) -> Option<Policy> 
             if p.policy_server_api_key.is_none() {
                 p.policy_server_api_key = Some(api_key.to_string());
             }
+            snapshot::observe_replacement(&p, PolicySource::new("remote_cache", Some(&path)), None,
+                "origin-and-credential-bound cached remote policy replaces the complete local policy");
+            snapshot::observe_remote(|remote| {
+                remote.availability = "cached".into();
+                remote.fallback = Some("cached".into());
+                remote.freshness = "unknown".into();
+            });
+            observe_cached_fetch_metadata(&path, &bytes);
             Some(p)
         }
         Err(e) => {
@@ -6079,6 +6526,7 @@ custom_rules:
             },
             fail_mode: FailMode::Closed,
             schema_version: 1,
+            protection_profile: None,
             // Loader-stamped / serde-skipped — set so the destructure is total.
             path: Some("test".into()),
             scope: PolicyScope::Repo,
@@ -6144,6 +6592,7 @@ custom_rules:
             checkpoints,
             fail_mode,
             schema_version,
+            protection_profile: _,
             // Provenance / serde-skipped — not part of the trust decision, but
             // bound so the destructure stays total.
             path,
@@ -6866,5 +7315,101 @@ custom_rules:
             scan.action_for_gap_kind(crate::scan::CoverageGapKind::PdfAnalyzerIncomplete),
             GapAction::Fail
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_cache_tests {
+    use super::*;
+    use crate::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
+    use tirith_test_support::GlobalStateGuard;
+
+    fn fixture() -> GlobalStateGuard {
+        let mut state = GlobalStateGuard::new().unwrap();
+        state.set_env("TIRITH_ALLOW_HTTP", "0");
+        let config = config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("policy.yaml"), "paranoia: 4\nallowlist: [local.example]\ndlp_custom_patterns: [local-secret]\npolicy_server_url: 'http://127.0.0.1:1'\npolicy_server_api_key: cache-credential\npolicy_fetch_fail_mode: cached\n").unwrap();
+        state
+    }
+
+    fn cache() -> PathBuf {
+        let fetched = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        let validated = (chrono::Utc::now() - chrono::Duration::seconds(59)).to_rfc3339();
+        cache_remote_policy_with_metadata(
+            "http://127.0.0.1:1",
+            "cache-credential",
+            "paranoia: 1\nallowlist: [remote.example]\n",
+            &crate::policy_client::RemoteFetchMetadata {
+                fetched_at: fetched,
+                server_date: Some("server-date-evidence".into()),
+                etag: Some("opaque-server-etag".into()),
+                last_modified: None,
+            },
+            &validated,
+        )
+        .unwrap();
+        remote_policy_cache_path().unwrap()
+    }
+
+    #[test]
+    fn cached_snapshot_keeps_remote_replacement_and_bound_receipt_metadata() {
+        let _state = fixture();
+        let path = cache();
+        let _diagnostics = PolicyDiagnosticCapture::start();
+        let snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
+        assert_eq!(snapshot.policy.paranoia, 1);
+        assert!(snapshot.policy.is_allowlisted("https://remote.example/x"));
+        assert!(!snapshot.policy.is_allowlisted("https://local.example/x"));
+        assert_eq!(snapshot.remote.availability, "cached");
+        assert_eq!(snapshot.remote.freshness, "recorded_fetch");
+        assert!(snapshot
+            .remote
+            .cache_age_seconds
+            .is_some_and(|age| age >= 60));
+        assert_eq!(snapshot.remote.etag.as_deref(), Some("opaque-server-etag"));
+        assert!(snapshot.policy.dlp_custom_patterns.is_empty());
+        assert!(captured_policy_dlp_patterns_or(&[]).contains(&"local-secret".to_string()));
+        assert!(snapshot.revalidate_for_mutation().is_err());
+        let envelope: RemotePolicyCacheEnvelope =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(envelope.schema, 1);
+    }
+
+    #[test]
+    fn old_cache_without_receipt_keeps_unknown_age_and_remains_usable() {
+        let _state = fixture();
+        let path = cache();
+        std::fs::remove_file(remote_cache_receipt_path(&path)).unwrap();
+        let snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
+        assert_eq!(snapshot.remote.availability, "cached");
+        assert_eq!(snapshot.remote.freshness, "unknown");
+        assert!(snapshot.remote.cache_age_seconds.is_none());
+        assert!(snapshot.remote.fetched_at.is_none());
+        assert_eq!(snapshot.policy.paranoia, 1);
+    }
+
+    #[test]
+    fn mismatched_and_future_cache_receipts_cannot_fabricate_freshness() {
+        let _state = fixture();
+        let path = cache();
+        let receipt_path = remote_cache_receipt_path(&path);
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        for mutate in [0, 1] {
+            let mut value = original.clone();
+            if mutate == 0 {
+                value["cache_sha256"] = serde_json::Value::String("mismatched".into());
+            } else {
+                let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+                value["fetch"]["fetched_at"] = serde_json::Value::String(future.clone());
+                value["validated_at"] = serde_json::Value::String(future);
+            }
+            std::fs::write(&receipt_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
+            assert_eq!(snapshot.remote.availability, "cached");
+            assert_eq!(snapshot.remote.freshness, "unknown");
+            assert!(snapshot.remote.cache_age_seconds.is_none());
+        }
     }
 }

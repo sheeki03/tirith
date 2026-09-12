@@ -1,0 +1,56 @@
+[
+  {
+    "path": "/lib/aarch64-linux-gnu/libatomic.so.1",
+    "canonical": "/usr/lib/aarch64-linux-gnu/libatomic.so.1.2.0",
+    "sha256": "c90c21008853899dfa102eeaa43b703c2bf41553dd56b13aac6da2803d5884b7",
+    "size": 67520
+  },
+  {
+    "path": "/lib/aarch64-linux-gnu/libdl.so.2",
+    "canonical": "/usr/lib/aarch64-linux-gnu/libdl.so.2",
+    "sha256": "e5e9474a683596d59cc9e13246bc83878433e53c3befbabd73e3da9ccb5fe174",
+    "size": 67528
+  },
+  {
+    "path": "/lib/aarch64-linux-gnu/libm.so.6",
+    "canonical": "/usr/lib/aarch64-linux-gnu/libm.so.6",
+    "sha256": "3c4cb3be0b974edf05f023f85ab15107fb5afc2687163593d0d4cf8e80c17b39",
+    "size": 591960
+  },
+  {
+    "path": "/lib/aarch64-linux-gnu/libstdc++.so.6",
+    "canonical": "/usr/lib/aarch64-linux-gnu/libstdc++.so.6.0.30",
+    "sha256": "532f3a12d7b8fef6cc7a064ea106b6c4ab2365674b73e743e4a385d4ffb6c8ab",
+    "size": 2174296
+  },
+  {
+    "path": "/lib/aarch64-linux-gnu/libgcc_s.so.1",
+    "canonical": "/usr/lib/aarch64-linux-gnu/libgcc_s.so.1",
+    "sha256": "046856f95f4636f1fc7c3a12bf4f3cd5634c2fc5145c3fdf7395d4f349fa69c7",
+    "size": 133448
+  },
+  {
+    "path": "/lib/aarch64-linux-gnu/libpthread.so.0",
+    "canonical": "/usr/lib/aarch64-linux-gnu/libpthread.so.0",
+    "sha256": "434dcd27f22fc8bf236c0c00541a1e503d302aa796c333729a2cd15a4cfe4814",
+    "size": 67528
+  },
+  {
+    "path": "/lib/aarch64-linux-gnu/libc.so.6",
+    "canonical": "/usr/lib/aarch64-linux-gnu/libc.so.6",
+    "sha256": "e4ac8ae1d81e4865e3aadedb962879cf9415903b3f2ba81ec75e9962b86ab8b0",
+    "size": 1651408
+  },
+  {
+    "path": "/lib/ld-linux-aarch64.so.1",
+    "canonical": "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+    "sha256": "17538b8f9889a470c061f69a8fea8124da89627311cd16546c133a89f09056df",
+    "size": 202912
+  },
+  {
+    "path": "/etc/ld.so.cache",
+    "canonical": "/etc/ld.so.cache",
+    "sha256": "22dd85a709000e56ce36b6f49dee13a408aa59c992cca932c422546ebf79d4a2",
+    "size": 4647
+  }
+]

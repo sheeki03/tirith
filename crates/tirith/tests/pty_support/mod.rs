@@ -33,17 +33,107 @@ use tempfile::TempDir;
 /// so the two never interleave on the PTY master.
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
-/// Absolute path to an embedded shell hook under `assets/shell/lib/`
-/// (`embedded_shell_hooks_match_repo_hooks` guarantees it matches `shell/lib/`).
+/// Certification overrides are paired to prevent combining a shipped binary
+/// with repository hook assets accidentally. Explicit invalid overrides fail.
+fn candidate_paths() -> Option<(PathBuf, PathBuf)> {
+    match (
+        std::env::var_os("TIRITH_CERTIFY_BINARY"),
+        std::env::var_os("TIRITH_CERTIFY_HOOK_DIR"),
+    ) {
+        (None, None) => None,
+        (Some(binary), Some(hooks)) => {
+            let binary = PathBuf::from(binary);
+            let hooks = PathBuf::from(hooks);
+            assert!(
+                binary.is_absolute() && binary.is_file(),
+                "certification binary must be an existing absolute file"
+            );
+            assert_eq!(
+                binary.file_name().and_then(|s| s.to_str()),
+                Some("tirith"),
+                "certification binary must be named tirith for hook PATH resolution"
+            );
+            assert!(
+                hooks.is_absolute() && hooks.is_dir(),
+                "certification hook directory must be an existing absolute directory"
+            );
+            Some((binary, hooks))
+        }
+        _ => panic!("TIRITH_CERTIFY_BINARY and TIRITH_CERTIFY_HOOK_DIR must be set together"),
+    }
+}
+
+fn selected_shell(family: &str, candidate: Option<PathBuf>) -> Option<PathBuf> {
+    let key = format!("TIRITH_CERTIFY_{}", family.to_ascii_uppercase());
+    let candidate = match std::env::var_os(key) {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            assert!(
+                path.is_absolute() && path.is_file(),
+                "explicit certification shell must be an existing absolute file"
+            );
+            Some(path)
+        }
+        None => candidate,
+    };
+    if std::env::var("TIRITH_CERTIFY_SHELLS")
+        .unwrap_or_default()
+        .split(',')
+        .any(|value| value == family)
+    {
+        assert!(
+            candidate.is_some(),
+            "required certification shell {family} is unavailable"
+        );
+    }
+    candidate
+}
+
+/// Hook from the exact candidate bundle in certification mode, otherwise the
+/// embedded repository copy used by ordinary development tests.
 pub fn embedded_hook(file: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/shell/lib")
-        .join(file)
+    assert!(
+        Path::new(file).components().count() == 1,
+        "hook name must be a basename"
+    );
+    let path = candidate_paths()
+        .map(|(_, hooks)| hooks)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib"))
+        .join(file);
+    assert!(
+        path.is_file(),
+        "candidate hook is unavailable: {}",
+        path.display()
+    );
+    path
+}
+
+/// Fixed loader beside the candidate bundle's lib directory. A separate
+/// accessor keeps embedded_hook basename-only instead of admitting traversal.
+pub fn embedded_loader() -> PathBuf {
+    let root = candidate_paths()
+        .map(|(_, hooks)| {
+            assert_eq!(
+                hooks.file_name().and_then(|name| name.to_str()),
+                Some("lib"),
+                "candidate hooks must use the packaged lib directory"
+            );
+            hooks
+                .parent()
+                .expect("absolute packaged lib has a parent")
+                .to_path_buf()
+        })
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell"));
+    let loader = root.join("tirith.sh");
+    assert!(loader.is_file(), "candidate source loader is unavailable");
+    loader
 }
 
 /// Path to the freshly-built `tirith` binary under test.
 pub fn tirith_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_tirith"))
+    candidate_paths()
+        .map(|(binary, _)| binary)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_tirith")))
 }
 
 /// Directory of the freshly-built `tirith` binary. The hooks resolve `tirith`
@@ -60,6 +150,14 @@ pub fn tirith_bin_dir() -> PathBuf {
 /// Locate a modern bash (>= 5). macOS's `/bin/bash` is 3.2 (too old for enter
 /// mode); checks the Homebrew paths and whatever's on `PATH`. `None` ⇒ skip.
 pub fn modern_bash() -> Option<PathBuf> {
+    if std::env::var_os("TIRITH_CERTIFY_BASH").is_some() {
+        let path = selected_shell("bash", None).unwrap();
+        assert!(
+            bash_major_version(&path).is_some_and(|version| version >= 5),
+            "certification Bash must be >= 5"
+        );
+        return Some(path);
+    }
     let mut candidates: Vec<PathBuf> = vec![
         PathBuf::from("/opt/homebrew/bin/bash"),
         PathBuf::from("/usr/local/bin/bash"),
@@ -73,9 +171,12 @@ pub fn modern_bash() -> Option<PathBuf> {
             }
         }
     }
-    candidates
-        .into_iter()
-        .find(|p| p.exists() && bash_major_version(p).map(|v| v >= 5).unwrap_or(false))
+    selected_shell(
+        "bash",
+        candidates
+            .into_iter()
+            .find(|p| p.exists() && bash_major_version(p).map(|v| v >= 5).unwrap_or(false)),
+    )
 }
 
 /// Parse the major version of the bash binary at `path`.
@@ -116,18 +217,21 @@ pub fn bash_version_string(path: &Path) -> Option<String> {
 
 /// Locate a fish shell. Returns `None` when fish is not installed.
 pub fn fish_bin() -> Option<PathBuf> {
-    let out = Command::new("sh")
-        .args(["-c", "command -v fish"])
-        .output()
-        .ok()?;
+    if std::env::var_os("TIRITH_CERTIFY_FISH").is_some() {
+        return selected_shell("fish", None);
+    }
+    let out = Command::new("sh").args(["-c", "command -v fish"]).output();
+    let Ok(out) = out else {
+        return selected_shell("fish", None);
+    };
     if !out.status.success() {
-        return None;
+        return selected_shell("fish", None);
     }
     let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if p.is_empty() {
-        None
+        selected_shell("fish", None)
     } else {
-        Some(PathBuf::from(p))
+        selected_shell("fish", Some(PathBuf::from(p)))
     }
 }
 
@@ -142,7 +246,7 @@ pub fn zsh_bin() -> Option<PathBuf> {
             }
         }
     }
-    candidates.into_iter().find(|path| path.is_file())
+    selected_shell("zsh", candidates.into_iter().find(|path| path.is_file()))
 }
 
 /// A fresh, fully-isolated environment for one PTY session: holds the temp dirs
@@ -199,6 +303,19 @@ impl IsolatedEnv {
         );
         // Audit log off: tests assert on terminal behaviour, not the log.
         env.insert("TIRITH_LOG".to_string(), "0".to_string());
+        // Delivery evidence must not depend on DNS/HTTP enrichment or a
+        // background ThreatDB refresh, including package certification runs.
+        env.insert("TIRITH_OFFLINE".to_string(), "1".to_string());
+        if let Some((_, hooks)) = candidate_paths() {
+            env.insert(
+                "TIRITH_SHELL_DIR".into(),
+                hooks
+                    .parent()
+                    .expect("candidate lib directory has a parent")
+                    .display()
+                    .to_string(),
+            );
+        }
 
         Self {
             _root: root,

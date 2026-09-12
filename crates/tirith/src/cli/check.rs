@@ -125,6 +125,7 @@ pub fn run(
     cmd: &str,
     shell_type: ShellType,
     json: bool,
+    json_schema: u8,
     non_interactive: bool,
     interactive_flag: bool,
     approval_check: bool,
@@ -186,6 +187,20 @@ pub fn run(
             return 1;
         }
         return 0;
+    }
+
+    if let Some(channel) = execution_receipt {
+        match super::shell_verification::observe_check(cmd, channel) {
+            Ok(execution_state::ShellVerificationHookDecision::ForceDiagnosticBlock) => {
+                eprintln!("tirith: diagnostic command blocked; its inert body must not execute");
+                return 1;
+            }
+            Ok(_) => {} // Allowed/status probes retain ordinary policy and receipts.
+            Err(error) => {
+                eprintln!("tirith: shell verification check failed; command blocked: {error}");
+                return 1;
+            }
+        }
     }
 
     let interactive = if interactive_flag {
@@ -577,6 +592,7 @@ pub fn run(
     // human decision back to Tirith. Legacy --approval-check callers without an
     // execution receipt keep the temp-file stdout contract below unchanged.
     if let (Some(channel), Some(token)) = (execution_receipt, receipt_token.as_deref()) {
+        let recovery = tirith_core::recovery::for_command(&effective, cmd, shell_type);
         let requires_warn_ack = effective.action == Action::WarnAck
             || (effective.action == Action::Warn && (strict_warn || policy.strict_warn));
         return complete_owned_receipt_check(
@@ -584,13 +600,17 @@ pub fn run(
             &session_id,
             token,
             channel,
-            requires_warn_ack,
-            warn_only,
+            ReceiptCheckOptions {
+                requires_warn_ack,
+                warn_only,
+            },
             &policy.dlp_custom_patterns,
+            &recovery,
         );
     }
 
     if approval_check {
+        let recovery = tirith_core::recovery::for_command(&effective, cmd, shell_type);
         // W6: collapse repeated Warn/WarnAck findings in the DISPLAY only. The
         // full `effective` verdict above already drove the action, exit code,
         // audit log, ack file, last_trigger, and webhook; only this rendering is
@@ -621,6 +641,7 @@ pub fn run(
             )
             .is_err();
         }
+        human_failed |= recovery.write_human(&mut human).is_err();
         human_failed |= human.finish().is_err();
         if human_failed {
             eprintln!("tirith: failed to write approval output");
@@ -702,10 +723,13 @@ pub fn run(
         } else {
             None
         };
-        if output::write_json_with_suggestions(
+        let recovery = (json_schema == 4)
+            .then(|| tirith_core::recovery::for_command(&effective, cmd, shell_type));
+        if output::write_json_with_recovery(
             &effective,
             &policy.dlp_custom_patterns,
             suggestions_opt,
+            recovery.as_ref(),
             std::io::stdout().lock(),
         )
         .is_err()
@@ -713,6 +737,7 @@ pub fn run(
             eprintln!("tirith: failed to write JSON output");
         }
     } else {
+        let recovery = tirith_core::recovery::for_command(&effective, cmd, shell_type);
         // W6: collapse repeated Warn/WarnAck findings in the DISPLAY only; the
         // full `effective` verdict already drove every enforcement side effect
         // above. `write_human_auto` writes the human verdict to stderr.
@@ -747,6 +772,7 @@ pub fn run(
             &mut human,
         )
         .is_err();
+        human_failed |= recovery.write_human(&mut human).is_err();
         // On a clean human verdict from DIRECT CLI use, confirm nothing was found
         // (`write_human_auto` is silent on no findings). Gated OFF for hook
         // invocations — a per-keystroke "no issues" would be noise — detected via
@@ -1121,15 +1147,24 @@ fn publish_armed_receipt(
     exit_code
 }
 
+struct ReceiptCheckOptions {
+    requires_warn_ack: bool,
+    warn_only: bool,
+}
+
 fn complete_owned_receipt_check(
     effective: &Verdict,
     session_id: &str,
     token: &str,
     channel: ShellReceiptChannel,
-    requires_warn_ack: bool,
-    warn_only: bool,
+    options: ReceiptCheckOptions,
     custom_patterns: &[String],
+    recovery: &tirith_core::recovery::RecoveryAdvice,
 ) -> i32 {
+    let ReceiptCheckOptions {
+        requires_warn_ack,
+        warn_only,
+    } = options;
     let interaction_dlp = tirith_core::redact::CompiledCustomPatterns::new_silent(custom_patterns);
     if effective.action == Action::Block && !effective.bypass_honored {
         if let Err(error) = render_receipt_display(
@@ -1141,6 +1176,7 @@ fn complete_owned_receipt_check(
         ) {
             eprintln!("tirith: {error}");
         }
+        let _ = recovery.write_human(std::io::stderr().lock());
         discard_receipt_best_effort(token, channel);
         return 1;
     }

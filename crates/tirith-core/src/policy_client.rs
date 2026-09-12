@@ -1,6 +1,23 @@
 use std::fmt;
 use std::time::Duration;
 
+/// Client-observed successful body receipt. Server headers are supporting
+/// evidence only and never determine whether a cached policy is trusted.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteFetchMetadata {
+    pub fetched_at: String,
+    pub server_date: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct FetchedRemotePolicy {
+    pub yaml: String,
+    pub metadata: RemoteFetchMetadata,
+}
+
 /// Errors that can occur when fetching remote policy.
 #[derive(Debug)]
 pub enum PolicyFetchError {
@@ -28,6 +45,13 @@ impl fmt::Display for PolicyFetchError {
 /// Fetch remote policy YAML from `{url}/api/policy/fetch` (Bearer auth, 5s
 /// connect / 10s total timeout).
 pub fn fetch_remote_policy(url: &str, api_key: &str) -> Result<String, PolicyFetchError> {
+    fetch_remote_policy_with_metadata(url, api_key).map(|response| response.yaml)
+}
+
+pub fn fetch_remote_policy_with_metadata(
+    url: &str,
+    api_key: &str,
+) -> Result<FetchedRemotePolicy, PolicyFetchError> {
     // SSRF protection: validate the URL before connecting.
     if let Err(reason) = crate::url_validate::validate_server_url(url) {
         return Err(PolicyFetchError::NetworkError(reason));
@@ -54,7 +78,28 @@ pub fn fetch_remote_policy(url: &str, api_key: &str) -> Result<String, PolicyFet
         .map_err(|e| PolicyFetchError::NetworkError(e.to_string()))?;
 
     match resp.status().as_u16() {
-        200 => read_policy_body_capped(resp),
+        200 => {
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| value.len() <= 1024)
+                    .map(str::to_owned)
+            };
+            let server_date = header("date");
+            let etag = header("etag");
+            let last_modified = header("last-modified");
+            let yaml = read_policy_body_capped(resp)?;
+            Ok(FetchedRemotePolicy {
+                yaml,
+                metadata: RemoteFetchMetadata {
+                    fetched_at: chrono::Utc::now().to_rfc3339(),
+                    server_date,
+                    etag,
+                    last_modified,
+                },
+            })
+        }
         401 | 403 => Err(PolicyFetchError::AuthError(resp.status().as_u16())),
         404 => Err(PolicyFetchError::ServerError(
             "no active policy found".into(),

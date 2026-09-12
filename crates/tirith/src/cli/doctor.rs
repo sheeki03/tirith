@@ -19,7 +19,7 @@ pub fn run(
     }
 
     if simulate_enter {
-        return run_simulate_enter();
+        return run_simulate_enter(json);
     }
 
     if fix {
@@ -1067,6 +1067,8 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
 
 #[derive(serde::Serialize)]
 struct DoctorInfo {
+    audit_recording: super::audit_health::AuditHealth,
+    package_approval: super::package_approval_authority::PackageApprovalAvailability,
     version: String,
     binary_path: String,
     detected_shell: String,
@@ -1181,6 +1183,7 @@ pub(crate) struct QuickDoctorInfo {
     /// Whether the shell hook is configured in the detected shell's profile
     /// (mirrors the full report's `hook_configured`).
     pub(crate) hook_configured: bool,
+    pub(crate) protection_evidence: crate::cli::protection_evidence::ProtectionEvidence,
 }
 
 /// Gather ONLY the three cheap quick-status fields. The unit-testable seam:
@@ -1218,6 +1221,10 @@ pub(crate) fn gather_quick_info() -> QuickDoctorInfo {
 
     QuickDoctorInfo {
         schema_version: 1,
+        protection_evidence: crate::cli::protection_evidence::gather(
+            &protection_mode,
+            hook_configured,
+        ),
         protection_mode,
         policy_path_used,
         hook_configured,
@@ -1240,7 +1247,10 @@ fn run_quick(json: bool) -> i32 {
 
 /// Human-readable 2-3 line summary for `tirith doctor --quick`.
 pub(crate) fn print_quick_human(info: &QuickDoctorInfo) {
-    println!("  protection:   {}", info.protection_mode);
+    println!(
+        "  protection:   {} (reported; blocking unverified)",
+        info.protection_mode
+    );
     println!(
         "  hook:         {}",
         if info.hook_configured {
@@ -1364,6 +1374,8 @@ fn gather_info() -> DoctorInfo {
     };
 
     DoctorInfo {
+        audit_recording: super::audit_health::read(),
+        package_approval: super::package_approval_authority::availability(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         binary_path,
         detected_shell,
@@ -1883,7 +1895,7 @@ const BUNDLE_ENV_ALLOWLIST: &[&str] = &[
 /// Replace the literal home-directory path with `~` everywhere in `text` (the
 /// bundle's absolute paths would otherwise spell out the username). Applied as
 /// the last pass. Input unchanged when home can't be determined.
-fn redact_home_path(text: &str, home: Option<&std::path::Path>) -> String {
+pub(crate) fn redact_home_path(text: &str, home: Option<&std::path::Path>) -> String {
     let home = match home {
         Some(h) => h.to_string_lossy().into_owned(),
         None => return text.to_string(),
@@ -1982,7 +1994,7 @@ fn looks_like_secret(value: &str) -> bool {
 
 /// Assemble the full diagnostic bundle as a single redacted text blob. `home` is
 /// a parameter so tests can drive the home-path redaction deterministically.
-fn build_bundle_text(home: Option<&std::path::Path>) -> String {
+pub(crate) fn build_bundle_text(home: Option<&std::path::Path>) -> String {
     let info = gather_info();
     let compat = gather_compat();
     let now = chrono::Utc::now().to_rfc3339();
@@ -2000,7 +2012,7 @@ fn build_bundle_text(home: Option<&std::path::Path>) -> String {
          have been masked."
             .to_string(),
     );
-    line("Safe to attach to a bug report. Review it before sharing if unsure.".to_string());
+    line("Review this local diagnostic copy before sharing it.".to_string());
     line(String::new());
 
     line("== tirith ==".to_string());
@@ -2164,6 +2176,7 @@ fn build_bundle_text(home: Option<&std::path::Path>) -> String {
 /// prefix is cosmetic. On Unix the handle is chmod'd `0600` BEFORE the write, so
 /// the bundle is never briefly world-readable. `keep()` persists at the random
 /// path (NOT `persist()` onto a guessable name).
+#[cfg(test)]
 fn write_bundle_file(dir: &std::path::Path, text: &str) -> std::io::Result<PathBuf> {
     let mut tmp = tempfile::Builder::new()
         .prefix("tirith-bundle-")
@@ -2187,43 +2200,7 @@ fn write_bundle_file(dir: &std::path::Path, text: &str) -> std::io::Result<PathB
 /// `tirith doctor --bundle`: write the redacted bundle to a file and print its
 /// path. With `--format json`, prints `{"bundle_path": "..."}`.
 fn run_bundle(json: bool) -> i32 {
-    let home = home::home_dir();
-    let text = build_bundle_text(home.as_deref());
-
-    // Write into the state dir; fall back to the system temp dir.
-    let dir = tirith_core::policy::state_dir().unwrap_or_else(std::env::temp_dir);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("tirith: could not create {}: {e}", dir.display());
-        return 1;
-    }
-
-    let path = match write_bundle_file(&dir, &text) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("tirith: could not write bundle into {}: {e}", dir.display());
-            return 1;
-        }
-    };
-
-    if json {
-        // The path can contain the home dir; redact it like the bundle body.
-        let shown = redact_home_path(&path.display().to_string(), home.as_deref());
-        match serde_json::to_string_pretty(&serde_json::json!({ "bundle_path": shown })) {
-            Ok(s) => println!("{s}"),
-            Err(e) => {
-                eprintln!("tirith: JSON serialization failed: {e}");
-                return 1;
-            }
-        }
-    } else {
-        println!("tirith: diagnostic bundle written to:");
-        println!("  {}", path.display());
-        println!();
-        println!("The bundle is redacted (secrets, tokens, and your home-directory path");
-        println!("are masked) and safe to attach to a bug report. Review it before");
-        println!("sharing if you want to be sure.");
-    }
-    0
+    super::support_bundle::run(false, Vec::new(), Vec::new(), json)
 }
 
 /// The `protection status:` line for `tirith doctor --compat`, from
@@ -2493,7 +2470,11 @@ fn print_protection_status(status: Option<&str>) {
 
 fn print_human(info: &DoctorInfo) {
     println!("tirith {}", info.version);
+    println!("  audit recording: {}", info.audit_recording.summary());
     println!("  binary:       {}", info.binary_path);
+    println!("  pkg approval: {} (optional)", info.package_approval.state);
+    println!("    {}", info.package_approval.detail);
+    println!("    {}", info.package_approval.next_action);
     // Low-value advisory: the noisy shadow-binary warning is suppressed under
     // `--quiet` (the `--fix` guidance block remains a separate, always-shown path).
     if !info.shadow_binaries.is_empty() && !crate::cli::is_quiet() {
@@ -2972,53 +2953,35 @@ fn unreadable_profile_msg(
 /// detector reuses the same check. `command_label` is the caller's log prefix
 /// (so the shared path doesn't surface a misleading "doctor:" elsewhere).
 pub(crate) fn check_shell_profile(shell: &str, command_label: &str) -> (Option<PathBuf>, bool) {
-    let home = match home::home_dir() {
-        Some(h) => h,
-        None => return (None, false),
+    let target = match crate::cli::shell_target::resolve_for_shell(shell) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("{command_label} shell target unavailable: {error}");
+            return (None, false);
+        }
     };
-
-    let profile_candidates: Vec<PathBuf> = match shell {
-        "zsh" => vec![
-            home.join(".zshrc"),
-            home.join(".zshenv"),
-            home.join(".zprofile"),
-        ],
-        "bash" => vec![
-            home.join(".bashrc"),
-            home.join(".bash_profile"),
-            home.join(".profile"),
-        ],
-        "fish" => {
-            let mut candidates = vec![home.join(".config/fish/config.fish")];
-            let conf_d = home.join(".config/fish/conf.d");
-            if let Ok(entries) = std::fs::read_dir(&conf_d) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("fish") {
-                        candidates.push(path);
-                    }
-                }
+    let mut profile_candidates: Vec<PathBuf> =
+        target.profiles.iter().map(|p| p.path.clone()).collect();
+    // These are valid manual startup routes, but their presence never proves
+    // that a particular current shell actually sourced them.
+    if shell == "zsh" {
+        if let Some(root) = target.profiles.first().and_then(|p| p.path.parent()) {
+            profile_candidates.extend([root.join(".zshenv"), root.join(".zprofile")]);
+        }
+    }
+    if shell == "fish" {
+        if let Some(root) = target.profiles.first().and_then(|p| p.path.parent()) {
+            if let Ok(entries) = std::fs::read_dir(root.join("conf.d")) {
+                let mut snippets: Vec<_> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("fish"))
+                    .collect();
+                snippets.sort();
+                profile_candidates.extend(snippets);
             }
-            candidates
         }
-        "powershell" | "pwsh" => {
-            let docs = home.join("Documents");
-            vec![
-                docs.join("PowerShell/Microsoft.PowerShell_profile.ps1"),
-                docs.join("WindowsPowerShell/Microsoft.PowerShell_profile.ps1"),
-                home.join(".config/powershell/Microsoft.PowerShell_profile.ps1"),
-            ]
-        }
-        "nushell" | "nu" => {
-            let xdg = std::env::var("XDG_CONFIG_HOME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"));
-            vec![xdg.join("nushell/config.nu")]
-        }
-        _ => return (None, false),
-    };
+    }
 
     // Scan ALL candidates — the first existing file may not be the configured one.
     let mut first_existing = None;
@@ -3053,9 +3016,51 @@ pub(crate) fn check_shell_profile(shell: &str, command_label: &str) -> (Option<P
 /// for the hook. Proves whether `bind -x` on Enter works HERE (issue #111)
 /// rather than guessing from the bash version.
 #[cfg(unix)]
-fn run_simulate_enter() -> i32 {
-    println!("tirith: running bash enter-mode delivery self-test...");
+fn run_simulate_enter(json: bool) -> i32 {
+    if !json {
+        println!("tirith: running bash enter-mode delivery self-test...");
+    }
     let outcome = crate::cli::bash_capability::run_and_cache();
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut evidence =
+        crate::cli::protection_evidence::ProtectionEvidence::configuration("unknown", false, true);
+    evidence.surface = "disposable-bash-enter-probe".into();
+    // This probe owns a disposable native shell, never the calling terminal.
+    // Its scope stays explicit even when its delivery self-test succeeds.
+    let passed = outcome.capability.enables_enter();
+    evidence.source = "disposable-native-shell-test".into();
+    evidence.observed_at = Some(observed_at);
+    evidence.expires_at = Some(observed_at.saturating_add(1));
+    evidence.fresh = passed;
+    evidence.verified_blocking = passed;
+    evidence.state = if passed {
+        crate::cli::protection_evidence::ProtectionState::ObservedBlocking
+    } else {
+        crate::cli::protection_evidence::ProtectionState::Unknown
+    };
+    evidence.invalidation_reason =
+        (!passed).then(|| "disposable shell did not complete its allow-and-block self-test".into());
+    if json {
+        let result = serde_json::json!({
+            "schema_version": 1,
+            "shell": "bash",
+            "executable": outcome.bash_path,
+            "version": outcome.bash_version,
+            "protection_evidence": evidence,
+            "detail": outcome.reason,
+            "cache_path": outcome.cache_path,
+            "current_shell_verified": false,
+        });
+        return if write_json_stdout(&result, "tirith doctor: cannot write probe evidence") {
+            0
+        } else {
+            1
+        };
+    }
+    println!("  tested surface: disposable bash (current shell remains unverified)");
 
     if let Some(v) = &outcome.bash_version {
         println!("  bash version:   {v}");
@@ -3099,7 +3104,15 @@ fn run_simulate_enter() -> i32 {
 
 /// Non-Unix stub: enter mode / `bind -x` are Unix-only.
 #[cfg(not(unix))]
-fn run_simulate_enter() -> i32 {
+fn run_simulate_enter(json: bool) -> i32 {
+    if json {
+        let result = serde_json::json!({"schema_version": 1, "status": "unsupported", "surface": "disposable-bash-enter-probe", "current_shell_verified": false});
+        return if write_json_stdout(&result, "tirith doctor: cannot write probe evidence") {
+            0
+        } else {
+            1
+        };
+    }
     println!("tirith: --simulate-enter is only meaningful on Unix (bash enter mode)");
     0
 }
@@ -4512,6 +4525,9 @@ mod tests {
         let info = QuickDoctorInfo {
             schema_version: 1,
             protection_mode: "guarded".to_string(),
+            protection_evidence: crate::cli::protection_evidence::ProtectionEvidence::configuration(
+                "guarded", true, true,
+            ),
             policy_path_used: Some("/repo/.tirith/policy.yaml".to_string()),
             hook_configured: true,
         };
@@ -4524,6 +4540,7 @@ mod tests {
             [
                 "hook_configured",
                 "policy_path_used",
+                "protection_evidence",
                 "protection_mode",
                 "schema_version"
             ],

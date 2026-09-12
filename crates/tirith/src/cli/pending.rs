@@ -121,6 +121,9 @@ pub fn resolve(id: &str, action: &str, reason: Option<String>) -> i32 {
     match pending::resolve(id, status, reason, Some("cli".to_string())) {
         Ok(true) => {
             println!("Resolved {id} ({action}).");
+            if action == "approve" {
+                println!("This records a review decision only. It grants no execution permission; retry the original command through its supported execution boundary for a fresh policy check.");
+            }
             print_rollback_hint();
             0
         }

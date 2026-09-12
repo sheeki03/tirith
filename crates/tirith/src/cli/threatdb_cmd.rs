@@ -1,5 +1,10 @@
 //! CLI subcommands for threat DB management: update, status, and background auto-update.
 
+#[path = "threatdb_evidence.rs"]
+mod evidence;
+#[path = "threatdb_lifecycle.rs"]
+pub(crate) mod lifecycle;
+
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use tirith_core::policy;
 use tirith_core::selfupdate::SemVer;
+use tirith_core::threatdb::operations::send_with_retry;
 use tirith_core::threatdb::{ThreatDb, ThreatDbWriter, ThreatSource, MAX_FORMAT_VERSION};
 use tirith_core::threatdb_feeds::{
     parse_domain_blocklist_reader, parse_phishtank_csv, parse_threatfox_zip,
@@ -76,7 +82,7 @@ fn validate_remote_url(url: &str, purpose: &str) -> Result<(), String> {
         .map_err(|reason| format!("refusing unsafe {purpose} URL: {reason}"))
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct Manifest {
     sha256: String,
     size: u64,
@@ -131,7 +137,7 @@ impl Manifest {
 /// One asset in the signed v2 index. The `url` is explicit (not derived), and
 /// `min_tirith_version`, when present, gates the asset to clients at or above
 /// that Tirith version.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct IndexAsset {
     format: u32,
     // `filename` is part of the signed canonical payload (see `canonical_payload`),
@@ -150,7 +156,7 @@ struct IndexAsset {
 /// the `assets` array; alphabetical compact keys; only `signature` excluded),
 /// mirroring [`Manifest::canonical_payload`] and the `jq -cS` signing step so the
 /// same key and discipline apply. Old clients never fetch this and only see v1.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct IndexV2 {
     // Schema v2 moved this field into the signed canonical payload. It must be
     // present: accepting an absent/defaulted value would recreate an unsigned
@@ -350,6 +356,13 @@ pub fn update(force: bool, background: bool) -> i32 {
         return run_background_update();
     }
 
+    let _lock = match lock_foreground_update() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("tirith: threat-db update refused: {error}");
+            return 1;
+        }
+    };
     match do_update(force) {
         Ok(()) => 0,
         Err(e) => {
@@ -378,18 +391,22 @@ enum UpdateOutcome {
 /// or invalid index, an unverifiable asset, or any parse failure. Old clients
 /// only ever run the legacy path, so they only ever install v1.
 fn do_update(force: bool) -> Result<(), String> {
-    let outcome = match try_v2_index_update(force) {
-        Ok(UpdateOutcome::NoCompatibleAsset) => {
-            // The optional index is unpublished or offers no compatible asset.
-            do_update_legacy(force)?
+    let result = do_update_inner(force);
+    if let Err(error) = &result {
+        evidence::record("primary", Some(error));
+    }
+    result
+}
+
+fn do_update_inner(force: bool) -> Result<(), String> {
+    let candidate = lifecycle::resolve_candidate()?;
+    let outcome = match lifecycle::apply_primary(&candidate, force, |_| Ok(())) {
+        Ok(outcome) => outcome,
+        Err(error) if matches!(candidate, lifecycle::Candidate::Index { .. }) => {
+            eprintln!("tirith: selected index asset unavailable ({error}); trying independently signed legacy manifest");
+            lifecycle::apply_primary(&lifecycle::resolve_legacy()?, force, |_| Ok(()))?
         }
-        Ok(other) => other,
-        Err(e) => {
-            // Any v2-index error (fetch / signature / parse / unverifiable
-            // asset) falls back to the legacy manifest rather than aborting.
-            eprintln!("tirith: v2 index unavailable ({e}), falling back to legacy manifest...");
-            do_update_legacy(force)?
-        }
+        Err(error) => return Err(error),
     };
 
     // Primary currentness and supplemental currentness are independent. Enabling,
@@ -400,6 +417,9 @@ fn do_update(force: bool) -> Result<(), String> {
         update_supplemental_db(&policy::Policy::discover(None))
     }) {
         eprintln!("tirith: warning: supplemental threat DB update failed: {e}");
+        evidence::record("supplemental", Some(&e));
+    } else {
+        evidence::record("complete", None);
     }
     Ok(())
 }
@@ -427,6 +447,7 @@ where
 ///   offered no compatible asset; use the legacy manifest;
 /// - `Err(_)`: the index could not be fetched / verified / parsed, also a
 ///   fall-back trigger (the caller logs and continues to legacy).
+#[allow(dead_code)]
 fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
     // `fetch_index_v2` returns only a signature- and schema-validated candidate;
     // an invalid primary has already caused the independently published release
@@ -459,6 +480,7 @@ fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
             "tirith: threat DB is already up to date (v2 index sequence {}, format v{})",
             index.sequence, asset.format
         );
+        evidence::refresh(&asset.url, index.sequence, asset.format, &asset.sha256);
         return Ok(UpdateOutcome::AlreadyCurrent);
     }
 
@@ -497,6 +519,7 @@ fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
     if asset.format == 1 {
         retire_primary_v2()?;
     }
+    evidence::refresh(&asset.url, index.sequence, asset.format, &asset.sha256);
     Ok(UpdateOutcome::Installed)
 }
 
@@ -523,6 +546,7 @@ fn index_install_needed(
 /// Legacy single-asset update: fetch `threatdb-manifest.json`, verify, download,
 /// install to the v1 path. Always v1. Returns `Installed` when it wrote a new
 /// DB, `AlreadyCurrent` when the installed DB is already at this version.
+#[allow(dead_code)]
 fn do_update_legacy(force: bool) -> Result<UpdateOutcome, String> {
     let manifest = fetch_manifest()?;
 
@@ -535,6 +559,7 @@ fn do_update_legacy(force: bool) -> Result<UpdateOutcome, String> {
             "tirith: threat DB is already up to date (version {})",
             manifest.version
         );
+        evidence::refresh(&manifest.url, manifest.version, 1, &manifest.sha256);
         return Ok(UpdateOutcome::AlreadyCurrent);
     }
 
@@ -568,6 +593,7 @@ fn do_update_legacy(force: bool) -> Result<UpdateOutcome, String> {
         force || equal_sequence_format_switch,
     )?;
     retire_primary_v2()?;
+    evidence::refresh(&manifest.url, manifest.version, 1, &manifest.sha256);
     Ok(UpdateOutcome::Installed)
 }
 
@@ -607,6 +633,16 @@ fn primary_db_dest(format: u32) -> Result<PathBuf, String> {
 /// Validate a downloaded primary DB blob (structure, rollback, internal
 /// signature) and atomically install it to [`primary_db_dest`] for its `format`.
 fn install_primary_db(data: Vec<u8>, format: u32, version: u64, force: bool) -> Result<(), String> {
+    install_primary_db_checked(data, format, version, force, &|| Ok(()))
+}
+
+fn install_primary_db_checked(
+    data: Vec<u8>,
+    format: u32,
+    version: u64,
+    force: bool,
+    before_publish: &impl Fn() -> Result<(), String>,
+) -> Result<(), String> {
     let min_seq = if force { 0 } else { current_sequence() };
     let db =
         ThreatDb::from_bytes(data.clone(), min_seq).map_err(|e| format!("invalid DB file: {e}"))?;
@@ -629,7 +665,7 @@ fn install_primary_db(data: Vec<u8>, format: u32, version: u64, force: bool) -> 
     }
 
     let dest = primary_db_dest(format)?;
-    atomic_write(&dest, &data)?;
+    atomic_write_checked(&dest, &data, before_publish)?;
 
     let stats = db.stats();
     let total_entries = stats.package_count
@@ -731,6 +767,13 @@ impl SupplementalEntries {
 }
 
 fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
+    update_supplemental_db_checked(policy, &|| Ok(()))
+}
+
+fn update_supplemental_db_checked(
+    policy: &policy::Policy,
+    before_publish: &impl Fn() -> Result<(), String>,
+) -> Result<(), String> {
     let supplemental_path = match ThreatDb::supplemental_path() {
         Some(path) => path,
         None => return Ok(()),
@@ -744,6 +787,7 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
     let phishing_enabled = policy.threat_intel.phishing_army_enabled;
 
     if !abusech_enabled && !phishing_enabled {
+        before_publish()?;
         remove_disabled_supplemental(&supplemental_path)?;
         ThreatDb::refresh_cache();
         return Ok(());
@@ -803,18 +847,16 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
     // supplemental DB — the old code rebuilt from only the successful feeds,
     // silently dropping every indicator of the failed source.
     if !failed_feeds.is_empty() {
-        eprintln!(
-            "tirith: warning: supplemental feed(s) failed ({}); keeping the existing supplemental threat DB unchanged",
+        return Err(format!(
+            "supplemental feed(s) failed ({}); keeping the existing supplemental threat DB unchanged",
             failed_feeds.join(", ")
-        );
-        return Ok(());
+        ));
     }
 
     if supplemental.is_empty() {
-        eprintln!(
-            "tirith: warning: supplemental feeds produced no IOC data across {attempted_feeds} attempted feed(s); leaving existing supplemental threat DB unchanged"
-        );
-        return Ok(());
+        return Err(format!(
+            "supplemental feeds produced no IOC data across {attempted_feeds} attempted feed(s); leaving existing supplemental threat DB unchanged"
+        ));
     }
 
     let mut writer = ThreatDbWriter::new(unix_now(), 0);
@@ -832,7 +874,7 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
     let data = writer
         .build(&local_overlay_signing_key())
         .map_err(|e| format!("failed to build supplemental threat DB: {e}"))?;
-    atomic_write(&supplemental_path, &data)?;
+    atomic_write_checked(&supplemental_path, &data, before_publish)?;
     ThreatDb::refresh_cache();
     eprintln!(
         "tirith: supplemental threat DB updated ({} hostnames, {} IPs)",
@@ -1017,6 +1059,16 @@ fn local_overlay_signing_key() -> SigningKey {
 
 /// Background update (`--background`): acquire exclusive lock, download, verify,
 /// install, write next-check-at.
+/// The same no-follow owner-checked rendezvous is used by every updater.
+fn lock_foreground_update() -> Result<crate::cli::setup::fs_helpers::PlatformLock, String> {
+    let state = policy::state_dir().ok_or("cannot locate ThreatDB update state")?;
+    if !state.exists() {
+        crate::cli::setup::fs_helpers::ensure_private_directory(&state, &state)?;
+    }
+    crate::cli::setup::fs_helpers::try_lock_operation(&state.join(LOCKFILE_NAME), &state)?
+        .ok_or("another ThreatDB update is active; retry after it finishes".into())
+}
+
 fn run_background_update() -> i32 {
     let state = match policy::state_dir() {
         Some(d) => d,
@@ -1030,34 +1082,14 @@ fn run_background_update() -> i32 {
         return 1;
     }
 
-    let lock_path = state.join(LOCKFILE_NAME);
-
-    // Exclusive lock: if held, another child is updating — exit silently.
-    let lock_file = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "tirith: warning: failed to open lock file {}: {e}",
-                lock_path.display()
-            );
-            return 1;
-        }
+    let _update_lock = match lock_foreground_update() {
+        Ok(lock) => lock,
+        Err(_) => return 0,
     };
-
-    use fs2::FileExt;
-    if lock_file.try_lock_exclusive().is_err() {
-        return 0;
-    }
 
     let policy = policy::Policy::discover(None);
     let auto_hours = policy.threat_intel.auto_update_hours;
     if auto_hours == 0 {
-        let _ = fs2::FileExt::unlock(&lock_file);
         return 0;
     }
 
@@ -1082,7 +1114,6 @@ fn run_background_update() -> i32 {
         }
     }
 
-    let _ = fs2::FileExt::unlock(&lock_file);
     if success {
         0
     } else {
@@ -1126,6 +1157,7 @@ pub(crate) struct ThreatDbStatus {
     pub(crate) signature_valid: Option<bool>,
     pub(crate) stale: bool,
     pub(crate) error: Option<String>,
+    pub(crate) freshness: tirith_core::threatdb::operations::FreshnessReport,
 }
 
 pub(crate) fn gather_status() -> ThreatDbStatus {
@@ -1153,6 +1185,11 @@ pub(crate) fn gather_status() -> ThreatDbStatus {
                 signature_valid: None,
                 stale: true,
                 error: None,
+                freshness: tirith_core::threatdb::operations::FreshnessReport::unavailable(
+                    None,
+                    unix_now(),
+                    None,
+                ),
             };
         }
     };
@@ -1196,6 +1233,7 @@ pub(crate) fn gather_status() -> ThreatDbStatus {
                 signature_valid: Some(sig_valid),
                 stale: is_stale,
                 error: None,
+                freshness: evidence::gather(db_path_ref, &db, now),
             }
         }
         Err(e) => ThreatDbStatus {
@@ -1214,6 +1252,11 @@ pub(crate) fn gather_status() -> ThreatDbStatus {
             signature_valid: None,
             stale: true,
             error: Some(format!("{e}")),
+            freshness: tirith_core::threatdb::operations::FreshnessReport::unavailable(
+                None,
+                unix_now(),
+                None,
+            ),
         },
     }
 }
@@ -1286,6 +1329,42 @@ fn print_status_human(info: &ThreatDbStatus) {
         "  update:      auto-update checks main manifest, falls back to release asset if stale"
     );
     println!("               (fallback may hit GitHub API rate limits for unauthenticated users)");
+    print_freshness_human(&info.freshness);
+}
+
+fn print_freshness_human(report: &tirith_core::threatdb::operations::FreshnessReport) {
+    println!("  publication: age uses signed build time; upload completion time is unknown");
+    if report.clock_skew {
+        println!("  clock:       local time precedes signed freshness evidence; age is unknown");
+    }
+    if report.sources.is_empty() {
+        println!(
+            "  source ages: unavailable — {}",
+            report
+                .source_evidence_error
+                .as_deref()
+                .unwrap_or("no authenticated source evidence")
+        );
+    }
+    for source in &report.sources {
+        let revision = source
+            .revision_age_seconds
+            .map(|seconds| format_age(seconds as f64 / 3600.0))
+            .unwrap_or_else(|| "unknown".into());
+        let lag = source
+            .known_upstream_lag_seconds
+            .map(|seconds| format_age(seconds as f64 / 3600.0))
+            .unwrap_or_else(|| "unknown".into());
+        let review = match source.reviewed_pin_adoption_required {
+            Some(true) => "reviewed pin adoption required",
+            Some(false) => "observed upstream unchanged",
+            None => "upstream not observed",
+        };
+        println!(
+            "  {}: revision age {revision}; observed upstream lag {lag}; {review}",
+            source.source
+        );
+    }
 }
 
 /// Guard: only try once per process lifetime.
@@ -1509,8 +1588,7 @@ fn fetch_manifest_from_with_state_and_client(
         }
     }
 
-    let resp = req
-        .send()
+    let resp = send_with_retry(req, std::time::Duration::from_secs(MANIFEST_TIMEOUT_SECS))
         .map_err(|e| format!("manifest fetch failed: {e}"))?;
 
     let status = resp.status().as_u16();
@@ -1661,14 +1739,14 @@ fn download_url(url: &str, declared_size: u64) -> Result<Vec<u8>, String> {
     validate_remote_url(url, "threat DB asset")?;
     let client = guarded_http_client(DB_DOWNLOAD_TIMEOUT_SECS)?;
 
-    let resp = client
-        .get(url)
-        .header(
+    let resp = send_with_retry(
+        client.get(url).header(
             "User-Agent",
             format!("tirith/{}", env!("CARGO_PKG_VERSION")),
-        )
-        .send()
-        .map_err(|e| format!("DB download failed: {e}"))?;
+        ),
+        std::time::Duration::from_secs(DB_DOWNLOAD_TIMEOUT_SECS),
+    )
+    .map_err(|e| format!("DB download failed: {e}"))?;
 
     if !resp.status().is_success() {
         return Err(format!("DB download HTTP {}", resp.status()));
@@ -1761,14 +1839,14 @@ where
 fn fetch_index_v2_from(url: &str) -> Result<Option<IndexV2>, String> {
     validate_remote_url(url, "threat DB index")?;
     let client = guarded_http_client(MANIFEST_TIMEOUT_SECS)?;
-    let resp = client
-        .get(url)
-        .header(
+    let resp = send_with_retry(
+        client.get(url).header(
             "User-Agent",
             format!("tirith/{}", env!("CARGO_PKG_VERSION")),
-        )
-        .send()
-        .map_err(|e| format!("v2 index fetch failed: {e}"))?;
+        ),
+        std::time::Duration::from_secs(MANIFEST_TIMEOUT_SECS),
+    )
+    .map_err(|e| format!("v2 index fetch failed: {e}"))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -1793,6 +1871,14 @@ fn fetch_index_v2_from(url: &str) -> Result<Option<IndexV2>, String> {
 /// Durable atomic write: write and sync a temp file in the same directory,
 /// rename it into place, then sync the containing directory on Unix.
 fn atomic_write(dest: &PathBuf, data: &[u8]) -> Result<(), String> {
+    atomic_write_checked(dest, data, &|| Ok(()))
+}
+
+fn atomic_write_checked(
+    dest: &PathBuf,
+    data: &[u8],
+    before_publish: &impl Fn() -> Result<(), String>,
+) -> Result<(), String> {
     let parent = dest
         .parent()
         .ok_or_else(|| "cannot determine parent directory".to_string())?;
@@ -1808,6 +1894,7 @@ fn atomic_write(dest: &PathBuf, data: &[u8]) -> Result<(), String> {
         .sync_all()
         .map_err(|e| format!("failed to sync temp file: {e}"))?;
 
+    before_publish()?;
     let persisted = tmp
         .persist(dest)
         .map_err(|e| format!("failed to rename temp file: {e}"))?;
@@ -2459,7 +2546,7 @@ fn print_sources_human(r: &SourcesReport, popular_count: Option<u64>) {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct HealthReport {
+pub(crate) struct HealthReport {
     installed: bool,
     path: Option<String>,
     /// Ed25519 signature verified (`None` when not installed or load failed).
@@ -2477,6 +2564,8 @@ struct HealthReport {
     error: Option<String>,
     /// `ok`, `stale`, `not_installed`, or `error`.
     status: String,
+    freshness: tirith_core::threatdb::operations::FreshnessReport,
+    last_update: Option<evidence::UpdateRecord>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2500,7 +2589,7 @@ pub fn health(json: bool) -> i32 {
     exit
 }
 
-fn gather_health() -> HealthReport {
+pub(crate) fn gather_health() -> HealthReport {
     // repo-0501: same fix on the health surface.
     let db_path = ThreatDb::resolve_primary_path();
     let path_str = db_path.as_ref().map(|p| p.display().to_string());
@@ -2531,6 +2620,12 @@ fn gather_health() -> HealthReport {
             supplemental,
             error: None,
             status: "not_installed".to_string(),
+            freshness: tirith_core::threatdb::operations::FreshnessReport::unavailable(
+                None,
+                unix_now(),
+                None,
+            ),
+            last_update: evidence::last_update(),
         };
     }
 
@@ -2575,6 +2670,8 @@ fn gather_health() -> HealthReport {
                     Some("Ed25519 signature verification failed".to_string())
                 },
                 status: status.to_string(),
+                freshness: evidence::gather(db_path_ref, &db, unix_now()),
+                last_update: evidence::last_update(),
             }
         }
         Err(e) => HealthReport {
@@ -2590,12 +2687,19 @@ fn gather_health() -> HealthReport {
             supplemental,
             error: Some(format!("{e}")),
             status: "error".to_string(),
+            freshness: tirith_core::threatdb::operations::FreshnessReport::unavailable(
+                None,
+                unix_now(),
+                None,
+            ),
+            last_update: evidence::last_update(),
         },
     }
 }
 
 fn print_health_human(r: &HealthReport) {
     println!("threat-db health");
+    evidence::print_last_update(&r.last_update);
 
     if !r.installed {
         println!("  status:        NOT INSTALLED");
@@ -2664,6 +2768,7 @@ fn print_health_human(r: &HealthReport) {
         );
     }
     print_supplemental_health(&r.supplemental);
+    print_freshness_human(&r.freshness);
 }
 
 fn print_supplemental_health(s: &SupplementalHealth) {

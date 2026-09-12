@@ -12,16 +12,109 @@ jobs:
   benchmark:
     name: Performance
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Separate EPYC 7763 reference cohort on the existing PR. Its product and
+      # measurement source stay frozen even as the workflow or PR advances.
+      # Retain three admitted executions; never pool these with EPYC 9V74.
+      # Other PRs and main retain their event source, ten samples and stable.
+      RESOURCE_REFERENCE_COHORT: ${{ github.event_name == 'pull_request' && github.event.pull_request.number == 250 }}
+      RESOURCE_REFERENCE_SOURCE: 150e753a0adf8f9f13c8cc2b38f7a9325de40d91
+      RESOURCE_REFERENCE_TREE: 53123b9d0aa615d4135ce6c42f37abe6a5cdca16
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The PR reference measures this explicit retained source, not its
+          # newer workflow/event revision. Provenance records both separately.
+          ref: ${{ env.RESOURCE_REFERENCE_COHORT == 'true' && env.RESOURCE_REFERENCE_SOURCE || github.sha }}
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RESOURCE_REFERENCE_COHORT == 'true' && '1.98.1' || 'stable' }}
+
+      - name: Retain build and runner provenance; admit comparable PR 250 references
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib, json, os, pathlib, platform, subprocess, sys, uuid
+          def command(*args):
+              return subprocess.check_output(args, text=True).strip()
+          def sha(path):
+              return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+          cpu = next(line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name'))
+          observed = {'system': platform.system(), 'release': platform.release(),
+                      'machine': platform.machine(), 'image': os.environ.get('ImageOS'),
+                      'image_version': os.environ.get('ImageVersion'), 'cpu_model': cpu,
+                      'logical_cpus': os.cpu_count()}
+          expected = {'system': 'Linux', 'release': '6.17.0-1022-azure', 'machine': 'x86_64',
+                      'image': 'ubuntu24', 'image_version': '20260907.300.1',
+                      'cpu_model': 'AMD EPYC 7763 64-Core Processor', 'logical_cpus': 4}
+          reference = os.environ['RESOURCE_REFERENCE_COHORT'] == 'true'
+          revision = command('git', 'rev-parse', 'HEAD')
+          source_tree = command('git', 'rev-parse', 'HEAD^{tree}')
+          selected_source = os.environ['RESOURCE_REFERENCE_SOURCE'] if reference else os.environ['GITHUB_SHA']
+          selected_tree = os.environ['RESOURCE_REFERENCE_TREE'] if reference else None
+          manifest_hashes = {'Cargo.toml': sha('Cargo.toml'), 'Cargo.lock': sha('Cargo.lock')}
+          expected_manifests = {
+              'Cargo.toml': 'd382d1e50d73b3062a3bec5a461bd17017b8417444258559e014173fa47fb9e5',
+              'Cargo.lock': '6bed94688b407f844a026ac8550b463faab265ec4453f1d408621f1692f16264'}
+          boot_id = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+          rustc = command('rustc', '-Vv')
+          expected_rustc = ('rustc 1.98.1 (48a229cea 2026-09-01)\n'
+                            'binary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\n'
+                            'commit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\n'
+                            'release: 1.98.1\nLLVM version: 22.1.8')
+          clean = not command('git', 'status', '--porcelain', '--untracked-files=no')
+          issues = []
+          if not clean:
+              issues.append('tracked source is not clean before compilation')
+          if revision != selected_source:
+              issues.append('checkout differs from the explicitly selected measurement source')
+          if reference and source_tree != selected_tree:
+              issues.append('measurement source tree differs from the reviewed reference')
+          if reference and manifest_hashes != expected_manifests:
+              issues.append('build manifests differ from the reviewed reference')
+          try:
+              boot = uuid.UUID(boot_id)
+              if str(boot) != boot_id or boot.int == 0:
+                  raise ValueError('noncanonical or zero boot ID')
+          except ValueError:
+              issues.append('native runner boot identity is unavailable or invalid')
+          if reference and observed != expected:
+              issues.append('runner class changed; retain this run and review a separate cohort')
+          if reference and rustc != expected_rustc:
+              issues.append('compiler differs from the reviewed reference')
+          value = {'schema_version': 1, 'source_revision': revision,
+                   'source_tree': source_tree, 'selected_measurement_source': selected_source,
+                   'expected_measurement_tree': selected_tree, 'event_revision': os.environ['GITHUB_SHA'],
+                   'run_id': os.environ['GITHUB_RUN_ID'] + '/' + os.environ['GITHUB_RUN_ATTEMPT'],
+                   'workflow_ref': os.environ['GITHUB_WORKFLOW_REF'],
+                   'workflow_sha': os.environ['GITHUB_WORKFLOW_SHA'],
+                   'runner_name': os.environ['RUNNER_NAME'],
+                   'runner_boot_id': boot_id,
+                   'runner_class': observed, 'expected_reference_class': expected if reference else None,
+                   'source_clean_before_build': clean, 'rustc_verbose': rustc,
+                   'cargo_verbose': command('cargo', '-Vv'), 'build_profile': 'release',
+                   'build_manifest_sha256': manifest_hashes,
+                   'expected_build_manifest_sha256': expected_manifests if reference else None,
+                   'reference_cohort': 'pr250-release100-epyc7763-source150e753a' if reference else None,
+                   'workload_samples': 100 if reference else 10, 'admission_issues': issues}
+          with open('resource-build-provenance.json', 'x') as output:
+              json.dump(value, output, indent=2, allow_nan=False)
+              output.write('\n')
+          if issues:
+              print('; '.join(issues), file=sys.stderr)
+              raise SystemExit(2)
+          PYCODE
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check resource and certification fixtures
+        run: |
+          python3 scripts/test-measure-local-control.py
+          python3 scripts/test-check-resource-budgets.py
+          python3 scripts/test-certify-shell-package.py
+          python3 scripts/test-certify-claude-host.py
 
       - name: Discard cached Criterion baselines
         # rust-cache intentionally restores compiled artifacts, but a partial
@@ -35,7 +128,7 @@ jobs:
         # the downstream result step is gated on this step's success.
         run: |
           set -o pipefail
-          cargo bench --bench perf -- --output-format bencher | tee bench-output.txt
+          cargo bench --locked --bench perf -- --output-format bencher | tee bench-output.txt
 
       # C19: the ABSOLUTE gate. The relative alert below reports but does not
       # fail, so on its own it can only answer "slower than last week" and never
@@ -46,11 +139,69 @@ jobs:
       - name: Enforce absolute benchmark budgets
         run: ./scripts/check-bench-budgets.sh bench-output.txt
 
+      - name: Characterize core allocation requests
+        run: >-
+          cargo bench --locked -p tirith-core --bench resource_counts --
+          --output "$GITHUB_WORKSPACE/resource-allocations.json"
+          --samples ${{ env.RESOURCE_REFERENCE_COHORT == 'true' && '100' || '10' }}
+
+      - name: Build release candidate for resource characterization
+        run: cargo build --release --locked -p tirith --bin tirith
+
+      - name: Characterize CLI and local control resources
+        timeout-minutes: 20
+        run: >-
+          python3 scripts/measure-local-control.py
+          --binary "$GITHUB_WORKSPACE/target/release/tirith"
+          --output "$GITHUB_WORKSPACE/resource-local-control.json"
+          --resources --samples ${{ env.RESOURCE_REFERENCE_COHORT == 'true' && '100' || '10' }}
+          --history-rows 250000
+
+      - name: Record exact native resource measurement context
+        run: |
+          git diff --exit-code -- Cargo.toml Cargo.lock
+          python3 scripts/record-resource-context.py \
+            --local-report resource-local-control.json \
+            --allocation-report resource-allocations.json \
+            --local-source scripts/measure-local-control.py \
+            --allocation-source crates/tirith-core/benches/resource_counts.rs \
+            --source-revision "$(git rev-parse HEAD)" --build-profile release \
+            --run-id "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" \
+            --runner-label ubuntu-latest --runner-image "$ImageOS" \
+            --runner-image-version "$ImageVersion" --output resource-context.json
+
+      - name: Validate measured resource contracts
+        run: >-
+          python3 scripts/check-resource-budgets.py
+          --local-report resource-local-control.json
+          --allocation-report resource-allocations.json
+          --context resource-context.json --validate-only
+          --output resource-evaluation.json
+
+      # Read-only characterization artifacts. The existing Criterion budgets
+      # above remain the performance gate. This validates measurements and records
+      # validated_unbudgeted, never a new resource-budget pass. Enable --budget
+      # only after independent release runs support a reviewed reference budget.
+      - name: Upload resource characterization
+        # Preserve failed observations and class refusals as well as valid reports.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: resource-characterization-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            resource-build-provenance.json
+            resource-allocations.json
+            resource-local-control.json
+            resource-context.json
+            resource-evaluation.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Upload trusted-main benchmark input
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: benchmark-output
+          name: benchmark-output-${{ github.run_id }}-${{ github.run_attempt }}
           path: bench-output.txt
           if-no-files-found: error
 
@@ -69,7 +220,7 @@ jobs:
       - name: Download benchmark output
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: benchmark-output
+          name: benchmark-output-${{ github.run_id }}-${{ github.run_attempt }}
           path: benchmark-output
 
       - name: Store benchmark result

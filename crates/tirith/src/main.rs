@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 /// `every_command_is_categorized` test guards this against drift.
 const COMMANDS_BY_CATEGORY: &str = "\
 COMMANDS BY CATEGORY:
-  Scan & Analyze:   check paste run score diff fetch fix scan view preview watch temp-run capsule taint intend task lab explain why visual-audit
+  Scan & Analyze:   check paste run score diff fetch fix scan review view preview watch temp-run capsule taint intend task lab explain why visual-audit
   Status & Health:  status doctor prompt-status dashboard warnings receipt logs baseline
   Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
   Policy & Trust:   policy trust rule output
@@ -222,6 +222,25 @@ enum ExecutionReceiptAction {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Explicit read-only review of selected dependency, hook, AI and MCP files
+    Review {
+        /// Replace known-surface discovery with project-relative files
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Internal authenticated caller-shell diagnostic. Invoked only by the
+    /// loaded shell helper with a narrowly scoped protocol-v3 capability.
+    #[command(name = "__shell-verification", hide = true)]
+    ShellVerificationInternal {
+        #[arg(value_parser = ["start", "allowed", "blocked", "status"])]
+        action: String,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, value_enum)]
+        channel: ShellReceiptChannelArg,
+    },
     /// Internal one-shot shell execution receipt protocol.
     #[command(name = "__execution-receipt", hide = true)]
     ExecutionReceiptInternal {
@@ -261,6 +280,11 @@ Examples:
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
+
+        /// JSON schema: 3 preserves the legacy contract; 4 includes recovery advice.
+        /// Requires JSON output and does not change the verdict or exit code.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(3..=4), conflicts_with_all = ["approval_check", "execution_receipt"])]
+        json_schema: Option<u8>,
 
         /// Force non-interactive mode
         #[arg(long)]
@@ -439,9 +463,8 @@ after the analysis and your go-ahead.
 
 This is pre-execution install-RISK ANALYSIS plus a recorded transaction. Real
 package-manager installs (`npm`, `pip`, `cargo`, and others) are not sandboxed;
-on x86_64 Linux, use `tirith pkg install` for the enforcing package firewall.
-Other platforms and architectures refuse that enforcing execution. The `url`
-form is different: reviewed scripts execute contained by default and fail closed
+contained package installation (`tirith pkg install`) is currently disabled
+pending qualification of immutable named inputs. The `url` form is different: reviewed scripts execute contained by default and fail closed
 when the Linux capsule cannot provide the required coverage.
 
 The package(s) are scored with the deterministic `tirith package risk`
@@ -525,9 +548,8 @@ Examples:
         sha256: Option<String>,
     },
 
-    /// Package firewall: resolve and inspect Python packages; on x86_64 Linux,
-    /// install ONLY the verified bytes inside a containment capsule, with a
-    /// tamper-evident receipt.
+    /// Inspect Python packages and verify installed environments.
+    /// Contained package installation is currently disabled.
     #[command(after_help = "\
 Examples:
   tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
@@ -536,11 +558,16 @@ Examples:
   tirith pkg verify-env --target .venv requests flask
   tirith pkg receipt list
 
-`tirith pkg approve` native approval issuance and `tirith pkg install` enforcing
-execution are supported only on x86_64 Linux. Other platforms and architectures
-fail closed instead of issuing an approval that cannot be redeemed. `pkg
-verify-env` remains a read-only verifier, and `tirith install` remains the
-portable analysis path.")]
+`tirith pkg install` is disabled on every host and refuses with
+private_input_execution_unqualified before resolver, quarantine, checkpoint,
+or package execution. --yes, --allow-degraded, sudo, and administrator access
+do not enable it. Immutable named inputs must be qualified for the complete
+target lifetime before contained package execution can be enabled.
+
+`tirith pkg approve` remains subject to its separate native authority and
+x86_64 Linux requirements; an approval cannot bypass the execution refusal.
+`pkg verify-env` remains a read-only verifier, and `tirith package inspect`
+remains available for local artifact inspection.")]
     Pkg {
         #[command(subcommand)]
         action: PkgAction,
@@ -874,8 +901,14 @@ Examples:
   tirith dashboard serve
   tirith dashboard serve --port 8765")]
     Dashboard {
+        /// Print the private local URL without launching a browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// Emit the launch result as JSON (no subcommand).
+        #[arg(long)]
+        json: bool,
         #[command(subcommand)]
-        action: DashboardAction,
+        action: Option<DashboardAction>,
     },
 
     /// Print a one-line shell-prompt status (M8 ch6).
@@ -924,6 +957,9 @@ Cache:
         /// Output as JSON.
         #[arg(long)]
         json: bool,
+        /// Succeed only when fresh evidence verifies blocking on this surface.
+        #[arg(long)]
+        require_verified_blocking: bool,
     },
 
     /// Scan files for hidden content, config poisoning, and CI/repo supply-chain risk
@@ -1233,8 +1269,32 @@ Examples:
   tirith setup kiro --scope user
   tirith setup claude-code --dry-run")]
     Setup {
-        /// Tool to configure: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, windsurf
+        /// Tool to configure: recommended, shell, or a named AI host
         tool: String,
+
+        /// Personal baseline for tool 'recommended' (defaults to balanced)
+        #[arg(long, value_parser = ["comfortable", "balanced", "strict"])]
+        profile: Option<String>,
+
+        /// Explicit agent selection for tool 'recommended'; uncertified hosts refuse before changes
+        #[arg(long = "agent", value_parser = ["claude-code", "codex", "cursor", "windsurf"])]
+        agents: Vec<String>,
+
+        /// Save a recommended setup review without applying it
+        #[arg(long, conflicts_with = "dry_run")]
+        plan_only: bool,
+
+        /// Reuse the immutable recommended setup request on retry
+        #[arg(long)]
+        operation_id: Option<String>,
+
+        /// Emit recommended setup results as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Shell family for tool 'shell' or 'recommended'; omitted means the observed current shell
+        #[arg(long, value_parser = ["bash", "zsh", "fish", "nushell", "powershell", "pwsh"])]
+        shell: Option<String>,
 
         /// Scope: project (default for most tools) or user
         #[arg(long)]
@@ -1251,6 +1311,10 @@ Examples:
         /// Show what would be written without writing
         #[arg(long)]
         dry_run: bool,
+
+        /// Remove owned shell hook blocks (requires tool 'shell')
+        #[arg(long, conflicts_with_all = ["force", "update_configs", "with_mcp", "install_zshenv", "scope"])]
+        remove: bool,
 
         /// Overwrite existing files and update stale entries
         #[arg(long)]
@@ -1357,11 +1421,12 @@ Examples:
     #[command(after_help = "\
 Trust is narrow and expiring by default: trust the most specific thing that
 works, and entries expire after 30d unless you pass --permanent. A broad
-pattern (whole domain, wildcard, bare TLD) requires --broad.
+pattern (whole domain, wildcard, bare TLD) requires --broad; omitting --rule
+requires explicit --all-rules. Project grants are stored by the operator.
 
 Examples:
-  tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
-  tirith trust add example.com --broad --ttl 7d
+  tirith trust add raw.githubusercontent.com/org/repo/main/get.sh --rule pipe_to_interpreter
+  tirith trust add example.com --broad --rule shortened_url --ttl 7d
   tirith trust add get.docker.com --broad --rule curl_pipe_shell --permanent
   tirith trust list --format json --expired
   tirith trust explain example.com
@@ -1484,6 +1549,10 @@ Examples:
             conflicts_with = "reset_bash_safe_mode"
         )]
         json: bool,
+        /// Start the authenticated diagnostic in the actual calling shell.
+        /// Prints the helper command; an external child cannot certify its parent.
+        #[arg(long, conflicts_with_all = ["fix", "simulate_enter", "reset_bash_safe_mode", "compat", "bundle", "quick"])]
+        verify_shell: bool,
         /// Remove persistent bash safe-mode flag (re-enables enter mode)
         #[arg(long, conflicts_with = "format")]
         reset_bash_safe_mode: bool,
@@ -1513,13 +1582,8 @@ Examples:
         )]
         compat: bool,
 
-        /// Write a redacted diagnostic bundle to a file and print its path.
-        /// The bundle (doctor info, tirith + hook versions, shell/mode/effective
-        /// protection, hook-chain state, policy discovery, threat-DB status, and
-        /// relevant environment) is safe to attach to a bug report: secrets,
-        /// tokens, and the literal home-directory path are redacted. Accepts the
-        /// aliases --redacted-report and --shell-trace. Mutually exclusive with
-        /// --fix, --simulate-enter, --reset-bash-safe-mode, and --compat.
+        /// Save a private diagnostic bundle with fresh redaction. Review it
+        /// before sharing; no report is uploaded. Use --bundle-preview first.
         #[arg(
             long,
             visible_alias = "redacted-report",
@@ -1530,6 +1594,18 @@ Examples:
             conflicts_with = "compat"
         )]
         bundle: bool,
+
+        /// Preview the selected diagnostic bundle without saving a file.
+        #[arg(long, requires = "bundle")]
+        bundle_preview: bool,
+
+        /// Include one private operation UUID (repeatable; ten selections total).
+        #[arg(long, requires = "bundle")]
+        bundle_operation: Vec<String>,
+
+        /// Include an incident event UUID from bounded recent history (repeatable).
+        #[arg(long, requires = "bundle")]
+        bundle_incident: Vec<String>,
 
         /// Fast status only (protection_mode, policy_path_used, hook_configured);
         /// skips DB/log/baseline probes. Read-only and safe to poll (the VS
@@ -3308,9 +3384,9 @@ FAIL-CLOSED CONTAINMENT. NO DEGRADED FALLBACK.
   nothing else.
 
 PLATFORM LIMIT (not a bug, a refusal):
-  Enforceable only on x86_64 Linux with a usable Landlock ABI. Raw-network
-  denial needs seccomp, which this build supports on x86_64 Linux only; macOS
-  cannot enforce a memory or process-count ceiling at all; and the parent-owned
+  Enforceable on x86_64 Linux or native aarch64 Linux with usable Landlock and
+  seccomp. Kernel or outer-container restrictions may make either unavailable;
+  macOS cannot enforce a memory or process-count ceiling at all; and the parent-owned
   wall-clock and combined-output supervisor is Linux-only. Every other host
   REFUSES before anything is copied or spawned, naming the exact control it
   could not deliver. It never falls back to a degraded or uncontained run.
@@ -3385,6 +3461,23 @@ enum CapsuleAction {
 
 #[derive(Subcommand)]
 enum DashboardAction {
+    /// Start or reuse the authenticated local control dashboard.
+    Open {
+        #[arg(long)]
+        no_browser: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(hide = true)]
+    ControlServe {
+        #[arg(long)]
+        startup_id: String,
+    },
+    #[command(hide = true)]
+    LifecycleWorker {
+        #[arg(long)]
+        operation_id: String,
+    },
     /// Write the HTML security report to a file
     #[command(after_help = "\
 Default output is <documents-dir>/tirith-dashboard-<date>.html (<documents-dir> is
@@ -5721,6 +5814,72 @@ enum LicenseAction {
 
 #[derive(Subcommand)]
 enum AuditAction {
+    /// Export one retained segment to an operator-private derived directory
+    ExportSegment {
+        #[arg(long)]
+        segment_id: String,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Irreversibly delete retained records, keeping a checkpoint and tombstone
+    DeleteSegment {
+        #[arg(long)]
+        segment_id: String,
+        /// Acknowledge that the retained records cannot be restored
+        #[arg(long)]
+        acknowledge_irreversible: bool,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prepare verified audit rotation with a saved, private recovery plan
+    Rotate {
+        /// Reuse an existing operation ID for retries
+        #[arg(long)]
+        operation_id: Option<String>,
+        /// Explicitly apply the prepared rotation
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record whether you intended an observed operation; never changes trust
+    Feedback {
+        #[arg(long)]
+        event_id: String,
+        #[arg(long, value_enum)]
+        expectation: cli::feedback::Expectation,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a bounded recent page with explicit coverage and original decisions
+    Recent {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// RFC3339 inclusive lower bound
+        #[arg(long)]
+        since: Option<String>,
+        /// RFC3339 inclusive upper bound
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long, value_parser = ["allow", "warn", "warn_ack", "block"])]
+        action: Option<String>,
+        #[arg(long)]
+        rule: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Export audit log records as JSON or CSV
     #[command(after_help = "\
 Examples:
@@ -5828,6 +5987,22 @@ enum PendingAction {
     },
 }
 
+/// Explicit interpretation of a local artifact; no installation authority.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LocalArtifactEcosystem {
+    Python,
+    Npm,
+}
+
+impl LocalArtifactEcosystem {
+    fn into_core(self) -> cli::package::ArtifactEcosystem {
+        match self {
+            Self::Python => cli::package::ArtifactEcosystem::Python,
+            Self::Npm => cli::package::ArtifactEcosystem::Npm,
+        }
+    }
+}
+
 /// The ecosystem `tirith pkg` enforces for. Only `pip` installs; `npm`/`cargo`
 /// resolve-and-inspect lives behind hidden experimental flags and cannot install.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -5852,6 +6027,31 @@ impl PkgEcosystem {
 
 #[derive(Subcommand)]
 enum PkgAction {
+    /// Inspect exact local npm tarballs or Python wheels without executing them.
+    #[command(after_help = "\
+Examples:
+  tirith pkg inspect package-1.0.0.tgz --format json
+  tirith pkg inspect package-1.0.0.tgz --format sarif
+  tirith pkg inspect distribution-1.0-py3-none-any.whl
+  tirith pkg inspect package.tar.gz --ecosystem npm
+
+npm inspection is bounded static evidence over the exact compressed artifact.
+Coverage gaps are explicit. It never installs, executes lifecycle scripts,
+contacts a registry, or issues installation approval.")]
+    Inspect {
+        /// Local npm tarballs (.tgz/.tar.gz) or wheels (.whl); do not mix ecosystems.
+        #[arg(value_name = "ARTIFACT", required = true)]
+        artifacts: Vec<PathBuf>,
+        /// Select the reader explicitly; .tar.gz preserves Python behavior by default.
+        #[arg(long, value_enum)]
+        ecosystem: Option<LocalArtifactEcosystem>,
+        /// Output format (SARIF is supported for npm tarballs).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonSarifFormat>,
+        /// Alias for --format json.
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
     /// Resolve + inspect a requirement set and approve its install plan through
     /// the x86_64 Linux native authority. Does NOT install.
     #[command(after_help = "\
@@ -5884,18 +6084,22 @@ platforms fail closed before publishing an approval record.")]
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Resolve + inspect + install ONLY the verified, hash-pinned bytes, inside the
-    /// containment capsule, recording a tamper-evident receipt. Enforcing execution
-    /// is x86_64 Linux-only; every other platform or architecture fails closed
-    /// before pip starts.
+    /// Contained package installation (currently disabled on every host).
+    /// Refuses before resolver, quarantine, checkpoint, or package execution.
     #[command(after_help = "\
 Examples:
   tirith pkg install pip requests==2.31.0 --target .tirith-pkg
   tirith pkg install pip flask --target .venv --yes
 
-Execution is supported only on x86_64 Linux. Unsupported platforms and
-architectures refuse before pip starts; they never fall back to an uncontained
-install.")]
+Execution is disabled on every host. These examples retain the accepted syntax
+but refuse with private_input_execution_unqualified before resolver execution,
+network access, quarantine writes, checkpoint creation, or package launch.
+--yes, --allow-degraded, sudo, and administrator access do not enable it.
+
+The private named-input backend has not been qualified to keep package inputs
+unchanged for the complete target lifetime against another process owned by
+the same user. `tirith package inspect` and `tirith pkg verify-env` remain
+available.")]
     Install {
         /// The ecosystem (only `pip` is enforced).
         #[arg(value_enum)]
@@ -5912,8 +6116,7 @@ install.")]
         /// egress only and is never treated as a package index.
         #[arg(long = "artifact-origin")]
         artifact_origin: Vec<String>,
-        /// Install without a prior `tirith pkg approve` (unattended). The receipt
-        /// still attests the install honestly.
+        /// Retained unattended confirmation flag; cannot enable the disabled backend.
         #[arg(long)]
         yes: bool,
         /// Acknowledge degraded containment (still routes through the fail-closed
@@ -5990,10 +6193,8 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Release differential: compare an OLD wheel against a NEW wheel of the same
-    /// distribution and flag the execution-shape changes that mark a benign release
-    /// turning malicious. Local-artifact-only; warns (never auto-blocks) on an
-    /// anomaly, so a strict policy can escalate it.
+    /// Compare two local npm tarballs or Python wheels and report release changes.
+    /// npm comparisons qualify differences when analyzer or coverage differs.
     #[command(after_help = "\
 What it flags:
   A pure-Python release that now ships a compiled extension, a release that newly
@@ -6006,17 +6207,26 @@ What it flags:
 
 Examples:
   tirith pkg diff requests-2.31.0-py3-none-any.whl requests-2.32.0-py3-none-any.whl
-  tirith pkg diff old.whl new.whl --json")]
+  tirith pkg diff old.whl new.whl --json
+  tirith pkg diff old.tgz new.tgz --format json
+  tirith pkg diff old.tgz new.tgz --format sarif
+
+npm output separates exact member/metadata changes from static capability
+observations, and records analyzer, limit, and coverage qualifications. Static
+evidence is advisory and never authorizes an installation.")]
     Diff {
-        /// The OLD (prior) wheel artifact.
-        #[arg(value_name = "OLD_WHEEL")]
+        /// The OLD (prior) npm tarball or wheel artifact.
+        #[arg(value_name = "OLD_ARTIFACT")]
         old: std::path::PathBuf,
-        /// The NEW (candidate) wheel artifact.
-        #[arg(value_name = "NEW_WHEEL")]
+        /// The NEW (candidate) artifact from the same ecosystem.
+        #[arg(value_name = "NEW_ARTIFACT")]
         new: std::path::PathBuf,
-        /// Output format (default: human)
+        /// Select the reader explicitly; use npm for ambiguous .tar.gz archives.
         #[arg(long, value_enum)]
-        format: Option<HumanJsonFormat>,
+        ecosystem: Option<LocalArtifactEcosystem>,
+        /// Output format (SARIF is supported for npm tarballs).
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonSarifFormat>,
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
@@ -6142,13 +6352,32 @@ Examples:
     },
 }
 
+/// Canonical signed storage and display projections are distinct contracts.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ArtifactReceiptFormat {
+    Human,
+    Json,
+    DisplayJson,
+}
+
+impl ArtifactReceiptFormat {
+    fn resolve(format: Option<Self>, json: bool) -> (bool, bool) {
+        match format {
+            Some(Self::DisplayJson) => (true, true),
+            Some(Self::Json) => (true, false),
+            Some(Self::Human) => (false, false),
+            None => (json, false),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum PkgReceiptQuery {
     /// List all artifact-scan receipts (newest first).
     List {
         /// Output format (default: human)
         #[arg(long, value_enum)]
-        format: Option<HumanJsonFormat>,
+        format: Option<ArtifactReceiptFormat>,
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
@@ -6157,7 +6386,7 @@ enum PkgReceiptQuery {
     Last {
         /// Output format (default: human)
         #[arg(long, value_enum)]
-        format: Option<HumanJsonFormat>,
+        format: Option<ArtifactReceiptFormat>,
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
@@ -6168,7 +6397,7 @@ enum PkgReceiptQuery {
         receipt_id: String,
         /// Output format (default: human)
         #[arg(long, value_enum)]
-        format: Option<HumanJsonFormat>,
+        format: Option<ArtifactReceiptFormat>,
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
@@ -6384,6 +6613,11 @@ Examples:
 
 #[derive(Subcommand)]
 enum PolicyAction {
+    /// Review a local profile rollout, then explicitly activate or undo its stored plan
+    Rollout {
+        #[command(subcommand)]
+        action: PolicyRolloutAction,
+    },
     /// Generate a starter policy file
     #[command(after_help = "\
 Examples:
@@ -6439,14 +6673,20 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Show the fully-resolved effective policy for the current directory: source
-    /// path, scope, and (for a repo-scoped policy) which weakening fields were
-    /// neutralized. Local discovery only — never a network fetch.
+    /// Show local policy diagnostics, or resolve the enforcement policy with --runtime.
+    /// The default stays offline and excludes separate trust/list overlays.
     #[command(after_help = "\
 Examples:
   tirith policy effective
-  tirith policy effective --format json")]
+  tirith policy effective --local-only
+  tirith policy effective --runtime --format json")]
     Effective {
+        /// Use the enforcement resolver, including configured remote policy and overlays
+        #[arg(long, conflicts_with = "local_only")]
+        runtime: bool,
+        /// Explicit offline diagnostic (the default); excludes separate overlays
+        #[arg(long)]
+        local_only: bool,
         /// Output format (default: human)
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
@@ -6473,12 +6713,61 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
+    /// Apply or reset a versioned personal protection profile
+    Profile {
+        #[arg(value_parser = ["comfortable", "balanced", "strict", "reset"])]
+        name: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a typed personal setting (use reset to remove the override)
+    Setting {
+        #[arg(value_parser = ["strict_warn", "allow_bypass_env", "allow_bypass_env_noninteractive", "scan_require_complete", "env_guard_enabled", "context_guard_enabled", "exec_guard_enabled", "hooks_guard_enabled", "baseline_enabled", "mcp_redact_injection", "fail_mode", "paranoia", "rule_severity"])]
+        name: String,
+        value: String,
+        #[arg(long)]
+        rule: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect, retry, cancel, or undo a saved typed operation
+    Operation {
+        id: String,
+        #[arg(long, default_value = "status", value_parser = ["status", "apply", "cancel", "undo"])]
+        action: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare policies against the same captured command and session evidence
+    Simulate {
+        /// Exact command text to inspect; never executed
+        command: String,
+        /// Command grammar (posix, fish, powershell, cmd)
+        #[arg(long, default_value = "posix")]
+        shell: tirith_core::tokenize::ShellType,
+        /// Model an interactive execution boundary
+        #[arg(long)]
+        interactive: bool,
+        /// Hypothetical complete effective policy document; does not authorize or apply it
+        #[arg(long)]
+        proposed_policy: Option<String>,
+        /// Explicit session whose current evidence should be captured
+        #[arg(long)]
+        session: Option<String>,
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Suggest policy adjustments from the local audit log (suggest-only)
     #[command(after_help = "\
-Analyzes your audit log and suggests concrete, conservative policy changes —
-e.g. a rule you allow or bypass every time may warrant an allowlist entry.
-It only SUGGESTS: it never edits your policy. Review each suggestion, then
-apply it yourself. When the log is too small it says so rather than guess.
+Reviews at most 500 recent records within a 2 MiB audit read. Counts, selected
+expectation labels and redacted examples describe recorded checks, not proven
+execution or false positives. No policy is changed. Inspect remaining blockers
+and simulate representative commands before reviewing a scoped change.
 
 Examples:
   tirith policy tune --from-audit
@@ -6492,6 +6781,48 @@ Examples:
         format: Option<HumanJsonFormat>,
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyRolloutAction {
+    /// Capture command impact and save a profile plan without activating it
+    Prepare {
+        #[arg(value_parser = ["comfortable", "balanced", "strict"])]
+        profile: String,
+        /// Personal policy, or the existing operator-owned organization authority
+        #[arg(long, default_value = "user", value_parser = ["user", "org"])]
+        scope: String,
+        /// Command to analyze without execution; repeat for each workflow
+        #[arg(long = "command", required = true)]
+        commands: Vec<String>,
+        #[arg(long, default_value = "posix")]
+        shell: tirith_core::tokenize::ShellType,
+        #[arg(long)]
+        interactive: bool,
+        /// Retry identity; omitted creates a new UUID
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect saved impact and current local activation status
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Activate exactly the reviewed local profile operation
+    Activate {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Undo owned changes; organization rollback refuses any newer policy document
+    Undo {
+        id: String,
+        #[arg(long)]
         json: bool,
     },
 }
@@ -6572,6 +6903,7 @@ Examples:
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TrustMutationScope {
     User,
+    Project,
     Repo,
     Invalid(String),
 }
@@ -6580,6 +6912,7 @@ impl TrustMutationScope {
     fn as_str(&self) -> &str {
         match self {
             Self::User => "user",
+            Self::Project => "project",
             Self::Repo => "repo",
             Self::Invalid(value) => value,
         }
@@ -6592,6 +6925,7 @@ impl std::str::FromStr for TrustMutationScope {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Ok(match value {
             "user" => Self::User,
+            "project" => Self::Project,
             "repo" => Self::Repo,
             // Keep parsing infallible so Clap never reflects the raw,
             // attacker-controlled invalid value in its own error renderer. The
@@ -6605,6 +6939,7 @@ impl std::str::FromStr for TrustMutationScope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TrustQueryScope {
     User,
+    Project,
     Repo,
     All,
     Invalid(String),
@@ -6614,6 +6949,7 @@ impl TrustQueryScope {
     fn as_str(&self) -> &str {
         match self {
             Self::User => "user",
+            Self::Project => "project",
             Self::Repo => "repo",
             Self::All => "all",
             Self::Invalid(value) => value,
@@ -6627,6 +6963,7 @@ impl std::str::FromStr for TrustQueryScope {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Ok(match value {
             "user" => Self::User,
+            "project" => Self::Project,
             "repo" => Self::Repo,
             "all" => Self::All,
             // See `TrustMutationScope::from_str`: unknown values must reach
@@ -6642,20 +6979,23 @@ enum TrustAction {
     /// Add a trusted pattern (narrow scope and a 30d TTL by default)
     #[command(after_help = "\
 Trust the narrowest thing that works. A specific URL or path is accepted as-is;
-a whole domain, wildcard, or bare TLD is broad and requires --broad. Entries
-expire after 30d unless you pass --permanent or your own --ttl.
+a whole domain, wildcard, or bare TLD is broad and requires --broad. Select
+--rule, or explicitly opt into --all-rules. Entries expire after 30d unless you pass --permanent or your own --ttl.
 
 Examples:
-  tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
-  tirith trust add example.com --broad --ttl 7d
+  tirith trust add raw.githubusercontent.com/org/repo/main/get.sh --rule pipe_to_interpreter
+  tirith trust add example.com --broad --rule shortened_url --ttl 7d
   tirith trust add example.com --broad --rule pipe_to_interpreter --permanent
-  tirith trust add example.com --broad --reason \"internal mirror, ticket OPS-42\"")]
+  tirith trust add example.com --broad --all-rules --reason \"internal mirror, ticket OPS-42\"")]
     Add {
         /// Pattern to trust (a specific URL/path, or a domain with --broad)
         pattern: String,
         /// Scope trust to a specific rule ID (narrower than a global trust)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all_rules")]
         rule: Option<String>,
+        /// Explicitly trust this target for every suppressible rule (broad)
+        #[arg(long, conflicts_with = "rule")]
+        all_rules: bool,
         /// TTL duration (e.g., 1h, 7d, 30d). Default: 30d. Conflicts with --permanent
         #[arg(long, conflicts_with = "permanent")]
         ttl: Option<String>,
@@ -6668,11 +7008,11 @@ Examples:
         /// Free-text reason recorded with the entry (shown by `trust explain`)
         #[arg(long)]
         reason: Option<String>,
-        /// Scope: user (default) or repo
+        /// Scope: user (default), project (operator-owned checkout), or repo (inactive)
         #[arg(
             long,
             value_parser = clap::value_parser!(TrustMutationScope),
-            value_name = "user|repo",
+            value_name = "user|project|repo",
             default_value = "user"
         )]
         scope: TrustMutationScope,
@@ -6680,6 +7020,35 @@ Examples:
         #[arg(long, value_enum)]
         format: Option<HumanJsonFormat>,
         /// Alias for --format json
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Change the expiry of one stable grant, preserving its identity and scope
+    Expiry {
+        id: String,
+        #[arg(long, conflicts_with = "permanent")]
+        ttl: Option<String>,
+        #[arg(long, conflicts_with = "ttl")]
+        permanent: bool,
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Revoke one stable grant and reveal remaining broader permissions
+    Revoke {
+        id: String,
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
+        #[arg(long, hide = true, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Migrate legacy user trust to stable IDs; older clients then ignore it
+    Migrate {
+        #[arg(long, value_parser = clap::value_parser!(TrustMutationScope), default_value = "user")]
+        scope: TrustMutationScope,
+        #[arg(long, value_enum)]
+        format: Option<HumanJsonFormat>,
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
@@ -6704,11 +7073,11 @@ Examples:
         /// Include expired entries
         #[arg(long)]
         expired: bool,
-        /// Scope: user, repo, or all (default)
+        /// Scope: user, project, repo, or all (default)
         #[arg(
             long,
             value_parser = clap::value_parser!(TrustQueryScope),
-            value_name = "user|repo|all",
+            value_name = "user|project|repo|all",
             default_value = "all"
         )]
         scope: TrustQueryScope,
@@ -6721,11 +7090,11 @@ Examples:
     Explain {
         /// Pattern of the entry to explain
         pattern: String,
-        /// Scope: user, repo, or all (default)
+        /// Scope: user, project, repo, or all (default)
         #[arg(
             long,
             value_parser = clap::value_parser!(TrustQueryScope),
-            value_name = "user|repo|all",
+            value_name = "user|project|repo|all",
             default_value = "all"
         )]
         scope: TrustQueryScope,
@@ -6759,11 +7128,11 @@ Examples:
         /// Only remove entries scoped to this rule ID
         #[arg(long)]
         rule: Option<String>,
-        /// Scope: user (default) or repo
+        /// Scope: user (default), project (operator-owned checkout), or repo (inactive)
         #[arg(
             long,
             value_parser = clap::value_parser!(TrustMutationScope),
-            value_name = "user|repo",
+            value_name = "user|project|repo",
             default_value = "user"
         )]
         scope: TrustMutationScope,
@@ -6794,11 +7163,11 @@ Examples:
         /// this flag is optional
         #[arg(long)]
         expired: bool,
-        /// Scope: user, repo, or all (default)
+        /// Scope: user, project, repo, or all (default)
         #[arg(
             long,
             value_parser = clap::value_parser!(TrustQueryScope),
-            value_name = "user|repo|all",
+            value_name = "user|project|repo|all",
             default_value = "all"
         )]
         scope: TrustQueryScope,
@@ -6822,11 +7191,11 @@ Examples:
         /// Collect expired entries — currently the only collection mode.
         #[arg(long)]
         expired: bool,
-        /// Scope: user, repo, or all (default)
+        /// Scope: user, project, repo, or all (default)
         #[arg(
             long,
             value_parser = clap::value_parser!(TrustQueryScope),
-            value_name = "user|repo|all",
+            value_name = "user|project|repo|all",
             default_value = "all"
         )]
         scope: TrustQueryScope,
@@ -7030,7 +7399,7 @@ is assumed.")]
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Inspect exact package artifacts (wheels) or an installed environment for
+    /// Inspect exact npm tarballs, Python wheels, or an installed environment for
     /// startup hooks, native import chains, RECORD tampering, and
     /// cross-distribution loader/payload splits
     #[command(after_help = "\
@@ -7040,6 +7409,8 @@ Examples:
   tirith package inspect --artifact-set ./downloaded-wheels/
   tirith package inspect --installed ./.venv
   tirith package inspect --format json --artifact dist/foo.whl
+  tirith package inspect --format json --artifact package-1.0.0.tgz
+  tirith package inspect --artifact package.tar.gz --ecosystem npm
 
 Verdict-oriented (unlike `package risk`, which is an advisory scorer): exits
 0 when clean, 1 on a block-grade finding, 2 on an advisory (warn) finding.
@@ -7047,12 +7418,16 @@ Pass two or more --artifact files (or --artifact-set <dir>) to detect a
 cross-distribution split where one wheel's startup hook executes a payload
 bundled in another. Member-qualified locations (foo.whl!/pkg/file) appear in
 --format json output. tirith never downloads an artifact; it inspects the
-bytes you point it at.")]
+bytes you point it at. npm tarballs use bounded static inspection with explicit
+coverage gaps; their reports are advisory and do not authorize installation.")]
     Inspect {
-        /// A wheel (.whl) artifact to inspect. Repeatable: pass two or more to
-        /// detect a cross-distribution loader/payload split across them.
+        /// A local npm tarball (.tgz/.tar.gz) or wheel (.whl), repeatable.
+        /// Multiple wheels also detect cross-distribution loader/payload splits.
         #[arg(long, value_name = "FILE")]
         artifact: Vec<PathBuf>,
+        /// Select a local artifact reader; ambiguous .tar.gz defaults to Python.
+        #[arg(long, value_enum, conflicts_with_all = ["artifact_set", "installed"])]
+        ecosystem: Option<LocalArtifactEcosystem>,
         /// A directory of wheels to inspect as a SET (cross-distribution
         /// correlation across every .whl found, non-recursively).
         #[arg(long, value_name = "DIR", conflicts_with = "installed")]
@@ -7746,8 +8121,15 @@ fn run() {
 
     let cli = Cli::parse();
     cli::init_quiet(cli.quiet);
+    cli::audit_health::install_sink();
 
     let exit_code = match cli.command {
+        Commands::Review { paths, json } => cli::project_review::run(paths, json),
+        Commands::ShellVerificationInternal {
+            action,
+            id,
+            channel,
+        } => cli::shell_verification::run(&action, id.as_deref(), channel.into()),
         Commands::ExecutionReceiptInternal { action } => match action {
             ExecutionReceiptAction::Capability => cli::check::receipt_capability(),
             ExecutionReceiptAction::Register { family, shell_pid } => {
@@ -7783,6 +8165,7 @@ fn run() {
             shell,
             format,
             json,
+            json_schema,
             non_interactive,
             interactive,
             approval_check,
@@ -7797,6 +8180,10 @@ fn run() {
             cmd,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
+            if json_schema.is_some() && !json {
+                eprintln!("tirith check: --json-schema requires --format json or --json");
+                std::process::exit(2);
+            }
             let shell_type = match shell.parse::<tirith_core::tokenize::ShellType>() {
                 Ok(shell_type) => shell_type,
                 Err(_) => {
@@ -7820,6 +8207,7 @@ fn run() {
                     &command,
                     shell_type,
                     json,
+                    json_schema.unwrap_or(3),
                     non_interactive,
                     interactive,
                     approval_check,
@@ -7915,6 +8303,27 @@ fn run() {
 
         Commands::Pkg {
             action:
+                PkgAction::Inspect {
+                    artifacts,
+                    ecosystem,
+                    format,
+                    json,
+                },
+        } => {
+            let (format, _, _) = HumanJsonSarifFormat::resolve(format, json, false);
+            let format = match format {
+                HumanJsonSarifFormat::Human => cli::npm_artifact::Format::Human,
+                HumanJsonSarifFormat::Json => cli::npm_artifact::Format::Json,
+                HumanJsonSarifFormat::Sarif => cli::npm_artifact::Format::Sarif,
+            };
+            cli::package::inspect_local_artifacts(
+                &artifacts,
+                format,
+                ecosystem.map(LocalArtifactEcosystem::into_core),
+            )
+        }
+        Commands::Pkg {
+            action:
                 PkgAction::Graph {
                     wheels,
                     installed,
@@ -7936,12 +8345,23 @@ fn run() {
                 PkgAction::Diff {
                     old,
                     new,
+                    ecosystem,
                     format,
                     json,
                 },
         } => {
-            let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::provenance::run_diff(&old, &new, json)
+            let (format, _, _) = HumanJsonSarifFormat::resolve(format, json, false);
+            let format = match format {
+                HumanJsonSarifFormat::Human => cli::npm_artifact::Format::Human,
+                HumanJsonSarifFormat::Json => cli::npm_artifact::Format::Json,
+                HumanJsonSarifFormat::Sarif => cli::npm_artifact::Format::Sarif,
+            };
+            cli::package::diff_local_artifacts(
+                &old,
+                &new,
+                format,
+                ecosystem.map(LocalArtifactEcosystem::into_core),
+            )
         }
         Commands::Pkg {
             action:
@@ -8034,31 +8454,36 @@ fn run() {
                     cli::pkg::PkgAction::TrustTool { path, json }
                 }
                 PkgAction::Receipt { query } => {
-                    let (which, json) = match query {
+                    let (which, json, display_json) = match query {
                         PkgReceiptQuery::List { format, json } => {
-                            let (_, json) = HumanJsonFormat::resolve(format, json);
-                            (cli::pkg::ReceiptQuery::List, json)
+                            let (json, display_json) = ArtifactReceiptFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::List, json, display_json)
                         }
                         PkgReceiptQuery::Last { format, json } => {
-                            let (_, json) = HumanJsonFormat::resolve(format, json);
-                            (cli::pkg::ReceiptQuery::Last, json)
+                            let (json, display_json) = ArtifactReceiptFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::Last, json, display_json)
                         }
                         PkgReceiptQuery::Show {
                             receipt_id,
                             format,
                             json,
                         } => {
-                            let (_, json) = HumanJsonFormat::resolve(format, json);
-                            (cli::pkg::ReceiptQuery::Show(receipt_id), json)
+                            let (json, display_json) = ArtifactReceiptFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::Show(receipt_id), json, display_json)
                         }
                     };
-                    cli::pkg::PkgAction::Receipt { which, json }
+                    cli::pkg::PkgAction::Receipt {
+                        which,
+                        json,
+                        display_json,
+                    }
                 }
                 // `Graph` is handled by the earlier `Commands::Pkg { action:
                 // PkgAction::Graph { .. } }` arm (it returns its own exit code
                 // through `cli::provenance::run`), so it can never reach this inner
                 // match.
                 PkgAction::Graph { .. } => unreachable!("pkg graph handled above"),
+                PkgAction::Inspect { .. } => unreachable!("pkg inspect handled above"),
                 // `Diff` is likewise handled by its own earlier arm (it returns the
                 // release-differential verdict's exit code through
                 // `cli::provenance::run_diff`), so it never reaches here.
@@ -8391,21 +8816,71 @@ fn run() {
 
         Commands::Setup {
             tool,
+            profile,
+            agents,
+            plan_only,
+            operation_id,
+            json,
+            shell,
             scope,
             with_mcp,
             install_zshenv,
             dry_run,
+            remove,
             force,
             update_configs,
-        } => cli::setup::run(
-            &tool,
-            scope.as_deref(),
-            with_mcp,
-            install_zshenv,
-            dry_run,
-            force,
-            update_configs,
-        ),
+        } => {
+            if tool == "recommended" {
+                if with_mcp
+                    || install_zshenv
+                    || remove
+                    || force
+                    || update_configs
+                    || scope.as_deref().is_some_and(|scope| scope != "user")
+                {
+                    eprintln!("tirith setup recommended: choose personal --scope user, --shell, --profile, and explicit --agent selections; repair and host-specific flags require their own setup command");
+                    1
+                } else {
+                    cli::recommended_setup::run(
+                        shell.as_deref(),
+                        profile.as_deref(),
+                        &agents,
+                        operation_id,
+                        dry_run,
+                        plan_only,
+                        json,
+                    )
+                }
+            } else if profile.is_some()
+                || !agents.is_empty()
+                || plan_only
+                || operation_id.is_some()
+                || json
+            {
+                eprintln!("tirith setup: --profile, --agent, --plan-only, --operation-id and --json require tool 'recommended'");
+                1
+            } else if tool == "shell" {
+                if scope.is_some() || with_mcp || install_zshenv || update_configs {
+                    eprintln!("tirith setup shell: only --shell, --dry-run, --force, and --remove apply to personal shell setup");
+                    1
+                } else {
+                    cli::setup::shell_service::run_cli(shell.as_deref(), remove, force, dry_run)
+                }
+            } else if remove || shell.is_some() {
+                eprintln!("tirith setup: --remove and --shell require tool 'shell'");
+                1
+            } else {
+                cli::setup::run(
+                    &tool,
+                    scope.as_deref(),
+                    with_mcp,
+                    install_zshenv,
+                    dry_run,
+                    force,
+                    update_configs,
+                )
+            }
+        }
 
         Commands::Policy { action } => match action {
             PolicyAction::Init {
@@ -8422,9 +8897,14 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::policy::validate(path_pos.or(path).as_deref(), json)
             }
-            PolicyAction::Effective { format, json } => {
+            PolicyAction::Effective {
+                format,
+                json,
+                runtime,
+                local_only: _,
+            } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::policy::effective(json)
+                cli::policy::effective(json, runtime)
             }
             PolicyAction::Test {
                 command,
@@ -8435,6 +8915,69 @@ fn run() {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
                 cli::policy::test(command.as_deref(), file.as_deref(), json)
             }
+            PolicyAction::Profile {
+                name,
+                dry_run,
+                json,
+            } => cli::policy::apply_profile(&name, dry_run, json),
+            PolicyAction::Rollout { action } => match action {
+                PolicyRolloutAction::Prepare {
+                    profile,
+                    scope,
+                    commands,
+                    shell,
+                    interactive,
+                    operation_id,
+                    json,
+                } => cli::rollout::prepare_cli(
+                    tirith_core::protection_profiles::ProtectionProfile::parse(&profile)
+                        .expect("clap validates profile"),
+                    match scope.as_str() {
+                        "org" => cli::managed_policy::ProfileScope::Org,
+                        "user" => cli::managed_policy::ProfileScope::User,
+                        _ => unreachable!("clap validates rollout scope"),
+                    },
+                    commands,
+                    shell,
+                    interactive,
+                    operation_id.as_deref(),
+                    json,
+                ),
+                PolicyRolloutAction::Show { id, json } => {
+                    cli::rollout::operation_cli(&id, "show", json)
+                }
+                PolicyRolloutAction::Activate { id, json } => {
+                    cli::rollout::operation_cli(&id, "activate", json)
+                }
+                PolicyRolloutAction::Undo { id, json } => {
+                    cli::rollout::operation_cli(&id, "undo", json)
+                }
+            },
+            PolicyAction::Setting {
+                name,
+                value,
+                rule,
+                dry_run,
+                json,
+            } => cli::profile_service::setting_cli(&name, &value, rule.as_deref(), dry_run, json),
+            PolicyAction::Operation { id, action, json } => {
+                cli::profile::operation(&id, &action, json)
+            }
+            PolicyAction::Simulate {
+                command,
+                shell,
+                interactive,
+                proposed_policy,
+                session,
+                json,
+            } => cli::policy::simulate(
+                &command,
+                shell,
+                interactive,
+                proposed_policy.as_deref(),
+                session.as_deref(),
+                json,
+            ),
             PolicyAction::Tune {
                 from_audit,
                 format,
@@ -8481,6 +9024,52 @@ fn run() {
         ),
 
         Commands::Audit { action } => match action {
+            AuditAction::ExportSegment {
+                segment_id,
+                operation_id,
+                apply,
+                json,
+            } => cli::audit_retention::segment(
+                operation_id,
+                cli::setup::audit_segments::SegmentChange::Export { segment_id },
+                apply,
+                json,
+            ),
+            AuditAction::DeleteSegment {
+                segment_id,
+                acknowledge_irreversible,
+                operation_id,
+                apply,
+                json,
+            } => cli::audit_retention::segment(
+                operation_id,
+                cli::setup::audit_segments::SegmentChange::Delete {
+                    segment_id,
+                    acknowledge_irreversible,
+                },
+                apply,
+                json,
+            ),
+            AuditAction::Rotate {
+                operation_id,
+                apply,
+                json,
+            } => cli::audit_retention::rotate(operation_id, apply, json),
+            AuditAction::Feedback {
+                event_id,
+                expectation,
+                operation_id,
+                dry_run,
+                json,
+            } => cli::feedback::run(event_id, expectation, operation_id, dry_run, json),
+            AuditAction::Recent {
+                limit,
+                since,
+                until,
+                action,
+                rule,
+                json,
+            } => cli::history::recent(limit, since, until, action, rule, json),
             AuditAction::Export {
                 format,
                 since,
@@ -8619,6 +9208,7 @@ fn run() {
             TrustAction::Add {
                 pattern,
                 rule,
+                all_rules,
                 ttl,
                 permanent,
                 broad,
@@ -8628,16 +9218,39 @@ fn run() {
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::trust::add(
+                cli::trust_lifecycle::add(
                     &pattern,
                     rule.as_deref(),
                     ttl.as_deref(),
                     permanent,
                     broad,
+                    all_rules,
                     reason.as_deref(),
                     scope.as_str(),
                     json,
                 )
+            }
+            TrustAction::Expiry {
+                id,
+                ttl,
+                permanent,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust_lifecycle::change_expiry(&id, ttl.as_deref(), permanent, json)
+            }
+            TrustAction::Revoke { id, format, json } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust_lifecycle::revoke(&id, json)
+            }
+            TrustAction::Migrate {
+                scope,
+                format,
+                json,
+            } => {
+                let (_, json) = HumanJsonFormat::resolve(format, json);
+                cli::trust_lifecycle::migrate(scope.as_str(), json)
             }
             TrustAction::List {
                 rule,
@@ -8647,8 +9260,7 @@ fn run() {
                 scope,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::trust::snapshot_current_trust();
-                cli::trust::list(rule.as_deref(), json, expired, scope.as_str())
+                cli::trust_lifecycle::list(rule.as_deref(), expired, scope.as_str(), json)
             }
             TrustAction::Explain {
                 pattern,
@@ -8657,7 +9269,7 @@ fn run() {
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::trust::explain(&pattern, scope.as_str(), json)
+                cli::trust_lifecycle::explain(&pattern, scope.as_str(), json)
             }
             TrustAction::Diff { format, json } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
@@ -8667,7 +9279,7 @@ fn run() {
                 pattern,
                 rule,
                 scope,
-            } => cli::trust::remove(&pattern, rule.as_deref(), scope.as_str()),
+            } => cli::trust_lifecycle::remove(&pattern, rule.as_deref(), scope.as_str()),
             TrustAction::Last => cli::trust::last(),
             TrustAction::FromLastTrigger { apply } => cli::trust::from_last_trigger(apply),
             TrustAction::Gc {
@@ -8677,7 +9289,8 @@ fn run() {
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::trust::gc(expired, scope.as_str(), json)
+                let _ = expired;
+                cli::trust_lifecycle::gc(scope.as_str(), json)
             }
             TrustAction::Prune {
                 expired,
@@ -8686,7 +9299,8 @@ fn run() {
                 json,
             } => {
                 let (_, json) = HumanJsonFormat::resolve(format, json);
-                cli::trust::prune(expired, scope.as_str(), json)
+                let _ = expired;
+                cli::trust_lifecycle::gc(scope.as_str(), json)
             }
             TrustAction::Audit {
                 since,
@@ -8723,9 +9337,23 @@ fn run() {
             cli::onboard::run(mode, apply, json)
         }
 
-        Commands::Dashboard { action } => match action {
-            DashboardAction::Export { out, json } => cli::dashboard::export(out.as_deref(), json),
-            DashboardAction::Serve { port, json } => cli::dashboard::serve(port, json),
+        Commands::Dashboard {
+            action,
+            no_browser,
+            json,
+        } => match action {
+            None => cli::control::open(no_browser, json),
+            Some(DashboardAction::Open { no_browser, json }) => {
+                cli::control::open(no_browser, json)
+            }
+            Some(DashboardAction::ControlServe { startup_id }) => cli::control::serve(&startup_id),
+            Some(DashboardAction::LifecycleWorker { operation_id }) => {
+                cli::control::lifecycle_worker::run(&operation_id)
+            }
+            Some(DashboardAction::Export { out, json }) => {
+                cli::dashboard::export(out.as_deref(), json)
+            }
+            Some(DashboardAction::Serve { port, json }) => cli::dashboard::serve(port, json),
         },
 
         Commands::PromptStatus {
@@ -8737,7 +9365,16 @@ fn run() {
             cli::prompt_status::run(short, json)
         }
 
-        Commands::Status { json } => cli::status::run(json),
+        Commands::Status {
+            json,
+            require_verified_blocking,
+        } => {
+            if require_verified_blocking {
+                cli::status::run_with_requirement(json, true)
+            } else {
+                cli::status::run(json)
+            }
+        }
 
         Commands::Warnings {
             clear,
@@ -8801,6 +9438,7 @@ fn run() {
             }
             PackageAction::Inspect {
                 artifact,
+                ecosystem,
                 artifact_set,
                 installed,
                 format,
@@ -8812,6 +9450,7 @@ fn run() {
                     artifact_set.as_deref(),
                     installed.as_deref(),
                     json,
+                    ecosystem.map(LocalArtifactEcosystem::into_core),
                 )
             }
         },
@@ -8883,19 +9522,29 @@ fn run() {
             simulate_enter,
             compat,
             bundle,
+            bundle_preview,
+            bundle_operation,
+            bundle_incident,
             quick,
+            verify_shell,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
-            cli::doctor::run(
-                json,
-                reset_bash_safe_mode,
-                fix,
-                yes,
-                simulate_enter,
-                compat,
-                bundle,
-                quick,
-            )
+            if verify_shell {
+                cli::shell_verification::instructions(json)
+            } else if bundle {
+                cli::support_bundle::run(bundle_preview, bundle_operation, bundle_incident, json)
+            } else {
+                cli::doctor::run(
+                    json,
+                    reset_bash_safe_mode,
+                    fix,
+                    yes,
+                    simulate_enter,
+                    compat,
+                    false,
+                    quick,
+                )
+            }
         }
 
         Commands::Completions { shell } => cli::completions::run(shell),

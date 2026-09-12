@@ -1,6 +1,6 @@
 # Command reference
 
-tirith ships 78 top-level commands. `tirith --help` prints this same list
+`tirith --help` prints the available top-level commands
 grouped by category, and `tirith <command> --help` documents any one in detail.
 The groups below mirror that built-in grouping. The [README](../README.md)
 covers the everyday subset; this is the complete reference.
@@ -9,7 +9,8 @@ covers the everyday subset; this is the complete reference.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds remediation and, only when fully verified on x86_64 Linux with the current Tirith binary at a fixed root-managed path, a typed pipe-runner command; `--defer` records a non-critical block as pending and exits 4 instead of blocking) |
+| `tirith review [--path FILE]` | Explicit offline review of selected project declarations, hooks, AI instructions and MCP configuration; retains identities, reports gaps and never runs project tooling (`--json`) |
+| `tirith check -- <cmd>` | Analyze a command without executing it (JSON keeps schema 3 by default; `--format json --json-schema 4` adds typed recovery advice without changing the decision or exit; `--suggest` adds remediation and, only when fully verified on x86_64 Linux with the current Tirith binary at a fixed root-managed path, a typed pipe-runner command; `--defer` records a non-critical block as pending and exits 4 instead of blocking) |
 | `tirith paste` | Check pasted content (called by shell hooks; `--with-source` attributes the paste to its recorded clipboard origin) |
 | `tirith scan [path]` | Scan files, directories, and configs (`--include`, `--exclude`, `--profile`, `--format sarif`, `--ci`) |
 | `tirith run [--capsule] <url>` | Inspect a remote script (`--no-exec` on Unix); Linux live execution is contained and fail-closed by default and executes exact reviewed bytes from a sealed anonymous descriptor (`--capsule` is legacy-compatible) |
@@ -21,7 +22,7 @@ covers the everyday subset; this is the complete reference.
 | `tirith preview -- <cmd>` | Simulate the filesystem blast radius of `rm` / `mv` / `chmod -R` / `rsync --delete` without running it |
 | `tirith watch -- <cmd>` | Run a command, then diff its filesystem, `$PATH`, and shell-rc impact |
 | `tirith temp-run -- <cmd>` | Run a command in a throwaway temp directory and diff its file impact (file isolation, not a sandbox) |
-| `tirith capsule run --preset untrusted-project --project <dir> -- <cmd>` | Copy an untrusted project into a held ephemeral directory and run an exact argv inside a fail-closed OS capsule, emitting a signed receipt. Enforceable on x86_64 Linux only; every other host refuses before anything is copied or spawned, and there is no degraded fallback |
+| `tirith capsule run --preset untrusted-project --project <dir> -- <cmd>` | Copy an untrusted project into a held ephemeral directory and run an exact argv inside a fail-closed OS capsule, emitting a signed receipt. Enforceable on native x86_64 and AArch64 Linux with usable Landlock and seccomp; hosts missing required controls refuse before anything is copied or spawned, and there is no degraded fallback |
 | `tirith taint {list,explain,clear}` | Track files downloaded from risky sources; executing or sourcing a tainted file fires a finding |
 | `tirith intend "<intent>" -- <cmd>` | Flag high-impact behavior the stated intent does not justify (advisory) |
 | `tirith task check` | Preview. Diagnostically assess an untrusted task envelope (issue body, PDF, web page) and report which effects it would be allowed. Executes nothing, fetches nothing, resolves no package, writes nothing, and declares `enforceability: observe_only` (`--file`, `--adapter`, `--format json`) |
@@ -37,7 +38,7 @@ covers the everyday subset; this is the complete reference.
 | `tirith status` | "Am I protected?": protection mode, hook health, active policy, threat-DB freshness; exits non-zero when protection is provably reduced (`--json`) |
 | `tirith doctor` | Diagnose install / hooks / policy. `--fix` auto-fixes, `--compat` is a shell/terminal report, `--quick` is a fast pollable snapshot (`--format json`) |
 | `tirith prompt-status` | One-line protection and active-context indicator for your prompt (`--short`, `--json`; 30s cache) |
-| `tirith dashboard {export,serve}` | Local-only HTML security dashboard from your audit log, policy, and trust store (`serve` binds loopback with an ephemeral token) |
+| `tirith dashboard` | Open authenticated loopback controls for personal setup, protection, exceptions, history, project review and lifecycle operations (`--no-browser --json` for headless access); `export` retains the static report route |
 | `tirith warnings` | Session warnings (`--summary` for shell exit hooks, `--clear`, `--format json`) |
 | `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
 | `tirith logs {scan,summarize,redact}` | Review agent / CLI logs for injection seeds, secrets, and escape bytes (`summarize --safe-for-agent`) |
@@ -50,6 +51,8 @@ covers the everyday subset; this is the complete reference.
 | `tirith init` | Print the shell hook for your profile (`--prompt-status` adds the prompt snippet) |
 | `tirith onboard` | Guided first-run wizard: detect the environment and recommend a policy template (`--apply`) |
 | `tirith setup <tool>` | One-command setup for 19 named hosts: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, and windsurf (`--scope`, `--with-mcp`, `--dry-run`, `--update-configs`) |
+| `tirith setup recommended` | Apply one personal shell/profile plan (`--scope user --shell bash --profile balanced`); `--dry-run` writes nothing and `--plan-only` saves a review for later apply |
+| `tirith setup shell` | Set up, repair (`--force`) or remove owned startup blocks (`--remove`) for an explicit `--shell`; activation and verified blocking are separate |
 | `tirith install <backend> <args>` | Recorded, risk-analyzed install across npm / pip / cargo / apt / brew / dnf / yum / pacman / scoop / docker / go / url (`--online`, `--no-exec`, `--yes`, `--sha256`) |
 | `tirith verify-self` / `update` / `version --provenance` | Verify the running binary, signature-verified self-update, and build / install provenance |
 | `tirith browser {host,install-extension}` | Install the Chrome native-messaging host that records clipboard provenance |
@@ -61,7 +64,7 @@ covers the everyday subset; this is the complete reference.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith policy {init,validate,test,tune,effective}` | Scaffold (`--template`), validate, dry-run, suggest from audit, and show the resolved effective policy with any neutralized repo fields |
+| `tirith policy {init,validate,test,tune,effective}` | Scaffold (`--template`), validate, dry-run, suggest from audit, and inspect policy. `effective` defaults to a local-only diagnostic; `effective --runtime` uses the enforcement resolver, including configured remote policy and separate overlays ([coverage](next-cycle/policy-snapshots.md)) |
 | `tirith trust {add,list,explain,diff,remove,gc,last,from-last-trigger}` | Manage trusted patterns (narrow scope, 30-day TTL by default); `from-last-trigger` turns a block into a targeted trust |
 | `tirith rule {test,validate,explain}` | Author and test custom detection rules (regex or the `when:` semantic DSL) |
 | `tirith output wrap {on,off,status}` | Install or remove the `tirith-out` wrapper that runs a command's output through `tirith view` |
@@ -102,7 +105,7 @@ covers the everyday subset; this is the complete reference.
 | Command | What it does |
 |---------|-------------|
 | `tirith pkg approve <backend> <spec>` | Resolve and inspect a requirement set and approve its install plan, printing the plan digest the approval binds to. Does not install |
-| `tirith pkg install <backend> <spec>` | Resolve, inspect, and install only the verified hash-pinned bytes inside the containment capsule, with a tamper-evident receipt. Enforcing execution is x86_64 Linux-only; every other platform fails closed before pip starts |
+| `tirith pkg install <backend> <spec>` | Currently disabled on every host pending private-input qualification. Refuses with `private_input_execution_unqualified` before resolver, quarantine, checkpoint, or package execution; flags and elevation do not enable it |
 | `tirith pkg verify-env` | Verify an already-installed environment's RECORD integrity without installing anything |
 | `tirith pkg trust-tool` | Enroll a fully static native Linux `uv` executable by canonical path and SHA-256 |
 | `tirith pkg graph` | Compose a provenance graph (ownership / execution / payload) over a wheel set or an installed environment. Read model only |
@@ -126,7 +129,7 @@ covers the everyday subset; this is the complete reference.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith audit {export,stats,report,verify}` | Audit-log management; `verify` checks the tamper-evident hash chain (`--expected-head`) |
+| `tirith audit {recent,feedback,rotate,export-segment,delete-segment,export,stats,report,verify}` | Bounded recent history, intent annotations, reviewed retention/export/deletion and reports; deletion requires `--acknowledge-irreversible`, while `verify` checks the active tamper-evident chain |
 | `tirith incident {start,stop,status,report}` | Declare an "under attack" posture: fail-closed, bypass disabled, key rules elevated |
 | `tirith checkpoint {create,list,restore,diff,purge,watch}` | Snapshot files before risky operations in the private per-user state directory; `restore` sha256-verifies each blob and reports per-file outcomes. Releases before 0.4.0 may have left data under `/tmp/tirith/checkpoints`; inspect and remove that legacy directory manually. |
 | `tirith pending {list,resolve,export}` | Pending-decision registry for deferred blocks, suppressed-finding rollups, and restore prompts |

@@ -12,6 +12,9 @@ if set -q _TIRITH_FISH_LOADED
 end
 set -g _TIRITH_FISH_LOADED 1
 
+# A fresh load must not retain an inherited or failed integration label.
+set -e TIRITH_INTEGRATION_VERSION; set -e TIRITH_INTEGRATION_SHELL
+
 # Session tracking: generate ID per shell session if not inherited
 if not set -q TIRITH_SESSION_ID
     set -gx TIRITH_SESSION_ID (builtin printf '%x-%x-%x-%x' \
@@ -89,7 +92,8 @@ end
 # Receipt protocol state. Registration itself happens further down, after the
 # capture-file helpers are defined.
 set -g _TIRITH_RECEIPT_PROTOCOL 0
-set -g _TIRITH_RECEIPT_INSTANCE ""
+# A supplied exported placeholder must not export the newly registered capability.
+set -gu _TIRITH_RECEIPT_INSTANCE ""
 set -g _TIRITH_RECEIPT_REGISTER_ERROR ""
 set -g _TIRITH_RECEIPT_SHELL_PID "$fish_pid"
 set -g _TIRITH_RECEIPT_FAMILY fish
@@ -133,6 +137,7 @@ function _tirith_escape_preview
 end
 
 function _tirith_receipt_consume_at
+    set -l fish_trace
     set -l token "$argv[1]"
     set -l command_text "$argv[2]"
     set -l original_cwd "$argv[3]"
@@ -149,6 +154,7 @@ function _tirith_receipt_consume_at
 end
 
 function _tirith_receipt_reconcile_at
+    set -l fish_trace
     set -l token "$argv[1]"
     set -l original_cwd "$argv[2]"
     test $_TIRITH_V3_HELPERS_READY -eq 1; or return 1
@@ -164,6 +170,7 @@ function _tirith_receipt_reconcile_at
 end
 
 function _tirith_receipt_discard_at
+    set -l fish_trace
     set -l token "$argv[1]"
     set -l original_cwd "$argv[2]"
     test $_TIRITH_V3_HELPERS_READY -eq 1; or return 1
@@ -179,6 +186,7 @@ function _tirith_receipt_discard_at
 end
 
 function _tirith_unresolved_receipt_cleanup
+    set -l fish_trace
     set -l token "$_TIRITH_UNRESOLVED_RECEIPT"
     set -l original_cwd "$_TIRITH_UNRESOLVED_RECEIPT_CWD"
     test -n "$token"; or return 0
@@ -191,6 +199,7 @@ function _tirith_unresolved_receipt_cleanup
 end
 
 function _tirith_receipt_discard_or_retain
+    set -l fish_trace
     set -l token "$argv[1]"
     set -l original_cwd "$argv[2]"
     test -n "$token"; and test -n "$original_cwd"; or return 1
@@ -241,6 +250,9 @@ end
 # Register with a plain redirected foreground command rather than a command
 # substitution, matching the bash and zsh hooks, and keep the failure reason
 # for the status warning below instead of discarding it.
+# The empty function/block-local value suppresses fish tracing; "0" does not.
+begin
+    set -l fish_trace
 if status is-interactive
     and test $_TIRITH_V3_HELPERS_READY -eq 1
     and test (command "$_TIRITH_BIN" __execution-receipt capability 2>/dev/null) = "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3"
@@ -264,6 +276,7 @@ if status is-interactive
     else
         _tirith_v3_cleanup_registration_files "$register_out" "$register_err"
     end
+end
 end
 
 function _tirith_receipt_exit --on-event fish_exit
@@ -362,7 +375,7 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
         set -l tmpfile (_tirith_v3_new_capture_file)
         set -l capture_status $status
         if test $capture_status -ne 0
-            _tirith_output "tirith: secure paste capture unavailable; paste blocked for safety"
+            _tirith_output "tirith: secure paste capture unavailable; paste blocked for safety. tirith: recovery: open a separate terminal with fish --no-config, inspect tirith doctor --quick, pinned helpers and writable TMPDIR, then restart and verify. Pre-binary hook failures cannot be repaired with TIRITH=0."
             commandline -f repaint
             return
         end
@@ -406,6 +419,7 @@ if functions -q fish_clipboard_paste; and not functions -q _tirith_original_fish
 end
 
 function _tirith_check_command
+    set -l fish_trace
     set -l cmd (commandline)
 
     # Never create or deliver a second receipt while recovery of an older one is
@@ -440,7 +454,7 @@ function _tirith_check_command
             if test -n "$outfile"
                 _tirith_v3_remove_capture_files "$outfile" >/dev/null 2>&1
             end
-            _tirith_output "tirith: secure execution-receipt capture unavailable; command blocked"
+            _tirith_output "tirith: secure execution-receipt capture unavailable; command blocked. tirith: recovery: open a separate terminal with fish --no-config, inspect tirith doctor --quick, pinned helpers and writable TMPDIR, then restart and verify. Pre-binary hook failures cannot be repaired with TIRITH=0."
             commandline -r ""
             commandline -f repaint
             return 1
@@ -449,8 +463,15 @@ function _tirith_check_command
         set -lx _TIRITH_RECEIPT_INSTANCE "$_TIRITH_RECEIPT_INSTANCE"
         set -lx _TIRITH_RECEIPT_SHELL_PID "$_TIRITH_RECEIPT_SHELL_PID"
         set -lx _TIRITH_RECEIPT_FAMILY "$_TIRITH_RECEIPT_FAMILY"
+        if string match -q "_tirith_verification_probe *" -- "$cmd"
+            set -l verification_capture (_tirith_verification_state | string collect)
+            set -lx _TIRITH_VERIFICATION_CAPTURE 1
+            builtin printf '%s\n' "$verification_capture" | command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell fish \
+            --execution-receipt fish -- "$cmd" >$outfile 2>$errfile
+        else
         command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell fish \
             --execution-receipt fish -- "$cmd" >$outfile 2>$errfile
+        end
     else
         set outfile (_tirith_v3_new_capture_file)
         set -l outfile_status $status
@@ -463,7 +484,7 @@ function _tirith_check_command
             if test -n "$outfile"
                 _tirith_v3_remove_capture_files "$outfile" >/dev/null 2>&1
             end
-            _tirith_output "tirith: secure preflight capture unavailable; command blocked"
+            _tirith_output "tirith: secure preflight capture unavailable; command blocked. tirith: recovery: open a separate terminal with fish --no-config, inspect tirith doctor --quick, pinned helpers and writable TMPDIR, then restart and verify. Pre-binary hook failures cannot be repaired with TIRITH=0."
             commandline -r ""
             commandline -f repaint
             return 1
@@ -762,6 +783,55 @@ if status is-interactive
             _tirith_output "$_TIRITH_RECEIPT_REGISTER_ERROR"
         end
     end
+end
+
+# This capture stays in memory and includes the helper itself and native
+# bindings. Only the internal binary hashes it; raw definitions are not saved.
+function _tirith_verification_state
+    builtin printf 'tirith-loaded-shell-v1\n'
+    for name in (builtin functions --names --all)
+        if string match -q '_tirith_*' -- "$name"
+            builtin functions "$name"
+        end
+    end
+    builtin functions fish_user_key_bindings
+    builtin bind
+    builtin printf 'protocol=%s protection=%s bypass=%s keybindings=%s\n' \
+        "$_TIRITH_RECEIPT_PROTOCOL" "$TIRITH_STATUS" "$TIRITH" "$fish_key_bindings"
+end
+
+function _tirith_verification_probe
+    set -l fish_trace
+    set -l action
+    set -l id_args
+    if test (count $argv) -eq 1; and test "$argv[1]" = start
+        set action start
+    else if test (count $argv) -eq 2; and contains -- "$argv[2]" allowed blocked status
+        set action "$argv[2]"
+        set id_args --id "$argv[1]"
+    else
+        builtin printf '%s\n' 'tirith: use _tirith_verification_probe start, then its exact challenge commands' >&2
+        return 2
+    end
+    if test "$_TIRITH_RECEIPT_PROTOCOL" != 3
+        builtin printf '%s\n' 'tirith: authenticated shell verification requires the current protocol-v3 hook' >&2
+        return 1
+    end
+    set -l loaded_state (_tirith_verification_state | string collect)
+    or return 1
+    set -lx _TIRITH_RECEIPT_INSTANCE "$_TIRITH_RECEIPT_INSTANCE"
+    set -lx _TIRITH_RECEIPT_SHELL_PID "$_TIRITH_RECEIPT_SHELL_PID"
+    set -lx _TIRITH_RECEIPT_FAMILY "$_TIRITH_RECEIPT_FAMILY"
+    builtin printf '%s\n' "$loaded_state" | command "$_TIRITH_BIN" __shell-verification "$action" --channel fish $id_args
+end
+
+# Report loaded code only after this fresh initialization reaches installation.
+if status is-interactive
+    set -gx TIRITH_INTEGRATION_VERSION unknown
+    if set -q _TIRITH_INIT_VERSION; and test -n "$_TIRITH_INIT_VERSION"
+        set -gx TIRITH_INTEGRATION_VERSION "$_TIRITH_INIT_VERSION"
+    end
+    set -gx TIRITH_INTEGRATION_SHELL fish
 end
 
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────

@@ -8,7 +8,7 @@
 //! (`MIN_OBSERVATIONS`); below that, [`analyze`] returns an empty list and sets
 //! `data_is_thin` so the caller says "not enough data" rather than guessing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -35,14 +35,18 @@ pub struct RuleStats {
     pub allowed: usize,
     /// Records where the final action was `Warn` or `WarnAck`.
     pub warned: usize,
+    /// Records with a final Block decision that also contained this rule.
+    /// Multiple rules can contribute; this count does not identify causality
+    /// or establish that a host actually withheld execution.
     pub blocked: usize,
     /// Records with an honored `TIRITH=0` bypass.
     pub bypassed: usize,
 }
 
 impl RuleStats {
-    /// Records the user effectively waved through (`Allow` or honored bypass) —
-    /// the signal the rule is firing on something the user doesn't see as a threat.
+    /// Records allowed by the policy or carrying an honored bypass.
+    /// This is an observation of a decision, not evidence of user intent,
+    /// execution, or a validated false positive.
     fn waved_through(&self) -> usize {
         // `allowed` and `bypassed` overlap (a bypass is logged as Allow); max
         // avoids double-counting.
@@ -90,6 +94,25 @@ pub struct TuneReport {
     pub suggestions: Vec<TuneSuggestion>,
 }
 
+impl TuneReport {
+    /// Repeated blocked checks, kept separate from relaxation suggestions.
+    /// Available even with a thin history; counts are observations, not a
+    /// conclusion that any finding was a false positive.
+    pub fn recurring_blocks(&self) -> Vec<&RuleStats> {
+        let mut recurring: Vec<_> = self
+            .rule_stats
+            .iter()
+            .filter(|stats| stats.blocked >= MIN_RULE_FIRINGS)
+            .collect();
+        recurring.sort_by(|a, b| {
+            b.blocked
+                .cmp(&a.blocked)
+                .then_with(|| a.rule_id.cmp(&b.rule_id))
+        });
+        recurring
+    }
+}
+
 /// Roll up per-rule statistics from audit records. Only `verdict` records are
 /// counted; returned sorted by `total` descending, then `rule_id`.
 pub fn compute_rule_stats(records: &[AuditRecord]) -> Vec<RuleStats> {
@@ -97,13 +120,16 @@ pub fn compute_rule_stats(records: &[AuditRecord]) -> Vec<RuleStats> {
 
     for record in records.iter().filter(|r| is_verdict(r)) {
         let action = record.action.to_ascii_lowercase();
-        for rule_id in &record.rule_ids {
+        // One finding may repeat within a verdict (e.g. several URLs). These
+        // are record counts, so a rule contributes at most once per check.
+        let unique_rules: BTreeSet<_> = record.rule_ids.iter().collect();
+        for rule_id in unique_rules {
             let stats = by_rule.entry(rule_id.clone()).or_default();
             stats.rule_id = rule_id.clone();
             stats.total += 1;
             match action.as_str() {
                 "allow" => stats.allowed += 1,
-                "warn" | "warnack" => stats.warned += 1,
+                "warn" | "warnack" | "warn_ack" => stats.warned += 1,
                 "block" => stats.blocked += 1,
                 _ => {}
             }
@@ -146,14 +172,14 @@ pub fn analyze(records: &[AuditRecord], known_rule_ids: &[&str]) -> TuneReport {
 
     let mut suggestions = Vec::new();
 
-    // Suggestion 1 — a rule that fires often and is (nearly) always waved
-    // through: the strongest signal the user isn't acting on it.
+    // Suggestion 1 — a recurring rule in allowed checks. This identifies
+    // commands to review, not an inference that they are legitimate.
     for stats in &rule_stats {
         if stats.total < MIN_RULE_FIRINGS {
             continue;
         }
         let waved = stats.waved_through();
-        // Never suggest downgrading a rule the user sometimes blocks on.
+        // A blocked final decision is never evidence for a safe relaxation.
         if stats.blocked > 0 {
             continue;
         }
@@ -164,7 +190,7 @@ pub fn analyze(records: &[AuditRecord], known_rule_ids: &[&str]) -> TuneReport {
                 rule_id: stats.rule_id.clone(),
                 confidence: Confidence::Strong,
                 observation: format!(
-                    "Rule '{}' fired {} time(s) and was allowed or bypassed every time — never blocked.",
+                    "Rule '{}' appeared in {} check(s), all allowed or bypassed; no blocked decisions were recorded.",
                     stats.rule_id, stats.total
                 ),
                 recommendation: format!(
@@ -182,12 +208,12 @@ pub fn analyze(records: &[AuditRecord], known_rule_ids: &[&str]) -> TuneReport {
                 rule_id: stats.rule_id.clone(),
                 confidence: Confidence::Moderate,
                 observation: format!(
-                    "Rule '{}' fired {} time(s); {} were allowed or bypassed and none were blocked.",
+                    "Rule '{}' appeared in {} check(s); {} were allowed or bypassed and none had a blocked decision.",
                     stats.rule_id, stats.total, waved
                 ),
                 recommendation: format!(
-                    "'{}' is mostly being waved through. Review those commands: if they share a \
-                     trusted source, an allowlist entry is cleaner than repeatedly bypassing.",
+                    "Most checks containing '{}' were allowed. Review the commands and sources \
+                     before considering a scoped allowlist entry; these counts do not establish safety.",
                     stats.rule_id
                 ),
                 policy_snippet: None,
@@ -255,7 +281,7 @@ fn confidence_rank(c: Confidence) -> u8 {
 /// severity (lowering one is a judgement call only they can make).
 fn severity_override_snippet(rule_id: &str) -> String {
     format!(
-        "# Reviewed and trusted? Lower the severity (pick LOW/MEDIUM yourself):\nseverity_overrides:\n  {rule_id}: LOW   # or MEDIUM — your call after reviewing the commands"
+        "# For a policy scope authorized to lower severity; repository overrides are ignored.\n# Review `tirith policy effective --runtime` and the matching commands first.\nseverity_overrides:\n  {rule_id}: LOW   # or MEDIUM — your call after reviewing the commands"
     )
 }
 
@@ -522,5 +548,55 @@ mod tests {
         assert!(report.data_is_thin);
         assert_eq!(report.records_analyzed, 0);
         assert!(report.suggestions.is_empty());
+    }
+    #[test]
+    fn recurring_blocks_are_reported_without_relaxation_even_with_thin_history() {
+        for count in [MIN_RULE_FIRINGS, MIN_OBSERVATIONS] {
+            let report = analyze(&n_records(count, "Block", "curl_pipe_shell", false), &[]);
+            assert!(report.suggestions.is_empty());
+            let recurring = report.recurring_blocks();
+            assert_eq!(recurring.len(), 1);
+            assert_eq!(recurring[0].blocked, count);
+            assert_eq!(recurring[0].total, count);
+        }
+    }
+
+    #[test]
+    fn recurring_blocks_sort_by_blocked_checks_not_total_firings() {
+        let mut records = n_records(6, "Block", "curl_pipe_shell", false);
+        records.extend(n_records(5, "Block", "shortened_url", false));
+        records.extend(n_records(20, "Allow", "shortened_url", false));
+        let report = analyze(&records, &[]);
+        let recurring = report.recurring_blocks();
+        assert_eq!(recurring[0].rule_id, "curl_pipe_shell");
+        assert_eq!(recurring[1].rule_id, "shortened_url");
+    }
+
+    #[test]
+    fn repeated_findings_in_a_single_check_do_not_inflate_counts() {
+        let record = verdict_record(
+            "Block",
+            &["curl_pipe_shell", "curl_pipe_shell", "shortened_url"],
+            false,
+        );
+        let report = analyze(&[record], &[]);
+        assert_eq!(report.records_analyzed, 1);
+        assert_eq!(report.rule_stats.len(), 2);
+        assert!(report
+            .rule_stats
+            .iter()
+            .all(|stats| stats.total == 1 && stats.blocked == 1));
+        assert!(report.recurring_blocks().is_empty());
+    }
+
+    #[test]
+    fn legacy_and_machine_confirmation_spellings_count_as_warnings() {
+        let records = vec![
+            verdict_record("WarnAck", &["shortened_url"], false),
+            verdict_record("warn_ack", &["shortened_url"], false),
+        ];
+        let stats = compute_rule_stats(&records);
+        assert_eq!(stats[0].warned, 2);
+        assert_eq!(stats[0].allowed, 0);
     }
 }

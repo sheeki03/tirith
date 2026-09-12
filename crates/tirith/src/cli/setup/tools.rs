@@ -400,6 +400,23 @@ where
     }
 }
 
+fn claude_hook_command(opts: &SetupOpts) -> Result<String, String> {
+    let python = quoted_python_bin(opts)?;
+    let command = match opts.scope {
+        Scope::Project => {
+            format!(r#"{python} "${{CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/tirith-check.py""#)
+        }
+        Scope::User => format!(r#"{python} "$HOME/.claude/hooks/tirith-check.py""#),
+    };
+    // Claude treats launch errors and other nonzero exits as nonblocking.
+    // Keep the fixed POSIX shell alive so a missing interpreter or crashed
+    // hook maps to its documented PreToolUse blocking exit code. Windows
+    // launch semantics require native qualification before adding a wrapper.
+    #[cfg(unix)]
+    let command = format!("{command} || exit 2");
+    Ok(command)
+}
+
 pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     let target = match opts.scope {
@@ -435,13 +452,7 @@ pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {
     }
 
     let settings_path = target.join("settings.json");
-    let python = quoted_python_bin(opts)?;
-    let hook_command = match opts.scope {
-        Scope::Project => {
-            format!(r#"{python} "${{CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/tirith-check.py""#)
-        }
-        Scope::User => format!(r#"{python} "$HOME/.claude/hooks/tirith-check.py""#),
-    };
+    let hook_command = claude_hook_command(opts)?;
     merge::merge_claude_settings(
         &settings_path,
         &scope_root,
@@ -4795,6 +4806,63 @@ mod tests {
             result.is_err(),
             "containment check should fail when target is outside scope_root"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_launcher_preserves_quoted_identity_and_maps_launch_failures_to_blocking_exit() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let interpreter = root.path().join("Python's $literal executable");
+        let user_home = root.path().join("user's $HOME");
+        let project = root.path().join("project's $(literal)");
+        std::fs::create_dir_all(&user_home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let record = root.path().join("actual-hook-argument");
+        for scope in [Scope::User, Scope::Project] {
+            let mut opts = opts_for(scope);
+            opts.python_bin = Some(interpreter.display().to_string());
+            let command = claude_hook_command(&opts).unwrap();
+            let invoke = || {
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", &command])
+                    .env_clear()
+                    .env("HOME", &user_home)
+                    .env("CLAUDE_PROJECT_DIR", &project)
+                    .env("TIRITH_TEST_ARGUMENT_RECORD", &record)
+                    .output()
+                    .unwrap()
+            };
+            assert_eq!(
+                invoke().status.code(),
+                Some(2),
+                "missing interpreter must block"
+            );
+            for (body, code) in [
+                ("printf 'fixture-output'; exit 0", 0),
+                ("exit 1", 2),
+                ("kill -KILL $$", 2),
+            ] {
+                std::fs::write(&interpreter, format!("#!/bin/sh\nprintf '%s' \"$1\" > \"$TIRITH_TEST_ARGUMENT_RECORD\"\n{body}\n")).unwrap();
+                std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let result = invoke();
+                assert_eq!(result.status.code(), Some(code));
+                if code == 0 {
+                    assert_eq!(result.stdout, b"fixture-output");
+                }
+                let expected = match scope {
+                    Scope::User => &user_home,
+                    Scope::Project => &project,
+                }
+                .join(".claude/hooks/tirith-check.py");
+                assert_eq!(
+                    std::fs::read_to_string(&record).unwrap(),
+                    expected.display().to_string()
+                );
+            }
+            std::fs::remove_file(&interpreter).unwrap();
+        }
     }
 
     fn opts_for(scope: Scope) -> SetupOpts {

@@ -371,6 +371,7 @@ fn release_workflow_keeps_manual_dispatch_non_publishing() {
         "build",
         "smoke-test",
         "linux-runtime-compat",
+        "native-arm-runtime",
         "build-deb",
         "build-rpm",
         "rpm-runtime-compat",
@@ -700,6 +701,33 @@ fn release_publication_refuses_mutable_inputs_and_version_conflicts() {
 }
 
 #[test]
+fn linux_packages_do_not_depend_on_or_suggest_sudo() {
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml")).unwrap();
+    let deb = &manifest["package"]["metadata"]["deb"];
+    assert_eq!(deb["depends"].as_str(), Some("ca-certificates"));
+    assert!(deb.get("suggests").is_none());
+    assert!(deb.get("recommends").is_none());
+
+    let spec = std::fs::read_to_string(repository_root.join("packaging/rpm/tirith.spec"))
+        .expect("read RPM spec");
+    let requires: Vec<_> = spec
+        .lines()
+        .filter_map(|line| line.strip_prefix("Requires:"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(requires, ["ca-certificates"]);
+    for weak_dependency in ["Suggests:", "Recommends:", "Supplements:", "Enhances:"] {
+        assert!(!spec.lines().any(|line| line.starts_with(weak_dependency)));
+    }
+
+    let pkgbuild = std::fs::read_to_string(repository_root.join("packaging/aur/PKGBUILD"))
+        .expect("read AUR PKGBUILD");
+    assert!(pkgbuild.lines().any(|line| line == "depends=('gcc-libs')"));
+    assert!(!pkgbuild.lines().any(|line| line.starts_with("optdepends")));
+}
+
+#[test]
 fn linux_release_keeps_glibc_and_canonical_package_contracts() {
     let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let workflow_path = repository_root.join(".github/workflows/release.yml");
@@ -880,6 +908,36 @@ fn linux_release_keeps_glibc_and_canonical_package_contracts() {
             && rpm_runs.contains(r#"rpm_output="${RUNNER_TEMP}/tirith-rpm-output""#),
         "the RPM tool container must receive a read-only checkout and a narrowly writable output mount"
     );
+
+    for (job_name, installation, installed_state, forbidden_bypass) in [
+        (
+            "build-deb",
+            "dpkg -i /workspace/tirith_*.deb",
+            "install ok installed",
+            "dpkg --unpack",
+        ),
+        (
+            "rpm-runtime-compat",
+            "rpm -Uvh --replacepkgs /packages/tirith-*.x86_64.rpm",
+            "rpm -q tirith",
+            "--nodeps",
+        ),
+    ] {
+        let runs = joined_run_scripts(workflow_job(jobs, job_name));
+        assert!(
+            runs.contains(installation) && runs.contains(installed_state),
+            "{job_name} must install a fully configured package with dependency validation"
+        );
+        assert!(
+            !runs.contains(forbidden_bypass),
+            "{job_name} must not bypass dependency validation with {forbidden_bypass:?}"
+        );
+        assert_eq!(
+            runs.matches("test ! -e /usr/bin/sudo").count(),
+            2,
+            "{job_name} must prove sudo is absent before and after installation"
+        );
+    }
 
     let smoke_path = repository_root.join(".github/scripts/smoke-linux-release.sh");
     let smoke = std::fs::read_to_string(smoke_path).expect("read Linux release smoke script");

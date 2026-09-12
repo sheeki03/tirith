@@ -54,7 +54,8 @@ pub struct ApprovalMetadata {
 }
 
 /// `Some(ApprovalMetadata)` if a verdict triggers any policy approval rule.
-/// Team-tier feature: callers should gate on tier before calling.
+/// This policy gate applies at every supported execution boundary. A caller
+/// without an interactive approval channel must refuse pending approval.
 pub fn check_approval(verdict: &Verdict, policy: &Policy) -> Option<ApprovalMetadata> {
     if policy.approval_rules.is_empty() {
         return None;

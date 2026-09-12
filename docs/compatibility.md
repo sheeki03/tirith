@@ -43,7 +43,8 @@ what an experimental command must satisfy to move to stable.
 | `threat-db` | Experimental | Threat-DB `update` / `status` / `explain` / `sources` / `health` / `diff`. |
 | `package risk` / `package explain` / `package scan` | Experimental | Advisory package-name, local-content, installed-tree, and optional registry-provenance analysis. Does not enforce an install. |
 | `package inspect` | Experimental | Local-only verdict over wheel artifacts, artifact sets, or installed Python environments. No implicit download. |
-| `pkg approve` / `pkg install` | Experimental | Enforcing pip approval/install path on x86_64 Linux only. Unsupported systems refuse before pip starts; npm and Cargo are not enforcing backends. |
+| `pkg approve` | Experimental | Non-installing pip approval flow subject to its native authority and platform requirements. An approval cannot enable the disabled package-install backend. |
+| `pkg install` | Experimental | Disabled on every host: `private_input_execution_unqualified` refuses before resolver, quarantine, checkpoint, or package execution. Flags and elevation cannot enable it. Local inspection, `pkg verify-env`, ordinary command checks, and shell protection remain available. |
 | `pkg verify-env` | Experimental | Read-only RECORD verification of an installed Python environment. |
 | `pkg graph` / `pkg diff` / `pkg attest` / `pkg receipt` | Experimental | Provenance, differential, attestation-binding, and receipt evidence. Graph and attestation are not auto-allow decisions. |
 | `mcp lock` / `mcp verify` / `mcp diff` | Experimental | Source-qualified MCP config and descriptor drift. `verify` is the gating command; `diff` is informational. |
@@ -157,7 +158,7 @@ warning.
 
 ## JSON Output
 
-- `schema_version` is emitted in all JSON output (currently version 3)
+- Command-check JSON defaults to `schema_version: 3` with its existing fields. `tirith check --format json --json-schema 4` explicitly adds typed recovery advice; it keeps the same decision and exit code. Other commands retain their own documented schema versions.
 - Version 3 changes: added `Info` severity level (maps to `Allow` action), added `httpie_pipe_shell` and `xh_pipe_shell` rule IDs
 - JSON fields are additive only: new fields may appear in any release
 - Existing fields will not be removed or change type within a major version

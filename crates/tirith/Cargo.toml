@@ -140,6 +140,7 @@ windows = { version = "0.62", default-features = false, features = [
     "Win32_Security_Isolation",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_JobObjects",
@@ -148,12 +149,13 @@ windows = { version = "0.62", default-features = false, features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"
 section = "utils"
-depends = "ca-certificates, sudo"
+depends = "ca-certificates"
 # Paths relative to crates/tirith/ (NOT repo root)
 assets = [
     ["target/release/tirith", "usr/bin/", "755"],

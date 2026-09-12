@@ -3758,7 +3758,11 @@ fn emit_combined_json(
         }),
     };
     append_install_policy_diagnostics_json(&mut combined, compiled);
-    tirith_core::redact::redact_json_strings(&mut combined, compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut combined,
+        tirith_core::output_contract::Projection::Install,
+        compiled,
+    );
     let combined = tirith_core::verdict::bound_json_value_for_output(combined);
     write_json_stdout(&combined)
 }
@@ -4535,7 +4539,11 @@ fn build_url_transaction_json(
         "dropped_findings_count": dropped_findings_count,
     });
     append_install_policy_diagnostics_json(&mut out, &compiled);
-    tirith_core::redact::redact_json_strings(&mut out, &compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut out,
+        tirith_core::output_contract::Projection::InstallUrl,
+        &compiled,
+    );
     tirith_core::verdict::bound_json_value_for_output(out)
 }
 

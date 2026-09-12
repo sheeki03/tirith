@@ -7,17 +7,26 @@
 // Unix fs_helpers uses PermissionsExt for chmod; Windows uses no-op shims.
 #[cfg_attr(unix, path = "fs_helpers.rs")]
 #[cfg_attr(not(unix), path = "fs_helpers_windows.rs")]
-mod fs_helpers;
+pub(crate) mod fs_helpers;
 
 mod fs_transaction;
+pub(crate) use fs_transaction::{write_private_notice_bounded, TransactionOutcome};
+
+pub(crate) mod audit_segments;
+pub(crate) mod audit_service;
+pub(crate) mod change_plan;
+pub(crate) mod recommended;
 
 // Compile Windows containment/ACL policy tests on Unix CI as pure tests.
 #[cfg(all(test, unix))]
 #[path = "fs_helpers_windows_path.rs"]
 mod fs_helpers_windows_path;
 
+mod claude_config;
+mod claude_service;
 mod merge;
 mod shell_profile;
+pub(crate) mod shell_service;
 mod tools;
 pub(crate) use shell_profile::shell_quote;
 pub(crate) use tools::{
@@ -287,7 +296,7 @@ mod run_impl {
     /// when it currently resolves to the exact executable identity that entered
     /// setup. This lets package-manager upgrades retarget the stable alias
     /// without leaving generated configuration pinned to a removed version.
-    fn resolve_tirith_bin(_dry_run: bool) -> Result<String, String> {
+    pub(super) fn resolve_tirith_bin(_dry_run: bool) -> Result<String, String> {
         let current = tirith_core::trusted_child::TrustedExecutable::current().map_err(|error| {
             format!(
                 "running tirith executable could not be validated for generated security configuration: {error}"

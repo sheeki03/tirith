@@ -60,6 +60,11 @@ path = "fuzz_targets/artifact_wheel.rs"
 doc = false
 
 [[bin]]
+name = "npm_artifact"
+path = "fuzz_targets/npm_artifact.rs"
+doc = false
+
+[[bin]]
 name = "lexical_path"
 path = "fuzz_targets/lexical_path.rs"
 doc = false

@@ -120,6 +120,40 @@ cleanly** — never fails — when a prerequisite is missing:
 
 ## Current coverage
 
+Development test success is distinct from installed candidate certification.
+`scripts/certify-shell-package.py` takes a release tar/zip, its extracted binary,
+and the compiled `shell_conformance` harness. It verifies that the binary bytes
+match the package, initializes only that binary's embedded hook bundle in a
+disposable home, and runs the available native Bash/Zsh/Fish PTY suites. It fails
+if initialization selects external hooks, any requested shell is unavailable,
+a required test skips, or an assertion fails. Package, binary, harness, hook and
+shell identities, OS details, test names and logs are recorded in the JSON report.
+
+```sh
+python3 scripts/certify-shell-package.py \
+  --package /absolute/path/tirith-candidate.tar.gz \
+  --binary /absolute/path/extracted/tirith \
+  --harness /absolute/path/target/debug/deps/shell_conformance-HASH \
+  --report /absolute/path/shell-certification.json
+```
+
+The harness accepts paired `TIRITH_CERTIFY_BINARY` and
+`TIRITH_CERTIFY_HOOK_DIR` overrides for a prepared candidate; explicit invalid or
+partial overrides fail. `TIRITH_CERTIFY_SHELLS` lists mandatory shell families,
+with exact executable paths pinned by `TIRITH_CERTIFY_BASH`,
+`TIRITH_CERTIFY_ZSH` and `TIRITH_CERTIFY_FISH`. These variables affect test code
+only. Ordinary development runs retain optional prerequisites.
+
+The resulting supported state applies only to the measured package and covered
+interactive modes. Native Windows PowerShell, Unix PowerShell, Nushell and actual
+agent-host invocation remain explicitly unavailable in this runner. Their
+configuration files and mocked hook events cannot extend its certification.
+A separate [native Claude host checkpoint](next-cycle/claude-native-evidence.md)
+records actual host invocation with a scripted loopback provider, exact matcher
+scope, and observed launch/timeout failure boundaries.
+The block fixtures use local inert pipelines plus allowed-once controls so
+network failure cannot masquerade as successful interception.
+
 | Shell / mode | Invariants covered | Status |
 |--------------|--------------------|--------|
 | bash — preexec (DEBUG-trap, warn-only) | a, b, c, e, g | Passing |
@@ -244,9 +278,9 @@ and a modern Bash PTY.
 
 ## Follow-up
 
-- **zsh / PowerShell / nushell PTY conformance.** The harness is
+- **PowerShell / nushell PTY conformance.** The harness is
   shell-agnostic; each shell needs a spawn helper and its delivery quirks
-  encoded (zsh `zle` widget, PowerShell PSReadLine handler, nushell hook
+  encoded (PowerShell PSReadLine handler, nushell hook
   model). Tracked as M0.1 follow-up; placeholder `#[ignore]`d tests mark the
   gap. PowerShell PTY coverage can validate preflight delivery, but cannot turn
   the intentionally unsupported strict receipt into an execution-proof claim.

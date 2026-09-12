@@ -136,7 +136,7 @@ fn source_loader_resolves_itself_independently_of_caller_and_cdpath() {
         let directory = root.path().join("hook's directory");
         fs::create_dir_all(directory.join("lib")).unwrap();
         let loader = directory.join("tirith.sh");
-        fs::copy(pty_support::embedded_hook("../tirith.sh"), &loader).unwrap();
+        fs::copy(pty_support::embedded_loader(), &loader).unwrap();
         fs::write(
             directory.join(format!("lib/{family}-hook.{family}")),
             "builtin printf 'LOADED_FROM_SOURCE\\n'\n",
