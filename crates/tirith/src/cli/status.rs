@@ -18,91 +18,178 @@ pub fn run(json: bool) -> i32 {
 }
 
 pub fn run_with_requirement(json: bool, require_verified_blocking: bool) -> i32 {
-    let quick = doctor::gather_quick_info();
-    let health = ProtectionHealth::classify(&quick.protection_mode, quick.hook_configured);
-    let evidence = &quick.protection_evidence;
-    let exit = if require_verified_blocking && !evidence.verified_blocking {
+    let status = StatusSnapshot::capture(json).finish(require_verified_blocking);
+    if json {
+        if !super::write_json_stdout(&status.projection(), "tirith status: cannot write JSON") {
+            return 1;
+        }
+    } else {
+        status.print_human();
+    }
+    status.exit_code
+}
+
+/// The helper's final status uses the same snapshot, projection and strict exit
+/// contract. Its existing diagnostic keys remain alongside the canonical result.
+pub(crate) fn run_authenticated(
+    proof: tirith_core::execution_state::ShellVerificationProof,
+) -> i32 {
+    let mut snapshot = StatusSnapshot::capture(true);
+    let (observation, evidence) =
+        super::protection_evidence::ProtectionEvidence::from_authenticated_shell(proof);
+    if evidence.verified_blocking {
+        snapshot.quick.protection_mode = "guarded".into();
+    }
+    snapshot.quick.protection_evidence = evidence;
+    let status = snapshot.finish(true);
+    let value = serde_json::json!({
+        "observation": observation,
+        "protection": status.snapshot.quick.protection_evidence,
+        "status": status.projection(),
+        "status_exit_code": status.exit_code,
+    });
+    if !super::write_json_stdout(&value, "tirith: cannot write shell verification result") {
+        return 1;
+    }
+    status.exit_code
+}
+
+struct StatusSnapshot {
+    quick: doctor::QuickDoctorInfo,
+    scope: Option<&'static str>,
+    tdb: threatdb_cmd::ThreatDbStatus,
+    audit_recording: super::audit_health::AuditHealth,
+    shell_target: serde_json::Value,
+    approval: super::package_approval_authority::PackageApprovalAvailability,
+}
+
+impl StatusSnapshot {
+    fn capture(include_shell_target: bool) -> Self {
+        let quick = doctor::gather_quick_info();
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string());
+        let scope = tirith_core::policy::discover_local_policy_path_scoped(cwd.as_deref())
+            .map(|(_, s)| scope_label(s));
+        Self {
+            quick,
+            scope,
+            tdb: threatdb_cmd::gather_status(),
+            audit_recording: super::audit_health::read(),
+            shell_target: if include_shell_target {
+                serde_json::json!(super::shell_target::inspect_current().ok())
+            } else {
+                serde_json::Value::Null
+            },
+            approval: super::package_approval_authority::availability(),
+        }
+    }
+
+    fn finish(self, require_verified_blocking: bool) -> StatusResult {
+        // A sourced hook can prove current interception without a startup-file
+        // claim. Keep hook_configured as the separate disk fact in the output.
+        let health = if self.quick.protection_evidence.verified_blocking {
+            ProtectionHealth::Guarded
+        } else {
+            ProtectionHealth::classify(&self.quick.protection_mode, self.quick.hook_configured)
+        };
+        let exit_code = status_exit_code(
+            health,
+            require_verified_blocking,
+            self.quick.protection_evidence.verified_blocking,
+        );
+        StatusResult {
+            snapshot: self,
+            health,
+            require_verified_blocking,
+            exit_code,
+        }
+    }
+}
+
+struct StatusResult {
+    snapshot: StatusSnapshot,
+    health: ProtectionHealth,
+    require_verified_blocking: bool,
+    exit_code: i32,
+}
+
+fn status_exit_code(health: ProtectionHealth, required: bool, verified: bool) -> i32 {
+    if required && !verified {
         1
     } else {
         health.exit_code()
-    };
+    }
+}
 
-    // Active policy scope — local discovery only, never a network fetch.
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
-    let scope = tirith_core::policy::discover_local_policy_path_scoped(cwd.as_deref())
-        .map(|(_, s)| scope_label(s));
-
-    let tdb = threatdb_cmd::gather_status();
-    let audit_recording = super::audit_health::read();
-
-    if json {
+impl StatusResult {
+    fn projection(&self) -> serde_json::Value {
+        let quick = &self.snapshot.quick;
+        let evidence = &quick.protection_evidence;
         let mut out = status_json(
             &quick.protection_mode,
-            health,
-            scope,
+            self.health,
+            self.snapshot.scope,
             quick.policy_path_used.as_deref(),
             quick.hook_configured,
-            &tdb,
+            &self.snapshot.tdb,
         );
         out["schema_version"] = serde_json::json!(1);
-        out["audit_recording"] = audit_recording.projection();
+        out["audit_recording"] = self.snapshot.audit_recording.projection();
         out["protection_evidence"] = serde_json::json!(evidence);
-        out["shell_target"] = serde_json::json!(crate::cli::shell_target::inspect_current().ok());
+        out["shell_target"] = self.snapshot.shell_target.clone();
         out["protected"] = serde_json::json!(evidence.verified_blocking);
-        out["requirement"] = serde_json::json!({"verified_blocking_required": require_verified_blocking, "satisfied": !require_verified_blocking || evidence.verified_blocking});
-        out["package_approval"] =
-            serde_json::to_value(super::package_approval_authority::availability())
-                .expect("package approval availability contains only JSON primitives");
-        match serde_json::to_string_pretty(&out) {
-            Ok(s) => println!("{s}"),
-            Err(e) => {
-                eprintln!("tirith status: failed to serialize JSON: {e}");
-                return 1;
-            }
-        }
-        return exit;
+        out["requirement"] = serde_json::json!({
+            "verified_blocking_required": self.require_verified_blocking,
+            "satisfied": !self.require_verified_blocking || evidence.verified_blocking,
+        });
+        out["package_approval"] = serde_json::json!(self.snapshot.approval);
+        out
     }
 
-    println!("tirith status");
-    println!("  protection:  {}", quick.protection_mode);
-    println!(
-        "  hook:        {}",
-        if quick.hook_configured {
-            "configured"
-        } else {
-            "NOT configured"
+    fn print_human(&self) {
+        let quick = &self.snapshot.quick;
+        let evidence = &quick.protection_evidence;
+        println!("tirith status");
+        println!("  protection:  {}", quick.protection_mode);
+        println!(
+            "  hook:        {}",
+            if quick.hook_configured {
+                "configured"
+            } else {
+                "NOT configured"
+            }
+        );
+        match (&quick.policy_path_used, &self.snapshot.scope) {
+            (Some(p), Some(s)) => println!("  policy:      {p} (scope: {s})"),
+            (Some(p), None) => println!("  policy:      {p}"),
+            (None, _) => println!("  policy:      (none found)"),
         }
-    );
-    match (&quick.policy_path_used, &scope) {
-        (Some(p), Some(s)) => println!("  policy:      {p} (scope: {s})"),
-        (Some(p), None) => println!("  policy:      {p}"),
-        (None, _) => println!("  policy:      (none found)"),
+        println!("  threat db:   {}", threatdb_summary(&self.snapshot.tdb));
+        println!(
+            "  audit recording: {}",
+            self.snapshot.audit_recording.summary()
+        );
+        let approval = &self.snapshot.approval;
+        println!("  pkg approval: {} (optional)", approval.state);
+        println!("    {}", approval.detail);
+        println!("    {}", approval.next_action);
+        println!();
+        if evidence.verified_blocking {
+            println!("tirith: blocking observed in this caller shell; evidence is limited to the authenticated diagnostic sequence");
+        } else {
+            match self.health {
+                ProtectionHealth::Guarded => println!("tirith: hook reports blocking; current-shell blocking has not been verified"),
+                ProtectionHealth::ConfiguredUnknown => println!(
+                    "tirith: hook configured; this external check can't see the live per-shell mode\n  (run `tirith doctor --verify-shell` for caller-shell verification instructions)"
+                ),
+                other => eprintln!("tirith: NOT FULLY PROTECTED — {}", health_reason(other)),
+            }
+        }
+        if self.require_verified_blocking && !evidence.verified_blocking {
+            eprintln!("tirith: verified blocking requirement not satisfied for current-shell; configuration and inherited environment are insufficient evidence");
+        }
     }
-    println!("  threat db:   {}", threatdb_summary(&tdb));
-    println!("  audit recording: {}", audit_recording.summary());
-    let approval = super::package_approval_authority::availability();
-    println!("  pkg approval: {} (optional)", approval.state);
-    println!("    {}", approval.detail);
-    println!("    {}", approval.next_action);
-    println!();
-    // The verdict line: PROTECTED on stdout when guarded; otherwise the reason on
-    // stderr (a security notice — always shown, never `--quiet`-gated).
-    match health {
-        ProtectionHealth::Guarded => println!("tirith: hook reports blocking; current-shell blocking has not been verified"),
-        // Configured, but this external process can't see the live per-shell mode
-        // (TIRITH_STATUS is non-exported; only bash re-exports it). Not provably
-        // off, so exit 0 — yet say so honestly rather than claim full protection.
-        ProtectionHealth::ConfiguredUnknown => println!(
-            "tirith: hook configured; this external check can't see the live per-shell mode\n  (only bash re-exports it, so run `tirith doctor` in your shell to confirm)"
-        ),
-        other => eprintln!("tirith: NOT FULLY PROTECTED — {}", health_reason(other)),
-    }
-    if require_verified_blocking && !evidence.verified_blocking {
-        eprintln!("tirith: verified blocking requirement not satisfied for current-shell; configuration and inherited environment are insufficient evidence");
-    }
-    exit
 }
 
 /// Build the `status --json` envelope. A pure seam (no env, no I/O) so the
@@ -175,6 +262,36 @@ fn health_reason(h: ProtectionHealth) -> &'static str {
 mod tests {
     use super::*;
     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+
+    #[test]
+    fn canonical_strict_exit_never_accepts_configuration_as_observation() {
+        for health in [
+            ProtectionHealth::Guarded,
+            ProtectionHealth::ConfiguredUnknown,
+            ProtectionHealth::WarnOnly,
+            ProtectionHealth::Degraded,
+            ProtectionHealth::HookMissing,
+            ProtectionHealth::Unknown,
+        ] {
+            assert_eq!(status_exit_code(health, true, false), 1);
+            assert_eq!(status_exit_code(health, false, false), health.exit_code());
+        }
+        assert_eq!(status_exit_code(ProtectionHealth::Guarded, true, true), 0);
+    }
+
+    #[test]
+    fn ordinary_canonical_capture_does_not_promote_inherited_blocking() {
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        guard.set_env("TIRITH_STATUS", "blocks");
+        guard.set_env("TIRITH_BASH_EFFECTIVE_PROTECTION", "blocks");
+        guard.set_env("TIRITH_VERIFIED_BLOCKING", "1");
+        let status = StatusSnapshot::capture(true).finish(true);
+        let value = status.projection();
+        assert_eq!(value["protected"], false);
+        assert_eq!(value["protection_evidence"]["verified_blocking"], false);
+        assert_eq!(value["requirement"]["satisfied"], false);
+        assert_eq!(status.exit_code, 1);
+    }
 
     /// A deterministic, "not installed" [`ThreatDbStatus`] used as a functional
     /// update base. `ThreatDbStatus` has private fields (and no `Default`), so a

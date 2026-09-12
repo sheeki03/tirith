@@ -72,6 +72,127 @@ mod native {
         assert_eq!(observation.status, ShellVerificationStatus::Pending);
     }
 
+    fn completed_proof(
+        configs: &[PathBuf],
+    ) -> (ShellVerificationChallenge, ShellVerificationProof) {
+        let challenge = start_shell_verification(CHANNEL, configs, LOADED).unwrap();
+        allowed(&challenge);
+        assert_eq!(
+            observe_shell_verification_hook(&challenge.blocked_command, CHANNEL, Some(LOADED))
+                .unwrap(),
+            ShellVerificationHookDecision::ForceDiagnosticBlock,
+        );
+        observe_shell_verification_hook(&challenge.status_command, CHANNEL, Some(LOADED)).unwrap();
+        let proof =
+            finish_shell_verification_authenticated(&challenge.id, CHANNEL, LOADED).unwrap();
+        (challenge, proof)
+    }
+
+    #[test]
+    fn canonical_projection_consumes_fresh_authority_without_renewing_observation() {
+        fixture(|_, configs, _, _| {
+            let (challenge, proof) = completed_proof(configs);
+            let first = proof.into_current_observation();
+            assert_eq!(first.status, ShellVerificationStatus::ObservedBlocking);
+            observe_shell_verification_hook(&challenge.status_command, CHANNEL, Some(LOADED))
+                .unwrap();
+            let next = finish_shell_verification_authenticated(&challenge.id, CHANNEL, LOADED)
+                .unwrap()
+                .into_current_observation();
+            assert_eq!(next.status, ShellVerificationStatus::ObservedBlocking);
+            assert_eq!(next.observed_unix_ms, first.observed_unix_ms);
+            assert_eq!(next.expires_unix_ms, first.expires_unix_ms);
+            // The saved report cannot stand in for another native status event.
+            let replay = finish_shell_verification_authenticated(&challenge.id, CHANNEL, LOADED)
+                .unwrap()
+                .into_current_observation();
+            assert_eq!(replay.status, ShellVerificationStatus::Failed);
+        });
+    }
+
+    #[test]
+    fn projection_revalidates_policy_configuration_cwd_and_loaded_binding_after_capture() {
+        for change in ["policy", "configuration", "cwd", "loaded", "record"] {
+            fixture(|root, configs, _, guard| {
+                let (_, mut proof) = completed_proof(configs);
+                match change {
+                    "policy" => std::fs::write(
+                        root.join("config/tirith/policy.yaml"),
+                        "strict_warn: true\n",
+                    )
+                    .unwrap(),
+                    "configuration" => {
+                        std::fs::write(&configs[0], "# changed during status capture\n").unwrap()
+                    }
+                    "cwd" => {
+                        std::fs::create_dir(root.join("other-cwd")).unwrap();
+                        guard.set_cwd(root.join("other-cwd")).unwrap();
+                    }
+                    // Core owns this binding; production callers cannot replace it.
+                    "loaded" => proof.binding.loaded_hook_state = OTHER.into(),
+                    "record" => {
+                        start_shell_verification(CHANNEL, configs, LOADED).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    proof.into_current_observation().status,
+                    ShellVerificationStatus::Stale,
+                    "{change}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn projection_revalidates_live_capability_and_refuses_retained_or_foreign_process_proofs() {
+        for change in ["secret", "parent", "family", "issuer", "elapsed"] {
+            fixture(|_, configs, _, guard| {
+                let (_, mut proof) = completed_proof(configs);
+                match change {
+                    "secret" => guard.set_env("_TIRITH_RECEIPT_INSTANCE", OTHER),
+                    "parent" => {
+                        guard.set_env("_TIRITH_RECEIPT_SHELL_PID", std::process::id().to_string())
+                    }
+                    "family" => guard.set_env("_TIRITH_RECEIPT_FAMILY", "fish"),
+                    // These private-field changes exercise failure predicates
+                    // without a fork or sleeping in the shared native test process.
+                    "issuer" => proof.binding.issuer_pid = 0,
+                    "elapsed" => {
+                        proof.binding.issued_at = std::time::Instant::now() - PROJECTION_TTL
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    proof.into_current_observation().status,
+                    ShellVerificationStatus::Stale,
+                    "{change}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn expired_projection_never_renews_a_saved_success() {
+        fixture(|_, configs, secret, _| {
+            let (_, mut proof) = completed_proof(configs);
+            let now = unix_time_ms().unwrap();
+            {
+                let store = VerificationStore::open(secret).unwrap();
+                let mut record = store.load(secret, now).unwrap().unwrap();
+                record.created_unix_ms = now - VERIFICATION_TTL_MS - 2;
+                record.expires_unix_ms = now - 2;
+                record.observed_unix_ms = Some(record.created_unix_ms + 1);
+                store.publish(&mut record, secret).unwrap();
+                proof.observation = record.observation(ShellVerificationStatus::ObservedBlocking);
+                proof.binding.record_seal = record.seal;
+            }
+            let expired = proof.into_current_observation();
+            assert_eq!(expired.status, ShellVerificationStatus::Expired);
+            assert!(expired.expires_unix_ms < now);
+        });
+    }
+
     #[test]
     fn authenticated_sequence_requires_actual_body_then_later_status_observation() {
         fixture(|_, configs, _, _| {

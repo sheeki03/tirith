@@ -13,3 +13,20 @@ old store location. Neither command check executes the proposed pipeline.
 See [verification](../../../docs/next-cycle/verification.md) for signature and
 scope details. Wider native, expiry, copy/move and final-candidate evidence is
 still required.
+
+`cli-reader-compatibility.json` adds 32 actual baseline/candidate reader cases:
+clean/blocked check contracts, personal and neutralized repository policies,
+permanent/expired/malformed-expiry legacy trust, four inherited shell modes,
+and saved download receipt list/last/cache verification. Inputs are synthetic
+fixtures written by the harness; the outputs are observations from native
+executables. This does not claim receipt producer, signature, publication or
+live shell-interception qualification. Both native versions and all supplied
+input hashes are retained. The baseline executable matches the separately
+authenticated release recorded by `macos-release-contracts.json`.
+
+The compact projection omits test-root paths, full policy values and timing
+noise. It records the default schema-3 check contract and policy-envelope
+additions separately. Inherited status never becomes verified blocking in the
+candidate. Use `tools/qualification/compatibility_capture.py` for a new capture;
+the report pins both binaries and the runner and process-helper sources before
+and after execution. It refuses a baseline other than 0.4.2.

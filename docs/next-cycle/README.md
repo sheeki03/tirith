@@ -13,13 +13,13 @@ changes or substituted with simulated success.
 
 | Package | Current implementation and remaining work |
 | --- | --- |
-| WP00 | Baseline, schema/fixture inventory and acceptance matrix recorded. Signed macOS 0.4.2 baseline commands and five old/new scoped-grant compatibility assertions passed. Wider fixtures and packaged performance measurements remain. |
+| WP00 | Baseline, schema inventory and acceptance matrix recorded. Signed macOS 0.4.2 baseline commands, five scoped-grant assertions and 32 paired policy/trust/shell-mode/receipt reader cases passed. Wider historical schemas and packaged performance distributions remain. |
 | WP01 | Runtime snapshots capture field provenance, input revisions, private replay guards, authority, neutralized preferences, trust expiry and remote-cache evidence. Mutations refuse unconditioned remote authority. Broader runtime/native verification remains. |
 | WP02 | Frozen evaluation separates observed facts from pure policy evaluation and preserves combined blockers and incomplete evidence. Capture includes available cached threat enrichment and reports unavailable runtime/session/baseline evidence. Final candidate equivalence and native journey evidence remain. |
 | WP03 | Producer-selected CLI/core/MCP projections preserve typed protocol values under broad DLP; signed documents remain separate. Saved receipts now have bounded typed reads, fresh display redaction and explicit canonical-output refusal when privacy requires a projection; the shared public Rust reader and CLI privacy/identity/limit cases passed on candidate 1a72833. Final export/service acceptance remains. |
-| WP04 | Shared native shell/operator targets and evidence grades are implemented. Five actual caller-shell helper/PTY checks passed on the retained macOS candidate. Configured and inherited states do not imply observed blocking. Twenty-two Unix PowerShell 7.6.6 cases passed using the hook extracted from retained candidate 39f6acc. Native Windows, Nushell and final release qualification remain. |
+| WP04 | Shared native shell/operator targets and evidence grades are implemented. Authenticated helper completion now projects canonical status through a one-use core proof; five actual Bash/Zsh/Fish terminal cases and 48 other proof/status checks passed on candidate fad9af58. Configured/inherited state and saved success do not promote ordinary status or dashboard reads. Native PowerShell/Nushell receipt adapters and automatic fresh-shell verification remain. |
 | WP05 | Comfortable/Balanced/Strict versioned personal presets preserve unknown settings/manual overrides; reset touches owned values. CLI and browser use shared preparation. Broader corpus and end-to-end verification remain. |
-| WP06 | Shared durable plan/apply/status/cancel/undo service, exact preimages, typed intent, task authorization, conflicts, compensation and bounded workers implemented. Async admission, fresh undo baselines, and bounded saved-operation inventory are implemented; expanded crash and native Windows checks remain. |
+| WP06 | Shared durable plan/apply/status/cancel/undo, exact preimages, typed intent, conflicts, compensation and bounded workers are implemented. Fourteen native process-death/storage cases passed on fad9af58, with eleven exact stopped boundaries and ten actual owner deaths. Broader write-boundary, signed lifecycle and native Windows checks remain. |
 | WP07 | Stable scoped/expiring grants, retained project identities, legacy migration, CLI lifecycle and typed browser preparation implemented. Five actual 0.4.2/new-client compatibility assertions passed; native/copy/move/expiry and final-candidate evidence remain. |
 | WP08 | Existing one-operation receipts retained; recovery uses the actual shell bypass parser and distinguishes unsupported syntax/hard blocks. Native recovery journeys remain. |
 | WP09 | Frozen simulation and private reversible expectation labels passed earlier tests. Bounded CLI/browser tuning now reads selected annotations and redacted examples, without replay or automatic approval. Selected CLI and complete browser tuning/annotation/impact workflows passed; final candidate recertification remains. |
@@ -30,7 +30,7 @@ changes or substituted with simulated success.
 | WP14 | Six embedded pages expose typed shell/profile/settings/exception plans, saved jobs, feedback, support preview/download, retention, impact reviews and lifecycle actions. Eighteen complete real-browser workflows and five separate delayed-response cases passed again on retained candidate 39f6acc, including busy-history paging, combined setup, archive controls and stale-dialog isolation. Final release recertification remains. |
 | WP15 | Channel/privilege guidance, exact signed compatibility, candidate binding, rollback receipts and a durable lifecycle store/retained worker handshake are registered. Native publication/crash/reopen and rollback/removal evidence remains. |
 | WP16 | Signed source evidence, freshness dimensions, publication/parser guards, transient recovery and incident records implemented. Final compiled and publication-path verification remains. |
-| WP17 | Native sampling found debug-build SHA cost in repeated executable guards. The development SHA dependency is optimized while retaining exact checks. Bounded CLI/CPU/RSS/service sampling and instrumented core allocation counting are implemented, with source-pinned native development measurements. Release comparisons and variance-based resource budgets remain. |
+| WP17 | Bounded CLI/CPU/RSS/service sampling and instrumented core allocation counting are implemented. Resource validation, raw latency distributions and exact CI host/source/report context are now registered; 20 validator and three accounting fixtures passed. New limits remain disabled pending independent pinned release distributions and reviewed runner variance; broader whole-hook/host and concurrent workloads remain. |
 | WP18 | Selected support preview and private task-authorized export passed linked tests with fresh privacy/output bounds. Read-only lifecycle selection is newly registered. Six user journeys and documentation reconciliation remain. |
 | WP19 | Final-byte installed/native acceptance, beginner pilot and release/channel evidence remain. No substituted evidence is claimed. |
 | WP20 | Retained-identity project review is registered through CLI and browser using existing dependency/hook/AI/MCP analyzers. Explicit coverage, whole-entry privacy limits and no tooling execution are enforced; selected core/CLI/API and complete browser workflows passed on retained development candidates. Final G2 qualification remains. |
@@ -49,6 +49,12 @@ sudo package suggestions as well as hard dependencies and describes privileged
 approval availability separately from ordinary protection. Exact heads
 `356981b8` and `3dce8f2d` each have 53 passed checks, 12 expected skips and no
 failures. These separate PR results do not certify the larger cycle branch.
+The focused private-input execution refusal in
+[PR 254](https://github.com/sheeki03/tirith/pull/254), exact head `0f679ac4`, also
+has 53 passing checks and 12 expected skips. On cycle commit `897bad30`, Linux,
+macOS and Rust 1.83 workspace jobs passed; Windows detected and cleaned up a
+surviving build descendant and refused qualification. Bounded identity diagnostics
+are added for the next native run; this failure remains open.
 
 Contracts and evidence:
 

@@ -1865,10 +1865,43 @@ fn verification_complete(session: &mut PtySession, id: &str) {
     );
     session.clear_buffer();
     session.send_line(&format!("_tirith_verification_probe {id} status"));
-    let output = session.expect("\"verified_blocking\": true");
-    assert!(output.contains("\"scope\": \"current_shell_only\""));
-    assert!(output.contains("\"source\": \"authenticated_caller_shell\""));
-    session.wait_idle(QUIET, SETTLE_MAX);
+    session.expect("\"status_exit_code\": 0");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    let start = output
+        .find('{')
+        .expect("helper must emit its JSON envelope");
+    let value: serde_json::Value = serde_json::Deserializer::from_str(&output[start..])
+        .into_iter()
+        .next()
+        .expect("helper JSON exists")
+        .expect("helper JSON is valid");
+    assert_eq!(value["observation"]["status"], "observed_blocking");
+    assert_eq!(value["observation"]["scope"], "current_shell_only");
+    assert_eq!(value["observation"]["source"], "authenticated_caller_shell");
+    assert_eq!(value["protection"]["verified_blocking"], true);
+    assert_eq!(value["status"]["protection_evidence"], value["protection"]);
+    assert_eq!(value["status"]["protected"], true);
+    assert_eq!(
+        value["status"]["requirement"]["verified_blocking_required"],
+        true
+    );
+    assert_eq!(value["status"]["requirement"]["satisfied"], true);
+    assert_eq!(value["status_exit_code"], 0);
+    session.clear_buffer();
+
+    // An ordinary child must not inherit the helper's proof or read a saved
+    // success into canonical status, even in the same still-protected PTY.
+    session.send_line("tirith status --json --require-verified-blocking");
+    session.expect("\"verified_blocking\": false");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    let start = output.find('{').expect("status must emit JSON");
+    let value: serde_json::Value = serde_json::Deserializer::from_str(&output[start..])
+        .into_iter()
+        .next()
+        .expect("status JSON exists")
+        .expect("status JSON is valid");
+    assert_eq!(value["protected"], false);
+    assert_eq!(value["requirement"]["satisfied"], false);
     session.clear_buffer();
 }
 

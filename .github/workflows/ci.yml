@@ -49,6 +49,8 @@ jobs:
           python3 scripts/test-certify-claude-host.py
           python3 scripts/test-certify-powershell-hook.py
           python3 tools/qualification/test_mixed_audit_native.py
+          python3 tools/qualification/test_compatibility_capture.py
+          python3 tools/qualification/test_durable_boundaries_native.py
       - name: Validate ThreatDB manifest transition fixtures
         run: bash .github/scripts/test-threatdb-manifest-transition.sh
       - name: Refuse a stale ThreatDB manifest transition

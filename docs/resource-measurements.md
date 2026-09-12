@@ -2,8 +2,9 @@
 
 The Performance CI job retains two JSON reports alongside the existing Criterion
 results. Criterion's absolute budgets remain enforced. Resource reports
-characterize one runner and the recorded executable bytes; they introduce no
-allocation, memory or timing regression thresholds.
+characterize one runner and the recorded executable bytes. The resource evaluator
+validates metric and provenance contracts, but no allocation, memory or timing
+threshold is enabled until independent release measurements support reviewed limits.
 
 `resource-allocations.json` comes from the `resource_counts` core benchmark. A
 thread-local counter wraps Rust's `System` global allocator for each measured
@@ -48,9 +49,27 @@ bounds and fixture file sizes. File sizes describe only regular files in the
 private fixture; they are not disk I/O counters or an estimate of a user's data.
 Optional baseline comparisons use identical supported CLI arguments, alternate
 candidate/baseline order and record both executable hashes. They do not create a
-universal performance target. CI uploads each JSON only after checking its
-schema version and a one-MiB artifact size ceiling, with no repository write
-permission or automatic resource-baseline publication.
+universal performance target. CLI and HTTP distributions retain their original
+ordered timing samples. Their p95 uses the nearest-rank definition; this corrects
+the prior upward index at sample counts divisible by twenty. First and subsequent
+samples remain separate. Instrumented core timings retain their historical
+upper-middle p50 field; the evaluator's explicitly named median is recomputed
+from raw samples. These statistics are not interchangeable.
+
+CI records a same-job context manifest with report/source/executable hashes,
+release profile, source revision, run attempt, kernel, architecture, runner image,
+CPU model and logical CPU count. It validates finite numeric values, integer count
+types, sample counts, summaries against raw samples, complete known workloads,
+resource availability, service sampling errors and cross-report identity. Missing
+or malformed metrics fail the validation step. Reports remain bounded to one MiB.
+The context records provenance; it is not a signature or independent attestation
+of a compiler or machine. Workflow/source review must establish its origin.
+
+Without a reviewed budget, the result is explicitly `validated_unbudgeted`, never
+a resource-budget pass. CI retains the context and evaluation with the two source
+reports, without repository write permission or automatic baseline publication.
+See [resource budget review](resource-budget-review.md) for the enforcement format,
+available evidence and remaining baseline work.
 
 Run the same characterization locally with explicit output paths:
 

@@ -68,6 +68,98 @@ pub struct ShellVerificationObservation {
     pub scope: &'static str,
 }
 
+/// An in-process observation capability, distinct from the public report DTO.
+/// Only an authenticated final helper can obtain one. It cannot be serialized,
+/// cloned, constructed from a report, or reused after projection.
+///
+/// ```compile_fail
+/// use tirith_core::execution_state::{ShellVerificationObservation, ShellVerificationProof};
+/// fn forge(observation: ShellVerificationObservation) -> ShellVerificationProof {
+///     ShellVerificationProof { observation }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use tirith_core::execution_state::ShellVerificationProof;
+/// fn replay(proof: ShellVerificationProof) {
+///     proof.into_current_observation();
+///     proof.into_current_observation();
+/// }
+/// ```
+pub struct ShellVerificationProof {
+    observation: ShellVerificationObservation,
+    #[cfg(unix)]
+    binding: ProjectionBinding,
+}
+
+#[cfg(unix)]
+struct ProjectionBinding {
+    channel: ShellReceiptChannel,
+    loaded_hook_state: String,
+    record_seal: String,
+    issuer_pid: u32,
+    issued_at: std::time::Instant,
+}
+
+#[cfg(unix)]
+const PROJECTION_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl ShellVerificationProof {
+    /// Consumes the capability after rechecking its live authority and context.
+    /// The returned DTO is a report, not a reusable proof. An unavailable or
+    /// changed context is reported conservatively as stale or expired.
+    pub fn into_current_observation(mut self) -> ShellVerificationObservation {
+        #[cfg(not(unix))]
+        {
+            self.observation.status = ShellVerificationStatus::Failed;
+        }
+        #[cfg(unix)]
+        {
+            if self.revalidate().is_err() {
+                self.observation.status =
+                    if unix_time_ms().is_ok_and(|now| now >= self.observation.expires_unix_ms) {
+                        ShellVerificationStatus::Expired
+                    } else {
+                        ShellVerificationStatus::Stale
+                    };
+            }
+        }
+        self.observation
+    }
+
+    #[cfg(unix)]
+    fn revalidate(&self) -> Result<(), String> {
+        if std::process::id() != self.binding.issuer_pid
+            || self.binding.issued_at.elapsed() >= PROJECTION_TTL
+        {
+            return Err("caller-shell observation projection is no longer current".into());
+        }
+        let session = crate::session::resolve_session_id();
+        let secret = current_hook_instance(self.binding.channel, &session)?;
+        let now = unix_time_ms()?;
+        let store = VerificationStore::open(&secret)?;
+        let record = store
+            .load(&secret, now)?
+            .ok_or("caller-shell verification challenge is unavailable")?;
+        if record.id != self.observation.challenge_id
+            || record.family != self.binding.channel.hook_family()?
+            || record.hook_binding != token_sha256(&secret)
+            || record.seal != self.binding.record_seal
+            || context_status(&record, &secret, Some(&self.binding.loaded_hook_state), now)?
+                .is_some()
+        {
+            return Err("caller-shell observation context changed".into());
+        }
+        current_hook_instance(self.binding.channel, &session)?;
+        if self.binding.issued_at.elapsed() >= PROJECTION_TTL
+            || unix_time_ms()? >= self.observation.expires_unix_ms
+        {
+            return Err("caller-shell observation projection expired".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg(unix)]
@@ -654,7 +746,7 @@ fn record_body(
     channel: ShellReceiptChannel,
     loaded_hook_state: &str,
     probe: Option<ShellVerificationProbe>,
-) -> Result<ShellVerificationObservation, String> {
+) -> Result<ShellVerificationProof, String> {
     #[cfg(not(unix))]
     {
         let _ = (id, channel, loaded_hook_state, probe);
@@ -684,17 +776,29 @@ fn record_body(
         {
             return Err("caller-shell verification challenge does not match this shell".into());
         }
-        if let Some(status) = context_status(&record, &secret, Some(loaded_hook_state), now)? {
-            return Ok(record.observation(status));
-        }
-        if let Some(probe) = probe {
-            record.body_event(probe);
-        } else {
-            record.finish(now);
-        }
-        current_hook_instance(channel, &session)?;
-        store.publish(&mut record, &secret)?;
-        Ok(record.observation(record.status()))
+        let status =
+            if let Some(status) = context_status(&record, &secret, Some(loaded_hook_state), now)? {
+                status
+            } else {
+                if let Some(probe) = probe {
+                    record.body_event(probe);
+                } else {
+                    record.finish(now);
+                }
+                current_hook_instance(channel, &session)?;
+                store.publish(&mut record, &secret)?;
+                record.status()
+            };
+        Ok(ShellVerificationProof {
+            observation: record.observation(status),
+            binding: ProjectionBinding {
+                channel,
+                loaded_hook_state: loaded_hook_state.into(),
+                record_seal: record.seal.clone(),
+                issuer_pid: std::process::id(),
+                issued_at: std::time::Instant::now(),
+            },
+        })
     }
 }
 
@@ -706,7 +810,7 @@ pub fn execute_shell_verification_probe(
     channel: ShellReceiptChannel,
     loaded_hook_state: &str,
 ) -> Result<ShellVerificationObservation, String> {
-    record_body(id, channel, loaded_hook_state, Some(probe))
+    record_body(id, channel, loaded_hook_state, Some(probe)).map(|result| result.observation)
 }
 
 /// Requires a later authenticated status-hook observation before it can turn
@@ -716,6 +820,17 @@ pub fn finish_shell_verification(
     channel: ShellReceiptChannel,
     loaded_hook_state: &str,
 ) -> Result<ShellVerificationObservation, String> {
+    record_body(id, channel, loaded_hook_state, None).map(|result| result.observation)
+}
+
+/// The final authenticated helper's canonical-status route. A previous DTO or
+/// persisted success cannot obtain this capability without a new status-hook
+/// event. The caller must consume it in this process after gathering status.
+pub fn finish_shell_verification_authenticated(
+    id: &str,
+    channel: ShellReceiptChannel,
+    loaded_hook_state: &str,
+) -> Result<ShellVerificationProof, String> {
     record_body(id, channel, loaded_hook_state, None)
 }
 

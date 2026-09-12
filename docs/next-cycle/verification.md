@@ -647,3 +647,74 @@ the unsigned held-writer case failed when its native descriptor observer exceede
 the unchanged three-second deadline during compilation load. That failed report
 is retained separately from subsequent runs. Observation timeout does not count
 as a completed descriptor-crossing proof.
+
+### Authenticated canonical status and stricter native observations
+
+Source commit `897bad30` incorporates main through `d121b57c` and remains version
+0.4.2. Its Linux, macOS and Rust 1.83 workspace jobs passed. The macOS installer
+job initially failed downloading the pinned checkout action before repository
+execution; its rerun passed. Windows Cargo completed compilation, but the owned
+Job retained a descendant after the ten-second grace. The runner terminated it,
+confirmed cleanup and failed qualification before workspace harness execution.
+The preserved artifact digest is
+`53a201147f86a5af8591cf18c22d6744ff2e49095d827eb80314bc75aa077de9`.
+New bounded Job diagnostics preserve the leader exit separately and record held
+member identities before cleanup. All 45 portable contracts pass; identifying
+the actual Windows survivor and completing native tests remain required.
+
+Development binary
+`fad9af58fa5ba5e902d61e1571b7d934645d3bce5b07b15136247014f9714f39`
+is retained as `authenticated-status-native-v7`, with source capture
+`authenticated-status-inputs-v7`. Captured Rust hashes matched after linking.
+Strict workspace/all-target Clippy passed. All 51 selected runtime tests passed:
+thirteen core verification tests, thirteen CLI status/evidence/helper tests,
+twenty status integration tests and five real Bash/Zsh/Fish terminal cases.
+Two compile-fail proof doctests also passed. The helper's canonical status now
+consumes an opaque, one-use proof after status collection and revalidates live
+shell identity, context, loaded definitions and original evidence expiry.
+Ordinary status and background dashboard reads remain unverified. This does not
+qualify automatic activation or new PowerShell/Nushell receipt adapters.
+
+The shared native qualification helper now retains the waitable child until
+owned-group signaling and native membership observation finish, then reaps once.
+It refuses unsupported runtimes and never signals a saved group after reaping.
+Twenty-nine fixture tests passed on macOS/Python 3.14 and in a native Linux ARM
+container as an ordinary user. The helper certifies only its owned process group;
+descendants that escape the session and close inherited pipes are outside scope.
+Earlier reports lack the new `group_members_exited` proof and remain historical.
+
+On the exact `fad9af58` binary and final helper
+`913a3499bd78b39c6870b9dc280fcaad8a49739db7f2781bbfe914ff4db12e75`,
+all six signed/unsigned mixed-version audit cases passed again, including actual
+legacy descriptors held across rotation. The report digest is
+`c5a6f11c750b30f415dad172ba3aceb235913d1168d6590df946895db871cc0f`.
+All 32 paired policy, trust, inherited-shell-mode and download-receipt reader
+cases passed against the separately authenticated 0.4.2 baseline; report digest
+`854c90c1ca7795431604b9ddc14fad53149993abc1359ea9278e28e7f534b2c7`.
+Both runs retained all four cleanup facts and unchanged input hashes. The compact
+reader fixture records observed contracts, with explicit synthetic-input scope;
+it does not certify receipt creation, signatures or publication authority.
+
+Resource qualification now validates measured units, sample counts, raw timing
+distributions, memory/CPU observations and exact source/host/report context.
+Twenty validator fixtures and three accounting fixtures passed. CI records
+`validated_unbudgeted`; no new limits are enabled until at least three independent
+pinned release distributions and runner variance support reviewed thresholds.
+The existing Criterion budgets retain their separate scope.
+
+The reviewed process-death runner then passed all fourteen native cases on the
+same `fad9af58` binary. Eleven stopped boundaries exactly matched the requested
+stage with a running/applying journal and observed held locks. Ten cases killed
+the actual owner with SIGKILL; all 112 commands retained complete cleanup facts.
+Recovery preserved audit inode identity and exact archive/head bytes, refused a
+concurrent owned policy edit, and retained intended profile publication across
+retry. Real ordinary-user EACCES and RLIMIT_FSIZE/EFBIG failures preserved verdicts
+and exposed append failures; the mismatched audit head was explicitly refused.
+All 27 runner fixtures passed on macOS and in a native Linux ARM container.
+The native report digest is
+`a5c6c3ff61824a9a908ebb6b4fcc16395bcbd338454cd4a8ea33f48f757c195e`;
+evidence manifest `durable-boundaries-reviewed-native-v7` has digest
+`dfe4f544ea016af592faa3d6662616c59d6290789bc8ebf5eaece4b0eb432bbc`.
+This qualifies the named macOS process-death/storage cases only. Power loss,
+actual ENOSPC, every write boundary, signed recovery, Windows and signed binary
+publication still need separate evidence.

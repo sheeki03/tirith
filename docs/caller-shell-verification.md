@@ -9,7 +9,11 @@ hooks instead support a short diagnostic sequence in the shell being checked:
 3. Run its exact `blocked` command. The authenticated check returns a diagnostic
    block; the inert binary body must never run.
 4. Run its exact `status` command. A later authenticated hook observation and
-   the actual status body complete the sequence.
+   the actual status body complete the sequence and return canonical status.
+   Its `status` object uses the same schema and strict verified-blocking exit
+   contract as `tirith status --json --require-verified-blocking`; the helper's
+   existing `observation` and `protection` fields remain, with `status_exit_code`
+   recording the canonical result.
 
 The allowed and status commands retain the ordinary policy and execution
 receipt path. Policy refusal leaves verification incomplete. The blocked
@@ -41,7 +45,19 @@ capability or raw hook contents. Public output contains the challenge UUID,
 shell family, state, timestamps and the explicit `current_shell_only` scope.
 Normal `tirith status` does not acquire an unexported shell capability and cannot
 authenticate this evidence by reading a marker alone. Use the authenticated
-helper status path when a machine requires observed blocking.
+helper status path when a machine requires observed blocking. This final helper
+consumes a core-issued proof in the same Tirith process, after gathering status.
+Core rechecks the live shell capability, the sealed record, and its bound context;
+projection must complete within five seconds of proof issuance and before the
+original challenge expiry. A public report, a copied environment variable, or a
+saved result cannot mint that proof. A sourced hook can prove this shell's current
+interception while `hook_configured` still reports no configured startup file.
+
+The background dashboard remains a configuration view. Neither a saved success
+nor a surviving shell PID lets it resample that shell's loaded definitions or
+claim current blocking. This sequence does not activate hooks automatically:
+run each exact command separately in the intended interactive shell. Commands
+executed in a disposable child only describe that child's shell.
 
 The core state-machine tests do not qualify a shell adapter. Each adapter must
 also demonstrate the full sequence in a real interactive shell, including

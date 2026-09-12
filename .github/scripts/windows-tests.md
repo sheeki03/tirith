@@ -56,3 +56,26 @@ Native contracts: [Cargo JSON messages](https://doc.rust-lang.org/cargo/referenc
 [Cargo dynamic library paths](https://doc.rust-lang.org/cargo/reference/environment-variables.html#dynamic-library-paths),
 [CreateProcessWithLogonW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createprocesswithlogonw),
 [Windows Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
+
+## Owned Job failure diagnostics
+
+Process results retain `leader_exit_code` separately from the final runner exit:
+successful Cargo completion followed by a descendant leak still fails. The
+`before_cleanup` snapshot records native Job accounting and its process-ID list
+before termination. Each retained process image and creation time is read through
+a held process handle only after membership in that exact Job is confirmed.
+An exited or reused PID is reported as unavailable, never attributed by name or
+used as cleanup authority. `after_cleanup` is captured if the Job does not empty.
+
+The snapshot uses one fixed 256-PID buffer, at most 32 process observations and
+1024 image-path characters per process. It stops between queries after one second;
+the individual Win32 metadata calls have no cancellable timeout contract. Errors,
+truncation and unavailable fields remain explicit. It starts no diagnostic child,
+enumerates no unrelated host processes, and collects no command line/environment.
+Snapshots are observations at different instants, so accounting and list counts
+can differ while processes exit. They do not relax the leak or cleanup gates.
+
+A compiler/PDB server is a hypothesis until its owned image is observed. Do not
+allowlist a process name, detach it, or lengthen the grace period merely to make a
+build pass. The real exited-leader Windows control must retain the known child's
+PID, creation time and image before cleanup and still confirm its termination.

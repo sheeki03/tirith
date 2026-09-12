@@ -211,6 +211,17 @@ exit 0
         Assert-True ($orphan.Stdout.Contains('descendant retains stdout') -and $orphan.Stdout.Contains('leader exits before descendant') -and
             $orphan.Stderr.Contains('descendant retains stderr')) 'Real descendant did not inherit both output channels'
         $identity = [IO.File]::ReadAllText($pidFile) | ConvertFrom-Json
+        Assert-True ($orphan.LeaderExitCode -eq 0 -and $orphan.ExitCode -ne 0 -and $orphan.ProcessId -gt 0) 'Cleanup failure lost the original leader result'
+        $diagnostic = $orphan.BeforeCleanup
+        Assert-True ($null -ne $diagnostic -and $diagnostic.Reason -ceq 'descendant-grace-exceeded' -and
+            $diagnostic.AccountingActiveProcesses -ge 1 -and $diagnostic.ListedProcesses -ge 1 -and
+            $diagnostic.ProcessListComplete -and -not $diagnostic.Truncated -and $diagnostic.Error -ceq '') 'Owned Job leak diagnostics were unavailable or incomplete'
+        $observedChild = @($diagnostic.Processes | Where-Object { $_.ProcessId -eq $identity.pid })
+        Assert-True ($observedChild.Count -eq 1 -and $observedChild[0].JobMember -eq $true -and
+            $observedChild[0].Running -eq $true -and -not $observedChild[0].IsLeader -and
+            $observedChild[0].CreationTimeUtcTicks -eq $identity.creation_ticks -and
+            [IO.Path]::GetFileName($observedChild[0].ImagePath) -ieq 'pwsh.exe' -and
+            $observedChild[0].Error -ceq '') 'Leak diagnostics did not identify the held owned descendant'
         $survivor = Get-Process -Id $identity.pid -ErrorAction SilentlyContinue
         if ($null -ne $survivor) {
             try { Assert-True ($survivor.HasExited -or $survivor.StartTime.ToUniversalTime().Ticks -ne $identity.creation_ticks) 'Owned descendant survived cleanup' }

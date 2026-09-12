@@ -9,6 +9,7 @@ modifying any real audit log. Only ordinary read/preview routes are measured.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -37,9 +38,12 @@ def http(origin, token, csrf, path, body=None):
 
 
 def distribution(samples):
+    if not samples or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in samples):
+        raise ValueError("timing samples must be nonempty, finite and nonnegative")
     values = sorted(samples)
     return {"n": len(values), "min_ms": values[0], "median_ms": statistics.median(values),
-            "p95_ms": values[min(len(values) - 1, int(len(values) * .95))], "max_ms": values[-1]}
+            "p95_ms": values[math.ceil(len(values) * .95) - 1], "max_ms": values[-1],
+            "samples_ms": list(samples)}
 
 
 def resource_child(report_path, command):

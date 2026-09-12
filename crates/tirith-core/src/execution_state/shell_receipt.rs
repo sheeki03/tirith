@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 #[path = "shell_verification.rs"]
 mod shell_verification;
 pub use shell_verification::{
-    execute_shell_verification_probe, finish_shell_verification, observe_shell_verification_hook,
+    execute_shell_verification_probe, finish_shell_verification,
+    finish_shell_verification_authenticated, observe_shell_verification_hook,
     start_shell_verification, ShellVerificationChallenge, ShellVerificationHookDecision,
-    ShellVerificationObservation, ShellVerificationProbe, ShellVerificationStatus,
+    ShellVerificationObservation, ShellVerificationProbe, ShellVerificationProof,
+    ShellVerificationStatus,
 };
 
 const RECEIPT_SCHEMA_VERSION: u32 = 3;

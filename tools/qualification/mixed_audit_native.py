@@ -6,7 +6,9 @@ Results certify only the supplied hash-pinned executables on the recorded host.
 """
 import argparse
 import base64
+import ctypes
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -24,6 +26,9 @@ import uuid
 OUTPUT_LIMIT = 64 * 1024
 FILE_LIMIT = 16 * 1024 * 1024
 TIMEOUT = 45
+GROUP_LIMIT = 4096
+PROCESS_TABLE_LIMIT = 65536
+CLEANUP_TIMEOUT = 3
 FIXTURE_SEED = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
 FIXTURE_PUBLIC = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
 
@@ -73,43 +78,231 @@ def isolated_env(root):
     return env
 
 
+def require_process_observation():
+    required = ("waitid", "P_PID", "WEXITED", "WSTOPPED", "WNOHANG", "WNOWAIT",
+                "CLD_EXITED", "CLD_KILLED", "CLD_DUMPED", "CLD_STOPPED")
+    require(all(hasattr(os, name) for name in required) and callable(getattr(os, "waitid", None)),
+            "owned process cleanup requires Python os.waitid with WNOWAIT; no reaping fallback is safe")
+    require(sys.platform == "darwin" or sys.platform.startswith("linux"),
+            "owned group observation is supported only on native macOS and Linux")
+    require(signal.getsignal(signal.SIGCHLD) != signal.SIG_IGN,
+            "SIGCHLD must retain waitable children for owned cleanup")
+    if sys.platform == "darwin":
+        _darwin_proc()
+    else:
+        require(Path("/proc/self/stat").is_file(), "native procfs is required for group observation")
+
+
+class _BsdShortInfo(ctypes.Structure):
+    # Darwin SDK sys/proc_info.h: struct proc_bsdshortinfo (64 bytes).
+    _fields_ = [(name, ctypes.c_uint32) for name in ("pid", "ppid", "pgid", "status")]
+    _fields_ += [("comm", ctypes.c_char * 16)]
+    _fields_ += [(name, ctypes.c_uint32) for name in
+                ("flags", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "reserved")]
+
+
+_LIBPROC = None
+
+
+def _darwin_proc():
+    global _LIBPROC
+    if _LIBPROC is None:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        library.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+        library.proc_listpids.restype = ctypes.c_int
+        library.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        library.proc_pidinfo.restype = ctypes.c_int
+        require(ctypes.sizeof(_BsdShortInfo) == 64, "unsupported Darwin process-info ABI")
+        _LIBPROC = library
+    return _LIBPROC
+
+
+def group_members(pgid):
+    """Read native membership; never signal enumerated PIDs or reap descendants.
+
+    Called only while our unreaped child pins pgid. Exited zombies cannot execute
+    or retain file descriptors; their final reap belongs to their actual parent.
+    This observes the owned process group, not descendants that escape its session.
+    """
+    members = []
+    if sys.platform == "darwin":
+        library = _darwin_proc()
+        buffer = (ctypes.c_int * (GROUP_LIMIT + 1))()
+        ctypes.set_errno(0)
+        used = library.proc_listpids(2, pgid, buffer, ctypes.sizeof(buffer))  # PROC_PGRP_ONLY
+        require(0 <= used < ctypes.sizeof(buffer) and used % ctypes.sizeof(ctypes.c_int) == 0,
+                "native process-group list unavailable or exceeds bound")
+        require(used != 0 or ctypes.get_errno() == 0,
+                "native process-group list failed; empty output is not absence proof")
+        for pid in buffer[:used // ctypes.sizeof(ctypes.c_int)]:
+            if not pid:
+                continue
+            info = _BsdShortInfo()
+            ctypes.set_errno(0)
+            size = library.proc_pidinfo(pid, 13, 0, ctypes.byref(info), ctypes.sizeof(info))
+            if size == 0 and ctypes.get_errno() in (errno.ESRCH, errno.ENOENT):
+                continue
+            require(size == ctypes.sizeof(info) and info.pid == pid,
+                    "native member identity/status unavailable")
+            require(info.pgid == pgid, "member escaped observed group before cleanup proof")
+            members.append({"pid": pid, "state": "exited" if info.status == 5 else "live"})  # SZOMB
+    else:
+        scanned = 0
+        with os.scandir("/proc") as entries:
+            for entry in entries:
+                if not entry.name.isdecimal():
+                    continue
+                scanned += 1
+                require(scanned <= PROCESS_TABLE_LIMIT, "native process table exceeds observation bound")
+                try:
+                    with open(entry.path + "/stat", "rb") as source:
+                        raw = source.read(4097)
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                require(len(raw) <= 4096, "native process stat exceeds observation bound")
+                # comm can contain spaces and closing parentheses; fields after
+                # its final ')' start at state (3), ppid (4), pgrp (5).
+                fields = raw[raw.rfind(b")") + 2:].split()
+                require(len(fields) >= 3, "malformed native process stat")
+                if int(fields[2]) == pgid:
+                    members.append({"pid": int(entry.name),
+                                    "state": "exited" if fields[0] in (b"Z", b"X", b"x") else "live"})
+                    require(len(members) <= GROUP_LIMIT, "native group exceeds observation bound")
+    return sorted(members, key=lambda member: member["pid"])
+
+
+class OwnedProcess:
+    """Popen-shaped observations retain the waitable leader until cleanup.
+
+    poll()/wait() return the observed exit without reaping. Only reap() consumes
+    the child, after group signals and native membership observation are complete.
+    No other caller may waitpid()/waitid() without WNOWAIT for this child.
+    """
+    def __init__(self, argv, **kwargs):
+        require_process_observation()
+        self._child = subprocess.Popen(argv, **kwargs)
+        self.pid = self._child.pid
+        self.stdout, self.stderr = self._child.stdout, self._child.stderr
+        self._returncode = None
+        self.reaped = False
+        self.ownership_lost = False
+
+    @property
+    def returncode(self):
+        return self._returncode
+
+    def observe(self, stops=False):
+        if self.reaped:
+            return None
+        options = os.WEXITED | os.WNOHANG | os.WNOWAIT
+        if stops:
+            options |= os.WSTOPPED
+        try:
+            event = os.waitid(os.P_PID, self.pid, options)
+        except ChildProcessError:
+            self.ownership_lost = True
+            raise RuntimeError("owned leader was reaped outside cleanup; refusing numeric PID/group signals")
+        if event is not None and event.si_pid:
+            require(event.si_pid == self.pid, "unexpected child observation")
+            if event.si_code == os.CLD_EXITED:
+                self._returncode = event.si_status
+            elif event.si_code in (os.CLD_KILLED, os.CLD_DUMPED):
+                self._returncode = -event.si_status
+            return event
+        return None
+
+    def observe_stop(self):
+        return self.observe(stops=True)
+
+    def poll(self):
+        self.observe()
+        return self.returncode
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout)
+            time.sleep(0.005)
+        return self.returncode
+
+    def send_signal(self, value):
+        require(not self.reaped and not self.ownership_lost, "owned child is no longer signalable")
+        if self.poll() is None:
+            os.kill(self.pid, value)
+
+    def kill(self):
+        self.send_signal(signal.SIGKILL)
+
+    def reap(self):
+        if not self.reaped:
+            require(not self.ownership_lost and self.poll() is not None, "leader is not waitably exited")
+            observed = self.returncode
+            status = self._child.wait(timeout=0)
+            self.reaped = True
+            require(status == observed, "reaped status differs from retained native exit")
+        return self.returncode
+
+
 class Job:
     def __init__(self, name, argv, root, env, timeout=TIMEOUT):
         self.name, self.argv, self.started = name, list(map(str, argv)), time.monotonic()
         self.timeout, self.output = timeout, {"stdout": bytearray(), "stderr": bytearray()}
         self.failure = None
         self.pipe_deadline = None
-        self.cleanup = {"leader_reaped": False, "group_signaled_or_absent": False,
+        self.cleanup = {"leader_reaped": False, "group_signaled_or_absent": False, "group_members_exited": False,
                         "output_eof": False}
-        self.process = subprocess.Popen(self.argv, cwd=root, env=env, stdin=subprocess.DEVNULL,
+        self.group_observation = None
+        self.cleanup_attempted = False
+        self.process = OwnedProcess(self.argv, cwd=root, env=env, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         start_new_session=True)
 
     def kill(self):
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
+        if self.cleanup_attempted:
+            return  # In particular, never signal a numeric PGID after reap.
+        self.cleanup_attempted = True
+        deadline = time.monotonic() + CLEANUP_TIMEOUT
+        try:
+            while time.monotonic() < deadline:
+                require(not self.process.reaped and not self.process.ownership_lost,
+                        "group signaling requires the retained unreaped leader")
+                self.process.poll()  # WNOWAIT proves we still own this pinned PID.
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                    self.cleanup["group_signaled_or_absent"] = True
+                except ProcessLookupError:
+                    self.cleanup["group_signaled_or_absent"] = True
+                except PermissionError:
+                    pass
+                if self.process.poll() is not None:
+                    members = group_members(self.process.pid)
+                    if all(member["state"] == "exited" for member in members):
+                        if not members:
+                            self.cleanup["group_signaled_or_absent"] = True
+                        self.group_observation = {"method": "libproc" if sys.platform == "darwin" else "procfs",
+                                                  "leader_retained_waitable": True, "members": members,
+                                                  "scope": "owned process group; exited zombies may await their parent"}
+                        self.cleanup["group_members_exited"] = True
+                        break
+                time.sleep(0.01)
+        except (OSError, RuntimeError, AssertionError) as error:
+            self.failure = self.failure or "process-cleanup"
+            self.group_observation = {"error": str(error)}
+        finally:
+            # Direct leader signaling is safe only while this unreaped child is
+            # still ours. Observation failure never permits an unowned fallback.
             try:
-                os.killpg(self.process.pid, signal.SIGKILL)
-                self.cleanup["group_signaled_or_absent"] = True
-            except ProcessLookupError:
-                self.cleanup["group_signaled_or_absent"] = True
-            except PermissionError:
-                # Darwin can briefly refuse a group signal while its owned
-                # child exits. Only an observed reap and confirmed group cleanup
-                # satisfy this fixture; a permanent permission error does not.
-                pass
-            self.cleanup["leader_reaped"] = self.process.poll() is not None
-            if self.cleanup["leader_reaped"] and self.cleanup["group_signaled_or_absent"]:
-                break
-            time.sleep(0.01)
-        if not self.cleanup["leader_reaped"]:
-            try:
-                self.process.kill()
-                self.process.wait(timeout=1)
-                self.cleanup["leader_reaped"] = True
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        if not self.cleanup["leader_reaped"] or not self.cleanup["group_signaled_or_absent"]:
+                if self.process.reaped:
+                    self.cleanup["leader_reaped"] = True
+                elif not self.process.ownership_lost:
+                    self.process.kill()
+                    self.process.wait(timeout=1)
+                    self.process.reap()
+                    self.cleanup["leader_reaped"] = True
+            except (OSError, RuntimeError, AssertionError, subprocess.TimeoutExpired):
+                self.failure = self.failure or "process-cleanup"
+        if not all(self.cleanup[key] for key in ("leader_reaped", "group_signaled_or_absent", "group_members_exited")):
             self.failure = self.failure or "process-cleanup"
         if self.pipe_deadline is None:
             self.pipe_deadline = time.monotonic() + 2
@@ -118,6 +311,7 @@ class Job:
         return {"name": self.name, "argv": self.argv, "pid": self.process.pid,
                 "exit": self.process.returncode, "failure": self.failure,
                 "cleanup": dict(self.cleanup),
+                "group_observation": self.group_observation,
                 "elapsed_seconds": round(time.monotonic() - self.started, 6),
                 **{key: bytes(value).decode("utf-8", "replace") for key, value in self.output.items()}}
 
@@ -318,7 +512,7 @@ class Case:
         finally:
             try:
                 for job in self.jobs:
-                    if job.process.poll() is None:
+                    if getattr(job, "cleanup_attempted", False) is not True:
                         job.kill()
                     if job.failure is not None:
                         result["passed"] = False
@@ -434,12 +628,13 @@ def held_writer(case):
                         fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         fcntl.flock(probe, fcntl.LOCK_UN)
                     except BlockingIOError:
-                        os.kill(rotator.process.pid, signal.SIGSTOP)
+                        rotator.process.send_signal(signal.SIGSTOP)
                         stop_deadline = time.monotonic() + 1
                         while True:
-                            pid, status = os.waitpid(rotator.process.pid, os.WNOHANG | os.WUNTRACED)
-                            if pid:
-                                require(os.WIFSTOPPED(status), "rotator exited before stop observation")
+                            event = rotator.process.observe_stop()
+                            if event is not None:
+                                require(event.si_code == os.CLD_STOPPED and event.si_status == signal.SIGSTOP,
+                                        "rotator exited before stop observation")
                                 stopped = True
                                 break
                             require(time.monotonic() < stop_deadline, "rotator stop not observed")
@@ -468,7 +663,7 @@ def held_writer(case):
                                      resume_monotonic=time.monotonic(), identity_before=before)
         finally:
             if stopped:
-                os.kill(rotator.process.pid, signal.SIGCONT)
+                rotator.process.send_signal(signal.SIGCONT)
     for row in case.finish([rotator, writer]):
         success(row)
     state = json.loads(case.rows[-2]["stdout"])
@@ -497,6 +692,7 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     require(os.name == "posix", "this runner does not certify native Windows")
+    require_process_observation()
     pinned, binaries = {}, {}
     for who in ("baseline", "candidate"):
         path = getattr(args, who).absolute()

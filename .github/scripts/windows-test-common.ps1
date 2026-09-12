@@ -185,6 +185,8 @@ function Save-CiProcessResult([string]$Directory, [string]$Name, $Result) {
     [IO.File]::WriteAllText((Join-Path $Directory "$Name.stderr.log"), $Result.Stderr)
     return [ordered]@{
         exit_code = $Result.ExitCode; timed_out = $Result.TimedOut; output_overflow = $Result.OutputOverflow;
+        leader_exit_code = $Result.LeaderExitCode; process_id = $Result.ProcessId;
+        before_cleanup = $Result.BeforeCleanup; after_cleanup = $Result.AfterCleanup;
         native_job = $Result.NativeJob; leader_reaped = $Result.LeaderReaped; job_empty = $Result.JobEmpty;
         output_drained = $Result.OutputDrained; descendants_leaked = $Result.DescendantsLeaked;
         error = $Result.Error; cleanup_error = $Result.CleanupError

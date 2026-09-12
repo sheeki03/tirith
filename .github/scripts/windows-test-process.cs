@@ -14,8 +14,30 @@ using System.Threading;
 using System.Threading.Tasks;
 
 namespace TirithCi {
+    // Diagnostic observations only; neither PID lookup nor image names grant
+    // authority to terminate a process. Cleanup always targets the owned Job.
+    public sealed class JobProcessDiagnostic {
+        public uint ProcessId;
+        public bool IsLeader;
+        public bool? JobMember, Running;
+        public long? CreationTimeUtcTicks;
+        public string ImagePath = "", Error = "";
+    }
+
+    public sealed class JobDiagnostic {
+        public string Reason = "", Error = "";
+        public long CapturedUnixMilliseconds, ElapsedMilliseconds;
+        public uint? AccountingActiveProcesses, AccountingTotalProcesses, AccountingTerminatedProcesses;
+        public uint? AssignedProcesses, ListedProcesses;
+        public bool ProcessListComplete, Truncated;
+        public JobProcessDiagnostic[] Processes = Array.Empty<JobProcessDiagnostic>();
+    }
+
     public sealed class ProcessResult {
         public int ExitCode;
+        public int? LeaderExitCode;
+        public uint ProcessId;
+        public JobDiagnostic BeforeCleanup, AfterCleanup;
         public bool NativeJob, JobEmpty, LeaderReaped, OutputDrained, DescendantsLeaked;
         public string Error = "", CleanupError = "";
         public bool TimedOut;
@@ -26,6 +48,8 @@ namespace TirithCi {
 
     public sealed class StandardResult {
         public int ExitCode = -1;
+        public int? LeaderExitCode;
+        public JobDiagnostic BeforeCleanup, AfterCleanup;
         public bool TimedOut;
         public bool DescendantsLeaked;
         public bool JobEmpty;
@@ -148,6 +172,16 @@ namespace TirithCi {
         static extern bool SetInformationJobObject(IntPtr job, int kind, ref ExtendedLimits info, uint length);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool QueryInformationJobObject(IntPtr job, int kind, out Accounting info, uint length, IntPtr returned);
+        [DllImport("kernel32.dll", EntryPoint = "QueryInformationJobObject", SetLastError = true)]
+        static extern bool QueryJobProcessIds(IntPtr job, int kind, IntPtr info, uint length, out uint returned);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool member);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder path, ref uint length);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -219,6 +253,84 @@ namespace TirithCi {
             do { if (Empty(job)) return true; Thread.Sleep(50); } while (clock.ElapsedMilliseconds < milliseconds);
             return Empty(job);
         }
+
+        static string DiagnosticError(Exception error) {
+            string text = error.GetType().Name + ": " + error.Message;
+            return text.Length <= 512 ? text : text.Substring(0, 512);
+        }
+
+        // Fixed 256-PID query buffer, at most 32 held-process observations and
+        // 1024 image characters per process. Never enumerate the host, invoke a
+        // child, inspect command lines/environment, retry, or wait for a process.
+        // Stop between kernel queries after a one-second work budget; Win32
+        // metadata calls themselves have no cancellable timeout contract.
+        static JobDiagnostic CaptureJobDiagnostic(IntPtr job, uint leader, string reason) {
+            const int pidCapacity = 256, processLimit = 32, imageLimit = 1024;
+            var result = new JobDiagnostic { Reason = reason, CapturedUnixMilliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+            var rows = new List<JobProcessDiagnostic>();
+            var clock = Stopwatch.StartNew();
+            IntPtr buffer = IntPtr.Zero;
+            try {
+                Accounting accounting;
+                if (QueryInformationJobObject(job, 1, out accounting, (uint)Marshal.SizeOf<Accounting>(), IntPtr.Zero)) {
+                    result.AccountingActiveProcesses = accounting.activeProcesses;
+                    result.AccountingTotalProcesses = accounting.totalProcesses;
+                    result.AccountingTerminatedProcesses = accounting.terminatedProcesses;
+                } else result.Error = "accounting query Win32 error " + Marshal.GetLastWin32Error();
+                int size = 8 + pidCapacity * IntPtr.Size;
+                buffer = Marshal.AllocHGlobal(size);
+                uint returned;
+                if (!QueryJobProcessIds(job, 3, buffer, (uint)size, out returned)) {
+                    int code = Marshal.GetLastWin32Error();
+                    result.Truncated = code == 234; // ERROR_MORE_DATA; never trust partial output.
+                    throw new Win32Exception(code, "bounded owned-Job PID query");
+                }
+                uint assigned = unchecked((uint)Marshal.ReadInt32(buffer, 0));
+                uint listed = unchecked((uint)Marshal.ReadInt32(buffer, 4));
+                if (returned < 8 || returned > size || listed > pidCapacity || 8L + listed * IntPtr.Size > returned)
+                    throw new IOException("invalid owned-Job PID list bounds");
+                result.AssignedProcesses = assigned;
+                result.ListedProcesses = listed;
+                result.ProcessListComplete = listed == assigned;
+                result.Truncated = listed != assigned || listed > processLimit;
+                for (int i = 0; i < Math.Min(listed, processLimit); i++) {
+                    if (clock.ElapsedMilliseconds >= 1000) { result.Truncated = true; break; }
+                    long raw = Marshal.ReadIntPtr(buffer, 8 + i * IntPtr.Size).ToInt64();
+                    if (raw <= 0 || raw > uint.MaxValue) throw new IOException("invalid owned-Job process ID");
+                    var row = new JobProcessDiagnostic { ProcessId = (uint)raw, IsLeader = (uint)raw == leader };
+                    rows.Add(row);
+                    IntPtr process = OpenProcess(0x1000 | 0x100000, false, row.ProcessId); // QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+                    if (process == IntPtr.Zero) { row.Error = "OpenProcess Win32 error " + Marshal.GetLastWin32Error(); continue; }
+                    try {
+                        // A listed process may have exited and its PID may have
+                        // been reused. Bind image/creation observations to the
+                        // opened handle only after confirming this exact Job.
+                        bool member;
+                        Require(IsProcessInJob(process, job, out member), "IsProcessInJob diagnostic");
+                        row.JobMember = member;
+                        if (!member) { row.Error = "listed PID no longer belongs to owned Job"; continue; }
+                        long created, exited, kernel, user;
+                        Require(GetProcessTimes(process, out created, out exited, out kernel, out user), "GetProcessTimes diagnostic");
+                        row.CreationTimeUtcTicks = DateTime.FromFileTimeUtc(created).Ticks;
+                        uint wait = WaitForSingleObject(process, 0);
+                        if (wait == WAIT_OBJECT_0) row.Running = false;
+                        else if (wait == WAIT_TIMEOUT) row.Running = true;
+                        else throw new Win32Exception(Marshal.GetLastWin32Error(), "diagnostic process state");
+                        uint characters = imageLimit;
+                        var image = new StringBuilder(imageLimit);
+                        Require(QueryFullProcessImageNameW(process, 0, image, ref characters), "QueryFullProcessImageNameW diagnostic");
+                        row.ImagePath = image.ToString();
+                    } catch (Exception error) { row.Error = DiagnosticError(error); }
+                    finally { CloseHandle(process); }
+                }
+            } catch (Exception error) { result.Error = (result.Error.Length == 0 ? "" : result.Error + "; ") + DiagnosticError(error); }
+            finally {
+                if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+                result.Processes = rows.ToArray();
+                result.ElapsedMilliseconds = clock.ElapsedMilliseconds;
+            }
+            return result;
+        }
         static string Quote(string value) {
             // Every argument here is a fixed switch or canonical path, never a
             // shell expression. Embedded quotes/control characters are refused.
@@ -260,6 +372,7 @@ namespace TirithCi {
                 if (!result.TimedOut) {
                     uint code; Require(GetExitCodeProcess(info.process, out code), "GetExitCodeProcess");
                     result.ExitCode = unchecked((int)code);
+                    result.LeaderExitCode = result.ExitCode;
                     result.DescendantsLeaked = !WaitEmpty(job, 10000);
                 }
             } catch (Exception error) { result.Error = error.GetType().Name + ": " + error.Message; }
@@ -267,8 +380,11 @@ namespace TirithCi {
                 if (secret != IntPtr.Zero) Marshal.ZeroFreeGlobalAllocUnicode(secret);
                 try {
                     if (assigned) {
+                        result.BeforeCleanup = CaptureJobDiagnostic(job, info.pid,
+                            result.DescendantsLeaked ? "descendant-grace-exceeded" : result.TimedOut ? "timeout" : result.Error.Length != 0 ? "runner-error" : "completion");
                         Require(TerminateJobObject(job, 1), "TerminateJobObject");
                         result.JobEmpty = WaitEmpty(job, 10000);
+                        if (!result.JobEmpty) result.AfterCleanup = CaptureJobDiagnostic(job, info.pid, "cleanup-not-empty");
                     } else if (info.process != IntPtr.Zero) {
                         Require(TerminateProcess(info.process, 1), "TerminateProcess suspended worker");
                         result.JobEmpty = WaitForSingleObject(info.process, 10000) == WAIT_OBJECT_0;
@@ -433,6 +549,7 @@ namespace TirithCi {
                 Require(CreateProcessW(start.FileName, command, IntPtr.Zero, IntPtr.Zero, true,
                     CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | 0x80000,
                     environment, start.WorkingDirectory, ref startup, out info), "CreateProcessW suspended CI child");
+                result.ProcessId = info.pid;
                 Require(AssignProcessToJobObject(job, info.process), "AssignProcessToJobObject before resume");
                 assigned = true;
                 Require(ResumeThread(info.thread) != 0xffffffff, "ResumeThread CI child");
@@ -448,6 +565,7 @@ namespace TirithCi {
                         result.LeaderReaped = true;
                         uint code; Require(GetExitCodeProcess(info.process, out code), "GetExitCodeProcess CI child");
                         result.ExitCode = unchecked((int)code);
+                        result.LeaderExitCode = result.ExitCode;
                         if (Volatile.Read(ref capture.Overflow) == 0) result.DescendantsLeaked = !WaitEmpty(job, 10000);
                         break;
                     }
@@ -461,8 +579,12 @@ namespace TirithCi {
             finally {
                 try {
                     if (assigned) {
+                        result.BeforeCleanup = CaptureJobDiagnostic(job, info.pid,
+                            result.DescendantsLeaked ? "descendant-grace-exceeded" : result.TimedOut ? "timeout" :
+                            Volatile.Read(ref capture.Overflow) != 0 ? "output-overflow" : result.Error.Length != 0 ? "runner-error" : "completion");
                         Require(TerminateJobObject(job, 1), "TerminateJobObject CI child tree");
                         result.JobEmpty = WaitEmpty(job, 10000);
+                        if (!result.JobEmpty) result.AfterCleanup = CaptureJobDiagnostic(job, info.pid, "cleanup-not-empty");
                     } else if (info.process != IntPtr.Zero) {
                         Require(TerminateProcess(info.process, 1), "TerminateProcess suspended CI child");
                     }

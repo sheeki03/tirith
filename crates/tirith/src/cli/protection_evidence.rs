@@ -33,60 +33,71 @@ pub(crate) struct ProtectionEvidence {
 }
 
 impl ProtectionEvidence {
-    /// Called only with a fresh result from core's authenticated caller-shell
-    /// capability path. Public environment markers never enter this constructor.
+    /// The only promotion route consumes core's opaque in-process capability.
+    /// Revalidation happens after the canonical status capture, not while its
+    /// potentially slower configuration and threat database reads are pending.
     pub(crate) fn from_authenticated_shell(
-        observation: &tirith_core::execution_state::ShellVerificationObservation,
-    ) -> Self {
+        proof: tirith_core::execution_state::ShellVerificationProof,
+    ) -> (
+        tirith_core::execution_state::ShellVerificationObservation,
+        Self,
+    ) {
+        let mut observation = proof.into_current_observation();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|value| value.as_millis() as u64)
             .unwrap_or(0);
-        Self::from_authenticated_shell_at(observation, now)
+        if observation.status
+            == tirith_core::execution_state::ShellVerificationStatus::ObservedBlocking
+            && (observation.observed_unix_ms.is_none_or(|at| at > now)
+                || observation.expires_unix_ms <= now)
+        {
+            observation.status = if observation.expires_unix_ms <= now {
+                tirith_core::execution_state::ShellVerificationStatus::Expired
+            } else {
+                tirith_core::execution_state::ShellVerificationStatus::Stale
+            };
+        }
+        let mut evidence = Self::from_report(&observation);
+        if observation.status
+            == tirith_core::execution_state::ShellVerificationStatus::ObservedBlocking
+            && observation.observed_unix_ms.is_some_and(|at| at <= now)
+            && observation.expires_unix_ms > now
+        {
+            evidence.state = ProtectionState::ObservedBlocking;
+            evidence.fresh = true;
+            evidence.verified_blocking = true;
+            evidence.invalidation_reason = None;
+        }
+        (observation, evidence)
     }
 
-    fn from_authenticated_shell_at(
+    /// Report DTOs retain their diagnostic detail, but cannot confer authority.
+    pub(crate) fn from_report(
         observation: &tirith_core::execution_state::ShellVerificationObservation,
-        now: u64,
     ) -> Self {
         use tirith_core::execution_state::ShellVerificationStatus;
         let mut evidence = Self::configuration("guarded", true, true);
-        let fresh = observation.schema_version == 1
-            && observation.source == "authenticated_caller_shell"
-            && observation.scope == "current_shell_only"
-            && observation.status == ShellVerificationStatus::ObservedBlocking
-            && observation.observed_unix_ms.is_some_and(|at| at <= now)
-            && observation.expires_unix_ms > now;
         evidence.source = observation.source.into();
         evidence.observed_at = observation.observed_unix_ms.map(|at| at / 1000);
         evidence.expires_at = Some(observation.expires_unix_ms / 1000);
-        evidence.fresh = fresh;
-        evidence.verified_blocking = fresh;
-        evidence.state = if fresh {
-            ProtectionState::ObservedBlocking
-        } else {
-            ProtectionState::Unknown
-        };
-        evidence.invalidation_reason = if fresh {
-            None
-        } else {
-            Some(
-                match observation.status {
-                    ShellVerificationStatus::Pending => {
-                        "caller-shell diagnostic sequence is incomplete"
-                    }
-                    ShellVerificationStatus::Failed => "caller-shell diagnostic sequence failed",
-                    ShellVerificationStatus::Stale => {
-                        "shell, loaded hook, configuration or policy changed"
-                    }
-                    ShellVerificationStatus::Expired => "caller-shell observation expired",
-                    ShellVerificationStatus::ObservedBlocking => {
-                        "caller-shell observation is no longer fresh"
-                    }
+        evidence.state = ProtectionState::Unknown;
+        evidence.invalidation_reason = Some(
+            match observation.status {
+                ShellVerificationStatus::Pending => {
+                    "caller-shell diagnostic sequence is incomplete"
                 }
-                .into(),
-            )
-        };
+                ShellVerificationStatus::Failed => "caller-shell diagnostic sequence failed",
+                ShellVerificationStatus::Stale => {
+                    "shell, loaded hook, configuration, policy or projection context changed"
+                }
+                ShellVerificationStatus::Expired => "caller-shell observation expired",
+                ShellVerificationStatus::ObservedBlocking => {
+                    "a report alone cannot establish fresh authenticated caller-shell blocking"
+                }
+            }
+            .into(),
+        );
         evidence
     }
 
@@ -185,49 +196,32 @@ mod tests {
         assert!(!evidence.fresh);
     }
     #[test]
-    fn authenticated_projection_requires_fresh_completed_observation() {
-        let observation = observation();
-        let fresh = ProtectionEvidence::from_authenticated_shell_at(&observation, 110_000);
-        assert!(fresh.verified_blocking && fresh.fresh);
-        assert_eq!(fresh.observed_at, Some(100));
-        for now in [99_000, 160_000, 170_000] {
-            let invalid = ProtectionEvidence::from_authenticated_shell_at(&observation, now);
-            assert!(!invalid.verified_blocking && !invalid.fresh);
-            assert_ne!(invalid.state, ProtectionState::ObservedBlocking);
-        }
-    }
-    #[test]
-    fn invalidated_or_incomplete_core_result_cannot_retain_verification() {
+    fn public_report_dto_cannot_promote_current_or_saved_success() {
         let mut observation = observation();
         for status in [
             ShellVerificationStatus::Pending,
             ShellVerificationStatus::Failed,
             ShellVerificationStatus::Stale,
             ShellVerificationStatus::Expired,
+            ShellVerificationStatus::ObservedBlocking,
         ] {
             observation.status = status;
-            let invalid = ProtectionEvidence::from_authenticated_shell_at(&observation, 110_000);
-            assert!(!invalid.verified_blocking);
-            assert!(invalid.invalidation_reason.is_some());
+            let report = ProtectionEvidence::from_report(&observation);
+            assert!(!report.verified_blocking && !report.fresh);
+            assert_ne!(report.state, ProtectionState::ObservedBlocking);
+            assert!(report.invalidation_reason.is_some());
         }
-        observation.status = ShellVerificationStatus::ObservedBlocking;
-        observation.observed_unix_ms = None;
-        assert!(
-            !ProtectionEvidence::from_authenticated_shell_at(&observation, 110_000)
-                .verified_blocking
-        );
+        observation.observed_unix_ms = Some(0);
+        observation.expires_unix_ms = u64::MAX;
+        assert!(!ProtectionEvidence::from_report(&observation).verified_blocking);
     }
     #[test]
     fn disposable_or_unauthenticated_result_cannot_certify_the_caller() {
         let mut value = observation();
         value.scope = "disposable_child_only";
-        assert!(
-            !ProtectionEvidence::from_authenticated_shell_at(&value, 110_000).verified_blocking
-        );
+        assert!(!ProtectionEvidence::from_report(&value).verified_blocking);
         value.scope = "current_shell_only";
         value.source = "inherited_environment";
-        assert!(
-            !ProtectionEvidence::from_authenticated_shell_at(&value, 110_000).verified_blocking
-        );
+        assert!(!ProtectionEvidence::from_report(&value).verified_blocking);
     }
 }

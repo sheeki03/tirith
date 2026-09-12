@@ -136,6 +136,11 @@ pub fn run(action: &str, id: Option<&str>, channel: ShellReceiptChannel) -> i32 
             return Ok(0);
         }
         let id = id.ok_or("a challenge ID is required")?;
+        if action == "status" {
+            let proof =
+                execution_state::finish_shell_verification_authenticated(id, channel, &loaded)?;
+            return Ok(super::status::run_authenticated(proof));
+        }
         let observation = match action {
             "allowed" => execution_state::execute_shell_verification_probe(
                 id,
@@ -149,12 +154,9 @@ pub fn run(action: &str, id: Option<&str>, channel: ShellReceiptChannel) -> i32 
                 channel,
                 &loaded,
             )?,
-            "status" => execution_state::finish_shell_verification(id, channel, &loaded)?,
             _ => return Err("unsupported shell verification action".into()),
         };
-        let observed = observation.status == ShellVerificationStatus::ObservedBlocking;
-        let evidence =
-            super::protection_evidence::ProtectionEvidence::from_authenticated_shell(&observation);
+        let evidence = super::protection_evidence::ProtectionEvidence::from_report(&observation);
         if !super::write_json_stdout(
             &serde_json::json!({"observation": observation, "protection": evidence}),
             "tirith: cannot write shell verification result",
@@ -164,9 +166,7 @@ pub fn run(action: &str, id: Option<&str>, channel: ShellReceiptChannel) -> i32 
         // Allowed-body success means the inert body was observed, not that the
         // challenge is already verified. Status is the strict machine route.
         Ok(
-            if observed
-                || (action == "allowed" && observation.status == ShellVerificationStatus::Pending)
-            {
+            if action == "allowed" && observation.status == ShellVerificationStatus::Pending {
                 0
             } else {
                 1
@@ -200,7 +200,7 @@ pub fn instructions(json: bool) -> i32 {
             1
         };
     }
-    println!("In the shell you want to verify, run:\n  _tirith_verification_probe start\nThen enter its three exact challenge commands separately, in order.\nThe final helper status returns success only for fresh observed blocking.\nIf the helper is unavailable, activate the current integration in a fresh shell.\nPowerShell and Nushell do not yet have an authenticated verification adapter.");
+    println!("In the shell you want to verify, run:\n  _tirith_verification_probe start\nThen enter its three exact challenge commands separately, in order.\nThe final helper returns canonical status and succeeds only for fresh observed blocking.\nIf the helper is unavailable, activate the current integration in a fresh shell.\nPowerShell and Nushell do not yet have an authenticated verification adapter.");
     0
 }
 
