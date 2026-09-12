@@ -57,6 +57,67 @@ impl<T> PackageApprovalAuthority for T where T: PackageApprovalIssuer + PackageA
 
 pub(crate) struct NativePackageApprovalAuthority;
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PackageApprovalAvailability {
+    pub state: &'static str,
+    pub platform_supported: bool,
+    pub trusted_sudo_present: bool,
+    pub trusted_helper_present: bool,
+    pub automatic_elevation: bool,
+    pub ordinary_protection_requires_sudo: bool,
+    pub detail: &'static str,
+    pub next_action: &'static str,
+}
+
+impl PackageApprovalAvailability {
+    fn from_prerequisites(platform: bool, sudo: bool, helper: bool) -> Self {
+        let (state, detail, next_action) = if !platform {
+            ("unsupported", "package approvals are redeemable only on x86_64 Linux; native issuance is unavailable on this platform.", "Command checks and shell protection remain available; use a supported x86_64 Linux host for native package approvals.")
+        } else if !sudo {
+            ("unavailable", "Native package-approval issuance is off: trusted /usr/bin/sudo is unavailable. Command checks and shell protection do not require sudo.", "Only if you need tirith pkg approve, have an administrator install sudo and the protected Tirith approval helper, then run pkg approve from a non-root interactive session with fresh administrator confirmation.")
+        } else if !helper {
+            ("unavailable", "Native package-approval issuance is off: the protected approval helper is unavailable. Command checks and shell protection do not require it.", "Only if you need tirith pkg approve, install the protected helper from a verified matching release (manual installer: TIRITH_INSTALL_APPROVAL_HELPER=1); provisioning requires a root session or trusted /usr/bin/sudo.")
+        } else {
+            ("available_on_explicit_request", "Native approval prerequisites are present; nothing runs or elevates automatically. Fresh administrator confirmation is still required for each pkg approve invocation.", "Run tirith pkg approve only when you intend to approve an exact package plan. A non-root interactive operator and sudo password confirmation are required; passwordless approval is refused.")
+        };
+        Self {
+            state,
+            platform_supported: platform,
+            trusted_sudo_present: platform && sudo,
+            trusted_helper_present: platform && helper,
+            automatic_elevation: false,
+            ordinary_protection_requires_sudo: false,
+            detail,
+            next_action,
+        }
+    }
+
+    pub(crate) fn require_explicit_issuance(&self) -> Result<(), NativeAuthorityError> {
+        if self.state == "available_on_explicit_request" {
+            Ok(())
+        } else {
+            Err(NativeAuthorityError::blocked(format!(
+                "{} {}",
+                self.detail, self.next_action
+            )))
+        }
+    }
+}
+
+/// Metadata validation only: never invokes sudo/helper or creates authority state.
+pub(crate) fn availability() -> PackageApprovalAvailability {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        PackageApprovalAvailability::from_prerequisites(
+            true,
+            validate_approval_sudo(Path::new("/usr/bin/sudo")).is_ok(),
+            find_installed_helper().is_ok(),
+        )
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    PackageApprovalAvailability::from_prerequisites(false, false, false)
+}
+
 #[cfg(unix)]
 impl PackageApprovalIssuer for NativePackageApprovalAuthority {
     fn issue(
@@ -169,6 +230,34 @@ impl PackageApprovalIssuer for NativePackageApprovalAuthority {
             PackageApprovalRecordV2::from_json(&output.stdout).map_err(|_| {
                 NativeAuthorityError::blocked("native authority returned invalid proof")
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::PackageApprovalAvailability;
+
+    #[test]
+    fn capability_is_explicit_and_missing_prerequisites_do_not_disable_protection() {
+        for platform in [false, true] {
+            for sudo in [false, true] {
+                for helper in [false, true] {
+                    let report =
+                        PackageApprovalAvailability::from_prerequisites(platform, sudo, helper);
+                    assert!(!report.automatic_elevation);
+                    assert!(!report.ordinary_protection_requires_sudo);
+                    assert_eq!(
+                        report.require_explicit_issuance().is_ok(),
+                        platform && sudo && helper
+                    );
+                    if platform && !sudo {
+                        assert!(report.detail.contains("off"));
+                        assert!(report.detail.contains("/usr/bin/sudo"));
+                        assert!(report.next_action.contains("Only if you need"));
+                    }
+                }
+            }
         }
     }
 }

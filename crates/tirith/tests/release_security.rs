@@ -700,12 +700,12 @@ fn release_publication_refuses_mutable_inputs_and_version_conflicts() {
 }
 
 #[test]
-fn linux_packages_keep_sudo_optional() {
+fn linux_packages_do_not_depend_on_or_suggest_sudo() {
     let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml")).unwrap();
     let deb = &manifest["package"]["metadata"]["deb"];
     assert_eq!(deb["depends"].as_str(), Some("ca-certificates"));
-    assert_eq!(deb["suggests"].as_str(), Some("sudo"));
+    assert!(deb.get("suggests").is_none());
     assert!(deb.get("recommends").is_none());
 
     let spec = std::fs::read_to_string(repository_root.join("packaging/rpm/tirith.spec"))
@@ -716,17 +716,14 @@ fn linux_packages_keep_sudo_optional() {
         .map(str::trim)
         .collect();
     assert_eq!(requires, ["ca-certificates"]);
-    assert!(spec.lines().any(|line| {
-        line.strip_prefix("Suggests:")
-            .is_some_and(|dependency| dependency.trim() == "sudo")
-    }));
+    for weak_dependency in ["Suggests:", "Recommends:", "Supplements:", "Enhances:"] {
+        assert!(!spec.lines().any(|line| line.starts_with(weak_dependency)));
+    }
 
     let pkgbuild = std::fs::read_to_string(repository_root.join("packaging/aur/PKGBUILD"))
         .expect("read AUR PKGBUILD");
     assert!(pkgbuild.lines().any(|line| line == "depends=('gcc-libs')"));
-    assert!(pkgbuild.lines().any(|line| {
-        line == "optdepends_x86_64=('sudo: fresh administrator confirmation for tirith pkg approve')"
-    }));
+    assert!(!pkgbuild.lines().any(|line| line.starts_with("optdepends")));
 }
 
 #[test]

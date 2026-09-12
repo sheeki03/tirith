@@ -1067,6 +1067,7 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
 
 #[derive(serde::Serialize)]
 struct DoctorInfo {
+    package_approval: super::package_approval_authority::PackageApprovalAvailability,
     version: String,
     binary_path: String,
     detected_shell: String,
@@ -1364,6 +1365,7 @@ fn gather_info() -> DoctorInfo {
     };
 
     DoctorInfo {
+        package_approval: super::package_approval_authority::availability(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         binary_path,
         detected_shell,
@@ -2492,6 +2494,9 @@ fn print_protection_status(status: Option<&str>) {
 }
 
 fn print_human(info: &DoctorInfo) {
+    println!("  pkg approval: {} (optional)", info.package_approval.state);
+    println!("    {}", info.package_approval.detail);
+    println!("    {}", info.package_approval.next_action);
     println!("tirith {}", info.version);
     println!("  binary:       {}", info.binary_path);
     // Low-value advisory: the noisy shadow-binary warning is suppressed under

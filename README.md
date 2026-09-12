@@ -601,11 +601,14 @@ sudo dnf install ./tirith-*.rpm
 ```
 
 Package installation requires administrator privileges; in an existing root
-session, run the commands without `sudo`. Sudo is optional for normal tirith
-use. On x86_64 Linux, only `tirith pkg approve` requires a trusted
+session, run the commands without `sudo`. Tirith packages neither depend on nor
+suggest installing sudo. On x86_64 Linux, only the explicitly requested
+`tirith pkg approve` operation requires a trusted
 `/usr/bin/sudo` and the root-owned approval helper for fresh administrator
-confirmation. If that authority is unavailable, approval remains blocked;
-ordinary command checks and shell protection continue to work.
+confirmation. The packaged helper is inert: installation creates no sudoers
+rule, elevated service, or signing key. If that authority is unavailable,
+approval remains blocked; ordinary command checks and shell protection
+continue to work.
 
 The Linux GNU release binaries target a GLIBC 2.28 ceiling. CI runs both
 x86_64 and aarch64 tarballs on AlmaLinux 8, Amazon Linux 2023, and Rocky Linux

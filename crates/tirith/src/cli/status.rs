@@ -27,7 +27,7 @@ pub fn run(json: bool) -> i32 {
     let tdb = threatdb_cmd::gather_status();
 
     if json {
-        let out = status_json(
+        let mut out = status_json(
             &quick.protection_mode,
             health,
             scope,
@@ -35,6 +35,9 @@ pub fn run(json: bool) -> i32 {
             quick.hook_configured,
             &tdb,
         );
+        out["package_approval"] =
+            serde_json::to_value(super::package_approval_authority::availability())
+                .expect("package approval availability contains only JSON primitives");
         match serde_json::to_string_pretty(&out) {
             Ok(s) => println!("{s}"),
             Err(e) => {
@@ -61,6 +64,10 @@ pub fn run(json: bool) -> i32 {
         (None, _) => println!("  policy:      (none found)"),
     }
     println!("  threat db:   {}", threatdb_summary(&tdb));
+    let approval = super::package_approval_authority::availability();
+    println!("  pkg approval: {} (optional)", approval.state);
+    println!("    {}", approval.detail);
+    println!("    {}", approval.next_action);
     println!();
     // The verdict line: PROTECTED on stdout when guarded; otherwise the reason on
     // stderr (a security notice — always shown, never `--quiet`-gated).

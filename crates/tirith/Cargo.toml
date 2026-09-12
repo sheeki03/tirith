@@ -154,7 +154,6 @@ windows = { version = "0.62", default-features = false, features = [
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"
 section = "utils"
 depends = "ca-certificates"
-suggests = "sudo"
 # Paths relative to crates/tirith/ (NOT repo root)
 assets = [
     ["target/release/tirith", "usr/bin/", "755"],
