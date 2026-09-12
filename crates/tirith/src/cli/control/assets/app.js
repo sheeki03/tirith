@@ -7,7 +7,7 @@
   const operationActions = document.querySelector('#operation-actions');
   const token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
   history.replaceState(null, '', location.pathname);
-  let csrf = '', currentPage = 'overview', generation = 0, activeOperation = null, pollTimer = null, pendingPlan = null, pendingLifecycle = null;
+  let csrf = '', currentPage = 'overview', generation = 0, dialogGeneration = 0, activeOperation = null, pollTimer = null, pendingPlan = null, pendingLifecycle = null, planRequest = null, lifecycleRequest = null;
   const pages = {
     overview: ['Overview', 'Protection evidence from this computer.'],
     activity: ['Activity', 'Recorded checks and interruptions, with the limits of the available history.'],
@@ -49,6 +49,8 @@
       row('Personal baseline', 'Repository, organization, remote, or incident restrictions may constrain your selection.', policy.resolution?.requested_profile?.name || policy.policy?.protection_profile?.name || 'Custom / default'),
       row('Threat intelligence', fresh.error || 'Signature verification and source freshness are reported independently.', fresh.status),
       row('Project', state.project, 'Service scope'));
+    if (state.audit_recording) surfaces.append(row('Audit recording', state.audit_recording.detail, state.audit_recording.state,
+      [button('Inspect activity coverage', () => navigate('activity'))]));
     return [hero, surfaces, projectReviewPanel(), npmArtifactPanel(), rawDetails('Inspect effective policy evidence', policy)];
   }
   function npmArtifactPanel() {
@@ -57,8 +59,8 @@
     const previous = field('Previous npm tarball (for comparison)', 'text', '', 'artifacts/package-previous.tgz');
     for (const input of [current.input, previous.input]) input.maxLength = 512;
     section.append(paragraph('Inspect the exact bytes of a project-relative .tgz or .tar.gz file, up to 32 MiB compressed. Static observations include script, code and native-file evidence. Nothing is installed or executed, and registry provenance is unavailable offline.'), current.label, previous.label,
-      button('Inspect npm tarball', async () => { const request = {action:'inspect', path:current.input.value.trim()}; showNpmReport(await api('/api/artifacts/npm', request), request); }, 'primary'),
-      button('Compare npm tarballs', async () => { const request = {action:'compare', old_path:previous.input.value.trim(), new_path:current.input.value.trim()}; showNpmReport(await api('/api/artifacts/npm', request), request); }));
+      button('Inspect npm tarball', async () => { const request = {action:'inspect', path:current.input.value.trim()}; await requestDialog(() => api('/api/artifacts/npm', request), value => showNpmReport(value, request)); }, 'primary'),
+      button('Compare npm tarballs', async () => { const request = {action:'compare', old_path:previous.input.value.trim(), new_path:current.input.value.trim()}; await requestDialog(() => api('/api/artifacts/npm', request), value => showNpmReport(value, request)); }));
     return section;
   }
   function showNpmReport(value, request) {
@@ -87,7 +89,7 @@
     const section = panel('Review this project');
     const label = element('label', 'Project-relative files (optional)'); const paths = element('textarea'); paths.rows = 3; paths.maxLength = 8192; paths.setAttribute('aria-label', 'Project-relative files (optional)'); label.append(paths);
     section.append(paragraph('Explicitly inspect dependency declarations, known hook files, AI instructions and MCP configuration in this service’s project. No package manager, hook or server is started. Leave the list empty to review known surfaces; nested workspaces and unselected files remain uninspected.'), label,
-      button('Inspect selected project files', async () => showProjectReview(await api('/api/project/review', {paths:paths.value.split('\n').map(path => path.trim()).filter(Boolean)})), 'primary'));
+      button('Inspect selected project files', () => requestDialog(() => api('/api/project/review', {paths:paths.value.split('\n').map(path => path.trim()).filter(Boolean)}), showProjectReview), 'primary'));
     return section;
   }
   function showProjectReview(value) {
@@ -100,7 +102,7 @@
       if (file.dependency_count) item.append(paragraph(`${file.dependencies?.length || 0} assessed among ${file.dependency_count} declared dependencies. Artifact code was not inspected.`));
       operationContent.append(item);
     }
-    operationActions.append(button('Recheck retained file identities', async () => showProjectReview(await api('/api/project/revalidate', {report_id:value.report_id}))));
+    operationActions.append(button('Recheck retained file identities', () => requestDialog(() => api('/api/project/revalidate', {report_id:value.report_id}), showProjectReview)));
   }
   async function activity() {
     const wrapper = element('div'); const tools = element('form', undefined, 'toolbar');
@@ -123,6 +125,7 @@
       const coverage = panel('Collection coverage'); coverage.append(badge(data.availability), paragraph(`${[...rows.values()].filter(event => event.semantics === 'recorded_check').length} recorded checks among ${rows.size} loaded records (at most 1,000 retained in the browser). These counts do not establish execution or attacks prevented.`),
         paragraph(data.detail || (data.earlier_history_uninspected ? 'Older history has not been inspected in this bounded view.' : 'Coverage is limited to the inspected records.')),
         paragraph(`Malformed records: ${data.malformed_lines || 0}. Oversized records: ${data.oversized_lines || 0}. Unfinished tail: ${data.incomplete_tail ? 'yes' : 'no'}. Audit integrity: ${data.integrity || 'not verified by this reader'}.`, 'muted'));
+      if (data.audit_recording) coverage.append(paragraph(data.audit_recording.detail, data.audit_recording.state === 'failure_observed' ? 'notice' : 'muted'), rawDetails('Audit writer observations', data.audit_recording));
       result.append(coverage);
       if (!rows.size) result.append(paragraph('No recorded activity is available for this selection.', 'empty'));
       const list = panel('Recorded activity'); const counts = new Map();
@@ -174,10 +177,10 @@
     const details = panel('Effective settings and constraints'); details.append(paragraph('This is the resolver’s effective policy. A saved preference may be overridden by a stronger authority.'), rawDetails('Inspect settings, source provenance, and neutralized values', effective));
     const tuning = panel('Review recurring interruptions');
     tuning.append(paragraph('Inspect bounded recent check counts, recorded expectations, and redacted examples before choosing a change. Repeated warnings, allowed decisions and user labels do not prove a relaxation is safe.'),
-      button('Review recent friction', async () => {
-        const value = await api('/api/policy/tuning'); showDialog('Recent friction review', value);
+      button('Review recent friction', () => requestDialog(() => api('/api/policy/tuning'), value => {
+        showDialog('Recent friction review', value);
         operationContent.prepend(paragraph(value.notice, 'notice'), paragraph(`${value.records_analyzed} recorded checks inspected. Older history uninspected: ${value.coverage.earlier_history_uninspected ? 'yes' : 'no'}.`), paragraph(value.next_action));
-      }));
+      })));
     return [intro, tuning, rolloutPanel(), advancedSettings(effective), details];
   }
   function rolloutPanel() {
@@ -210,14 +213,15 @@
     form.addEventListener('submit', event => { event.preventDefault(); const selected = value.input.value;
       const change = {setting:setting.input.value, value:selected === 'reset' ? null : selected === 'true' ? true : selected === 'false' ? false : setting.input.value === 'paranoia' ? Number(selected) : selected};
       if (setting.input.value === 'rule_severity') change.rule = rule.input.value.trim();
-      api('/api/settings/preview', change).then(preview => { showDialog('Review personal setting', preview); operationActions.append(button('Create change plan', () => plan({kind:'personal_setting',change}), 'primary')); }).catch(showError);
+      requestDialog(() => api('/api/settings/preview', change), preview => { showDialog('Review personal setting', preview); operationActions.append(button('Create change plan', () => plan({kind:'personal_setting',change}), 'primary')); }).catch(showError);
     });
     section.append(paragraph('These changes apply to your personal policy. Profile changes and resets preserve explicit overrides. Removal restores the value inherited from other policy sources.'), form); return section;
   }
   async function previewProfile(profile) {
-    const value = await api('/api/profile/preview', { profile });
-    showDialog('Review personal profile', value);
-    operationActions.append(button('Create change plan', () => plan({ kind: 'profile', profile }), 'primary'));
+    return requestDialog(() => api('/api/profile/preview', {profile}), value => {
+      showDialog('Review personal profile', value);
+      operationActions.append(button('Create change plan', () => plan({kind:'profile', profile}), 'primary'));
+    });
   }
   function field(title, type = 'text', value = '', placeholder = '') { const label = element('label', title); const input = element('input'); input.type = type; input.value = value; input.placeholder = placeholder; if (type === 'checkbox') label.replaceChildren(input, document.createTextNode(title)); else label.append(input); return { label, input }; }
   function select(title, options) { const label = element('label', title); const input = element('select'); input.setAttribute('aria-label', title); for (const [value, text] of options) { const option = element('option', text); option.value = value; input.append(option); } label.append(input); return { label, input }; }
@@ -231,7 +235,7 @@
         const node = element('div', undefined, 'row'); const copy = element('div'); copy.append(element('strong', grant.pattern || 'Unusable grant'), element('small', `${grant.scope} · ${grant.rule_id || 'All rules'} · ${grant.expires_at || 'No expiry recorded'}`), paragraph(grant.state_reason || '', 'muted'), rawDetails('Inspect exception and scope', grant));
         const actions = element('div', undefined, 'actions');
         if (grant.id) { actions.append(button('Revoke', () => plan({ kind: 'trust_revoke', grant_id: grant.id })), button('Change expiry', () => expiryDialog(grant))); }
-        if (grant.id && ['user', 'project'].includes(grant.scope)) actions.append(button('Explain trust eligibility', async () => showDialog('Permission explanation', await api('/api/exceptions/explain', { target: grant.id, scope: grant.scope }))));
+        if (grant.id && ['user', 'project'].includes(grant.scope)) actions.append(button('Explain trust eligibility', () => requestDialog(() => api('/api/exceptions/explain', {target:grant.id, scope:grant.scope}), value => showDialog('Permission explanation', value))));
         copy.append(actions); node.append(copy, badge(grant.state || 'Unknown')); rows.append(node);
       }
     }
@@ -259,7 +263,7 @@
     const setup = panel('Set up or repair a shell'); const shell = select('Intended shell', [['', 'Choose a shell'], ['bash', 'Bash'], ['zsh', 'Zsh'], ['fish', 'Fish'], ['nushell', 'Nushell'], ['powershell', 'Windows PowerShell 5.1'], ['pwsh', 'PowerShell 7']]);
     const choose = () => { if (!shell.input.value) throw new Error('Choose the shell whose startup configuration you want to change.'); return shell.input.value; };
     setup.append(paragraph('Tirith discovers the personal startup files for the selected shell. Review every destination before applying. Restart that shell after setup, repair, removal, or undo.'), shell.label,
-      button('Inspect selected configuration', async () => showDialog('Shell configuration', await api('/api/integrations/inspect', { shell: choose() }))),
+      button('Inspect selected configuration', () => requestDialog(() => api('/api/integrations/inspect', {shell:choose()}), value => showDialog('Shell configuration', value))),
       button('Review setup', () => plan({ kind: 'shell', change: { action: 'install', shell: choose(), force: false } }), 'primary'),
       button('Review repair', () => plan({ kind: 'shell', change: { action: 'install', shell: choose(), force: true } })),
       button('Review removal of owned hook', () => plan({ kind: 'shell', change: { action: 'remove', shell: choose() } })));
@@ -286,7 +290,7 @@
       button('Review saved rollback', () => prepareLifecycle('rollback')));
     const sources = panel('Threat intelligence freshness'); sources.append(row('Installed database', fresh.error || 'A signed publication can contain older source data; inspect each dimension.', fresh.status), rawDetails('Inspect publication, source age, and pin adoption', fresh));
     sources.append(button('Check and review database refresh', () => prepareLifecycle('refresh_threat_db')));
-    const local = panel('Local service'); local.append(paragraph('Stop accepting changes and close this dashboard service after its active jobs finish. Shell and agent protection continue independently.'), button('Close local service', async () => { const response = await api('/api/quiesce', {}); showDialog('Service is draining', response); document.querySelector('#session-state').textContent = 'Service closing — reopen with tirith dashboard'; }, 'secondary'));
+    const local = panel('Local service'); local.append(paragraph('Stop accepting changes and close this dashboard service after its active jobs finish. Shell and agent protection continue independently.'), button('Close local service', () => requestDialog(() => api('/api/quiesce', {}), response => { showDialog('Service is draining', response); document.querySelector('#session-state').textContent = 'Service closing — reopen with tirith dashboard'; }), 'secondary'));
     const exportPanel = panel('Export this redacted view'); exportPanel.append(paragraph('Exports refresh the lifecycle and freshness projections under the current privacy policy. Canonical signed files and private operation journals are not included.'), button('Download JSON', async () => { const [currentLifecycle, freshness] = await Promise.all([api('/api/lifecycle'), api('/api/freshness')]); download('tirith-local-status.json', {lifecycle:currentLifecycle, freshness}); }));
     const retention = panel('Audit retention'); retention.append(paragraph('Review a rotation of the active audit history into a private retained segment. Rotation preserves exact archived bytes and starts a checkpointed active segment. Undo requires that no further records have been appended.'), button('Review audit rotation', () => plan({kind:'audit_retention', change:'rotate'})));
     const segment = field('Retained segment ID', 'text', '', 'UUID of the completed rotation operation');
@@ -301,10 +305,10 @@
     approval.append(row('Native package approval', state.package_approval.detail, state.package_approval.state), paragraph(state.package_approval.next_action), paragraph('Ordinary command checks and shell protection do not require sudo. This dashboard never requests administrator credentials.'));
     const recent = panel('Saved changes and recovery'); recent.append(paragraph('These are saved operation states. Open an operation to reconcile its current status; closing the browser does not cancel submitted work.'));
     if (!jobs.operations.length) recent.append(paragraph('No saved operations in the bounded inventory.', 'empty'));
-    for (const operation of jobs.operations) recent.append(row(operation.kind || 'Saved change', operation.operation_id, operation.no_op ? 'unchanged' : operation.state, [button('Open saved operation', async () => { const stored = await api('/api/operations', {operation_id: operation.operation_id, action: 'status'}); showDialog('Saved operation', stored); displayOperation(stored); })]));
+    for (const operation of jobs.operations) recent.append(row(operation.kind || 'Saved change', operation.operation_id, operation.no_op ? 'unchanged' : operation.state, [button('Open saved operation', () => requestDialog(() => api('/api/operations', {operation_id:operation.operation_id, action:'status'}), stored => { showDialog('Saved operation', stored); displayOperation(stored); }))]));
     recent.append(rawDetails('Inspect inventory coverage', jobs.coverage));
     const lifecycleId = field('Update or refresh operation ID', 'text', '', 'UUID retained from a lifecycle preview');
-    recent.append(lifecycleId.label, button('Open saved lifecycle operation', async () => displayLifecycle(await api('/api/lifecycle/operation', {operation_id:lifecycleId.input.value.trim(), action:'status'}))));
+    recent.append(lifecycleId.label, button('Open saved lifecycle operation', () => requestDialog(() => api('/api/lifecycle/operation', {operation_id:lifecycleId.input.value.trim(), action:'status'}), displayLifecycle)));
     return [install, approval, sources, retention, recent, supportPanel(), local, exportPanel];
   }
   function supportPanel() {
@@ -315,10 +319,11 @@
     support.append(paragraph('Include only the incidents and saved changes you select. Preview applies the current redaction policy. Older history may be outside the bounded read; no report is uploaded.'), operations.label, incidents.label,
       button('Preview support report', async () => {
         const selection = {operation_ids: selected(operations.input), incident_ids: selected(incidents.input)};
-        const value = await api('/api/support/preview', selection);
+        await requestDialog(() => api('/api/support/preview', selection), value => {
         showDialog('Review support report', value);
         operationContent.prepend(paragraph(value.notice, 'notice'));
         operationActions.append(button('Download with fresh redaction', async () => download('tirith-support.json', await api('/api/support/preview', selection)), 'primary'));
+        });
       }));
     return support;
   }
@@ -328,30 +333,31 @@
     if (pendingLifecycle && pendingLifecycle.action !== action) throw new Error('Inspect or retry the pending lifecycle request before selecting a different action.');
     if (!pendingLifecycle) pendingLifecycle = {operation_id:crypto.randomUUID(), action};
     const pending = pendingLifecycle;
-    showDialog('Checking lifecycle candidate', {operation_id:pending.operation_id, detail:'This explicit check may contact release servers. Applying requires a separate reviewed action.'});
+    const epoch = showDialog('Checking lifecycle candidate', {operation_id:pending.operation_id, detail:'This explicit check may contact release servers. Applying requires a separate reviewed action.'});
+    if (!lifecycleRequest || lifecycleRequest.pending !== pending) lifecycleRequest = {pending, promise:api('/api/lifecycle/prepare', pending)};
+    const request = lifecycleRequest;
     try {
-      const view = await api('/api/lifecycle/prepare', pending);
-      pendingLifecycle = null; displayLifecycle(view);
+      const view = await request.promise;
+      if (pendingLifecycle === pending) pendingLifecycle = null;
+      if (dialogGeneration === epoch) displayLifecycle(view);
     } catch (error) {
+      if (dialogGeneration !== epoch) return;
       showDialog('Lifecycle preview response unavailable', {operation_id:pending.operation_id, detail:'The request may have been saved. Keep this ID; retries retain the same requested action.', error:error.message});
       operationActions.append(button('Retry this lifecycle request', () => prepareLifecycle(pending.action), 'primary'),
-        button('Inspect saved lifecycle request', async () => { const value = await api('/api/lifecycle/operation', {operation_id:pending.operation_id, action:'status'}); pendingLifecycle = null; displayLifecycle(value); }),
-        button('Leave this lifecycle request unapplied', () => { pendingLifecycle = null; dialog.close(); }));
-    }
+        button('Inspect saved lifecycle request', () => requestDialog(() => api('/api/lifecycle/operation', {operation_id:pending.operation_id, action:'status'}), value => { if (pendingLifecycle === pending) pendingLifecycle = null; displayLifecycle(value); })),
+        button('Leave this lifecycle request unapplied', () => { if (pendingLifecycle === pending) pendingLifecycle = null; dialog.close(); }));
+    } finally { if (lifecycleRequest === request) lifecycleRequest = null; }
   }
   function displayLifecycle(view) {
-    showDialog('Lifecycle operation', view);
-    const id = view.operation_id;
+    const context = operationContext('lifecycle', view.operation_id);
+    renderDialog('Lifecycle operation', view);
+    const id = context.id;
     operationContent.prepend(badge(view.phase), paragraph(view.next_action || 'Inspect the saved result.'), paragraph(`Operation ID: ${id}`, 'muted'));
     if (view.preview) {
       operationContent.prepend(row('Prepared candidate', view.preview.evidence, view.preview.candidate_version || (view.preview.candidate_sequence === null ? 'Unavailable' : `Sequence ${view.preview.candidate_sequence}`)),
         paragraph((view.preview.issues || []).join('\n'), view.preview.compatible ? 'muted' : 'notice'));
     }
-    const action = async name => {
-      clearTimeout(pollTimer);
-      const value = await api('/api/lifecycle/operation', {operation_id:id, action:name});
-      if (dialog.open) displayLifecycle(value);
-    };
+    const action = name => act(context, name);
     if (view.phase === 'prepared') {
       if (view.preview?.compatible) operationActions.append(button('Apply reviewed lifecycle change', () => action('apply'), 'primary'));
       operationActions.append(button('Cancel lifecycle preview', () => action('cancel')));
@@ -362,8 +368,25 @@
       pollTimer = setTimeout(() => action('status').catch(() => showError(new Error('The service may be restarting. Reopen with tirith dashboard and inspect lifecycle operation ' + id + '.'))), 2000);
     }
   }
-  function showDialog(title, value) {
-    clearTimeout(pollTimer); activeOperation = null; document.querySelector('#operation-title').textContent = title;
+  function invalidateDialog() { clearTimeout(pollTimer); activeOperation = null; return ++dialogGeneration; }
+  function showDialog(title, value) { const epoch = invalidateDialog(); renderDialog(title, value); return epoch; }
+  async function requestDialog(load, render) {
+    const epoch = invalidateDialog();
+    let value;
+    try { value = await load(); }
+    catch (error) { if (dialogGeneration === epoch) throw error; return; }
+    if (dialogGeneration === epoch) render(value);
+  }
+  function operationContext(kind, id) {
+    if (!activeOperation || activeOperation.kind !== kind || activeOperation.id !== id) {
+      invalidateDialog();
+      activeOperation = {kind, id, epoch:dialogGeneration, sequence:0, mutations:new Map()};
+    }
+    return activeOperation;
+  }
+  function currentOperation(context) { return dialog.open && activeOperation === context && dialogGeneration === context.epoch; }
+  function renderDialog(title, value) {
+    clearTimeout(pollTimer); document.querySelector('#operation-title').textContent = title;
     operationContent.replaceChildren(); operationActions.replaceChildren();
     if (value.kind === 'profile_preview') {
       operationContent.append(paragraph(`Personal profile: ${value.selection?.name || 'reset owned settings'}`), paragraph(`Destination: ${value.target}`, 'muted'), paragraph('Organization, project, remote, and incident restrictions still apply. No settings have changed yet.'));
@@ -392,32 +415,36 @@
     if (!pendingPlan) pendingPlan = { operation_id: crypto.randomUUID(), intent };
     await submitPendingPlan();
   }
-  function pendingPlanActions() {
-    operationActions.append(button('Retry the same request', submitPendingPlan, 'primary'), button('Inspect stored operation', async () => {
-      const id = pendingPlan.operation_id;
-      const result = await api('/api/operations', { operation_id: id, action: 'status' });
-      pendingPlan = null; displayOperation(result);
-    }), button('Leave this plan unapplied', () => { pendingPlan = null; dialog.close(); }));
+  function pendingPlanActions(pending = pendingPlan) {
+    operationActions.append(button('Retry the same request', () => { if (pendingPlan !== pending) throw new Error('This request is no longer pending. Inspect its saved ID.'); return submitPendingPlan(); }, 'primary'), button('Inspect stored operation', () => requestDialog(
+      () => api('/api/operations', {operation_id:pending.operation_id, action:'status'}),
+      result => { if (pendingPlan === pending) pendingPlan = null; showDialog('Saved operation', result); displayOperation(result); }
+    )), button('Leave this plan unapplied', () => { if (pendingPlan === pending) pendingPlan = null; dialog.close(); }));
   }
   async function submitPendingPlan() {
     const pending = pendingPlan;
-    showDialog('Preparing change plan', { operation_id: pending.operation_id });
+    if (!pending) throw new Error('No pending request remains. Inspect its saved operation ID.');
+    const epoch = showDialog('Preparing change plan', {operation_id:pending.operation_id});
+    if (!planRequest || planRequest.pending !== pending) planRequest = {pending, promise:api('/api/plans', {operation_id:pending.operation_id, ...pending.intent})};
+    const request = planRequest;
     try {
-      const value = await api('/api/plans', { operation_id: pending.operation_id, ...pending.intent });
-      pendingPlan = null;
+      const value = await request.promise;
+      if (pendingPlan === pending) pendingPlan = null;
+      if (dialogGeneration !== epoch) return;
       showDialog(value.unchanged || value.operation === null ? 'No change required' : 'Review change plan', value);
       if (value.operation) {
         if (value.impact) value.operation.impact_review = value.impact;
-        displayOperation(value.operation, true);
+        displayOperation(value.operation);
         if (value.kind === 'audit_rotation_plan' && value.preview) operationContent.prepend(paragraph(`Retain ${value.preview.retained_records} records (${value.preview.retained_bytes} bytes). ${value.preview.signed_segment ? 'The signed segment was verified.' : 'This segment has no signed-chain proof.'} Undo is available only before additional records are appended.`, 'notice'));
       }
     } catch (error) {
-      showDialog('Plan response unavailable', { operation_id: pending.operation_id, detail: 'The request may have been stored. Retrying uses the same operation ID and original intent.', error: error.message });
-      pendingPlanActions();
-    }
+      if (dialogGeneration !== epoch) return;
+      showDialog('Plan response unavailable', {operation_id:pending.operation_id, detail:'The request may have been stored. Retrying uses the same operation ID and original intent.', error:error.message});
+      pendingPlanActions(pending);
+    } finally { if (planRequest === request) planRequest = null; }
   }
-  function displayOperation(operation, canApply = false) {
-    activeOperation = operation.operation_id; operationContent.replaceChildren(badge(operation.no_op ? 'unchanged' : operation.state)); operationActions.replaceChildren();
+  function displayOperation(operation) {
+    const context = operationContext('settings', operation.operation_id); clearTimeout(pollTimer); operationContent.replaceChildren(badge(operation.no_op ? 'unchanged' : operation.state)); operationActions.replaceChildren();
     const descriptions = { planned: 'Review the destinations and changes below before applying.', running: 'The change continues if you close this page.', completed: 'The change was saved. Reload the relevant shell or host where required.', 'completed-with-recovery': 'The change was saved, with recovery material retained. Inspect the details before cleanup.', undone: 'The owned change was undone. Unrelated settings were preserved.', 'undone-with-recovery': 'Undo completed with recovery material retained.', 'refresh-required': 'Inputs changed. Refresh and review a new plan before continuing.', 'recovery-required': 'The operation needs recovery. Inspect its steps; do not assume every change was applied.', 'partially-applied': 'Only some steps completed. Inspect the recorded result before another action.', cancelled: 'The operation was cancelled.', 'cancel-requested': 'Cancellation was requested. Already completed steps remain recorded.' };
     operationContent.append(paragraph(operation.no_op ? 'No settings needed changing. This result is saved so retries cannot turn it into a different change.' : descriptions[operation.state] || 'Inspect the stored operation state.'));
     if (operation.detail) operationContent.append(paragraph(operation.detail, 'notice'));
@@ -430,15 +457,40 @@
         rawDetails('Inspect workflow impact, exception ownership and unavailable evidence', impact));
     }
     for (const step of operation.steps || []) operationContent.append(row(step.description, step.target, step.state));
-    operationContent.append(rawDetails('Stored operation and recovery details', operation), paragraph(`Operation ID: ${activeOperation}`, 'muted'));
-    if (!operation.no_op && !operation.presentation_incomplete && (canApply || operation.state === 'planned')) operationActions.append(button('Apply reviewed change', () => act('apply'), 'primary'));
-    if (['planned','running','waiting','queued','cancel-requested'].includes(operation.state)) operationActions.append(button('Request cancellation', () => act('cancel')));
-    if (!operation.irreversible && !operation.no_op && !operation.presentation_incomplete && ['completed','completed-with-recovery'].includes(operation.state)) operationActions.append(button('Undo owned change', () => act('undo')));
-    operationActions.append(button('Refresh stored status', () => act('status')));
-    if (['running','waiting','queued','cancel-requested'].includes(operation.state)) pollTimer = setTimeout(() => act('status').catch(showError), 1500);
+    operationContent.append(rawDetails('Stored operation and recovery details', operation), paragraph(`Operation ID: ${context.id}`, 'muted'));
+    if (!operation.no_op && !operation.presentation_incomplete && operation.state === 'planned') operationActions.append(button('Apply reviewed change', () => act(context, 'apply'), 'primary'));
+    if (['planned','running','waiting','queued','cancel-requested'].includes(operation.state)) operationActions.append(button('Request cancellation', () => act(context, 'cancel')));
+    if (!operation.irreversible && !operation.no_op && !operation.presentation_incomplete && ['completed','completed-with-recovery'].includes(operation.state)) operationActions.append(button('Undo owned change', () => act(context, 'undo')));
+    operationActions.append(button('Refresh stored status', () => act(context, 'status')));
+    if (['running','waiting','queued','cancel-requested'].includes(operation.state)) pollTimer = setTimeout(() => act(context, 'status').catch(showError), 1500);
   }
-  async function act(action) { clearTimeout(pollTimer); const id = activeOperation; const value = await api('/api/operations', { operation_id: id, action }); if (activeOperation === id) displayOperation(value); }
-  document.querySelector('#close-dialog').addEventListener('click', () => dialog.close()); dialog.addEventListener('close', () => clearTimeout(pollTimer));
+  async function act(context, action) {
+    if (!currentOperation(context)) return;
+    clearTimeout(pollTimer);
+    if (action === 'status' && context.mutations.size) return;
+    if (context.mutations.has(action)) return context.mutations.get(action);
+    if (action !== 'status' && action !== 'cancel' && context.mutations.size) throw new Error('An action is being submitted for this operation. Its cancellation control remains available.');
+    const sequence = ++context.sequence;
+    const request = (async () => {
+      const path = context.kind === 'lifecycle' ? '/api/lifecycle/operation' : '/api/operations';
+      let value;
+      try { value = await api(path, {operation_id:context.id, action}); }
+      catch (error) { if (currentOperation(context) && sequence === context.sequence) throw error; return; }
+      if (!currentOperation(context) || sequence !== context.sequence) return;
+      if (value.operation_id !== context.id) throw new Error('The response identifies a different operation. Inspect the original stored ID.');
+      if (context.kind === 'lifecycle') displayLifecycle(value); else displayOperation(value);
+    })();
+    if (action === 'status') return request;
+    context.mutations.set(action, request);
+    try { await request; }
+    finally {
+      context.mutations.delete(action);
+      // A cancellation can overtake an apply response. Reconcile once all
+      // submitted mutations settle instead of accepting the older snapshot.
+      if (currentOperation(context) && !context.mutations.size) { clearTimeout(pollTimer); pollTimer = setTimeout(() => act(context, 'status').catch(showError), 0); }
+    }
+  }
+  document.querySelector('#close-dialog').addEventListener('click', () => dialog.close()); dialog.addEventListener('close', invalidateDialog);
   async function navigate(page) {
     const run = ++generation; currentPage = page; notice.hidden = true;
     document.querySelector('#title').textContent = pages[page][0]; document.querySelector('#subtitle').textContent = pages[page][1];

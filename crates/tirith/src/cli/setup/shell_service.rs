@@ -1012,6 +1012,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn precondition_rejects_new_higher_priority_bash_login_target() {
         crate::cli::test_harness::with_fake_env(true, |home, _| {

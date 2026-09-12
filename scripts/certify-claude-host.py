@@ -3,7 +3,7 @@
 
 No model credentials, user configuration, project data, or remote model service
 are used. This qualifies only the explicitly recorded host/binary/hook tuple and
-three inert cases; it is not the complete real-agent release certification gate.
+inert cases selected below; it is not the complete real-agent release certification gate.
 """
 
 import argparse
@@ -101,9 +101,13 @@ def isolated_env(root, binary):
 class Provider(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, command):
+    def __init__(self, command, write_target=None):
         super().__init__(("127.0.0.1", 0), ProviderHandler)
         self.command = command
+        self.tool_name = "Write" if write_target else "Bash"
+        self.tool_input = ({"file_path": str(write_target), "content": "TIRITH_AGENT_BLOCK_MARKER\n"}
+                           if write_target else {"command": command,
+                           "description": "Execute the inert local certification marker once"})
         self.requests = 0
         self.tool_issued = 0
         self.tool_results = 0
@@ -140,13 +144,12 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
                     self.server.tool_results += sum(
                         item.get("type") == "tool_result" for item in content if isinstance(item, dict)
                     )
-            emit_tool = "Bash" in names and self.server.tool_issued == 0
+            emit_tool = self.server.tool_name in names and self.server.tool_issued == 0
             if emit_tool:
                 self.server.tool_issued += 1
         if emit_tool:
-            block = {"type": "tool_use", "id": "toolu_tirith_fixture", "name": "Bash",
-                     "input": {"command": self.server.command,
-                               "description": "Execute the inert local certification marker once"}}
+            block = {"type": "tool_use", "id": "toolu_tirith_fixture",
+                     "name": self.server.tool_name, "input": self.server.tool_input}
         else:
             block = {"type": "text", "text": "Inert local fixture finished."}
         message = {"id": "msg_tirith_fixture", "type": "message", "role": "assistant",
@@ -181,6 +184,57 @@ class ProviderHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+BASELINE_CASES = ("allowed", "blocked", "hook-disabled")
+FAILURE_CASES = ("interpreter-unavailable", "checker-unavailable", "hook-crash",
+                 "checker-deadline", "shortened-host-timeout", "unmatched-write")
+BOUNDARY_CASES = ("hook-disabled", "shortened-host-timeout", "unmatched-write")
+
+
+def apply_control(root, env, settings, hook, case):
+    """Mutate only private fixture inputs; preserve the generated launcher guard."""
+    document = json.loads(settings.read_text())
+    control = {"kind": case, "configuration_mutated": False}
+    if case == "hook-disabled":
+        document.pop("hooks", None)
+        control["configuration_mutated"] = True
+    elif case == "interpreter-unavailable":
+        entry = document["hooks"]["PreToolUse"][0]["hooks"][0]
+        command = entry["command"]
+        suffix = ' "$HOME/.claude/hooks/tirith-check.py"'
+        guard = " || exit 2" if command.endswith(" || exit 2") else ""
+        expected_end = suffix + guard
+        if not command.endswith(expected_end):
+            raise ValueError("generated user hook launcher no longer matches the fixture contract")
+        interpreter = command[:-len(expected_end)]
+        if len(shlex.split(interpreter)) != 1:
+            raise ValueError("generated interpreter is not one quoted executable")
+        entry["command"] = shlex.quote(str(root / "missing-python")) + expected_end
+        control.update(configuration_mutated=True, generated_blocking_guard=bool(guard))
+    elif case == "checker-unavailable":
+        env["TIRITH_BIN"] = str(root / "missing-tirith")
+        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+    elif case == "hook-crash":
+        hook.write_text("import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n")
+        control["configuration_mutated"] = True
+    elif case == "checker-deadline":
+        # This is an intentionally controlled checker executable; the real
+        # setup-installed Python hook enforces its own shared ten-second budget.
+        checker = root / "sleeping-checker"
+        checker.write_text("#!/bin/sh\nexec /bin/sleep 30\n")
+        checker.chmod(0o700)
+        env["TIRITH_BIN"] = str(checker)
+        control["controlled_checker_sha256"] = digest(checker)
+        control["deadline_source"] = "unchanged_installed_hook"
+    elif case == "shortened-host-timeout":
+        hook.write_text("import time\ntime.sleep(8)\n")
+        document["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = 1
+        control.update(configuration_mutated=True, host_timeout_seconds=1,
+                       expected_boundary="host_terminates_hook_before_its_own_deadline")
+    if control["configuration_mutated"]:
+        settings.write_text(json.dumps(document))
+    return control
+
+
 def run_case(binary, host, case):
     with fixture_directory(prefix=f"tirith-native-claude-{case}-") as root:
         env = isolated_env(root, binary)
@@ -205,20 +259,18 @@ def run_case(binary, host, case):
         if preflight["exit"] != (0 if case == "allowed" else 1):
             return {"case": case, "passed": False, "stage": "preflight", **preflight,
                     "diagnostic": output.decode(errors="replace")[-6000:]}
-        if case == "hook-disabled":
-            document = json.loads(settings.read_text())
-            document.pop("hooks", None)
-            settings.write_text(json.dumps(document))
-        provider = Provider(command)
+        control = apply_control(root, env, settings, hook, case)
+        provider = Provider(command, marker if case == "unmatched-write" else None)
         thread = threading.Thread(target=provider.serve_forever, daemon=True)
         thread.start()
         env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{provider.server_port}"
+        executed = {"settings_sha256": digest(settings), "hook_sha256": digest(hook)}
         try:
             result, stdout, stderr = execute(
                 [str(host), "--print", "--output-format", "stream-json", "--verbose",
                  "--no-session-persistence", "--setting-sources", "", "--settings", str(settings),
                  "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-                 "--tools", "Bash", "--allowedTools", "Bash", "--permission-mode", "dontAsk",
+                 "--tools", provider.tool_name, "--allowedTools", provider.tool_name, "--permission-mode", "dontAsk",
                  "--permission-prompts", "none", "--include-hook-events",
                  "--system-prompt", "Execute only the inert local fixture tool call provided.",
                  "Run the single inert local certification command, then finish."],
@@ -229,7 +281,7 @@ def run_case(binary, host, case):
             provider.server_close()
             thread.join(timeout=2)
         lines = marker.read_text().splitlines() if marker.exists() else []
-        expected = [] if case == "blocked" else [token]
+        expected = [token] if case == "allowed" or case in BOUNDARY_CASES else []
         parsed = []
         for line in stdout.decode(errors="replace").splitlines():
             try:
@@ -237,9 +289,16 @@ def run_case(binary, host, case):
             except ValueError:
                 pass
         hook_events = sum("hook" in str(item.get("subtype", "")) for item in parsed)
-        passed = (result["exit"] == 0 and provider.tool_issued == 1
+        inputs_unchanged = executed == {"settings_sha256": digest(settings), "hook_sha256": digest(hook)}
+        expected_hooks = hook_events == 0 if case in ("hook-disabled", "unmatched-write") else hook_events >= 2
+        passed = (inputs_unchanged and expected_hooks and result["exit"] == 0 and provider.tool_issued == 1
                   and provider.tool_results >= 1 and lines == expected)
         report = {"case": case, "passed": passed, "stage": "native_host", **result, **before,
+                  "executed_settings_sha256": executed["settings_sha256"],
+                  "executed_hook_sha256": executed["hook_sha256"],
+                  "configuration_unchanged_during_host_run": inputs_unchanged,
+                  "tool": provider.tool_name, "control": control,
+                  "evidence_scope": "explicit_boundary_control" if case in BOUNDARY_CASES else "configured_bash_hook",
                   "provider_requests": provider.requests, "tool_calls_issued": provider.tool_issued,
                   "tool_result_observations": provider.tool_results, "rejected_provider_requests": provider.rejected,
                   "host_hook_events": hook_events, "marker_count": len(lines), "expected_marker_count": len(expected)}
@@ -253,6 +312,8 @@ def main():
     parser.add_argument("--tirith", type=Path, required=True)
     parser.add_argument("--claude", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--failure-controls", action="store_true",
+                        help="also exercise isolated launch failures, checker deadlines and host-scope limits")
     args = parser.parse_args()
     if os.name != "posix":
         parser.error("this initial native-host fixture supports POSIX hosts only")
@@ -273,18 +334,19 @@ def main():
                 parser.error(f"{name} version probe failed")
             versions[name] = {"path": str(path), "version": stdout.decode().strip(), "sha256": digest(path)}
     cases = []
-    for case in ["allowed", "blocked", "hook-disabled"]:
+    for case in BASELINE_CASES + (FAILURE_CASES if args.failure_controls else ()):
         result = run_case(binary, host, case)
         cases.append(result)
         print(json.dumps({"case": case, "passed": result["passed"], "stage": result["stage"]}), flush=True)
     unchanged = digest(binary) == versions["tirith"]["sha256"] and digest(host) == versions["claude"]["sha256"]
-    report = {"schema_version": 1, "evidence_kind": "scripted-provider-native-host",
+    report = {"schema_version": 1, "evidence_kind": "scripted-provider-native-host", "harness_sha256": digest(Path(__file__)),
               "recorded_unix": int(time.time()), "os": platform.platform(), "versions": versions,
               "scope": "explicit-settings Claude Bash tool on this host; standalone candidate bytes",
               "complete_release_certification": False, "binaries_unchanged_during_run": unchanged,
-              "remaining": ["alternate tools", "MCP-only control", "timeout and crash",
-                            "moved interpreter", "reload omission", "native Windows",
-                            "beginner pilot", "real-model workflow"],
+              "failure_controls_requested": args.failure_controls,
+              "remaining": ["MCP-only control", "reload omission", "native Windows",
+                            "beginner pilot", "real-model workflow"] +
+                           ([] if args.failure_controls else ["alternate tools", "timeout and crash", "moved interpreter"]),
               "passed": unchanged and all(case["passed"] for case in cases), "cases": cases}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")

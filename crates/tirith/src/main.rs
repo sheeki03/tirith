@@ -281,6 +281,11 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
 
+        /// JSON schema: 3 preserves the legacy contract; 4 includes recovery advice.
+        /// Requires JSON output and does not change the verdict or exit code.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(3..=4), conflicts_with_all = ["approval_check", "execution_receipt"])]
+        json_schema: Option<u8>,
+
         /// Force non-interactive mode
         #[arg(long)]
         non_interactive: bool,
@@ -8061,6 +8066,7 @@ fn run() {
 
     let cli = Cli::parse();
     cli::init_quiet(cli.quiet);
+    cli::audit_health::install_sink();
 
     let exit_code = match cli.command {
         Commands::Review { paths, json } => cli::project_review::run(paths, json),
@@ -8104,6 +8110,7 @@ fn run() {
             shell,
             format,
             json,
+            json_schema,
             non_interactive,
             interactive,
             approval_check,
@@ -8118,6 +8125,10 @@ fn run() {
             cmd,
         } => {
             let (_, json) = HumanJsonFormat::resolve(format, json);
+            if json_schema.is_some() && !json {
+                eprintln!("tirith check: --json-schema requires --format json or --json");
+                std::process::exit(2);
+            }
             let shell_type = match shell.parse::<tirith_core::tokenize::ShellType>() {
                 Ok(shell_type) => shell_type,
                 Err(_) => {
@@ -8141,6 +8152,7 @@ fn run() {
                     &command,
                     shell_type,
                     json,
+                    json_schema.unwrap_or(3),
                     non_interactive,
                     interactive,
                     approval_check,

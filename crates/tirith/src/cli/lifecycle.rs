@@ -95,8 +95,8 @@ fn loaded_integration(
         evidence: "inherited_environment_unverified",
         reload_status,
         next_action: match reload_status {
-            "matching_version_unverified" => "Inspect tirith status --format json in the target shell; reported configuration is not a fresh blocking test.",
-            "reload_required" => "Open a fresh shell or reload the owning host, then inspect tirith status --format json; configuration alone does not prove blocking.",
+            "matching_version_unverified" => "Inspect tirith status --json in the target shell; reported configuration is not a fresh blocking test.",
+            "reload_required" => "Open a fresh shell or reload the owning host, then inspect tirith status --json; configuration alone does not prove blocking.",
             _ => "Open the intended shell or host and verify its loaded integration; an absent marker does not prove it is disabled.",
         },
     }

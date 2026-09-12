@@ -49,6 +49,12 @@ and export paths still need a complete audit before WP03 can close.
 
 ## Compatibility decision
 
+Command-check JSON defaults to the frozen schema-3 contract. Callers explicitly
+select `tirith check --format json --json-schema 4` to include typed recovery
+advice. Both versions retain the same action and exit code. Schema selection is
+rejected without JSON output and cannot be combined with approval checks or
+execution receipts. `tirith commands check` keeps its existing schema-3 output.
+
 This correction preserves current field names, serialized enum spellings,
 optional fields, stdout/stderr routing and process exits. It repairs corruption
 of existing contracts and does not introduce a new envelope version. Existing

@@ -16,6 +16,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -68,6 +69,108 @@ def resource_child(report_path, command):
     return result.returncode
 
 
+
+def parse_process_sample(text, pid):
+    fields = text.split()
+    if len(fields) != 8 or fields[0] != str(pid):
+        raise ValueError("unexpected process sample")
+    elapsed = fields[7]
+    days, elapsed = elapsed.split("-", 1) if "-" in elapsed else ("0", elapsed)
+    clock = elapsed.split(":")
+    if len(clock) not in (2, 3):
+        raise ValueError("unexpected process CPU time")
+    hours, minutes, seconds = ("0", *clock) if len(clock) == 2 else clock
+    days, hours, minutes, seconds = int(days), int(hours), int(minutes), float(seconds)
+    rss = int(fields[6]) * 1024
+    if min(days, hours, minutes, seconds, rss) < 0 or minutes >= 60 or not seconds < 60:
+        raise ValueError("invalid process accounting")
+    return {"start_identity": " ".join(fields[1:6]), "rss_bytes": rss,
+            "cpu_ms": ((days * 24 + hours) * 3600 + minutes * 60 + seconds) * 1000}
+
+
+class ServiceSampler:
+    """Observe only the new fixture service; sampled RSS is not an exact peak.
+
+    The private record routes to a PID, and ps start time detects PID changes.
+    No credentials, executable arguments or operator process list are collected.
+    """
+    def __init__(self, record_path, launch, binary_sha256):
+        self.stop = threading.Event()
+        self.samples, self.errors = [], []
+        self.thread = None
+        self.record_path = record_path
+        self.service_id = launch["service_id"]
+        self.binary_sha256 = binary_sha256
+        self.pid, self.identity = None, None
+        self.started = time.monotonic()
+        self.availability = "available" if sys.platform in ("linux", "darwin") else "unsupported"
+        if self.availability != "available":
+            return
+        self.sample()
+        self.thread = threading.Thread(target=self.observe, daemon=True)
+        self.thread.start()
+
+    def sample(self):
+        with self.record_path.open("rb") as source:
+            data = source.read(16385)
+        if len(data) > 16384:
+            raise ValueError("fixture service record exceeds bound")
+        record = json.loads(data)
+        if record["service_id"] != self.service_id or record["binary_sha256"] != self.binary_sha256:
+            raise ValueError("fixture service identity changed")
+        pid = record["pid"]
+        if type(pid) is not int or not 1 < pid < 2 ** 31 or self.pid not in (None, pid):
+            raise ValueError("fixture service process changed")
+        self.pid = pid
+        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "pid=", "-o", "lstart=", "-o", "rss=", "-o", "time="],
+                                env={**os.environ, "LC_ALL":"C"}, capture_output=True, text=True, timeout=2)
+        if result.returncode or len(result.stdout) > 4096:
+            raise ValueError("fixture service process unavailable")
+        sample = parse_process_sample(result.stdout, pid)
+        identity = sample.pop("start_identity")
+        if self.identity not in (None, identity):
+            raise ValueError("fixture service PID was reused")
+        self.identity = identity
+        sample["elapsed_ms"] = (time.monotonic() - self.started) * 1000
+        self.samples.append(sample)
+
+    def observe(self):
+        while not self.stop.wait(.25):
+            if len(self.samples) >= 4800:
+                self.errors.append("sample_limit_reached")
+                return
+            try:
+                self.sample()
+            except Exception as error:
+                self.errors.append(type(error).__name__)
+                return
+
+    def finish(self):
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=3)
+            if self.thread.is_alive():
+                self.errors.append("sampler_stop_timeout")
+        if self.availability == "available" and not self.errors:
+            if len(self.samples) < 4800:
+                self.sample()
+            else:
+                self.errors.append("sample_limit_reached")
+        report = {"availability":self.availability, "source":"ps for fixture PID with unchanged start time and private service record",
+                  "nominal_interval_ms":250, "sample_limit":4800, "samples":self.samples, "errors":self.errors,
+                  "scope":"service only between launch response and quiesce; excludes startup and children",
+                  "identity_precision":"ps lstart has one-second resolution; this fixture check is not a process security boundary",
+                  "memory":"sampled RSS maximum is a lower bound, not a kernel peak or process-tree total",
+                  "cpu":"delta of cumulative ps CPU time; limited by platform display precision"}
+        if self.samples:
+            delta = self.samples[-1]["cpu_ms"] - self.samples[0]["cpu_ms"]
+            if delta < 0:
+                self.errors.append("cpu_counter_regressed")
+            report.update(sampled_max_rss_bytes=max(x["rss_bytes"] for x in self.samples),
+                          cpu_observed_ms=delta if delta >= 0 else None)
+        return report
+
+
 def fixture_storage(root):
     """Count regular-file bytes in only this private, bounded fixture tree."""
     import stat
@@ -100,7 +203,7 @@ def run(binary, output, samples, history_rows, baseline=None, resources=False):
             "source": "RUSAGE_CHILDREN in one fresh wrapper per command",
             "wrapper_startup_included": False,
             "peak_memory": "kernel maximum for completed children; not simultaneous process-tree total",
-            "detached_service_resources": "not_measured",
+            "detached_service_resources": "separate bounded PID/start-time sampling",
             "allocations": "not_measured",
             "resource_samples": "same measured commands; baseline and candidate alternate as above"}
     if baseline is not None:
@@ -109,7 +212,7 @@ def run(binary, output, samples, history_rows, baseline=None, resources=False):
     with tempfile.TemporaryDirectory(prefix="tirith-perf-fixture-") as raw:
         root = Path(raw).resolve()
         env = {key: value for key, value in os.environ.items()
-               if not key.startswith("TIRITH_") and key not in {"SUDO_USER", "SUDO_UID", "SUDO_GID"}}
+               if not key.startswith("TIRITH_") and key not in {"TIRITH", "SUDO_USER", "SUDO_UID", "SUDO_GID"}}
         roots = {"HOME": "home", "USERPROFILE": "home", "XDG_CONFIG_HOME": "home/.config",
                  "XDG_CONFIG_DIRS": "config-dirs", "XDG_DATA_HOME": "data", "XDG_STATE_HOME": "state",
                  "XDG_CACHE_HOME": "cache", "XDG_RUNTIME_DIR": "runtime", "APPDATA": "appdata",
@@ -198,7 +301,10 @@ def run(binary, output, samples, history_rows, baseline=None, resources=False):
         report["measurements"]["service_launch"] = {"ms": launch_ms}
         if resources:
             report["measurements"]["service_launch"]["resources"] = resource_samples[("candidate", ("dashboard", "--no-browser", "--json"))]
+        service_sampler = None
         try:
+            if resources:
+                service_sampler = ServiceSampler(root / "state/tirith/control/v1/service.json", launch, report["binary_sha256"])
             for name, route, body in [("service_policy", "/api/policy", None), ("service_health", "/api/state", None),
                                       ("recent_operations", "/api/jobs", None), ("aggregate_incremental", "/api/activity/summary", None)]:
                 timings, sizes = [], []
@@ -218,13 +324,25 @@ def run(binary, output, samples, history_rows, baseline=None, resources=False):
                                 "response_bytes": 512 * 1024, "assertions_passed": True}
         finally:
             try:
-                http(origin, token, csrf, "/api/quiesce", {})
+                if service_sampler is not None:
+                    report["service_resources"] = service_sampler.finish()
             finally:
-                time.sleep(1)
+                try:
+                    http(origin, token, csrf, "/api/quiesce", {})
+                finally:
+                    time.sleep(1)
+        if resources and report.get("service_resources", {}).get("errors"):
+            raise AssertionError("service resource sampling failed: " + str(report["service_resources"]["errors"]))
         storage_after = fixture_storage(root)
         report["fixture_storage"] = {"before": storage_before, "after": storage_after,
                                      "growth_bytes": storage_after["regular_file_bytes"] - storage_before["regular_file_bytes"],
                                      "scope": "all fixture runs combined, including baseline when selected; live user data excluded"}
+    report["binary_unchanged_during_run"] = hashlib.sha256(binary.read_bytes()).hexdigest() == report["binary_sha256"]
+    assert report["binary_unchanged_during_run"], "candidate bytes changed during measurement"
+    if baseline is not None:
+        report["baseline"]["binary_unchanged_during_run"] = hashlib.sha256(baseline.read_bytes()).hexdigest() == report["baseline"]["binary_sha256"]
+        assert report["baseline"]["binary_unchanged_during_run"], "baseline bytes changed during measurement"
+    report["harness_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))

@@ -143,7 +143,7 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --no-fail-fast
       - name: Native capsule supervisor and guard interruption
         if: matrix.name == 'Linux'
         run: .github/scripts/test-native-capsule-lifetime.sh target/debug/tirith
@@ -246,7 +246,7 @@ jobs:
         with:
           toolchain: "1.83"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --no-fail-fast
 
   deny:
     name: Cargo Deny

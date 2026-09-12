@@ -190,3 +190,7 @@ rand = "0.9.2"
 [[bench]]
 name = "perf"
 harness = false
+
+[[bench]]
+name = "resource_counts"
+harness = false

@@ -3,11 +3,14 @@
 import hashlib
 import importlib.util
 import io
+import os
+import sys
 from pathlib import Path
 import stat
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 SPEC = importlib.util.spec_from_file_location("certificate", Path(__file__).with_name("certify-shell-package.py"))
@@ -16,6 +19,17 @@ SPEC.loader.exec_module(CERTIFICATE)
 
 
 class PackageIdentity(unittest.TestCase):
+    def test_native_child_does_not_inherit_ambient_bypass(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch.dict(os.environ, {"TIRITH": "0", "_TIRITH_RECEIPT_INSTANCE": "inert-placeholder"}):
+                env = CERTIFICATE.isolated_env(root, root / "bin/tirith")
+                result = CERTIFICATE.run(
+                    [sys.executable, "-c", "import os; assert 'TIRITH' not in os.environ; assert '_TIRITH_RECEIPT_INSTANCE' not in os.environ; assert os.environ['TIRITH_OFFLINE'] == '1'"],
+                    env,
+                )
+            self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_tar_regular_member_is_hashed_without_extracting_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             package = Path(temporary) / "candidate.tar.gz"

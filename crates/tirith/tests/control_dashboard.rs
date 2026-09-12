@@ -469,3 +469,51 @@ fn browser_npm_inspection_and_comparison_are_project_scoped_and_inert() {
     let (_, jobs) = server.request("GET", "/api/jobs", None);
     assert!(jobs["operations"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn real_service_reports_writer_failure_even_when_no_history_record_was_saved() {
+    let mut state = state();
+    state.set_env("TIRITH_LOG", "1");
+    let log = tirith_core::audit::audit_log_path().unwrap();
+    std::fs::create_dir_all(&log).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    state.apply_to_command(&mut command);
+    let checked = command
+        .current_dir(&state.roots().cwd)
+        .args([
+            "check",
+            "--json",
+            "--shell",
+            "posix",
+            "--no-daemon",
+            "--",
+            "echo inert",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(String::from_utf8_lossy(&checked.stderr).contains("audit append failed"));
+    let (server, _) = service(&state);
+    for (method, path, body) in [
+        ("GET", "/api/state", None),
+        ("POST", "/api/history", Some(json!({"limit":10}))),
+    ] {
+        let (status, report) = server.request(method, path, body);
+        assert_eq!(status, 200, "{report}");
+        let health = &report["audit_recording"];
+        assert_eq!(health["state"], "failure_observed", "{report}");
+        assert_eq!(health["source"], "private_failure_notice");
+        assert_eq!(health["claims_current_success"], false);
+        assert_eq!(health["detects_all_losses"], false);
+        assert!(health["detail"]
+            .as_str()
+            .unwrap()
+            .contains("may be incomplete"));
+        assert!(!health.to_string().contains("destination_binding"));
+        assert!(!health.to_string().contains(&log.display().to_string()));
+    }
+}

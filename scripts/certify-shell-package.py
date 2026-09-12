@@ -98,6 +98,15 @@ def shell_path(family):
     return None
 
 
+def isolated_env(root, candidate):
+    """Allowlisted process environment; ambient bypass/session flags never pass."""
+    return {"PATH": str(candidate.parent) + os.pathsep + os.environ.get("PATH", os.defpath),
+            "HOME": str(root / "home"), "XDG_CONFIG_HOME": str(root / "config"),
+            "XDG_DATA_HOME": str(root / "data"), "XDG_STATE_HOME": str(root / "state"),
+            "TERM": "xterm-256color", "TIRITH_LOG": "0", "TIRITH_QUIET": "1",
+            "TIRITH_OFFLINE": "1"}
+
+
 def save_report(path, report):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -122,6 +131,7 @@ def main():
         parser.error("--shells must be a unique comma-separated subset of bash,zsh,fish")
     report = {
         "schema_version": 1, "started_at": int(time.time()),
+        "runner_sha256": sha256(Path(__file__).resolve()),
         "platform": {"system": os.uname().sysname, "release": os.uname().release,
                      "architecture": os.uname().machine},
         "package": {"name": package.name, "sha256": sha256(package)},
@@ -143,11 +153,7 @@ def main():
             candidate.parent.mkdir(parents=True)
             shutil.copy2(binary, candidate)
             candidate.chmod(0o700)
-            env = {"PATH": str(candidate.parent) + os.pathsep + os.environ.get("PATH", os.defpath),
-                   "HOME": str(root / "home"), "XDG_CONFIG_HOME": str(root / "config"),
-                   "XDG_DATA_HOME": str(root / "data"), "XDG_STATE_HOME": str(root / "state"),
-                   "TERM": "xterm-256color", "TIRITH_LOG": "0", "TIRITH_QUIET": "1",
-                   "TIRITH_OFFLINE": "1"}
+            env = isolated_env(root, candidate)
             for key in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"):
                 Path(env[key]).mkdir()
             version = run([str(candidate), "--version"], env)

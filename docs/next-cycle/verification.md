@@ -370,8 +370,12 @@ a successful browser run. A third retained-binary attempt passed fourteen checks
 but remained at a planned impact operation after Apply; its request timeline was
 not recorded and the cause remains unresolved. The instrumented focused five-flow
 reproduction passed impact apply/undo, shell setup, combined setup and narrow
-layout with actual operation transitions recorded. The full instrumented run is
-pending; focused success does not replace that remaining browser qualification.
+layout with actual operation transitions recorded. The full instrumented run subsequently passed all **eighteen workflows** on the
+retained candidate, including busy-history pagination, impact review and combined
+setup. Binary identity remained unchanged. That pass does not erase the earlier
+intermittent result: independent review found same-operation stale-response and
+dialog-replacement races. A guarded UI and deterministic delayed-response
+regressions are being prepared as a separate correction.
 
 ## Bounded npm-reader fuzz checkpoint
 
@@ -392,3 +396,87 @@ and full reallocation request sizes, excluding native allocation bypasses, other
 threads, children and live-heap size. The 10,000-record fixture was 4,360,000 bytes.
 Evidence is `allocation-runner-prototype-v2`; the production benchmark registration
 and release-profile measurements remain pending.
+
+## Corrective checkpoint CI follow-up
+
+Checkpoint `13e18ca8` passes formatting, Clippy, dependency policy, Bash hooks,
+Linux/macOS install scripts, action-runtime checks, artifact transport and the
+existing performance gate. The Linux/MSRV CLI unit suites pass 1,957 tests with
+two existing ignores; macOS passes 1,899 with two existing ignores. Their later
+C00 compatibility test rejects an added recovery field in legacy schema-3 command
+JSON. The frozen fixture is retained; a separate opt-in schema-4 recovery format
+is being prepared so ordinary JSON retains its existing shape.
+
+Windows now compiles and reaches native tests, finding 47 CLI unit failures.
+Many share private journal-directory ACL validation, and one finds an in-place
+binary edit that metadata-only validation missed. These are open defects under
+investigation, not permission checks to waive. The test workflow now uses
+`--no-fail-fast` to report later executable failures in the same run while still
+failing the required check.
+
+### Retained audit-health, Claude and dashboard candidate
+
+The next development candidate, SHA-256
+`a70b8eba427c8cfbc20287c94102d0da59ce7d44a01e2f0e388f1baddcae156f`,
+was retained before additional compatibility/native corrections. Its source
+capture is `health-claude-ui-inputs` on `13e18ca88e6c923c1c2df547741735bb17dda930`;
+the candidate manifest pins all seventeen linked test/benchmark executables.
+This is a development executable, not a signed release artifact.
+
+All eighteen complete browser journeys passed using its embedded assets and
+real local service. The five separate delayed-response cases also passed with
+no source override. The old embedded candidate failed the stale planned-status
+negative control, demonstrating that the new response-order assertions detect
+the original defect. Real Claude Code dispatch passed all nine configured-hook
+and explicit boundary controls; the three boundary controls document behavior
+outside the protection claim rather than expanding its scope.
+
+The selected Rust runtime run completed with 310 passing tests and six failures.
+Three failure-notice unit fixtures timed out on the shared filesystem-root setup
+lock; the cross-process fixture then found no persisted notice. A generation
+change was refused with a newly bounded snapshot error that the older assertion
+did not recognize. The concurrent audit writer test assumed every call succeeds
+and discarded its results; bounded lock waiting now explicitly reports refused
+appends. These failures are retained as evidence and require correction or an
+appropriately isolated verification of the documented contention behavior.
+Passing browser or host tests do not substitute for those checks.
+
+On pushed commit `13e18ca8`, the separate Fuzz, Benchmarks, Release workflow and
+both native ARM containment checks completed successfully. The ordinary CI
+workflow failed for legacy command JSON compatibility and native Windows
+storage/identity/fixture defects described above. Release workflow success on a
+branch is not evidence that a release was published. The next candidate preserves
+the legacy schema and adds explicit schema-4 recovery selection, atomically
+private Windows storage, and a retained executable write lease.
+
+
+### Compatibility and private-storage candidate
+
+The next retained native macOS development executable has SHA-256
+`181aa10334856a5d6947e933c6b943086d5cdbb012d213b696917a0808a474ae`.
+Its source capture is `compat-health-native-inputs-v2` on `13e18ca8`; its manifest
+pins the CLI and eighteen linked harnesses. Unregistered npm installation drafts
+are explicitly excluded from the compiled graph. All registered Rust input
+hashes matched the capture before the executable and harnesses were retained.
+The selected build completed in 13 minutes 21 seconds without warnings.
+Strict workspace/all-target Clippy passed on these same registered sources in
+4 minutes 20 seconds; formatting and diff checks passed.
+
+All **385 focused checks passed**, with zero failures or ignores: 144 selected
+core checks, 186 selected CLI checks, four compatibility checks, nine dashboard
+API checks, five history checks, four feedback checks, eight profile lifecycle
+checks, three local rollout checks, three tuning checks, two project-review
+checks, four support-bundle checks and thirteen release-security checks. This
+includes the schema-3/schema-4 compatibility correction and the audit-notice,
+concurrent-writer and generation-change regressions that failed on the preceding
+candidate. The production notice lock budget remains 25 milliseconds; the tests
+exercise bounded refusal and use a longer explicit budget only for positive
+unit-fixture creation. The cross-process integration retries the actual inert
+check and verifies the unchanged verdict on every attempt.
+
+The same source contains native Windows ownership/DACL and binary write-lease
+corrections. A macOS pass does not validate those Windows branches; the next
+native CI run must do so. Linux private-input namespace corrections have separate
+primitive evidence, while the actual wheel pipeline remains under qualification.
+The update dry-run side effect found during the lifecycle audit is a separate
+pending correction and is not included in this executable.

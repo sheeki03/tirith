@@ -1,8 +1,8 @@
 # Decision messages and audit tuning
 
-This is a bounded correctness slice of WP02 and WP09 in the next-cycle plan. It
-changes presentation and count accuracy; it does not introduce a new evaluator,
-permission, profile, or execution receipt.
+This document describes the decision wording and history-tuning boundaries in
+WP02 and WP09. The implementation also provides frozen evaluation and reviewed
+local feedback; these remain separate from permission and execution receipts.
 
 ## Human decision output
 
@@ -79,8 +79,16 @@ coverage, warn-only limitations, multiple independent findings, blocked-only
 and thin history, duplicate rules, warning spelling, target guidance, and
 read-only tuning.
 
-The broader WP02/WP09 contracts remain pending: pure frozen-context evaluation,
-structured decisive/remaining-blocker attribution, verified hypothetical recovery,
-bounded freshly redacted historical examples, complete history coverage metadata,
-simulation, and local feedback labels. These messages do not claim those
-capabilities or native shell certification.
+Frozen evaluation now captures detector evidence and available cached threat
+enrichment, then compares policies without execution, receipt consumption or
+state updates. Its explanations retain contributing restrictions and explicit
+gaps for unavailable sessions, baselines, enrichment or changed detector inputs.
+CLI/browser simulation and impact reviews use that frozen context. Missing
+evidence never becomes proof of complete analysis.
+
+Bounded tuning reads freshly redacted examples and explicitly selected local
+feedback labels through the same history reader. Labels are reversible review
+metadata, not trust grants. The full browser candidate exercised tuning,
+feedback, impact apply/undo and history paging; revision-specific results and
+remaining native/release qualifications are recorded in [verification](verification.md).
+Shell-appropriate recovery remains a separate [contract](recovery.md).

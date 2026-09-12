@@ -227,7 +227,7 @@ where
     transactional_update_impl(
         path,
         scope_root,
-        dry_run,
+        TransactionOptions::ordinary(dry_run),
         transform,
         revalidate_selection,
         authorize_publication,
@@ -236,10 +236,76 @@ where
     )
 }
 
+#[derive(Clone, Copy)]
+struct TransactionOptions {
+    dry_run: bool,
+    lock_timeout: std::time::Duration,
+    read_cap: usize,
+    quiet: bool,
+    retain_artifacts: bool,
+}
+impl TransactionOptions {
+    fn ordinary(dry_run: bool) -> Self {
+        Self {
+            dry_run,
+            lock_timeout: SETUP_LOCK_TIMEOUT,
+            read_cap: MAX_SETUP_FILE_BYTES,
+            quiet: false,
+            retain_artifacts: true,
+        }
+    }
+}
+
+/// Small internal health notices reuse the same protected native transaction.
+/// This is not a configurable environment timeout and changes no ordinary writer.
+pub(crate) fn write_private_notice_bounded(
+    path: &Path,
+    scope_root: &Path,
+    content: String,
+    cap: usize,
+    lock_timeout: std::time::Duration,
+    valid_existing: impl Fn(&[u8]) -> bool,
+) -> Result<TransactionOutcome, String> {
+    if cap == 0 || cap > MAX_SETUP_FILE_BYTES || content.len() > cap {
+        return Err("private notice exceeds its fixed bound".into());
+    }
+    transactional_update_impl(
+        path,
+        scope_root,
+        TransactionOptions {
+            dry_run: false,
+            lock_timeout,
+            read_cap: cap,
+            quiet: true,
+            retain_artifacts: false,
+        },
+        |snapshot| {
+            snapshot.require_private()?;
+            if let Some(existing) = snapshot.bytes() {
+                // Keep the first valid observation. Replacing a Windows file
+                // retains a displaced recovery generation; a failure reporter
+                // must never accumulate one for each new failed append.
+                if !valid_existing(existing) {
+                    return Err("existing private notice is not valid for this destination".into());
+                }
+                return Ok(FileUpdate::Unchanged);
+            }
+            let update = FileUpdate::write_text(content.clone(), 0o600);
+            #[cfg(unix)]
+            let update = update.with_exact_mode();
+            Ok(update)
+        },
+        || Ok(()),
+        |_| Ok(()),
+        #[cfg(test)]
+        |_| Ok(()),
+    )
+}
+
 fn transactional_update_impl<F, V, A>(
     path: &Path,
     scope_root: &Path,
-    dry_run: bool,
+    options: TransactionOptions,
     mut transform: F,
     mut revalidate_selection: V,
     mut authorize_publication: A,
@@ -255,14 +321,14 @@ where
     // rejected oversized writes therefore remain completely non-mutating.
     revalidate_selection()?;
     let preflight_snapshot = FileSnapshot {
-        inner: super::fs_helpers::read_snapshot_scoped(path, scope_root)?,
+        inner: super::fs_helpers::read_snapshot_scoped_capped(path, scope_root, options.read_cap)?,
     };
     let mut update = transform(&preflight_snapshot)?;
     validate_update_size(&update)?;
     #[cfg(test)]
     test_hook(TestStage::PreflightReady)?;
 
-    if dry_run {
+    if options.dry_run {
         return match update {
             FileUpdate::Unchanged => Ok(TransactionOutcome::Unchanged),
             FileUpdate::Write { .. } => Ok(TransactionOutcome::DryRunWouldWrite),
@@ -273,10 +339,10 @@ where
     // not create a lock file or destination parent. Re-read and recompute
     // while holding it, so a drifted oversized transform is rejected before
     // any persistent filesystem side effect.
-    let transaction_lock = PlatformTransaction::lock(path, scope_root)?;
+    let transaction_lock = PlatformTransaction::lock_for(path, scope_root, options.lock_timeout)?;
     revalidate_selection()?;
     let snapshot = FileSnapshot {
-        inner: super::fs_helpers::read_snapshot_scoped(path, scope_root)?,
+        inner: super::fs_helpers::read_snapshot_scoped_capped(path, scope_root, options.read_cap)?,
     };
     if snapshot.inner != preflight_snapshot.inner {
         // A cooperative writer may have completed between the side-effect-free
@@ -382,20 +448,27 @@ where
                 .map_err(|error| format!("update committed, but {error}"))?;
         }
 
-        let retention_warning = transaction
-            .cleanup_old_backups(backup_guard.as_ref())
-            .err()
+        // Tiny failure notices create no backup and must not scan a possibly
+        // large directory of unrelated old artifacts on the command path.
+        let retention_warning = options
+            .retain_artifacts
+            .then(|| transaction.cleanup_old_backups(backup_guard.as_ref()).err())
+            .flatten()
             .map(|error| format!("could not enforce transaction-artifact retention: {error}"));
 
         match (publication_outcome, retention_warning) {
             (PublicationOutcome::Clean, None) => Ok(TransactionOutcome::Written),
             (PublicationOutcome::Clean, Some(message))
             | (PublicationOutcome::RecoveryRetained(message), None) => {
-                eprintln!("tirith: WARNING: {message}");
+                if !options.quiet {
+                    eprintln!("tirith: WARNING: {message}");
+                }
                 Ok(TransactionOutcome::WrittenWithRecovery)
             }
             (PublicationOutcome::RecoveryRetained(publication), Some(retention)) => {
-                eprintln!("tirith: WARNING: {publication}; {retention}");
+                if !options.quiet {
+                    eprintln!("tirith: WARNING: {publication}; {retention}");
+                }
                 Ok(TransactionOutcome::WrittenWithRecovery)
             }
         }
@@ -411,13 +484,13 @@ where
             "{error}; transaction-artifact cleanup also failed: {cleanup}"
         )),
         Ok(TransactionOutcome::Written) => {
-            eprintln!(
+            if !options.quiet { eprintln!(
                 "tirith: WARNING: update completed but transaction-artifact cleanup failed: {cleanup}"
-            );
+            ); }
             Ok(TransactionOutcome::WrittenWithRecovery)
         }
         Ok(TransactionOutcome::WrittenWithRecovery) => {
-            eprintln!("tirith: WARNING: transaction-artifact cleanup also failed: {cleanup}");
+            if !options.quiet { eprintln!("tirith: WARNING: transaction-artifact cleanup also failed: {cleanup}"); }
             Ok(TransactionOutcome::WrittenWithRecovery)
         }
         Ok(other) => Err(format!(
@@ -440,7 +513,7 @@ where
     transactional_update_impl(
         path,
         scope_root,
-        false,
+        TransactionOptions::ordinary(false),
         transform,
         || Ok(()),
         |_| Ok(()),
@@ -512,5 +585,80 @@ mod tests {
             TransactionOutcome::DryRunWouldWrite.completion_annotation(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod private_notice_tests {
+    use super::*;
+    #[test]
+    fn repeated_private_notices_keep_one_generation_without_replacement_artifacts() {
+        let _guard = crate::cli::test_harness::ENV_LOCK.lock().unwrap();
+        let scope = tempfile::tempdir().unwrap();
+        let target = scope.path().join("notice.json");
+        for index in 0..12 {
+            let outcome = write_private_notice_bounded(
+                &target,
+                scope.path(),
+                format!("{{\"failure\":{index}}}"),
+                1024,
+                SETUP_LOCK_TIMEOUT,
+                |bytes| bytes == b"{\"failure\":0}",
+            )
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                TransactionOutcome::Written | TransactionOutcome::Unchanged
+            ));
+            assert_eq!(std::fs::read(&target).unwrap(), b"{\"failure\":0}");
+        }
+        assert_eq!(
+            std::fs::read_dir(scope.path()).unwrap().count(),
+            1,
+            "repeated failures must not leave Windows displaced/backup/temp generations"
+        );
+        assert!(write_private_notice_bounded(
+            &target,
+            scope.path(),
+            "new".into(),
+            1024,
+            SETUP_LOCK_TIMEOUT,
+            |_| false
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"{\"failure\":0}");
+    }
+
+    #[test]
+    fn private_notice_lock_deadline_creates_no_destination_when_contended() {
+        let _guard = crate::cli::test_harness::ENV_LOCK.lock().unwrap();
+        let scope = tempfile::tempdir().unwrap();
+        let target = scope.path().join("notice.json");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_target = target.clone();
+        let held_scope = scope.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let _held = PlatformTransaction::lock(&held_target, &held_scope).unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let outcome = write_private_notice_bounded(
+            &target,
+            scope.path(),
+            "{}".into(),
+            1024,
+            std::time::Duration::from_millis(25),
+            |_| true,
+        );
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(outcome.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!target.exists());
     }
 }

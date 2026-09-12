@@ -1067,6 +1067,7 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
 
 #[derive(serde::Serialize)]
 struct DoctorInfo {
+    audit_recording: super::audit_health::AuditHealth,
     package_approval: super::package_approval_authority::PackageApprovalAvailability,
     version: String,
     binary_path: String,
@@ -1373,6 +1374,7 @@ fn gather_info() -> DoctorInfo {
     };
 
     DoctorInfo {
+        audit_recording: super::audit_health::read(),
         package_approval: super::package_approval_authority::availability(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         binary_path,
@@ -2468,6 +2470,7 @@ fn print_protection_status(status: Option<&str>) {
 
 fn print_human(info: &DoctorInfo) {
     println!("tirith {}", info.version);
+    println!("  audit recording: {}", info.audit_recording.summary());
     println!("  binary:       {}", info.binary_path);
     println!("  pkg approval: {} (optional)", info.package_approval.state);
     println!("    {}", info.package_approval.detail);

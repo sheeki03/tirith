@@ -6,6 +6,7 @@ pub(crate) fn projection(
 ) -> serde_json::Value {
     let mut output = tirith_core::history::display_projection(history, patterns);
     output["annotations"] = super::feedback::read_for_history(history);
+    output["audit_recording"] = super::audit_health::read().projection();
     if serde_json::to_vec_pretty(&output).map_or(true, |bytes| {
         bytes.len() > tirith_core::verdict::MAX_PRESENTATION_BYTES
     }) {
@@ -80,6 +81,9 @@ pub fn recent(
                 history.availability,
                 history.events.len()
             );
+            if let Some(detail) = output["audit_recording"]["detail"].as_str() {
+                eprintln!("  Audit recording: {detail}");
+            }
             if history.earlier_history_uninspected || history.more_available {
                 eprintln!("  Partial coverage: older or additional history was not inspected in this page.");
             }

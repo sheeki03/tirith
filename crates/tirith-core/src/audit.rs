@@ -1,15 +1,21 @@
+pub mod health;
 pub mod retention;
 mod verify;
+#[cfg(windows)]
+mod windows;
 use verify::verify_open_audit_log;
 
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(any(not(windows), test))]
+use std::fs::OpenOptions;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use base64::Engine as _;
+#[cfg(test)]
 use fs2::FileExt;
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -594,11 +600,24 @@ fn append_to_audit_log_inner(
     log_path: Option<PathBuf>,
     trusted_artifact_detail: Option<TrustedReceiptDetail<'_>>,
 ) -> AuditWrite {
+    let path = log_path.or_else(default_log_path);
+    let result = append_to_audit_log_unobserved(entry, path.clone(), trusted_artifact_detail);
+    if let (AuditWrite::Failed(_), Some(path)) = (&result, path.as_ref()) {
+        health::record_append_failure(path);
+    }
+    result
+}
+
+fn append_to_audit_log_unobserved(
+    entry: &AuditEntry,
+    log_path: Option<PathBuf>,
+    trusted_artifact_detail: Option<TrustedReceiptDetail<'_>>,
+) -> AuditWrite {
     if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") {
         return AuditWrite::Skipped;
     }
 
-    let Some(path) = log_path.or_else(default_log_path) else {
+    let Some(path) = log_path else {
         return AuditWrite::Skipped;
     };
 
@@ -627,16 +646,21 @@ fn append_to_audit_log_inner(
         }
     }
 
-    let mut open_opts = OpenOptions::new();
-    // Windows LockFileEx requires GENERIC_READ or GENERIC_WRITE. Opening with
-    // FILE_APPEND_DATA alone fails with ERROR_ACCESS_DENIED (os error 5).
-    open_opts.create(true).append(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        open_opts.mode(0o600);
-        open_opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = open_opts.open(&path);
+    #[cfg(windows)]
+    let file = windows::open_log(&path);
+    #[cfg(not(windows))]
+    let file = {
+        let mut open_opts = OpenOptions::new();
+        // Windows LockFileEx requires GENERIC_READ or GENERIC_WRITE. Opening with
+        // FILE_APPEND_DATA alone fails with ERROR_ACCESS_DENIED (os error 5).
+        open_opts.create(true).append(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            open_opts.mode(0o600);
+            open_opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        open_opts.open(&path)
+    };
 
     let mut file = match file {
         Ok(f) => f,
@@ -654,7 +678,7 @@ fn append_to_audit_log_inner(
         let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
 
-    if let Err(e) = file.lock_exclusive() {
+    if let Err(e) = health::lock_append_for(&file, health::APPEND_LOCK_TIMEOUT) {
         let reason = format!("cannot lock {}: {e}", path.display());
         audit_diagnostic(format!("tirith: audit: {reason}"));
         return AuditWrite::Failed(reason);
@@ -1285,7 +1309,8 @@ fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Res
     // NOT followed or clobbered: O_EXCL fails if the path already exists, and
     // O_NOFOLLOW fails if the final component is a symlink. On an O_EXCL
     // collision (a name already squatted), randomize the suffix and retry a few
-    // times before giving up. On non-unix we fall back to plain create+truncate.
+    // times before giving up. Windows uses protected private CREATE_NEW files
+    // with the same bounded collision handling.
     let (tmp, mut f) = open_head_tmp(&hp)?;
 
     // Write + fsync the temp file so its bytes are durable before the rename.
@@ -1314,7 +1339,7 @@ fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Res
 /// retries with a randomized suffix so a squatted temp name cannot wedge the
 /// writer permanently.
 fn open_head_tmp(hp: &std::path::Path) -> std::io::Result<(PathBuf, fs::File)> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         // First the stable `<head>.tmp` name (the common, uncontended case), then
         // randomized fallbacks if that exact path is squatted.
@@ -1333,10 +1358,16 @@ fn open_head_tmp(hp: &std::path::Path) -> std::io::Result<(PathBuf, fs::File)> {
                 tmp_os.push(format!(".tmp.{}.{}.{}", std::process::id(), nonce, attempt));
             }
             let tmp = PathBuf::from(tmp_os);
-            let mut opts = OpenOptions::new();
-            opts.write(true).create_new(true).mode(0o600);
-            opts.custom_flags(libc::O_NOFOLLOW);
-            match opts.open(&tmp) {
+            #[cfg(unix)]
+            let opened = {
+                let mut opts = OpenOptions::new();
+                opts.write(true).create_new(true).mode(0o600);
+                opts.custom_flags(libc::O_NOFOLLOW);
+                opts.open(&tmp)
+            };
+            #[cfg(windows)]
+            let opened = windows::create_head(&tmp);
+            match opened {
                 Ok(f) => return Ok((tmp, f)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -1347,7 +1378,7 @@ fn open_head_tmp(hp: &std::path::Path) -> std::io::Result<(PathBuf, fs::File)> {
             "head temp path is squatted; refusing to write head receipt",
         ))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let mut tmp_os = hp.as_os_str().to_owned();
         tmp_os.push(".tmp");
@@ -2642,6 +2673,45 @@ mod tests {
     }
 
     #[test]
+    fn contended_append_reports_failure_without_changing_verdict_or_allowing_required_audit() {
+        let _environment = GlobalStateGuard::new().expect("isolated audit environment");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("held.jsonl");
+        #[cfg(windows)]
+        let held = windows::open_log(&log).unwrap();
+        #[cfg(not(windows))]
+        let held = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&log)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let verdict = Verdict::allow_fast(1, crate::verdict::Timings::default());
+        let start = std::time::Instant::now();
+        assert!(log_verdict(&verdict, "inert", Some(log.clone()), None, &[]).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(verdict.action, crate::verdict::Action::Allow);
+        assert!(health::latest_process_failure(&log).is_some());
+        assert!(log_verdict_with_raw_required(
+            &verdict,
+            "inert",
+            Some(log.clone()),
+            None,
+            &[],
+            None,
+            None
+        )
+        .is_err());
+        assert_eq!(held.metadata().unwrap().len(), 0);
+        fs2::FileExt::unlock(&held).unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), Vec::<u8>::new());
+        log_verdict(&verdict, "inert", Some(log.clone()), None, &[]).unwrap();
+        // A later success does not erase the observation of a lost record.
+        assert!(health::latest_process_failure(&log).is_some());
+    }
+
+    #[test]
     fn required_raw_audit_rejects_disabled_and_real_write_failure() {
         let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let directory = tempfile::tempdir().unwrap();
@@ -3769,7 +3839,10 @@ mod tests {
     fn audit_chain_concurrent_appends_stay_consistent() {
         // The exclusive fs2 lock must serialize concurrent in-process writers so
         // no interleave breaks a prev_hash. Spawn several threads each appending
-        // a few entries to ONE log, then verify the chain and line count.
+        // a few entries to ONE log, then compare the exact acknowledged records
+        // with disk. A bounded lock wait can explicitly refuse under contention;
+        // it must never report success for a missing record or partially append
+        // a refused record. The held-lock regression pins the deadline itself.
         let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
@@ -3777,22 +3850,68 @@ mod tests {
 
         const THREADS: usize = 8;
         const PER_THREAD: usize = 4;
-        std::thread::scope(|scope| {
+        let outcomes = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
             for t in 0..THREADS {
                 let log = log.clone();
-                scope.spawn(move || {
-                    for i in 0..PER_THREAD {
-                        let _ = append_to_audit_log(
-                            &chain_test_entry(&format!("t{t}-{i}")),
-                            Some(log.clone()),
-                        );
-                    }
-                });
+                workers.push(scope.spawn(move || {
+                    (0..PER_THREAD)
+                        .map(|i| {
+                            append_to_audit_log(
+                                &chain_test_entry(&format!("t{t}-{i}")),
+                                Some(log.clone()),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }));
             }
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
         });
-
-        let total = std::fs::read_to_string(&log).unwrap().lines().count();
-        assert_eq!(total, THREADS * PER_THREAD, "every append must land");
+        assert_eq!(outcomes.len(), THREADS * PER_THREAD);
+        let mut acknowledged = std::collections::BTreeSet::new();
+        let mut refused = 0;
+        for outcome in outcomes {
+            match outcome {
+                AuditWrite::Written(line) => assert!(acknowledged.insert(line)),
+                AuditWrite::Failed(reason) => {
+                    assert!(
+                        reason.starts_with("cannot lock ")
+                            && reason.ends_with("audit append lock deadline reached"),
+                        "unexpected append failure: {reason}"
+                    );
+                    refused += 1;
+                }
+                AuditWrite::Skipped => panic!("configured append was silently skipped"),
+            }
+        }
+        assert!(
+            !acknowledged.is_empty(),
+            "at least one concurrent writer must progress"
+        );
+        assert_eq!(acknowledged.len() + refused, THREADS * PER_THREAD);
+        let persisted = std::fs::read_to_string(&log).unwrap();
+        let total = persisted.lines().count();
+        assert_eq!(
+            total,
+            acknowledged.len(),
+            "every acknowledged append must land exactly once"
+        );
+        assert_eq!(
+            persisted
+                .lines()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>(),
+            acknowledged
+        );
+        if refused > 0 {
+            assert!(
+                health::latest_process_failure(&log).is_some(),
+                "a refused append must leave a failure observation"
+            );
+        }
         let report = verify_audit_log(&log, None);
         assert!(
             report.ok,
@@ -3800,7 +3919,7 @@ mod tests {
             report.problems
         );
         // Genesis line is unchained; every subsequent line is chained.
-        assert_eq!(report.chained_lines, THREADS * PER_THREAD - 1);
+        assert_eq!(report.chained_lines, total - 1);
     }
 
     #[cfg(unix)]

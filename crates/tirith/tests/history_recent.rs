@@ -111,3 +111,160 @@ fn recent_cli_selects_the_newest_records_in_a_small_busy_log() {
     assert_eq!(result["earlier_history_uninspected"], true);
     assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
 }
+
+fn invoke_health_command(state: &GlobalStateGuard, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    state.apply_to_command(&mut command);
+    command
+        .current_dir(&state.roots().cwd)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn failed_writer_state() -> GlobalStateGuard {
+    let mut state = GlobalStateGuard::new().unwrap();
+    for key in ["SUDO_USER", "SUDO_UID", "TIRITH_POLICY_ROOT"] {
+        state.remove_env(key);
+    }
+    state.set_env("TIRITH_LOG", "1");
+    state.set_env("TIRITH_OFFLINE", "1");
+    let log = tirith_core::audit::audit_log_path().unwrap();
+    // An actual directory at the destination forces append failure on every OS,
+    // without relying on root-sensitive permission bits or a full host disk.
+    std::fs::create_dir_all(log).unwrap();
+    state
+}
+
+#[test]
+fn failed_writer_is_visible_across_processes_without_changing_the_check_verdict() {
+    let state = failed_writer_state();
+    let config = tirith_core::policy::config_dir().unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("policy.yaml"), "dlp_custom_patterns: ['.+']\n").unwrap();
+    let notice = tirith_core::policy::state_dir()
+        .unwrap()
+        .join("audit-append-failure-v1.json");
+    // The real notice writer deliberately waits only 25 ms. Other processes
+    // share the Unix setup lock, so one failed append need not persist a notice.
+    // Retry the same inert check within a fixed budget, checking the actual
+    // verdict and privacy on EVERY attempt; never seed a notice in the fixture.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut attempts = 0;
+    let captured = loop {
+        attempts += 1;
+        let checked = invoke_health_command(
+            &state,
+            &[
+                "check",
+                "--json",
+                "--shell",
+                "posix",
+                "--no-daemon",
+                "--",
+                "echo private-health-fixture",
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&checked.stderr);
+        assert!(checked.status.success(), "attempt {attempts}: {stderr}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&checked.stdout).unwrap()["action"],
+            "allow",
+            "attempt {attempts}: {stderr}"
+        );
+        assert!(
+            stderr.contains("audit append failed; recorded history may be incomplete"),
+            "attempt {attempts}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("private-health-fixture"),
+            "attempt {attempts}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&checked.stdout).contains("private-health-fixture"),
+            "attempt {attempts}"
+        );
+        match std::fs::read(&notice) {
+            Ok(bytes) => break bytes,
+            Err(error) => {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "attempt {attempts}: notice unavailable: {error}"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline && attempts < 16,
+                    "no best-effort notice persisted after {attempts} actual checks: {error}; {stderr}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    };
+    assert!(captured.len() <= 1024);
+    assert!(!String::from_utf8_lossy(&captured).contains("private-health-fixture"));
+    for args in [
+        vec!["audit", "recent", "--json"],
+        vec!["status", "--json"],
+        vec!["doctor", "--json"],
+    ] {
+        let result = invoke_health_command(&state, &args);
+        // An unreadable history is allowed to return nonzero with its typed DTO.
+        let value: Value = serde_json::from_slice(&result.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{args:?}: {error}; stdout={} stderr={}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            )
+        });
+        let health = &value["audit_recording"];
+        assert_eq!(health["schema_version"], 1, "{args:?}: {value}");
+        assert_eq!(health["state"], "failure_observed");
+        assert_eq!(health["source"], "private_failure_notice");
+        assert_eq!(health["claims_current_success"], false);
+        assert_eq!(health["detects_all_losses"], false);
+        assert!(uuid::Uuid::parse_str(
+            health["failure_observation"]["observation_id"]
+                .as_str()
+                .unwrap()
+        )
+        .is_ok());
+        assert!(!health.to_string().contains("destination_binding"));
+    }
+    assert_eq!(
+        std::fs::read(notice).unwrap(),
+        captured,
+        "health readers must not rewrite the observation"
+    );
+}
+
+#[test]
+fn unavailable_notice_storage_does_not_turn_a_missing_observation_into_success() {
+    let state = failed_writer_state();
+    let destination = tirith_core::policy::state_dir().unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::fs::write(&destination, b"retained-sentinel").unwrap();
+    let checked = invoke_health_command(
+        &state,
+        &[
+            "check",
+            "--json",
+            "--shell",
+            "posix",
+            "--no-daemon",
+            "--",
+            "echo inert",
+        ],
+    );
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(String::from_utf8_lossy(&checked.stderr).contains("audit append failed"));
+    let result = run(&state, &[]);
+    let value: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(value["audit_recording"]["state"], "unknown");
+    assert_eq!(value["audit_recording"]["claims_current_success"], false);
+    assert_eq!(value["audit_recording"]["detects_all_losses"], false);
+    assert_eq!(std::fs::read(destination).unwrap(), b"retained-sentinel");
+}

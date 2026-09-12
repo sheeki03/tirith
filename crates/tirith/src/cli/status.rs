@@ -35,6 +35,7 @@ pub fn run_with_requirement(json: bool, require_verified_blocking: bool) -> i32 
         .map(|(_, s)| scope_label(s));
 
     let tdb = threatdb_cmd::gather_status();
+    let audit_recording = super::audit_health::read();
 
     if json {
         let mut out = status_json(
@@ -46,6 +47,7 @@ pub fn run_with_requirement(json: bool, require_verified_blocking: bool) -> i32 
             &tdb,
         );
         out["schema_version"] = serde_json::json!(1);
+        out["audit_recording"] = audit_recording.projection();
         out["protection_evidence"] = serde_json::json!(evidence);
         out["shell_target"] = serde_json::json!(crate::cli::shell_target::inspect_current().ok());
         out["protected"] = serde_json::json!(evidence.verified_blocking);
@@ -79,6 +81,7 @@ pub fn run_with_requirement(json: bool, require_verified_blocking: bool) -> i32 
         (None, _) => println!("  policy:      (none found)"),
     }
     println!("  threat db:   {}", threatdb_summary(&tdb));
+    println!("  audit recording: {}", audit_recording.summary());
     let approval = super::package_approval_authority::availability();
     println!("  pkg approval: {} (optional)", approval.state);
     println!("    {}", approval.detail);

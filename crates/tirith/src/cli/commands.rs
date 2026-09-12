@@ -1018,7 +1018,7 @@ pub fn check(command_parts: &[String], shell: &str, json: bool) -> i32 {
     };
     // Reuse the exact `tirith check` path — no divergent second code path.
     super::check::run(
-        &cmd, shell_type, json, /* non_interactive */ false,
+        &cmd, shell_type, json, /* legacy JSON schema */ 3, /* non_interactive */ false,
         /* interactive_flag */ false, /* approval_check */ false,
         /* execution_receipt */ None, /* strict_warn */ false, /* no_daemon */ true,
         /* warn_only */ false, /* defer */ false, /* offline */ false,

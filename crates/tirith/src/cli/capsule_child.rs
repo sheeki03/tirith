@@ -46,6 +46,8 @@ mod aarch64_trace;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod parent_lifetime;
+#[cfg(target_os = "linux")]
+mod private_input_fs;
 
 #[cfg(target_os = "linux")]
 use tirith_core::runner::{
@@ -806,7 +808,8 @@ struct PreparedBoundInputs {
 }
 
 /// Construct the package launch's private input view before Landlock/seccomp.
-/// Each visible filename is a read-only bind mount of a fully sealed memfd inside
+/// Each visible filename contains a bounded copy from a fully sealed memfd. The
+/// complete private filesystem becomes read-only and passes inventory/hash checks inside
 /// a new user+mount namespace. The public target pathname is checked against the
 /// retained descriptor, but write authority remains the descriptor itself.
 #[cfg(target_os = "linux")]
@@ -934,7 +937,7 @@ fn prepare_bound_inputs(
         ));
     }
 
-    enter_private_input_namespace(staging_fd, &parsed.inputs)?;
+    enter_private_input_namespace(staging_fd, &staging, &parsed.inputs, 64 * 1024 * 1024)?;
     Ok(Some(PreparedBoundInputs {
         staging_root: staging,
         staging_fd,
@@ -959,10 +962,16 @@ fn safe_bound_input_name(name: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn enter_private_input_namespace(
     staging_fd: i32,
+    staging_root: &std::path::Path,
     inputs: &[(i32, OsString)],
+    payload_limit: u64,
 ) -> Result<(), String> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
+    let retained_staging = private_input_fs::clone_fd(staging_fd)?;
+    let retained_identity = retained_staging
+        .metadata()
+        .map_err(|_| "inspect retained staging identity")?;
     let host_uid = unsafe { libc::geteuid() };
     let host_gid = unsafe { libc::getegid() };
     if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
@@ -1000,10 +1009,21 @@ fn enter_private_input_namespace(
             std::io::Error::last_os_error()
         ));
     }
-    // Build a detached tmpfs mount, then attach it directly to the retained
-    // staging descriptor with empty-path move_mount. No visible pathname is
-    // reopened between validation, mount, population, cwd selection, or the
-    // later Landlock rule. Landlock-capable kernels already postdate this mount
+    let current_staging =
+        private_input_fs::open_directory_at(libc::AT_FDCWD, &c_path(staging_root)?)?;
+    let current_identity = current_staging
+        .metadata()
+        .map_err(|_| "inspect current namespace staging identity")?;
+    use std::os::unix::fs::MetadataExt as _;
+    if (retained_identity.dev(), retained_identity.ino())
+        != (current_identity.dev(), current_identity.ino())
+    {
+        return Err("staging alias changed across the private namespace transition".into());
+    }
+    // Build a detached tmpfs, populate only from sealed retained inputs, and
+    // make the entire private filesystem read-only before attachment. The
+    // current-namespace staging alias was compared to the still-held original
+    // directory above; attachment, cwd and Landlock use retained descriptors. Landlock-capable kernels already postdate this mount
     // API; an unavailable syscall therefore fails the enforcing launch closed.
     const FSOPEN_CLOEXEC: libc::c_uint = 1;
     const FSCONFIG_SET_STRING: libc::c_uint = 1;
@@ -1012,8 +1032,6 @@ fn enter_private_input_namespace(
     const MOUNT_ATTR_NOSUID: libc::c_uint = 0x0000_0002;
     const MOUNT_ATTR_NODEV: libc::c_uint = 0x0000_0004;
     const MOUNT_ATTR_NOEXEC: libc::c_uint = 0x0000_0008;
-    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
-    const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x0000_0040;
 
     let tmpfs = std::ffi::CString::new("tmpfs").expect("literal has no NUL");
     let fs_context = unsafe { libc::syscall(libc::SYS_fsopen, tmpfs.as_ptr(), FSOPEN_CLOEXEC) };
@@ -1025,7 +1043,12 @@ fn enter_private_input_namespace(
     }
     // SAFETY: fsopen returned a fresh descriptor.
     let fs_context = unsafe { std::os::fd::OwnedFd::from_raw_fd(fs_context as i32) };
-    for (key, value) in [("mode", "0700"), ("size", "64m")] {
+    let size = match payload_limit {
+        67_108_864 => "64m",
+        134_217_728 => "128m",
+        _ => return Err("unsupported private input byte limit".into()),
+    };
+    for (key, value) in [("mode", "0700"), ("size", size)] {
         let key = std::ffi::CString::new(key).expect("literal has no NUL");
         let value = std::ffi::CString::new(value).expect("literal has no NUL");
         if unsafe {
@@ -1077,108 +1100,13 @@ fn enter_private_input_namespace(
     }
     // SAFETY: fsmount returned a fresh mount descriptor.
     let mounted = unsafe { std::os::fd::OwnedFd::from_raw_fd(mounted as i32) };
-    let empty = std::ffi::CString::new("").expect("literal has no NUL");
-    if unsafe {
-        libc::syscall(
-            libc::SYS_move_mount,
-            mounted.as_raw_fd(),
-            empty.as_ptr(),
-            staging_fd,
-            empty.as_ptr(),
-            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
-        )
-    } != 0
-    {
-        return Err(format!(
-            "attach private sealed-input tmpfs to held staging capability: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    for (fd, raw_name) in inputs {
-        let name = c_os(raw_name)?;
-        let destination_fd = unsafe {
-            libc::openat(
-                mounted.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o400,
-            )
-        };
-        if destination_fd < 0 {
-            return Err(format!(
-                "create private input {raw_name:?}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        unsafe {
-            libc::close(destination_fd);
-        }
-        let source = std::path::PathBuf::from(format!("/proc/self/fd/{fd}"));
-        let destination = std::path::PathBuf::from(format!(
-            "/proc/self/fd/{}/{}",
-            mounted.as_raw_fd(),
-            raw_name.to_string_lossy()
-        ));
-        let source_c = c_path(&source)?;
-        let destination_c = c_path(&destination)?;
-        if unsafe {
-            libc::mount(
-                source_c.as_ptr(),
-                destination_c.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            )
-        } != 0
-        {
-            return Err(format!(
-                "bind sealed input {}: {}",
-                destination.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        if unsafe {
-            libc::mount(
-                std::ptr::null(),
-                destination_c.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND
-                    | libc::MS_REMOUNT
-                    | libc::MS_RDONLY
-                    | libc::MS_NOSUID
-                    | libc::MS_NODEV
-                    | libc::MS_NOEXEC,
-                std::ptr::null(),
-            )
-        } != 0
-        {
-            return Err(format!(
-                "remount sealed input read-only {}: {}",
-                destination.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-    if unsafe {
-        libc::mount(
-            std::ptr::null(),
-            c_path(&std::path::PathBuf::from(format!(
-                "/proc/self/fd/{}",
-                mounted.as_raw_fd()
-            )))?
-            .as_ptr(),
-            std::ptr::null(),
-            libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            std::ptr::null(),
-        )
-    } != 0
-    {
-        return Err(format!(
-            "seal private input mount read-only: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    let mounted: std::fs::File = mounted.into();
+    private_input_fs::materialize_inputs(&mounted, inputs, payload_limit)?;
+    private_input_fs::attach_mount(&mounted, &current_staging)?;
+    private_input_fs::verify_visible_mount(
+        staging_root.to_str().ok_or("staging root is not UTF-8")?,
+        &mounted,
+    )?;
     if unsafe { libc::dup3(mounted.as_raw_fd(), staging_fd, 0) } < 0 {
         return Err(format!(
             "replace staging capability with attached tmpfs root: {}",
@@ -1192,12 +1120,6 @@ fn enter_private_input_namespace(
         ));
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn c_os(value: &std::ffi::OsStr) -> Result<std::ffi::CString, String> {
-    use std::os::unix::ffi::OsStrExt as _;
-    std::ffi::CString::new(value.as_bytes()).map_err(|_| "component contains NUL".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -1340,6 +1262,7 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         }
     }
 
+    let lifetime_parent = unsafe { libc::getppid() };
     if let Err(error) = parent_lifetime::arm_group_guard() {
         eprintln!("tirith __capsule-child: parent lifetime bootstrap is unavailable: {error}");
         std::process::exit(2);
@@ -1366,6 +1289,11 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
             std::process::exit(2);
         }
     };
+
+    if let Err(error) = parent_lifetime::revalidate_group_guard(lifetime_parent) {
+        eprintln!("tirith __capsule-child: parent lifetime changed during setup: {error}");
+        std::process::exit(2);
+    }
 
     // Build both the executable C string and argv BEFORE we lock down, so an
     // interior NUL fails early. The executable path is intentionally independent

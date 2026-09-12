@@ -249,6 +249,7 @@ pub fn write_json_with_suggestions(
 
 /// Recovery contains only closed enums, rule IDs and compiler-owned strings;
 /// its original command is used for eligibility and never serialized.
+/// Supplying advice selects schema 4; None preserves the schema-3 contract.
 pub fn write_json_with_recovery(
     verdict: &Verdict,
     custom_patterns: &[String],
@@ -319,6 +320,7 @@ pub fn write_json_with_recovery(
         &project_public_text,
     );
     if let (Some(recovery), Some(object)) = (recovery, output.as_object_mut()) {
+        object.insert("schema_version".into(), 4.into());
         object.insert(
             "recovery".into(),
             serde_json::to_value(recovery).map_err(std::io::Error::other)?,
@@ -1065,6 +1067,34 @@ mod tests {
         assert!(!String::from_utf8(bytes)
             .unwrap()
             .contains("operator-secret"));
+    }
+
+    #[test]
+    fn recovery_is_explicit_schema_four_and_remains_typed_under_broad_dlp() {
+        let verdict = block_verdict_with_bypass();
+        let advice = crate::recovery::for_command(
+            &verdict,
+            "echo recovery-private | sh",
+            crate::tokenize::ShellType::Posix,
+        );
+        let mut bytes = Vec::new();
+        write_json_with_recovery(
+            &verdict,
+            &["(?s).+".into()],
+            None,
+            Some(&advice),
+            &mut bytes,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["action"], "block");
+        assert_eq!(value["recovery"]["schema_version"], 1);
+        assert_eq!(value["recovery"]["bypass"], "eligible");
+        assert_eq!(value["recovery"]["execution_permitted"], false);
+        assert!(!String::from_utf8(bytes)
+            .unwrap()
+            .contains("recovery-private"));
     }
 
     fn block_verdict_with_bypass() -> Verdict {

@@ -10,6 +10,7 @@
 pub(crate) mod fs_helpers;
 
 mod fs_transaction;
+pub(crate) use fs_transaction::{write_private_notice_bounded, TransactionOutcome};
 
 pub(crate) mod audit_segments;
 pub(crate) mod audit_service;

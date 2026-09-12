@@ -2317,8 +2317,9 @@ fn normalize_bound_target_policy(
 
 /// Production `pkg install` seam: execute a content-bound program against immutable
 /// named inputs and one held writable target directory. x86_64 Linux constructs a
-/// private user+mount namespace in the hidden launcher, exposes only sealed
-/// bind-mounted input names, installs the target Landlock WRITE rule from the
+/// private user+mount namespace in the hidden launcher, copies sealed source
+/// bytes into a private filesystem made read-only and verified in full, installs
+/// the target Landlock WRITE rule from the
 /// retained directory descriptor, and proves achieved coverage plus target exec
 /// before reporting execution. Other operating systems refuse explicitly;
 /// non-x86_64 Linux cannot provide the required deny-all seccomp coverage and
@@ -6066,7 +6067,24 @@ fn reserve_bound_directory_fd(
 fn validate_bound_launch_inputs(inputs: &[BoundLaunchInput]) -> Result<(), CapsuleRefused> {
     let mut names = std::collections::BTreeSet::new();
     let mut approved = 0usize;
+    let mut total_bytes = 0u64;
     for input in inputs {
+        let metadata = input.source.metadata().map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!("inspect captured input: {error}"),
+        })?;
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: "captured input size overflow".into(),
+            })?;
+        if !metadata.is_file() || total_bytes > 64 * 1024 * 1024 {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: "wheel input collection exceeds the 64 MiB private staging bound".into(),
+            });
+        }
         let name = input.name.as_str();
         if name.is_empty()
             || name == "."
@@ -6126,6 +6144,18 @@ fn seal_bound_launch_input(
     use sha2::{Digest as _, Sha256};
     use std::os::fd::FromRawFd as _;
 
+    let expected_length = input.source.metadata().map_err(|error| CapsuleRefused {
+        backend_id: "landlock-seccomp",
+        reason: format!("inspect captured input before bounded sealing: {error}"),
+    })?;
+    if !expected_length.is_file() || expected_length.len() > 64 * 1024 * 1024 {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "captured input must remain a regular file within the 64 MiB per-input bound"
+                .to_owned(),
+        });
+    }
+    let expected_length = expected_length.len();
     input
         .source
         .seek(SeekFrom::Start(0))
@@ -6155,16 +6185,28 @@ fn seal_bound_launch_input(
     let mut sealed = unsafe { std::fs::File::from_raw_fd(raw as i32) };
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
     loop {
+        // Read at most one byte beyond the retained regular-file size. A
+        // concurrent growing writer cannot turn sealing into unbounded work.
+        let read_limit = (expected_length.saturating_sub(total).saturating_add(1))
+            .min(buffer.len() as u64) as usize;
         let count = input
             .source
-            .read(&mut buffer)
+            .read(&mut buffer[..read_limit])
             .map_err(|error| CapsuleRefused {
                 backend_id: "landlock-seccomp",
                 reason: format!("read bound input {:?}: {error}", input.name),
             })?;
         if count == 0 {
             break;
+        }
+        total += count as u64;
+        if total > expected_length {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: "captured input grew while being sealed".to_owned(),
+            });
         }
         digest.update(&buffer[..count]);
         sealed
@@ -6178,7 +6220,7 @@ fn seal_bound_launch_input(
             })?;
     }
     let actual = format!("{:x}", digest.finalize());
-    if actual != input.expected_sha256 {
+    if total != expected_length || actual != input.expected_sha256 {
         return Err(CapsuleRefused {
             backend_id: "landlock-seccomp",
             reason: format!(

@@ -67,6 +67,22 @@ pub(super) fn arm_group_guard() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Verify the original lifetime binding after user/mount namespace setup and
+/// before containment or target fork. A cleared binding refuses; learning a new
+/// parent here could accept a child whose actual supervisor already died.
+pub(super) fn revalidate_group_guard(expected_parent: libc::pid_t) -> std::io::Result<()> {
+    let mut signal = 0;
+    if expected_parent <= 0
+        || unsafe { libc::getppid() } != expected_parent
+        || unsafe { libc::getpgrp() } != unsafe { libc::getpid() }
+        || unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal, 0, 0, 0) } != 0
+        || signal != PARENT_DEATH_SIGNAL
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +133,24 @@ mod tests {
             let mut signal = 0;
             (unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal, 0, 0, 0) == 0 })
                 && signal == PARENT_DEATH_SIGNAL
+        });
+    }
+    #[test]
+    fn namespace_revalidation_requires_original_parent_and_armed_signal() {
+        isolated_child(|| {
+            let parent = unsafe { libc::getppid() };
+            if unsafe { libc::setpgid(0, 0) } != 0
+                || arm_before_exec(parent).is_err()
+                || arm_group_guard().is_err()
+                || revalidate_group_guard(parent).is_err()
+                || revalidate_group_guard(0).is_ok()
+            {
+                return false;
+            }
+            if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0, 0, 0, 0) } != 0 {
+                return false;
+            }
+            revalidate_group_guard(parent).is_err()
         });
     }
 }

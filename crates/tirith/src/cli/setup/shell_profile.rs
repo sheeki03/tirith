@@ -292,6 +292,7 @@ fn remove_hook_blocks(content: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn managed_removal_preserves_manual_bytes_and_retires_shadowed_bash_blocks() {
         crate::cli::test_harness::with_fake_env(false, |home, _| {

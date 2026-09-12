@@ -1,7 +1,11 @@
 # Recovery at the execution boundary
 
-`tirith check` now returns a `recovery` projection in JSON and prints guidance
-for the exact input's shell and command shape. The projection uses the same
+`tirith check` prints guidance for the exact input's shell and command shape.
+Machine callers opt into the versioned `recovery` projection with
+`--format json --json-schema 4`. Ordinary JSON remains schema 3 with its existing
+fields; `--json-schema 3` selects that contract explicitly. Selecting a JSON
+schema without JSON output is refused before analysis. Neither version changes
+the decision or exit code. The projection uses the same
 inline-bypass parser as runtime. A policy-enabled POSIX/Fish pipeline can receive
 a `TIRITH=0 ` prefix hint; compound and background forms that runtime rejects do
 not. PowerShell and Cmd environment assignments persist beyond one operation, so

@@ -33,6 +33,10 @@ fn fixture() -> CliContracts {
 }
 
 fn run_check(command: &str) -> Output {
+    run_check_with_options(command, &["--json"])
+}
+
+fn run_check_with_options(command: &str, options: &[&str]) -> Output {
     let root = tempfile::Builder::new()
         .prefix("tirith-c00-cli-")
         .tempdir()
@@ -66,7 +70,9 @@ fn run_check(command: &str) -> Output {
         .env("LOCALAPPDATA", root.path().join("localappdata"))
         .env("TIRITH_LOG", "0")
         .env("TIRITH_OFFLINE", "1")
-        .args(["check", "--shell", "posix", "--json", "--", command]);
+        .args(["check", "--shell", "posix"])
+        .args(options)
+        .args(["--", command]);
 
     for key in [
         "TIRITH",
@@ -161,5 +167,67 @@ fn benign_web3_negative_corpus_remains_non_blocking() {
                 case.name
             );
         }
+    }
+}
+
+#[test]
+fn explicit_recovery_schema_preserves_legacy_decisions_and_exit_codes() {
+    for case in &fixture().legacy_command {
+        let output =
+            run_check_with_options(&case.command, &["--format", "json", "--json-schema", "4"]);
+        assert_eq!(
+            output.status.code(),
+            Some(case.expected_exit),
+            "{}: {}",
+            case.name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["action"], case.expected_action);
+        let mut expected: BTreeSet<String> = case.expected_keys.iter().cloned().collect();
+        expected.insert("recovery".into());
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(value["recovery"]["schema_version"], 1);
+        assert_eq!(value["recovery"]["execution_permitted"], false);
+        assert_eq!(value["recovery"]["hard_block_is_approvable"], false);
+        assert!(!value["recovery"].to_string().contains(&case.command));
+    }
+    let output = run_check_with_options("echo hello", &["--json", "--json-schema", "3"]);
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 3);
+    assert!(value.get("recovery").is_none());
+}
+
+#[test]
+fn json_schema_selection_refuses_invalid_or_non_json_output() {
+    for options in [
+        vec!["--json-schema", "4"],
+        vec!["--format", "human", "--json-schema", "4"],
+        vec!["--json", "--json-schema", "5"],
+        vec!["--json", "--json-schema", "4", "--approval-check"],
+        vec![
+            "--json",
+            "--json-schema",
+            "4",
+            "--execution-receipt",
+            "invalid-unused-receipt",
+        ],
+    ] {
+        let output = run_check_with_options("echo schema-selection", &options);
+        assert_eq!(output.status.code(), Some(2), "{options:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "invalid schema selection cannot emit a decision or approval path"
+        );
     }
 }

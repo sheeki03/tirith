@@ -1023,15 +1023,21 @@ pub(crate) struct PlatformTransaction {
 
 impl PlatformTransaction {
     pub(crate) fn lock(_path: &Path, scope_root: &Path) -> Result<PlatformLock, String> {
+        Self::lock_for(_path, scope_root, super::fs_transaction::SETUP_LOCK_TIMEOUT)
+    }
+
+    pub(crate) fn lock_for(
+        _path: &Path,
+        scope_root: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<PlatformLock, String> {
         let anchor = open_lock_anchor(scope_root)?;
-        super::fs_transaction::wait_for_lock(super::fs_transaction::SETUP_LOCK_TIMEOUT, || {
-            match anchor.try_lock_exclusive() {
-                Ok(()) => Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
-                Err(error) => Err(format!(
-                    "lock setup scope without creating a lock file: {error}"
-                )),
-            }
+        super::fs_transaction::wait_for_lock(timeout, || match anchor.try_lock_exclusive() {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(format!(
+                "lock setup scope without creating a lock file: {error}"
+            )),
         })?;
         Ok(PlatformLock { _anchor: anchor })
     }
@@ -1073,7 +1079,8 @@ impl PlatformTransaction {
     }
 
     pub(crate) fn validate_snapshot(&self, expected: &PlatformSnapshot) -> Result<(), String> {
-        let live = self.read_snapshot()?;
+        let limit = expected.bytes.as_ref().map_or(0, Vec::len);
+        let live = snapshot_from_parent_capped(&self.parent, &self.path, limit)?;
         if &live != expected {
             return Err(format!(
                 "{} changed while setup was preparing the update; no changes were published",
@@ -3146,23 +3153,29 @@ mod tests {
 
     #[test]
     fn non_cooperating_generation_change_is_rejected_and_temp_is_scrubbed() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("config.json");
-        fs::write(&path, "before").unwrap();
-        let result = transactional_update_with_hook(
-            &path,
-            root.path(),
-            |_| Ok(FileUpdate::write_text("ours".into(), 0o644)),
-            |stage| {
-                if stage == TestStage::TempSynced {
-                    fs::write(&path, "editor-change").unwrap();
-                }
-                Ok(())
-            },
-        );
-        assert!(result.unwrap_err().contains("changed while setup"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "editor-change");
-        assert!(nonempty(temporary_setup_paths(root.path())).is_empty());
+        for (editor_bytes, expected_refusal) in [
+            ("editor", "changed while setup"),
+            ("editor-change", "exceeds setup file limit of 6 bytes"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("config.json");
+            fs::write(&path, "before").unwrap();
+            let result = transactional_update_with_hook(
+                &path,
+                root.path(),
+                |_| Ok(FileUpdate::write_text("ours".into(), 0o644)),
+                |stage| {
+                    if stage == TestStage::TempSynced {
+                        fs::write(&path, editor_bytes).unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            let refusal = result.unwrap_err();
+            assert!(refusal.contains(expected_refusal), "{refusal}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), editor_bytes);
+            assert!(nonempty(temporary_setup_paths(root.path())).is_empty());
+        }
     }
 
     #[test]

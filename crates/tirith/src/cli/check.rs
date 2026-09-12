@@ -125,6 +125,7 @@ pub fn run(
     cmd: &str,
     shell_type: ShellType,
     json: bool,
+    json_schema: u8,
     non_interactive: bool,
     interactive_flag: bool,
     approval_check: bool,
@@ -722,12 +723,13 @@ pub fn run(
         } else {
             None
         };
-        let recovery = tirith_core::recovery::for_command(&effective, cmd, shell_type);
+        let recovery = (json_schema == 4)
+            .then(|| tirith_core::recovery::for_command(&effective, cmd, shell_type));
         if output::write_json_with_recovery(
             &effective,
             &policy.dlp_custom_patterns,
             suggestions_opt,
-            Some(&recovery),
+            recovery.as_ref(),
             std::io::stdout().lock(),
         )
         .is_err()

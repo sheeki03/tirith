@@ -116,6 +116,9 @@ struct Generation {
 
 /// Hash one retained regular-file handle once. Subsequent request checks use
 /// native object/generation metadata on both that handle and the current name.
+/// Windows also retains a deny-write sharing lease, because its timestamps can
+/// lag same-size writes. Atomic replacement remains allowed and is detected by
+/// native identity; in-place updates wait for this service's handle to close.
 /// This is an update guard, not a code signature or a defense against an owner
 /// who can replace the process itself or forge filesystem metadata.
 pub(crate) struct BinaryIdentity {
@@ -131,8 +134,7 @@ impl BinaryIdentity {
     }
 
     pub fn capture(path: &Path) -> Result<Self, String> {
-        let mut file = tirith_core::util::open_read_no_follow_capped(path, 512 * 1024 * 1024)
-            .map_err(|_| "cannot retain running binary")?;
+        let mut file = open_binary_identity_file(path)?;
         let generation = native::generation(&file)?;
         if generation.size == 0 || generation.size > 512 * 1024 * 1024 {
             return Err("binary size exceeds identity limit".into());
@@ -180,7 +182,7 @@ impl BinaryIdentity {
     }
 
     pub fn revalidate(&self) -> Result<(), String> {
-        let named = tirith_core::util::open_read_no_follow_capped(&self.path, 512 * 1024 * 1024)
+        let named = open_binary_identity_file(&self.path)
             .map_err(|_| "binary path changed; reopen the dashboard")?;
         if native::generation(&self.file)? != self.generation
             || native::generation(&named)? != self.generation
@@ -188,6 +190,38 @@ impl BinaryIdentity {
             return Err("binary was updated or replaced; reopen the dashboard".into());
         }
         Ok(())
+    }
+}
+
+fn open_binary_identity_file(path: &Path) -> Result<File, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        };
+        // CreateFileW's share contract rejects existing writable handles AND
+        // writable mappings when FILE_SHARE_WRITE is absent. It also blocks new
+        // writers until this retained handle closes. READ|DELETE keeps ordinary
+        // readers and atomic replacement available; timestamps alone cannot
+        // certify unchanged bytes on Windows.
+        // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_DELETE).0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path)
+            .map_err(|_| "cannot retain a binary without concurrent write access")?;
+        let generation = native::generation(&file)?;
+        if generation.size == 0 || generation.size > 512 * 1024 * 1024 {
+            return Err("binary size exceeds identity limit".into());
+        }
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    {
+        tirith_core::util::open_read_no_follow_capped(path, 512 * 1024 * 1024)
+            .map_err(|_| "cannot retain running binary".into())
     }
 }
 
@@ -506,6 +540,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(windows))]
     fn binary_guard_detects_replacement_and_same_size_in_place_edits() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("binary");
@@ -523,6 +558,94 @@ mod tests {
         std::fs::write(&replacement, b"modified bytes").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
         assert!(current.revalidate().is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn binary_guard_excludes_in_place_writes_and_detects_atomic_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("binary");
+        std::fs::write(&path, b"original bytes").unwrap();
+        let original = BinaryIdentity::capture(&path).unwrap();
+        assert!(std::fs::write(&path, b"modified bytes").is_err());
+        assert!(original.revalidate().is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
+        let replacement = temp.path().join("replacement");
+        std::fs::write(&replacement, b"original bytes").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(
+            original.revalidate().is_err(),
+            "identical replacement is a new binary generation"
+        );
+        let current = BinaryIdentity::capture(&path).unwrap();
+        assert_eq!(current.sha256(), original.sha256());
+        drop(current);
+        std::fs::write(&path, b"modified bytes").unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn binary_guard_refuses_preexisting_writable_handles_and_mappings() {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE,
+            MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+        };
+        struct Mapping {
+            view: MEMORY_MAPPED_VIEW_ADDRESS,
+            _handle: OwnedHandle,
+        }
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = UnmapViewOfFile(self.view);
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("binary");
+        std::fs::write(&path, b"original bytes").unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            BinaryIdentity::capture(&path).is_err(),
+            "existing writer must prevent capture"
+        );
+        let handle = unsafe {
+            CreateFileMappingW(
+                HANDLE(writer.as_raw_handle()),
+                None,
+                PAGE_READWRITE,
+                0,
+                0,
+                PCWSTR::null(),
+            )
+        }
+        .unwrap();
+        let owned = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        let view = unsafe { MapViewOfFile(HANDLE(owned.as_raw_handle()), FILE_MAP_WRITE, 0, 0, 0) };
+        assert!(!view.Value.is_null());
+        let mapping = Mapping {
+            view,
+            _handle: owned,
+        };
+        drop(writer);
+        // Closing the original file handle does not erase the writable mapping
+        // contract: capture must still refuse, even with unchanged timestamps.
+        unsafe {
+            mapping.view.Value.cast::<u8>().write(b'm');
+        }
+        assert!(
+            BinaryIdentity::capture(&path).is_err(),
+            "existing writable mapping must prevent capture"
+        );
+        drop(mapping);
+        assert!(BinaryIdentity::capture(&path).is_ok());
     }
 
     #[test]

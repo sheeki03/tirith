@@ -1784,7 +1784,7 @@ fn run_update(
             "  previous:      kept at {} — run `tirith update --rollback` to revert",
             swap.previous_backup.display()
         );
-        println!("  reload:        open a fresh shell or reload the owning host, then inspect tirith status --format json (configuration alone does not prove blocking)");
+        println!("  reload:        open a fresh shell or reload the owning host, then inspect tirith status --json (configuration alone does not prove blocking)");
     }
     0
 }
@@ -2228,7 +2228,7 @@ fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i
                 println!("tirith: rolled back to the previously-installed binary.");
                 println!("  binary: {}", binary_path.display());
                 println!("  run `tirith version` to confirm the version.");
-                println!("  open a fresh shell or reload the owning host, then inspect tirith status --format json (configuration alone does not prove blocking).");
+                println!("  open a fresh shell or reload the owning host, then inspect tirith status --json (configuration alone does not prove blocking).");
             }
             0
         }

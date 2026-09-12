@@ -10,7 +10,7 @@ covers the everyday subset; this is the complete reference.
 | Command | What it does |
 |---------|-------------|
 | `tirith review [--path FILE]` | Explicit offline review of selected project declarations, hooks, AI instructions and MCP configuration; retains identities, reports gaps and never runs project tooling (`--json`) |
-| `tirith check -- <cmd>` | Analyze a command without executing it (`--suggest` adds remediation and, only when fully verified on x86_64 Linux with the current Tirith binary at a fixed root-managed path, a typed pipe-runner command; `--defer` records a non-critical block as pending and exits 4 instead of blocking) |
+| `tirith check -- <cmd>` | Analyze a command without executing it (JSON keeps schema 3 by default; `--format json --json-schema 4` adds typed recovery advice without changing the decision or exit; `--suggest` adds remediation and, only when fully verified on x86_64 Linux with the current Tirith binary at a fixed root-managed path, a typed pipe-runner command; `--defer` records a non-critical block as pending and exits 4 instead of blocking) |
 | `tirith paste` | Check pasted content (called by shell hooks; `--with-source` attributes the paste to its recorded clipboard origin) |
 | `tirith scan [path]` | Scan files, directories, and configs (`--include`, `--exclude`, `--profile`, `--format sarif`, `--ci`) |
 | `tirith run [--capsule] <url>` | Inspect a remote script (`--no-exec` on Unix); Linux live execution is contained and fail-closed by default and executes exact reviewed bytes from a sealed anonymous descriptor (`--capsule` is legacy-compatible) |

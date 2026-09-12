@@ -157,7 +157,7 @@ warning.
 
 ## JSON Output
 
-- `schema_version` is emitted in all JSON output (currently version 3)
+- Command-check JSON defaults to `schema_version: 3` with its existing fields. `tirith check --format json --json-schema 4` explicitly adds typed recovery advice; it keeps the same decision and exit code. Other commands retain their own documented schema versions.
 - Version 3 changes: added `Info` severity level (maps to `Allow` action), added `httpie_pipe_shell` and `xh_pipe_shell` rule IDs
 - JSON fields are additive only: new fields may appear in any release
 - Existing fields will not be removed or change type within a major version

@@ -23,6 +23,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      - name: Check resource and certification fixtures
+        run: |
+          python3 scripts/test-measure-local-control.py
+          python3 scripts/test-certify-shell-package.py
+          python3 scripts/test-certify-claude-host.py
+
       - name: Discard cached Criterion baselines
         # rust-cache intentionally restores compiled artifacts, but a partial
         # target/criterion tree makes Criterion emit diagnostics in the middle
@@ -45,6 +51,46 @@ jobs:
       # regression. Derivation is written down in benches/budgets.txt.
       - name: Enforce absolute benchmark budgets
         run: ./scripts/check-bench-budgets.sh bench-output.txt
+
+      - name: Characterize core allocation requests
+        run: >-
+          cargo bench --locked -p tirith-core --bench resource_counts --
+          --output "$GITHUB_WORKSPACE/resource-allocations.json" --samples 10
+
+      - name: Build release candidate for resource characterization
+        run: cargo build --release --locked -p tirith --bin tirith
+
+      - name: Characterize CLI and local control resources
+        timeout-minutes: 20
+        run: >-
+          python3 scripts/measure-local-control.py
+          --binary "$GITHUB_WORKSPACE/target/release/tirith"
+          --output "$GITHUB_WORKSPACE/resource-local-control.json"
+          --resources --samples 10 --history-rows 250000
+
+      - name: Validate bounded resource reports
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          for name in ("resource-allocations.json", "resource-local-control.json"):
+              path = Path(name)
+              assert 0 < path.stat().st_size <= 1048576, f"invalid report size: {name}"
+              report = json.loads(path.read_text())
+              assert report["schema_version"] == 1, f"unexpected report schema: {name}"
+          PY
+
+      # Read-only characterization artifacts. The existing Criterion budgets
+      # above remain the performance gate; these reports invent no new budgets.
+      - name: Upload resource characterization
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: resource-characterization
+          path: |
+            resource-allocations.json
+            resource-local-control.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload trusted-main benchmark input
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

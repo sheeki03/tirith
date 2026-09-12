@@ -356,6 +356,7 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
             Ok(
                 json!({"schema_version": 1, "kind": "protection_state", "shell": info,
                 "package_approval": super::super::package_approval_authority::availability(),
+                "audit_recording": super::super::audit_health::read().projection(),
                 "project": tirith_core::redact::redact_sanitize_redact_with_compiled(&service.record.cwd, &compiled),
                 "source": "local_service_inherited_context", "service_running_is_protection_evidence": false}),
             )

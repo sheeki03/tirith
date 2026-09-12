@@ -32,8 +32,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
@@ -41,8 +41,8 @@ use windows::Win32::Security::{
     GetSecurityDescriptorOwner, GetTokenInformation, SetKernelObjectSecurity,
     SetSecurityDescriptorControl, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
     DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_AUTO_INHERITED,
-    SE_DACL_AUTO_INHERIT_REQ, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FlushFileBuffers,
@@ -752,7 +752,18 @@ fn open_or_create_directory(
         None if !create => return Ok(false),
         None => {
             let current_wide = wide(current);
-            if let Err(error) = unsafe { CreateDirectoryW(PCWSTR(current_wide.as_ptr()), None) } {
+            // Set owner and privacy atomically. A default token owner may be the
+            // Administrators group on an elevated native Windows runner; a
+            // later DACL-only update cannot turn that into a user-owned object.
+            let descriptor = owner_only_descriptor()?;
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor.0 .0,
+                bInheritHandle: BOOL(0),
+            };
+            if let Err(error) =
+                unsafe { CreateDirectoryW(PCWSTR(current_wide.as_ptr()), Some(&attributes)) }
+            {
                 if !is_win32(&error, ERROR_ALREADY_EXISTS.0) {
                     return Err(format!("create directory {}: {error}", current.display()));
                 }
@@ -1346,10 +1357,23 @@ fn snapshot_destination(
     destination: &Path,
     display_path: &Path,
 ) -> Result<PlatformSnapshot, String> {
+    snapshot_destination_capped(
+        destination,
+        display_path,
+        super::fs_transaction::MAX_SETUP_FILE_BYTES,
+    )
+}
+
+fn snapshot_destination_capped(
+    destination: &Path,
+    display_path: &Path,
+    limit: usize,
+) -> Result<PlatformSnapshot, String> {
     let Some(handle) = open_existing(destination)? else {
         return Ok(PlatformSnapshot::absent());
     };
-    let (_, bytes, generation) = capture_stable_file(handle.into_file(), display_path)?;
+    let (_, bytes, generation) =
+        capture_stable_file_capped(handle.into_file(), display_path, limit)?;
     Ok(PlatformSnapshot {
         bytes: Some(bytes),
         mode: None,
@@ -1483,9 +1507,45 @@ pub(crate) fn ensure_private_directory(path: &Path, scope_root: &Path) -> Result
     }
     .map_err(|e| format!("open private journal directory: {e}"))?;
     let held = OwnedHandle(handle);
+    // This helper is only for the caller's explicitly selected managed state
+    // directory. Never take ownership of an existing shared/foreign directory.
+    let mut before = security_descriptor(held.0, path)?;
+    let mut owner = PSID::default();
+    let mut defaulted = BOOL(0);
+    unsafe {
+        GetSecurityDescriptorOwner(
+            PSECURITY_DESCRIPTOR(before.as_mut_ptr().cast()),
+            &mut owner,
+            &mut defaulted,
+        )
+    }
+    .map_err(|e| format!("read private journal directory owner: {e}"))?;
+    if owner.0.is_null() || !owner_is_current_user(owner) {
+        return Err("private journal directory is not owned by the current user".into());
+    }
     let descriptor = owner_only_descriptor()?;
-    unsafe { SetKernelObjectSecurity(held.0, DACL_SECURITY_INFORMATION, descriptor.0) }
-        .map_err(|e| format!("make journal directory private: {e}"))?;
+    let mut dacl = std::ptr::null_mut();
+    let mut present = BOOL(0);
+    unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted) }
+        .map_err(|e| format!("read private journal directory DACL: {e}"))?;
+    if !present.as_bool() || dacl.is_null() {
+        return Err("private journal directory descriptor has no DACL".into());
+    }
+    // SetSecurityInfo is the filesystem-specific API. Protection must be an
+    // explicit security-information flag, not merely a bit in the source SDDL.
+    unsafe {
+        SetSecurityInfo(
+            held.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    }
+    .ok()
+    .map_err(|e| format!("make journal directory private: {e}"))?;
     if !owner_only_security_descriptor(&security_descriptor(held.0, path)?) {
         return Err("private journal directory ACL could not be verified".into());
     }
@@ -1599,8 +1659,16 @@ pub(crate) struct PlatformTransaction {
 
 impl PlatformTransaction {
     pub(crate) fn lock(path: &Path, scope_root: &Path) -> Result<PlatformLock, String> {
+        Self::lock_for(path, scope_root, super::fs_transaction::SETUP_LOCK_TIMEOUT)
+    }
+
+    pub(crate) fn lock_for(
+        path: &Path,
+        scope_root: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<PlatformLock, String> {
         let mutex = open_transaction_mutex(path, scope_root)?;
-        super::fs_transaction::wait_for_lock(super::fs_transaction::SETUP_LOCK_TIMEOUT, || {
+        super::fs_transaction::wait_for_lock(timeout, || {
             let wait = unsafe { WaitForSingleObject(mutex.0, 0) };
             if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
                 Ok(true)
@@ -1672,7 +1740,8 @@ impl PlatformTransaction {
         if !path_rules::final_path_within(&self.parent.root_final, &parent_final) {
             return Err("destination parent moved outside trusted setup root".into());
         }
-        let live = self.read_snapshot()?;
+        let limit = expected.bytes.as_ref().map_or(0, Vec::len);
+        let live = snapshot_destination_capped(&self.destination, &self.display_path, limit)?;
         if &live != expected {
             return Err(format!(
                 "{} changed while setup was preparing the update; no changes were published",
@@ -3030,6 +3099,61 @@ mod tests {
         let mut file = OwnedHandle(handle).into_file();
         file.write_all(content).unwrap();
         unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) }.unwrap();
+    }
+
+    #[test]
+    fn private_directory_creation_is_protected_and_current_user_owned() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("managed").join("journals");
+        ensure_private_directory(&path, fixture.path()).unwrap();
+        ensure_private_directory(&path, fixture.path()).unwrap();
+        // Every newly created component has explicit private security, including
+        // the scope itself when its first child causes it to be materialized.
+        for directory in [path.clone(), path.parent().unwrap().to_path_buf()] {
+            let handle = open_directory(&directory).unwrap().unwrap();
+            assert!(owner_only_security_descriptor(
+                &security_descriptor(handle.0, &directory).unwrap()
+            ));
+        }
+        let new_scope = fixture.path().join("new-scope");
+        ensure_private_directory(&new_scope, &new_scope).unwrap();
+        let handle = open_directory(&new_scope).unwrap().unwrap();
+        assert!(owner_only_security_descriptor(
+            &security_descriptor(handle.0, &new_scope).unwrap()
+        ));
+    }
+
+    #[test]
+    fn managed_private_directory_hardening_explicitly_protects_inheritance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("managed");
+        let sid = current_user_sid_string().unwrap();
+        let sddl: Vec<u16> = format!("O:{sid}D:(A;;FA;;;{sid})(A;;GR;;;WD)")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        }
+        .unwrap();
+        let descriptor = LocalSecurityDescriptor(descriptor);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0 .0,
+            bInheritHandle: BOOL(0),
+        };
+        unsafe { CreateDirectoryW(PCWSTR(wide(&directory).as_ptr()), Some(&attributes)) }.unwrap();
+        ensure_private_directory(&directory, fixture.path()).unwrap();
+        let handle = open_directory(&directory).unwrap().unwrap();
+        assert!(owner_only_security_descriptor(
+            &security_descriptor(handle.0, &directory).unwrap()
+        ));
     }
 
     #[test]

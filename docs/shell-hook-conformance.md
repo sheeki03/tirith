@@ -148,6 +148,9 @@ The resulting supported state applies only to the measured package and covered
 interactive modes. Native Windows PowerShell, Unix PowerShell, Nushell and actual
 agent-host invocation remain explicitly unavailable in this runner. Their
 configuration files and mocked hook events cannot extend its certification.
+A separate [native Claude host checkpoint](next-cycle/claude-native-evidence.md)
+records actual host invocation with a scripted loopback provider, exact matcher
+scope, and observed launch/timeout failure boundaries.
 The block fixtures use local inert pipelines plus allowed-once controls so
 network failure cannot masquerade as successful interception.
 
