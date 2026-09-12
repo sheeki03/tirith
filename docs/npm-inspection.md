@@ -11,7 +11,15 @@ Run `tirith pkg inspect package.tgz --format json` for inspection or
 `tirith pkg diff old.tgz new.tgz --format json` for release comparison. Both
 commands also support human output and `--format sarif`. The existing
 `tirith package inspect --artifact package.tgz --json` entry point uses the same
-inspector. Select one ecosystem per invocation; wheel behavior is preserved.
+inspector. Automatic npm selection applies to `.tgz` only. Ambiguous `.tar.gz`
+files retain the established Python inspection report and fail closed as
+unsupported source distributions. Select npm explicitly with
+`tirith pkg inspect package.tar.gz --ecosystem npm --json`,
+`tirith pkg diff old.tar.gz new.tar.gz --ecosystem npm --json`, or
+`tirith package inspect --artifact package.tar.gz --ecosystem npm --json`.
+`--ecosystem python` explicitly selects the Python reader. This option applies
+to local artifact files, not installed environments or wheel-set directories.
+Select one ecosystem per invocation; wheel behavior is preserved.
 The npm JSON schema is versioned independently, and SARIF 2.1.0 embeds its same
 redacted report. Exit 1 means the archive was refused; exit 2 means review,
 incomplete/qualified analysis, differences, or a usage/read error; exit 0 means

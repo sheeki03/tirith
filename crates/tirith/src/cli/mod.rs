@@ -1702,6 +1702,7 @@ pub mod output_guard;
 pub mod package;
 pub(crate) mod package_approval_authority;
 pub(crate) mod package_approval_authority_native;
+mod package_checkpoint;
 pub mod paste;
 pub mod path;
 pub mod pending;
@@ -1731,6 +1732,7 @@ pub mod provenance;
 /// network / `sigstore-*` half the plan keeps out of `tirith-core`.
 pub mod pypi_integrity;
 pub mod receipt;
+mod receipt_display;
 pub mod rollout;
 pub mod rule;
 pub mod scan;

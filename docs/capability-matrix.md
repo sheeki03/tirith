@@ -135,9 +135,9 @@ Inspected:
 
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
-| `tirith pkg install` | Full | Resolves with hashes, quarantines the exact wheel bytes, and inspects them. Enforcing Python installation is x86_64 Linux-only and uses only the verified bytes inside a containment capsule with a tamper-evident receipt; every other platform or architecture fails closed before pip starts. | Yes |
+| `tirith pkg install` | None | Package execution is disabled on every host because private named-input lifetime protection is unqualified. Valid pip requests refuse before resolver, network, quarantine, checkpoint or target effects. Confirmation flags, degraded mode and administrator access do not enable it. Use package inspection or verify-env for separate read-only workflows; npm/cargo installation is unavailable. | Yes |
 | `tirith pkg verify-env` | Full | Verifies an installed environment's files against their RECORD and the threat DB. Python-only. | Yes |
-| `tirith pkg approve` | Full | Binds an approval to an InstallPlanDigest over the inspected artifact hashes, packages, target env, policy projection, and DB sequence. | Yes |
+| `tirith pkg approve` | Full | Binds an approval to the inspected artifact hashes, packages, target environment, policy projection, and DB sequence. This explicit approval route requires the opt-in privileged helper and its supported authority, currently Linux x86_64. It is unavailable by default. Ordinary checks do not require it, and an approval cannot enable the currently disabled package-execution backend. | Yes |
 | `tirith pkg graph` | Full | Renders the execution/ownership provenance graph from inspected artifact execution edges and the ownership map. | Yes |
 | `tirith pkg diff` | Full | Local release differential between two wheels; inspects members for execution-shape drift (pure to native, hooks added). | Yes |
 | `tirith pkg attest` | Full | Binds a PyPI provenance attestation subject digest to the quarantined sha256 and verifies it (optional sigstore feature). Missing or invalid attestation is evidence, never an auto-allow. | Yes |

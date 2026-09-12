@@ -65,6 +65,7 @@ pub mod archive;
 /// Bounded local npm gzip/ustar/PAX reader and calibrated static observations.
 /// Captures exact artifact/member hashes without extraction or execution.
 pub mod npm_archive;
+pub mod npm_install;
 
 /// Pure npm release comparison, separating package byte changes from analyzer
 /// version, limit and coverage changes.

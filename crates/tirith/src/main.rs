@@ -463,9 +463,8 @@ after the analysis and your go-ahead.
 
 This is pre-execution install-RISK ANALYSIS plus a recorded transaction. Real
 package-manager installs (`npm`, `pip`, `cargo`, and others) are not sandboxed;
-on x86_64 Linux, use `tirith pkg install` for the enforcing package firewall.
-Other platforms and architectures refuse that enforcing execution. The `url`
-form is different: reviewed scripts execute contained by default and fail closed
+contained package installation (`tirith pkg install`) is currently disabled
+pending qualification of immutable named inputs. The `url` form is different: reviewed scripts execute contained by default and fail closed
 when the Linux capsule cannot provide the required coverage.
 
 The package(s) are scored with the deterministic `tirith package risk`
@@ -549,9 +548,8 @@ Examples:
         sha256: Option<String>,
     },
 
-    /// Package firewall: resolve and inspect Python packages; on x86_64 Linux,
-    /// install ONLY the verified bytes inside a containment capsule, with a
-    /// tamper-evident receipt.
+    /// Inspect Python packages and verify installed environments.
+    /// Contained package installation is currently disabled.
     #[command(after_help = "\
 Examples:
   tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
@@ -560,11 +558,16 @@ Examples:
   tirith pkg verify-env --target .venv requests flask
   tirith pkg receipt list
 
-`tirith pkg approve` native approval issuance and `tirith pkg install` enforcing
-execution are supported only on x86_64 Linux. Other platforms and architectures
-fail closed instead of issuing an approval that cannot be redeemed. `pkg
-verify-env` remains a read-only verifier, and `tirith install` remains the
-portable analysis path.")]
+`tirith pkg install` is disabled on every host and refuses with
+private_input_execution_unqualified before resolver, quarantine, checkpoint,
+or package execution. --yes, --allow-degraded, sudo, and administrator access
+do not enable it. Immutable named inputs must be qualified for the complete
+target lifetime before contained package execution can be enabled.
+
+`tirith pkg approve` remains subject to its separate native authority and
+x86_64 Linux requirements; an approval cannot bypass the execution refusal.
+`pkg verify-env` remains a read-only verifier, and `tirith package inspect`
+remains available for local artifact inspection.")]
     Pkg {
         #[command(subcommand)]
         action: PkgAction,
@@ -5984,6 +5987,22 @@ enum PendingAction {
     },
 }
 
+/// Explicit interpretation of a local artifact; no installation authority.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LocalArtifactEcosystem {
+    Python,
+    Npm,
+}
+
+impl LocalArtifactEcosystem {
+    fn into_core(self) -> cli::package::ArtifactEcosystem {
+        match self {
+            Self::Python => cli::package::ArtifactEcosystem::Python,
+            Self::Npm => cli::package::ArtifactEcosystem::Npm,
+        }
+    }
+}
+
 /// The ecosystem `tirith pkg` enforces for. Only `pip` installs; `npm`/`cargo`
 /// resolve-and-inspect lives behind hidden experimental flags and cannot install.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -6014,6 +6033,7 @@ Examples:
   tirith pkg inspect package-1.0.0.tgz --format json
   tirith pkg inspect package-1.0.0.tgz --format sarif
   tirith pkg inspect distribution-1.0-py3-none-any.whl
+  tirith pkg inspect package.tar.gz --ecosystem npm
 
 npm inspection is bounded static evidence over the exact compressed artifact.
 Coverage gaps are explicit. It never installs, executes lifecycle scripts,
@@ -6022,6 +6042,9 @@ contacts a registry, or issues installation approval.")]
         /// Local npm tarballs (.tgz/.tar.gz) or wheels (.whl); do not mix ecosystems.
         #[arg(value_name = "ARTIFACT", required = true)]
         artifacts: Vec<PathBuf>,
+        /// Select the reader explicitly; .tar.gz preserves Python behavior by default.
+        #[arg(long, value_enum)]
+        ecosystem: Option<LocalArtifactEcosystem>,
         /// Output format (SARIF is supported for npm tarballs).
         #[arg(long, value_enum)]
         format: Option<HumanJsonSarifFormat>,
@@ -6061,18 +6084,22 @@ platforms fail closed before publishing an approval record.")]
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Resolve + inspect + install ONLY the verified, hash-pinned bytes, inside the
-    /// containment capsule, recording a tamper-evident receipt. Enforcing execution
-    /// is x86_64 Linux-only; every other platform or architecture fails closed
-    /// before pip starts.
+    /// Contained package installation (currently disabled on every host).
+    /// Refuses before resolver, quarantine, checkpoint, or package execution.
     #[command(after_help = "\
 Examples:
   tirith pkg install pip requests==2.31.0 --target .tirith-pkg
   tirith pkg install pip flask --target .venv --yes
 
-Execution is supported only on x86_64 Linux. Unsupported platforms and
-architectures refuse before pip starts; they never fall back to an uncontained
-install.")]
+Execution is disabled on every host. These examples retain the accepted syntax
+but refuse with private_input_execution_unqualified before resolver execution,
+network access, quarantine writes, checkpoint creation, or package launch.
+--yes, --allow-degraded, sudo, and administrator access do not enable it.
+
+The private named-input backend has not been qualified to keep package inputs
+unchanged for the complete target lifetime against another process owned by
+the same user. `tirith package inspect` and `tirith pkg verify-env` remain
+available.")]
     Install {
         /// The ecosystem (only `pip` is enforced).
         #[arg(value_enum)]
@@ -6089,8 +6116,7 @@ install.")]
         /// egress only and is never treated as a package index.
         #[arg(long = "artifact-origin")]
         artifact_origin: Vec<String>,
-        /// Install without a prior `tirith pkg approve` (unattended). The receipt
-        /// still attests the install honestly.
+        /// Retained unattended confirmation flag; cannot enable the disabled backend.
         #[arg(long)]
         yes: bool,
         /// Acknowledge degraded containment (still routes through the fail-closed
@@ -6195,6 +6221,9 @@ evidence is advisory and never authorizes an installation.")]
         /// The NEW (candidate) artifact from the same ecosystem.
         #[arg(value_name = "NEW_ARTIFACT")]
         new: std::path::PathBuf,
+        /// Select the reader explicitly; use npm for ambiguous .tar.gz archives.
+        #[arg(long, value_enum)]
+        ecosystem: Option<LocalArtifactEcosystem>,
         /// Output format (SARIF is supported for npm tarballs).
         #[arg(long, value_enum)]
         format: Option<HumanJsonSarifFormat>,
@@ -6323,13 +6352,32 @@ Examples:
     },
 }
 
+/// Canonical signed storage and display projections are distinct contracts.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ArtifactReceiptFormat {
+    Human,
+    Json,
+    DisplayJson,
+}
+
+impl ArtifactReceiptFormat {
+    fn resolve(format: Option<Self>, json: bool) -> (bool, bool) {
+        match format {
+            Some(Self::DisplayJson) => (true, true),
+            Some(Self::Json) => (true, false),
+            Some(Self::Human) => (false, false),
+            None => (json, false),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum PkgReceiptQuery {
     /// List all artifact-scan receipts (newest first).
     List {
         /// Output format (default: human)
         #[arg(long, value_enum)]
-        format: Option<HumanJsonFormat>,
+        format: Option<ArtifactReceiptFormat>,
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
@@ -6338,7 +6386,7 @@ enum PkgReceiptQuery {
     Last {
         /// Output format (default: human)
         #[arg(long, value_enum)]
-        format: Option<HumanJsonFormat>,
+        format: Option<ArtifactReceiptFormat>,
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
@@ -6349,7 +6397,7 @@ enum PkgReceiptQuery {
         receipt_id: String,
         /// Output format (default: human)
         #[arg(long, value_enum)]
-        format: Option<HumanJsonFormat>,
+        format: Option<ArtifactReceiptFormat>,
         /// Alias for --format json
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
@@ -7359,6 +7407,7 @@ Examples:
   tirith package inspect --installed ./.venv
   tirith package inspect --format json --artifact dist/foo.whl
   tirith package inspect --format json --artifact package-1.0.0.tgz
+  tirith package inspect --artifact package.tar.gz --ecosystem npm
 
 Verdict-oriented (unlike `package risk`, which is an advisory scorer): exits
 0 when clean, 1 on a block-grade finding, 2 on an advisory (warn) finding.
@@ -7373,6 +7422,9 @@ coverage gaps; their reports are advisory and do not authorize installation.")]
         /// Multiple wheels also detect cross-distribution loader/payload splits.
         #[arg(long, value_name = "FILE")]
         artifact: Vec<PathBuf>,
+        /// Select a local artifact reader; ambiguous .tar.gz defaults to Python.
+        #[arg(long, value_enum, conflicts_with_all = ["artifact_set", "installed"])]
+        ecosystem: Option<LocalArtifactEcosystem>,
         /// A directory of wheels to inspect as a SET (cross-distribution
         /// correlation across every .whl found, non-recursively).
         #[arg(long, value_name = "DIR", conflicts_with = "installed")]
@@ -8250,6 +8302,7 @@ fn run() {
             action:
                 PkgAction::Inspect {
                     artifacts,
+                    ecosystem,
                     format,
                     json,
                 },
@@ -8260,7 +8313,11 @@ fn run() {
                 HumanJsonSarifFormat::Json => cli::npm_artifact::Format::Json,
                 HumanJsonSarifFormat::Sarif => cli::npm_artifact::Format::Sarif,
             };
-            cli::package::inspect_local_artifacts(&artifacts, format)
+            cli::package::inspect_local_artifacts(
+                &artifacts,
+                format,
+                ecosystem.map(LocalArtifactEcosystem::into_core),
+            )
         }
         Commands::Pkg {
             action:
@@ -8285,6 +8342,7 @@ fn run() {
                 PkgAction::Diff {
                     old,
                     new,
+                    ecosystem,
                     format,
                     json,
                 },
@@ -8295,7 +8353,12 @@ fn run() {
                 HumanJsonSarifFormat::Json => cli::npm_artifact::Format::Json,
                 HumanJsonSarifFormat::Sarif => cli::npm_artifact::Format::Sarif,
             };
-            cli::package::diff_local_artifacts(&old, &new, format)
+            cli::package::diff_local_artifacts(
+                &old,
+                &new,
+                format,
+                ecosystem.map(LocalArtifactEcosystem::into_core),
+            )
         }
         Commands::Pkg {
             action:
@@ -8388,25 +8451,29 @@ fn run() {
                     cli::pkg::PkgAction::TrustTool { path, json }
                 }
                 PkgAction::Receipt { query } => {
-                    let (which, json) = match query {
+                    let (which, json, display_json) = match query {
                         PkgReceiptQuery::List { format, json } => {
-                            let (_, json) = HumanJsonFormat::resolve(format, json);
-                            (cli::pkg::ReceiptQuery::List, json)
+                            let (json, display_json) = ArtifactReceiptFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::List, json, display_json)
                         }
                         PkgReceiptQuery::Last { format, json } => {
-                            let (_, json) = HumanJsonFormat::resolve(format, json);
-                            (cli::pkg::ReceiptQuery::Last, json)
+                            let (json, display_json) = ArtifactReceiptFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::Last, json, display_json)
                         }
                         PkgReceiptQuery::Show {
                             receipt_id,
                             format,
                             json,
                         } => {
-                            let (_, json) = HumanJsonFormat::resolve(format, json);
-                            (cli::pkg::ReceiptQuery::Show(receipt_id), json)
+                            let (json, display_json) = ArtifactReceiptFormat::resolve(format, json);
+                            (cli::pkg::ReceiptQuery::Show(receipt_id), json, display_json)
                         }
                     };
-                    cli::pkg::PkgAction::Receipt { which, json }
+                    cli::pkg::PkgAction::Receipt {
+                        which,
+                        json,
+                        display_json,
+                    }
                 }
                 // `Graph` is handled by the earlier `Commands::Pkg { action:
                 // PkgAction::Graph { .. } }` arm (it returns its own exit code
@@ -9362,6 +9429,7 @@ fn run() {
             }
             PackageAction::Inspect {
                 artifact,
+                ecosystem,
                 artifact_set,
                 installed,
                 format,
@@ -9373,6 +9441,7 @@ fn run() {
                     artifact_set.as_deref(),
                     installed.as_deref(),
                     json,
+                    ecosystem.map(LocalArtifactEcosystem::into_core),
                 )
             }
         },

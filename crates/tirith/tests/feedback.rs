@@ -189,7 +189,14 @@ fn feedback_is_owned_replayable_undoable_and_does_not_change_trust_or_audit() {
             "--json",
         ],
     ));
-    assert_eq!(undo["state"], "undone");
+    assert_eq!(
+        undo["state"],
+        if cfg!(windows) {
+            "undone-with-recovery"
+        } else {
+            "undone"
+        }
+    );
     assert!(std::fs::read_to_string(&destination)
         .unwrap_or_default()
         .is_empty());

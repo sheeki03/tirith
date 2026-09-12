@@ -935,6 +935,16 @@ impl extrasafe::RuleSet for PostExecRuntime {
             // the authority over *where* either syscall may create a directory.
             Sysno::mkdir,
             Sysno::mkdirat,
+            // pip creates, replaces and removes temporary/target entries. These
+            // content/topology operations remain mediated by Landlock; metadata
+            // changes such as chmod/chown/utime are deliberately not granted.
+            Sysno::unlink,
+            Sysno::unlinkat,
+            Sysno::rmdir,
+            Sysno::rename,
+            Sysno::renameat,
+            // Process-local creation mask; existing file metadata stays denied.
+            Sysno::umask,
         ]
     }
 
@@ -1110,6 +1120,26 @@ impl extrasafe::RuleSet for SafeDescriptorControls {
                     )),
             );
         }
+        // CPython's custom opener sets CLOEXEC with this exact ioctl. It
+        // changes only the caller's descriptor flags, like permitted F_SETFD.
+        rules.entry(Sysno::ioctl).or_insert_with(Vec::new).push(
+            SeccompRule::new(Sysno::ioctl)
+                .and_condition(SeccompArgumentFilter::new64(
+                    0,
+                    SeccompilerComparator::Le,
+                    i32::MAX as u64,
+                ))
+                .and_condition(SeccompArgumentFilter::new64(
+                    1,
+                    SeccompilerComparator::Eq,
+                    libc::FIOCLEX,
+                ))
+                .and_condition(SeccompArgumentFilter::new64(
+                    2,
+                    SeccompilerComparator::Eq,
+                    0,
+                )),
+        );
         for command in SAFE_FCNTL_COMMANDS {
             rules.entry(Sysno::fcntl).or_insert_with(Vec::new).push(
                 SeccompRule::new(Sysno::fcntl).and_condition(SeccompArgumentFilter::new32(
@@ -1481,10 +1511,10 @@ mod tests {
         assert!(SafeDescriptorControls.simple_rules().is_empty());
         let rules = SafeDescriptorControls.conditional_rules();
         let ioctl_rules = rules.get(&Sysno::ioctl).expect("conditional ioctl rules");
-        assert_eq!(ioctl_rules.len(), SAFE_TERMINAL_IOCTL_REQUESTS.len());
+        assert_eq!(ioctl_rules.len(), SAFE_TERMINAL_IOCTL_REQUESTS.len() + 1);
         assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&{ libc::TIOCSTI }));
         assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&{ libc::TIOCLINUX }));
-        for rule in ioctl_rules {
+        for rule in &ioctl_rules[..SAFE_TERMINAL_IOCTL_REQUESTS.len()] {
             assert_eq!(rule.argument_filters.len(), 2);
             assert!(rule
                 .argument_filters
@@ -1498,6 +1528,21 @@ mod tests {
                 .value;
             assert!(SAFE_TERMINAL_IOCTL_REQUESTS.contains(&request));
         }
+
+        let close_on_exec = ioctl_rules.last().unwrap();
+        assert_eq!(close_on_exec.argument_filters.len(), 3);
+        assert!(close_on_exec
+            .argument_filters
+            .iter()
+            .any(|f| f.arg_idx == 0 && f.value == i32::MAX as u64));
+        assert!(close_on_exec
+            .argument_filters
+            .iter()
+            .any(|f| f.arg_idx == 1 && f.value == libc::FIOCLEX));
+        assert!(close_on_exec
+            .argument_filters
+            .iter()
+            .any(|f| f.arg_idx == 2 && f.value == 0));
 
         let fcntl_rules = rules.get(&Sysno::fcntl).expect("conditional fcntl rules");
         assert_eq!(fcntl_rules.len(), SAFE_FCNTL_COMMANDS.len());
@@ -1959,6 +2004,125 @@ mod tests {
             !marker.exists(),
             "target survived its seccomp-confined guard"
         );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn runtime_file_topology_subprocess() {
+        let Some(root) = std::env::var_os("TIRITH_RUNTIME_FILE_TOPOLOGY_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let writable = root.join("writable");
+        let readonly = root.join("readonly");
+        let outside = root.join("outside");
+        // Retain a harmless read descriptor so the actual installed filter is
+        // tested above stdio without granting any external file-write right.
+        let descriptor = std::fs::File::open(readonly.join("source")).unwrap();
+        use std::os::fd::AsRawFd as _;
+        let fd = descriptor.as_raw_fd();
+        assert!(fd > 2);
+        set_no_new_privs().unwrap();
+        let filesystem = FilesystemPolicy {
+            read_roots: vec![readonly.clone()],
+            write_roots: vec![writable.clone()],
+            deny_roots: vec![],
+        };
+        assert!(apply_landlock(&filesystem, &[], &[]).unwrap().fs_confined());
+        assert!(apply_seccomp().unwrap());
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        assert_eq!(
+            unsafe { libc::ioctl(fd, libc::FIOCLEX, std::ptr::null::<libc::c_void>()) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC
+        );
+        assert_eq!(
+            unsafe { libc::ioctl(fd, libc::FIONCLEX, std::ptr::null::<libc::c_void>()) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        let mask = unsafe { libc::syscall(libc::SYS_umask, 0o027) };
+        assert!((0..=0o777).contains(&mask));
+        assert_eq!(unsafe { libc::syscall(libc::SYS_umask, mask) }, 0o027);
+        std::fs::rename(writable.join("source"), writable.join("renamed")).unwrap();
+        std::fs::remove_file(writable.join("renamed")).unwrap();
+        std::fs::remove_dir(writable.join("empty")).unwrap();
+        for source in [readonly.join("source"), outside.join("source")] {
+            assert!(std::fs::remove_file(&source).is_err());
+            assert!(std::fs::rename(&source, writable.join("escaped")).is_err());
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        assert!(std::fs::set_permissions(
+            outside.join("source"),
+            std::fs::Permissions::from_mode(0o777)
+        )
+        .is_err());
+        for syscall in [
+            libc::SYS_socket,
+            libc::SYS_io_uring_setup,
+            libc::SYS_setsid,
+            libc::SYS_unshare,
+        ] {
+            assert_eq!(unsafe { libc::syscall(syscall, 0, 0, 0, 0, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn runtime_file_topology_remains_confined_to_writable_roots() {
+        if !landlock_probe().usable {
+            // The separate native artifact qualification lane requires Landlock;
+            // portable builds retain their explicit unsupported-host refusal.
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        for name in ["writable", "readonly", "outside"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+            std::fs::write(root.path().join(name).join("source"), b"captured").unwrap();
+        }
+        std::fs::create_dir(root.path().join("writable/empty")).unwrap();
+        let outside = root.path().join("outside/source");
+        use std::os::unix::fs::PermissionsExt as _;
+        let outside_mode = std::fs::metadata(&outside).unwrap().permissions().mode();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "capsule::linux::tests::runtime_file_topology_subprocess",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TIRITH_RUNTIME_FILE_TOPOLOGY_FIXTURE", root.path())
+            .output()
+            .expect("run isolated file-topology fixture");
+        assert!(
+            output.status.success(),
+            "file topology fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("readonly/source")).unwrap(),
+            b"captured"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"captured");
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode(),
+            outside_mode
+        );
+        assert!(std::fs::read_dir(root.path().join("writable"))
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

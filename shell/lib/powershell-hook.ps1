@@ -13,11 +13,59 @@ if ($global:_TIRITH_PS_LOADED) {
         return  # Set in this session - genuine double-source guard
     }
 }
-$global:_TIRITH_PS_LOADED = $true
+$global:_TIRITH_PS_LOADED = $false
 
 # A fresh load must not retain an inherited or failed integration label.
 $env:TIRITH_INTEGRATION_VERSION = $null
 $env:TIRITH_INTEGRATION_SHELL = $null
+
+# UserInteractive describes the process desktop, not PowerShell's invocation:
+# it is true even for `pwsh -NonInteractive -Command ...` on supported hosts.
+# Check the native terminal and only startup options before any script payload.
+# Unknown host forms remain inactive until explicitly supported.
+$global:TIRITH_STATUS = 'off'
+$_tirithInteractive = & {
+    param([string[]]$InvocationArgs)
+    try {
+        if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { return $false }
+    } catch { return $false }
+    $noExit = $false
+    for ($i = 1; $i -lt $InvocationArgs.Length; $i++) {
+        $argument = $InvocationArgs[$i]
+        if ($argument.Length -gt 256) { return $false }
+        if (-not ($argument.StartsWith('-') -or $argument.StartsWith('/'))) { return $noExit }
+        $option = $argument.TrimStart('-', '/').ToLowerInvariant()
+        if ($option.Length -ge 4 -and 'noninteractive'.StartsWith($option)) { return $false }
+        if ($option.Length -ge 3 -and 'noexit'.StartsWith($option)) { $noExit = $true; continue }
+        if ($option -eq 'f' -or ($option.Length -ge 2 -and 'file'.StartsWith($option))) {
+            # -File - with a terminal is documented as an ordinary session.
+            return ($noExit -or ($i + 1 -lt $InvocationArgs.Length -and $InvocationArgs[$i + 1] -eq '-'))
+        }
+        if ($option -in @('c', 'cwa', 'e', 'ec', 'enc') -or
+            ($option.Length -ge 2 -and 'command'.StartsWith($option)) -or
+            ($option.Length -ge 8 -and 'commandwithargs'.StartsWith($option)) -or
+            ($option.Length -ge 3 -and 'encodedcommand'.StartsWith($option))) { return $noExit }
+        if ($option -in @('l', 'i', 'sta', 'mta') -or
+            ($option.Length -ge 2 -and 'login'.StartsWith($option)) -or
+            ($option.Length -ge 3 -and 'interactive'.StartsWith($option)) -or
+            ($option.Length -ge 3 -and 'nologo'.StartsWith($option)) -or
+            ($option.Length -ge 3 -and 'noprofile'.StartsWith($option)) -or
+            ($option.Length -ge 10 -and 'noprofileloadtime'.StartsWith($option))) { continue }
+        if ($option -in @('ex', 'ep', 'if', 'of', 'wd') -or
+            ($option.Length -ge 3 -and 'executionpolicy'.StartsWith($option)) -or
+            ($option.Length -ge 3 -and 'inputformat'.StartsWith($option)) -or
+            ($option.Length -ge 3 -and 'outputformat'.StartsWith($option)) -or
+            ($option.Length -ge 2 -and 'workingdirectory'.StartsWith($option)) -or
+            ($option.Length -ge 2 -and 'windowstyle'.StartsWith($option))) {
+            $i++
+            if ($i -ge $InvocationArgs.Length) { return $false }
+            continue
+        }
+        return $false
+    }
+    return $true
+} ([Environment]::GetCommandLineArgs())
+if (-not $_tirithInteractive) { return }
 
 # Session tracking: generate ID per session if not inherited
 if (-not $env:TIRITH_SESSION_ID) {
@@ -33,14 +81,6 @@ if ((-not $env:TIRITH_SSH_REMOTE) -and ($env:SSH_CONNECTION -or $env:SSH_CLIENT 
     $env:TIRITH_SSH_REMOTE = '1'
 }
 
-# Interactivity gate: the hook only intercepts commands typed at a prompt and
-# pasted text, so it must be a complete no-op in a non-interactive PowerShell
-# (`pwsh -c …`, `pwsh -File …`, a CI step). `[Environment]::UserInteractive`
-# is false there. A non-interactive child must inherit nothing from tirith.
-if (-not [Environment]::UserInteractive) {
-    return
-}
-
 # Resolve the trusted executable once while the interactive hook is loaded.
 # Repository-local PATH changes made by a later command must not redirect the
 # security hook into an attacker-controlled `tirith` shim.
@@ -52,6 +92,19 @@ if ($null -eq $tirithCommand -or [string]::IsNullOrWhiteSpace($tirithCommand.Sou
     return
 }
 $global:_TIRITH_BIN = [System.IO.Path]::GetFullPath($tirithCommand.Source)
+
+# Check for PSReadLine
+$psrlModule = Get-Module PSReadLine -ErrorAction SilentlyContinue
+if (-not $psrlModule) {
+    Write-Host "tirith: PSReadLine not found, hooks disabled. Install PSReadLine for shell protection." -ForegroundColor Yellow
+    # TIRITH_STATUS: opt-in prompt indicator (see docs/prompt-status.md). With
+    # no PSReadLine, no key handler is installed and tirith intercepts nothing,
+    # so the live protection level is `off`. Set as a session-scoped
+    # `$global:` variable — deliberately NOT `$env:`, which would export it to
+    # child processes that have no tirith protection of their own.
+    $global:TIRITH_STATUS = 'off'
+    return
+}
 
 # M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
 # Start a background job that execs a hidden tirith subcommand; the child reads
@@ -68,19 +121,6 @@ try {
     } -ArgumentList $global:_TIRITH_BIN | Out-Null
 } catch {
     # Ignore — the snapshot is best-effort and must never break the shell.
-}
-
-# Check for PSReadLine
-$psrlModule = Get-Module PSReadLine -ErrorAction SilentlyContinue
-if (-not $psrlModule) {
-    Write-Host "tirith: PSReadLine not found, hooks disabled. Install PSReadLine for shell protection." -ForegroundColor Yellow
-    # TIRITH_STATUS: opt-in prompt indicator (see docs/prompt-status.md). With
-    # no PSReadLine, no key handler is installed and tirith intercepts nothing,
-    # so the live protection level is `off`. Set as a session-scoped
-    # `$global:` variable — deliberately NOT `$env:`, which would export it to
-    # child processes that have no tirith protection of their own.
-    $global:TIRITH_STATUS = 'off'
-    return
 }
 
 function global:_tirith_escape_preview {
@@ -210,7 +250,7 @@ function global:_tirith_parse_warn_ack {
 }
 
 # Override Enter key
-Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+Set-PSReadLineKeyHandler -Key Enter -ErrorAction Stop -ScriptBlock {
     $line = $null
     $cursor = $null
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
@@ -221,18 +261,42 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
         return
     }
 
-    # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
-    $errfile = [System.IO.Path]::GetTempFileName()
+    # Preserve the previous native result and never reuse it if invocation fails.
+    $errfile = $null
+    $approvalPath = $null
+    $rc = -1
+    $invocationFailed = $false
+    $prevExitCode = $global:LASTEXITCODE
     $prevHook = $env:_TIRITH_HOOK
-    $env:_TIRITH_HOOK = '1'
+    $prevNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+    $prevErrorPreference = $ErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+    $ErrorActionPreference = 'Continue'
     try {
+        $errfile = [System.IO.Path]::GetTempFileName()
+        $env:_TIRITH_HOOK = '1'
         $approvalPath = & $global:_TIRITH_BIN check --approval-check --non-interactive --interactive --shell powershell -- $line 2>$errfile
         $rc = $LASTEXITCODE
+    } catch {
+        $invocationFailed = $true
     } finally {
+        $global:LASTEXITCODE = $prevExitCode
+        $PSNativeCommandUseErrorActionPreference = $prevNativeErrorPreference
+        $ErrorActionPreference = $prevErrorPreference
         if ($null -eq $prevHook) { Remove-Item Env:\_TIRITH_HOOK -ErrorAction SilentlyContinue } else { $env:_TIRITH_HOOK = $prevHook }
     }
-    $output = Get-Content $errfile -Raw -ErrorAction SilentlyContinue
-    Remove-Item $errfile -Force -ErrorAction SilentlyContinue
+    $output = ''
+    if ($null -ne $errfile) {
+        $output = Get-Content $errfile -Raw -ErrorAction SilentlyContinue
+        Remove-Item $errfile -Force -ErrorAction SilentlyContinue
+    }
+    if ($invocationFailed) {
+        $global:TIRITH_STATUS = 'degraded'
+        Write-Host 'tirith: checker or temporary storage unavailable; command was not run. Restore the checker/storage and retry.' -ForegroundColor Yellow
+        [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+        return
+    }
+    if ($rc -in @(0, 1, 2, 3)) { $global:TIRITH_STATUS = 'blocks' }
 
     # Exit code 3 (WarnAck): stdout has two lines — approval path + warn-ack path.
     $warnAckPath = ""
@@ -256,7 +320,9 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
         Write-Host "command> $(_tirith_escape_preview $line)"
         if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
     } else {
-        # Unexpected rc: warn + execute (fail-open to avoid terminal breakage)
+        # Preserve this surface's existing unexpected-exit fallback, and make
+        # the reduced protection visible until a subsequent check succeeds.
+        $global:TIRITH_STATUS = 'degraded'
         if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
         Write-Host "tirith: unexpected exit code $rc - running unprotected"
         if (-not [string]::IsNullOrWhiteSpace($approvalPath)) {
@@ -338,26 +404,48 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
 }
 
 # Override Ctrl+V for paste interception
-Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
+Set-PSReadLineKeyHandler -Key Ctrl+v -ErrorAction Stop -ScriptBlock {
     # Get clipboard content
-    $pasted = Get-Clipboard -ErrorAction SilentlyContinue
+    $pasted = Get-Clipboard -Raw -ErrorAction SilentlyContinue
 
     if ([string]::IsNullOrEmpty($pasted)) {
         return
     }
 
-    # Check with tirith paste, use temp file to prevent output leakage
-    $tmpfile = [System.IO.Path]::GetTempFileName()
+    # Capture failures without leaving a stale blocking or native-exit claim.
+    $tmpfile = $null
+    $rc = -1
+    $invocationFailed = $false
+    $prevExitCode = $global:LASTEXITCODE
     $prevHook = $env:_TIRITH_HOOK
-    $env:_TIRITH_HOOK = '1'
+    $prevNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+    $prevErrorPreference = $ErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+    $ErrorActionPreference = 'Continue'
     try {
+        $tmpfile = [System.IO.Path]::GetTempFileName()
+        $env:_TIRITH_HOOK = '1'
         $pasted | & $global:_TIRITH_BIN paste --shell powershell --interactive > $tmpfile 2>&1
         $rc = $LASTEXITCODE
+    } catch {
+        $invocationFailed = $true
     } finally {
+        $global:LASTEXITCODE = $prevExitCode
+        $PSNativeCommandUseErrorActionPreference = $prevNativeErrorPreference
+        $ErrorActionPreference = $prevErrorPreference
         if ($null -eq $prevHook) { Remove-Item Env:\_TIRITH_HOOK -ErrorAction SilentlyContinue } else { $env:_TIRITH_HOOK = $prevHook }
     }
-    $output = Get-Content $tmpfile -Raw -ErrorAction SilentlyContinue
-    Remove-Item $tmpfile -Force -ErrorAction SilentlyContinue
+    $output = ''
+    if ($null -ne $tmpfile) {
+        $output = Get-Content $tmpfile -Raw -ErrorAction SilentlyContinue
+        Remove-Item $tmpfile -Force -ErrorAction SilentlyContinue
+    }
+    if ($invocationFailed) {
+        $global:TIRITH_STATUS = 'degraded'
+        Write-Host 'tirith: checker or temporary storage unavailable; paste was not inserted. Restore the checker/storage and retry.' -ForegroundColor Yellow
+        return
+    }
+    if ($rc -in @(0, 1, 2)) { $global:TIRITH_STATUS = 'blocks' }
 
     if ($rc -eq 0) {
         # Allow: fall through to insert
@@ -368,7 +456,10 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
         # Block or unexpected: discard paste
         Write-Host "paste> $(_tirith_escape_preview $pasted)"
         if (-not [string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
-        if ($rc -ne 1) { Write-Host "tirith: unexpected exit code $rc - paste blocked for safety" }
+        if ($rc -ne 1) {
+            $global:TIRITH_STATUS = 'degraded'
+            Write-Host "tirith: unexpected exit code $rc - paste blocked for safety"
+        }
         return
     }
 
@@ -380,7 +471,8 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
 # docs/prompt-status.md). tirith prints NOTHING per-prompt — it only sets the
 # variable; wiring it into a prompt is opt-in. The PowerShell hook overrides
 # the Enter key handler, which can revert a blocked command, so its protection
-# level is `blocks`; there is no runtime-degrade path.
+# level is `blocks` after loading or a successful check. Invocation/storage
+# failures and unexpected checker exits report `degraded` until recovery.
 #
 # Set as a session-scoped `$global:` variable, deliberately NOT `$env:`: a
 # `prompt` function runs in THIS interactive session and reads a `$global:`
@@ -388,6 +480,7 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
 # process — and a non-interactive child has no tirith protection, so an
 # inherited status would misrepresent it. The hook above already returned
 # early for a non-interactive session, so this only runs interactively.
+$global:_TIRITH_PS_LOADED = $true
 $global:TIRITH_STATUS = 'blocks'
 
 # Report loaded code only after this fresh initialization reaches installation.

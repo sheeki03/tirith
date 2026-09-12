@@ -250,11 +250,26 @@ impl NpmInspection {
 /// caller should open one regular, no-follow handle and pass that same handle;
 /// it must not compute an identity with a second path read. Reads at most the
 /// compressed cap plus one byte, even for a non-terminating reader.
-pub fn read_npm_tarball<R: Read>(
+pub fn read_npm_tarball<R: Read>(reader: R, filename: &str, limits: &NpmLimits) -> NpmInspection {
+    read_npm_tarball_impl(reader, filename, limits, false).0
+}
+
+/// Private install-preparation seam. Complete root metadata is returned only
+/// alongside the inspection derived from the same bounded, validated stream.
+pub(crate) fn read_npm_tarball_with_manifest<R: Read>(
+    reader: R,
+    filename: &str,
+    limits: &NpmLimits,
+) -> (NpmInspection, Option<Vec<u8>>) {
+    read_npm_tarball_impl(reader, filename, limits, true)
+}
+
+fn read_npm_tarball_impl<R: Read>(
     mut reader: R,
     filename: &str,
     limits: &NpmLimits,
-) -> NpmInspection {
+    capture_manifest: bool,
+) -> (NpmInspection, Option<Vec<u8>>) {
     let limits = limits.bounded();
     let mut inspection = NpmInspection {
         schema_version: NPM_INSPECTION_SCHEMA_VERSION,
@@ -291,7 +306,7 @@ pub fn read_npm_tarball<R: Read>(
                 None,
                 "Compressed input exceeds the configured limit; exact identity is unavailable.",
             ));
-            return inspection;
+            return (inspection, None);
         }
         Err(_) => {
             inspection.refuse(problem(
@@ -299,7 +314,7 @@ pub fn read_npm_tarball<R: Read>(
                 None,
                 "The complete input could not be read; exact identity is unavailable.",
             ));
-            return inspection;
+            return (inspection, None);
         }
     };
     inspection.artifact.sha256 = Some(hex::encode(Sha256::digest(&compressed)));
@@ -322,7 +337,7 @@ pub fn read_npm_tarball<R: Read>(
                 )
             };
             inspection.refuse(problem(kind, None, message));
-            return inspection;
+            return (inspection, None);
         }
         Err(_) => {
             inspection.refuse(problem(
@@ -330,7 +345,7 @@ pub fn read_npm_tarball<R: Read>(
                 None,
                 "Invalid or truncated gzip stream, including its checksum trailer.",
             ));
-            return inspection;
+            return (inspection, None);
         }
     };
     if !decoder.into_inner().is_empty() {
@@ -339,13 +354,13 @@ pub fn read_npm_tarball<R: Read>(
             None,
             "Concatenated gzip members and trailing compressed data are unsupported.",
         ));
-        return inspection;
+        return (inspection, None);
     }
     let members = match parse_tar(&decoded, &limits) {
         Ok(members) => members,
         Err(issue) => {
             inspection.refuse(issue);
-            return inspection;
+            return (inspection, None);
         }
     };
     inspection.archive_state = NpmArchiveState::Accepted;
@@ -362,7 +377,18 @@ pub fn read_npm_tarball<R: Read>(
         })
         .collect();
     signals::inspect_members(&members, &mut inspection);
-    inspection
+    // This private capture comes from the exact already-validated member walk.
+    // It is withheld whenever root metadata is absent, invalid or over budget.
+    // Public inspection reports never carry these raw manifest bytes.
+    let manifest = (capture_manifest && inspection.coverage.metadata_complete).then(|| {
+        members
+            .iter()
+            .find(|member| member.path == "package/package.json")
+            .expect("complete metadata requires the unique root member")
+            .bytes
+            .to_vec()
+    });
+    (inspection, manifest)
 }
 
 fn read_capped(reader: &mut impl Read, cap: usize) -> io::Result<Option<Vec<u8>>> {

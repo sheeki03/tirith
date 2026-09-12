@@ -52,7 +52,16 @@ fn both_inspection_routes_and_release_diff_share_exact_artifact_identity() {
     let renamed = fixture(&state.roots().cwd, "renamed.tar.gz");
     let compared = report(&run(
         &state,
-        &["pkg", "diff", &path, &renamed, "--format", "json"],
+        &[
+            "pkg",
+            "diff",
+            &path,
+            &renamed,
+            "--ecosystem",
+            "npm",
+            "--format",
+            "json",
+        ],
     ));
     assert_eq!(compared["kind"], "npm_comparison");
     assert_eq!(compared["same_artifact"], true);
@@ -86,4 +95,71 @@ fn sarif_and_usage_errors_keep_canonical_metadata_under_broad_dlp() {
     let error = report(&mixed);
     assert_eq!(error["kind"], "npm_artifact_error");
     assert_eq!(error["status"], "unavailable");
+}
+
+#[test]
+fn ambiguous_tar_gz_preserves_python_contract_unless_npm_is_explicit() {
+    let state = GlobalStateGuard::new().unwrap();
+    let path = fixture(&state.roots().cwd, "package-1.0.0.tar.gz");
+    for args in [
+        vec!["pkg", "inspect", &path, "--json"],
+        vec!["package", "inspect", "--artifact", &path, "--json"],
+    ] {
+        let output = run(&state, &args);
+        assert_eq!(output.status.code(), Some(1));
+        let refused: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(refused["action"], "block");
+        assert!(refused["coverage_gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["kind"] == "unsupported"));
+        assert!(refused["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["rule_id"] == "analysis_incomplete"));
+    }
+    let selected = report(&run(
+        &state,
+        &["pkg", "inspect", &path, "--ecosystem", "npm", "--json"],
+    ));
+    let alias = report(&run(
+        &state,
+        &[
+            "package",
+            "inspect",
+            "--artifact",
+            &path,
+            "--ecosystem",
+            "npm",
+            "--json",
+        ],
+    ));
+    assert_eq!(selected, alias);
+    assert_eq!(selected["kind"], "npm_inspection");
+    assert_eq!(selected["artifacts"][0]["artifact"]["sha256"], SHA);
+    let tgz = fixture(&state.roots().cwd, "package-1.0.0.tgz");
+    let python = run(
+        &state,
+        &["pkg", "inspect", &tgz, "--ecosystem", "python", "--json"],
+    );
+    assert_eq!(python.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&python.stdout).unwrap()["action"],
+        "block"
+    );
+    let invalid = run(
+        &state,
+        &[
+            "package",
+            "inspect",
+            "--installed",
+            ".",
+            "--ecosystem",
+            "npm",
+        ],
+    );
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(!state.roots().cwd.join("node_modules").exists());
 }

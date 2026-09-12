@@ -480,3 +480,170 @@ native CI run must do so. Linux private-input namespace corrections have separat
 primitive evidence, while the actual wheel pipeline remains under qualification.
 The update dry-run side effect found during the lifecycle audit is a separate
 pending correction and is not included in this executable.
+
+### Receipt, npm staging and combined agent setup candidate
+
+Retained macOS ARM development binary
+`f703dad659d12899330f6c214ded5363f45dc6381d13afe5245fbe8190752f2e`
+was built from `npm-receipt-claude-inputs-v2` on `24be3f28`. Its manifest pins
+the CLI and fourteen test executables. The linked build completed in 14 minutes
+44 seconds without warnings. Registered npm staging, runtime-pack models,
+checkpoint extraction and schema-3 npm receipt types are included; npm execution
+qualification still refuses installation.
+
+The complete core unit suite passed **5,931 tests**, with two existing ignores.
+The complete CLI unit suite passed **1,925 tests**, with two existing ignores.
+Eleven selected integration targets passed **258 tests**, including frozen
+contracts, freshly private saved receipts, explicit npm ecosystem routing,
+tuning, profiles, rollout, feedback, dashboard transport, shell helpers and help.
+The separate 502-case CLI integration executable recorded **498 passes, three
+failures and one existing ignore**. The failures were the generated capability
+table, an inherited-status assertion that expected a verified-looking prompt,
+and a receipt error-message compatibility substring. The table was regenerated
+with this exact compiled renderer and its isolated check passed. The other two
+corrections require the next linked candidate. Earlier failures remain retained.
+
+Real recommended setup, followed by actual host dispatch, passed all nine
+configured-hook and explicit boundary cases on this binary. Every case used
+the installed command and default user settings; there was no replacement of
+the candidate command after setup. Allowed commands executed once; policy
+blocks, missing interpreter/checker, hook crash and checker deadline cases
+executed no marker. The three controls demonstrate limitations: disabled hooks,
+a shorter host timeout and an unmatched tool each executed once. The deadline
+case observed exactly one actual check start. A separate real MCP-only run
+reported the candidate server connected while the policy-denied Bash marker
+still executed once, confirming that tool availability alone is not interception.
+These are named native host controls, not a beginner pilot or release certificate.
+
+The first combined run exceeded its 120-second setup deadline under concurrent
+test load. That failure is retained separately. A diagnostic allowed case with
+a longer bound completed setup in 45.86 seconds, and the subsequent complete
+nine-case run passed using the original bound. Profiling found full executable
+rehashing at every shell mutation callback. A later correction retains native
+input handles during each operation and rehashes when an operation resumes;
+its whole-setup performance and integrated regressions require a new build.
+
+The lifecycle dry-run regression passed with logging both enabled and disabled:
+the fixture's files and directories were unchanged. PowerShell 7.6.6 native
+testing against this binary and a separately pinned corrected hook passed 22
+cases across redirected processes, real-terminal noninteractive invocations,
+Enter and paste handling, missing checker/storage, unexpected checker exits,
+recovery and exact multiline text. This is hook-source qualification on Unix,
+not proof of a Windows terminal or a final packaged hook. A quick-exit Darwin
+PTY cleanup failure was retained and fixed in the repeatable runner.
+
+The Windows CI runner now inventories the actual compiled workspace harnesses
+and runs the dashboard's nine tests under a disposable real standard account.
+Its parser, inventory, result and process-bound contracts passed 26 local
+checks. Native Windows logon, token, job, ACL and account cleanup remain unrun
+until the next Windows job. Product refusal to start an elevated dashboard and
+protected storage ACL checks are preserved.
+
+### Retained shell input and packaged PowerShell candidate
+
+Development binary `39f6acc9929cdb53fcd0f9a0b4d82187aadf8e6b50af54058085d40812e09d3a`
+and nine linked test executables are retained under `retained-inputs-native-v3`.
+The source capture is `retained-inputs-powershell-inputs-v3` on `24be3f28`; all
+captured Rust and embedded asset hashes matched after linking. Strict workspace
+Clippy with all targets and warnings denied passed on those sources.
+
+All **445 selected tests passed**, with one existing ignore: 133 CLI unit tests,
+274 core unit tests, five core compatibility contracts, four CLI compatibility
+contracts, three receipt privacy cases, six shell helpers, eight profile lifecycle
+cases, nine real dashboard API cases and the three corrected CLI integration
+failures from the preceding candidate. The core selection's nested subprocess
+results are not counted again. These tests include retained native input handles,
+changed paths/content/permissions, resume rehashing, exact lease/precondition
+binding and owned undo after an executable change.
+
+The exact binary passed all eighteen complete embedded-browser workflows and
+five separate delayed-response cases without a source-asset override. The
+PowerShell hook materialized by this binary matched the reviewed hook digest
+`9a8e1ef63e8d4a83618ffdda33ed3932037c30bc0d9300466059b1f53a14a35e`;
+all 22 native Unix PowerShell 7.6.6 cases passed using those extracted bytes.
+Native Windows terminal behavior remains separate.
+
+The repeatable actual-host runner passed all nine recommended-setup cases, the
+MCP-only boundary and retained-host reload observation on the same binary. It
+used the native macOS ARM host 2.1.268 and normal isolated user settings. Complete
+setup operations took 6.933–24.918 seconds under the unchanged 120-second bound;
+these measurements include process cleanup and are not release performance
+budgets or a controlled before/after comparison. Every requested setup step
+completed and every executable, interpreter, alias and harness postcheck matched.
+In the reload case, the next turn 0.003 seconds after publication omitted the
+hook and executed once. The same host blocked after a policy recheck, 2.107
+seconds after publication; a fresh host also blocked. This does not establish
+immediate or universal hot reload. The evidence manifest is
+`claude-repeatable-native-v3`, digest
+`a4efd68cd64b22467fafe6a721523fd6ac12c337378136b97c16a95af8da6edd`.
+
+The repeatable mixed-audit runner passed six native cases against the signed
+official macOS 0.4.2 baseline: signed and unsigned sequential rotation, two mixed
+concurrent-writer bursts, and an actual legacy descriptor held across completed
+rotation. The rotator was paused only after observed lock ownership, the old
+writer's open log descriptor was observed before truncation, and the unchanged
+rotator resumed. Active inode identity remained stable, retained archive bytes
+matched exactly, and both clients verified the archived and active chains. Undo
+after later appends and rotation without the signing key refused without changing
+the active log. Public fixture signing keys were removed after each case.
+The runner and its 20 process/format/cleanup fixtures are registered under
+`tools/qualification`; fixture results do not substitute for native client tests.
+
+Subsequent public receipt-reader consolidation and private-input execution
+qualification refusal have independent source review. A native package-backend
+investigation invalidated the assumption
+that read-only private mounts establish complete input-lifetime protection
+against another same-user process. The experimental metadata/uv extensions are
+not registered. Package execution is restricted at public and hidden
+launch boundaries; ordinary capsules and static inspection retain separate
+capability requirements. No earlier package primitive result qualifies this
+unresolved boundary.
+
+### Public receipt APIs and package qualification refusal
+
+Development binary
+`1a72833d6d2f8b3dffa13a57259c3b73c8856cc96661bf2937ceab89b0a6a936`
+and seven linked test executables are retained under
+`receipt-qualification-native-v4`, with source capture
+`receipt-qualification-inputs-v4`. Strict workspace/all-target Clippy passed.
+The captured core source hashes matched after linking; CLI sources matched
+when its executables were retained, before the subsequent help-copy changes.
+
+All **349 selected tests passed**, with one existing ignore: 253 core receipt
+tests, 72 CLI package/checkpoint/receipt tests, twelve public package/inspection
+and hidden-launch integration cases, five core compatibility contracts, four
+CLI compatibility contracts and three receipt privacy cases. Nested subprocess
+results are not counted again. Direct public Rust readers now share record,
+inventory and cache bounds and requested identity checks; tests include wrong
+embedded IDs, oversized records/inventories, symbolic links, mixed historical
+schemas and cached-byte changes. Inspection remains separate from signature or
+content verification and publication authority.
+
+Valid public package-install requests refuse before resolver/network,
+quarantine, checkpoint and execution effects in both supported output formats.
+Private hidden launcher operands also refuse. Opt-in flags and administrator
+access do not bypass qualification; ordinary capsule parsing and static artifact
+inspection retain their own contracts. The focused refusal is also proposed
+against current main in [PR 254](https://github.com/sheeki03/tirith/pull/254).
+The cycle candidate results do not certify that separate branch.
+
+The Windows runner now creates current-account children suspended, assigns them
+to an owned kill-on-close Job, and resumes only after assignment. Both success
+and expected-refusal results require confirmed leader reaping, an empty Job,
+complete output drainage and no process/cleanup errors or descendant leak.
+Independent review and 45 portable parser/process contracts passed, including
+nineteen cleanup-result regressions. Native Windows process, token, handle-list,
+logon, ACL and account cleanup behavior still requires the platform CI run.
+
+The subsequent help-only CLI candidate
+`7823f71e6a2523163241a49e47daf37a7cc44e1336a08e0bb87002f419822ad4`
+retains source capture `help-claims-inputs-v5`; all captured Rust and embedded
+asset hashes matched after linking. The complete help suite and selected public
+package refusal, hidden launcher and static inspection integration checks passed.
+No package execution path was enabled by the help/documentation corrections.
+
+A repeat of the six native mixed-audit cases on candidate `1a72833` passed five;
+the unsigned held-writer case failed when its native descriptor observer exceeded
+the unchanged three-second deadline during compilation load. That failed report
+is retained separately from subsequent runs. Observation timeout does not count
+as a completed descriptor-crossing proof.

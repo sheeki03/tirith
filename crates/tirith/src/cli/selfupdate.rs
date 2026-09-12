@@ -122,18 +122,55 @@ fn self_boundary_envelope(
     })
 }
 
+/// Only a read-only CLI dry run may suppress durable task-boundary recording.
+/// The decision, permit consumption and retained effect checks are identical.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelfAuthorizationAudit {
+    Record,
+    Preview,
+}
+
 fn prepare_self_authorization<B: tirith_core::task_boundary::BoundaryMarker>(
     envelope: tirith_core::task::TaskEnvelopeInput,
     effects: BTreeSet<tirith_core::effects::CommandEffectKind>,
 ) -> Result<RetainedSelfAuthorization<B>, String> {
+    prepare_self_authorization_with_audit::<B>(envelope, effects, SelfAuthorizationAudit::Record)
+}
+
+fn prepare_self_authorization_with_audit<B: tirith_core::task_boundary::BoundaryMarker>(
+    envelope: tirith_core::task::TaskEnvelopeInput,
+    effects: BTreeSet<tirith_core::effects::CommandEffectKind>,
+    audit: SelfAuthorizationAudit,
+) -> Result<RetainedSelfAuthorization<B>, String> {
     let policy = tirith_core::policy::Policy::discover_local_only(None);
-    prepare_self_authorization_with_policy::<B>(envelope, effects, &policy.task_gate)
+    prepare_self_authorization_with_policy_and_audit::<B>(
+        envelope,
+        effects,
+        &policy.task_gate,
+        audit,
+    )
 }
 
 fn prepare_self_authorization_with_policy<B: tirith_core::task_boundary::BoundaryMarker>(
     envelope: tirith_core::task::TaskEnvelopeInput,
     effects: BTreeSet<tirith_core::effects::CommandEffectKind>,
     gate: &tirith_core::web3_policy::TaskGatePolicy,
+) -> Result<RetainedSelfAuthorization<B>, String> {
+    prepare_self_authorization_with_policy_and_audit::<B>(
+        envelope,
+        effects,
+        gate,
+        SelfAuthorizationAudit::Record,
+    )
+}
+
+fn prepare_self_authorization_with_policy_and_audit<
+    B: tirith_core::task_boundary::BoundaryMarker,
+>(
+    envelope: tirith_core::task::TaskEnvelopeInput,
+    effects: BTreeSet<tirith_core::effects::CommandEffectKind>,
+    gate: &tirith_core::web3_policy::TaskGatePolicy,
+    audit: SelfAuthorizationAudit,
 ) -> Result<RetainedSelfAuthorization<B>, String> {
     let operation = tirith_core::task_boundary::BoundaryOperation {
         boundary: B::BOUNDARY,
@@ -150,7 +187,7 @@ fn prepare_self_authorization_with_policy<B: tirith_core::task_boundary::Boundar
         Ok(pending) => Some(pending.assessment()),
         Err(error) => error.assessment(),
     };
-    if let Some(assessment) = assessment {
+    if let Some(assessment) = assessment.filter(|_| audit == SelfAuthorizationAudit::Record) {
         if let Err(error) = tirith_core::audit::log_task_boundary_assessment(assessment) {
             tirith_core::audit::audit_diagnostic(format!(
                 "self-integrity task-boundary audit append failed: {error}"
@@ -1362,39 +1399,45 @@ fn run_update(
         helper_present,
     );
     let effects = update_effects(updates_privileged_helper, dry_run);
-    let authorization =
-        match prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
-            match self_boundary_envelope(
-                "self-update",
-                serde_json::json!({
-                    "mode": "update",
-                    "release_selector": "latest",
-                    "current_version": current.to_string(),
-                    "target": target.clone(),
-                    "binary_path": binary_path.to_str(),
-                    "binary_preimage_sha256": expected_binary_sha.clone(),
-                    "rollback_preimage_sha256": expected_rollback_sha.clone(),
-                    "allow_unsigned": allow_unsigned,
-                    "updates_privileged_helper": updates_privileged_helper,
-                    "dry_run": dry_run,
-                    "release_origin": REPO,
-                }),
-                if dry_run { None } else { Some(&binary_path) },
-            ) {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    emit_update_error(json, &error);
-                    return 1;
-                }
-            },
-            effects,
+    let authorization = match prepare_self_authorization_with_audit::<
+        tirith_core::task_boundary::SelfUpdateBoundary,
+    >(
+        match self_boundary_envelope(
+            "self-update",
+            serde_json::json!({
+                "mode": "update",
+                "release_selector": "latest",
+                "current_version": current.to_string(),
+                "target": target.clone(),
+                "binary_path": binary_path.to_str(),
+                "binary_preimage_sha256": expected_binary_sha.clone(),
+                "rollback_preimage_sha256": expected_rollback_sha.clone(),
+                "allow_unsigned": allow_unsigned,
+                "updates_privileged_helper": updates_privileged_helper,
+                "dry_run": dry_run,
+                "release_origin": REPO,
+            }),
+            if dry_run { None } else { Some(&binary_path) },
         ) {
-            Ok(authorization) => authorization,
+            Ok(envelope) => envelope,
             Err(error) => {
                 emit_update_error(json, &error);
                 return 1;
             }
-        };
+        },
+        effects,
+        if dry_run {
+            SelfAuthorizationAudit::Preview
+        } else {
+            SelfAuthorizationAudit::Record
+        },
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            emit_update_error(json, &error);
+            return 1;
+        }
+    };
 
     // 1. Find the latest release version via the GitHub API.
     let latest = match fetch_latest_version(&authorization) {
@@ -4269,6 +4312,97 @@ mod tests {
         assert!(result.is_err());
         assert!(!destination.exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn preview_authorization_preserves_files_and_runtime_decisions_for_allow_and_deny() {
+        fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+            fn visit(
+                root: &Path,
+                path: &Path,
+                result: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+            ) {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    let kind = entry.file_type().unwrap();
+                    let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                    if kind.is_dir() {
+                        result.insert(relative, None);
+                        visit(root, &path, result);
+                    } else {
+                        assert!(kind.is_file(), "isolated fixture has a nonregular entry");
+                        result.insert(relative, Some(std::fs::read(&path).unwrap()));
+                    }
+                }
+            }
+            let mut result = std::collections::BTreeMap::new();
+            visit(root, root, &mut result);
+            result
+        }
+        for denied in [false, true] {
+            let mut environment = tirith_test_support::GlobalStateGuard::new().unwrap();
+            environment.set_env("TIRITH_LOG", "1");
+            environment.remove_env("TIRITH_SESSION_ID");
+            let gate = tirith_core::web3_policy::TaskGatePolicy {
+                mode: tirith_core::web3_policy::TaskGateMode::Enforce,
+                effects_denied_for_untrusted_sources: if denied {
+                    [tirith_core::effects::CommandEffectKind::NetworkEgress]
+                        .into_iter()
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                },
+                ..Default::default()
+            };
+            let envelope = self_boundary_envelope(
+                "self-update",
+                serde_json::json!({"mode":"update","dry_run":true}),
+                None,
+            )
+            .unwrap();
+            let effects = [tirith_core::effects::CommandEffectKind::NetworkEgress]
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let before = snapshot(&environment.roots().root);
+            let preview = prepare_self_authorization_with_policy_and_audit::<
+                tirith_core::task_boundary::SelfUpdateBoundary,
+            >(
+                envelope.clone(),
+                effects.clone(),
+                &gate,
+                SelfAuthorizationAudit::Preview,
+            );
+            assert_eq!(preview.is_err(), denied);
+            assert_eq!(
+                snapshot(&environment.roots().root),
+                before,
+                "preview must not create logs, sessions, source files or temporary state"
+            );
+            let preview_error = preview.as_ref().err().cloned();
+            if let Ok(mut authorization) = preview {
+                authorization.authorize_effect().unwrap();
+                authorization.envelope.sources[0]
+                    .content
+                    .push_str("changed");
+                assert!(
+                    authorization.authorize_effect().is_err(),
+                    "preview still consumes a permit bound to the exact effect"
+                );
+            }
+            let runtime = prepare_self_authorization_with_policy::<
+                tirith_core::task_boundary::SelfUpdateBoundary,
+            >(envelope, effects, &gate);
+            assert_eq!(runtime.is_err(), denied);
+            assert_eq!(runtime.as_ref().err().cloned(), preview_error);
+            if let Ok(authorization) = runtime {
+                authorization.authorize_effect().unwrap();
+            }
+            assert!(
+                tirith_core::audit::audit_log_path().unwrap().is_file(),
+                "ordinary runtime authorization must retain durable boundary recording"
+            );
+        }
     }
 
     #[test]

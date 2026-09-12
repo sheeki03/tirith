@@ -4,6 +4,15 @@ use std::fs;
 use std::process::{Command, Output};
 
 fn run_tune(record_count: usize, action: &str, json: bool) -> Output {
+    run_tune_with_recording(record_count, action, json, true)
+}
+
+fn run_tune_with_recording(
+    record_count: usize,
+    action: &str,
+    json: bool,
+    recording: bool,
+) -> Output {
     let root = tempfile::tempdir().expect("temporary environment");
     let data = root.path().join("data");
     fs::create_dir_all(data.join("tirith")).unwrap();
@@ -22,6 +31,11 @@ fn run_tune(record_count: usize, action: &str, json: bool) -> Output {
     let log = format!("{record}\n").repeat(record_count);
     fs::write(data.join("tirith/log.jsonl"), &log).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    for (key, _) in std::env::vars_os() {
+        if key == "TIRITH" || key.to_string_lossy().starts_with("TIRITH_") {
+            command.env_remove(key);
+        }
+    }
     command
         .current_dir(root.path())
         .env("HOME", root.path())
@@ -32,21 +46,11 @@ fn run_tune(record_count: usize, action: &str, json: bool) -> Output {
         .env("XDG_CACHE_HOME", root.path().join("cache"))
         .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
         .env("APPDATA", &data)
-        .env("LOCALAPPDATA", root.path().join("localappdata"))
-        .env("TIRITH_LOG", "0")
+        .env("LOCALAPPDATA", &data)
+        .env("TIRITH_LOG", if recording { "1" } else { "0" })
+        .env("TIRITH_OFFLINE", "1")
         .env("NO_COLOR", "1")
         .args(["policy", "tune", "--from-audit"]);
-    for key in [
-        "TIRITH",
-        "TIRITH_POLICY_ROOT",
-        "TIRITH_SERVER_URL",
-        "TIRITH_API_KEY",
-        "TIRITH_LICENSE",
-        "TIRITH_AUDIT_DEBUG",
-        "TIRITH_SESSION_ID",
-    ] {
-        command.env_remove(key);
-    }
     if json {
         command.args(["--format", "json"]);
     }
@@ -110,4 +114,16 @@ fn blocked_tuning_json_retains_the_existing_counts_and_suggestion_contract() {
     assert_eq!(value["rule_stats"][0]["rule_id"], "curl_pipe_shell");
     assert_eq!(value["rule_stats"][0]["blocked"], 25);
     assert_eq!(value["rule_stats"][0]["total"], 25);
+}
+
+#[test]
+fn explicitly_disabled_history_is_uninspected_and_never_suggests_a_relaxation() {
+    let output = run_tune_with_recording(25, "Allow", true, false);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["availability"], "disabled");
+    assert_eq!(value["records_analyzed"], 0);
+    assert_eq!(value["coverage"]["inspected_bytes"], 0);
+    assert_eq!(value["suggestions"], serde_json::json!([]));
+    assert_eq!(value["examples"], serde_json::json!([]));
+    assert_eq!(value["policy_changed"], false);
 }

@@ -11,7 +11,7 @@ use tirith_core::protection_profiles::ProtectionProfile;
 pub(crate) enum SetupScope {
     User,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum SelectedAgent {
     ClaudeCode,
@@ -60,8 +60,17 @@ pub(crate) fn prepare(
             return result(status, None, cwd.as_deref());
         }
     }
-    if !request.agents.is_empty() {
-        return Err("selected agent hosts do not yet have native installed-candidate certification for recommended automatic setup; use each explicit `tirith setup <host>` workflow and verify its actual host before requesting this combined plan".into());
+    if request
+        .agents
+        .iter()
+        .any(|agent| *agent != SelectedAgent::ClaudeCode)
+    {
+        return Err("selected agent hosts lack current combined-setup certification; preserve their explicit setup workflow".into());
+    }
+    if request.agents.len() > 1 {
+        return Err(
+            "duplicate agent selections are ambiguous; select each supported host once".into(),
+        );
     }
     let shell = if let Some(shell) = request.shell {
         shell
@@ -92,6 +101,21 @@ pub(crate) fn prepare(
     if profile.snapshot.private_replay_guard() != shell.snapshot.private_replay_guard() {
         return Err("policy or operator context changed while capturing recommended setup; refresh the plan".into());
     }
+    let agent = if request.agents.is_empty() {
+        None
+    } else {
+        Some(super::claude_service::PreparedClaude::capture(
+            cwd.as_deref(),
+        )?)
+    };
+    if agent.as_ref().is_some_and(|agent| {
+        agent.snapshot.private_replay_guard() != profile.snapshot.private_replay_guard()
+    }) {
+        return Err(
+            "policy or operator context changed while capturing agent setup; refresh the plan"
+                .into(),
+        );
+    }
     profile
         .snapshot
         .revalidate_for_mutation()
@@ -108,9 +132,21 @@ pub(crate) fn prepare(
             return Err("recommended setup targets overlap".into());
         }
     }
+    let agent_precondition = if let Some(agent) = &agent {
+        let (agent_changes, agent_expected, precondition) = agent.setup_parts()?;
+        changes.extend(agent_changes);
+        for (path, bytes) in agent_expected {
+            if expected.insert(path, bytes).is_some() {
+                return Err("recommended setup targets overlap".into());
+            }
+        }
+        Some(precondition)
+    } else {
+        None
+    };
     let preview = serde_json::json!({"schema_version":1,"kind":"recommended_setup_preview",
         "scope":"user","profile":profile.projection(),"shell":shell.projection(),
-        "selected_agents":request.agents,"step_count":changes.len(),"applied":false,
+        "selected_agents":request.agents,"agent":agent.as_ref().map(|agent| agent.projection()),"step_count":changes.len(),"applied":false,
         "activation_required":true,"current_shell_verified":false,
         "next_action":"Open a fresh terminal and run the current-shell verification handshake after loading the configured integration."});
     if dry_run {
@@ -124,16 +160,18 @@ pub(crate) fn prepare(
             &intent,
         )?
     } else {
-        service.plan_shell_change_with_intent(
+        service.plan_integrations_with_intent(
             id,
-            OperationKind::RecommendedSetup,
             super::change_plan::PlanChanges {
                 requests: changes,
                 preimages: &expected,
             },
             &profile.snapshot,
             &intent,
-            precondition,
+            super::change_plan::IntegrationPreconditions {
+                shell: Some(precondition),
+                agent: agent_precondition,
+            },
         )?
     };
     result(status, Some(preview), cwd.as_deref())

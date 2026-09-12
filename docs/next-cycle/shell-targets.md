@@ -58,3 +58,18 @@ Nushell paths, separate Windows PowerShell variants and redirected Documents,
 unsupported shells, inherited environment, stale/changed identities, expired and
 future observations, and cross-surface evidence. Native Windows execution must
 still run on Windows CI; Unix fixtures are not Windows certification.
+
+The PowerShell hook checks actual terminal availability and startup options
+before installing PSReadLine handlers or starting background snapshots.
+Noninteractive invocations remain off, including a command or file payload that
+contains the text `-NoExit`. Missing checker or temporary storage leaves Enter
+unexecuted and paste uninserted, with degraded status until a successful check.
+Unexpected Enter exit codes preserve the existing unprotected fallback and
+report it explicitly; unexpected paste exits refuse insertion. Clipboard input
+uses one raw string so multiline content is checked and inserted intact.
+
+`scripts/certify-powershell-hook.py` records executable, hook and harness hashes
+in disposable environments. Its full mode uses native POSIX terminals; the
+Windows CI lane explicitly selects noninteractive-only. Neither lane certifies
+an untested platform, version or current user session. See the retained candidate
+results and limits in [verification](verification.md).

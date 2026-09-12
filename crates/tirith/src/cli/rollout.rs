@@ -382,21 +382,7 @@ fn run(json_output: bool, action: impl FnOnce(&RolloutService) -> Result<Value, 
                         .unwrap_or("unknown")
                 );
             }
-            if matches!(
-                value["operation"]["state"].as_str(),
-                Some(
-                    "planned"
-                        | "completed"
-                        | "completed_with_recovery"
-                        | "undone"
-                        | "undone_with_recovery"
-                        | "cancelled"
-                )
-            ) {
-                0
-            } else {
-                1
-            }
+            operation_exit(&value["operation"]["state"])
         }
         Err(error) => {
             let patterns =
@@ -416,10 +402,63 @@ fn run(json_output: bool, action: impl FnOnce(&RolloutService) -> Result<Value, 
     }
 }
 
+fn operation_exit(value: &serde_json::Value) -> i32 {
+    use super::setup::change_plan::JobState;
+    match serde_json::from_value::<JobState>(value.clone()) {
+        Ok(
+            JobState::Planned
+            | JobState::Completed
+            | JobState::CompletedWithRecovery
+            | JobState::Undone
+            | JobState::UndoneWithRecovery
+            | JobState::Cancelled,
+        ) => 0,
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::setup::change_plan::{JobState, OperationStatus, StepState, StepStatus};
     use super::*;
+
+    #[test]
+    fn operation_exit_preserves_completed_recovery_and_refuses_unfinished_states() {
+        for state in [
+            JobState::Planned,
+            JobState::Completed,
+            JobState::CompletedWithRecovery,
+            JobState::Undone,
+            JobState::UndoneWithRecovery,
+            JobState::Cancelled,
+        ] {
+            assert_eq!(
+                operation_exit(&serde_json::to_value(state).unwrap()),
+                0,
+                "{state:?}"
+            );
+        }
+        for state in [
+            JobState::Running,
+            JobState::CancelRequested,
+            JobState::PartiallyApplied,
+            JobState::RefreshRequired,
+            JobState::RecoveryRequired,
+        ] {
+            assert_eq!(
+                operation_exit(&serde_json::to_value(state).unwrap()),
+                1,
+                "{state:?}"
+            );
+        }
+        for value in [
+            serde_json::Value::Null,
+            json!("unknown"),
+            json!("completed_with_recovery"),
+        ] {
+            assert_eq!(operation_exit(&value), 1);
+        }
+    }
 
     #[test]
     fn composite_projection_stays_bounded_without_erasing_saved_operation_identity() {

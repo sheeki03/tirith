@@ -59,8 +59,8 @@ const ONBOARD_SCHEMA_VERSION: u32 = 1;
 
 /// The detection report `onboard` builds and (optionally) serializes to JSON.
 /// Naming/casing mirror the other `--json` surfaces. `recommended_template`
-/// remains a recommendation label; `recommended_profile` distinguishes a
-/// personal profile from an explicitly selected legacy policy template.
+/// remains an accepted legacy template for schema-1 consumers. When present,
+/// `recommended_profile` is the primary versioned personal recommendation.
 #[derive(Debug, Clone, serde::Serialize)]
 struct OnboardReport {
     schema_version: u32,
@@ -171,6 +171,14 @@ fn gather_report(
     let recommended_profile_version = recommended_profile
         .as_ref()
         .map(|_| tirith_core::protection_profiles::PROFILE_VERSION);
+    // Schema-1 consumers may pass this field to `policy init --template`.
+    // Preserve an accepted legacy fallback while current consumers and apply
+    // follow the separate versioned personal-profile recommendation.
+    let recommended_template = if recommended_profile.is_some() {
+        "individual".to_owned()
+    } else {
+        recommended_template
+    };
 
     OnboardReport {
         schema_version: ONBOARD_SCHEMA_VERSION,
@@ -761,7 +769,7 @@ mod tests {
                 policy_present,
                 policy_path: policy_present.then(|| "/repo/.tirith/policy.yaml".to_string()),
             },
-            recommended_template: "balanced".to_string(),
+            recommended_template: "individual".to_string(),
             recommended_profile: Some("balanced".into()),
             recommended_profile_version: Some(1),
             recommendation_reason: "test".to_string(),

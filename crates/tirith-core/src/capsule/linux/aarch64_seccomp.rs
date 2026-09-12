@@ -108,6 +108,12 @@ fn policy_rules() -> Result<Rules, String> {
         libc::SYS_dup3,
         libc::SYS_pipe2,
         libc::SYS_mkdirat,
+        // Landlock still confines each source and destination directory.
+        // Metadata-only chmod/chown/utime calls remain denied.
+        libc::SYS_unlinkat,
+        libc::SYS_renameat,
+        // Process-local creation mask; existing file metadata stays denied.
+        libc::SYS_umask,
         libc::SYS_execve,
         libc::SYS_execveat,
         libc::SYS_wait4,
@@ -149,6 +155,12 @@ fn policy_rules() -> Result<Rules, String> {
             eq(1, request as u64)?,
         ])?);
     }
+    // Exact process-local CLOEXEC setter used by CPython custom file openers.
+    terminal_rules.push(rule(vec![
+        condition(0, SeccompCmpOp::Le, i32::MAX as u64)?,
+        eq(1, libc::FIOCLEX as u64)?,
+        eq(2, 0)?,
+    ])?);
     rules.insert(libc::SYS_ioctl, terminal_rules);
 
     // Only the caller's immutable group may be terminated. This is used by the
@@ -390,6 +402,17 @@ mod tests {
             decision(libc::SYS_ioctl, [1, libc::TCGETS as u64, 0, 0, 0, 0]),
             ALLOW
         );
+        assert_eq!(
+            decision(libc::SYS_ioctl, [4, libc::FIOCLEX as u64, 0, 0, 0, 0]),
+            ALLOW
+        );
+        for args in [
+            [4, libc::FIOCLEX as u64, 1, 0, 0, 0],
+            [u64::MAX, libc::FIOCLEX as u64, 0, 0, 0, 0],
+            [4, libc::FIONCLEX as u64, 0, 0, 0, 0],
+        ] {
+            assert_eq!(decision(libc::SYS_ioctl, args), DENY);
+        }
         assert_eq!(
             decision(libc::SYS_ioctl, [4, libc::TCGETS as u64, 0, 0, 0, 0]),
             DENY

@@ -108,6 +108,27 @@ pub fn embedded_hook(file: &str) -> PathBuf {
     path
 }
 
+/// Fixed loader beside the candidate bundle's lib directory. A separate
+/// accessor keeps embedded_hook basename-only instead of admitting traversal.
+pub fn embedded_loader() -> PathBuf {
+    let root = candidate_paths()
+        .map(|(_, hooks)| {
+            assert_eq!(
+                hooks.file_name().and_then(|name| name.to_str()),
+                Some("lib"),
+                "candidate hooks must use the packaged lib directory"
+            );
+            hooks
+                .parent()
+                .expect("absolute packaged lib has a parent")
+                .to_path_buf()
+        })
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell"));
+    let loader = root.join("tirith.sh");
+    assert!(loader.is_file(), "candidate source loader is unavailable");
+    loader
+}
+
 /// Path to the freshly-built `tirith` binary under test.
 pub fn tirith_bin() -> PathBuf {
     candidate_paths()

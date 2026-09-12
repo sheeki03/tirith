@@ -33,8 +33,8 @@
 //!   its exit code. Used by `tirith run` and `temp-run --capsule`.
 //! - [`run_to_completion_bound_inputs`]: execute a content-bound program against
 //!   immutable named inputs and a held writable target. This is the production D4
-//!   `pkg install` seam. Its enforcing execution is x86_64 Linux-only; every other
-//!   platform or architecture refuses before the package interpreter starts.
+//!   `pkg install` seam. It requires Linux private namespaces and complete native
+//!   containment; other platforms or missing capabilities refuse before execution.
 //! - [`spawn_piped`]: build the contained child with piped stdin/stdout/stderr and
 //!   hand back a [`ManagedChild`] the caller bridges (the MCP gateway needs to sit
 //!   between the client and the upstream server). Linux and macOS support
@@ -2315,15 +2315,62 @@ fn normalize_bound_target_policy(
     Ok((filesystem, requested_target_policy))
 }
 
-/// Production `pkg install` seam: execute a content-bound program against immutable
-/// named inputs and one held writable target directory. x86_64 Linux constructs a
+/// Qualification refusal for the package-only private named-input backend.
+/// Generic capsule coverage does not establish this additional input-lifetime
+/// guarantee. There is deliberately no environment, flag, or test override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrivateInputExecutionRefusal {
+    InputLifetimeUnqualified,
+}
+
+impl std::fmt::Display for PrivateInputExecutionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputLifetimeUnqualified => f.write_str(
+                "private_input_execution_unqualified: contained package execution is disabled; \
+                 the private-input backend cannot guarantee unchanged package inputs throughout \
+                 execution against another process owned by the same user. Sudo or administrator \
+                 access does not qualify this backend. Package inspection and ordinary command \
+                 protection remain available.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PrivateInputExecutionRefusal {}
+
+impl PrivateInputExecutionRefusal {
+    pub(crate) fn into_capsule_refusal(self, spec: &CapsuleSpec) -> CapsuleRefused {
+        CapsuleRefused {
+            backend_id: select_backend(spec).backend_id,
+            reason: self.to_string(),
+        }
+    }
+}
+
+/// A single production decision shared by the public install command, its
+/// side-effect seam, and both sides of the hidden private-input launcher.
+/// Re-enabling requires a reviewed implementation and native qualification of
+/// immutable named inputs for the complete target lifetime.
+pub(crate) fn require_private_input_execution_qualification(
+) -> Result<(), PrivateInputExecutionRefusal> {
+    Err(PrivateInputExecutionRefusal::InputLifetimeUnqualified)
+}
+
+/// Disabled production `pkg install` seam. The qualification guard refuses before
+/// target/input binding, staging creation, or spawning the hidden launcher. The
+/// retained implementation below is not an enabled or qualified capability.
+///
+/// Intended contract: execute a content-bound program against immutable
+/// named inputs and one held writable target directory. A qualified Linux host constructs a
 /// private user+mount namespace in the hidden launcher, copies sealed source
 /// bytes into a private filesystem made read-only and verified in full, installs
 /// the target Landlock WRITE rule from the
 /// retained directory descriptor, and proves achieved coverage plus target exec
-/// before reporting execution. Other operating systems refuse explicitly;
-/// non-x86_64 Linux cannot provide the required deny-all seccomp coverage and
-/// therefore fails closed before the package interpreter starts.
+/// before reporting execution. Native x86_64 and AArch64 filters are implemented;
+/// each launch must still prove kernel, namespace, policy, and tool requirements.
+/// Other operating systems or incomplete coverage refuse before execution. This
+/// primitive does not itself qualify the complete package install/receipt flow.
 pub fn run_to_completion_bound_inputs(
     spec: &CapsuleSpec,
     program: &TrustedExecutable,
@@ -2333,6 +2380,8 @@ pub fn run_to_completion_bound_inputs(
     extra_env: &[(String, String)],
     output_presentation: BoundOutputPresentation,
 ) -> Result<CapsuleExecutionOutcome, CapsuleExecutionError> {
+    require_private_input_execution_qualification()
+        .map_err(|error| error.into_capsule_refusal(spec))?;
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (
@@ -6711,8 +6760,9 @@ pub struct CapsuleDoctorInfo {
     /// The backend selected for this host.
     pub backend_id: &'static str,
     /// Whether the backend can fully satisfy a locked-down (deny-all) spec. This
-    /// alone does not make `pkg install` available: its dedicated bound-input seam
-    /// also requires x86_64 Linux.
+    /// alone does not make `pkg install` available: the package flow separately
+    /// requires Linux private namespaces, bound inputs, a supported toolchain,
+    /// and its policy/approval/publication checks.
     pub deny_all_enforceable: bool,
     /// The individual coverage flags achieved for a locked-down spec.
     pub fs_read_enforced: bool,

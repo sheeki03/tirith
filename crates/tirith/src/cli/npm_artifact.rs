@@ -41,6 +41,14 @@ pub fn is_npm_path(path: &Path) -> bool {
         })
 }
 
+/// Only this suffix selects npm implicitly. `.tar.gz` also names Python sdists
+/// and must keep their existing report contract unless npm is selected explicitly.
+pub fn is_unambiguous_npm_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("tgz"))
+}
+
 pub fn inspect(paths: &[PathBuf], format: Format) -> i32 {
     let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
     let mut context = Context::capture();

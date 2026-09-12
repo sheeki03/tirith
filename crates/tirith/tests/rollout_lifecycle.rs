@@ -65,7 +65,7 @@ fn reviewed_rollout_is_read_only_until_activation_and_undo_preserves_unrelated_f
     let undone = success(run(&state, &["policy", "rollout", "undo", &id, "--json"]));
     assert!(matches!(
         undone["operation"]["state"].as_str(),
-        Some("undone" | "undone_with_recovery")
+        Some("undone" | "undone-with-recovery")
     ));
     let current: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

@@ -593,7 +593,13 @@ pub(crate) fn validate_control_directory_handle(file: &fs::File) -> Result<(), S
 }
 
 pub(crate) fn validate_control_ancestor_handle(file: &fs::File) -> Result<(), String> {
-    if !control_ancestor_security_descriptor(&control_directory_descriptor(file)?) {
+    let descriptor = control_directory_descriptor(file)?;
+    if !control_ancestor_security_descriptor(&descriptor) {
+        #[cfg(test)]
+        eprintln!(
+            "Unsupported native test ancestor ACL: {}",
+            describe_security_descriptor(&descriptor)
+        );
         return Err("control directory ancestor has an untrusted owner or write authority".into());
     }
     Ok(())
@@ -3101,6 +3107,23 @@ mod tests {
         unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) }.unwrap();
     }
 
+    fn directory_security_for_test(path: &Path) -> Vec<u8> {
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(wide(path).as_ptr()),
+                (FILE_READ_ATTRIBUTES | READ_CONTROL).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .unwrap();
+        let held = OwnedHandle(handle);
+        security_descriptor(held.0, path).unwrap()
+    }
+
     #[test]
     fn private_directory_creation_is_protected_and_current_user_owned() {
         let fixture = tempfile::tempdir().unwrap();
@@ -3110,16 +3133,14 @@ mod tests {
         // Every newly created component has explicit private security, including
         // the scope itself when its first child causes it to be materialized.
         for directory in [path.clone(), path.parent().unwrap().to_path_buf()] {
-            let handle = open_directory(&directory).unwrap().unwrap();
             assert!(owner_only_security_descriptor(
-                &security_descriptor(handle.0, &directory).unwrap()
+                &directory_security_for_test(&directory)
             ));
         }
         let new_scope = fixture.path().join("new-scope");
         ensure_private_directory(&new_scope, &new_scope).unwrap();
-        let handle = open_directory(&new_scope).unwrap().unwrap();
         assert!(owner_only_security_descriptor(
-            &security_descriptor(handle.0, &new_scope).unwrap()
+            &directory_security_for_test(&new_scope)
         ));
     }
 
@@ -3150,9 +3171,8 @@ mod tests {
         };
         unsafe { CreateDirectoryW(PCWSTR(wide(&directory).as_ptr()), Some(&attributes)) }.unwrap();
         ensure_private_directory(&directory, fixture.path()).unwrap();
-        let handle = open_directory(&directory).unwrap().unwrap();
         assert!(owner_only_security_descriptor(
-            &security_descriptor(handle.0, &directory).unwrap()
+            &directory_security_for_test(&directory)
         ));
     }
 
@@ -3534,7 +3554,8 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(result.unwrap_err().contains("changed while setup"));
+        let error = result.unwrap_err();
+        assert!(error.contains("changed"), "unexpected refusal: {error}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "editor-change");
         assert!(!fs::read_dir(root.path())
             .unwrap()

@@ -627,14 +627,14 @@ coverage = "Clipboard with secret-shape gating and browser source attribution; i
 policy_complete = true
 
 # ---------------------------------------------------------------------------
-# Package firewall (Python; install enforcement is x86_64 Linux-only)
+# Package firewall (Python; installation has separate native qualification gates)
 # ---------------------------------------------------------------------------
 
 [[command]]
 name = "pkg install"
 group = "Package firewall"
-inspected = "full"
-coverage = "Resolves with hashes, quarantines the exact wheel bytes, and inspects them. Enforcing Python installation is x86_64 Linux-only and uses only the verified bytes inside a containment capsule with a tamper-evident receipt; every other platform or architecture fails closed before pip starts."
+inspected = "none"
+coverage = "Package execution is disabled on every host because private named-input lifetime protection is unqualified. Valid pip requests refuse before resolver, network, quarantine, checkpoint or target effects. Confirmation flags, degraded mode and administrator access do not enable it. Use package inspection or verify-env for separate read-only workflows; npm/cargo installation is unavailable."
 policy_complete = true
 
 [[command]]
@@ -648,7 +648,7 @@ policy_complete = true
 name = "pkg approve"
 group = "Package firewall"
 inspected = "full"
-coverage = "Binds an approval to an InstallPlanDigest over the inspected artifact hashes, packages, target env, policy projection, and DB sequence."
+coverage = "Binds an approval to the inspected artifact hashes, packages, target environment, policy projection, and DB sequence. This explicit approval route requires the opt-in privileged helper and its supported authority, currently Linux x86_64. It is unavailable by default. Ordinary checks do not require it, and an approval cannot enable the currently disabled package-execution backend."
 policy_complete = true
 
 [[command]]

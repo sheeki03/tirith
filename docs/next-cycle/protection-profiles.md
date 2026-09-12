@@ -56,3 +56,15 @@ nearby download-and-execute/exfiltration controls, selected versus unselected
 advisories, unsupported prompt hosts, and strict incomplete-analysis handling.
 Reset, repeated apply, unrelated settings, forged ownership, unknown versions,
 and old-reader materialization have independent regressions.
+
+Onboarding recommends personal Balanced v1 in automatic and repository modes.
+Detected CI workflows, AI instructions and MCP configuration remain inventory
+signals; they no longer choose `ci-strict`, `ai-agent-heavy` or `individual` as
+an inferred personal preference. Explicit `--team` and `--ai-agent-heavy` retain
+their legacy template selections. The schema-1 onboarding report keeps
+`recommended_template` as an accepted legacy fallback (`individual` for personal
+setup), so older consumers can still pass it to `policy init --template`.
+`recommended_profile` and `recommended_profile_version` carry the primary
+versioned personal recommendation; current next steps and apply use that route.
+Profile-aware consumers should prefer those fields when present and otherwise
+use the legacy template field. `balanced` is not a legacy template name.

@@ -1,12 +1,10 @@
 //! Typed shell preparation shared by the CLI and local controls. The caller
 //! chooses a shell and action; this module derives every path and payload.
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
 use tirith_core::trusted_child::TrustedExecutable;
 
@@ -14,6 +12,7 @@ use super::change_plan::{Edit, MutationService, OperationKind, OperationStatus, 
 use super::shell_profile::{
     has_executable_tirith_init, is_managed_begin_marker, shell_quote, validate_marker_pairing,
 };
+use crate::cli::control::identity::BinaryIdentity;
 use crate::cli::shell_target::{self, ProfileTarget, ShellTarget};
 
 const BEGIN: &str = "# BEGIN tirith-hook v1";
@@ -109,7 +108,7 @@ fn intent(change: ShellChange, cwd: Option<&str>) -> Result<ShellIntent, String>
     })
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ExpectedProfile {
     path: PathBuf,
     scope: PathBuf,
@@ -125,7 +124,7 @@ impl ExpectedProfile {
 /// Private replay input, never included in browser projections. Exact digest
 /// binding prevents a same-version binary or external hook update from turning
 /// an already reviewed startup plan into a different activation.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PinnedFile {
     invocation: PathBuf,
     canonical: PathBuf,
@@ -133,7 +132,15 @@ struct PinnedFile {
     executable: bool,
 }
 
-impl PinnedFile {
+/// A live identity is tied to an open native handle, never a metadata-only
+/// digest cache. Reacquisition hashes the current bytes against the journal.
+struct HeldShellInput {
+    expected: PinnedFile,
+    executable: Option<TrustedExecutable>,
+    identity: BinaryIdentity,
+}
+
+impl HeldShellInput {
     fn capture(path: &Path, executable: bool) -> Result<Self, String> {
         if !path.is_absolute() {
             return Err("shell activation input must have an absolute path".into());
@@ -141,56 +148,52 @@ impl PinnedFile {
         let canonical = path
             .canonicalize()
             .map_err(|_| "shell activation input is unavailable")?;
-        if executable {
-            TrustedExecutable::from_absolute(path, &[])
-                .map_err(|_| "shell activation executable is untrusted")?;
-        }
-        let digest = file_digest(&canonical)?;
-        Ok(Self {
+        let executable = executable
+            .then(|| TrustedExecutable::from_absolute(path, &[]))
+            .transpose()
+            .map_err(|_| "shell activation executable is untrusted")?;
+        let identity = if executable.is_some() {
+            BinaryIdentity::capture(&canonical)?
+        } else {
+            // A previously accepted empty external hook remains a valid input.
+            // It still retains a native handle and exact empty-content digest.
+            BinaryIdentity::capture_input(&canonical)?
+        };
+        let expected = PinnedFile {
             invocation: path.into(),
             canonical,
-            digest,
+            digest: identity.sha256().into(),
+            executable: executable.is_some(),
+        };
+        let held = Self {
+            expected,
             executable,
-        })
+            identity,
+        };
+        held.revalidate()?;
+        Ok(held)
     }
 
-    fn validate(&self) -> Result<(), String> {
-        let current = Self::capture(&self.invocation, self.executable)?;
-        if current.canonical != self.canonical || current.digest != self.digest {
-            return Err("shell activation executable or hook changed; refresh the plan".into());
+    fn revalidate(&self) -> Result<(), String> {
+        self.identity
+            .revalidate()
+            .map_err(|_| "shell activation executable or hook changed; refresh the plan")?;
+        if self.expected.invocation.canonicalize().ok().as_ref() != Some(&self.expected.canonical) {
+            return Err("shell activation invocation changed; refresh the plan".into());
+        }
+        if let Some(executable) = &self.executable {
+            executable
+                .revalidate()
+                .map_err(|_| "shell activation executable is no longer trusted")?;
         }
         Ok(())
     }
 }
 
-fn file_digest(path: &Path) -> Result<String, String> {
-    const LIMIT: u64 = 512 * 1024 * 1024;
-    let file = tirith_core::util::open_read_no_follow_capped(path, LIMIT)
-        .map_err(|_| "shell activation input is non-regular, unreadable, or oversized")?;
-    let mut source = file.take(LIMIT + 1);
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut size = 0u64;
-    loop {
-        let count = source
-            .read(&mut buffer)
-            .map_err(|_| "cannot read shell activation input")?;
-        if count == 0 {
-            break;
-        }
-        size += count as u64;
-        if size > LIMIT {
-            return Err("shell activation input exceeds size limit".into());
-        }
-        hash.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}
-
 /// Retained by the operation journal and checked at each protected publication.
 /// It captures selected startup destinations, not an environment claim that a
 /// browser's parent shell is active or can block a command.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ShellPrecondition {
     shell: ShellKind,
     home: PathBuf,
@@ -218,7 +221,7 @@ impl ShellPrecondition {
         })
     }
 
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    fn validate_selection(&self) -> Result<(), String> {
         let current = shell_target::resolve_for_shell(self.shell.name())?;
         shell_target::require_personal_writer(&current)?;
         if current.operator_home != self.home
@@ -232,10 +235,27 @@ impl ShellPrecondition {
         {
             return Err("shell profile selection or operator changed; refresh the plan".into());
         }
-        for input in &self.inputs {
-            input.validate()?;
-        }
         Ok(())
+    }
+
+    pub(crate) fn retain(&self) -> Result<RetainedShellInputs, String> {
+        self.validate_selection()?;
+        let mut inputs = Vec::with_capacity(self.inputs.len());
+        for expected in &self.inputs {
+            let held = HeldShellInput::capture(&expected.invocation, expected.executable)?;
+            if &held.expected != expected {
+                return Err(
+                    "shell activation input bytes or selection changed; refresh the plan".into(),
+                );
+            }
+            inputs.push(held);
+        }
+        let retained = RetainedShellInputs {
+            expected: self.clone(),
+            inputs,
+        };
+        retained.revalidate()?;
+        Ok(retained)
     }
 
     pub(crate) fn validate_undo(&self) -> Result<(), String> {
@@ -247,6 +267,44 @@ impl ShellPrecondition {
         // Compensation restores captured bytes in the original held scopes.
         // An executable upgrade or newly selected startup file does not grant
         // authority over other paths; each old owned postimage is still checked.
+        Ok(())
+    }
+}
+
+/// Retain exact activation input handles throughout one preparation or apply.
+/// Deserializing a journal never restores this lease: retry must hash again.
+pub(crate) struct RetainedShellInputs {
+    expected: ShellPrecondition,
+    inputs: Vec<HeldShellInput>,
+}
+
+impl RetainedShellInputs {
+    fn capture(target: &ShellTarget) -> Result<Self, String> {
+        Ok(Self {
+            expected: ShellPrecondition::capture(target)?,
+            inputs: Vec::new(),
+        })
+    }
+
+    fn capture_input(&mut self, path: &Path, executable: bool) -> Result<(), String> {
+        let input = HeldShellInput::capture(path, executable)?;
+        self.expected.inputs.push(input.expected.clone());
+        self.inputs.push(input);
+        Ok(())
+    }
+
+    pub(crate) fn revalidate_for(&self, expected: &ShellPrecondition) -> Result<(), String> {
+        if expected != &self.expected {
+            return Err("retained shell inputs do not belong to this immutable operation".into());
+        }
+        self.revalidate()
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        self.expected.validate_selection()?;
+        for input in &self.inputs {
+            input.revalidate()?;
+        }
         Ok(())
     }
 }
@@ -295,7 +353,7 @@ pub(crate) struct PreparedShell {
     pub compiled: tirith_core::redact::CompiledCustomPatterns,
     target: ShellTarget,
     intent: ShellIntent,
-    precondition: ShellPrecondition,
+    retained: RetainedShellInputs,
     steps: Vec<PreparedStep>,
     profiles: Vec<ProfilePreview>,
     changed: bool,
@@ -336,7 +394,7 @@ impl PreparedShell {
             ),
         );
         let mut prepared = Self {
-            precondition: ShellPrecondition::capture(&target)?,
+            retained: RetainedShellInputs::capture(&target)?,
             target,
             intent,
             snapshot,
@@ -349,10 +407,7 @@ impl PreparedShell {
             ShellChange::Install { shell, .. } => {
                 let binary =
                     binary.ok_or("shell setup requires the validated running executable")?;
-                prepared
-                    .precondition
-                    .inputs
-                    .push(PinnedFile::capture(Path::new(binary), true)?);
+                prepared.retained.capture_input(Path::new(binary), true)?;
                 let line = if *shell == ShellKind::Nushell {
                     prepared.prepare_nushell_source()?
                 } else {
@@ -380,7 +435,7 @@ impl PreparedShell {
             prepared.steps.clear();
             prepared.changed = false;
         }
-        prepared.precondition.validate()?;
+        prepared.retained.revalidate()?;
         Ok(prepared)
     }
 
@@ -495,9 +550,7 @@ impl PreparedShell {
                 .canonicalize()
                 .map_err(|_| "Nushell hook directory is unavailable")?;
             let hook = directory.join("lib/nushell-hook.nu");
-            self.precondition
-                .inputs
-                .push(PinnedFile::capture(&hook, false)?);
+            self.retained.capture_input(&hook, false)?;
             return Ok(format!(
                 "{}\nsource {}\n{}",
                 crate::cli::init::integration_stamp("nushell", &directory),
@@ -552,12 +605,12 @@ impl PreparedShell {
     }
 
     pub(crate) fn setup_parts(&self) -> Result<PreparedShellParts, String> {
-        self.precondition.validate()?;
+        self.retained.revalidate()?;
         self.snapshot
             .revalidate_inputs()
             .map_err(|e| e.to_string())?;
         if !self.changed {
-            return Ok((Vec::new(), BTreeMap::new(), self.precondition.clone()));
+            return Ok((Vec::new(), BTreeMap::new(), self.retained.expected.clone()));
         }
         Ok((
             self.steps.iter().map(PreparedStep::request).collect(),
@@ -565,7 +618,7 @@ impl PreparedShell {
                 .iter()
                 .map(|step| (step.target.clone(), step.before.clone()))
                 .collect(),
-            self.precondition.clone(),
+            self.retained.expected.clone(),
         ))
     }
 
@@ -586,7 +639,7 @@ impl PreparedShell {
                 )
                 .map(Some);
         }
-        self.precondition.validate()?;
+        self.retained.revalidate()?;
         let expected: BTreeMap<_, _> = self
             .steps
             .iter()
@@ -602,7 +655,7 @@ impl PreparedShell {
                 },
                 &self.snapshot,
                 &self.intent,
-                self.precondition.clone(),
+                self.retained.expected.clone(),
             )
             .map(Some)
     }
@@ -1019,9 +1072,190 @@ mod tests {
             std::fs::write(home.join(".profile"), "personal\n").unwrap();
             let target = shell_target::resolve_for_shell("bash").unwrap();
             let guard = ShellPrecondition::capture(&target).unwrap();
-            guard.validate().unwrap();
+            let held = guard.retain().unwrap();
+            held.revalidate().unwrap();
             std::fs::write(home.join(".bash_profile"), "new higher priority\n").unwrap();
-            assert!(guard.validate().is_err());
+            assert!(held.revalidate().is_err());
+            assert!(guard.retain().is_err());
         });
+    }
+
+    #[test]
+    fn retained_empty_hook_preserves_empty_input_compatibility() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("empty-hook");
+        std::fs::write(&path, b"").unwrap();
+        let held = HeldShellInput::capture(&path, false).unwrap();
+        held.revalidate().unwrap();
+        assert_eq!(
+            held.expected.digest,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert!(
+            BinaryIdentity::capture(&path).is_err(),
+            "empty executable admission stays unchanged"
+        );
+    }
+
+    #[test]
+    fn retained_hook_rejects_identical_replacement_while_original_handle_is_live() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("hook");
+        let replacement = root.path().join("replacement");
+        std::fs::write(&path, b"same hook bytes").unwrap();
+        let held = HeldShellInput::capture(&path, false).unwrap();
+        std::fs::write(&replacement, b"same hook bytes").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(held.revalidate().is_err());
+    }
+
+    #[test]
+    fn retained_hook_detects_or_excludes_in_place_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("hook");
+        std::fs::write(&path, b"before").unwrap();
+        let held = HeldShellInput::capture(&path, false).unwrap();
+        let write = std::fs::write(&path, b"after!");
+        #[cfg(windows)]
+        {
+            assert!(
+                write.is_err(),
+                "the retained Windows handle excludes writers"
+            );
+            held.revalidate().unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            write.unwrap();
+            assert!(held.revalidate().is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_invocation_alias_and_executable_permission_changes_refuse() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let alias = root.path().join("alias");
+        for path in [&first, &second] {
+            std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        symlink(&first, &alias).unwrap();
+        let held = HeldShellInput::capture(&alias, true).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        assert!(
+            held.revalidate().is_err(),
+            "identical bytes through another alias are not the reviewed selection"
+        );
+        let held = HeldShellInput::capture(&first, true).unwrap();
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            held.revalidate().is_err(),
+            "retention does not bypass executable trust"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_resume_reacquires_and_hashes_inputs_after_old_handles_close() {
+        crate::cli::test_harness::with_fake_env(true, |home, _| {
+            let target = shell_target::resolve_for_shell("bash").unwrap();
+            let path = home.join("resume-hook");
+            std::fs::write(&path, b"before").unwrap();
+            let mut held = RetainedShellInputs::capture(&target).unwrap();
+            held.capture_input(&path, false).unwrap();
+            let saved = serde_json::to_string(&held.expected).unwrap();
+            drop(held);
+            let expected: ShellPrecondition = serde_json::from_str(&saved).unwrap();
+            std::fs::write(&path, b"after!").unwrap();
+            assert!(
+                expected.retain().is_err(),
+                "durable metadata cannot reuse a closed-handle digest"
+            );
+            std::fs::write(&path, b"before").unwrap();
+            expected.retain().unwrap().revalidate().unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_shell_lease_is_bound_to_the_exact_immutable_precondition() {
+        crate::cli::test_harness::with_fake_env(true, |home, _| {
+            let target = shell_target::resolve_for_shell("bash").unwrap();
+            let path = home.join("bound-hook");
+            std::fs::write(&path, b"original").unwrap();
+            let mut held = RetainedShellInputs::capture(&target).unwrap();
+            held.capture_input(&path, false).unwrap();
+            held.revalidate_for(&held.expected).unwrap();
+            let mut other = held.expected.clone();
+            other.profiles[0].startup.push_str("-changed");
+            assert!(held.revalidate_for(&other).is_err());
+            let mut other = held.expected.clone();
+            other.inputs[0].digest = "0".repeat(64);
+            assert!(held.revalidate_for(&other).is_err());
+            let mut other = held.expected.clone();
+            other.inputs[0].executable = true;
+            assert!(held.revalidate_for(&other).is_err());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resumed_shell_apply_refuses_changed_input_but_undo_keeps_owned_compensation() {
+        use super::super::change_plan::JobState;
+        use std::os::unix::fs::PermissionsExt;
+        for apply_before_change in [false, true] {
+            crate::cli::test_harness::with_fake_env(true, |home, _| {
+                let binary = home.join("retained-shell-executable");
+                std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let prepared = PreparedShell::capture_with_binary(
+                    ShellChange::Install {
+                        shell: ShellKind::Bash,
+                        force: false,
+                    },
+                    None,
+                    binary.to_str(),
+                )
+                .unwrap();
+                let id = uuid::Uuid::new_v4().to_string();
+                prepared.plan(&id).unwrap().unwrap();
+                let policy = prepared.snapshot.clone();
+                if apply_before_change {
+                    assert_eq!(
+                        MutationService::current()
+                            .unwrap()
+                            .apply(&id, &policy)
+                            .unwrap()
+                            .state,
+                        JobState::Completed
+                    );
+                }
+                drop(prepared);
+                // A later caller owns no earlier native input handle.
+                std::fs::write(&binary, "#!/bin/sh\nexit 1\n").unwrap();
+                let service = MutationService::current().unwrap();
+                if apply_before_change {
+                    assert_eq!(
+                        service.undo(&id, &policy.refresh_runtime()).unwrap().state,
+                        JobState::Undone
+                    );
+                    assert!(!std::fs::read_to_string(home.join(".bashrc"))
+                        .unwrap()
+                        .contains(BEGIN));
+                } else {
+                    assert_eq!(
+                        service.apply(&id, &policy).unwrap().state,
+                        JobState::RefreshRequired
+                    );
+                    assert!(!home.join(".bashrc").exists());
+                    assert!(!home.join(".bash_profile").exists());
+                }
+            });
+        }
     }
 }

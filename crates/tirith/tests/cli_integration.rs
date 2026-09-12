@@ -6672,9 +6672,9 @@ fn policy_init_default_unchanged_without_template() {
 }
 
 /// M13 ch1: `tirith onboard --json` must report the planted, FILE-BASED signals and recommend a
-/// sensible template.
+/// personal profile while retaining a valid legacy-template fallback.
 #[test]
-fn onboard_json_reports_planted_signals_and_recommends_template() {
+fn onboard_json_reports_planted_signals_and_recommends_personal_profile() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
 
@@ -6756,11 +6756,13 @@ fn onboard_json_reports_planted_signals_and_recommends_template() {
         "mcp_configs: {mcp:?}"
     );
 
-    // Heavy AI-config + MCP presence → ai-agent-heavy recommendation.
+    // Integration inventory does not choose the personal risk preference (WP05).
     assert_eq!(
-        json["recommended_template"], "ai-agent-heavy",
-        "heavy AI-config/MCP presence should recommend ai-agent-heavy"
+        json["recommended_template"], "individual",
+        "the schema-1 template fallback must remain accepted by legacy policy init"
     );
+    assert_eq!(json["recommended_profile"], "balanced");
+    assert_eq!(json["recommended_profile_version"], 1);
 
     // Read-only without --apply: no policy file written.
     assert!(
@@ -6821,13 +6823,11 @@ fn onboard_json_does_not_execute_a_path_shadowed_ps() {
     );
 }
 
-/// M13 ch1: a CI-only repo (no heavy AI surface) recommends `ci-strict`. R11-3: this is the
-/// host-dependence regression guard. `recommend_template` returns `ai-agent-heavy` whenever
-/// `mcp_config_count >= 1` (BEFORE the CI branch), so if the home-relative Windsurf MCP scan
-/// leaked the runner's real `~/.codeium/windsurf/mcp_config.json`, this would flip to
-/// `ai-agent-heavy`.
+/// WP05: CI is an inventory signal, not a personal protection preference.
+/// R11-3 remains a host-isolation guard: the reported MCP inventory must contain
+/// only the deliberately planted isolated home/repository configuration.
 #[test]
-fn onboard_json_ci_repo_recommends_ci_strict() {
+fn onboard_json_ci_repo_keeps_personal_balanced() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     fs::create_dir_all(root.join(".git")).unwrap();
@@ -6854,9 +6854,11 @@ fn onboard_json_ci_repo_recommends_ci_strict() {
     );
 
     assert_eq!(
-        json["recommended_template"], "ci-strict",
-        "a CI repo with no heavy AI surface should recommend ci-strict"
+        json["recommended_template"], "individual",
+        "CI presence must not choose an incompatible legacy template fallback"
     );
+    assert_eq!(json["recommended_profile"], "balanced");
+    assert_eq!(json["recommended_profile_version"], 1);
 }
 
 /// R11-3: the positive half of the home-relative MCP isolation contract.
@@ -6864,7 +6866,7 @@ fn onboard_json_ci_repo_recommends_ci_strict() {
 fn onboard_json_detects_windsurf_mcp_under_isolated_home() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
-    // A CI-only repo: WITHOUT the windsurf signal this recommends ci-strict.
+    // A CI repository with a separately detected, isolated MCP integration.
     fs::create_dir_all(root.join(".git")).unwrap();
     fs::create_dir_all(root.join(".github/workflows")).unwrap();
     fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
@@ -6902,17 +6904,19 @@ fn onboard_json_detects_windsurf_mcp_under_isolated_home() {
         "the windsurf MCP config under the isolated home must be detected, got: {mcp:?}"
     );
 
-    // mcp_config_count >= 1 outranks the CI branch → ai-agent-heavy.
+    // MCP presence changes the inventory, while the personal recommendation stays Balanced.
     assert_eq!(
-        json["recommended_template"], "ai-agent-heavy",
-        "a detected home-relative MCP config must drive the recommendation to ai-agent-heavy"
+        json["recommended_template"], "individual",
+        "MCP presence must not choose an incompatible legacy template fallback"
     );
+    assert_eq!(json["recommended_profile"], "balanced");
+    assert_eq!(json["recommended_profile_version"], 1);
 }
 
-/// M13 ch1: an explicit `--repo` mode flag with no CI recommends `individual`,
-/// and the JSON records the requested mode bias.
+/// WP05: `--repo` records repository scope without treating it as a personal
+/// risk preference. The recommendation uses the versioned personal profile.
 #[test]
-fn onboard_json_repo_mode_recommends_individual() {
+fn onboard_json_repo_mode_keeps_personal_balanced() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     fs::create_dir_all(root.join(".git")).unwrap();
@@ -6927,6 +6931,8 @@ fn onboard_json_repo_mode_recommends_individual() {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     assert_eq!(json["requested_mode"], "repo");
     assert_eq!(json["recommended_template"], "individual");
+    assert_eq!(json["recommended_profile"], "balanced");
+    assert_eq!(json["recommended_profile_version"], 1);
 }
 
 /// M13 ch1: the mutually-exclusive mode flags must conflict (clap ArgGroup).
@@ -7734,74 +7740,47 @@ fn create_owned_install_test_dir_all(root: &Path, leaf: &Path) {
     }
 }
 
-/// End-to-end rollback of a SELF-MANAGED install, with no network: a tirith binary placed under a
-/// `.local/bin` path (so it self-detects as self-managed) plus a `.tirith-previous` backup is
-/// rolled back, and the live binary's bytes become the backup's bytes. This exercises the real
-/// binary self-replacement path — the most security-critical mutation — without touching the
-/// network or any real install.
+/// A pathname and sentinel backup do not supply compatibility evidence. The
+/// actual CLI must refuse this old rollback point before changing either file.
 #[cfg(unix)]
 #[test]
-fn update_rollback_self_managed_restores_previous_binary() {
+fn update_rollback_self_managed_without_compatibility_is_refused() {
     use std::os::unix::fs::PermissionsExt;
-
     let home = tempfile::tempdir().expect("tempdir");
-    // `.local/bin/tirith` makes detect_install_method classify it self-managed.
-    let bin_dir = home.path().join(".local").join("bin");
+    let bin_dir = home.path().join(".local/bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let live = bin_dir.join("tirith");
-
-    // The "live" binary is a real, runnable copy of the test tirith binary —
-    // it must be able to run `update --rollback` on itself.
     fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
     fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
-
-    // The rollback target: a `.tirith-previous` backup with sentinel content.
+    let original = fs::read(&live).unwrap();
     let backup = bin_dir.join("tirith.tirith-previous");
     let sentinel = b"PREVIOUS-TIRITH-BINARY-SENTINEL";
     fs::write(&backup, sentinel).unwrap();
-
     let out = run_freshly_written_binary(
         Command::new(&live)
             .args(["update", "--rollback", "--yes", "--format", "json"])
+            .env("HOME", home.path())
             .env_remove("TIRITH"),
     );
-
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "rollback of a self-managed install should succeed; stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("rollback JSON should parse");
-    assert_eq!(v["action"], "rolled-back");
-
-    // The live binary now holds the previous binary's bytes.
-    let live_after = fs::read(&live).unwrap();
-    assert_eq!(
-        live_after.len(),
-        sentinel.len(),
-        "rollback must replace the live binary with the (small) sentinel backup"
-    );
-    assert!(
-        live_after == sentinel,
-        "rollback must restore the previous binary's bytes onto the live path"
-    );
-    // The stale backup is consumed (it is no longer "the previous version").
-    assert!(
-        !backup.exists(),
-        "the consumed rollback backup should be removed after a successful rollback"
-    );
+    assert_eq!(out.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["action"], "error");
+    assert!(value["error"]
+        .as_str()
+        .unwrap()
+        .contains("rollback compatibility evidence is absent or unsafe"));
+    assert_eq!(fs::read(&live).unwrap(), original);
+    assert_eq!(fs::read(&backup).unwrap(), sentinel);
 }
 
 /// A Tirith release binary cached by Hermes is not package-manager state. Once
 /// the exact private path and ownership are proven, it reports `hermes` and may
 /// use the same signed/atomic self-update and rollback machinery as a standalone
-/// install. This real child-process rollback proves the filesystem boundary and
-/// performs no network request.
+/// install. An arbitrary old backup still lacks captured compatibility
+/// evidence and must be refused before publication or backup consumption.
 #[cfg(unix)]
 #[test]
-fn update_rollback_hermes_managed_restores_previous_binary() {
+fn update_rollback_hermes_managed_without_compatibility_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let directory = tempfile::tempdir().expect("tempdir");
@@ -7828,6 +7807,7 @@ fn update_rollback_hermes_managed_restores_previous_binary() {
         serde_json::from_slice(&provenance.stdout).expect("provenance JSON should parse");
     assert_eq!(provenance_json["install_method"], "hermes");
 
+    let original = fs::read(&live).unwrap();
     let backup = bin_dir.join("tirith.tirith-previous");
     let sentinel = b"PREVIOUS-HERMES-TIRITH-SENTINEL";
     fs::write(&backup, sentinel).unwrap();
@@ -7837,17 +7817,15 @@ fn update_rollback_hermes_managed_restores_previous_binary() {
             .env("HERMES_HOME", &hermes_home)
             .env_remove("TIRITH"),
     );
-    assert_eq!(
-        rollback.status.code(),
-        Some(0),
-        "Hermes rollback should succeed without a privileged helper: {}",
-        String::from_utf8_lossy(&rollback.stderr)
-    );
-    let rollback_json: serde_json::Value =
-        serde_json::from_slice(&rollback.stdout).expect("rollback JSON should parse");
-    assert_eq!(rollback_json["action"], "rolled-back");
-    assert_eq!(fs::read(&live).unwrap(), sentinel);
-    assert!(!backup.exists(), "the consumed backup should be removed");
+    assert_eq!(rollback.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&rollback.stdout).unwrap();
+    assert_eq!(value["action"], "error");
+    assert!(value["error"]
+        .as_str()
+        .unwrap()
+        .contains("rollback compatibility evidence is absent or unsafe"));
+    assert_eq!(fs::read(&live).unwrap(), original);
+    assert_eq!(fs::read(&backup).unwrap(), sentinel);
 }
 
 /// `cargo install --root` writes metadata beside its `bin` directory. Even if
@@ -7936,10 +7914,12 @@ fn update_rollback_self_managed_without_backup_fails_cleanly() {
 }
 
 /// `tirith update --dry-run --rollback` on a self-managed install with a
-/// backup reports what it WOULD do and changes nothing.
+/// an unverified backup refuses the unchecked preview and changes nothing.
+/// Positive local publication and captured-receipt validation remain covered
+/// by the protected selfupdate/release_compatibility unit seams.
 #[cfg(unix)]
 #[test]
-fn update_rollback_dry_run_changes_nothing() {
+fn update_rollback_dry_run_without_compatibility_changes_nothing() {
     use std::os::unix::fs::PermissionsExt;
 
     let home = tempfile::tempdir().expect("tempdir");
@@ -7948,22 +7928,36 @@ fn update_rollback_dry_run_changes_nothing() {
     let live = bin_dir.join("tirith");
     fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
     fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
-    let original_len = fs::metadata(&live).unwrap().len();
+    let original = fs::read(&live).unwrap();
 
     let backup = bin_dir.join("tirith.tirith-previous");
     fs::write(&backup, b"BACKUP-BYTES").unwrap();
 
     let out = run_freshly_written_binary(
         Command::new(&live)
-            .args(["update", "--rollback", "--dry-run"])
+            .args(["update", "--rollback", "--dry-run", "--format", "json"])
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("TIRITH_LOG", "1")
+            .env_remove("TIRITH_SESSION_ID")
             .env_remove("TIRITH"),
     );
 
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("dry run"), "got: {stdout}");
+    assert_eq!(out.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["action"], "error");
+    assert!(value["error"]
+        .as_str()
+        .unwrap()
+        .contains("rollback compatibility evidence is absent or unsafe"));
     // Nothing changed: live binary and backup are both intact.
-    assert_eq!(fs::metadata(&live).unwrap().len(), original_len);
+    assert_eq!(fs::read(&live).unwrap(), original);
+    for name in ["state", "config", "data", "cache"] {
+        assert!(!home.path().join(name).exists(), "preview created {name}");
+    }
     assert_eq!(fs::read(&backup).unwrap(), b"BACKUP-BYTES");
 }
 
@@ -13016,7 +13010,7 @@ fn prompt_status_short_starts_with_tirith_segment() {
 }
 
 #[test]
-fn prompt_status_short_reflects_tirith_status_env() {
+fn prompt_status_inherited_blocking_claim_stays_unverified() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("home")).unwrap();
     let out = prompt_status_cmd(dir.path())
@@ -13025,9 +13019,25 @@ fn prompt_status_short_reflects_tirith_status_env() {
         .output()
         .expect("failed to run tirith");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0));
     assert!(
-        stdout.trim().starts_with("[tirith:guarded"),
-        "TIRITH_STATUS=blocks must map to [tirith:guarded…], got {stdout:?}"
+        stdout.trim().starts_with("[tirith:blocking-unverified]"),
+        "an inherited claim is not an interception observation: {stdout:?}"
+    );
+    let json = prompt_status_cmd(dir.path())
+        .env("TIRITH_STATUS", "blocks")
+        .args(["prompt-status", "--json"])
+        .output()
+        .expect("failed to run tirith");
+    assert_eq!(json.status.code(), Some(0));
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["protection_mode"], "guarded");
+    assert_eq!(value["protection_evidence"]["verified_blocking"], false);
+    assert_eq!(value["protection_evidence"]["fresh"], false);
+    assert_eq!(
+        value["protection_evidence"]["source"],
+        "inherited-environment-unverified"
     );
 }
 
@@ -22060,10 +22070,10 @@ fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
                 stderr.contains("package approvals are redeemable only on x86_64 Linux"),
                 "pkg approve must report its native capability boundary: {stderr}"
             );
-        } else if action == "install" && !cfg!(target_os = "linux") {
+        } else if action == "install" {
             assert!(
-                stderr.contains("enforcing package target binding is supported only on Linux"),
-                "pkg install must report its target capability boundary: {stderr}"
+                stderr.contains("private_input_execution_unqualified:"),
+                "pkg install must refuse before resolver discovery: {stderr}"
             );
         } else {
             assert!(
@@ -22079,20 +22089,14 @@ fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
     );
 }
 
-/// `tirith pkg install pip <req>` on a host whose resolver toolchain is ABSENT must
-/// fail closed: a non-zero exit and a refusal message, never a clean success or a
-/// silent uncontained install. This is the real enforcing-surface negative path —
-/// the resolver-discovery gate refuses before any download/spawn. (The deeper
-/// `InterpreterNotFound` leg, reached only AFTER a successful resolve, is unit-
-/// tested in `cli/pkg_install.rs::install_fails_closed_when_capsule_is_degraded`;
-/// it cannot be driven end to end here without a real `uv`.)
+/// An absent resolver cannot change the package backend's qualification refusal.
+/// This reaches the real public command without any tool or network dependency.
 #[test]
 fn pkg_install_pip_fails_closed_when_toolchain_absent() {
     let home = tempfile::tempdir().expect("tempdir");
     let target = home.path().join("env");
     let out = tirith()
-        // No resolver tools on PATH -> discover() returns ToolNotFound, the install
-        // refuses. PATH is the only thing steering tool discovery here.
+        // The qualification refusal must precede even resolver discovery.
         .env("PATH", empty_path_dir(home.path()))
         // Isolate the data dir on every OS so no approval/receipt state leaks in.
         .env("XDG_DATA_HOME", home.path())
@@ -22116,18 +22120,11 @@ fn pkg_install_pip_fails_closed_when_toolchain_absent() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if cfg!(target_os = "linux") {
-        assert!(
-            stderr.contains("tirith pkg install:") && stderr.contains("resolve failed"),
-            "the refusal must name the failed resolve, not silently proceed: {stderr}"
-        );
-    } else {
-        assert!(
-            stderr.contains("target_binding")
-                && stderr.contains("enforcing package target binding is supported only on Linux"),
-            "the refusal must name the unavailable native target binding: {stderr}"
-        );
-    }
+    assert!(
+        stderr.contains("tirith pkg install:")
+            && stderr.contains("private_input_execution_unqualified:"),
+        "the refusal must name the unqualified private-input backend: {stderr}"
+    );
     // The enforcing surface must NOT have installed into the target environment.
     assert!(
         !target.exists()
@@ -22209,20 +22206,133 @@ fn pkg_install_pip_json_still_fails_closed_when_toolchain_absent() {
         )
     });
     assert_eq!(json["success"], false);
-    assert_eq!(
-        json["error_phase"],
-        if cfg!(target_os = "linux") {
-            "plan_preparation"
-        } else {
-            "target_binding"
-        }
-    );
+    assert_eq!(json["error_phase"], "refused_before_exec");
+    assert!(json["reason"]
+        .as_str()
+        .unwrap()
+        .starts_with("private_input_execution_unqualified:"));
     assert_eq!(json["target_executed"], false);
     assert_eq!(json["target_published"], false);
     assert!(
         !target.exists(),
         "an early structured refusal must not create the dedicated target"
     );
+}
+
+/// Existing confirmation/degradation flags cannot qualify a disabled execution
+/// backend. Refusal must precede target binding and all package state creation.
+#[test]
+fn pkg_install_private_input_qualification_refuses_before_package_side_effects() {
+    for flags in [
+        Vec::<&str>::new(),
+        vec!["--yes"],
+        vec!["--allow-degraded"],
+        vec!["--yes", "--allow-degraded"],
+    ] {
+        for json in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let data = fixture.path().join("data-must-not-exist");
+            let config = fixture.path().join("config-must-not-exist");
+            let target = fixture.path().join("missing-parent").join("target");
+            let mut command = tirith();
+            command
+                .current_dir(fixture.path())
+                .env("HOME", fixture.path())
+                .env("USERPROFILE", fixture.path())
+                .env("XDG_CONFIG_HOME", &config)
+                .env("XDG_DATA_HOME", &data)
+                .env(
+                    "XDG_STATE_HOME",
+                    fixture.path().join("state-must-not-exist"),
+                )
+                .env(
+                    "XDG_CACHE_HOME",
+                    fixture.path().join("cache-must-not-exist"),
+                )
+                .env(
+                    "XDG_RUNTIME_DIR",
+                    fixture.path().join("runtime-must-not-exist"),
+                )
+                .env("APPDATA", &data)
+                .env("LOCALAPPDATA", &data)
+                .env("TIRITH_LOG", "0")
+                .args(["pkg", "install", "pip", "examplepkg==1.0.0", "--target"])
+                .arg(&target)
+                .args(&flags);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().expect("run public package refusal");
+            assert_eq!(output.status.code(), Some(1), "flags={flags:?}");
+            let reason = if json {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+                    .expect("one complete JSON refusal document");
+                assert_eq!(value["success"], false);
+                assert_eq!(value["error_phase"], "refused_before_exec");
+                assert_eq!(value["target_executed"], false);
+                assert_eq!(value["target_published"], false);
+                value["reason"].as_str().unwrap().to_owned()
+            } else {
+                assert!(output.stdout.is_empty());
+                String::from_utf8(output.stderr).expect("static refusal is UTF-8")
+            };
+            assert!(reason.contains("private_input_execution_unqualified:"));
+            assert!(reason.contains("Sudo or administrator access does not qualify"));
+            assert!(!data.exists(), "refusal must not create package state");
+            assert!(!config.exists(), "refusal must not create configuration");
+            assert!(!target.parent().unwrap().exists());
+            assert!(fs::read_dir(fixture.path()).unwrap().next().is_none());
+        }
+    }
+}
+
+/// A complete private-input argv and valid spec must hit qualification before
+/// platform setup or descriptor validation. The target is a harmless shell that
+/// would create a marker if reached; no package or namespace attack is attempted.
+#[cfg(unix)]
+#[test]
+fn hidden_capsule_private_inputs_refuse_before_target_execution() {
+    let fixture = tempfile::tempdir().unwrap();
+    let marker = fixture.path().join("target-executed");
+    let spec = tirith_core::capsule::CapsuleSpec::locked_down();
+    let spec_json = serde_json::to_string(&spec).unwrap();
+    let output = tirith()
+        .current_dir(fixture.path())
+        .args(["__capsule-child", &spec_json])
+        .args([
+            "--staging-root",
+            "/must-not-open-stage",
+            "--staging-fd",
+            "57",
+            "--input-fd",
+            "58",
+            "--input-name",
+            "approved.txt",
+            "--target-dir-fd",
+            "59",
+            "--target-dir-root",
+            "/must-not-open-target",
+            "--target-dir-visible-root",
+            "/must-not-open-pending-target",
+            "--",
+            "/bin/sh",
+            "-c",
+            r#"printf launched > "$1""#,
+            "private-input-refusal-test",
+        ])
+        .arg(&marker)
+        .output()
+        .expect("run hidden private-input refusal");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("private_input_execution_unqualified:"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("invalid capsule spec"));
+    assert!(output.stdout.is_empty());
+    assert!(!marker.exists(), "refused target must never execute");
+    assert!(fs::read_dir(fixture.path()).unwrap().next().is_none());
 }
 
 /// `tirith pkg install` only enforces `pip` in v1; a non-pip ecosystem must be a

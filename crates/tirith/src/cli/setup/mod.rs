@@ -22,6 +22,8 @@ pub(crate) mod recommended;
 #[path = "fs_helpers_windows_path.rs"]
 mod fs_helpers_windows_path;
 
+mod claude_config;
+mod claude_service;
 mod merge;
 mod shell_profile;
 pub(crate) mod shell_service;

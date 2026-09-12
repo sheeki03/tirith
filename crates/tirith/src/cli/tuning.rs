@@ -91,8 +91,8 @@ pub(crate) fn review(cwd: Option<&str>) -> Result<Value, String> {
     value["automatic_approval"] = false.into();
     value["annotations"] = annotations;
     value["examples"] = examples.into();
-    value["notice"] = "Counts and expectation labels describe recorded checks and user intent. They do not establish command safety, execution, or a safe policy relaxation.".into();
-    value["next_action"] = "Review the recorded examples, then supply a representative command to 'tirith policy simulate'. Compare the effective policy and remaining restrictions before explicitly reviewing a profile or scoped exception change.".into();
+    value["notice"] = "Counts and expectation labels describe recorded checks and user intent, not confirmed execution or validated false positives. They do not establish command safety. No safe relaxation is established by recorded outcomes alone.".into();
+    value["next_action"] = "Review the recorded examples and 'tirith policy effective --runtime', then compare a representative command with 'tirith policy simulate'. Apply any reviewed relaxation only to an operator-writable user or organization policy. Repository policy cannot lower severity or suppress findings. A profile or scoped exception change still needs an explicit review.".into();
     value["coverage"] = json!({"record_limit":500,"byte_limit":2097152,
         "inspected_bytes":history.inspected_bytes,"earlier_history_uninspected":history.earlier_history_uninspected,
         "more_available":history.more_available,"malformed_lines":history.malformed_lines,

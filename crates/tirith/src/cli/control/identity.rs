@@ -134,9 +134,19 @@ impl BinaryIdentity {
     }
 
     pub fn capture(path: &Path) -> Result<Self, String> {
+        Self::capture_with_empty_input(path, false)
+    }
+
+    /// Retain an inert regular-file input with the same native generation and
+    /// no-concurrent-writer rules. Empty hooks are valid; empty binaries are not.
+    pub(crate) fn capture_input(path: &Path) -> Result<Self, String> {
+        Self::capture_with_empty_input(path, true)
+    }
+
+    fn capture_with_empty_input(path: &Path, allow_empty: bool) -> Result<Self, String> {
         let mut file = open_binary_identity_file(path)?;
         let generation = native::generation(&file)?;
-        if generation.size == 0 || generation.size > 512 * 1024 * 1024 {
+        if (!allow_empty && generation.size == 0) || generation.size > 512 * 1024 * 1024 {
             return Err("binary size exceeds identity limit".into());
         }
         let mut hash = Sha256::new();
@@ -213,7 +223,7 @@ fn open_binary_identity_file(path: &Path) -> Result<File, String> {
             .open(path)
             .map_err(|_| "cannot retain a binary without concurrent write access")?;
         let generation = native::generation(&file)?;
-        if generation.size == 0 || generation.size > 512 * 1024 * 1024 {
+        if generation.size > 512 * 1024 * 1024 {
             return Err("binary size exceeds identity limit".into());
         }
         Ok(file)

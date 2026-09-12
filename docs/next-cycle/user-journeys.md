@@ -52,9 +52,20 @@ Restart the host and inspect its configured hook or MCP integration. Run a
 harmless check through that actual host and inspect its returned decision.
 Only an integration that can withhold the real operation may report observed
 blocking. A diagnostic child process or a warn-only host does not establish
-that capability. Combined personal setup refuses selected agents until their
-automatic installed-candidate scope is certified; the explicit host workflow
-remains available with its actual documented limits.
+that capability. The current combined personal setup supports a narrow native
+Claude host and interpreter tuple on macOS ARM:
+
+```sh
+tirith setup recommended --scope user --shell zsh --agent claude-code --dry-run
+tirith setup recommended --scope user --shell zsh --agent claude-code
+```
+
+Setup checks the actual host, interpreter and owned configuration before applying
+the reviewed operation. Start a fresh host after publication: an existing host
+can miss the hook on its next turn. The supported tuple and actual host evidence
+are recorded in [Claude qualification](claude-native-evidence.md). Other combined
+agent selections remain unavailable; use their explicit workflow with its
+documented limits. An MCP connection alone does not intercept terminal commands.
 
 ## Inspect a project
 

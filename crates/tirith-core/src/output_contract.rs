@@ -13,6 +13,11 @@ pub enum Projection {
     SafeSuggestion,
     Run,
     RunReceipt,
+    ArtifactReceipt,
+    ArtifactReceiptVerdict,
+    ArtifactReceiptCapsule,
+    ArtifactReceiptNpm,
+    ArtifactReceiptNpmArtifact,
     Score,
     ScoreFactor,
     Install,
@@ -91,6 +96,14 @@ pub(crate) fn project_sensitive_strings(
                         Projection::Verdict
                     }
                     (Projection::Run, "receipt") => Projection::RunReceipt,
+                    (Projection::ArtifactReceipt, "verdict") => Projection::ArtifactReceiptVerdict,
+                    (Projection::ArtifactReceipt, "capsule") => Projection::ArtifactReceiptCapsule,
+                    (Projection::ArtifactReceipt, "npm_verification") => {
+                        Projection::ArtifactReceiptNpm
+                    }
+                    (Projection::ArtifactReceiptNpm, "artifacts") => {
+                        Projection::ArtifactReceiptNpmArtifact
+                    }
                     (Projection::Score, "score_breakdown") => Projection::Score,
                     (Projection::Score, "factors") => Projection::ScoreFactor,
                     (Projection::InstallUrl, "preflight") => Projection::Verdict,
@@ -132,6 +145,26 @@ fn token(value: &Value, tokens: &[&str]) -> bool {
     value.as_str().is_some_and(|text| tokens.contains(&text))
 }
 
+fn lower_sha256(value: &Value) -> bool {
+    value.as_str().is_some_and(|v| {
+        v.len() == 64
+            && v.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+// Receipt producers emit RFC3339 with at most nanosecond precision. Parsed
+// timestamps with an arbitrary numeric suffix are not a protocol exemption.
+fn receipt_timestamp(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        text.len() <= 35
+            && text.split_once('.').is_none_or(|(_, suffix)| {
+                matches!(suffix.bytes().take_while(u8::is_ascii_digit).count(), 1..=9)
+            })
+            && chrono::DateTime::parse_from_rfc3339(text).is_ok()
+    })
+}
+
 fn protocol_field(schema: Projection, key: &str, value: &Value) -> bool {
     use Projection::*;
     match (schema, key) {
@@ -142,13 +175,72 @@ fn protocol_field(schema: Projection, key: &str, value: &Value) -> bool {
         (Score | InstallPackage, "risk_level") => {
             token(value, &["low", "medium", "high", "critical"])
         }
+        (ArtifactReceipt, "receipt_id" | "private_receipt_id" | "policy_hash") => {
+            lower_sha256(value)
+        }
+        (ArtifactReceipt, "artifact_sha256") => value
+            .as_array()
+            .is_some_and(|values| values.iter().all(lower_sha256)),
+        (ArtifactReceipt, "engine_build_sha") => {
+            token(value, &["unknown"])
+                || value.as_str().is_some_and(|v| {
+                    matches!(v.len(), 40 | 64)
+                        && v.bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+        }
+        (ArtifactReceipt, "publication_state") => token(
+            value,
+            &[
+                "legacy_unspecified",
+                "private_verified",
+                "committed",
+                "npm_private_verified",
+                "npm_committed",
+            ],
+        ),
+        (ArtifactReceipt, "timestamp") => receipt_timestamp(value),
+        (ArtifactReceiptCapsule, "backend_id") => token(
+            value,
+            &["landlock-seccomp", "seatbelt", "appcontainer", "noop"],
+        ),
+        (ArtifactReceiptNpm, "contract") => token(value, &[crate::artifact::npm_install::CONTRACT]),
+        (ArtifactReceiptNpm, "operation_id") => value.as_str().is_some_and(|text| {
+            uuid::Uuid::parse_str(text)
+                .ok()
+                .is_some_and(|id| id.to_string() == text)
+        }),
+        (ArtifactReceiptNpm, "node_version") => {
+            token(value, &[crate::artifact::npm_install::tools::NODE_VERSION])
+        }
+        (ArtifactReceiptNpm, "npm_version") => {
+            token(value, &[crate::artifact::npm_install::tools::NPM_VERSION])
+        }
+        (
+            ArtifactReceiptNpm,
+            "node_sha256" | "npm_tree_sha256" | "runtime_pack_sha256" | "output_tree_sha256",
+        )
+        | (ArtifactReceiptNpmArtifact, "artifact_sha256" | "manifest_sha256") => {
+            lower_sha256(value)
+        }
+        (ArtifactReceiptNpm, "lifecycle_scripts") => {
+            canonical::<crate::artifact::npm_install::receipt_evidence::NpmLifecycleMode>(value)
+        }
+        (ArtifactReceiptNpm, "dependency_graph") => {
+            canonical::<crate::artifact::npm_install::receipt_evidence::NpmDependencyGraph>(value)
+        }
+        (ArtifactReceiptNpm, "code_safety") => {
+            canonical::<crate::artifact::npm_install::receipt_evidence::NpmCodeSafety>(value)
+        }
+        (ArtifactReceiptVerdict, "action") => token(value, &["Allow", "Warn", "WarnAck", "Block"]),
+        (ArtifactReceiptVerdict, "rule_ids") => value
+            .as_array()
+            .is_some_and(|items| items.iter().all(canonical::<crate::verdict::RuleId>)),
         (RunReceipt, "sha256") => value
             .as_str()
             .is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())),
         (RunReceipt, "privilege") => token(value, &["user", "normal", "elevated"]),
-        (RunReceipt, "timestamp") => value
-            .as_str()
-            .is_some_and(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok()),
+        (RunReceipt, "timestamp") => receipt_timestamp(value),
         (ScoreFactor, "id") => token(
             value,
             &[
@@ -401,5 +493,136 @@ mod tests {
         );
         assert_eq!(value["action"], "allow");
         assert!(!value.to_string().contains(&secret));
+    }
+
+    fn npm_summary() -> Value {
+        use crate::artifact::npm_install::{receipt_evidence::*, tools, CONTRACT};
+        let summary = NpmVerificationSummary {
+            schema_version: 1,
+            contract: CONTRACT.into(),
+            operation_id: "24e924ab-8440-46dd-9faf-9b6105d24c0d".into(),
+            node_version: tools::NODE_VERSION.into(),
+            node_sha256: tools::NODE_SHA256.into(),
+            npm_version: tools::NPM_VERSION.into(),
+            npm_tree_sha256: tools::NPM_TREE_SHA256.into(),
+            runtime_pack_sha256: "a".repeat(64),
+            artifacts: vec![NpmArtifactVerification {
+                artifact_sha256: "b".repeat(64),
+                manifest_sha256: "c".repeat(64),
+            }],
+            output_tree_sha256: "d".repeat(64),
+            files_verified: 2,
+            directories_verified: 3,
+            bytes_verified: 7,
+            lifecycle_scripts: NpmLifecycleMode::Disabled,
+            dependency_graph: NpmDependencyGraph::LocalLeafOnly,
+            code_safety: NpmCodeSafety::NotEstablished,
+        };
+        summary.validate_stored().unwrap();
+        serde_json::to_value(summary).unwrap()
+    }
+
+    #[test]
+    fn npm_receipt_projection_preserves_typed_evidence_and_redacts_unknown_content() {
+        let original = npm_summary();
+        let mut receipt = json!({"npm_verification":original,
+            "manifest":{"contract":"LocalLeafNoScriptsV1","secret":"operator-secret"},
+            "argv":["operator-secret"]});
+        receipt["npm_verification"]["future_content"] =
+            json!({"node_sha256":"a".repeat(64),"path":"operator-secret"});
+        receipt["npm_verification"]["artifacts"][0]["manifest"] = json!("operator-secret");
+        redact_projection(&mut receipt, Projection::ArtifactReceipt, &broad_patterns());
+        let summary = &mut receipt["npm_verification"];
+        let future = summary
+            .as_object_mut()
+            .unwrap()
+            .remove("future_content")
+            .unwrap();
+        assert_eq!(future["node_sha256"], "[REDACTED:custom]");
+        assert_eq!(future["path"], "[REDACTED:custom]");
+        assert_eq!(
+            summary["artifacts"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("manifest")
+                .unwrap(),
+            "[REDACTED:custom]"
+        );
+        assert_eq!(*summary, original);
+        assert_eq!(receipt["manifest"]["contract"], "[REDACTED:custom]");
+        assert_eq!(receipt["argv"][0], "[REDACTED:custom]");
+        assert!(!receipt.to_string().contains("operator-secret"));
+    }
+
+    #[test]
+    fn npm_receipt_projection_rejects_edited_protocol_tokens_and_wrong_positions() {
+        let mut summary = npm_summary();
+        for key in [
+            "contract",
+            "node_version",
+            "npm_version",
+            "lifecycle_scripts",
+            "dependency_graph",
+            "code_safety",
+        ] {
+            summary[key] = json!("operator-secret");
+        }
+        summary["operation_id"] = json!("24E924AB-8440-46DD-9FAF-9B6105D24C0D");
+        summary["runtime_pack_sha256"] = json!("A".repeat(64));
+        summary["artifacts"][0]["manifest_sha256"] = json!("operator-secret");
+        let mut receipt = json!({"npm_verification":summary,
+            "future_npm_verification":npm_summary()});
+        redact_projection(&mut receipt, Projection::ArtifactReceipt, &broad_patterns());
+        for key in [
+            "contract",
+            "operation_id",
+            "node_version",
+            "npm_version",
+            "runtime_pack_sha256",
+            "lifecycle_scripts",
+            "dependency_graph",
+            "code_safety",
+        ] {
+            assert_eq!(
+                receipt["npm_verification"][key], "[REDACTED:custom]",
+                "{key}"
+            );
+        }
+        assert_eq!(
+            receipt["npm_verification"]["artifacts"][0]["manifest_sha256"],
+            "[REDACTED:custom]"
+        );
+        assert_eq!(
+            receipt["future_npm_verification"]["contract"],
+            "[REDACTED:custom]"
+        );
+        assert_eq!(
+            receipt["future_npm_verification"]["artifacts"][0]["artifact_sha256"],
+            "[REDACTED:custom]"
+        );
+        assert!(!receipt.to_string().contains("operator-secret"));
+    }
+
+    #[test]
+    fn receipt_timestamps_preserve_produced_precision_but_refuse_hidden_numeric_suffixes() {
+        for schema in [Projection::ArtifactReceipt, Projection::RunReceipt] {
+            for timestamp in [
+                "2026-09-12T00:00:00Z",
+                "2026-09-12T00:00:00.123456789+00:00",
+            ] {
+                let mut receipt = json!({"timestamp":timestamp});
+                redact_projection(&mut receipt, schema, &broad_patterns());
+                assert_eq!(receipt["timestamp"], timestamp);
+            }
+            for timestamp in [
+                "2026-09-12T00:00:00.1234567890Z".to_owned(),
+                format!("2026-09-12T00:00:00.{}Z", "1234567890".repeat(100)),
+                "2026-09-12T00:00:00.operator-secretZ".to_owned(),
+            ] {
+                let mut receipt = json!({"timestamp":timestamp});
+                redact_projection(&mut receipt, schema, &broad_patterns());
+                assert_eq!(receipt["timestamp"], "[REDACTED:custom]");
+            }
+        }
     }
 }

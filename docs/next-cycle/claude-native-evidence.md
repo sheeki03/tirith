@@ -42,3 +42,59 @@ python3 scripts/certify-claude-host.py \
 Pass `--failure-controls` to additionally exercise missing interpreter/checker, hook crash, checker deadline, deliberately shortened host timeout and unmatched Write cases. A passing boundary control means the observed result matched the documented limitation; it does not mean that surface blocked execution. Each case records its scope separately.
 
 This harness requires the real host. It runs the setup-installed hook through the host's actual tool dispatch; direct Python hook invocation and fabricated hook events do not count as native-host evidence. Provider responses are deliberately scripted over loopback, and the host starts with an environment allowlist and isolated configuration roots. Native Windows, other agent hosts, live-provider behavior and real beginner usability remain separate qualification requirements.
+
+The same harness exposes two additional, separately reported routes. They require
+real recommended setup and the host's normal user settings discovery, both within
+a fresh temporary HOME. Select one route per new report:
+
+```sh
+python3 scripts/certify-claude-host.py \
+  --route mcp-only \
+  --setup-mode recommended --settings-loading default-user \
+  --tirith /absolute/path/tirith \
+  --claude /absolute/path/native-claude \
+  --claude-invocation /absolute/path/claude \
+  --python /absolute/path/python3 \
+  --output /absolute/path/claude-mcp-only-report.json
+```
+
+Use `--route retained-host-reload` with a different output path for the reload
+route. The `claude` PATH invocation must resolve to the selected native host, and
+the setup-installed Python runtime must match the independently discovered
+runtime. Existing reports are never overwritten. The default `hooks` route and
+its nine cases selected by `--failure-controls` remain unchanged.
+
+The MCP-only route removes the hook from the isolated generated settings, connects
+the actual selected candidate's `mcp-server`, and requires the host to report that
+connection. It then requires the independently policy-denied Bash marker to run
+exactly once without hook events. Passing this control demonstrates the boundary
+of MCP access; it does not certify automatic Bash interception.
+
+The reload route starts one host before the hook exists, completes a no-tool
+initialization turn, and publishes real recommended setup while retaining that
+process. It records the next turn immediately after publication, a later turn in
+the same process after a policy recheck, and a separate fresh host. Each retained
+turn may either observe the hook and block or omit the hook and execute the marker
+once; ambiguous or errored results fail the fixture. The fresh host must observe
+the hook and block without an additional marker. Elapsed time from setup is
+recorded. These are observations of exact host turns, not a universal hot reload
+guarantee or a promise of immediate activation.
+
+Reports bind candidate, native host, Python invocation/runtime, PATH alias,
+harness, generated settings/hook, policy and captured process output hashes. Policy
+before setup is recorded separately because recommended setup can legitimately
+change it; the published policy must remain unchanged during the observed turns.
+All input executable hashes and resolved identities are checked again after the
+route. Output is capped at 4 MiB per process, streaming lines at 1 MiB, input writes
+at five seconds and each host turn at 90 seconds. Every child gets a private
+process group; termination, reap and pipe drainage have finite deadlines. The
+loopback provider has bounded requests, connections and socket deadlines. Fixture
+cleanup failures cannot produce a passing report.
+
+Run `python3 scripts/test-certify-claude-host.py` for the harness regressions. These
+include bounded real subprocesses and a fake host using the real loopback provider,
+with immediate omission, later blocking, fresh-host blocking and absent-MCP
+connection controls. They validate the certification harness, not Tirith or Claude
+enforcement. Previously retained native reports remain tied to their original
+one-off driver hashes; these repeatable routes need fresh native reports for each
+candidate they qualify.

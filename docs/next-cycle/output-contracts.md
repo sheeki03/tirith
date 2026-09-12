@@ -108,3 +108,21 @@ it is not canonical or round-trip editable, and its enforcement-posture hash is
 not a full policy revision identity. Support exports and future browser output
 still require bounded content, fresh redaction and explicit signed/display
 separation before their work packages can close.
+
+
+## Bounded saved receipt access
+
+CLI views and the public Rust download/artifact receipt readers share one bounded
+store reader. A record is limited to 1 MiB; inventory to 10,000 entries and 16 MiB
+of record bytes; cached script verification streams at most the downloader's
+10 MiB ceiling. Oversized historical metadata returns an explicit read-limit
+error. The writer's historical format and signed bytes are not rewritten.
+
+Files must be native regular files opened without following a leaf symlink.
+Embedded download hashes and artifact receipt IDs must match their requested
+filenames. Invalid inventory is an error rather than an empty history; valid
+download and artifact schema 1/2/3 records can share the directory. Public list
+methods retain newest-first ordering. Loading a record for inspection does not
+validate its signature, content address or publication authority. Those checks
+remain mandatory at the corresponding authority boundary. Read diagnostics use
+static descriptions without echoing stored content.

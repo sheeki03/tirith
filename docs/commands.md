@@ -22,7 +22,7 @@ covers the everyday subset; this is the complete reference.
 | `tirith preview -- <cmd>` | Simulate the filesystem blast radius of `rm` / `mv` / `chmod -R` / `rsync --delete` without running it |
 | `tirith watch -- <cmd>` | Run a command, then diff its filesystem, `$PATH`, and shell-rc impact |
 | `tirith temp-run -- <cmd>` | Run a command in a throwaway temp directory and diff its file impact (file isolation, not a sandbox) |
-| `tirith capsule run --preset untrusted-project --project <dir> -- <cmd>` | Copy an untrusted project into a held ephemeral directory and run an exact argv inside a fail-closed OS capsule, emitting a signed receipt. Enforceable on x86_64 Linux only; every other host refuses before anything is copied or spawned, and there is no degraded fallback |
+| `tirith capsule run --preset untrusted-project --project <dir> -- <cmd>` | Copy an untrusted project into a held ephemeral directory and run an exact argv inside a fail-closed OS capsule, emitting a signed receipt. Enforceable on native x86_64 and AArch64 Linux with usable Landlock and seccomp; hosts missing required controls refuse before anything is copied or spawned, and there is no degraded fallback |
 | `tirith taint {list,explain,clear}` | Track files downloaded from risky sources; executing or sourcing a tainted file fires a finding |
 | `tirith intend "<intent>" -- <cmd>` | Flag high-impact behavior the stated intent does not justify (advisory) |
 | `tirith task check` | Preview. Diagnostically assess an untrusted task envelope (issue body, PDF, web page) and report which effects it would be allowed. Executes nothing, fetches nothing, resolves no package, writes nothing, and declares `enforceability: observe_only` (`--file`, `--adapter`, `--format json`) |
@@ -105,7 +105,7 @@ covers the everyday subset; this is the complete reference.
 | Command | What it does |
 |---------|-------------|
 | `tirith pkg approve <backend> <spec>` | Resolve and inspect a requirement set and approve its install plan, printing the plan digest the approval binds to. Does not install |
-| `tirith pkg install <backend> <spec>` | Resolve, inspect, and install only the verified hash-pinned bytes inside the containment capsule, with a tamper-evident receipt. Enforcing execution is x86_64 Linux-only; every other platform fails closed before pip starts |
+| `tirith pkg install <backend> <spec>` | Currently disabled on every host pending private-input qualification. Refuses with `private_input_execution_unqualified` before resolver, quarantine, checkpoint, or package execution; flags and elevation do not enable it |
 | `tirith pkg verify-env` | Verify an already-installed environment's RECORD integrity without installing anything |
 | `tirith pkg trust-tool` | Enroll a fully static native Linux `uv` executable by canonical path and SHA-256 |
 | `tirith pkg graph` | Compose a provenance graph (ownership / execution / payload) over a wheel set or an installed environment. Read model only |
