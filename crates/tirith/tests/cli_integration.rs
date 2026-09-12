@@ -21997,7 +21997,9 @@ fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if action == "approve" && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        if action == "approve" && stderr.contains("Native package-approval issuance is off:") {
+            assert!(stderr.contains("Command checks and shell protection do not require"));
+        } else if action == "approve" && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             assert!(
                 stderr.contains("package approvals are redeemable only on x86_64 Linux"),
                 "pkg approve must report its native capability boundary: {stderr}"
