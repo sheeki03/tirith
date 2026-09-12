@@ -60,6 +60,10 @@ struct Cli {
     #[arg(long)]
     compiler_metadata: Option<PathBuf>,
 
+    /// Read-only upstream observations, bound into signed compiler metadata.
+    #[arg(long, requires_all = ["source_provenance", "compiler_metadata"])]
+    upstream_observations: Option<PathBuf>,
+
     /// Feodo Tracker IP blocklist file
     #[arg(long)]
     feodo: Option<PathBuf>,
@@ -3165,6 +3169,59 @@ struct CompilerParseMetadata {
     source_transaction_sha256: Option<String>,
     registry_snapshot_sha256: Option<String>,
     sources: BTreeMap<String, CompilerParserCounts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_observations: Option<tirith_core::threatdb::operations::UpstreamObservations>,
+}
+
+fn load_upstream_observations(
+    path: &Path,
+    provenance_path: &Path,
+) -> FeedResult<tirith_core::threatdb::operations::UpstreamObservations> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| {
+            file.take(MAX_SOURCE_PROVENANCE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|error| format!("cannot read upstream observations: {error}"))?;
+    if bytes.len() > MAX_SOURCE_PROVENANCE_BYTES {
+        return Err("upstream observations exceed byte cap".into());
+    }
+    let observations: tirith_core::threatdb::operations::UpstreamObservations =
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid upstream observations: {error}"))?;
+    observations.validate()?;
+    if chrono::DateTime::parse_from_rfc3339(&observations.checked_at)
+        .map_err(|_| "invalid upstream observation time")?
+        > chrono::Utc::now()
+    {
+        return Err("upstream observation time is in the future".into());
+    }
+    let provenance: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(provenance_path)
+            .map_err(|error| format!("cannot read source provenance: {error}"))?,
+    )
+    .map_err(|error| format!("invalid source provenance: {error}"))?;
+    for (source, observation) in &observations.sources {
+        if provenance[source]["commit"].as_str() != Some(observation.pinned_commit.as_str()) {
+            return Err(format!(
+                "upstream observation for {source} does not bind the compiled source pin"
+            ));
+        }
+        if !observation.review_required {
+            let published = provenance[source]["commit_timestamp"]
+                .as_str()
+                .ok_or("observed source is missing its commit timestamp")?;
+            let published = chrono::DateTime::parse_from_rfc3339(published)
+                .map_err(|_| "invalid observed source commit time")?;
+            let candidate = chrono::DateTime::parse_from_rfc3339(&observation.candidate_timestamp)
+                .map_err(|_| "invalid observed candidate commit time")?;
+            if published != candidate {
+                return Err("unchanged observed source has a different commit timestamp".into());
+            }
+        }
+    }
+    Ok(observations)
 }
 
 /// First generation-index schema whose version is part of the signed payload.
@@ -4177,11 +4234,13 @@ fn fetch_registry_document(
     accept: &str,
     label: &str,
 ) -> FeedResult<(u16, String, Vec<u8>)> {
-    let response = client
-        .get(url.clone())
-        .header(reqwest::header::ACCEPT, accept)
-        .send()
-        .map_err(|error| format!("registry snapshot request for {label} failed: {error}"))?;
+    let response = tirith_core::threatdb::operations::send_with_retry(
+        client
+            .get(url.clone())
+            .header(reqwest::header::ACCEPT, accept),
+        std::time::Duration::from_secs(60),
+    )
+    .map_err(|error| format!("registry snapshot request for {label}: {error}"))?;
     let http_status = response.status().as_u16();
     if http_status != 200 && http_status != 404 {
         return Err(format!(
@@ -5089,6 +5148,18 @@ fn main() {
             .as_ref()
             .map(|binding| binding.registry_snapshot_sha256.clone()),
         sources: parser_sources,
+        upstream_observations: cli.upstream_observations.as_ref().map(|path| {
+            load_upstream_observations(
+                path,
+                cli.source_provenance
+                    .as_deref()
+                    .expect("clap requires provenance"),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            })
+        }),
     };
     let compiler_metadata_data = cli.compiler_metadata.as_ref().map(|_| {
         let value = serde_json::to_value(&compiler_metadata).unwrap_or_else(|error| {
@@ -6591,6 +6662,62 @@ mod tests {
         let error =
             fetch_registry_document(&client, &url, NPM_REGISTRY_MEDIA_TYPE, "broken").unwrap_err();
         assert!(error.contains("returned 503"), "{error}");
+    }
+
+    #[test]
+    fn registry_retries_rate_limits_but_never_invalid_successful_documents() {
+        let mut server = mockito::Server::new();
+        let limited = server
+            .mock("GET", "/retry")
+            .with_status(429)
+            .with_header("retry-after", "0")
+            .expect(1)
+            .create();
+        let success = server
+            .mock("GET", "/retry")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"name":"example","versions":{"1.0.0":{}}}"#)
+            .expect(1)
+            .create();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let url = url::Url::parse(&format!("{}/retry", server.url())).unwrap();
+        let (status, _, _) =
+            fetch_registry_document(&client, &url, JSON_MEDIA_TYPE, "example").unwrap();
+        assert_eq!(status, 200);
+        limited.assert();
+        success.assert();
+
+        let invalid = server
+            .mock("GET", "/invalid")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("<html>upstream error</html>")
+            .expect(1)
+            .create();
+        let url = url::Url::parse(&format!("{}/invalid", server.url())).unwrap();
+        let (status, media, bytes) =
+            fetch_registry_document(&client, &url, JSON_MEDIA_TYPE, "example").unwrap();
+        let key = RegistryPackageKey {
+            ecosystem: Ecosystem::Npm,
+            name: "example".into(),
+        };
+        assert!(registry_snapshot_package_from_response(&key, status, media, &bytes).is_err());
+        invalid.assert();
+
+        let deferred = server
+            .mock("GET", "/defer")
+            .with_status(503)
+            .with_header("retry-after", "120")
+            .expect(1)
+            .create();
+        let url = url::Url::parse(&format!("{}/defer", server.url())).unwrap();
+        assert!(fetch_registry_document(&client, &url, JSON_MEDIA_TYPE, "example").is_err());
+        deferred.assert();
     }
 
     #[test]
@@ -8664,6 +8791,7 @@ mod tests {
             source_transaction_sha256: Some("11".repeat(32)),
             registry_snapshot_sha256: Some("22".repeat(32)),
             sources,
+            upstream_observations: None,
         };
         let bytes = serde_json::to_vec(&serde_json::to_value(&document).unwrap()).unwrap();
         let directory = tempfile::tempdir().unwrap();

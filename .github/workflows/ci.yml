@@ -39,8 +39,11 @@ jobs:
           python3 .github/scripts/threatdb_source_pins.py validate \
             .github/threatdb-source-pins.json
           python3 .github/scripts/test_threatdb_source_pins.py
+          python3 .github/scripts/test-threatdb-operations.py
       - name: Validate fail-closed ThreatDB fetch orchestration
         run: bash .github/scripts/test-fetch-threatdb-sources.sh
+      - name: Validate signed release compatibility payload generation
+        run: python3 .github/scripts/test-release-compatibility.py
       - name: Validate ThreatDB manifest transition fixtures
         run: bash .github/scripts/test-threatdb-manifest-transition.sh
       - name: Refuse a stale ThreatDB manifest transition
@@ -126,14 +129,24 @@ jobs:
         run: node tests/ipython-vector-extraction.mjs
       - name: npm launcher exit and signal contract
         run: node tests/npm-launcher.mjs
+      - name: Windows user installer release contract
+        if: matrix.name == 'Windows'
+        shell: pwsh
+        run: ./tests/windows-install.ps1
       - name: Install interactive shell conformance dependencies
         if: matrix.name == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes fish zsh
+      - name: Native shell tracing does not disclose private capabilities
+        if: matrix.name == 'Linux'
+        run: python3 tests/shell-trace-capability.py --require-shell bash --require-shell zsh --require-shell fish
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --locked
+      - name: Native capsule supervisor and guard interruption
+        if: matrix.name == 'Linux'
+        run: .github/scripts/test-native-capsule-lifetime.sh target/debug/tirith
       - name: Production capsule reviewed-file receipt
         if: matrix.name == 'Linux'
         env:
@@ -281,6 +294,10 @@ jobs:
         run: sh tests/install-sh/verify_sha256.sh
       - name: package-approval helper return-path tests
         run: sh tests/install-sh/package_approval_helper_returns.sh
+      - name: Optional approval helper installation tests
+        run: sh tests/install-sh/optional_helper.sh
+      - name: Paired installer rollback tests
+        run: sh tests/install-sh/paired_rollback.sh
 
   artifact-roundtrip-produce:
     name: Artifact protocol (upload)

@@ -1,7 +1,8 @@
 # Output privacy and compatibility contracts
 
-Status: the MCP boundary correction is implemented. WP03 remains open for the
-other CLI, signed display, support-export and browser contracts listed below.
+Status: the MCP correction has regression evidence. CLI and history projection
+extensions are implemented and awaiting their current-revision regression run.
+WP03 remains open for the remaining signed display, support and browser audit.
 
 ## Implemented boundary inventory
 
@@ -16,8 +17,8 @@ other CLI, signed display, support-export and browser contracts listed below.
 | MCP cloaking | Fixed probe profile names and task-boundary enums | URL, remote diff content, finding content, error text, unexpected profile names | The remote output filter still runs. Custom DLP then applies to the content projection. |
 | `tirith://project-safety` resource | Exact generated URI, MIME and scan protocol fields | Scan content inside the resource's JSON text | Parse and redact the scan projection before encoding it as resource text; do not redact the JSON string as prose. |
 
-The implementation is in `crates/tirith-core/src/mcp/output_contract.rs`. It is
-private to Tirith-owned MCP producers. External/upstream MCP payloads continue
+The shared implementation is in `crates/tirith-core/src/output_contract.rs`.
+Tirith-owned producers select an explicit schema. External/upstream MCP payloads continue
 through `output_filter`; an upstream server cannot select these exemptions.
 
 An exemption depends on both schema position and a canonical value. A field
@@ -87,10 +88,15 @@ digests and completeness markers. Additional cases pin built-in secret redaction
 unknown fields and malformed protocol values. Existing output-filter, bound and
 policy-diagnostic tests remain applicable.
 
-Remaining boundaries with generic whole-projection redaction include CLI
-`commands`, `fetch`, `install`, `paste`, `run`, `scan`, `score`, and shared
-`output.rs` helpers. These need individual schemas, including receipt displays;
-they must not import MCP exemptions as a global key allowlist. The policy
+CLI `commands` decisions, `fetch` task assessments, `install`, `paste`, `run`,
+`scan`, `score`, and shared `output.rs` now select schemas at their producing
+boundaries. Run receipt displays preserve validated digest/time/privilege fields
+while URLs, paths and analysis prose receive DLP. Safe suggestions retain their
+rule identity; an executable suggestion is omitted when its display would alter
+the analyzed bytes. History displays contain no signature or chain hash, retain
+canonical actions/rules/timestamps, and freshly redact recorded content. These
+extensions have additional tests but are not yet included in the prior evidence
+count. Schemas are not a global key allowlist. The policy
 snapshot work in this cycle has its own explicitly redacted display projection;
 it is not canonical or round-trip editable, and its enforcement-posture hash is
 not a full policy revision identity. Support exports and future browser output

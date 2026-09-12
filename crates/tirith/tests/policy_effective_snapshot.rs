@@ -40,7 +40,14 @@ fn legacy_offline_default_and_explicit_runtime_have_honest_coverage() {
     state.set_env("TIRITH_API_KEY", "fixture-key");
     let default = json(&run(&state, &["--json"]));
     let offline = json(&run(&state, &["--local-only", "--format", "json"]));
-    assert_eq!(default, offline);
+    // Each resolution has distinct opaque input identities; its policy and
+    // coverage contract remain equivalent across the two offline spellings.
+    assert_eq!(default["policy"], offline["policy"]);
+    assert_eq!(default["scope"], offline["scope"]);
+    assert_ne!(
+        default["resolution"]["snapshot_identity"],
+        offline["resolution"]["snapshot_identity"]
+    );
     assert_eq!(default["resolution"]["mode"], "local_only");
     assert_eq!(
         default["resolution"]["remote_configuration_resolved"],
@@ -51,6 +58,12 @@ fn legacy_offline_default_and_explicit_runtime_have_honest_coverage() {
     let runtime = json(&run(&state, &["--runtime", "--json"]));
     assert_eq!(runtime["resolution"]["mode"], "runtime");
     assert_eq!(runtime["policy"]["fail_mode"], "closed");
+    assert_eq!(
+        runtime["resolution"]["remote"]["availability"],
+        "unavailable"
+    );
+    assert_eq!(runtime["resolution"]["remote"]["fallback"], "fail_closed");
+    assert!(runtime["resolution"].get("unavailable_evidence").is_none());
     assert!(runtime["policy"]["custom_rules"]
         .as_array()
         .unwrap()
@@ -85,6 +98,15 @@ fn primary_source_matches_resolved_user_policy_when_repository_tightens() {
             .ends_with(std::path::Path::new("tirith").join("policy.yaml"))
     );
     assert_eq!(output["policy"]["paranoia"], 3);
+    assert_eq!(
+        output["resolution"]["field_provenance"]["paranoia"]["effective_source"]["kind"],
+        "repo"
+    );
+    assert!(output["resolution"]["input_revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|input| input["source"]["kind"] == "user_list"));
     assert_eq!(
         output["policy"]["blocklist"],
         serde_json::json!(["user-denial.example"])
@@ -127,6 +149,21 @@ dlp_custom_patterns: ['.+']
         64
     );
     assert_eq!(value["resolution"]["policy_is_redacted_display"], true);
+    assert_eq!(
+        value["resolution"]["remote"]["availability"],
+        "not_queried_local_only"
+    );
+    assert_eq!(
+        value["resolution"]["snapshot_identity"]
+            .as_str()
+            .unwrap()
+            .len(),
+        36
+    );
+    for input in value["resolution"]["input_revisions"].as_array().unwrap() {
+        assert_eq!(input["revision"].as_str().unwrap().len(), 36);
+        assert!(["present", "absent", "unreadable"].contains(&input["state"].as_str().unwrap()));
+    }
 }
 
 #[test]

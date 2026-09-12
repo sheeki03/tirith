@@ -1,5 +1,13 @@
 use std::io::Write;
 
+pub mod audit_retention;
+pub mod feedback;
+pub mod project_review;
+pub mod recommended_setup;
+pub mod shell_verification;
+pub mod support_bundle;
+pub mod tuning;
+
 /// Output format for commands that support human and JSON output.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum HumanJsonFormat {
@@ -1648,6 +1656,7 @@ pub mod command_card;
 pub mod commands;
 pub mod completions;
 pub mod context;
+pub(crate) mod control;
 pub mod daemon;
 pub mod dashboard;
 pub mod devcontainer;
@@ -1659,6 +1668,7 @@ pub mod exec;
 pub mod explain;
 pub mod fix;
 pub mod gateway;
+pub mod history;
 pub mod hook_event;
 pub mod hooks;
 pub mod hygiene;
@@ -1684,6 +1694,7 @@ pub mod mcp_server;
 /// a clean receipt means npm's signature check passed, never that the package
 /// code is benign. The spawn / rendering half of
 /// [`tirith_core::provenance::npm`].
+pub mod npm_artifact;
 pub mod npm_integrity;
 pub mod onboard;
 pub mod output_guard;
@@ -1706,7 +1717,10 @@ pub mod pkg;
 pub mod pkg_install;
 pub mod policy;
 pub mod preview;
+pub mod profile;
+pub(crate) mod profile_service;
 pub mod prompt_status;
+pub mod protection_evidence;
 pub mod provenance;
 /// `tirith pkg attest` (PR F3, the `sigstore-attestations` spike): fetch a wheel's
 /// PyPI publish provenance from the Integrity API, bind the attestation's subject
@@ -1716,12 +1730,14 @@ pub mod provenance;
 /// network / `sigstore-*` half the plan keeps out of `tirith-core`.
 pub mod pypi_integrity;
 pub mod receipt;
+pub mod rollout;
 pub mod rule;
 pub mod scan;
 pub mod score;
 pub mod secret;
 pub mod selfupdate;
 pub mod share;
+pub mod shell_target;
 pub mod ssh;
 pub mod status;
 pub mod sudo;
@@ -1731,6 +1747,7 @@ pub(crate) mod task_receipt_keys;
 pub mod temp_run;
 pub mod threatdb_cmd;
 pub mod trust;
+pub mod trust_lifecycle;
 pub mod view;
 pub mod visual_audit;
 pub mod warnings;

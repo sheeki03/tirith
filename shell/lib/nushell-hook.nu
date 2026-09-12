@@ -77,6 +77,9 @@ if (($nu.is-interactive) and (not ('_TIRITH_NU_LOADED' in $env))) {
             }
         }
     )
+    # A double-source guard never reaches this version publication.
+    $env.TIRITH_INTEGRATION_VERSION = ($env._TIRITH_INIT_VERSION? | default "unknown")
+    $env.TIRITH_INTEGRATION_SHELL = "nushell"
 }
 
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────

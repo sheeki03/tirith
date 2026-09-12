@@ -406,6 +406,9 @@ impl ProbeEnv {
             ("XDG_DATA_HOME".to_string(), data.display().to_string()),
             ("XDG_CONFIG_HOME".to_string(), config.display().to_string()),
             ("TERM".to_string(), "xterm-256color".to_string()),
+            // Disposable verification never requests network enrichment or
+            // detached database refresh, regardless of the caller environment.
+            ("TIRITH_OFFLINE".to_string(), "1".to_string()),
             // Force enter mode for the probe regardless of the developer's env.
             ("TIRITH_BASH_MODE".to_string(), "enter".to_string()),
             // Audit log off — the probe asserts on behaviour.
@@ -949,6 +952,31 @@ mod tests {
     // `XDG_STATE_HOME` is process-global and cargo runs tests in parallel, so
     // enter the shared global-state domain through the compatibility harness.
     use crate::cli::test_harness::ENV_LOCK;
+
+    #[cfg(unix)]
+    #[test]
+    fn disposable_probe_child_forces_offline_when_caller_disabled_it() {
+        let mut environment = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        environment.set_env("TIRITH_OFFLINE", "0");
+        let fixture = ProbeEnv::new().expect("private probe fixture");
+        let mut session = ProbeSession::spawn(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                r#"printf 'TIRITH_PROBE_OFFLINE=%s\n' "$TIRITH_OFFLINE""#,
+            ],
+            &fixture.envs,
+            &fixture.work,
+        )
+        .expect("native disposable child");
+        let observed = session.wait_for("TIRITH_PROBE_OFFLINE=1", PHASE_TIMEOUT);
+        session.kill();
+        assert!(
+            observed,
+            "env_clear must not erase the diagnostic offline boundary"
+        );
+        assert!(!session.buf.contains("TIRITH_PROBE_OFFLINE=0"));
+    }
 
     fn isolated_state_home(dir: &Path) -> tirith_test_support::GlobalStateGuard {
         let mut environment = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -5863,8 +5863,10 @@ fn linux_contained_command_os_with_options(
     // SAFETY: setpgid/fcntl are async-signal-safe. The target inherits this owned
     // group. Each content-bound descriptor already occupies its atomically
     // reserved policy slot; pre_exec only clears CLOEXEC before launcher re-exec.
+    let supervisor_pid = unsafe { libc::getpid() };
     unsafe {
         cmd.pre_exec(move || {
+            crate::cli::capsule_child::parent_lifetime::arm_before_exec(supervisor_pid)?;
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }

@@ -3,7 +3,10 @@
 #[cfg(unix)]
 use std::ffi::{OsStr, OsString};
 use std::fs;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use std::io::Read;
 #[cfg(unix)]
 use std::io::Write;
@@ -970,7 +973,10 @@ fn commands_check_reconstructs_only_proven_posix_multi_argv() {
 /// live count and bound the fixture's own fan-out on top of it: still far
 /// below the host default, so a runaway fork is still capped, but immune to
 /// whatever else the UID happens to be running.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn capsule_process_ceiling(own_fanout: u32) -> u32 {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1003,7 +1009,10 @@ fn capsule_process_ceiling(own_fanout: u32) -> u32 {
 /// run behaved correctly under a weaker kernel, not that anything went wrong,
 /// so it must not fail an "expected no stderr" assertion — while every other
 /// line still does.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn capsule_stderr_without_coverage_notes(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
@@ -1018,7 +1027,10 @@ fn capsule_stderr_without_coverage_notes(stderr: &[u8]) -> String {
 /// `read_exact` reports only "failed to fill whole buffer" when the child died
 /// before publishing, which says nothing about why the sandbox refused to come
 /// up. Reap the child and name its exit status instead.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn read_capsule_observation(
     reader: &mut impl std::io::Read,
     child: &mut std::process::Child,
@@ -1050,7 +1062,29 @@ fn read_capsule_observation(
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+// Match the production pre-exec parent lifetime bootstrap for direct hidden
+// launcher fixtures. The ordinary CLI builds this internally.
+#[cfg(target_os = "linux")]
+fn arm_hidden_capsule_bootstrap(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    let parent = unsafe { libc::getpid() };
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+                || libc::getppid() != parent
+                || libc::setpgid(0, 0) != 0
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[test]
 fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
     let marker_dir = tempfile::tempdir().expect("marker tempdir");
@@ -1058,7 +1092,9 @@ fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
     let program = format!("printf launched > '{}'", marker.display());
     let spec_json = serde_json::to_string(&tirith_core::capsule::CapsuleSpec::locked_down())
         .expect("serialize locked-down spec");
-    let output = tirith()
+    let mut command = tirith();
+    arm_hidden_capsule_bootstrap(&mut command);
+    let output = command
         .args([
             "__capsule-child",
             spec_json.as_str(),
@@ -1082,7 +1118,10 @@ fn hidden_capsule_launcher_refuses_missing_parent_temp_home_before_exec() {
     );
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[test]
 fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -1362,6 +1401,7 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
         });
     }
     command.stderr(std::process::Stdio::piped());
+    arm_hidden_capsule_bootstrap(&mut command);
     let mut child = command.spawn().expect("spawn real hidden capsule launcher");
     drop(status_writer);
     drop(ack_guard);
@@ -1459,7 +1499,10 @@ fn hidden_capsule_launcher_runs_a_harmless_dynamic_stdin_shell() {
 /// `/proc` is deliberately absent from every read grant. Success therefore proves
 /// that the interpreter can open the inherited, fully sealed script memfd through
 /// its `/proc/self/fd/<n>` magic link after containment is active.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[test]
 fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link() {
     use std::ffi::CString;
@@ -1689,6 +1732,7 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
     }
 
     command.stderr(std::process::Stdio::piped());
+    arm_hidden_capsule_bootstrap(&mut command);
     let mut child = command
         .spawn()
         .expect("spawn production reviewed-file hidden launcher");
@@ -1752,7 +1796,10 @@ fn hidden_capsule_landlock_reads_reviewed_file_through_sealed_memfd_magic_link()
     );
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[test]
 fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -1895,6 +1942,7 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
         });
     }
     command.stderr(std::process::Stdio::piped());
+    arm_hidden_capsule_bootstrap(&mut command);
     let mut child = command.spawn().expect("spawn invalid-ACK capsule guard");
     let group = child.id();
     drop(status_writer);
@@ -1933,7 +1981,10 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
     );
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn process_group_disappears(group: u32, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -2081,6 +2132,7 @@ fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
                 Ok(())
             });
         }
+        arm_hidden_capsule_bootstrap(&mut command);
         let mut guard = command.spawn().expect("spawn guarded capsule adversary");
         let group = guard.id();
         let mut target_output = BufReader::new(guard.stdout.take().expect("guard stdout"));
@@ -21997,7 +22049,9 @@ fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if action == "approve" && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        if action == "approve" && stderr.contains("Native package-approval issuance is off:") {
+            assert!(stderr.contains("Command checks and shell protection do not require"));
+        } else if action == "approve" && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             assert!(
                 stderr.contains("package approvals are redeemable only on x86_64 Linux"),
                 "pkg approve must report its native capability boundary: {stderr}"

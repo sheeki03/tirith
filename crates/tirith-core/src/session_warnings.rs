@@ -849,6 +849,105 @@ fn ensure_private_session_directory(directory: &Path) -> std::io::Result<()> {
 /// oversized file before any read. `with_session_locked` writes via an atomic
 /// temp+rename, so a reader sees a complete old-or-new file and needs no shared lock
 /// to avoid a transient empty state.
+/// A read result for previews. Unlike the legacy runtime loader, errors do not
+/// become apparently empty sessions and this API emits no raw diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotAvailability {
+    Complete,
+    Absent,
+    Invalid,
+    Unreadable,
+    Unavailable,
+}
+
+pub struct SessionSnapshotRead {
+    pub availability: SnapshotAvailability,
+    pub session: Option<SessionWarnings>,
+}
+
+pub fn read_snapshot(session_id: &str) -> SessionSnapshotRead {
+    if privacy_project_session_id(session_id) != session_id {
+        return SessionSnapshotRead {
+            availability: SnapshotAvailability::Invalid,
+            session: None,
+        };
+    }
+    let Some(path) = session_state_path(session_id) else {
+        return SessionSnapshotRead {
+            availability: SnapshotAvailability::Unavailable,
+            session: None,
+        };
+    };
+    read_snapshot_at(session_id, &path)
+}
+
+fn read_snapshot_at(session_id: &str, path: &std::path::Path) -> SessionSnapshotRead {
+    let bytes = match crate::util::read_text_no_follow_capped(path, SESSION_FILE_READ_CAP) {
+        Ok(bytes) => bytes,
+        Err(crate::util::OpenRegularError::NotFound) => {
+            return SessionSnapshotRead {
+                availability: SnapshotAvailability::Absent,
+                session: Some(SessionWarnings::new(session_id)),
+            }
+        }
+        Err(_) => {
+            return SessionSnapshotRead {
+                availability: SnapshotAvailability::Unreadable,
+                session: None,
+            }
+        }
+    };
+    match serde_json::from_slice::<SessionWarnings>(&bytes) {
+        Ok(mut session) if session.session_id == session_id => {
+            migrate_typed_event_identities(&mut session);
+            SessionSnapshotRead {
+                availability: SnapshotAvailability::Complete,
+                session: Some(session),
+            }
+        }
+        _ => SessionSnapshotRead {
+            availability: SnapshotAvailability::Invalid,
+            session: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod snapshot_read_tests {
+    use super::*;
+
+    #[test]
+    fn preview_session_read_distinguishes_absent_invalid_and_complete_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        let absent = read_snapshot_at("preview", &path);
+        assert_eq!(absent.availability, SnapshotAvailability::Absent);
+        assert!(absent.session.is_some());
+        assert!(!path.exists());
+
+        std::fs::write(&path, b"broken-json").unwrap();
+        let invalid = read_snapshot_at("preview", &path);
+        assert_eq!(invalid.availability, SnapshotAvailability::Invalid);
+        assert!(invalid.session.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"broken-json");
+
+        let original = serde_json::to_vec(&SessionWarnings::new("preview")).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let complete = read_snapshot_at("preview", &path);
+        assert_eq!(complete.availability, SnapshotAvailability::Complete);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            read_snapshot_at("different", &path).availability,
+            SnapshotAvailability::Invalid
+        );
+        assert_eq!(
+            read_snapshot_at("preview", directory.path()).availability,
+            SnapshotAvailability::Unreadable
+        );
+    }
+}
+
 pub fn load(session_id: &str) -> SessionWarnings {
     if privacy_project_session_id(session_id) != session_id {
         crate::audit::audit_diagnostic(PRIVACY_UNSAFE_SESSION_DIAGNOSTIC);

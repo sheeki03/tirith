@@ -5,13 +5,26 @@
 //! fully verify says so and never falsely reports "verified", and `update` never
 //! self-modifies a package-manager-managed install.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{collections::BTreeSet, marker::PhantomData};
 
 use sha2::{Digest, Sha256};
 use tirith_core::selfupdate::{self, InstallMethod, Provenance, SemVer, VerificationStatus};
+
+#[path = "lifecycle.rs"]
+mod lifecycle;
+#[path = "lifecycle_operations.rs"]
+pub(crate) mod lifecycle_operations;
+#[path = "lifecycle_service.rs"]
+pub(crate) mod lifecycle_service;
+#[path = "release_compatibility.rs"]
+mod release_compatibility;
+
+pub(crate) fn gather_lifecycle_facts() -> lifecycle::LifecycleFacts {
+    lifecycle::gather(&gather_cli_provenance(), None)
+}
 
 /// GitHub repository slug for tirith releases.
 const REPO: &str = "sheeki03/tirith";
@@ -415,7 +428,11 @@ fn gather_cli_provenance() -> CliProvenance {
 
     let (install_method, origin) = match &binary_path {
         Some(p) => {
-            let m = selfupdate::detect_install_method(p);
+            let m = selfupdate::classify_install_method(
+                p,
+                !path_resolution_failed,
+                &read_os_release_ids(),
+            );
             let hermes_root = (!path_resolution_failed && m == InstallMethod::Unknown)
                 .then(|| proven_hermes_root_from_environment(p))
                 .flatten();
@@ -425,10 +442,7 @@ fn gather_cli_provenance() -> CliProvenance {
                     CliInstallOrigin::Hermes { root },
                 )
             } else {
-                (
-                    selfupdate::refine_system_pm(m, &read_os_release_ids()),
-                    CliInstallOrigin::Standard,
-                )
+                (m, CliInstallOrigin::Standard)
             }
         }
         None => (InstallMethod::Unknown, CliInstallOrigin::Standard),
@@ -482,6 +496,7 @@ pub fn version(provenance: bool, json: bool) -> i32 {
             "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             "verification_status": local_status.token(),
             "verification_detail": status_detail(&local_status),
+            "lifecycle": lifecycle::gather(&prov, None),
         });
         match serde_json::to_string_pretty(&v) {
             Ok(s) => println!("{s}"),
@@ -522,6 +537,23 @@ pub fn version(provenance: bool, json: bool) -> i32 {
             );
         }
         println!("  verification:    {}", describe_status(&local_status));
+        let lifecycle = lifecycle::gather(&prov, None);
+        println!(
+            "  loaded hook:     {} ({})",
+            lifecycle
+                .loaded_integration
+                .version
+                .as_deref()
+                .unwrap_or("unknown"),
+            lifecycle.loaded_integration.evidence
+        );
+        println!(
+            "  reload:          {}",
+            lifecycle.loaded_integration.reload_status
+        );
+        if lifecycle.multiple_binaries {
+            println!("  PATH:            multiple resolved Tirith binaries; verify the target shell's selected installation");
+        }
         if prov.dev_build {
             println!(
                 "  note:            this is a local/dev build — run `tirith verify-self` \
@@ -686,14 +718,59 @@ fn source_built_unverified_reason(method: &InstallMethod) -> Option<String> {
              canonical release binary to byte-compare against"
                 .to_string(),
         ),
+        InstallMethod::Nix => Some(
+            "installed from a Nix build; verify it through the owning flake/profile and Nix store integrity rather than comparing it with a prebuilt release".to_string(),
+        ),
         InstallMethod::SelfManaged
         | InstallMethod::Homebrew
         | InstallMethod::Npm
         | InstallMethod::Scoop
+        | InstallMethod::Chocolatey
+        | InstallMethod::Mise
+        | InstallMethod::Asdf
         | InstallMethod::Apt
         | InstallMethod::Dnf
         | InstallMethod::Unknown => None,
     }
+}
+
+fn mise_cargo_backend_is_recorded(binary: &Path) -> bool {
+    let Some(bin) = binary
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "bin"))
+    else {
+        return false;
+    };
+    let Some(root) = bin.parent() else {
+        return false;
+    };
+    let Ok(file) = std::fs::File::open(root.join(".crates2.json")) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if std::io::Read::take(file, 65537)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > 65536
+    {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|document| {
+            document
+                .get("installs")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+        })
+        .is_some_and(|installs| {
+            installs.iter().any(|(package, record)| {
+                package.starts_with("tirith ")
+                    && record["bins"]
+                        .as_array()
+                        .is_some_and(|bins| bins.iter().any(|bin| bin == "tirith"))
+            })
+        })
 }
 
 /// On a byte-compare MISMATCH (running binary differs from the verified release
@@ -718,6 +795,10 @@ fn benign_mismatch_reason(method: &InstallMethod) -> Option<String> {
         InstallMethod::SelfManaged
         | InstallMethod::Npm
         | InstallMethod::Scoop
+        | InstallMethod::Chocolatey
+        | InstallMethod::Nix
+        | InstallMethod::Mise
+        | InstallMethod::Asdf
         | InstallMethod::Apt
         | InstallMethod::Cargo
         | InstallMethod::Aur
@@ -749,6 +830,16 @@ fn run_verify_self(prov: &Provenance, hermes_managed: bool) -> VerifySelfOutcome
     //     NOT carved out here; they verify normally.
     if let Some(reason) = source_built_unverified_reason(&prov.install_method) {
         return VerifySelfOutcome::verdict(VerificationStatus::Unverified { reason });
+    }
+    if prov.install_method == InstallMethod::Mise
+        && prov
+            .binary_path
+            .as_deref()
+            .is_some_and(mise_cargo_backend_is_recorded)
+    {
+        return VerifySelfOutcome::verdict(VerificationStatus::Unverified {
+            reason: "mise records this installation's Cargo backend; verify its source build through mise rather than comparing it with the prebuilt release".into(),
+        });
     }
 
     // 2. Need a published target and parseable version — both honest "cannot
@@ -946,7 +1037,10 @@ fn run_verify_self(prov: &Provenance, hermes_managed: bool) -> VerifySelfOutcome
     let helper_note: Option<String> = None;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if let Err(reason) = verify_installed_package_approval_helper(workdir.path(), &target) {
-        if install_method_requires_package_approval_helper(&prov.install_method) && !hermes_managed
+        if install_method_requires_package_approval_helper(
+            &prov.install_method,
+            managed_helper_state_present(),
+        ) && !hermes_managed
         {
             return VerifySelfOutcome::verdict(VerificationStatus::Failed { reason });
         }
@@ -973,11 +1067,12 @@ fn run_verify_self(prov: &Provenance, hermes_managed: bool) -> VerifySelfOutcome
 }
 
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
-fn install_method_requires_package_approval_helper(method: &InstallMethod) -> bool {
-    matches!(
-        method,
-        InstallMethod::SelfManaged | InstallMethod::Apt | InstallMethod::Dnf
-    )
+fn install_method_requires_package_approval_helper(
+    method: &InstallMethod,
+    helper_present: bool,
+) -> bool {
+    matches!(method, InstallMethod::Apt | InstallMethod::Dnf)
+        || (matches!(method, InstallMethod::SelfManaged) && helper_present)
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1116,8 +1211,7 @@ pub fn update(allow_unsigned: bool, rollback: bool, dry_run: bool, yes: bool, js
 }
 
 fn update_effects(
-    method: &InstallMethod,
-    hermes_managed: bool,
+    updates_privileged_helper: bool,
     dry_run: bool,
 ) -> BTreeSet<tirith_core::effects::CommandEffectKind> {
     let mut effects = [tirith_core::effects::CommandEffectKind::NetworkEgress]
@@ -1125,7 +1219,7 @@ fn update_effects(
         .collect::<BTreeSet<_>>();
     if !dry_run {
         effects.insert(tirith_core::effects::CommandEffectKind::FilesystemWrite);
-        if install_method_updates_privileged_helper(method, hermes_managed) {
+        if updates_privileged_helper {
             effects.insert(tirith_core::effects::CommandEffectKind::ResourceEscalation);
         }
     }
@@ -1133,28 +1227,63 @@ fn update_effects(
 }
 
 fn rollback_effects(
-    method: &InstallMethod,
-    hermes_managed: bool,
+    updates_privileged_helper: bool,
 ) -> BTreeSet<tirith_core::effects::CommandEffectKind> {
     let mut effects = [tirith_core::effects::CommandEffectKind::FilesystemWrite]
         .into_iter()
         .collect::<BTreeSet<_>>();
-    if install_method_updates_privileged_helper(method, hermes_managed) {
+    if updates_privileged_helper {
         effects.insert(tirith_core::effects::CommandEffectKind::ResourceEscalation);
     }
     effects
 }
 
-fn install_method_updates_privileged_helper(method: &InstallMethod, hermes_managed: bool) -> bool {
+fn install_method_updates_privileged_helper(
+    method: &InstallMethod,
+    hermes_managed: bool,
+    helper_present: bool,
+) -> bool {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        !hermes_managed && install_method_requires_package_approval_helper(method)
+        !hermes_managed && install_method_requires_package_approval_helper(method, helper_present)
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
-        let _ = (method, hermes_managed);
+        let _ = (method, hermes_managed, helper_present);
         false
     }
+}
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+fn helper_state_present_at(paths: &[&Path]) -> bool {
+    paths
+        .iter()
+        .any(|path| match std::fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        })
+}
+
+fn managed_helper_state_present() -> bool {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        helper_state_present_at(&[
+            Path::new(PACKAGE_APPROVAL_HELPER_PATH),
+            Path::new(PACKAGE_APPROVAL_HELPER_BACKUP),
+            Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
+        ])
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+fn ensure_helper_state_unchanged(expected: bool) -> Result<(), String> {
+    if managed_helper_state_present() != expected {
+        return Err("package-approval helper state changed during the update; retry before replacing either binary".to_string());
+    }
+    Ok(())
 }
 
 fn ensure_hermes_install_still_proven(provenance: &CliProvenance) -> Result<(), String> {
@@ -1226,7 +1355,13 @@ fn run_update(
     };
     let expected_rollback_sha = hash_file_opt(&previous_backup_path(&binary_path));
     let hermes_managed = prov.is_hermes_managed();
-    let effects = update_effects(&prov.install_method, hermes_managed, dry_run);
+    let helper_present = managed_helper_state_present();
+    let updates_privileged_helper = install_method_updates_privileged_helper(
+        &prov.install_method,
+        hermes_managed,
+        helper_present,
+    );
+    let effects = update_effects(updates_privileged_helper, dry_run);
     let authorization =
         match prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
             match self_boundary_envelope(
@@ -1240,6 +1375,7 @@ fn run_update(
                     "binary_preimage_sha256": expected_binary_sha.clone(),
                     "rollback_preimage_sha256": expected_rollback_sha.clone(),
                     "allow_unsigned": allow_unsigned,
+                    "updates_privileged_helper": updates_privileged_helper,
                     "dry_run": dry_run,
                     "release_origin": REPO,
                 }),
@@ -1286,6 +1422,7 @@ fn run_update(
                 "current_version": current.to_string(),
                 "latest_version": latest.to_string(),
                 "message": "already up to date",
+                "lifecycle": lifecycle::gather(prov, Some(&latest.to_string())),
             });
             println!("{v}");
         } else {
@@ -1294,15 +1431,51 @@ fn run_update(
         return 0;
     }
 
+    let compatibility_workdir = match tempfile::Builder::new()
+        .prefix("tirith-compatibility-")
+        .tempdir()
+    {
+        Ok(directory) => directory,
+        Err(error) => {
+            emit_update_error(
+                json,
+                &format!("cannot stage compatibility verification: {error}"),
+            );
+            return 1;
+        }
+    };
+    let candidate = match download_candidate_compatibility(
+        &format!("v{latest}"),
+        &target,
+        compatibility_workdir.path(),
+        allow_unsigned,
+        &authorization,
+    ) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            emit_update_error(json, &error);
+            return 1;
+        }
+    };
+    let compatibility_preview = candidate.preview(prov);
+    let mut update_lifecycle = lifecycle::gather(prov, Some(&latest.to_string()));
+    update_lifecycle.compatibility.candidate_evidence = compatibility_preview.evidence;
+    update_lifecycle.compatibility.candidate_next_action = if compatibility_preview.compatible {
+        "candidate contract verified; replacement requires fresh preimage and format checks"
+    } else {
+        "resolve reported incompatibilities before replacement"
+    };
     if dry_run {
         if json {
             let v = serde_json::json!({
-                "action": "would-update",
+                "action": if compatibility_preview.compatible { "would-update" } else { "update-incompatible" },
                 "current_version": current.to_string(),
                 "latest_version": latest.to_string(),
                 "install_method": install_method_token(prov),
                 "binary_path": binary_path.display().to_string(),
                 "allow_unsigned": allow_unsigned,
+                "compatibility": compatibility_preview,
+                "lifecycle": update_lifecycle,
             });
             println!("{v}");
         } else {
@@ -1311,15 +1484,38 @@ fn run_update(
             println!("  latest:   v{latest}");
             println!("  binary:   {}", binary_path.display());
             println!(
-                "  would download, {}, and atomically replace the binary in place.",
-                if allow_unsigned {
-                    "verify the checksum (cosign signature optional)"
+                "  compatibility: {} ({})",
+                if compatibility_preview.compatible {
+                    "compatible"
                 } else {
-                    "verify the checksum and cosign signature"
-                }
+                    "unsupported"
+                },
+                compatibility_preview.evidence
             );
+            for issue in &compatibility_preview.issues {
+                println!("    {issue}");
+            }
+            if compatibility_preview.compatible {
+                println!(
+                    "  would download, {}, and atomically replace the binary in place.",
+                    if allow_unsigned {
+                        "verify the checksum (cosign signature optional)"
+                    } else {
+                        "verify the checksum and cosign signature"
+                    }
+                );
+            }
         }
-        return 0;
+        return if compatibility_preview.compatible {
+            0
+        } else {
+            1
+        };
+    }
+
+    if let Err(error) = compatibility_preview.require_compatible() {
+        emit_update_error(json, &error);
+        return 1;
     }
 
     if !crate::cli::confirm(&format!("Update tirith from v{current} to v{latest}?"), yes) {
@@ -1413,6 +1609,12 @@ fn run_update(
         }
     }
 
+    if !matches!(&archive_verdict, ArchiveVerdict::Ok { archive_sha256, .. } if selfupdate::digest_eq(archive_sha256, candidate.archive_sha256()))
+    {
+        emit_update_error(json, "downloaded archive differs from the candidate selected by the verified compatibility preview");
+        return 1;
+    }
+
     // 4. Extract the new binary from the verified archive.
     let new_binary = match extract_tirith_binary(
         &release.archive_path,
@@ -1429,6 +1631,20 @@ fn run_update(
             return 1;
         }
     };
+    if let Err(error) = verify_exact_regular_preimage(&new_binary, Some(candidate.binary_sha256()))
+    {
+        emit_update_error(
+            json,
+            &format!(
+                "candidate executable differs from the verified compatibility binding: {error}"
+            ),
+        );
+        return 1;
+    }
+    if let Err(error) = candidate.preview(prov).require_compatible() {
+        emit_update_error(json, &error);
+        return 1;
+    }
     // Hermes is a CLI-private subtype of `SelfManaged`. Its stable origin
     // always suppresses privileged-helper behavior, while a changed filesystem
     // proof aborts instead of downgrading into generic self-management.
@@ -1436,10 +1652,32 @@ fn run_update(
         emit_update_error(json, &error);
         return 1;
     }
+    let control_guard = match crate::cli::control::quiesce_for_update() {
+        Ok(guard) => guard,
+        Err(error) => {
+            emit_update_error(
+                json,
+                &format!("cannot reconcile the local control service before update: {error}"),
+            );
+            return 1;
+        }
+    };
+    if let Err(error) = control_guard.revalidate() {
+        emit_update_error(json, &error);
+        return 1;
+    }
+    if let Err(error) = release_compatibility::preserve_current_for_rollback(prov, &authorization) {
+        emit_update_error(json, &error);
+        return 1;
+    }
+    if !hermes_managed {
+        if let Err(error) = ensure_helper_state_unchanged(helper_present) {
+            emit_update_error(json, &error);
+            return 1;
+        }
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let helper_install = if !hermes_managed
-        && install_method_requires_package_approval_helper(&prov.install_method)
-    {
+    let helper_install = if updates_privileged_helper {
         let archive_sha256 = match &archive_verdict {
             ArchiveVerdict::Ok { archive_sha256, .. } => archive_sha256,
             _ => unreachable!("failed archive verdict returned above"),
@@ -1463,13 +1701,20 @@ fn run_update(
     };
 
     // 5. Atomic swap, keeping the previous binary for rollback.
-    let swap = match atomic_self_replace(
-        &binary_path,
-        &new_binary,
-        &expected_binary_sha,
-        expected_rollback_sha.as_deref(),
-        &authorization,
-    ) {
+    let swap = match control_guard.revalidate().and_then(|()| candidate.preview(prov).require_compatible()).and_then(|()| {
+        atomic_self_replace(
+            &binary_path,
+            &new_binary,
+            candidate.binary_sha256(),
+            &expected_binary_sha,
+            expected_rollback_sha.as_deref(),
+            &authorization,
+        ).and_then(|swap| {
+            verify_exact_regular_preimage(&binary_path, Some(candidate.binary_sha256()))
+                .map_err(|error| format!("binary was replaced but post-install verification failed; the previous binary is retained for recovery: {error}"))?;
+            Ok(swap)
+        })
+    }) {
         Ok(s) => s,
         Err(e) => {
             #[allow(unused_mut)]
@@ -1504,6 +1749,10 @@ fn run_update(
             "new_version": latest.to_string(),
             "binary_path": binary_path.display().to_string(),
             "previous_binary_kept_at": swap.previous_backup.display().to_string(),
+            "compatibility": compatibility_preview,
+            "installed_binary_sha256": candidate.binary_sha256(),
+            "integration_reload": "required; open a fresh shell or reload the host, then verify behavior",
+            "control_service": "previous operator service quiesced; next launch must use the new binary identity",
             "verification": match &archive_verdict {
                 ArchiveVerdict::Ok { signed: ChecksumStrength::Signed, .. } => "verified-signed",
                 ArchiveVerdict::Ok { signed: ChecksumStrength::ChecksumOnly, .. } => {
@@ -1535,6 +1784,7 @@ fn run_update(
             "  previous:      kept at {} — run `tirith update --rollback` to revert",
             swap.previous_backup.display()
         );
+        println!("  reload:        open a fresh shell or reload the owning host, then inspect tirith status --format json (configuration alone does not prove blocking)");
     }
     0
 }
@@ -1551,6 +1801,7 @@ fn advise_package_manager(prov: &Provenance, json: bool) -> i32 {
             "install_method": method.as_str(),
             "current_version": prov.version,
             "upgrade_command": cmd,
+            "lifecycle": gather_lifecycle_facts(),
             "message": match method {
                 InstallMethod::Unknown => "tirith could not determine how it was installed; \
                     it will not self-modify the binary. Update it the same way you installed it.",
@@ -1650,25 +1901,64 @@ fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i
         }
         return 1;
     }
+    let expected_rollback_sha = match hash_file_opt(&backup) {
+        Some(sha) => sha,
+        None => {
+            emit_update_error(json, "could not bind the rollback binary's exact preimage");
+            return 1;
+        }
+    };
+    let rollback_compatibility =
+        match release_compatibility::VerifiedRollback::load(&binary_path, &expected_rollback_sha) {
+            Ok(proof) => proof,
+            Err(error) => {
+                emit_update_error(json, &error);
+                return 1;
+            }
+        };
+    let compatibility_preview = rollback_compatibility.preview(prov);
     if dry_run {
         if json {
             let v = serde_json::json!({
-                "action": "would-rollback",
+                "action": if compatibility_preview.compatible { "would-rollback" } else { "rollback-incompatible" },
                 "binary_path": binary_path.display().to_string(),
                 "rollback_from": backup.display().to_string(),
+                "compatibility": compatibility_preview,
             });
             println!("{v}");
         } else {
             println!("tirith update --rollback (dry run)");
             println!(
-                "  would restore {} from {}",
-                binary_path.display(),
-                backup.display()
+                "  compatibility: {} ({})",
+                if compatibility_preview.compatible {
+                    "compatible"
+                } else {
+                    "unsupported"
+                },
+                compatibility_preview.evidence
             );
+            for issue in &compatibility_preview.issues {
+                println!("    {issue}");
+            }
+            if compatibility_preview.compatible {
+                println!(
+                    "  would restore {} from {}",
+                    binary_path.display(),
+                    backup.display()
+                );
+            }
         }
-        return 0;
+        return if compatibility_preview.compatible {
+            0
+        } else {
+            1
+        };
     }
 
+    if let Err(error) = compatibility_preview.require_compatible() {
+        emit_update_error(json, &error);
+        return 1;
+    }
     if !crate::cli::confirm("Roll tirith back to the previously-installed binary?", yes) {
         if json {
             let _ = super::write_json_stdout(
@@ -1687,15 +1977,14 @@ fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i
             return 1;
         }
     };
-    let expected_rollback_sha = match hash_file_opt(&backup) {
-        Some(sha) => sha,
-        None => {
-            emit_update_error(json, "could not bind the rollback binary's exact preimage");
-            return 1;
-        }
-    };
     let hermes_managed = prov.is_hermes_managed();
-    let effects = rollback_effects(&prov.install_method, hermes_managed);
+    let helper_present = managed_helper_state_present();
+    let updates_privileged_helper = install_method_updates_privileged_helper(
+        &prov.install_method,
+        hermes_managed,
+        helper_present,
+    );
+    let effects = rollback_effects(updates_privileged_helper);
     let authorization =
         match prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
             match self_boundary_envelope(
@@ -1706,6 +1995,8 @@ fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i
                     "binary_preimage_sha256": expected_binary_sha.clone(),
                     "rollback_path": backup.to_str(),
                     "rollback_preimage_sha256": expected_rollback_sha.clone(),
+                    "rollback_compatibility_sha256": rollback_compatibility.receipt_sha256(),
+                    "updates_privileged_helper": updates_privileged_helper,
                     "dry_run": false,
                 }),
                 Some(&binary_path),
@@ -1730,13 +2021,35 @@ fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i
         return 1;
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let helper_restore = if !hermes_managed
-        && install_method_requires_package_approval_helper(&prov.install_method)
-        && (Path::new(PACKAGE_APPROVAL_HELPER_PATH).is_file()
-            || Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file()
-            || Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT).is_file())
+    if let Err(error) = rollback_compatibility
+        .revalidate(&binary_path, &expected_rollback_sha)
+        .and_then(|()| rollback_compatibility.preview(prov).require_compatible())
     {
+        emit_update_error(json, &error);
+        return 1;
+    }
+    let control_guard = match crate::cli::control::quiesce_for_update() {
+        Ok(guard) => guard,
+        Err(error) => {
+            emit_update_error(
+                json,
+                &format!("cannot reconcile the local control service before rollback: {error}"),
+            );
+            return 1;
+        }
+    };
+    if let Err(error) = control_guard.revalidate() {
+        emit_update_error(json, &error);
+        return 1;
+    }
+    if !hermes_managed {
+        if let Err(error) = ensure_helper_state_unchanged(helper_present) {
+            emit_update_error(json, &error);
+            return 1;
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let helper_restore = if updates_privileged_helper {
         use std::ffi::OsStr;
         let had_previous = Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file();
         let previously_absent = Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT).is_file();
@@ -1828,13 +2141,19 @@ fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i
     // would first copy the live binary onto `previous_backup_path(dest)` (the
     // same path as `backup`), clobbering the rollback source before the swap.
     // `atomic_restore_from` reads the source up front and never writes to it.
-    match atomic_restore_from(
-        &binary_path,
-        &backup,
-        &expected_binary_sha,
-        &expected_rollback_sha,
-        &authorization,
-    ) {
+    match control_guard
+        .revalidate()
+        .and_then(|()| rollback_compatibility.revalidate(&binary_path, &expected_rollback_sha))
+        .and_then(|()| rollback_compatibility.preview(prov).require_compatible())
+        .and_then(|()| {
+            atomic_restore_from(
+                &binary_path,
+                &backup,
+                &expected_binary_sha,
+                &expected_rollback_sha,
+                &authorization,
+            )
+        }) {
         Ok(()) => {
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             {
@@ -1900,12 +2219,16 @@ fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i
                 let v = serde_json::json!({
                     "action": "rolled-back",
                     "binary_path": binary_path.display().to_string(),
+                    "restored_version": compatibility_preview.candidate_version,
+                    "compatibility": compatibility_preview,
+                    "integration_reload": "required; open a fresh shell or reload the host, then verify behavior",
                 });
                 println!("{v}");
             } else {
                 println!("tirith: rolled back to the previously-installed binary.");
                 println!("  binary: {}", binary_path.display());
                 println!("  run `tirith version` to confirm the version.");
+                println!("  open a fresh shell or reload the owning host, then inspect tirith status --format json (configuration alone does not prove blocking).");
             }
             0
         }
@@ -2060,6 +2383,64 @@ fn download_release_set(
         cert_path,
         checksums_path,
     })
+}
+
+fn download_candidate_compatibility(
+    tag: &str,
+    target: &str,
+    workdir: &Path,
+    allow_unsigned: bool,
+    authorization: &impl SelfEffectAuthorization,
+) -> Result<release_compatibility::VerifiedCandidate, String> {
+    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+    let client = http_client(API_TIMEOUT_SECS)
+        .map_err(|_| "cannot initialize compatibility verification client")?;
+    let checksums = fetch_bytes(
+        &client,
+        &format!("{base}/checksums.txt"),
+        MAX_METADATA_SIZE,
+        authorization,
+    )
+    .map_err(|error| error.message())?;
+    let checksums_txt =
+        String::from_utf8(checksums.clone()).map_err(|_| "release checksums are not UTF-8")?;
+    if selfupdate::checksum_for(&checksums_txt, release_compatibility::ASSET)
+        .map_err(|_| "release checksums are malformed")?
+        .is_none()
+    {
+        return Err("release has no checksum-bound compatibility document; automatic update is unsupported, use the owning installation channel after reviewing policy, lock, trust, and service compatibility".into());
+    }
+    let checksums_path = workdir.join("checksums.txt");
+    write_file(&checksums_path, &checksums, authorization)
+        .map_err(|_| "cannot stage signed compatibility checksums")?;
+    let release = ReleaseSet {
+        tag: tag.into(),
+        archive_path: workdir.join(selfupdate::release_archive_name(target)),
+        checksums_txt,
+        sig_path: fetch_optional(
+            &client,
+            &format!("{base}/checksums.txt.sig"),
+            workdir,
+            "checksums.txt.sig",
+            authorization,
+        ),
+        cert_path: fetch_optional(
+            &client,
+            &format!("{base}/checksums.txt.pem"),
+            workdir,
+            "checksums.txt.pem",
+            authorization,
+        ),
+        checksums_path,
+    };
+    let bytes = fetch_bytes(
+        &client,
+        &format!("{base}/{}", release_compatibility::ASSET),
+        MAX_METADATA_SIZE,
+        authorization,
+    )
+    .map_err(|error| error.message())?;
+    release_compatibility::VerifiedCandidate::verify(&release, &bytes, target, allow_unsigned)
 }
 
 /// Resolve the latest published release version through the GitHub API.
@@ -2334,37 +2715,66 @@ fn verify_cosign_signature_with_program(
         return CosignOutcomeInternal::Unavailable(CosignUnavailable::NotInstalled);
     };
 
-    let output = std::process::Command::new(cosign)
-        .arg("verify-blob")
-        .arg("--signature")
-        .arg(sig)
-        .arg("--certificate")
-        .arg(cert)
-        .arg("--certificate-identity")
-        .arg(format!("{COSIGN_WORKFLOW_IDENTITY}{}", release.tag))
-        .arg("--certificate-oidc-issuer")
-        .arg(COSIGN_OIDC_ISSUER)
-        .arg(&release.checksums_path)
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => CosignOutcomeInternal::Verified,
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            CosignOutcomeInternal::Failed(
-                stderr
-                    .lines()
-                    .next()
-                    .unwrap_or("cosign verify-blob exited non-zero")
-                    .to_string(),
-            )
+    use tirith_core::trusted_child::{ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable};
+    let executable = match TrustedExecutable::from_absolute(cosign, &[]) {
+        Ok(executable) => executable,
+        Err(_) => {
+            return CosignOutcomeInternal::Unavailable(CosignUnavailable::ExecFailed(
+                "signature verifier executable is untrusted".into(),
+            ))
         }
-        Err(e) => {
-            // cosign was on PATH but could not be executed: unavailable, not a
-            // verification failure — and distinct from "not installed" so the
-            // JSON detail does not falsely advise "install cosign".
-            eprintln!("tirith: warning: could not run cosign ({e}); skipping signature check");
-            CosignOutcomeInternal::Unavailable(CosignUnavailable::ExecFailed(e.to_string()))
+    };
+    let identity = format!("{COSIGN_WORKFLOW_IDENTITY}{}", release.tag);
+    let args = vec![
+        std::ffi::OsString::from("verify-blob"),
+        "--signature".into(),
+        sig.as_os_str().to_owned(),
+        "--certificate".into(),
+        cert.as_os_str().to_owned(),
+        "--certificate-identity".into(),
+        identity.into(),
+        "--certificate-oidc-issuer".into(),
+        COSIGN_OIDC_ISSUER.into(),
+        release.checksums_path.as_os_str().to_owned(),
+    ];
+    let spec = ChildSpec::new(
+        args,
+        ChildLimits::new(Duration::from_secs(45), 64 * 1024, 64 * 1024),
+    )
+    .inherit_env(&[
+        "HOME",
+        "PATH",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "SYSTEMROOT",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+    ]);
+    match tirith_core::trusted_child::run(&executable, &spec) {
+        ChildOutcome::Completed { status, .. } if status.success() => {
+            CosignOutcomeInternal::Verified
+        }
+        ChildOutcome::Completed { stderr, .. } => CosignOutcomeInternal::Failed(
+            String::from_utf8_lossy(&stderr)
+                .lines()
+                .next()
+                .unwrap_or("cosign verify-blob exited non-zero")
+                .to_string(),
+        ),
+        ChildOutcome::SpawnError(error) => {
+            CosignOutcomeInternal::Unavailable(CosignUnavailable::ExecFailed(error))
+        }
+        ChildOutcome::Timeout { .. } => CosignOutcomeInternal::Failed(
+            "signature verifier exceeded its 45-second deadline".into(),
+        ),
+        ChildOutcome::OutputLimitExceeded { .. } => CosignOutcomeInternal::Failed(
+            "signature verifier exceeded its bounded output limit".into(),
+        ),
+        ChildOutcome::WaitError(_) | ChildOutcome::CleanupError(_) => {
+            CosignOutcomeInternal::Failed(
+                "signature verifier completion could not be confirmed".into(),
+            )
         }
     }
 }
@@ -2476,23 +2886,46 @@ fn extract_tirith_binary(
         // system-helper provenance policy that a bare path string never did.
         #[cfg(unix)]
         let trusted_tar = resolve_trusted_tar()?;
-        #[cfg(unix)]
-        let tar = trusted_tar.path();
         #[cfg(not(unix))]
         // Both branches must yield `&Path`: the unix arm binds
         // `trusted_tar.path()`.
         let tar = std::path::Path::new("tar");
         authorization.authorize_effect()?;
-        let status = std::process::Command::new(tar)
-            .arg("--no-same-owner")
-            .arg("-xzf")
-            .arg(archive)
-            .arg("-C")
-            .arg(&extract_dir)
-            .status()
-            .map_err(|e| format!("could not run tar: {e}"))?;
-        if !status.success() {
-            return Err("tar failed to extract the release archive".to_string());
+        #[cfg(unix)]
+        {
+            use tirith_core::trusted_child::{ChildLimits, ChildOutcome, ChildSpec};
+            let spec = ChildSpec::new(
+                [
+                    std::ffi::OsString::from("--no-same-owner"),
+                    "-xzf".into(),
+                    archive.as_os_str().to_owned(),
+                    "-C".into(),
+                    extract_dir.as_os_str().to_owned(),
+                ],
+                ChildLimits::new(Duration::from_secs(120), 64 * 1024, 64 * 1024),
+            );
+            match tirith_core::trusted_child::run(&trusted_tar, &spec) {
+                ChildOutcome::Completed { status, .. } if status.success() => {}
+                _ => {
+                    return Err(
+                        "trusted tar extraction failed or exceeded its time/output limit".into(),
+                    )
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let status = std::process::Command::new(tar)
+                .arg("--no-same-owner")
+                .arg("-xzf")
+                .arg(archive)
+                .arg("-C")
+                .arg(&extract_dir)
+                .status()
+                .map_err(|_| "cannot run archive extractor")?;
+            if !status.success() {
+                return Err("tar failed to extract the release archive".into());
+            }
         }
     }
 
@@ -3010,6 +3443,7 @@ fn previous_backup_path(binary_path: &Path) -> PathBuf {
 fn atomic_self_replace(
     dest: &Path,
     new_binary: &Path,
+    expected_new_sha256: &str,
     expected_dest_sha256: &str,
     expected_backup_sha256: Option<&str>,
     authorization: &impl SelfEffectAuthorization,
@@ -3021,6 +3455,7 @@ fn atomic_self_replace(
     // Refuse early on a non-writable directory: a clean error beats a raw
     // rename failure, and no temp file is created.
     verify_exact_regular_preimage(dest, Some(expected_dest_sha256))?;
+    verify_exact_regular_preimage(new_binary, Some(expected_new_sha256))?;
     let backup = previous_backup_path(dest);
     verify_exact_regular_preimage(&backup, expected_backup_sha256)?;
     authorization.authorize_effect()?;
@@ -3080,6 +3515,9 @@ fn atomic_self_replace(
             .map_err(|e| format!("could not create a temp file in {}: {e}", dir.display()))?;
         let new_bytes =
             std::fs::read(new_binary).map_err(|e| format!("could not read the new binary: {e}"))?;
+        if !selfupdate::digest_eq(&hex_sha256(&new_bytes), expected_new_sha256) {
+            return Err("candidate executable changed after compatibility verification".into());
+        }
         tmp.write_all(&new_bytes)
             .map_err(|e| format!("could not write the new binary: {e}"))?;
         tmp.flush()
@@ -3178,6 +3616,9 @@ fn atomic_restore_from(
             source.display()
         )
     })?;
+    if !selfupdate::digest_eq(&hex_sha256(&bytes), expected_source_sha256) {
+        return Err("rollback executable changed after compatibility verification".into());
+    }
 
     authorization.authorize_effect()?;
     let mut tmp = tempfile::Builder::new()
@@ -3212,6 +3653,8 @@ fn atomic_restore_from(
     })?;
     // Rename durability (see `atomic_self_replace`): fsync the parent dir.
     fsync_parent_dir(dest);
+    verify_exact_regular_preimage(dest, Some(expected_source_sha256))
+        .map_err(|error| format!("rollback file was replaced but verification failed; saved backup remains available: {error}"))?;
     Ok(())
 }
 
@@ -3612,18 +4055,22 @@ mod tests {
     fn hermes_updates_never_request_privileged_helper_effects() {
         use tirith_core::effects::CommandEffectKind;
 
-        let update = update_effects(&InstallMethod::SelfManaged, true, false);
+        let manages_helper =
+            install_method_updates_privileged_helper(&InstallMethod::SelfManaged, true, true);
+        let update = update_effects(manages_helper, false);
         assert!(update.contains(&CommandEffectKind::NetworkEgress));
         assert!(update.contains(&CommandEffectKind::FilesystemWrite));
         assert!(!update.contains(&CommandEffectKind::ResourceEscalation));
-        let rollback = rollback_effects(&InstallMethod::SelfManaged, true);
+        let rollback = rollback_effects(manages_helper);
         assert!(rollback.contains(&CommandEffectKind::FilesystemWrite));
         assert!(!rollback.contains(&CommandEffectKind::ResourceEscalation));
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            let standalone_update = update_effects(&InstallMethod::SelfManaged, false, false);
-            let standalone_rollback = rollback_effects(&InstallMethod::SelfManaged, false);
+            let manages_helper =
+                install_method_updates_privileged_helper(&InstallMethod::SelfManaged, false, true);
+            let standalone_update = update_effects(manages_helper, false);
+            let standalone_rollback = rollback_effects(manages_helper);
             assert!(standalone_update.contains(&CommandEffectKind::ResourceEscalation));
             assert!(standalone_rollback.contains(&CommandEffectKind::ResourceEscalation));
         }
@@ -3659,20 +4106,23 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
         assert!(ensure_hermes_install_still_proven(&provenance).is_err());
         assert!(provenance.is_hermes_managed());
-        let effects = update_effects(
+        let manages_helper = install_method_updates_privileged_helper(
             &provenance.install_method,
             provenance.is_hermes_managed(),
-            false,
+            true,
         );
+        let effects = update_effects(manages_helper, false);
         assert!(!effects.contains(&CommandEffectKind::ResourceEscalation));
     }
 
     fn atomic_self_replace_for_test(dest: &Path, new_binary: &Path) -> Result<SwapResult, String> {
         let live_sha = hash_file_opt(dest).expect("test live binary");
+        let new_sha = hash_file_opt(new_binary).unwrap_or_default();
         let backup_sha = hash_file_opt(&previous_backup_path(dest));
         atomic_self_replace(
             dest,
             new_binary,
+            &new_sha,
             &live_sha,
             backup_sha.as_deref(),
             &TestEffectAuthorization,
@@ -3858,10 +4308,41 @@ mod tests {
         let expected = hash_file_opt(&live).unwrap();
         std::fs::write(&live, b"RACED").unwrap();
 
-        let result = atomic_self_replace(&live, &new, &expected, None, &TestEffectAuthorization);
+        let result = atomic_self_replace(
+            &live,
+            &new,
+            &hash_file_opt(&new).unwrap(),
+            &expected,
+            None,
+            &TestEffectAuthorization,
+        );
         assert!(result.is_err());
         assert_eq!(std::fs::read(&live).unwrap(), b"RACED");
         assert!(!previous_backup_path(&live).exists());
+    }
+
+    #[test]
+    fn selfupdate_refuses_candidate_changed_after_compatibility_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("tirith");
+        let new = dir.path().join("new-tirith");
+        let backup = previous_backup_path(&live);
+        std::fs::write(&live, b"LIVE").unwrap();
+        std::fs::write(&backup, b"PREVIOUS").unwrap();
+        std::fs::write(&new, b"VERIFIED").unwrap();
+        let candidate_sha = hash_file_opt(&new).unwrap();
+        std::fs::write(&new, b"SUBSTITUTED").unwrap();
+        assert!(atomic_self_replace(
+            &live,
+            &new,
+            &candidate_sha,
+            &hash_file_opt(&live).unwrap(),
+            hash_file_opt(&backup).as_deref(),
+            &TestEffectAuthorization,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&live).unwrap(), b"LIVE");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"PREVIOUS");
     }
 
     #[test]
@@ -3898,10 +4379,11 @@ mod tests {
     }
 
     #[test]
-    fn source_built_carveout_is_cargo_and_aur_only() {
+    fn source_built_carveout_includes_nix_and_keeps_prebuilt_channels_strict() {
         // Compiled-from-source installs get an honest Unverified.
         assert!(source_built_unverified_reason(&InstallMethod::Cargo).is_some());
         assert!(source_built_unverified_reason(&InstallMethod::Aur).is_some());
+        assert!(source_built_unverified_reason(&InstallMethod::Nix).is_some());
         // These ship the canonical binary and MUST verify normally (no carve-out).
         for m in [
             InstallMethod::Apt,
@@ -3910,6 +4392,9 @@ mod tests {
             InstallMethod::Homebrew,
             InstallMethod::Npm,
             InstallMethod::Scoop,
+            InstallMethod::Chocolatey,
+            InstallMethod::Mise,
+            InstallMethod::Asdf,
             InstallMethod::Unknown,
         ] {
             assert!(
@@ -3920,15 +4405,46 @@ mod tests {
     }
 
     #[test]
+    fn mise_cargo_provenance_requires_its_own_valid_install_record() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let binary = bin.join("tirith");
+        assert!(!mise_cargo_backend_is_recorded(&binary));
+        let metadata = root.path().join(".crates2.json");
+        std::fs::write(
+            &metadata,
+            r#"{"installs":{"other 1.0.0":{"bins":["tirith"]}}}"#,
+        )
+        .unwrap();
+        assert!(!mise_cargo_backend_is_recorded(&binary));
+        std::fs::write(
+            &metadata,
+            r#"{"installs":{"tirith 0.4.2 (registry+https://example.com/)":{"bins":["tirith"]}}}"#,
+        )
+        .unwrap();
+        assert!(mise_cargo_backend_is_recorded(&binary));
+        std::fs::write(&metadata, "not metadata").unwrap();
+        assert!(!mise_cargo_backend_is_recorded(&binary));
+    }
+
+    #[test]
     fn native_helper_is_required_only_for_install_methods_that_ship_it() {
         assert!(install_method_requires_package_approval_helper(
-            &InstallMethod::SelfManaged
+            &InstallMethod::SelfManaged,
+            true,
+        ));
+        assert!(!install_method_requires_package_approval_helper(
+            &InstallMethod::SelfManaged,
+            false,
         ));
         assert!(install_method_requires_package_approval_helper(
-            &InstallMethod::Apt
+            &InstallMethod::Apt,
+            false,
         ));
         assert!(install_method_requires_package_approval_helper(
-            &InstallMethod::Dnf
+            &InstallMethod::Dnf,
+            false,
         ));
         for method in [
             InstallMethod::Npm,
@@ -3937,7 +4453,48 @@ mod tests {
             InstallMethod::Aur,
             InstallMethod::Unknown,
         ] {
-            assert!(!install_method_requires_package_approval_helper(&method));
+            assert!(!install_method_requires_package_approval_helper(
+                &method, true
+            ));
+        }
+    }
+
+    #[test]
+    fn manual_install_without_helper_never_requests_elevation() {
+        use tirith_core::effects::CommandEffectKind;
+
+        let manages_helper =
+            install_method_updates_privileged_helper(&InstallMethod::SelfManaged, false, false);
+        assert!(!manages_helper);
+        let update = update_effects(manages_helper, false);
+        let rollback = rollback_effects(manages_helper);
+        assert!(update.contains(&CommandEffectKind::FilesystemWrite));
+        assert!(rollback.contains(&CommandEffectKind::FilesystemWrite));
+        assert!(!update.contains(&CommandEffectKind::ResourceEscalation));
+        assert!(!rollback.contains(&CommandEffectKind::ResourceEscalation));
+    }
+
+    #[test]
+    fn helper_backups_and_invalid_entries_keep_the_paired_update_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("helper");
+        let backup = directory.path().join("helper.previous");
+        let absent = directory.path().join("helper.previously-absent");
+        let paths = [live.as_path(), backup.as_path(), absent.as_path()];
+        assert!(!helper_state_present_at(&paths));
+        std::fs::write(&backup, b"previous-helper").unwrap();
+        assert!(helper_state_present_at(&paths));
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::write(&absent, b"").unwrap();
+        assert!(helper_state_present_at(&paths));
+        std::fs::remove_file(&absent).unwrap();
+        std::fs::create_dir(&live).unwrap();
+        assert!(helper_state_present_at(&paths));
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&live).unwrap();
+            std::os::unix::fs::symlink(directory.path().join("missing"), &live).unwrap();
+            assert!(helper_state_present_at(&paths));
         }
     }
 

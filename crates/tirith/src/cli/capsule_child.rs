@@ -41,6 +41,12 @@
 
 use std::ffi::{OsStr, OsString};
 
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod aarch64_trace;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod parent_lifetime;
+
 #[cfg(target_os = "linux")]
 use tirith_core::runner::{
     TARGET_ACK_RESUME, TARGET_EXEC_OBSERVED, TARGET_LAUNCH_ERROR, TARGET_LAUNCH_RESUMED,
@@ -1334,6 +1340,11 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         }
     }
 
+    if let Err(error) = parent_lifetime::arm_group_guard() {
+        eprintln!("tirith __capsule-child: parent lifetime bootstrap is unavailable: {error}");
+        std::process::exit(2);
+    }
+
     let bound_cwd = match prepare_bound_working_directory(&mut spec, parsed) {
         Ok(bound) => bound,
         Err(error) => {
@@ -1659,7 +1670,7 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
                         "tirith __capsule-child: target was authorized and may have executed before terminal resume proof failed: {error}"
                     ),
                 }
-                // kill(2) is deliberately absent from the seccomp policy. Use
+                // Only own-group SIGKILL is permitted by seccomp. Use
                 // the narrowly-filtered PTRACE_KILL relationship to clean and
                 // reap a stopped tracee, including failures before EXITKILL is
                 // known armed. If it cannot be issued, never block here: exit
@@ -1748,7 +1759,7 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
             // AArch64's synchronous breakpoint is the architectural equivalent
             // of x86_64 int3 and yields the initial SIGTRAP trace stop without a
             // signal-delivery syscall grant.
-            std::arch::asm!("brk #0", options(nomem, nostack));
+            aarch64_trace::stop();
         }
     }
 
@@ -1935,6 +1946,11 @@ fn confirm_target_exec_event(
             ),
         )
         .map_err(TargetExecEventError::BeforeAck);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if let Err(reason) = aarch64_trace::advance_initial_stop(target_pid) {
+        return refuse_unarmed_stopped_tracee(target_pid, reason)
+            .map_err(TargetExecEventError::BeforeAck);
     }
     let set_options = unsafe {
         libc::ptrace(
@@ -3295,7 +3311,7 @@ mod tests {
                 #[cfg(target_arch = "x86_64")]
                 std::arch::asm!("int3", options(nomem, nostack));
                 #[cfg(target_arch = "aarch64")]
-                std::arch::asm!("brk #0", options(nomem, nostack));
+                aarch64_trace::stop();
                 libc::execv(program.as_ptr(), argv.as_ptr());
                 let error = [TARGET_LAUNCH_ERROR];
                 let _ = libc::write(status[1], error.as_ptr().cast::<libc::c_void>(), 1);
@@ -3520,7 +3536,7 @@ mod tests {
                 #[cfg(target_arch = "x86_64")]
                 std::arch::asm!("int3", options(nomem, nostack));
                 #[cfg(target_arch = "aarch64")]
-                std::arch::asm!("brk #0", options(nomem, nostack));
+                aarch64_trace::stop();
                 let byte = *b"x";
                 let fd = libc::open(
                     marker_c.as_ptr(),

@@ -14,12 +14,38 @@ use super::fs_helpers::{PlatformSnapshot, PlatformTransaction};
 /// generation check. Reads use cap+1 so an exact-limit file remains valid.
 pub(crate) const MAX_SETUP_FILE_BYTES: usize = 10 * 1024 * 1024;
 
+/// The former global setup lock waited indefinitely. Existing contention tests
+/// measured roughly 23 seconds in aggregate; one acquisition now has a generous
+/// 30-second ceiling, while short injected budgets make timeout tests practical.
+pub(crate) const SETUP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) fn wait_for_lock(
+    timeout: std::time::Duration,
+    mut acquire: impl FnMut() -> Result<bool, String>,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        if acquire()? {
+            return Ok(());
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Err(format!("setup lock timed out after {} ms; another operation is still running; retry after it completes", elapsed.as_millis()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25).min(timeout - elapsed));
+    }
+}
+
 /// Immutable live state observed through a no-follow handle.
 pub(crate) struct FileSnapshot {
     inner: PlatformSnapshot,
 }
 
 impl FileSnapshot {
+    pub(crate) fn require_private(&self) -> Result<(), String> {
+        self.inner.require_private()
+    }
+
     pub(crate) fn exists(&self) -> bool {
         self.inner.bytes.is_some()
     }
@@ -172,28 +198,57 @@ where
     F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
     V: FnMut() -> Result<(), String>,
 {
+    transactional_update_authorized(
+        path,
+        scope_root,
+        dry_run,
+        transform,
+        revalidate_selection,
+        |_| Ok(()),
+    )
+}
+
+/// Retain the same checked destination and exact transformed bytes through a
+/// single authorization boundary immediately before publication. The caller
+/// also performs pure authorization preflight before any filesystem effects.
+pub(crate) fn transactional_update_authorized<F, V, A>(
+    path: &Path,
+    scope_root: &Path,
+    dry_run: bool,
+    transform: F,
+    revalidate_selection: V,
+    authorize_publication: A,
+) -> Result<TransactionOutcome, String>
+where
+    F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
+    V: FnMut() -> Result<(), String>,
+    A: FnMut(&[u8]) -> Result<(), String>,
+{
     transactional_update_impl(
         path,
         scope_root,
         dry_run,
         transform,
         revalidate_selection,
+        authorize_publication,
         #[cfg(test)]
         |_| Ok(()),
     )
 }
 
-fn transactional_update_impl<F, V>(
+fn transactional_update_impl<F, V, A>(
     path: &Path,
     scope_root: &Path,
     dry_run: bool,
     mut transform: F,
     mut revalidate_selection: V,
+    mut authorize_publication: A,
     #[cfg(test)] mut test_hook: impl FnMut(TestStage) -> Result<(), String>,
 ) -> Result<TransactionOutcome, String>
 where
     F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
     V: FnMut() -> Result<(), String>,
+    A: FnMut(&[u8]) -> Result<(), String>,
 {
     // Compute and cap the transformed payload before creating a parent,
     // persistent lock file, backup, or temporary file. Missing-parent dry runs and
@@ -270,6 +325,8 @@ where
         transaction.validate_snapshot(&snapshot.inner)?;
         #[cfg(test)]
         test_hook(TestStage::SnapshotValidated)?;
+
+        authorize_publication(&bytes)?;
 
         let mut publication = transaction.publish(
             temp,
@@ -380,11 +437,64 @@ where
     F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
     H: FnMut(TestStage) -> Result<(), String>,
 {
-    transactional_update_impl(path, scope_root, false, transform, || Ok(()), hook)
+    transactional_update_impl(
+        path,
+        scope_root,
+        false,
+        transform,
+        || Ok(()),
+        |_| Ok(()),
+        hook,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publication_authorization_binds_exact_bytes_and_refusal_preserves_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("policy.yaml");
+        std::fs::write(&path, "old\n").unwrap();
+        let mut calls = 0;
+        let error = super::transactional_update_authorized(
+            &path,
+            root.path(),
+            false,
+            |_| Ok(super::FileUpdate::write_text("new\n".into(), 0o600)),
+            || Ok(()),
+            |bytes| {
+                calls += 1;
+                assert_eq!(bytes, b"new\n");
+                Err("authorization refused".into())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("authorization refused"));
+        assert_eq!(calls, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
+    }
+
+    #[test]
+    fn contended_lock_has_a_measured_deadline() {
+        let started = std::time::Instant::now();
+        let error =
+            super::wait_for_lock(std::time::Duration::from_millis(40), || Ok(false)).unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(40));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn lock_retry_can_acquire_before_deadline() {
+        let mut attempts = 0;
+        super::wait_for_lock(std::time::Duration::from_secs(1), || {
+            attempts += 1;
+            Ok(attempts == 2)
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
     use super::TransactionOutcome;
 
     #[test]

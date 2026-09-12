@@ -33,10 +33,13 @@ use crate::verdict::{Action, Verdict};
 mod shell_receipt;
 pub use shell_receipt::{
     arm_shell_execution_receipt, consume_shell_execution_receipt, create_shell_execution_receipt,
-    discard_shell_execution_receipt, reconcile_shell_execution_receipt,
+    discard_shell_execution_receipt, execute_shell_verification_probe, finish_shell_verification,
+    observe_shell_verification_hook, reconcile_shell_execution_receipt,
     register_shell_hook_instance, register_shell_hook_instance_with_delivery,
-    shell_execution_receipt_context, validate_shell_hook_instance, ShellApprovalOutcome,
-    ShellHookFamily, ShellReceiptChannel, ShellReceiptContext,
+    shell_execution_receipt_context, start_shell_verification, validate_shell_hook_instance,
+    ShellApprovalOutcome, ShellHookFamily, ShellReceiptChannel, ShellReceiptContext,
+    ShellVerificationChallenge, ShellVerificationHookDecision, ShellVerificationObservation,
+    ShellVerificationProbe, ShellVerificationStatus,
 };
 
 pub const EXECUTION_LEDGER_SCHEMA_VERSION: u32 = 3;

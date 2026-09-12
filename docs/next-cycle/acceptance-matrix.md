@@ -54,7 +54,7 @@ decision, not a reduction of existing manual workflows.
 | PowerShell 5.1/7, Unix PowerShell | Trusted helper probes and config tests; ignored PTY follow-up stub | No next-cycle native blocking certification; target resolution and interception evidence required |
 | Nushell | Hook/config source; ignored PTY follow-up stub | No next-cycle native blocking certification |
 | Real agents and MCP clients | Adapter tests and unfilled E2E checklist | No selected agent certified here; record actual host version, enabled configuration, invocation and refusal separately |
-| Linux containment | Existing x86_64 Linux-only backend and release enforcement jobs | Independent native backend evidence; cannot be inferred from this macOS inventory or extended to other hosts |
+| Linux containment | Existing x86_64 release enforcement; native ARM GNU candidate passes nine installed-binary cases | ARM musl, cancellation and final release-artifact qualification remain separate gates; see containment-aarch64.md |
 
 ## Reproducible starting commands
 

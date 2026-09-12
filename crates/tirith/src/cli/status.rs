@@ -14,8 +14,18 @@ use crate::cli::prompt_status::ProtectionHealth;
 use crate::cli::threatdb_cmd;
 
 pub fn run(json: bool) -> i32 {
+    run_with_requirement(json, false)
+}
+
+pub fn run_with_requirement(json: bool, require_verified_blocking: bool) -> i32 {
     let quick = doctor::gather_quick_info();
     let health = ProtectionHealth::classify(&quick.protection_mode, quick.hook_configured);
+    let evidence = &quick.protection_evidence;
+    let exit = if require_verified_blocking && !evidence.verified_blocking {
+        1
+    } else {
+        health.exit_code()
+    };
 
     // Active policy scope — local discovery only, never a network fetch.
     let cwd = std::env::current_dir()
@@ -27,7 +37,7 @@ pub fn run(json: bool) -> i32 {
     let tdb = threatdb_cmd::gather_status();
 
     if json {
-        let out = status_json(
+        let mut out = status_json(
             &quick.protection_mode,
             health,
             scope,
@@ -35,6 +45,14 @@ pub fn run(json: bool) -> i32 {
             quick.hook_configured,
             &tdb,
         );
+        out["schema_version"] = serde_json::json!(1);
+        out["protection_evidence"] = serde_json::json!(evidence);
+        out["shell_target"] = serde_json::json!(crate::cli::shell_target::inspect_current().ok());
+        out["protected"] = serde_json::json!(evidence.verified_blocking);
+        out["requirement"] = serde_json::json!({"verified_blocking_required": require_verified_blocking, "satisfied": !require_verified_blocking || evidence.verified_blocking});
+        out["package_approval"] =
+            serde_json::to_value(super::package_approval_authority::availability())
+                .expect("package approval availability contains only JSON primitives");
         match serde_json::to_string_pretty(&out) {
             Ok(s) => println!("{s}"),
             Err(e) => {
@@ -42,7 +60,7 @@ pub fn run(json: bool) -> i32 {
                 return 1;
             }
         }
-        return health.exit_code();
+        return exit;
     }
 
     println!("tirith status");
@@ -61,11 +79,15 @@ pub fn run(json: bool) -> i32 {
         (None, _) => println!("  policy:      (none found)"),
     }
     println!("  threat db:   {}", threatdb_summary(&tdb));
+    let approval = super::package_approval_authority::availability();
+    println!("  pkg approval: {} (optional)", approval.state);
+    println!("    {}", approval.detail);
+    println!("    {}", approval.next_action);
     println!();
     // The verdict line: PROTECTED on stdout when guarded; otherwise the reason on
     // stderr (a security notice — always shown, never `--quiet`-gated).
     match health {
-        ProtectionHealth::Guarded => println!("tirith: PROTECTED"),
+        ProtectionHealth::Guarded => println!("tirith: hook reports blocking; current-shell blocking has not been verified"),
         // Configured, but this external process can't see the live per-shell mode
         // (TIRITH_STATUS is non-exported; only bash re-exports it). Not provably
         // off, so exit 0 — yet say so honestly rather than claim full protection.
@@ -74,7 +96,10 @@ pub fn run(json: bool) -> i32 {
         ),
         other => eprintln!("tirith: NOT FULLY PROTECTED — {}", health_reason(other)),
     }
-    health.exit_code()
+    if require_verified_blocking && !evidence.verified_blocking {
+        eprintln!("tirith: verified blocking requirement not satisfied for current-shell; configuration and inherited environment are insufficient evidence");
+    }
+    exit
 }
 
 /// Build the `status --json` envelope. A pure seam (no env, no I/O) so the
@@ -92,7 +117,7 @@ fn status_json(
     serde_json::json!({
         "protection_mode": mode,
         "health": health.label(),
-        "protected": health == ProtectionHealth::Guarded,
+        "protected": false,
         "hook_configured": hook_configured,
         "policy_path": policy_path,
         "policy_scope": scope,

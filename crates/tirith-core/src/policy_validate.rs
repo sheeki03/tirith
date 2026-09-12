@@ -121,6 +121,15 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
         };
 
     validate_paranoia(&policy, &mut issues);
+    if let Some(selection) = &policy.protection_profile {
+        if let Err(message) = crate::protection_profiles::validate_selection(selection) {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message,
+                field: Some("protection_profile".into()),
+            });
+        }
+    }
     validate_severity_overrides(&policy, &mut issues);
     validate_allowlist_blocklist_overlap(&policy, &mut issues);
     validate_custom_rules(&policy, &mut issues);

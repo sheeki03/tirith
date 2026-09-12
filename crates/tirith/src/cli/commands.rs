@@ -904,7 +904,11 @@ fn emit_run_json(
     let mut v =
         build_run_json_with_compiled(name, command, verdict, compiled, running, refused, error);
     append_commands_policy_diagnostics(&mut v, compiled);
-    tirith_core::redact::redact_json_strings(&mut v, compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut v,
+        tirith_core::output_contract::Projection::Verdict,
+        compiled,
+    );
     let v = tirith_core::verdict::bound_json_value_for_output(v);
     super::write_json_stdout(&v, "tirith commands run: failed to write JSON output")
 }
@@ -956,7 +960,11 @@ fn build_run_json_with_compiled(
         "refused": refused,
         "error": redacted_error,
     });
-    tirith_core::redact::redact_json_strings(&mut value, compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::Verdict,
+        compiled,
+    );
     tirith_core::verdict::bound_json_value_for_output(value)
 }
 
@@ -1241,7 +1249,11 @@ fn build_commands_error_json(
         "error": error,
     });
     append_commands_policy_diagnostics(&mut value, compiled);
-    tirith_core::redact::redact_json_strings(&mut value, compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::CommandsError,
+        compiled,
+    );
     tirith_core::verdict::bound_json_value_for_output(value)
 }
 

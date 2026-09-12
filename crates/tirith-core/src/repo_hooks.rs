@@ -3476,7 +3476,7 @@ fn push_entry(
 
 /// Run the five repo-hook rules over a hook body, High rules first so the most severe
 /// finding is listed first.
-fn classify_body(
+pub(crate) fn classify_body(
     name: &str,
     provider: HookProvider,
     location: &str,

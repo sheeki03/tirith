@@ -29,6 +29,8 @@
 //!
 //! Signature covers bytes `[0..108)` (header before sig) ++ bytes `[172..)` (all section data).
 
+pub mod operations;
+
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -317,6 +317,14 @@ impl ContainedAtomicFile {
         Ok(self.binding_identity()? == visible.binding_identity()?)
     }
 
+    /// Compare retained root objects while both capabilities remain alive.
+    /// This does not assert trust, authorize writes, or compare leaf contents.
+    /// It prevents a pathname replacement during traversal from changing the
+    /// project associated with an already open read-only service.
+    pub fn shares_retained_root(&self, other: &Self) -> io::Result<bool> {
+        Ok(self.binding_identity()?.root == other.binding_identity()?.root)
+    }
+
     /// Streaming variant of [`ContainedAtomicFile::write_atomic`]: copy from
     /// `reader` into the prepared temporary file, fsync it, then publish
     /// relative to the retained parent capability. When `unix_mode` is

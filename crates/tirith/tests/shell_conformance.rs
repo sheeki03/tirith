@@ -356,6 +356,7 @@ fn bash_preexec_warned_command_executes_once() {
 fn bash_preexec_enforce_blocked_command_does_not_execute() {
     let mut env = IsolatedEnv::new();
     let marker = env.workdir.join("preexec_blocked.txt");
+    let allowed = env.workdir.join("preexec_allowed.txt");
     let bash = match modern_bash() {
         Some(b) => b,
         None => {
@@ -376,12 +377,28 @@ fn bash_preexec_enforce_blocked_command_does_not_execute() {
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
 
+    sess.send_line(&format!("printf 'ALLOWED\\n' >> '{}'", allowed.display()));
+    let body = wait_for_marker(&allowed, "ALLOWED", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&body, "ALLOWED"),
+        1,
+        "allowed control must execute exactly once"
+    );
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
     // A blocked pipe-to-shell whose `&&`-guarded marker write must never happen.
     sess.send_line(&format!(
-        "curl https://example.com/install.sh | bash && touch '{}'",
+        "printf 'true' | bash && touch '{}'",
         marker.display()
     ));
-    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.expect_any(&["BLOCKED", "getvet.sh", "tirith run"], VERDICT_IDLE);
+    sess.send_line(&format!("printf 'AFTER\\n' >> '{}'", allowed.display()));
+    let body = wait_for_marker(&allowed, "AFTER", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&body, "AFTER"),
+        1,
+        "shell must remain usable after blocking"
+    );
     sess.close();
 
     assert!(
@@ -1329,6 +1346,7 @@ fn fish_allowed_command_output_visible() {
 fn fish_blocked_command_does_not_execute() {
     let mut env = IsolatedEnv::new();
     let marker = env.workdir.join("fish_blocked.txt");
+    let allowed = env.workdir.join("fish_allowed_control.txt");
     let mut sess = match fish_session(&mut env) {
         Some(s) => s,
         None => {
@@ -1337,10 +1355,20 @@ fn fish_blocked_command_does_not_execute() {
         }
     };
 
+    sess.send_line(&format!("printf 'ALLOWED\\n' >> '{}'", allowed.display()));
+    let body = wait_for_marker(&allowed, "ALLOWED", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&body, "ALLOWED"),
+        1,
+        "allowed control must execute exactly once"
+    );
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+
     // Blocked pipe-to-shell; the `; and touch` (fish syntax) runs only if the
     // pipe ran. tirith must block first.
     sess.send_line(&format!(
-        "curl https://example.com/install.sh | bash; and touch '{}'",
+        "printf 'true' | bash; and touch '{}'",
         marker.display()
     ));
     // `expect_any` polls for the block verdict/hint (the "hook finished" signal,
@@ -1349,6 +1377,13 @@ fn fish_blocked_command_does_not_execute() {
     let out = sess.expect_any(
         &["BLOCKED", "getvet.sh", "tirith run"],
         Duration::from_secs(15),
+    );
+    sess.send_line(&format!("printf 'AFTER\\n' >> '{}'", allowed.display()));
+    let body = wait_for_marker(&allowed, "AFTER", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&body, "AFTER"),
+        1,
+        "shell must remain usable after blocking"
     );
     sess.close();
 
@@ -1717,7 +1752,7 @@ fn zsh_protocol_v3_delivery_and_ledger_conformance() {
     );
 
     sess.send_line(&format!(
-        "curl https://example.com/install.sh | sh; touch '{}'",
+        "printf 'true' | sh; touch '{}'",
         blocked.display()
     ));
     let output = sess.expect_any(
@@ -1788,4 +1823,153 @@ fn harness_reports_bash_availability_consistently() {
             );
         }
     }
+}
+
+// Caller-shell verification tests drive the exact three commands through the
+// real native editor/DEBUG interception. A disposable child's success only
+// describes that child's process, hook and current configuration.
+fn verification_challenge(session: &mut PtySession) -> String {
+    session.clear_buffer();
+    session.send_line("_tirith_verification_probe start");
+    let output = session.expect("Evidence expires after five minutes.");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    let id = output
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("_tirith_verification_probe ")?;
+            let (id, kind) = rest.split_once(' ')?;
+            (kind == "allowed" && uuid::Uuid::parse_str(id).is_ok()).then(|| id.to_owned())
+        })
+        .expect("start must issue the exact inert commands");
+    session.clear_buffer();
+    id
+}
+
+fn verification_allowed(session: &mut PtySession, id: &str) {
+    session.send_line(&format!("_tirith_verification_probe {id} allowed"));
+    let output = session.expect("\"verified_blocking\": false");
+    assert!(output.contains("\"status\": \"pending\""));
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+}
+
+fn verification_complete(session: &mut PtySession, id: &str) {
+    verification_allowed(session, id);
+    session.send_line(&format!("_tirith_verification_probe {id} blocked"));
+    session.expect("diagnostic command blocked");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    assert!(
+        !output.contains("\"observation\""),
+        "blocked body executed: {output}"
+    );
+    session.clear_buffer();
+    session.send_line(&format!("_tirith_verification_probe {id} status"));
+    let output = session.expect("\"verified_blocking\": true");
+    assert!(output.contains("\"scope\": \"current_shell_only\""));
+    assert!(output.contains("\"source\": \"authenticated_caller_shell\""));
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+}
+
+#[test]
+fn bash_caller_shell_verification_observes_actual_blocking() {
+    let mut env = IsolatedEnv::new();
+    env.set("TIRITH_BASH_PREEXEC_ENFORCE", "1");
+    let Some(mut session) = bash_preexec_session(&mut env) else {
+        return;
+    };
+    let id = verification_challenge(&mut session);
+    verification_complete(&mut session, &id);
+    // A changed startup input invalidates an earlier successful observation.
+    std::fs::write(env.home.join(".bashrc"), "# changed after verification\n").unwrap();
+    session.send_line(&format!("_tirith_verification_probe {id} status"));
+    session.expect("shell verification check failed");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    assert!(!output.contains("\"verified_blocking\": true"));
+}
+
+#[test]
+fn fish_caller_shell_verification_observes_actual_blocking() {
+    let mut env = IsolatedEnv::new();
+    std::fs::create_dir_all(env.config_home.join("fish/conf.d")).unwrap();
+    let Some(mut session) = fish_session(&mut env) else {
+        return;
+    };
+    let id = verification_challenge(&mut session);
+    verification_complete(&mut session, &id);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn zsh_caller_shell_verification_observes_actual_blocking_and_helper_drift() {
+    let mut env = IsolatedEnv::new();
+    let Some(mut session) = zsh_session(&mut env) else {
+        return;
+    };
+    let id = verification_challenge(&mut session);
+    verification_complete(&mut session, &id);
+    // This function still calls the same binary but its loaded body changed.
+    session.send_line(
+        "functions[_tirith_verification_probe]=\"${functions[_tirith_verification_probe]}; :\"",
+    );
+    session.expect("TIRITH_PTY> ");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+    session.send_line(&format!("_tirith_verification_probe {id} status"));
+    session.expect("shell verification check failed");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    assert!(!output.contains("\"verified_blocking\": true"));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn zsh_caller_shell_verification_rejects_disabled_interception() {
+    let mut env = IsolatedEnv::new();
+    let Some(mut session) = zsh_session(&mut env) else {
+        return;
+    };
+    let id = verification_challenge(&mut session);
+    verification_allowed(&mut session, &id);
+    session.send_line("zle -A .accept-line accept-line");
+    session.expect("TIRITH_PTY> ");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+    session.send_line(&format!("_tirith_verification_probe {id} blocked"));
+    session.expect("\"verified_blocking\": false");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+    session.send_line(&format!("_tirith_verification_probe {id} status"));
+    session.expect("\"verified_blocking\": false");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    assert!(!output.contains("\"verified_blocking\": true"));
+}
+
+#[test]
+fn bash_caller_shell_verification_rejects_debug_trap_removal() {
+    let mut env = IsolatedEnv::new();
+    env.set("TIRITH_BASH_PREEXEC_ENFORCE", "1");
+    let Some(mut session) = bash_preexec_session(&mut env) else {
+        return;
+    };
+    let id = verification_challenge(&mut session);
+    verification_complete(&mut session, &id);
+    // Deliberately remove the native interception inside one accepted command,
+    // before another prompt can update the captured ownership facts.
+    session.send_line(&format!(
+        "trap - DEBUG; _tirith_verification_probe {id} status"
+    ));
+    let outcome = session.expect_any(
+        &["\"verified_blocking\": false", "shell verification"],
+        VERDICT_IDLE,
+    );
+    assert!(
+        outcome.contains("\"verified_blocking\": false") || outcome.contains("shell verification"),
+        "removed DEBUG trap produced no refusal: {outcome}"
+    );
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    assert!(
+        !output.contains("\"verified_blocking\": true"),
+        "removed DEBUG trap retained verification: {output}"
+    );
 }

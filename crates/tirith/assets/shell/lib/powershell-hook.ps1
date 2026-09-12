@@ -15,6 +15,10 @@ if ($global:_TIRITH_PS_LOADED) {
 }
 $global:_TIRITH_PS_LOADED = $true
 
+# A fresh load must not retain an inherited or failed integration label.
+$env:TIRITH_INTEGRATION_VERSION = $null
+$env:TIRITH_INTEGRATION_SHELL = $null
+
 # Session tracking: generate ID per session if not inherited
 if (-not $env:TIRITH_SESSION_ID) {
     $env:TIRITH_SESSION_ID = '{0:x}-{1:x}' -f $PID, [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -385,6 +389,11 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
 # inherited status would misrepresent it. The hook above already returned
 # early for a non-interactive session, so this only runs interactively.
 $global:TIRITH_STATUS = 'blocks'
+
+# Report loaded code only after this fresh initialization reaches installation.
+$env:TIRITH_INTEGRATION_VERSION = 'unknown'
+if ($global:_TIRITH_INIT_VERSION) { $env:TIRITH_INTEGRATION_VERSION = $global:_TIRITH_INIT_VERSION }
+$env:TIRITH_INTEGRATION_SHELL = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh' } else { 'powershell' }
 
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
 # Opt-in output-direction wrapper. Commented out by default in this embedded

@@ -175,6 +175,7 @@ trait PackageThreatBackend {
 
 struct LivePackageThreatBackend {
     network: RuntimeThreatNetwork,
+    cache: CacheReadContext,
 }
 
 impl PackageThreatBackend for LivePackageThreatBackend {
@@ -184,7 +185,7 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         name: &str,
         deadline: Instant,
     ) -> LookupOutcome<Option<String>> {
-        resolve_default_version(ecosystem, name, deadline, self.network)
+        resolve_default_version(ecosystem, name, deadline, self.network, &self.cache)
     }
 
     fn query_osv(
@@ -194,7 +195,14 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         version: &str,
         deadline: Instant,
     ) -> LookupOutcome<Vec<OsvVuln>> {
-        query_osv(ecosystem, name, version, deadline, self.network)
+        query_osv(
+            ecosystem,
+            name,
+            version,
+            deadline,
+            self.network,
+            &self.cache,
+        )
     }
 
     fn find_kev_alias(
@@ -202,7 +210,7 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         advisories: &[OsvVuln],
         deadline: Instant,
     ) -> LookupOutcome<Option<String>> {
-        find_kev_alias(advisories, deadline, self.network)
+        find_kev_alias(advisories, deadline, self.network, &self.cache)
     }
 
     fn collect_package_metadata(
@@ -212,7 +220,14 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         version: Option<&str>,
         deadline: Instant,
     ) -> MetadataLookup {
-        collect_package_metadata(ecosystem, name, version, deadline, self.network)
+        collect_package_metadata(
+            ecosystem,
+            name,
+            version,
+            deadline,
+            self.network,
+            &self.cache,
+        )
     }
 }
 
@@ -469,6 +484,49 @@ pub fn enrich_command_with_network(
     mode: RuntimeThreatMode,
     network: RuntimeThreatNetwork,
 ) -> Vec<Finding> {
+    enrich_command_with_cache(
+        input,
+        shell,
+        config,
+        mode,
+        network,
+        CacheReadContext::new(unix_now(), mode.timeout()),
+    )
+}
+
+/// One explicit read phase, with no network, cache publication or eviction.
+/// Complete refers to configured enrichment, not arbitrary command safety.
+pub(crate) fn capture_cached_enrichment(
+    input: &str,
+    shell: ShellType,
+    config: &ThreatIntelConfig,
+    captured_at: chrono::DateTime<chrono::Utc>,
+) -> (Vec<Finding>, bool) {
+    let findings = enrich_command_with_cache(
+        input,
+        shell,
+        config,
+        RuntimeThreatMode::Inline,
+        RuntimeThreatNetwork::CacheOnly,
+        CacheReadContext::new(
+            captured_at.timestamp().max(0) as u64,
+            Duration::from_millis(500),
+        ),
+    );
+    let complete = !findings
+        .iter()
+        .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete);
+    (findings, complete)
+}
+
+fn enrich_command_with_cache(
+    input: &str,
+    shell: ShellType,
+    config: &ThreatIntelConfig,
+    mode: RuntimeThreatMode,
+    network: RuntimeThreatNetwork,
+    cache: CacheReadContext,
+) -> Vec<Finding> {
     if !config.osv_enabled && !config.deps_dev_enabled && config.google_safe_browsing_key.is_none()
     {
         return Vec::new();
@@ -483,7 +541,7 @@ pub fn enrich_command_with_network(
     let extraction_truncated = extracted.truncated;
     let packages = extracted.packages;
     let urls = extract::extract_urls(input, shell);
-    let backend = LivePackageThreatBackend { network };
+    let backend = LivePackageThreatBackend { network, cache };
     let (mut findings, package_budget_truncated) =
         enrich_packages_with_backend(packages, config, mode.timeout(), &backend);
     let mut seen = HashSet::new();
@@ -533,7 +591,9 @@ pub fn enrich_command_with_network(
                 }
             }
             for batch in candidates.chunks(GSB_BATCH_SIZE) {
-                for (url, match_type) in query_safe_browsing_batch(batch, api_key, deadline) {
+                for (url, match_type) in
+                    query_safe_browsing_batch(batch, api_key, deadline, &backend.cache)
+                {
                     let key = format!("safe-browsing:{url}");
                     if seen.insert(key) {
                         findings.push(Finding {
@@ -581,6 +641,133 @@ pub fn enrich_command_with_network(
     findings
 }
 
+// A capture owns the complete cache-read budget. Repeated references to a
+// package or KEV catalog reuse the first observed bytes, including misses.
+// No mutable global cache or thread-local input can change a frozen preview.
+struct CacheReadContext {
+    now: u64,
+    deadline: Instant,
+    state: std::cell::RefCell<CacheReadState>,
+}
+
+#[derive(Default)]
+struct CacheReadState {
+    bytes: u64,
+    entries: std::collections::BTreeMap<PathBuf, Option<std::rc::Rc<CachedValue>>>,
+}
+
+struct CachedValue {
+    fetched_at: u64,
+    value: serde_json::Value,
+}
+
+const MAX_CAPTURE_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CAPTURE_CACHE_FILES: usize = 128;
+const MAX_CACHE_JSON_NODES: usize = 65_536;
+
+impl CacheReadContext {
+    fn new(now: u64, timeout: Duration) -> Self {
+        Self {
+            now,
+            deadline: Instant::now() + timeout,
+            state: Default::default(),
+        }
+    }
+
+    fn load<T: DeserializeOwned>(&self, kind: &str, key: &str, ttl_secs: u64) -> Option<T> {
+        if Instant::now() >= self.deadline {
+            return None;
+        }
+        let path = cache_path(kind, key)?;
+        let cached = {
+            let mut state = self.state.borrow_mut();
+            if let Some(prior) = state.entries.get(&path) {
+                prior.clone()
+            } else {
+                if state.entries.len() >= MAX_CAPTURE_CACHE_FILES {
+                    return None;
+                }
+                let remaining = MAX_CAPTURE_CACHE_BYTES.saturating_sub(state.bytes);
+                let cap = remaining.min(MAX_RESPONSE_BYTES);
+                let observed = self
+                    .read(&path, cap, &mut state.bytes)
+                    .map(std::rc::Rc::new);
+                state.entries.insert(path, observed.clone());
+                observed
+            }
+        }?;
+        // Future clocks are unknown, never fresh forever via saturating_sub.
+        if cached.fetched_at > self.now
+            || self.now - cached.fetched_at > ttl_secs
+            || Instant::now() >= self.deadline
+        {
+            return None;
+        }
+        serde_json::from_value(cached.value.clone()).ok()
+    }
+
+    fn read(&self, path: &std::path::Path, cap: u64, bytes_read: &mut u64) -> Option<CachedValue> {
+        use crate::util::dirfd::{file_generation, DirCapability};
+        use std::io::Read as _;
+        if cap == 0 {
+            return None;
+        }
+        let parent = DirCapability::open_root(path.parent()?).ok()?;
+        let parent_identity = parent.identity().ok()?;
+        let name = path.file_name()?.to_str()?;
+        let mut file = parent.open_child_file(name, cap).ok()?;
+        let generation = file_generation(&file).ok()?;
+        let mut bytes = Vec::new();
+        let result = (&mut file)
+            .take(cap.saturating_add(1))
+            .read_to_end(&mut bytes);
+        *bytes_read = bytes_read.saturating_add(bytes.len() as u64);
+        if result.is_err()
+            || bytes.len() as u64 > cap
+            || file_generation(&file).ok()? != generation
+            || file_generation(&parent.open_child_file(name, cap).ok()?).ok()? != generation
+            || DirCapability::open_root(path.parent()?)
+                .ok()?
+                .identity()
+                .ok()?
+                != parent_identity
+            || Instant::now() >= self.deadline
+        {
+            return None;
+        }
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let value = crate::mcp_lock::parse_json_no_duplicates(text).ok()?;
+        let mut pending = vec![&value];
+        let mut nodes = 0;
+        while let Some(value) = pending.pop() {
+            nodes += 1;
+            if nodes > MAX_CACHE_JSON_NODES {
+                return None;
+            }
+            match value {
+                serde_json::Value::Array(values) => {
+                    if values.len() > MAX_DECODED_ITEMS {
+                        return None;
+                    }
+                    pending.extend(values.iter());
+                }
+                serde_json::Value::Object(values) => {
+                    if values.len() > MAX_DECODED_ITEMS {
+                        return None;
+                    }
+                    pending.extend(values.values());
+                }
+                _ => (),
+            }
+        }
+        let envelope: CacheEnvelope<serde_json::Value> = serde_json::from_value(value).ok()?;
+        Some(CachedValue {
+            fetched_at: envelope.fetched_at,
+            value: envelope.value,
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEnvelope<T> {
     fetched_at: u64,
@@ -598,14 +785,9 @@ fn cache_path(kind: &str, key: &str) -> Option<PathBuf> {
     )
 }
 
+#[cfg(test)]
 fn load_cache<T: DeserializeOwned>(kind: &str, key: &str, ttl_secs: u64) -> Option<T> {
-    let path = cache_path(kind, key)?;
-    let content = std::fs::read_to_string(path).ok()?;
-    let envelope: CacheEnvelope<T> = serde_json::from_str(&content).ok()?;
-    if unix_now().saturating_sub(envelope.fetched_at) > ttl_secs {
-        return None;
-    }
-    Some(envelope.value)
+    CacheReadContext::new(unix_now(), Duration::from_secs(5)).load(kind, key, ttl_secs)
 }
 
 fn store_cache<T: Serialize>(kind: &str, key: &str, value: &T) {
@@ -744,6 +926,7 @@ fn query_osv(
     version: &str,
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> LookupOutcome<Vec<OsvVuln>> {
     let Some(label) = ecosystem_label(ecosystem) else {
         return LookupOutcome::Unsupported;
@@ -752,7 +935,7 @@ fn query_osv(
         return LookupOutcome::Unsupported;
     };
     let cache_key = format!("{label}:{name}:{version}");
-    if let Some(response) = load_cache::<OsvQueryResponse>("osv", &cache_key, CACHE_TTL_SECS) {
+    if let Some(response) = cache.load::<OsvQueryResponse>("osv", &cache_key, CACHE_TTL_SECS) {
         return LookupOutcome::Complete(response.vulns);
     }
     if !network.allows_network() {
@@ -820,6 +1003,7 @@ fn deps_package(
     name: &str,
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> LookupOutcome<DepsPackageResponse> {
     let Some(system) = deps_system_name(ecosystem) else {
         return LookupOutcome::Unsupported;
@@ -827,7 +1011,7 @@ fn deps_package(
     let encoded = utf8_percent_encode(name, NON_ALPHANUMERIC).to_string();
     let cache_key = format!("{system}:{encoded}");
     if let Some(response) =
-        load_cache::<DepsPackageResponse>("deps-package", &cache_key, CACHE_TTL_SECS)
+        cache.load::<DepsPackageResponse>("deps-package", &cache_key, CACHE_TTL_SECS)
     {
         return LookupOutcome::Complete(response);
     }
@@ -867,8 +1051,9 @@ fn resolve_default_version(
     name: &str,
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> LookupOutcome<Option<String>> {
-    match deps_package(ecosystem, name, deadline, network) {
+    match deps_package(ecosystem, name, deadline, network, cache) {
         LookupOutcome::Complete(package) => LookupOutcome::Complete(
             package
                 .versions
@@ -897,6 +1082,7 @@ fn ecosystems_package(
     name: &str,
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> LookupOutcome<EcosystemsPackageResponse> {
     let Some(registry) = ecosystems_registry_name(ecosystem) else {
         return LookupOutcome::Unsupported;
@@ -904,7 +1090,7 @@ fn ecosystems_package(
     let encoded = utf8_percent_encode(name, NON_ALPHANUMERIC).to_string();
     let cache_key = format!("{registry}:{encoded}");
     if let Some(response) =
-        load_cache::<EcosystemsPackageResponse>("ecosystems-package", &cache_key, CACHE_TTL_SECS)
+        cache.load::<EcosystemsPackageResponse>("ecosystems-package", &cache_key, CACHE_TTL_SECS)
     {
         return LookupOutcome::Complete(response);
     }
@@ -958,9 +1144,10 @@ fn collect_package_metadata(
     _version: Option<&str>,
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> MetadataLookup {
     let mut incomplete = Vec::new();
-    let first_release_days = match deps_package(ecosystem, name, deadline, network) {
+    let first_release_days = match deps_package(ecosystem, name, deadline, network, cache) {
         LookupOutcome::Complete(response) => response
             .versions
             .iter()
@@ -968,7 +1155,7 @@ fn collect_package_metadata(
             .filter_map(parse_rfc3339_secs)
             .min()
             .map(|first_seen| {
-                let now = unix_now() as i64;
+                let now = cache.now as i64;
                 ((now - first_seen).max(0)) / 86_400
             }),
         LookupOutcome::Unsupported => None,
@@ -978,7 +1165,7 @@ fn collect_package_metadata(
         }
     };
 
-    let maintainers = match ecosystems_package(ecosystem, name, deadline, network) {
+    let maintainers = match ecosystems_package(ecosystem, name, deadline, network, cache) {
         LookupOutcome::Complete(package) => Some(package.maintainers.len()),
         LookupOutcome::Unsupported => None,
         LookupOutcome::Incomplete(error) => {
@@ -1008,8 +1195,12 @@ struct KevVulnerability {
     cve_id: String,
 }
 
-fn kev_aliases(deadline: Instant, network: RuntimeThreatNetwork) -> LookupOutcome<HashSet<String>> {
-    if let Some(cached) = load_cache::<Vec<String>>("kev", "active", KEV_CACHE_TTL_SECS) {
+fn kev_aliases(
+    deadline: Instant,
+    network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
+) -> LookupOutcome<HashSet<String>> {
+    if let Some(cached) = cache.load::<Vec<String>>("kev", "active", KEV_CACHE_TTL_SECS) {
         return LookupOutcome::Complete(cached.into_iter().collect());
     }
     if !network.allows_network() {
@@ -1045,11 +1236,12 @@ fn find_kev_alias(
     advisories: &[OsvVuln],
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> LookupOutcome<Option<String>> {
     if advisories.is_empty() {
         return LookupOutcome::Complete(None);
     }
-    match kev_aliases(deadline, network) {
+    match kev_aliases(deadline, network, cache) {
         LookupOutcome::Complete(kev) => LookupOutcome::Complete(
             advisories
                 .iter()
@@ -1090,12 +1282,13 @@ fn query_safe_browsing_batch(
     urls: &[String],
     api_key: &str,
     deadline: Instant,
+    cache: &CacheReadContext,
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut missing: Vec<&str> = Vec::new();
     for url in urls {
         if let Some(response) =
-            load_cache::<SafeBrowsingResponse>("safe-browsing", url, CACHE_TTL_SECS)
+            cache.load::<SafeBrowsingResponse>("safe-browsing", url, CACHE_TTL_SECS)
         {
             if let Some(m) = response.matches.first() {
                 out.push((url.clone(), m.threat_type.clone()));
@@ -1541,6 +1734,226 @@ mod tests {
     use std::net::IpAddr;
     use std::sync::Mutex;
     use url::Url;
+
+    fn write_cache_fixture(kind: &str, key: &str, value: &str) -> PathBuf {
+        let path = cache_path(kind, key).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, value).unwrap();
+        path
+    }
+
+    #[test]
+    fn bounded_cache_capture_reuses_first_hit_and_miss_without_writes() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let path = write_cache_fixture(
+            "fixture",
+            "known",
+            r#"{"fetched_at":100,"value":["first"]}"#,
+        );
+        let cache = CacheReadContext::new(100, Duration::from_secs(5));
+        assert_eq!(
+            cache.load::<Vec<String>>("fixture", "known", 60).unwrap(),
+            ["first"]
+        );
+        let bytes = cache.state.borrow().bytes;
+        std::fs::write(&path, r#"{"fetched_at":100,"value":["changed"]}"#).unwrap();
+        assert_eq!(
+            cache.load::<Vec<String>>("fixture", "known", 60).unwrap(),
+            ["first"]
+        );
+        assert_eq!(cache.state.borrow().bytes, bytes);
+        assert!(cache
+            .load::<Vec<String>>("fixture", "missing", 60)
+            .is_none());
+        write_cache_fixture("fixture", "missing", r#"{"fetched_at":100,"value":[]}"#);
+        assert!(cache
+            .load::<Vec<String>>("fixture", "missing", 60)
+            .is_none());
+        assert_eq!(
+            CacheReadContext::new(100, Duration::from_secs(5))
+                .load::<Vec<String>>("fixture", "known", 60)
+                .unwrap(),
+            ["changed"]
+        );
+    }
+
+    #[test]
+    fn bounded_cache_rejects_future_expired_duplicate_and_excessive_values() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        for (key, text) in [
+            ("future", r#"{"fetched_at":101,"value":[]}"#.to_string()),
+            ("expired", r#"{"fetched_at":1,"value":[]}"#.to_string()),
+            (
+                "duplicate",
+                r#"{"fetched_at":100,"fetched_at":100,"value":[]}"#.to_string(),
+            ),
+            (
+                "collection",
+                serde_json::json!({"fetched_at":100,"value":vec!["x";MAX_DECODED_ITEMS+1]})
+                    .to_string(),
+            ),
+        ] {
+            write_cache_fixture("fixture", key, &text);
+            assert!(
+                CacheReadContext::new(100, Duration::from_secs(5))
+                    .load::<Vec<String>>("fixture", key, 60)
+                    .is_none(),
+                "{key}"
+            );
+        }
+        let large = write_cache_fixture("fixture", "large", "");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(large)
+            .unwrap()
+            .set_len(MAX_RESPONSE_BYTES + 1)
+            .unwrap();
+        let cache = CacheReadContext::new(100, Duration::from_secs(5));
+        assert!(cache.load::<Vec<String>>("fixture", "large", 60).is_none());
+        assert_eq!(
+            cache.state.borrow().bytes,
+            0,
+            "oversize refused before read"
+        );
+
+        write_cache_fixture("fixture", "small", r#"{"fetched_at":100,"value":[]}"#);
+        let cache = CacheReadContext::new(100, Duration::from_secs(5));
+        cache.state.borrow_mut().bytes = MAX_CAPTURE_CACHE_BYTES - 1;
+        assert!(cache.load::<Vec<String>>("fixture", "small", 60).is_none());
+        let cache = CacheReadContext::new(100, Duration::ZERO);
+        assert!(cache.load::<Vec<String>>("fixture", "small", 60).is_none());
+        assert!(cache.state.borrow().entries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_cache_refuses_symlink_fifo_and_replaced_directory() {
+        use std::os::unix::fs::symlink;
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let source = write_cache_fixture("fixture", "source", r#"{"fetched_at":100,"value":[]}"#);
+        let linked = cache_path("fixture", "link").unwrap();
+        symlink(&source, &linked).unwrap();
+        let fifo = cache_path("fixture", "fifo").unwrap();
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let cache = CacheReadContext::new(100, Duration::from_secs(5));
+        assert!(cache.load::<Vec<String>>("fixture", "link", 60).is_none());
+        assert!(cache.load::<Vec<String>>("fixture", "fifo", 60).is_none());
+        let directory = source.parent().unwrap();
+        let moved = directory.with_extension("moved");
+        std::fs::rename(directory, &moved).unwrap();
+        symlink(&moved, directory).unwrap();
+        assert!(cache.load::<Vec<String>>("fixture", "source", 60).is_none());
+    }
+
+    #[test]
+    fn disabled_cached_enrichment_has_no_gap_and_creates_no_cache_directory() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let config = ThreatIntelConfig {
+            osv_enabled: false,
+            deps_dev_enabled: false,
+            google_safe_browsing_key: None,
+            ..ThreatIntelConfig::default()
+        };
+        let directory = policy::state_dir().unwrap().join("threatdb-api-cache");
+        assert!(!directory.exists());
+        let (findings, complete) = capture_cached_enrichment(
+            "pip install missing-package==1.0.0",
+            ShellType::Posix,
+            &config,
+            chrono::Utc::now(),
+        );
+        assert!(findings.is_empty() && complete);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn frozen_cached_threat_uses_candidate_policy_and_never_rereads_changed_cache() {
+        let guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let name = "tirith-frozen-cache-regression";
+        let key = format!("pypi:{name}:1.0.0");
+        store_cache(
+            "osv",
+            &key,
+            &OsvQueryResponse {
+                vulns: vec![OsvVuln {
+                    id: "OSV-FROZEN-FIXTURE".into(),
+                    aliases: Vec::new(),
+                    summary: None,
+                    references: Vec::new(),
+                }],
+            },
+        );
+        store_cache("kev", "active", &Vec::<String>::new());
+        let policy = crate::policy::Policy {
+            threat_intel: ThreatIntelConfig {
+                osv_enabled: true,
+                deps_dev_enabled: false,
+                google_safe_browsing_key: None,
+                ..ThreatIntelConfig::default()
+            },
+            ..crate::policy::Policy::default()
+        };
+        let context = crate::engine::AnalysisContext {
+            input: format!("pip install {name}==1.0.0"),
+            shell: ShellType::Posix,
+            scan_context: crate::extract::ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(guard.roots().cwd.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        };
+        let frozen = crate::evaluation::FrozenEvaluation::capture_with_policy(
+            context,
+            &policy,
+            crate::escalation::CallerContext::Cli,
+            None,
+            crate::evaluation::SessionEvidence::Captured(Box::new(
+                crate::session_warnings::SessionWarnings::new("frozen-cache"),
+            )),
+        );
+        let before = frozen.evaluate_current();
+        assert!(!before
+            .explanation
+            .gaps
+            .contains(&crate::evaluation::EvidenceGap::RuntimeThreatEnrichmentNotCaptured));
+        assert!(before
+            .verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ThreatOsvVulnerable));
+        std::fs::remove_dir_all(policy::state_dir().unwrap().join("threatdb-api-cache")).unwrap();
+        let repeated = frozen.evaluate_current();
+        assert_eq!(
+            serde_json::to_value(&before.verdict).unwrap(),
+            serde_json::to_value(&repeated.verdict).unwrap()
+        );
+        assert!(!policy::state_dir()
+            .unwrap()
+            .join("threatdb-api-cache")
+            .exists());
+        let mut candidate = policy;
+        candidate.paranoia = 4;
+        candidate
+            .severity_overrides
+            .insert(RuleId::ThreatOsvVulnerable.to_string(), Severity::Info);
+        let changed = frozen.evaluate(&candidate);
+        assert!(changed
+            .verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ThreatOsvVulnerable
+                && finding.severity == Severity::Info));
+        assert!(!changed
+            .explanation
+            .gaps
+            .contains(&crate::evaluation::EvidenceGap::DetectorPolicyChanged));
+    }
 
     #[derive(Default)]
     struct FakeDns {
@@ -2114,6 +2527,7 @@ mod tests {
             "1.0.0",
             deadline,
             RuntimeThreatNetwork::CacheOnly,
+            &CacheReadContext::new(unix_now(), Duration::from_secs(5)),
         );
         assert!(matches!(cached, LookupOutcome::Complete(vulns) if vulns.len() == 1));
 
@@ -2123,6 +2537,7 @@ mod tests {
             "9.9.9",
             deadline,
             RuntimeThreatNetwork::CacheOnly,
+            &CacheReadContext::new(unix_now(), Duration::from_secs(5)),
         );
         assert!(
             matches!(missing, LookupOutcome::Incomplete(LookupFailure::Offline)),

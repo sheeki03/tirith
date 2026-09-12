@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   # Serialize manual + scheduled runs: each run pushes the manifest to main and
@@ -29,6 +30,7 @@ jobs:
     # workflow_dispatch). schedule/dispatch always use main's copy anyway.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       # github.run_id and github.run_attempt identify immutable asset files. They
       # are deliberately NOT the signed database sequence: a rerun has the same
@@ -135,7 +137,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build compiler
-        run: cargo build --release -p tirith --bin tirith-threatdb-compile
+        run: cargo build --locked --release -p tirith --bin tirith-threatdb-compile --bin tirith
 
       # Exercise the exact fetch transaction with fixture commands. A failed
       # background child must stop the job before compilation/publication and
@@ -146,7 +148,17 @@ jobs:
       # Fetch Phase A sources in parallel. Each PID is waited explicitly and the
       # complete set is published from private staging with one atomic rename.
       - name: Fetch sources
+        id: fetch
         run: bash .github/scripts/fetch-threatdb-sources.sh
+
+      - name: Observe upstream lag without adopting source pins
+        id: upstream
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/threatdb_source_pins.py observe \
+            .github/threatdb-source-pins.json \
+            --result "$RUNNER_TEMP/threatdb-upstream-observations.json"
 
       # DigitalSide Threat-Intel (davidonzo/Threat-Intel, MIT-licensed code) is
       # defined in the compiler as ThreatSource::DigitalSide with a --digitalside
@@ -179,6 +191,7 @@ jobs:
       # the configured key prevents an unsigned repository/release edit from
       # influencing the sequence allocator.
       - name: Allocate monotonic signed sequence
+        id: sequence
         env:
           GH_TOKEN: ${{ github.token }}
           TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
@@ -409,7 +422,9 @@ jobs:
           fi
           download_baseline() {
             local label="$1" url="$2" expected_sha="$3" expected_size="$4" output="$5"
-            curl -sSfL --retry 3 --retry-all-errors "$url" -o "$output"
+            curl -sSfL --connect-timeout 15 --max-time 120 \
+              --max-filesize "$expected_size" --retry 2 --retry-connrefused \
+              --retry-max-time 240 "$url" -o "$output"
             local actual_sha actual_size
             actual_sha=$(sha256sum "$output" | cut -d' ' -f1)
             actual_size=$(stat -c%s "$output")
@@ -450,6 +465,7 @@ jobs:
       # asset (--output-v2, the same base data plus artifact-SHA, file-SHA, and
       # malicious-URL sections, served to v2-capable clients via the v2 index).
       - name: Compile threat database
+        id: compile
         env:
           TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
         run: |
@@ -503,6 +519,7 @@ jobs:
             --registry-snapshots /tmp/tirith-threatdb-sources/registry-versions.json \
             --source-provenance "$RAW_SOURCE_PROVENANCE" \
             --compiler-metadata "$COMPILER_METADATA" \
+            --upstream-observations "$RUNNER_TEMP/threatdb-upstream-observations.json" \
             --datadog /tmp/tirith-threatdb-sources/dd-mp \
             --feodo /tmp/tirith-threatdb-sources/feodo.txt \
             --cisa-kev /tmp/tirith-threatdb-sources/cisa-kev.json \
@@ -622,6 +639,7 @@ jobs:
       # later v2-side failure (the version-tag preflight or an index validation
       # error) cannot skip the v1 publish that old clients depend on.
       - name: Publish release (v1 + legacy manifest)
+        id: publish_legacy
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ env.THREATDB_RELEASE_TAG }}
@@ -927,6 +945,7 @@ jobs:
       # immutable assets exist on the rolling release. A failed asset upload leaves
       # the previous index untouched; clients never discover a partial generation.
       - name: Publish release (signed generation index commit point)
+        id: publish_index
         if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
@@ -973,14 +992,32 @@ jobs:
       # (tirith-threatdb-<id>-<attempt>.dat vs tirith-threatdb-v2-<id>-<attempt>.dat),
       # so a combined sort would misorder v2. The v1 regex excludes the v2 names
       # by requiring digits immediately after the prefix.
+      - name: Verify primary, fallback and a cold client before pruning
+        id: cold_verify
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify-threatdb-publication.py \
+            --sequence "$BUILD_SEQUENCE" --v2 "$ENABLE_THREATDB_V2" \
+            --verify-key crates/tirith/assets/keys/threatdb-verify.pub \
+            --output "$RUNNER_TEMP/threatdb-publication-verification.json"
+          cold="$RUNNER_TEMP/threatdb-cold-client"
+          mkdir -p "$cold/config" "$cold/data" "$cold/state"
+          export XDG_CONFIG_HOME="$cold/config" XDG_DATA_HOME="$cold/data" XDG_STATE_HOME="$cold/state"
+          export TIRITH_THREATDB_PATH="$cold/data/tirith-threatdb.dat"
+          export TIRITH_THREATDB_SUPPLEMENTAL_PATH="$cold/data/supplemental.dat"
+          ./target/release/tirith threat-db update
+          ./target/release/tirith threat-db health --json > "$cold/health.json"
+          jq -e --argjson sequence "$BUILD_SEQUENCE" \
+            '.signature_valid == true and .build_sequence == $sequence and .error == null' "$cold/health.json"
+          if [ "$ENABLE_THREATDB_V2" = true ]; then
+            jq -e '.freshness.source_evidence == "signature_verified_for_installed_database" and (.freshness.sources | length > 0)' "$cold/health.json"
+          fi
+
       - name: Prune old threatdb assets
-        # `always()`: cleanup must run even when an upstream step failed (most
-        # concretely a v2-side failure such as the version-tag preflight). Without
-        # this, a repeating v2 failure would skip every prune and let v1+v2 assets
-        # accumulate past GitHub's 2 GB/release limit, eventually blocking uploads.
-        # Pruning keeps the newest KEEP assets, so running it on a failed build is
-        # safe (nothing new to over-delete).
-        if: ${{ always() }}
+        # Keep recovery assets until both discovery surfaces and a cold client
+        # verify. Repeated failures are visible in the run report and require
+        # repair before pruning; a partially uploaded generation is not success.
+        if: ${{ success() && steps.cold_verify.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
           KEEP: "3"
@@ -1177,3 +1214,33 @@ jobs:
             gh release delete-asset "$THREATDB_RELEASE_TAG" "$asset" \
               --repo "${{ github.repository }}" --yes
           done
+
+      - name: Record publication and recovery outcome
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_STEPS: ${{ toJSON(steps) }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$RUN_STEPS" > "$RUNNER_TEMP/threatdb-steps.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/threatdb.yml/runs?branch=main&status=completed&per_page=5" \
+            > "$RUNNER_TEMP/threatdb-previous-runs.json" || printf '{}' > "$RUNNER_TEMP/threatdb-previous-runs.json"
+          python3 .github/scripts/threatdb-run-report.py \
+            --steps "$RUNNER_TEMP/threatdb-steps.json" \
+            --previous "$RUNNER_TEMP/threatdb-previous-runs.json" \
+            --provenance "threatdb-source-provenance-${RUN_ID}-${RUN_ATTEMPT}.json" \
+            --run-id "$RUN_ID" --output "$RUNNER_TEMP/threatdb-run-report.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain operational evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: threatdb-operations-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/threatdb-run-report.json
+            ${{ runner.temp }}/threatdb-upstream-observations.json
+            ${{ runner.temp }}/threatdb-publication-verification.json
+            ${{ runner.temp }}/threatdb-cold-client/health.json
+          if-no-files-found: error
+          retention-days: 30

@@ -104,6 +104,17 @@ pub fn apply_escalation(
     session: &SessionWarnings,
     rules: &[EscalationRule],
 ) -> (Action, HashSet<String>, Vec<EscalationHit>, Option<String>) {
+    apply_escalation_at(current_action, findings, session, rules, chrono::Utc::now())
+}
+
+/// Evaluate escalation against an explicit clock and immutable session evidence.
+pub(crate) fn apply_escalation_at(
+    current_action: Action,
+    findings: &[Finding],
+    session: &SessionWarnings,
+    rules: &[EscalationRule],
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Action, HashSet<String>, Vec<EscalationHit>, Option<String>) {
     let mut action = current_action;
     let mut causal = HashSet::new();
     let mut hits: Vec<EscalationHit> = Vec::new();
@@ -169,7 +180,7 @@ pub fn apply_escalation(
                             };
                             rule_matches
                                 && domain_matches
-                                && is_within_minutes(&ev.timestamp, *cooldown_minutes)
+                                && is_within_minutes_at(&ev.timestamp, *cooldown_minutes, now)
                         });
                         if cooldown_active {
                             continue;
@@ -178,11 +189,23 @@ pub fn apply_escalation(
 
                     let session_count = if *domain_scoped {
                         match domain {
-                            Some(d) => session.count_by_rule_and_domain(fid, d, *window_minutes),
-                            None => session.count_by_rule(fid, *window_minutes),
+                            Some(d) => count_session_events_at(
+                                session,
+                                Some(fid),
+                                Some(d),
+                                *window_minutes,
+                                now,
+                            ),
+                            None => count_session_events_at(
+                                session,
+                                Some(fid),
+                                None,
+                                *window_minutes,
+                                now,
+                            ),
                         }
                     } else {
-                        session.count_by_rule(fid, *window_minutes)
+                        count_session_events_at(session, Some(fid), None, *window_minutes, now)
                     };
 
                     let total = session_count + current_count;
@@ -213,14 +236,16 @@ pub fn apply_escalation(
                 if wildcard && !domain_scoped && !action_gte(action, target) {
                     if *cooldown_minutes > 0 {
                         let wildcard_cooled = session.escalation_events.iter().any(|ev| {
-                            ev.rule_id == "*" && is_within_minutes(&ev.timestamp, *cooldown_minutes)
+                            ev.rule_id == "*"
+                                && is_within_minutes_at(&ev.timestamp, *cooldown_minutes, now)
                         });
                         if wildcard_cooled {
                             continue;
                         }
                     }
 
-                    let total = session.count_all(*window_minutes) + findings.len() as u32;
+                    let total = count_session_events_at(session, None, None, *window_minutes, now)
+                        + findings.len() as u32;
                     if total >= *threshold {
                         action = target;
                         for f in findings {
@@ -273,13 +298,34 @@ pub fn apply_escalation(
 
 /// Is an RFC 3339 timestamp within `minutes` of now? Fail-safe: an unparseable
 /// timestamp counts as within-window so cooldown stays active.
-fn is_within_minutes(timestamp: &str, minutes: u64) -> bool {
+fn is_within_minutes_at(timestamp: &str, minutes: u64, now: chrono::DateTime<chrono::Utc>) -> bool {
     let Ok(ts) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
         return true;
     };
+    ts >= now - chrono::Duration::minutes(minutes.min(u32::MAX as u64) as i64)
+}
+
+fn count_session_events_at(
+    session: &SessionWarnings,
+    rule: Option<&str>,
+    domain: Option<&str>,
+    minutes: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u32 {
     let cutoff =
-        chrono::Utc::now() - chrono::Duration::minutes(minutes.min(u32::MAX as u64) as i64);
-    ts >= cutoff
+        (now - chrono::Duration::minutes(minutes.min(u32::MAX as u64) as i64)).to_rfc3339();
+    session
+        .events
+        .iter()
+        .filter(|event| {
+            rule.is_none_or(|rule| event.rule_id == rule)
+                && event.timestamp.as_str() >= cutoff.as_str()
+                && domain.is_none_or(|domain| {
+                    event.domains.iter().any(|d| d.eq_ignore_ascii_case(domain))
+                })
+        })
+        .count()
+        .min(u32::MAX as usize) as u32
 }
 
 /// Apply per-rule action overrides (only "block" is valid). Returns the
@@ -685,7 +731,7 @@ pub fn post_process_verdict_for_verification(
 /// origin, not findings, and re-running would duplicate its denial finding.
 /// Escalation is likewise not re-run: it is session-stateful (repeat-density
 /// recording), not a monotonic pure function of the finding set.
-fn reapply_monotonic_policy_effects(
+pub(crate) fn reapply_monotonic_policy_effects(
     effective: &mut Verdict,
     policy: &crate::policy::Policy,
     caller: CallerContext,

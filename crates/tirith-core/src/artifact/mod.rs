@@ -62,6 +62,14 @@ use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings, Verdi
 /// structural violations from coverage limits and hands native members to B7.
 pub mod archive;
 
+/// Bounded local npm gzip/ustar/PAX reader and calibrated static observations.
+/// Captures exact artifact/member hashes without extraction or execution.
+pub mod npm_archive;
+
+/// Pure npm release comparison, separating package byte changes from analyzer
+/// version, limit and coverage changes.
+pub mod npm_diff;
+
 /// Pure parsers for a distribution's `.dist-info` metadata files (PR B5):
 /// METADATA, WHEEL, entry_points.txt, direct_url.json, and RECORD. No I/O.
 pub mod wheel;

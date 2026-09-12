@@ -293,6 +293,7 @@ pub fn dsl_backing_for_input(
 }
 
 /// Analysis context passed through the pipeline.
+#[derive(Clone)]
 pub struct AnalysisContext {
     pub input: String,
     pub shell: ShellType,
@@ -333,7 +334,7 @@ fn is_tirith_zero_assignment(word: &str) -> bool {
 /// Check if the input contains an inline `TIRITH=0` bypass prefix.
 /// Handles POSIX bare prefix (`TIRITH=0 cmd`), env wrappers (`env -i TIRITH=0 cmd`),
 /// and PowerShell env syntax (`$env:TIRITH="0"; cmd`).
-fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
+pub(crate) fn find_inline_bypass(input: &str, shell: ShellType) -> bool {
     use crate::tokenize;
 
     if matches!(shell, ShellType::Posix | ShellType::Fish) {
@@ -2626,7 +2627,7 @@ pub(crate) fn analyze_with_policy_without_bypass(
     ctx: &AnalysisContext,
     policy_snapshot: &Policy,
 ) -> Verdict {
-    analyze_inner_with_policy(ctx, false, Some(policy_snapshot), false).0
+    analyze_with_observation(ctx, false, Some(policy_snapshot), false, None, false, None).0
 }
 
 /// Run a complete analysis without honoring a process/inline bypass and return
@@ -2663,6 +2664,29 @@ fn analyze_inner_with_policy_and_pdf_coverage(
     policy_snapshot: Option<&Policy>,
     force_full: bool,
     pdf_coverage: Option<&mut Vec<String>>,
+) -> (Verdict, Policy) {
+    analyze_with_observation(
+        ctx,
+        honor_bypass,
+        policy_snapshot,
+        force_full,
+        pdf_coverage,
+        true,
+        None,
+    )
+}
+
+/// Detection may read local evidence; preview capture explicitly disables runtime
+/// effects. Evaluation of the returned observations performs no further reads.
+#[allow(clippy::too_many_arguments)]
+fn analyze_with_observation(
+    ctx: &AnalysisContext,
+    honor_bypass: bool,
+    policy_snapshot: Option<&Policy>,
+    force_full: bool,
+    pdf_coverage: Option<&mut Vec<String>>,
+    runtime_effects: bool,
+    observation: Option<&mut Option<ObservedAnalysis>>,
 ) -> (Verdict, Policy) {
     let start = Instant::now();
 
@@ -3036,6 +3060,7 @@ fn analyze_inner_with_policy_and_pdf_coverage(
     let file_path_str: Option<String> =
         crate::util::normalize_path_separators(ctx.file_path.as_deref());
     let mut web3_decision = None;
+    let mut approval_policy_bound = false;
 
     if ctx.scan_context == ScanContext::FileScan {
         let byte_input = if let Some(ref bytes) = ctx.raw_bytes {
@@ -3309,6 +3334,7 @@ fn analyze_inner_with_policy_and_pdf_coverage(
             )
             .as_ref()
             .is_some_and(|observation| command_card_approves_web3(ctx, &policy, observation));
+            approval_policy_bound = card_approved;
             let decision = crate::rules::web3_gate::decide(
                 &bound,
                 &policy.web3_guard,
@@ -3339,10 +3365,11 @@ fn analyze_inner_with_policy_and_pdf_coverage(
         if ctx.scan_context == ScanContext::Exec {
             // ch1 — context (behind `context_guard_enabled`).
             for (executable_input, executable_shell) in executable_inputs() {
-                findings.extend(crate::rules::context::check(
+                findings.extend(crate::rules::context::check_with_runtime_effects(
                     executable_input,
                     executable_shell,
                     &policy,
+                    runtime_effects,
                 ));
             }
 
@@ -3482,7 +3509,15 @@ fn analyze_inner_with_policy_and_pdf_coverage(
         };
         // Exec scans the prelude-stripped command; paste scans the original (Cow
         // borrowed unchanged) — a canary in a `# tirith-card:` line is metadata.
-        findings.extend(check_canary_hot(&analyzed_input, canary_context));
+        if runtime_effects {
+            findings.extend(check_canary_hot(&analyzed_input, canary_context));
+        } else {
+            findings.extend(
+                crate::redact::detect_canaries(&analyzed_input)
+                    .iter()
+                    .map(canary_finding),
+            );
+        }
 
         // M12 ch1 — paste provenance. Paste ONLY, called LAST so the risk-signal
         // findings it inspects (`ClipboardHidden`, `PipeToInterpreter`, URL
@@ -3585,6 +3620,82 @@ fn analyze_inner_with_policy_and_pdf_coverage(
         }
     }
 
+    let observed = ObservedAnalysis {
+        findings,
+        extracted,
+        manifest_allowed_match,
+        web3_decision,
+        approval_policy_bound,
+    };
+    let mut verdict = evaluate_observed(ctx, &policy, &observed);
+    if runtime_effects {
+        apply_baseline(
+            ctx,
+            &policy,
+            &analyzed_input,
+            &observed.extracted,
+            &mut verdict.findings,
+        );
+        enrich_pro(&mut verdict.findings);
+        enrich_team(&mut verdict.findings);
+    }
+    verdict.bypass_requested = bypass_requested;
+    verdict.timings_ms = Timings {
+        tier0_ms,
+        tier1_ms,
+        tier2_ms: Some(tier2_ms),
+        tier3_ms: Some(tier3_start.elapsed().as_secs_f64() * 1000.0),
+        total_ms: start.elapsed().as_secs_f64() * 1000.0,
+    };
+    if let Some(out) = observation {
+        *out = Some(observed);
+    }
+    (verdict, policy)
+}
+
+/// Private, unredacted observations. They are never serialized or execution permits.
+#[derive(Clone)]
+pub(crate) struct ObservedAnalysis {
+    findings: Vec<Finding>,
+    extracted: Vec<crate::extract::ExtractedUrl>,
+    manifest_allowed_match: Option<String>,
+    web3_decision: Option<crate::rules::web3_gate::Web3Decision>,
+    approval_policy_bound: bool,
+}
+
+impl ObservedAnalysis {
+    pub(crate) fn approval_policy_bound(&self) -> bool {
+        self.approval_policy_bound
+    }
+}
+
+pub(crate) fn capture_observed(ctx: &AnalysisContext, policy: &Policy) -> ObservedAnalysis {
+    let mut observed = None;
+    analyze_with_observation(
+        ctx,
+        false,
+        Some(policy),
+        true,
+        None,
+        false,
+        Some(&mut observed),
+    );
+    // A forced full pass without bypass always reaches the observation boundary.
+    observed.expect("full detection pass must produce observations")
+}
+
+pub(crate) fn evaluate_observed(
+    ctx: &AnalysisContext,
+    policy: &Policy,
+    observed: &ObservedAnalysis,
+) -> Verdict {
+    let ObservedAnalysis {
+        mut findings,
+        extracted,
+        manifest_allowed_match,
+        web3_decision,
+        approval_policy_bound: _,
+    } = observed.clone();
     for finding in &mut findings {
         if let Some(override_sev) = policy.severity_override(&finding.rule_id) {
             finding.severity = override_sev;
@@ -3644,31 +3755,13 @@ fn analyze_inner_with_policy_and_pdf_coverage(
         });
     }
 
-    // M10 ch5 — anomaly baseline (opt-in, D2; no-op when off). Runs before
-    // enrichment so the anomaly finding is enriched too. Pass `analyzed_input`
-    // (prelude-stripped in Exec) so the tuple is from the real command (R9 #D).
-    apply_baseline(ctx, &policy, &analyzed_input, &extracted, &mut findings);
-
     enrich_pro(&mut findings);
     enrich_team(&mut findings);
 
     crate::rule_metadata::filter_early_access(&mut findings, crate::license::Tier::Enterprise);
 
-    let tier3_ms = tier3_start.elapsed().as_secs_f64() * 1000.0;
-    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-    let mut verdict = Verdict::from_findings(
-        findings,
-        3,
-        Timings {
-            tier0_ms,
-            tier1_ms,
-            tier2_ms: Some(tier2_ms),
-            tier3_ms: Some(tier3_ms),
-            total_ms,
-        },
-    );
-    verdict.bypass_requested = bypass_requested;
+    let mut verdict = Verdict::from_findings(findings, 3, Timings::default());
+    verdict.bypass_requested = false;
     verdict.bypass_available = if ctx.interactive {
         policy.allow_bypass_env
     } else {
@@ -3710,7 +3803,7 @@ fn analyze_inner_with_policy_and_pdf_coverage(
         }
     }
 
-    (verdict, policy)
+    verdict
 }
 
 /// Filter a verdict's findings by paranoia level (output-layer only; the engine

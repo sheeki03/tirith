@@ -1,15 +1,27 @@
-//! Privacy contracts for Tirith-owned MCP projections. Upstream MCP payloads
+//! Privacy contracts for Tirith-owned machine projections. Upstream MCP payloads
 //! must use `output_filter`; they cannot opt into these protocol-field exemptions.
 
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
-use crate::redact::{redact_json_strings, CompiledCustomPatterns};
+use crate::redact::CompiledCustomPatterns;
 
 /// Select the schema at the producing call site, never from an untrusted field.
 #[derive(Clone, Copy)]
-pub(super) enum Projection {
+pub enum Projection {
     Verdict,
+    SafeSuggestion,
+    Run,
+    RunReceipt,
+    Score,
+    ScoreFactor,
+    Install,
+    InstallAnalysis,
+    InstallOutcome,
+    InstallUrl,
+    InstallPackage,
+    CommandsError,
+    HistoryRecord,
     FileScan,
     DirectoryScan,
     Task,
@@ -25,7 +37,7 @@ pub(super) enum Projection {
 }
 
 impl Projection {
-    pub(super) fn for_tool(name: Option<&str>) -> Self {
+    pub(crate) fn for_tool(name: Option<&str>) -> Self {
         match name {
             Some("tirith_check_command" | "tirith_check_url" | "tirith_check_paste") => {
                 Self::Verdict
@@ -42,15 +54,23 @@ impl Projection {
 /// Preserve only schema-positioned, canonical protocol values. Unknown fields,
 /// invalid enum spellings, free-form labels and content receive full DLP. This
 /// also reapplies the session's frozen DLP policy after a tool's own projection.
-pub(super) fn redact_projection(
+pub fn redact_projection(value: &mut Value, schema: Projection, compiled: &CompiledCustomPatterns) {
+    project_sensitive_strings(value, schema, &|text| {
+        crate::redact::redact_sanitize_redact_with_compiled(text, compiled)
+    });
+}
+
+/// Apply an audience-specific content projection through the same schema.
+/// Callers cannot use this to rewrite protocol tokens or signed representations.
+pub(crate) fn project_sensitive_strings(
     value: &mut Value,
     schema: Projection,
-    compiled: &CompiledCustomPatterns,
+    project: &impl Fn(&str) -> String,
 ) {
     match value {
         Value::Array(items) => {
             for item in items {
-                redact_projection(item, schema, compiled);
+                project_sensitive_strings(item, schema, project);
             }
         }
         Value::Object(object) => {
@@ -60,14 +80,31 @@ pub(super) fn redact_projection(
                 }
                 let child = match (schema, key.as_str()) {
                     (
-                        Projection::Verdict | Projection::FileScan | Projection::Cloaking,
+                        Projection::Verdict
+                        | Projection::FileScan
+                        | Projection::Cloaking
+                        | Projection::Score,
                         "findings",
                     ) => Projection::Finding,
                     (Projection::DirectoryScan, "files") => Projection::FileScan,
+                    (Projection::Run | Projection::InstallAnalysis, "verdict") => {
+                        Projection::Verdict
+                    }
+                    (Projection::Run, "receipt") => Projection::RunReceipt,
+                    (Projection::Score, "score_breakdown") => Projection::Score,
+                    (Projection::Score, "factors") => Projection::ScoreFactor,
+                    (Projection::InstallUrl, "preflight") => Projection::Verdict,
+                    (Projection::InstallUrl, "outcome") => Projection::Run,
+                    (Projection::Install, "analysis") => Projection::InstallAnalysis,
+                    (Projection::Install, "outcome") => Projection::InstallOutcome,
+                    (Projection::InstallAnalysis, "packages") => Projection::InstallPackage,
                     (Projection::DirectoryScan | Projection::FileScan, "coverage_gaps") => {
                         Projection::CoverageGap
                     }
-                    (Projection::Verdict, "agent_origin") => Projection::AgentOrigin,
+                    (Projection::Verdict | Projection::HistoryRecord, "agent_origin") => {
+                        Projection::AgentOrigin
+                    }
+                    (Projection::Verdict, "safe_suggestions") => Projection::SafeSuggestion,
                     (Projection::Finding, "evidence") => Projection::Evidence,
                     (Projection::Task, "provenance") => Projection::Provenance,
                     (Projection::Cloaking, "task_boundary") => Projection::Task,
@@ -75,10 +112,11 @@ pub(super) fn redact_projection(
                     (Projection::Cloaking, "diffs") => Projection::Diff,
                     _ => Projection::Content,
                 };
-                redact_projection(value, child, compiled);
+                project_sensitive_strings(value, child, project);
             }
         }
-        _ => redact_json_strings(value, compiled),
+        Value::String(text) => *text = project(text),
+        _ => {}
     }
 }
 
@@ -97,7 +135,74 @@ fn token(value: &Value, tokens: &[&str]) -> bool {
 fn protocol_field(schema: Projection, key: &str, value: &Value) -> bool {
     use Projection::*;
     match (schema, key) {
-        (Verdict, "action" | "approval_fallback") => canonical::<crate::verdict::Action>(value),
+        (Verdict, "action" | "approval_fallback")
+        | (Run | InstallUrl | CommandsError, "action") => {
+            canonical::<crate::verdict::Action>(value)
+        }
+        (Score | InstallPackage, "risk_level") => {
+            token(value, &["low", "medium", "high", "critical"])
+        }
+        (RunReceipt, "sha256") => value
+            .as_str()
+            .is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())),
+        (RunReceipt, "privilege") => token(value, &["user", "normal", "elevated"]),
+        (RunReceipt, "timestamp") => value
+            .as_str()
+            .is_some_and(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok()),
+        (ScoreFactor, "id") => token(
+            value,
+            &[
+                "base_severity",
+                "additional_findings",
+                "threat_intel_corroboration",
+                "clamp",
+            ],
+        ),
+        (Install, "kind") => token(value, &["install"]),
+        (InstallAnalysis, "kind") => token(value, &["install_analysis"]),
+        (InstallOutcome, "kind") => token(value, &["install_outcome"]),
+        (InstallUrl, "kind") => token(value, &["install_url"]),
+        (InstallUrl, "execution_policy") => token(value, &["contained_by_default"]),
+        (Install, "status") => token(
+            value,
+            &["not_run", "spawn_failed", "signal_terminated", "exited"],
+        ),
+        (InstallOutcome, "verdict_action") => token(value, &["Allow", "Warn", "WarnAck", "Block"]),
+        (InstallAnalysis | InstallOutcome, "manager") => token(
+            value,
+            &[
+                "npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "cargo", "gem", "go", "brew",
+                "apt", "apt-get", "dnf", "yum", "pacman", "winget", "choco", "scoop",
+            ],
+        ),
+        (CommandsError, "kind") => token(value, &["commands_error"]),
+        (CommandsError, "status") => token(value, &["error"]),
+        (HistoryRecord, "action" | "raw_action") => token(
+            value,
+            &[
+                "Allow", "Warn", "WarnAck", "Block", "allow", "warn", "warn_ack", "block",
+            ],
+        ),
+        (HistoryRecord, "rule_ids" | "raw_rule_ids") => {
+            canonical::<Vec<crate::verdict::RuleId>>(value)
+        }
+        (HistoryRecord, "entry_type") => token(
+            value,
+            &["verdict", "hook_telemetry", "trust_change", "task_boundary"],
+        ),
+        (HistoryRecord, "timestamp") => value
+            .as_str()
+            .is_some_and(|text| chrono::DateTime::parse_from_rfc3339(text).is_ok()),
+        (HistoryRecord, "event_id") => value
+            .as_str()
+            .is_some_and(|text| uuid::Uuid::parse_str(text).is_ok()),
+        (SafeSuggestion, "rule_id") => {
+            canonical::<crate::verdict::RuleId>(value)
+                || token(
+                    value,
+                    &["sudo_narrow", "env_scrub", "composed_safe_command"],
+                )
+        }
         (Verdict, "approval_rule") | (Finding, "rule_id") => {
             canonical::<crate::verdict::RuleId>(value)
         }
@@ -178,6 +283,44 @@ mod tests {
 
     fn broad_patterns() -> CompiledCustomPatterns {
         CompiledCustomPatterns::new_silent(&["(?s).+".to_string()])
+    }
+
+    #[test]
+    fn nested_cli_contracts_preserve_metadata_and_redact_sensitive_values() {
+        let digest = "a".repeat(64);
+        let mut run = json!({"action": "block", "error": "block",
+            "verdict": {"action": "warn_ack", "findings": [{"rule_id": "curl_pipe_shell", "severity": "HIGH", "description": "operator-secret"}]},
+            "receipt": {"sha256": digest, "timestamp": "2026-09-12T00:00:00Z", "privilege": "user", "url": "https://operator-secret.example", "analysis_method": "operator-secret"}});
+        redact_projection(&mut run, Projection::Run, &broad_patterns());
+        assert_eq!(run["action"], "block");
+        assert_eq!(run["verdict"]["action"], "warn_ack");
+        assert_eq!(run["verdict"]["findings"][0]["rule_id"], "curl_pipe_shell");
+        assert_eq!(run["receipt"]["sha256"], digest);
+        assert_eq!(run["receipt"]["privilege"], "user");
+        assert_eq!(run["receipt"]["timestamp"], "2026-09-12T00:00:00Z");
+        assert_eq!(run["error"], "[REDACTED:custom]");
+        assert!(!run.to_string().contains("operator-secret"));
+
+        let mut install = json!({"kind": "install", "status": "not_run",
+            "analysis": {"kind": "install_analysis", "manager": "npm", "command": "operator-secret", "verdict": {"action": "block"}},
+            "outcome": {"kind": "install_outcome", "manager": "npm", "verdict_action": "Block", "error": "operator-secret"}});
+        redact_projection(&mut install, Projection::Install, &broad_patterns());
+        assert_eq!(install["kind"], "install");
+        assert_eq!(install["status"], "not_run");
+        assert_eq!(install["analysis"]["manager"], "npm");
+        assert_eq!(install["analysis"]["verdict"]["action"], "block");
+        assert_eq!(install["outcome"]["verdict_action"], "Block");
+        assert!(!install.to_string().contains("operator-secret"));
+
+        let mut score = json!({"risk_level": "high", "url": "operator-secret",
+            "score_breakdown": {"risk_level": "high", "factors": [{"id": "base_severity", "label": "operator-secret", "detail": "operator-secret"}]}});
+        redact_projection(&mut score, Projection::Score, &broad_patterns());
+        assert_eq!(score["risk_level"], "high");
+        assert_eq!(
+            score["score_breakdown"]["factors"][0]["id"],
+            "base_severity"
+        );
+        assert!(!score.to_string().contains("operator-secret"));
     }
 
     #[test]

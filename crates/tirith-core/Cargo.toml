@@ -161,9 +161,9 @@ windows = { version = "0.62", default-features = false, features = [
 # are applied by the internal `tirith __capsule-child` launcher, NOT inside
 # `pre_exec`. Landlock supports Linux generally, but extrasafe 0.5 intentionally
 # compile-errors outside linux-x86_64, so keep that dependency gated to the only
-# architecture where `capsule::linux::apply_seccomp` uses it. On other Linux
-# architectures the backend reports `network_raw_denied = false`; locked-down
-# callers therefore degrade/fail closed rather than claiming absent seccomp.
+# architecture where `capsule::linux::apply_seccomp` uses it. AArch64 uses a
+# separately reviewed seccompiler policy with a native kernel capability probe.
+# Other architectures still report no raw-network enforcement.
 # Proven to resolve + build on MSRV 1.83. Licenses: landlock MIT/Apache-2.0,
 # extrasafe MIT.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -171,6 +171,9 @@ landlock = "0.4"
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 extrasafe = "0.5"
+
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+seccompiler = { version = "0.4", default-features = false }
 
 [build-dependencies]
 toml = "0.8"

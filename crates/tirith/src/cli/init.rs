@@ -18,6 +18,57 @@ fn fish_single_quote(path: &str) -> String {
     format!("'{}'", path.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+/// Offer a version handoff before sourcing. Only newly initialized hook code
+/// consumes it; a successful double-source return cannot relabel older functions.
+/// An external bundle must match the embedded bytes to receive a known version.
+pub(crate) fn integration_stamp(shell: &str, hook_dir: &Path) -> String {
+    let (file, expected) = match shell {
+        "bash" => ("bash-hook.bash", assets::BASH_HOOK),
+        "zsh" => ("zsh-hook.zsh", assets::ZSH_HOOK),
+        "fish" => ("fish-hook.fish", assets::FISH_HOOK),
+        "powershell" | "pwsh" => ("powershell-hook.ps1", assets::POWERSHELL_HOOK),
+        "nushell" | "nu" => ("nushell-hook.nu", assets::NUSHELL_HOOK),
+        _ => return String::new(),
+    };
+    use std::io::Read as _;
+    let matches = std::fs::File::open(hook_dir.join("lib").join(file))
+        .ok()
+        .and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(expected.len() as u64 + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            Some(bytes == expected.as_bytes())
+        })
+        .unwrap_or(false);
+    let version = if matches {
+        env!("CARGO_PKG_VERSION")
+    } else {
+        "unknown"
+    };
+    integration_handoff(shell, version)
+}
+
+pub(crate) fn integration_handoff(shell: &str, version: &str) -> String {
+    match shell {
+        "fish" => format!("set -g _TIRITH_INIT_VERSION '{version}'"),
+        "powershell" | "pwsh" => format!("$global:_TIRITH_INIT_VERSION = '{version}'"),
+        "nushell" | "nu" => format!("$env._TIRITH_INIT_VERSION = \"{version}\""),
+        "bash" | "zsh" => format!("_TIRITH_INIT_VERSION='{version}'"),
+        _ => String::new(),
+    }
+}
+
+pub(crate) fn integration_handoff_cleanup(shell: &str) -> &'static str {
+    match shell {
+        "fish" => "set -e _TIRITH_INIT_VERSION",
+        "powershell" | "pwsh" => "$global:_TIRITH_INIT_VERSION = $null",
+        "nushell" | "nu" => "hide-env --ignore-errors _TIRITH_INIT_VERSION",
+        "bash" | "zsh" => "unset _TIRITH_INIT_VERSION",
+        _ => "",
+    }
+}
+
 fn native_hook_source_line(shell: &str, hook: &Path, executable: &Path) -> Result<String, String> {
     let hook = hook
         .to_str()
@@ -162,7 +213,11 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
                     &dir.join("lib/zsh-hook.zsh"),
                     native_executable.as_ref().unwrap(),
                 ) {
-                    Ok(line) => println!("{line}"),
+                    Ok(line) => {
+                        println!("{}", integration_stamp(shell, dir));
+                        println!("{line}");
+                        println!("{}", integration_handoff_cleanup(shell));
+                    }
                     Err(error) => {
                         eprintln!("tirith: {error}");
                         return 1;
@@ -187,7 +242,11 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
                     &dir.join("lib/bash-hook.bash"),
                     native_executable.as_ref().unwrap(),
                 ) {
-                    Ok(line) => println!("{line}"),
+                    Ok(line) => {
+                        println!("{}", integration_stamp(shell, dir));
+                        println!("{line}");
+                        println!("{}", integration_handoff_cleanup(shell));
+                    }
                     Err(error) => {
                         eprintln!("tirith: {error}");
                         return 1;
@@ -212,7 +271,11 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
                     &dir.join("lib/fish-hook.fish"),
                     native_executable.as_ref().unwrap(),
                 ) {
-                    Ok(line) => println!("{line}"),
+                    Ok(line) => {
+                        println!("{}", integration_stamp(shell, dir));
+                        println!("{line}");
+                        println!("{}", integration_handoff_cleanup(shell));
+                    }
                     Err(error) => {
                         eprintln!("tirith: {error}");
                         return 1;
@@ -232,12 +295,14 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
         }
         "powershell" | "pwsh" => {
             if let Some(dir) = &hook_dir {
+                println!("{}", integration_stamp(shell, dir));
                 println!(
                     ". {}",
                     powershell_single_quote(
                         &dir.join("lib/powershell-hook.ps1").display().to_string()
                     )
                 );
+                println!("{}", integration_handoff_cleanup(shell));
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -269,7 +334,9 @@ pub fn run(shell: Option<&str>, prompt_status: bool) -> i32 {
                     );
                     return 1;
                 };
+                println!("{}", integration_stamp(shell, dir));
                 println!("source {}", nushell_string_literal(hook_path));
+                println!("{}", integration_handoff_cleanup(shell));
             } else {
                 eprintln!("tirith: could not locate or materialize shell hooks.");
                 return 1;
@@ -388,21 +455,40 @@ pub(crate) fn prompt_status_snippet_for(shell: &str, executable: &std::path::Pat
 }
 
 pub(crate) fn detect_shell() -> &'static str {
-    if let Some(shell) = detect_shell_from_parent() {
-        return shell;
+    detect_shell_identity().shell
+}
+
+pub(crate) struct ShellIdentity {
+    pub shell: &'static str,
+    pub executable: Option<PathBuf>,
+    pub source: &'static str,
+    pub startup_mode: &'static str,
+    pub process_id: Option<u32>,
+}
+
+pub(crate) fn detect_shell_identity() -> ShellIdentity {
+    if let Some(identity) = detect_shell_from_parent() {
+        return identity;
     }
 
     if let Ok(shell) = std::env::var("SHELL") {
         if let Some(shell) = normalize_shell_name(&shell) {
-            return shell;
+            return ShellIdentity {
+                shell,
+                executable: std::env::var_os("SHELL").map(PathBuf::from),
+                source: "environment-default-shell",
+                startup_mode: "unknown",
+                process_id: None,
+            };
         }
     }
-
-    #[cfg(windows)]
-    return "powershell";
-
-    #[cfg(not(windows))]
-    "bash"
+    ShellIdentity {
+        shell: "unknown",
+        executable: None,
+        source: "unobservable",
+        startup_mode: "unknown",
+        process_id: None,
+    }
 }
 
 fn normalize_shell_name(name: &str) -> Option<&'static str> {
@@ -417,17 +503,17 @@ fn normalize_shell_name(name: &str) -> Option<&'static str> {
         .trim_start_matches('-')
         .to_ascii_lowercase();
 
-    if base.contains("zsh") {
+    if matches!(base.as_str(), "zsh" | "zsh.exe") {
         Some("zsh")
-    } else if base.contains("bash") {
+    } else if matches!(base.as_str(), "bash" | "bash.exe") {
         Some("bash")
-    } else if base.contains("fish") {
+    } else if matches!(base.as_str(), "fish" | "fish.exe") {
         Some("fish")
-    } else if base.contains("pwsh") {
+    } else if matches!(base.as_str(), "pwsh" | "pwsh.exe") {
         Some("pwsh")
-    } else if base.contains("powershell") {
+    } else if matches!(base.as_str(), "powershell" | "powershell.exe") {
         Some("powershell")
-    } else if base == "nu" || base == "nu.exe" || base.contains("nushell") {
+    } else if matches!(base.as_str(), "nu" | "nu.exe" | "nushell" | "nushell.exe") {
         Some("nushell")
     } else {
         None
@@ -435,7 +521,7 @@ fn normalize_shell_name(name: &str) -> Option<&'static str> {
 }
 
 #[cfg(unix)]
-fn detect_shell_from_parent() -> Option<&'static str> {
+fn detect_shell_from_parent() -> Option<ShellIdentity> {
     let mut pid = unsafe { libc::getppid() };
 
     // Walk ancestors: the immediate parent may be a wrapper (timeout/env) or a
@@ -446,7 +532,24 @@ fn detect_shell_from_parent() -> Option<&'static str> {
         }
         let (name, parent_pid) = read_process(pid)?;
         if let Some(shell) = normalize_shell_name(&name) {
-            return Some(shell);
+            return Some(ShellIdentity {
+                shell,
+                executable: process_executable(pid).or_else(|| {
+                    PathBuf::from(&name)
+                        .is_absolute()
+                        .then(|| PathBuf::from(&name))
+                }),
+                source: "observed-ancestor-process",
+                startup_mode: process_arguments(pid)
+                    .as_deref()
+                    .map(|args| startup_mode_from_args(shell, args))
+                    .unwrap_or(if name.starts_with('-') {
+                        "login"
+                    } else {
+                        "unknown"
+                    }),
+                process_id: Some(pid as u32),
+            });
         }
         if parent_pid == pid {
             break;
@@ -455,6 +558,173 @@ fn detect_shell_from_parent() -> Option<&'static str> {
     }
 
     None
+}
+
+/// Classify only shell options before a command/script payload. Arguments are
+/// transient process evidence and must never be returned in diagnostics.
+pub(crate) fn startup_mode_from_args(shell: &str, args: &[String]) -> &'static str {
+    let mut login = args.first().is_some_and(|arg| arg.starts_with('-'));
+    let mut interactive = false;
+    let mut bash_option_value = false;
+    for arg in args.iter().skip(1) {
+        let lower = arg.to_ascii_lowercase();
+        if bash_option_value {
+            if lower == "posix" {
+                return "custom-profile";
+            }
+            bash_option_value = false;
+            continue;
+        }
+        if shell == "bash" && lower == "--posix" {
+            return "custom-profile";
+        }
+        if shell == "bash" && arg == "-o" {
+            bash_option_value = true;
+            continue;
+        }
+        if lower == "--" {
+            break;
+        }
+        if matches!(shell, "powershell" | "pwsh") {
+            if matches!(lower.as_str(), "-noprofile" | "-nop") {
+                return "no-profile";
+            }
+            if matches!(
+                lower.as_str(),
+                "-command" | "-c" | "-file" | "-f" | "-encodedcommand" | "-enc"
+            ) {
+                return "noninteractive-command";
+            }
+            continue;
+        }
+        if matches!(
+            lower.as_str(),
+            "--norc" | "--noprofile" | "--no-config" | "--no-config-file"
+        ) || (shell == "fish" && arg == "-N")
+            || (shell == "zsh"
+                && arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg.contains('f'))
+        {
+            return "no-profile";
+        }
+        if ["--rcfile", "--init-file", "--config", "--env-config"]
+            .iter()
+            .any(|option| lower == *option || lower.starts_with(&format!("{option}=")))
+        {
+            return "custom-profile";
+        }
+        if lower == "--login" {
+            login = true;
+            continue;
+        }
+        if lower == "--interactive" {
+            interactive = true;
+            continue;
+        }
+        if arg.starts_with('-') && !arg.starts_with("--") {
+            login |= arg.contains('l');
+            interactive |= arg.contains('i');
+            if arg.contains('c') {
+                return if interactive {
+                    "interactive-command"
+                } else {
+                    "noninteractive-command"
+                };
+            }
+        } else if !arg.starts_with('-') {
+            break;
+        }
+    }
+    if login {
+        "login"
+    } else if interactive {
+        "interactive-non-login"
+    } else {
+        "unknown"
+    }
+}
+
+#[cfg(unix)]
+fn process_arguments(pid: libc::pid_t) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(format!("/proc/{pid}/cmdline"))
+            .ok()?
+            .take(16 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() > 16 * 1024 {
+            return None;
+        }
+        bytes
+            .split(|b| *b == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8(arg.to_vec()).ok())
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tirith_core::trusted_child::{ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable};
+        let program = TrustedExecutable::from_system_candidates(&[
+            Path::new("/bin/ps"),
+            Path::new("/usr/bin/ps"),
+        ])
+        .ok()?;
+        let pid = pid.to_string();
+        let spec = ChildSpec::new(
+            ["-p", pid.as_str(), "-o", "args="],
+            ChildLimits::new(std::time::Duration::from_secs(1), 16 * 1024, 1024),
+        );
+        let ChildOutcome::Completed { status, stdout, .. } =
+            tirith_core::trusted_child::run(&program, &spec)
+        else {
+            return None;
+        };
+        if !status.success() {
+            return None;
+        }
+        // ps has already flattened argv. Only option-like tokens before a
+        // command payload are used; ambiguous values remain unobservable.
+        Some(
+            String::from_utf8(stdout)
+                .ok()?
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+}
+
+#[cfg(unix)]
+fn process_executable(pid: libc::pid_t) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut bytes = vec![0u8; 4096];
+        // SAFETY: proc_pidpath writes at most the supplied buffer length.
+        let length =
+            unsafe { libc::proc_pidpath(pid, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
+        if length <= 0 {
+            return None;
+        }
+        let end = bytes
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(length as usize);
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end])))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -481,14 +751,87 @@ fn read_process(pid: libc::pid_t) -> Option<(String, libc::pid_t)> {
     }
 
     let line = String::from_utf8_lossy(&stdout);
-    let mut parts = line.split_whitespace();
-    let name = parts.next()?.to_string();
-    let ppid = parts.next()?.parse::<libc::pid_t>().ok()?;
+    let (name, ppid) = line.trim().rsplit_once(char::is_whitespace)?;
+    let name = name.trim().to_owned();
+    let ppid = ppid.parse::<libc::pid_t>().ok()?;
     Some((name, ppid))
 }
 
-#[cfg(not(unix))]
-fn detect_shell_from_parent() -> Option<&'static str> {
+#[cfg(windows)]
+fn detect_shell_from_parent() -> Option<ShellIdentity> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: Toolhelp fills a correctly sized structure; the snapshot handle
+    // is closed before any return and UTF-16 names are bounded by szExeFile.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut processes = std::collections::HashMap::new();
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                processes.insert(entry.th32ProcessID, (entry.th32ParentProcessID, name));
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+        let mut pid = std::process::id();
+        for _ in 0..8 {
+            let (parent, _) = processes.get(&pid)?;
+            if *parent == pid || *parent == 0 {
+                break;
+            }
+            let (_, name) = processes.get(parent)?;
+            if let Some(shell) = normalize_shell_name(name) {
+                use windows::Win32::System::Threading::{
+                    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+                    PROCESS_QUERY_LIMITED_INFORMATION,
+                };
+                let executable = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, *parent)
+                    .ok()
+                    .and_then(|handle| {
+                        let mut buffer = vec![0u16; 32768];
+                        let mut length = buffer.len() as u32;
+                        let result = QueryFullProcessImageNameW(
+                            handle,
+                            PROCESS_NAME_WIN32,
+                            windows::core::PWSTR(buffer.as_mut_ptr()),
+                            &mut length,
+                        );
+                        let _ = CloseHandle(handle);
+                        result.ok().map(|_| {
+                            PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize]))
+                        })
+                    });
+                return Some(ShellIdentity {
+                    shell,
+                    executable,
+                    source: "observed-ancestor-process",
+                    startup_mode: "unknown",
+                    process_id: Some(*parent),
+                });
+            }
+            pid = *parent;
+        }
+        None
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn detect_shell_from_parent() -> Option<ShellIdentity> {
     None
 }
 
@@ -728,10 +1071,11 @@ fn materialize_hooks_at(data_dir: &Path) -> Result<(PathBuf, bool), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        materialize_hooks_at, materialized_hooks_match_at, native_hook_source_line,
-        normalize_shell_name, nushell_string_literal, posix_single_quote, powershell_single_quote,
-        prompt_status_snippet_for,
+        integration_stamp, materialize_hooks_at, materialized_hooks_match_at,
+        native_hook_source_line, normalize_shell_name, nushell_string_literal, posix_single_quote,
+        powershell_single_quote, prompt_status_snippet_for,
     };
+    use crate::assets;
     use std::path::Path;
 
     fn prompt_status_snippet(shell: &str) -> String {
@@ -835,6 +1179,119 @@ mod tests {
             nushell_string_literal("/tmp/it's \\quoted\" #hook\n\t\u{001f}"),
             "\"/tmp/it's \\\\quoted\\\" #hook\\n\\t\\u{1f}\""
         );
+    }
+
+    #[test]
+    fn integration_version_is_reported_only_for_matching_embedded_hook_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("lib")).unwrap();
+        let hook = root.path().join("lib/bash-hook.bash");
+        std::fs::write(&hook, assets::BASH_HOOK).unwrap();
+        let matching = integration_stamp("bash", root.path());
+        assert!(matching.contains(&format!(
+            "_TIRITH_INIT_VERSION='{}'",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(!matching.contains("TIRITH_INTEGRATION_VERSION"));
+        std::fs::write(&hook, "# older external hook\n").unwrap();
+        assert!(integration_stamp("bash", root.path()).contains("_TIRITH_INIT_VERSION='unknown'"));
+        assert!(integration_stamp("unsupported", root.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn double_source_does_not_relabel_already_loaded_hook_generation() {
+        // Exercise the actual shipped guard. No new hook or Tirith command is
+        // installed: each child starts with a session-local loaded sentinel.
+        for (shell, candidates, hook, loaded) in [
+            (
+                "bash",
+                &["/bin/bash"][..],
+                assets::BASH_HOOK,
+                "_TIRITH_BASH_LOADED=1",
+            ),
+            (
+                "zsh",
+                &["/bin/zsh", "/usr/bin/zsh"][..],
+                assets::ZSH_HOOK,
+                "_TIRITH_ZSH_LOADED=1",
+            ),
+            (
+                "fish",
+                &["/opt/homebrew/bin/fish", "/usr/bin/fish"][..],
+                assets::FISH_HOOK,
+                "set -g _TIRITH_FISH_LOADED 1",
+            ),
+        ] {
+            let Some(executable) = candidates.iter().find(|path| Path::new(path).is_file()) else {
+                continue; // Optional native guard regression, not qualification evidence.
+            };
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("hook");
+            std::fs::write(&path, hook).unwrap();
+            let set_old = if shell == "fish" {
+                "set -gx TIRITH_INTEGRATION_VERSION old-generation"
+            } else {
+                "export TIRITH_INTEGRATION_VERSION=old-generation"
+            };
+            let script = format!("{loaded}\n{set_old}\n{}\nsource '{}'\n{}\nprintf '%s' \"$TIRITH_INTEGRATION_VERSION\"",
+                super::integration_handoff(shell, "new-generation"), path.display(),
+                super::integration_handoff_cleanup(shell));
+            let output = std::process::Command::new(executable)
+                .args(["-c", &script])
+                .env_clear()
+                .env("HOME", root.path())
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"old-generation", "{shell}");
+        }
+    }
+
+    #[test]
+    fn startup_options_stop_at_command_payload_and_identify_custom_profiles() {
+        for (shell, args, expected) in [
+            (
+                "bash",
+                vec!["bash", "--rcfile", "/custom/rc"],
+                "custom-profile",
+            ),
+            ("bash", vec!["bash", "--norc", "-i"], "no-profile"),
+            ("bash", vec!["-bash"], "login"),
+            ("bash", vec!["bash", "-i"], "interactive-non-login"),
+            ("bash", vec!["bash", "--posix", "-i"], "custom-profile"),
+            ("bash", vec!["bash", "-o", "posix", "-i"], "custom-profile"),
+            (
+                "bash",
+                vec!["bash", "-c", "echo --norc"],
+                "noninteractive-command",
+            ),
+            ("zsh", vec!["zsh", "-f"], "no-profile"),
+            ("fish", vec!["fish", "--no-config"], "no-profile"),
+            (
+                "nushell",
+                vec!["nu", "--config=/private/custom.nu"],
+                "custom-profile",
+            ),
+            ("pwsh", vec!["pwsh", "-NoProfile"], "no-profile"),
+            (
+                "powershell",
+                vec!["powershell.exe", "-Command", "Write-Host -NoProfile"],
+                "noninteractive-command",
+            ),
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(
+                super::startup_mode_from_args(shell, &args),
+                expected,
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

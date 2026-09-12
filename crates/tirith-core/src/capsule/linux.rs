@@ -36,7 +36,7 @@
 //!    roots; everything else (including the sensitive subtrees in
 //!    [`crate::capsule::deny_default_paths`] that are not under a grant) is denied
 //!    by Landlock's default-deny model.
-//! 5. **seccomp** (`extrasafe`): a default-deny syscall policy that allows the
+//! 5. **seccomp** (`extrasafe` on x86_64, reviewed `seccompiler` policy on AArch64): a default-deny syscall policy that allows the
 //!    basics + file I/O + thread creation + fork/exec, but grants **no
 //!    socket-creation syscalls**, so the child cannot open a raw outbound socket.
 //! 6. **Environment cleanup**: drop every variable except the policy's survivors,
@@ -82,12 +82,21 @@ const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
     wall_clock_seconds: false,
 };
 
-/// Whether this build can install a seccomp filter. `extrasafe`/`seccompiler`
-/// only support `linux-x86_64`; on any other Linux architecture the seccomp layer
-/// is unavailable and must be reported as such (the rest of the containment still
-/// applies). Kept as a `const fn` so both the backend and its tests agree.
-pub const fn seccomp_supported() -> bool {
-    cfg!(target_arch = "x86_64")
+#[cfg(target_arch = "aarch64")]
+mod aarch64_seccomp;
+
+/// Report only an architecture with an implemented filter and, on AArch64,
+/// observed kernel seccomp support. User-mode emulators that cannot install a
+/// native filter retain the before-launch unsupported result.
+pub fn seccomp_supported() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64_seccomp::kernel_support_observed()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        cfg!(target_arch = "x86_64")
+    }
 }
 
 /// The Linux containment backend. Stateless: it probes the kernel on demand.
@@ -903,6 +912,15 @@ impl extrasafe::RuleSet for PostExecRuntime {
             Sysno::getppid,
             Sysno::getpgrp,
             Sysno::getrlimit,
+            // Descriptor-local libuv readiness and relative sleep; sockets,
+            // io_uring and process/namespace escape remain independently denied.
+            Sysno::nanosleep,
+            Sysno::clock_nanosleep,
+            Sysno::epoll_create1,
+            Sysno::epoll_ctl,
+            Sysno::epoll_pwait,
+            Sysno::eventfd2,
+            Sysno::ppoll,
             Sysno::sysinfo,
             // POSIX-shell redirection and in-script pipelines. Every inherited
             // descriptor was closed before this filter is installed, and newly
@@ -977,10 +995,24 @@ impl extrasafe::RuleSet for PostExecRuntime {
                 SeccompilerComparator::Eq,
                 0,
             ));
+        // The stable guard terminates its entire group when its supervisor dies.
+        // pid=0 is always the caller's own group; every group escape stays denied.
+        let kill_own_group = SeccompRule::new(Sysno::kill)
+            .and_condition(SeccompArgumentFilter::new64(
+                0,
+                SeccompilerComparator::Eq,
+                0,
+            ))
+            .and_condition(SeccompArgumentFilter::new64(
+                1,
+                SeccompilerComparator::Eq,
+                libc::SIGKILL as u64,
+            ));
         let mut rules: std::collections::HashMap<_, Vec<_>> = [
             (Sysno::prlimit64, vec![prlimit]),
             (Sysno::getpgid, vec![getpgid]),
             (Sysno::prctl, vec![parent_death_signal]),
+            (Sysno::kill, vec![kill_own_group]),
         ]
         .into_iter()
         .collect();
@@ -1130,12 +1162,14 @@ fn apply_seccomp() -> Result<bool, ContainError> {
     Ok(true)
 }
 
-/// Non-x86_64 Linux: the `extrasafe`/`seccompiler` stack only supports
-/// `linux-x86_64`, so no seccomp filter can be installed. The rest of the
-/// containment (rlimits, no-new-privs, Landlock, env) still applies; the caller
-/// reports `network_raw_denied = false` and an enforcing surface that requires it
-/// will fail closed.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+fn apply_seccomp() -> Result<bool, ContainError> {
+    aarch64_seccomp::apply().map_err(ContainError::Seccomp)
+}
+
+/// Other Linux architectures have no reviewed syscall policy. Keep runtime
+/// capability reporting honest and refuse enforcing network requirements.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn apply_seccomp() -> Result<bool, ContainError> {
     Ok(false)
 }
@@ -1429,6 +1463,12 @@ mod tests {
 
     #[test]
     fn seccomp_supported_matches_arch() {
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            seccomp_supported(),
+            aarch64_seccomp::kernel_support_observed()
+        );
+        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(seccomp_supported(), cfg!(target_arch = "x86_64"));
     }
 
@@ -1509,7 +1549,6 @@ mod tests {
             Sysno::connect,
             Sysno::setsid,
             Sysno::setpgid,
-            Sysno::kill,
             Sysno::tkill,
             Sysno::tgkill,
             Sysno::rt_sigqueueinfo,
@@ -1521,6 +1560,17 @@ mod tests {
                 "conditional post-exec runtime must not grant {denied:?}"
             );
         }
+        let own_group = conditional.get(&Sysno::kill).expect("own-group kill rule");
+        assert_eq!(own_group.len(), 1);
+        assert_eq!(own_group[0].argument_filters.len(), 2);
+        assert!(own_group[0]
+            .argument_filters
+            .iter()
+            .any(|filter| filter.arg_idx == 0 && filter.value == 0));
+        assert!(own_group[0]
+            .argument_filters
+            .iter()
+            .any(|filter| filter.arg_idx == 1 && filter.value == libc::SIGKILL as u64));
         let prlimit = conditional
             .get(&Sysno::prlimit64)
             .expect("self-query-only prlimit64 rule");
@@ -1683,7 +1733,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn seccomp_guard_death_subprocess() {
         use std::io::BufRead as _;
@@ -1705,13 +1755,10 @@ mod tests {
                 );
                 // A second pipe whose WRITE end the target keeps open itself, so
                 // reading it can never reach EOF. That is the target's blocking
-                // primitive after it observes parent death: `read` is in the
-                // seccomp allow-set (SystemIO::allow_read) while `nanosleep`,
-                // `clock_nanosleep`, and `pause` are all absent from every
-                // enabled rule set, so the filter's EPERM default made those
-                // return instantly and the target exited normally instead of
-                // waiting to be killed. Created BEFORE `apply_seccomp` because
-                // `pipe2` is itself not permitted afterwards.
+                // primitive after it observes parent death: an allowed `read`
+                // has no timer deadline and cannot finish before the signal.
+                // Create both pipes before containment to keep fixture setup
+                // separate from the parent-death behavior under examination.
                 let mut hold = [0i32; 2];
                 assert_eq!(
                     unsafe { libc::pipe2(hold.as_mut_ptr(), libc::O_CLOEXEC) },
@@ -1779,12 +1826,8 @@ mod tests {
                         // would then report a normal exit and defeat the
                         // controller's WIFSIGNALED proof.
                         //
-                        // Block instead — on `read`, which IS permitted
-                        // (SystemIO::allow_read). `nanosleep`, `clock_nanosleep`
-                        // and `pause` are in NO enabled rule set, so the seccomp
-                        // default action returns EPERM immediately and any
-                        // sleep-based wait degenerates into an instant normal
-                        // exit; that, not signal latency, is what kept failing.
+                        // Block instead on the permitted `read` operation,
+                        // without a timer that could race the signal.
                         // This process holds `hold[1]` open itself, so `hold[0]`
                         // can never reach EOF and only the parent-death SIGKILL
                         // ends the wait, however delayed it is. A genuinely
@@ -1890,7 +1933,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn production_seccomp_parent_death_signal_kills_and_reaps_target() {
         const MODE: &str = "TIRITH_SECCOMP_GUARD_DEATH_MODE";
@@ -1915,6 +1958,105 @@ mod tests {
         assert!(
             !marker.exists(),
             "target survived its seccomp-confined guard"
+        );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn runtime_readiness_subprocess() {
+        if std::env::var_os("TIRITH_RUNTIME_READINESS_FIXTURE").is_none() {
+            return;
+        }
+        assert!(apply_seccomp().expect("apply production syscall policy"));
+        let duration = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        };
+        assert_eq!(
+            unsafe { libc::nanosleep(&duration, std::ptr::null_mut()) },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &duration, std::ptr::null_mut())
+            },
+            0
+        );
+        let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(
+            epoll >= 0 && event >= 0,
+            "create local readiness descriptors"
+        );
+        let mut interest = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: 7,
+        };
+        assert_eq!(
+            unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, event, &mut interest) },
+            0
+        );
+        let ready = 1u64;
+        assert_eq!(
+            unsafe { libc::write(event, (&ready as *const u64).cast(), 8) },
+            8
+        );
+        let mut observed: libc::epoll_event = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::epoll_pwait(epoll, &mut observed, 1, 100, std::ptr::null()) },
+            1
+        );
+        let mut poll = libc::pollfd {
+            fd: event,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ppoll(&mut poll, 1, &duration, std::ptr::null()) },
+            1
+        );
+        unsafe {
+            libc::close(event);
+            libc::close(epoll);
+        }
+        // Local readiness never supplies network or arbitrary signal authority.
+        for syscall in [
+            libc::SYS_socket,
+            libc::SYS_io_uring_setup,
+            libc::SYS_setsid,
+            libc::SYS_unshare,
+        ] {
+            assert_eq!(unsafe { libc::syscall(syscall, 0, 0, 0, 0, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+        assert_eq!(unsafe { libc::kill(libc::getppid(), 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn production_policy_allows_local_readiness_without_network_or_signal_escape() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "capsule::linux::tests::runtime_readiness_subprocess",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TIRITH_RUNTIME_READINESS_FIXTURE", "1")
+            .output()
+            .expect("run isolated production filter readiness fixture");
+        assert!(
+            output.status.success(),
+            "readiness fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

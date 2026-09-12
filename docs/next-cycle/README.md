@@ -1,49 +1,59 @@
 # Next-cycle implementation progress
 
-Implementation starts from current main at Tirith **0.4.2**,
-`7fd35101568bb06ee0d361dc1d4a4d193c5f60fd`, on
-`codex/next-cycle-foundations`. The original 0.4.1 workspace and its local changes
-are preserved. No package version, release tag, personal configuration or remote
-publication was changed.
+Implementation is based on main at Tirith **0.4.2**,
+`7fd35101568bb06ee0d361dc1d4a4d193c5f60fd`, in the isolated
+`codex/next-cycle-foundations` checkout. The original 0.4.1 checkout and its
+uncommitted edits remain preserved. The package version remains 0.4.2 until a
+separate release decision. This is an implementation record, not release evidence.
 
-The implementation plan covers all ten cycle workstreams. Its dependency and
-release-gate separation remains appropriate. Initial inspection confirmed the
-reported policy-reporting, message, redaction, onboarding, trust-expiry and
-shell-target inconsistencies. It also identified existing ThreatDB fixes and
-large regression corpora to reuse. See the [baseline inventory](baseline.md) and
-[acceptance matrix](acceptance-matrix.md).
+The complete WP00–WP27 scope remains active. No work package or G0–G3 release
+gate is declared complete. Native qualification, real beginner pilots, final
+packaged measurements, and publication evidence cannot be inferred from source
+changes or substituted with simulated success.
 
-## Work-package progress
+| Package | Current implementation and remaining work |
+| --- | --- |
+| WP00 | Baseline, schema/fixture inventory and acceptance matrix recorded. Signed macOS 0.4.2 baseline commands and five old/new scoped-grant compatibility assertions passed. Wider fixtures and packaged performance measurements remain. |
+| WP01 | Runtime snapshots capture field provenance, input revisions, private replay guards, authority, neutralized preferences, trust expiry and remote-cache evidence. Mutations refuse unconditioned remote authority. Broader runtime/native verification remains. |
+| WP02 | Frozen evaluation separates observed facts from pure policy evaluation and preserves combined blockers and incomplete evidence. Runtime threat enrichment capture and complete equivalence evidence remain. |
+| WP03 | Producer-selected CLI/core/MCP projections preserve typed protocol values under broad DLP; signed documents remain separate. Complete signed/export/service boundary audit remains. |
+| WP04 | Shared native shell/operator targets and evidence grades are implemented. Caller-shell attestation core is registered; actual helper/PTY integration is in progress. Configured and inherited states do not imply observed blocking. Native Windows/PowerShell/Nushell qualification remains. |
+| WP05 | Comfortable/Balanced/Strict versioned personal presets preserve unknown settings/manual overrides; reset touches owned values. CLI and browser use shared preparation. Broader corpus and end-to-end verification remain. |
+| WP06 | Shared durable plan/apply/status/cancel/undo service, exact preimages, typed intent, task authorization, conflicts, compensation and bounded workers implemented. Async admission, fresh undo baselines, and bounded saved-operation inventory are implemented; expanded crash and native Windows checks remain. |
+| WP07 | Stable scoped/expiring grants, retained project identities, legacy migration, CLI lifecycle and typed browser preparation implemented. Five actual 0.4.2/new-client compatibility assertions passed; native/copy/move/expiry and final-candidate evidence remain. |
+| WP08 | Existing one-operation receipts retained; recovery uses the actual shell bypass parser and distinguishes unsupported syntax/hard blocks. Native recovery journeys remain. |
+| WP09 | Frozen simulation and private reversible expectation labels passed earlier tests. Bounded CLI/browser tuning now reads selected annotations and redacted examples, without replay or automatic approval; expanded regressions await the next candidate. |
+| WP10 | Combined personal profile/shell setup is registered through `setup recommended` and browser plans; new tests await the next capture. Selected agents refuse until their native automatic setup scope is certified. Multi-host qualification and current-shell verification remain. |
+| WP11 | Packaged-byte runner passed 27 native Bash/Zsh/Fish checks on one macOS debug checkpoint. Other native installed package/real-agent matrices and final candidate recertification remain. |
+| WP12 | Bounded history and incremental aggregates preserve attribution, limits and invalidation. Same-inode retention passed core/CLI/browser tests. Exact segment export and acknowledged irreversible deletion are now registered; new signing-drift/cancellation guards and append-failure health need final verification. |
+| WP13 | Embedded local service, strict HTTP/auth/origin/CSRF bounds, typed routes, exact-version discovery, identity guards and quiesce implemented. Integrated workspace typecheck passes and real transport tests passed at the preceding checkpoint; expanded browser/security/lifecycle evidence remains. |
+| WP14 | Six embedded pages expose typed shell/profile/settings/exception plans, saved jobs, feedback, support preview/download, retention, impact reviews and lifecycle actions. Twelve real-browser workflows passed on the previous candidate. Project review, combined setup and archive controls await the next build. |
+| WP15 | Channel/privilege guidance, exact signed compatibility, candidate binding, rollback receipts and a durable lifecycle store/retained worker handshake are registered. Native publication/crash/reopen and rollback/removal evidence remains. |
+| WP16 | Signed source evidence, freshness dimensions, publication/parser guards, transient recovery and incident records implemented. Final compiled and publication-path verification remains. |
+| WP17 | Native sampling found debug-build SHA cost in repeated executable guards. The development SHA dependency is optimized while retaining exact checks. A bounded isolated measurement runner is prepared; new candidate measurements and release comparisons remain. |
+| WP18 | Selected support preview and private task-authorized export passed linked tests with fresh privacy/output bounds. Read-only lifecycle selection is newly registered. Six user journeys and documentation reconciliation remain. |
+| WP19 | Final-byte installed/native acceptance, beginner pilot and release/channel evidence remain. No substituted evidence is claimed. |
+| WP20 | Retained-identity project review is registered through CLI and browser using existing dependency/hook/AI/MCP analyzers. Explicit coverage, whole-entry privacy limits and no tooling execution are enforced; core/CLI/API/browser regressions await the next capture. |
+| WP21 | Bounded npm ustar/PAX/gzip reader, exact identities and hostile/real npm corpus are registered; 22 reader tests passed in the prior integrated selection. Fuzz evidence and final candidate rerun remain. |
+| WP22 | Offline metadata/script/code/native observations and private JSON/SARIF CLI projections are registered and selected CLI checks passed. Explicit project-scoped browser detail is now registered; transport/browser and final corpus evidence await the next candidate. |
+| WP23 | npm comparison and CLI bind hashes and qualify analyzer/coverage differences; eight core comparisons and two combined CLI tests passed previously. Explicit project-scoped browser comparison is now registered; browser and final G2 evidence await the next candidate. |
+| WP24 | Conservative pip/Cargo command-family models are registered with explicit incomplete dynamic effects and new fixtures. Linked tests and capability qualification remain. |
+| WP25 | Bounded impact reports, exception ownership/expiry and local activation/undo are registered through CLI/browser with immutable journal attachments and shared freshness checks. Remote publication/fleet adoption remain explicitly unavailable; linked acceptance remains. |
+| WP26 | LocalLeafNoScriptsV1 defines a pinned, zero-transitive local artifact contract. Retained capture/staging/verification foundation is being drafted separately; launcher integration and native execution qualification remain. |
+| WP27 | Native Linux aarch64 deny-all filter is registered; native primitive/filter probes passed. The actual GNU launcher built with Rust 1.83 and passed nine native unprivileged containment cases, including resources and cleanup. Musl, cancellation and final release-artifact qualification remain. |
 
-| Package | Status | Implemented work and remaining boundary |
-| --- | --- | --- |
-| WP00 | In progress | Baseline revision, toolchain, package/schema/fixture inventory and acceptance matrix recorded. New packaged measurements, full 0.4.2 fixtures and native qualification remain open. |
-| WP01 | In progress | Shared runtime policy resolver; explicit runtime CLI view; source/scope from the same resolved object; safe display projection and declared evidence gaps. Full field provenance, input revisions, profile identity and fetch/expiry metadata remain open. |
-| WP02 | In progress | Distinct confirmation label, honest incomplete/warn-only messages and scoped exception-review guidance. Pure evaluation and structured causal/recovery contracts remain open. |
-| WP03 | In progress | Schema-selected MCP redaction and compatibility regressions; protocol fields survive broad custom patterns. Remaining CLI/signed/export/browser boundaries stay open. |
-| WP09 | In progress | Correct repeated blocked-check counts and truthful no-suggestion/writable-target guidance. Frozen simulation, examples and feedback depend on the preceding contracts. |
-| WP04–WP08, WP10–WP27 | Pending | Inventory/design context recorded where applicable; no complete work package or release gate claimed. WP09's isolated reporting fixes were pulled forward without introducing new mutation authority. |
+The focused privilege changes are reviewed separately in
+[PR 251](https://github.com/sheeki03/tirith/pull/251) and
+[PR 252](https://github.com/sheeki03/tirith/pull/252). The latest revision removes
+sudo package suggestions as well as hard dependencies and describes privileged
+approval availability separately from ordinary protection. Exact heads
+`356981b8` and `3dce8f2d` each have 53 passed checks, 12 expected skips and no
+failures. These separate PR results do not certify the larger cycle branch.
 
-Detailed contracts:
+Contracts and evidence:
 
-- [Policy snapshot and CLI compatibility](policy-snapshot.md)
-- [Decision messages and tuning](decision-messages.md)
-- [Output privacy and versioning](output-contracts.md)
-
-## Review and validation
-
-Independent review covered the combined production diff and new tests. It found
-and prompted fixes for strict-warning acknowledgement wording, private data in
-dynamic policy map keys, and quadratic collision numbering. The final follow-up
-found no remaining substantive issues. Review did not substitute for tests.
-
-See [verification.md](verification.md) for the exact local checks and limits.
-G0 remains open, as do G1–G3. This slice neither adds automatic recommended setup
-nor claims new native host enforcement, installed-package certification, a full
-preview contract, or a browser mutation service.
-
-Next implementation priority is to complete WP01's provenance/revision capture
-inside the resolver, extend WP03 to the remaining machine boundaries, and then
-establish frozen evaluation and shared shell-target evidence before profile or
-setup mutations. New field/schema contracts need tests before browser controls
-consume them.
+- [Baseline inventory](baseline.md) and [acceptance matrix](acceptance-matrix.md)
+- [Policy snapshots](policy-snapshots.md) and [profile ownership](protection-profiles.md)
+- [Output contracts](output-contracts.md), [trust grants](trust-grants.md), [recovery](recovery.md)
+- [Shell targets](shell-targets.md), [bounded history](history.md), [ThreatDB operations](threatdb-operations.md)
+- [Dashboard design](dashboard-design.md) and [verification](verification.md)

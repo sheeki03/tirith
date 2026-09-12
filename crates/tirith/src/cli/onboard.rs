@@ -2,9 +2,9 @@
 //!
 //! Read-only detection of the developer's environment (shell, IDE/AI configs,
 //! package managers, lockfiles, CI, MCP configs, tirith install state) that
-//! prints a report and recommends a shipping policy template
-//! (`individual` / `startup` / `ci-strict` / `ai-agent-heavy`) plus next
-//! actions. Reuses existing helpers (`init::detect_shell`,
+//! prints integration inventory separately from the recommended personal
+//! Balanced protection profile. Explicit team/agent modes retain their legacy
+//! template choice. Personal writes use the shared mutation service. It Reuses existing helpers (`init::detect_shell`,
 //! `doctor::check_shell_profile`, `policy::discover_local_policy_path`,
 //! `path_audit::which_all`).
 //!
@@ -13,8 +13,6 @@
 //! WOULD do) so a piped/CI run never silently mutates the tree.
 
 use std::path::{Path, PathBuf};
-
-use crate::cli::policy::PolicyTemplate;
 
 /// Repo-local MCP config files `onboard` probes for. Mirrors core's
 /// (crate-private) `mcp_lock::MCP_CONFIG_RELATIVE_PATHS`; kept explicit so
@@ -61,8 +59,8 @@ const ONBOARD_SCHEMA_VERSION: u32 = 1;
 
 /// The detection report `onboard` builds and (optionally) serializes to JSON.
 /// Naming/casing mirror the other `--json` surfaces. `recommended_template`
-/// carries the canonical template NAME so a consumer can feed it back into
-/// `tirith policy init --template <name>`.
+/// remains a recommendation label; `recommended_profile` distinguishes a
+/// personal profile from an explicitly selected legacy policy template.
 #[derive(Debug, Clone, serde::Serialize)]
 struct OnboardReport {
     schema_version: u32,
@@ -84,6 +82,10 @@ struct OnboardReport {
     mcp_configs: Vec<String>,
     tirith: TirithState,
     recommended_template: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recommended_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recommended_profile_version: Option<u32>,
     recommendation_reason: String,
     next_actions: Vec<String>,
 }
@@ -164,7 +166,11 @@ fn gather_report(
         ci_detected,
     };
     let (recommended_template, recommendation_reason) = recommend_template(&signals);
-    let next_actions = build_next_actions(&tirith, recommended_template);
+    let next_actions = build_next_actions(&tirith, &recommended_template);
+    let recommended_profile = (recommended_template == "balanced").then(|| "balanced".to_string());
+    let recommended_profile_version = recommended_profile
+        .as_ref()
+        .map(|_| tirith_core::protection_profiles::PROFILE_VERSION);
 
     OnboardReport {
         schema_version: ONBOARD_SCHEMA_VERSION,
@@ -179,7 +185,9 @@ fn gather_report(
         ci_detected,
         mcp_configs,
         tirith,
-        recommended_template: recommended_template.canonical_name().to_string(),
+        recommended_template,
+        recommended_profile,
+        recommended_profile_version,
         recommendation_reason,
         next_actions,
     }
@@ -394,72 +402,23 @@ struct RecommendationSignals<'a> {
     ci_detected: bool,
 }
 
-/// Map detections → a shipping template, biased by `mode`.
-///
-/// Priority:
-///   1. An explicit `--repo|--team|--ai-agent-heavy` mode wins outright.
-///   2. Heavy AI-config / MCP presence → `ai-agent-heavy`.
-///   3. A CI repo (`.github/workflows`) → `ci-strict`.
-///   4. Otherwise → `individual`.
-fn recommend_template(signals: &RecommendationSignals) -> (PolicyTemplate, String) {
-    // 1. Explicit mode bias.
+/// Personal risk preference is independent of discovered integrations. Only
+/// explicit legacy team/agent modes select a legacy policy template.
+fn recommend_template(signals: &RecommendationSignals) -> (String, String) {
     match signals.mode {
-        Some("ai-agent-heavy") => {
-            return (
-                PolicyTemplate::AiAgentHeavy,
-                "requested --ai-agent-heavy".to_string(),
-            );
-        }
-        Some("team") => {
-            return (
-                PolicyTemplate::Startup,
-                "requested --team (balanced shared defaults for a human team)".to_string(),
-            );
-        }
-        Some("repo") => {
-            // A "repo" bias still respects a CI signal (ci-strict), else individual.
-            if signals.ci_detected {
-                return (
-                    PolicyTemplate::CiStrict,
-                    "requested --repo and a .github/workflows CI pipeline is present".to_string(),
-                );
-            }
-            return (
-                PolicyTemplate::Individual,
-                "requested --repo with no CI pipeline detected".to_string(),
-            );
-        }
-        _ => {}
+        Some("ai-agent-heavy") => (
+            "ai-agent-heavy".into(), "explicitly requested --ai-agent-heavy legacy template".into()),
+        Some("team") => (
+            "startup".into(), "explicitly requested --team legacy template".into()),
+        _ => (
+            "balanced".into(),
+            format!("personal Balanced v1 defaults; integration inventory: {} AI config(s), {} MCP config(s), CI {}",
+                signals.ai_config_count, signals.mcp_config_count, signals.ci_detected)),
     }
-
-    // 2. Auto: heavy AI-agent surface.
-    if signals.ai_config_count >= 2 || signals.mcp_config_count >= 1 {
-        return (
-            PolicyTemplate::AiAgentHeavy,
-            format!(
-                "{} AI-config file(s) and {} MCP config(s) detected — an AI-agent-heavy environment",
-                signals.ai_config_count, signals.mcp_config_count
-            ),
-        );
-    }
-
-    // 3. Auto: CI repo.
-    if signals.ci_detected {
-        return (
-            PolicyTemplate::CiStrict,
-            "a .github/workflows CI pipeline is present".to_string(),
-        );
-    }
-
-    // 4. Auto: default.
-    (
-        PolicyTemplate::Individual,
-        "no CI or heavy AI-agent signals — sensible single-developer defaults".to_string(),
-    )
 }
 
 /// Build the ordered next-actions list from tirith's state and the template.
-fn build_next_actions(tirith: &TirithState, template: PolicyTemplate) -> Vec<String> {
+fn build_next_actions(tirith: &TirithState, template: &str) -> Vec<String> {
     let mut actions = Vec::new();
     if !tirith.hook_installed {
         actions.push(
@@ -468,10 +427,9 @@ fn build_next_actions(tirith: &TirithState, template: PolicyTemplate) -> Vec<Str
         );
     }
     if !tirith.policy_present {
-        actions.push(format!(
-            "run `tirith policy init --template {}`",
-            template.canonical_name()
-        ));
+        actions.push(if template == "balanced" {
+            "run `tirith policy profile apply balanced` to record personal settings through the shared change plan".into()
+        } else { format!("run `tirith policy init --template {template}` for the explicitly selected legacy template") });
     }
     if actions.is_empty() {
         actions.push(
@@ -523,10 +481,17 @@ fn print_human(report: &OnboardReport) {
     }
     println!();
 
-    println!(
-        "Recommended policy template: {}",
-        report.recommended_template
-    );
+    if let Some(profile) = &report.recommended_profile {
+        println!(
+            "Recommended personal protection profile: {profile} v{}",
+            report.recommended_profile_version.unwrap_or(1)
+        );
+    } else {
+        println!(
+            "Explicit legacy policy template: {}",
+            report.recommended_template
+        );
+    }
     println!("  why: {}", report.recommendation_reason);
     println!();
     println!("Next steps:");
@@ -608,17 +573,23 @@ fn apply_actions_with_interactivity(report: &OnboardReport, interactive: bool) -
             "  A policy already exists at {} — leaving it untouched.",
             report.tirith.policy_path.as_deref().unwrap_or("<unknown>")
         );
-    } else if confirm_stdin(&format!(
-        "Run `tirith policy init --template {}`?",
-        report.recommended_template
-    )) {
-        // `policy::init` is no-clobber without --force, safe even if a policy
-        // raced in after detection.
-        let rc = crate::cli::policy::init(false, false, Some(&report.recommended_template));
+    } else if confirm_stdin(&if let Some(profile) = &report.recommended_profile {
+        format!("Apply personal {profile} settings using a revision-checked change plan?")
+    } else {
+        format!(
+            "Run `tirith policy init --template {}`?",
+            report.recommended_template
+        )
+    }) {
+        let rc = if let Some(profile) = &report.recommended_profile {
+            crate::cli::policy::apply_profile(profile, false, false)
+        } else {
+            crate::cli::policy::init(false, false, Some(&report.recommended_template))
+        };
         if rc == 0 {
             performed += 1;
         } else {
-            eprintln!("  `tirith policy init` failed (exit code {rc}).");
+            eprintln!("  Policy setup failed (exit code {rc}).");
             failed = true;
         }
     }
@@ -671,7 +642,7 @@ mod tests {
             mcp_config_count: 0,
             ci_detected: false,
         });
-        assert_eq!(ai.0, PolicyTemplate::AiAgentHeavy);
+        assert_eq!(ai.0, "ai-agent-heavy");
 
         // `--team` maps to the balanced `startup` preset, not the CI one (finding M).
         let team = recommend_template(&RecommendationSignals {
@@ -680,16 +651,16 @@ mod tests {
             mcp_config_count: 0,
             ci_detected: false,
         });
-        assert_eq!(team.0, PolicyTemplate::Startup);
+        assert_eq!(team.0, "startup");
 
-        // `--repo` respects a CI signal but otherwise picks individual.
+        // Repository mode keeps the same personal default regardless of CI.
         let repo_ci = recommend_template(&RecommendationSignals {
             mode: Some("repo"),
             ai_config_count: 0,
             mcp_config_count: 0,
             ci_detected: true,
         });
-        assert_eq!(repo_ci.0, PolicyTemplate::CiStrict);
+        assert_eq!(repo_ci.0, "balanced");
         let repo_plain = recommend_template(&RecommendationSignals {
             mode: Some("repo"),
             ai_config_count: 5,
@@ -697,49 +668,48 @@ mod tests {
             ci_detected: false,
         });
         assert_eq!(
-            repo_plain.0,
-            PolicyTemplate::Individual,
+            repo_plain.0, "balanced",
             "an explicit --repo bias must not be overridden by auto AI-agent signals"
         );
     }
 
     #[test]
-    fn recommend_auto_prioritizes_ai_then_ci_then_individual() {
-        // 2+ AI configs → ai-agent-heavy, even with CI.
+    fn recommend_auto_preserves_balanced_across_integration_inventory() {
+        // Multiple AI configs remain integration inventory.
         let ai = recommend_template(&RecommendationSignals {
             mode: None,
             ai_config_count: 2,
             mcp_config_count: 0,
             ci_detected: true,
         });
-        assert_eq!(ai.0, PolicyTemplate::AiAgentHeavy);
+        assert_eq!(ai.0, "balanced");
 
-        // A single MCP config alone is enough for ai-agent-heavy.
+        // MCP discovery does not select a personal risk preference.
         let mcp = recommend_template(&RecommendationSignals {
             mode: None,
             ai_config_count: 0,
             mcp_config_count: 1,
             ci_detected: false,
         });
-        assert_eq!(mcp.0, PolicyTemplate::AiAgentHeavy);
+        assert_eq!(mcp.0, "balanced");
 
-        // CI without a heavy AI surface → ci-strict.
+        // CI discovery leaves personal defaults unchanged.
         let ci = recommend_template(&RecommendationSignals {
             mode: None,
             ai_config_count: 1,
             mcp_config_count: 0,
             ci_detected: true,
         });
-        assert_eq!(ci.0, PolicyTemplate::CiStrict);
+        assert_eq!(ci.0, "balanced");
 
-        // Nothing notable → individual.
+        // An empty integration inventory uses the same Balanced default.
         let individual = recommend_template(&RecommendationSignals {
             mode: None,
             ai_config_count: 0,
             mcp_config_count: 0,
             ci_detected: false,
         });
-        assert_eq!(individual.0, PolicyTemplate::Individual);
+        assert_eq!(individual.0, "balanced");
     }
 
     #[test]
@@ -751,12 +721,12 @@ mod tests {
                 policy_present: false,
                 policy_path: None,
             },
-            PolicyTemplate::Individual,
+            "balanced",
         );
         assert!(fresh.iter().any(|a| a.contains("tirith init")));
         assert!(fresh
             .iter()
-            .any(|a| a.contains("tirith policy init --template individual")));
+            .any(|a| a.contains("tirith policy profile apply balanced")));
 
         // Fully set up: a single "already set up" line.
         let done = build_next_actions(
@@ -765,7 +735,7 @@ mod tests {
                 policy_present: true,
                 policy_path: Some("/repo/.tirith/policy.yaml".to_string()),
             },
-            PolicyTemplate::CiStrict,
+            "ci-strict",
         );
         assert_eq!(done.len(), 1);
         assert!(done[0].contains("already set up"));
@@ -791,7 +761,9 @@ mod tests {
                 policy_present,
                 policy_path: policy_present.then(|| "/repo/.tirith/policy.yaml".to_string()),
             },
-            recommended_template: "individual".to_string(),
+            recommended_template: "balanced".to_string(),
+            recommended_profile: Some("balanced".into()),
+            recommended_profile_version: Some(1),
             recommendation_reason: "test".to_string(),
             next_actions: vec!["do a thing".to_string()],
         }
@@ -839,8 +811,8 @@ mod tests {
     }
 
     /// R7-5: the AI-config detector covers the broader surface, not just the
-    /// `CLAUDE.md`/`.cursorrules`/`AGENTS.md` trio — with 2+ such files the AUTO
-    /// recommendation must reach `ai-agent-heavy`.
+    /// `CLAUDE.md`/`.cursorrules`/`AGENTS.md` trio. Expanded inventory still
+    /// leaves the personal protection-profile recommendation unchanged.
     #[test]
     fn detect_ai_config_recognizes_broader_signals() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -864,7 +836,7 @@ mod tests {
             "themed .clinerules-* must be detected as AI config, got: {found:?}"
         );
 
-        // The broadened count (>= 2) drives the AUTO recommendation to ai-agent-heavy.
+        // Broader integration coverage does not silently tighten personal policy.
         let (template, _why) = recommend_template(&RecommendationSignals {
             mode: None,
             ai_config_count: found.len(),
@@ -872,9 +844,8 @@ mod tests {
             ci_detected: false,
         });
         assert_eq!(
-            template,
-            PolicyTemplate::AiAgentHeavy,
-            "a repo with multiple broader AI-config signals must recommend ai-agent-heavy"
+            template, "balanced",
+            "integration inventory must not select a stricter personal policy"
         );
     }
 

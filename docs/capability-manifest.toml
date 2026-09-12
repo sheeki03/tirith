@@ -39,6 +39,13 @@ coverage = "Tokenizes the command and inspects every extracted URL, path, and Do
 policy_complete = true
 
 [[command]]
+name = "review"
+group = "Scan & analyze"
+inspected = "partial"
+coverage = "Explicit offline review of bounded project-relative dependency declarations, hooks, AI instructions and MCP configuration. Retains file identities and reports uninspected surfaces; never starts tooling, installs packages or establishes runtime safety."
+policy_complete = false
+
+[[command]]
 name = "paste"
 group = "Scan & analyze"
 inspected = "full"
@@ -119,7 +126,7 @@ policy_complete = false
 name = "capsule run"
 group = "Scan & analyze"
 inspected = "full"
-coverage = "Copies the project with symlink-safe same-inode traversal (refusing symlinks, escapes, and case/Unicode collisions), digests every copied file, runs the exact argv in a fail-closed capsule, and diffs the tree afterwards. Enforceable only on x86_64 Linux; every other host refuses before any copy or spawn."
+coverage = "Copies the project with symlink-safe same-inode traversal (refusing symlinks, escapes, and case/Unicode collisions), digests every copied file, runs the exact argv in a fail-closed capsule, and diffs the tree afterwards. Available on native x86_64 or aarch64 Linux when the kernel provides every requested Landlock/seccomp control; unavailable controls or other hosts refuse before any copy or spawn. ARM GNU candidate acceptance is recorded separately from pending final release-artifact qualification."
 policy_complete = true
 
 [[command]]
@@ -140,7 +147,7 @@ policy_complete = true
 name = "task check"
 group = "Scan & analyze"
 inspected = "partial"
-coverage = "Preview, diagnostic. Parses a bounded untrusted task envelope in full and assigns each source's effective provenance from the tirith-owned ingress adapter rather than the document's own claim, but effect inference models the Web3 shell grammar and nothing else, so a proposed shell action outside that grammar is reported INCOMPLETE rather than understood. Executes nothing, fetches nothing, resolves no package, and writes nothing; it declares enforceability observe_only, so it reports what an envelope would be allowed to do and stops nothing."
+coverage = "Preview, diagnostic. Parses a bounded untrusted task envelope in full and assigns each source's effective provenance from the tirith-owned ingress adapter rather than the document's own claim, but effect inference models recognized Web3 and package-command families with bounded syntax, while unsupported or dynamic runtime effects remain explicitly INCOMPLETE. Executes nothing, fetches nothing, resolves no package, and writes nothing; it declares enforceability observe_only, so it reports what an envelope would be allowed to do and stops nothing."
 policy_complete = true
 
 [[command]]
@@ -200,8 +207,8 @@ policy_complete = true
 name = "dashboard"
 group = "Status & health"
 inspected = "none"
-coverage = "Renders a local-only HTML dashboard from the audit log, policy, and trust store. Reporting surface."
-policy_complete = true
+coverage = "Loopback-only authenticated local controls share typed CLI plans for personal setup, policy, grants, retention and lifecycle changes. History, project and artifact evidence have explicit limits; a running service does not prove shell interception."
+policy_complete = false
 
 [[command]]
 name = "warnings"
@@ -253,7 +260,7 @@ policy_complete = true
 name = "setup"
 group = "Setup & onboarding"
 inspected = "none"
-coverage = "One-command AI-tool setup. Writes integration config; does not inspect content."
+coverage = "Personal recommended setup combines a selected shell and profile in one owned journal; explicit host setup writes selected integration configuration. Configuration does not establish observed interception. Unsupported or uncertified automatic selections refuse."
 policy_complete = true
 
 [[command]]
@@ -440,7 +447,7 @@ policy_complete = true
 name = "package"
 group = "Supply-chain"
 inspected = "partial"
-coverage = "Scores a package's supply-chain risk (offline by default; --online adds registry provenance; --installed walks installed trees). Inspects locally-available content when present, name and metadata otherwise. For npm, --online reports dist identity facts and their verification state; no state can be verified here, and tirith does not download, inspect, or bind npm tarball bytes."
+coverage = "Scores supply-chain evidence offline or with explicit registry provenance. The local npm artifact route inspects exact bounded tarball bytes, metadata, scripts and selected code/native signals without extraction or execution; artifact comparison reports identity and coverage changes. Provenance and inspection do not approve installation."
 policy_complete = false
 
 [[command]]
@@ -574,7 +581,7 @@ policy_complete = true
 name = "audit"
 group = "Forensics & response"
 inspected = "none"
-coverage = "Audit-log management; verify checks the tamper-evident hash chain. Verification and export surface."
+coverage = "Bounded recent checks and intention labels, signed-chain verification, reviewed rotation, exact private segment export and acknowledged irreversible segment deletion. Deleted history remains unavailable; recorded checks and labels do not establish execution or command safety."
 policy_complete = true
 
 [[command]]

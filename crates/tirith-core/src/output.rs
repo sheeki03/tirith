@@ -120,26 +120,13 @@ fn project_public_text(s: &str) -> String {
     crate::redact::redact_blocked_output(&share_safe)
 }
 
-fn project_public_json(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(text) => *text = project_public_text(text),
-        serde_json::Value::Array(values) => {
-            for value in values {
-                project_public_json(value);
-            }
-        }
-        serde_json::Value::Object(values) => {
-            for value in values.values_mut() {
-                project_public_json(value);
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
-}
-
 fn project_verdict(verdict: &Verdict) -> std::io::Result<Verdict> {
     let mut value = serde_json::to_value(verdict).map_err(std::io::Error::other)?;
-    project_public_json(&mut value);
+    crate::output_contract::project_sensitive_strings(
+        &mut value,
+        crate::output_contract::Projection::Verdict,
+        &project_public_text,
+    );
     serde_json::from_value(value).map_err(std::io::Error::other)
 }
 
@@ -221,12 +208,19 @@ fn redact_suggestion(
             " Executable command omitted because mandatory output projection would change the verified bytes.",
         );
     }
-    let rule_id = crate::redact::redact_with_compiled(&s.rule_id, compiled);
-    let rule_id = project_public_text(&rule_id);
+    let rule_id = if serde_json::from_value::<RuleId>(s.rule_id.clone().into()).is_ok()
+        || matches!(
+            s.rule_id.as_str(),
+            "sudo_narrow" | "env_scrub" | "composed_safe_command"
+        ) {
+        s.rule_id.clone()
+    } else {
+        project_public_text(&crate::redact::redact_with_compiled(&s.rule_id, compiled))
+    };
     let remediation = crate::redact::redact_with_compiled(&s.remediation, compiled);
     let remediation = project_public_text(&remediation);
     SafeSuggestion {
-        rule_id: crate::redact::redact_sanitize_redact_with_compiled(&rule_id, compiled),
+        rule_id,
         safe_command,
         rationale,
         remediation: crate::redact::redact_sanitize_redact_with_compiled(&remediation, compiled),
@@ -248,6 +242,18 @@ pub fn write_json_with_suggestions(
     verdict: &Verdict,
     custom_patterns: &[String],
     suggestions: Option<&[SafeSuggestion]>,
+    w: impl Write,
+) -> std::io::Result<()> {
+    write_json_with_recovery(verdict, custom_patterns, suggestions, None, w)
+}
+
+/// Recovery contains only closed enums, rule IDs and compiler-owned strings;
+/// its original command is used for eligibility and never serialized.
+pub fn write_json_with_recovery(
+    verdict: &Verdict,
+    custom_patterns: &[String],
+    suggestions: Option<&[SafeSuggestion]>,
+    recovery: Option<&crate::recovery::RecoveryAdvice>,
     mut w: impl Write,
 ) -> std::io::Result<()> {
     // Redact before applying presentation bounds: truncating first can split a
@@ -300,10 +306,24 @@ pub fn write_json_with_suggestions(
             );
         }
     }
-    crate::redact::redact_json_strings(&mut output, &compiled);
+    crate::output_contract::redact_projection(
+        &mut output,
+        crate::output_contract::Projection::Verdict,
+        &compiled,
+    );
     // Diagnostics and suggestion metadata are attached after the verdict
     // projection, so re-project the complete public response before bounding.
-    project_public_json(&mut output);
+    crate::output_contract::project_sensitive_strings(
+        &mut output,
+        crate::output_contract::Projection::Verdict,
+        &project_public_text,
+    );
+    if let (Some(recovery), Some(object)) = (recovery, output.as_object_mut()) {
+        object.insert(
+            "recovery".into(),
+            serde_json::to_value(recovery).map_err(std::io::Error::other)?,
+        );
+    }
     let output = crate::verdict::bound_json_value_for_output(output);
     serde_json::to_writer(&mut w, &output)?;
     writeln!(w)?;
@@ -503,16 +523,16 @@ fn write_human_color_into(
         if is_warn_only_block {
             writeln!(
                 w,
-                "  Safer: use zsh or fish to actually block this, or prefix with TIRITH=0 to suppress."
+                "  This hook reports warn-only mode; inspect activation with tirith doctor --quick."
             )?;
             writeln!(
                 w,
-                "  Bash can block too: export TIRITH_BASH_PREEXEC_ENFORCE=1 before the tirith init line (remove any TIRITH_BASH_MODE=enter override)."
+                "  Run tirith doctor --simulate-enter for a disposable Bash allow/block probe."
             )?;
         } else {
             writeln!(
                 w,
-                "  Bypass: prefix your command with TIRITH=0 (applies to that command only)"
+                "  Bypass policy is enabled; tirith check --shell <shell> provides exact-input recovery eligibility."
             )?;
         }
     }
@@ -956,16 +976,16 @@ fn write_human_no_color_into(
         if is_warn_only_block {
             writeln!(
                 w,
-                "  Safer: use zsh or fish to actually block this, or prefix with TIRITH=0 to suppress."
+                "  This hook reports warn-only mode; inspect activation with tirith doctor --quick."
             )?;
             writeln!(
                 w,
-                "  Bash can block too: export TIRITH_BASH_PREEXEC_ENFORCE=1 before the tirith init line (remove any TIRITH_BASH_MODE=enter override)."
+                "  Run tirith doctor --simulate-enter for a disposable Bash allow/block probe."
             )?;
         } else {
             writeln!(
                 w,
-                "  Bypass: prefix your command with TIRITH=0 (applies to that command only)"
+                "  Bypass policy is enabled; tirith check --shell <shell> provides exact-input recovery eligibility."
             )?;
         }
     }
@@ -1020,6 +1040,33 @@ mod tests {
     use super::*;
     use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings, Verdict};
 
+    #[test]
+    fn broad_custom_dlp_preserves_json_actions_and_suggestion_ids() {
+        let verdict = block_verdict_with_bypass();
+        let suggestions = vec![SafeSuggestion {
+            rule_id: "plain_http_to_sink".into(),
+            safe_command: Some("echo operator-secret".into()),
+            rationale: "operator-secret".into(),
+            remediation: "operator-secret".into(),
+        }];
+        let mut bytes = Vec::new();
+        write_json_with_suggestions(&verdict, &["(?s).+".into()], Some(&suggestions), &mut bytes)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["action"], "block");
+        assert_eq!(value["findings"][0]["rule_id"], "plain_http_to_sink");
+        assert_eq!(value["findings"][0]["severity"], "HIGH");
+        assert_eq!(
+            value["safe_suggestions"][0]["rule_id"],
+            "plain_http_to_sink"
+        );
+        assert!(value["safe_suggestions"][0].get("safe_command").is_none());
+        assert!(!String::from_utf8(bytes)
+            .unwrap()
+            .contains("operator-secret"));
+    }
+
     fn block_verdict_with_bypass() -> Verdict {
         let mut v = Verdict::from_findings(
             vec![Finding {
@@ -1065,12 +1112,12 @@ mod tests {
             "warn-only must render DETECTED with explanation: {out}"
         );
         assert!(
-            !out.contains("Bypass:"),
+            !out.contains("Bypass policy"),
             "warn-only must replace the Bypass hint: {out}"
         );
         assert!(
-            out.contains("Safer:"),
-            "warn-only must render the Safer hint: {out}"
+            out.contains("inspect activation"),
+            "warn-only must render activation guidance: {out}"
         );
     }
 
@@ -1089,8 +1136,8 @@ mod tests {
             "default must not render DETECTED: {out}"
         );
         assert!(
-            out.contains("Bypass:"),
-            "default must render the Bypass hint: {out}"
+            out.contains("exact-input recovery eligibility"),
+            "context-free output must require exact-input recovery eligibility: {out}"
         );
     }
 
