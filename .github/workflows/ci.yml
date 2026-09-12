@@ -126,6 +126,10 @@ jobs:
         run: node tests/ipython-vector-extraction.mjs
       - name: npm launcher exit and signal contract
         run: node tests/npm-launcher.mjs
+      - name: Windows user installer release contract
+        if: matrix.name == 'Windows'
+        shell: pwsh
+        run: ./tests/windows-install.ps1
       - name: Install interactive shell conformance dependencies
         if: matrix.name == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes fish zsh
@@ -281,6 +285,10 @@ jobs:
         run: sh tests/install-sh/verify_sha256.sh
       - name: package-approval helper return-path tests
         run: sh tests/install-sh/package_approval_helper_returns.sh
+      - name: Optional approval helper installation tests
+        run: sh tests/install-sh/optional_helper.sh
+      - name: Paired installer rollback tests
+        run: sh tests/install-sh/paired_rollback.sh
 
   artifact-roundtrip-produce:
     name: Artifact protocol (upload)

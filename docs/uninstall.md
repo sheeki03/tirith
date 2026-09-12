@@ -1,5 +1,12 @@
 # Uninstall
 
+Removing files in your home directory needs no administrator privileges.
+System packages, a root-owned approval helper, and its system keyring require
+administrator privileges. The examples use `sudo` for those operations;
+omit it when already in a root session. You do not need to install `sudo`
+to remove Tirith. See [installation privileges](install-privileges.md) for
+the requirements of each distribution channel.
+
 ## Remove shell hook
 
 Remove the `tirith init` hook line from your shell config:
@@ -75,6 +82,12 @@ sudo dnf remove tirith
 ### Shell script install
 ```sh
 rm ~/.local/bin/tirith
+```
+
+If you enabled the optional package-approval helper, remove it from an
+administrator session after all installations using it have been removed:
+
+```sh
 sudo rm -f /usr/local/libexec/tirith-package-approval-authority
 sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous
 sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent

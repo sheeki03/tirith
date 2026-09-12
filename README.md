@@ -609,6 +609,8 @@ confirmation. The packaged helper is inert: installation creates no sudoers
 rule, elevated service, or signing key. If that authority is unavailable,
 approval remains blocked; ordinary command checks and shell protection
 continue to work.
+The [installation privileges guide](docs/install-privileges.md) covers all
+package formats, manual installs, updates, and removal.
 
 The Linux GNU release binaries target a GLIBC 2.28 ceiling. CI runs both
 x86_64 and aarch64 tarballs on AlmaLinux 8, Amazon Linux 2023, and Rocky Linux

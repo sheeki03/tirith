@@ -946,7 +946,10 @@ fn run_verify_self(prov: &Provenance, hermes_managed: bool) -> VerifySelfOutcome
     let helper_note: Option<String> = None;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if let Err(reason) = verify_installed_package_approval_helper(workdir.path(), &target) {
-        if install_method_requires_package_approval_helper(&prov.install_method) && !hermes_managed
+        if install_method_requires_package_approval_helper(
+            &prov.install_method,
+            managed_helper_state_present(),
+        ) && !hermes_managed
         {
             return VerifySelfOutcome::verdict(VerificationStatus::Failed { reason });
         }
@@ -973,11 +976,12 @@ fn run_verify_self(prov: &Provenance, hermes_managed: bool) -> VerifySelfOutcome
 }
 
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
-fn install_method_requires_package_approval_helper(method: &InstallMethod) -> bool {
-    matches!(
-        method,
-        InstallMethod::SelfManaged | InstallMethod::Apt | InstallMethod::Dnf
-    )
+fn install_method_requires_package_approval_helper(
+    method: &InstallMethod,
+    helper_present: bool,
+) -> bool {
+    matches!(method, InstallMethod::Apt | InstallMethod::Dnf)
+        || (matches!(method, InstallMethod::SelfManaged) && helper_present)
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1116,8 +1120,7 @@ pub fn update(allow_unsigned: bool, rollback: bool, dry_run: bool, yes: bool, js
 }
 
 fn update_effects(
-    method: &InstallMethod,
-    hermes_managed: bool,
+    updates_privileged_helper: bool,
     dry_run: bool,
 ) -> BTreeSet<tirith_core::effects::CommandEffectKind> {
     let mut effects = [tirith_core::effects::CommandEffectKind::NetworkEgress]
@@ -1125,7 +1128,7 @@ fn update_effects(
         .collect::<BTreeSet<_>>();
     if !dry_run {
         effects.insert(tirith_core::effects::CommandEffectKind::FilesystemWrite);
-        if install_method_updates_privileged_helper(method, hermes_managed) {
+        if updates_privileged_helper {
             effects.insert(tirith_core::effects::CommandEffectKind::ResourceEscalation);
         }
     }
@@ -1133,28 +1136,63 @@ fn update_effects(
 }
 
 fn rollback_effects(
-    method: &InstallMethod,
-    hermes_managed: bool,
+    updates_privileged_helper: bool,
 ) -> BTreeSet<tirith_core::effects::CommandEffectKind> {
     let mut effects = [tirith_core::effects::CommandEffectKind::FilesystemWrite]
         .into_iter()
         .collect::<BTreeSet<_>>();
-    if install_method_updates_privileged_helper(method, hermes_managed) {
+    if updates_privileged_helper {
         effects.insert(tirith_core::effects::CommandEffectKind::ResourceEscalation);
     }
     effects
 }
 
-fn install_method_updates_privileged_helper(method: &InstallMethod, hermes_managed: bool) -> bool {
+fn install_method_updates_privileged_helper(
+    method: &InstallMethod,
+    hermes_managed: bool,
+    helper_present: bool,
+) -> bool {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        !hermes_managed && install_method_requires_package_approval_helper(method)
+        !hermes_managed && install_method_requires_package_approval_helper(method, helper_present)
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
-        let _ = (method, hermes_managed);
+        let _ = (method, hermes_managed, helper_present);
         false
     }
+}
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+fn helper_state_present_at(paths: &[&Path]) -> bool {
+    paths
+        .iter()
+        .any(|path| match std::fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        })
+}
+
+fn managed_helper_state_present() -> bool {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        helper_state_present_at(&[
+            Path::new(PACKAGE_APPROVAL_HELPER_PATH),
+            Path::new(PACKAGE_APPROVAL_HELPER_BACKUP),
+            Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT),
+        ])
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+fn ensure_helper_state_unchanged(expected: bool) -> Result<(), String> {
+    if managed_helper_state_present() != expected {
+        return Err("package-approval helper state changed during the update; retry before replacing either binary".to_string());
+    }
+    Ok(())
 }
 
 fn ensure_hermes_install_still_proven(provenance: &CliProvenance) -> Result<(), String> {
@@ -1226,7 +1264,13 @@ fn run_update(
     };
     let expected_rollback_sha = hash_file_opt(&previous_backup_path(&binary_path));
     let hermes_managed = prov.is_hermes_managed();
-    let effects = update_effects(&prov.install_method, hermes_managed, dry_run);
+    let helper_present = managed_helper_state_present();
+    let updates_privileged_helper = install_method_updates_privileged_helper(
+        &prov.install_method,
+        hermes_managed,
+        helper_present,
+    );
+    let effects = update_effects(updates_privileged_helper, dry_run);
     let authorization =
         match prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
             match self_boundary_envelope(
@@ -1240,6 +1284,7 @@ fn run_update(
                     "binary_preimage_sha256": expected_binary_sha.clone(),
                     "rollback_preimage_sha256": expected_rollback_sha.clone(),
                     "allow_unsigned": allow_unsigned,
+                    "updates_privileged_helper": updates_privileged_helper,
                     "dry_run": dry_run,
                     "release_origin": REPO,
                 }),
@@ -1436,10 +1481,14 @@ fn run_update(
         emit_update_error(json, &error);
         return 1;
     }
+    if !hermes_managed {
+        if let Err(error) = ensure_helper_state_unchanged(helper_present) {
+            emit_update_error(json, &error);
+            return 1;
+        }
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let helper_install = if !hermes_managed
-        && install_method_requires_package_approval_helper(&prov.install_method)
-    {
+    let helper_install = if updates_privileged_helper {
         let archive_sha256 = match &archive_verdict {
             ArchiveVerdict::Ok { archive_sha256, .. } => archive_sha256,
             _ => unreachable!("failed archive verdict returned above"),
@@ -1695,7 +1744,13 @@ fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i
         }
     };
     let hermes_managed = prov.is_hermes_managed();
-    let effects = rollback_effects(&prov.install_method, hermes_managed);
+    let helper_present = managed_helper_state_present();
+    let updates_privileged_helper = install_method_updates_privileged_helper(
+        &prov.install_method,
+        hermes_managed,
+        helper_present,
+    );
+    let effects = rollback_effects(updates_privileged_helper);
     let authorization =
         match prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
             match self_boundary_envelope(
@@ -1706,6 +1761,7 @@ fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i
                     "binary_preimage_sha256": expected_binary_sha.clone(),
                     "rollback_path": backup.to_str(),
                     "rollback_preimage_sha256": expected_rollback_sha.clone(),
+                    "updates_privileged_helper": updates_privileged_helper,
                     "dry_run": false,
                 }),
                 Some(&binary_path),
@@ -1730,13 +1786,14 @@ fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i
         return 1;
     }
 
+    if !hermes_managed {
+        if let Err(error) = ensure_helper_state_unchanged(helper_present) {
+            emit_update_error(json, &error);
+            return 1;
+        }
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let helper_restore = if !hermes_managed
-        && install_method_requires_package_approval_helper(&prov.install_method)
-        && (Path::new(PACKAGE_APPROVAL_HELPER_PATH).is_file()
-            || Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file()
-            || Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT).is_file())
-    {
+    let helper_restore = if updates_privileged_helper {
         use std::ffi::OsStr;
         let had_previous = Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file();
         let previously_absent = Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT).is_file();
@@ -3612,18 +3669,22 @@ mod tests {
     fn hermes_updates_never_request_privileged_helper_effects() {
         use tirith_core::effects::CommandEffectKind;
 
-        let update = update_effects(&InstallMethod::SelfManaged, true, false);
+        let manages_helper =
+            install_method_updates_privileged_helper(&InstallMethod::SelfManaged, true, true);
+        let update = update_effects(manages_helper, false);
         assert!(update.contains(&CommandEffectKind::NetworkEgress));
         assert!(update.contains(&CommandEffectKind::FilesystemWrite));
         assert!(!update.contains(&CommandEffectKind::ResourceEscalation));
-        let rollback = rollback_effects(&InstallMethod::SelfManaged, true);
+        let rollback = rollback_effects(manages_helper);
         assert!(rollback.contains(&CommandEffectKind::FilesystemWrite));
         assert!(!rollback.contains(&CommandEffectKind::ResourceEscalation));
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            let standalone_update = update_effects(&InstallMethod::SelfManaged, false, false);
-            let standalone_rollback = rollback_effects(&InstallMethod::SelfManaged, false);
+            let manages_helper =
+                install_method_updates_privileged_helper(&InstallMethod::SelfManaged, false, true);
+            let standalone_update = update_effects(manages_helper, false);
+            let standalone_rollback = rollback_effects(manages_helper);
             assert!(standalone_update.contains(&CommandEffectKind::ResourceEscalation));
             assert!(standalone_rollback.contains(&CommandEffectKind::ResourceEscalation));
         }
@@ -3659,11 +3720,12 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
         assert!(ensure_hermes_install_still_proven(&provenance).is_err());
         assert!(provenance.is_hermes_managed());
-        let effects = update_effects(
+        let manages_helper = install_method_updates_privileged_helper(
             &provenance.install_method,
             provenance.is_hermes_managed(),
-            false,
+            true,
         );
+        let effects = update_effects(manages_helper, false);
         assert!(!effects.contains(&CommandEffectKind::ResourceEscalation));
     }
 
@@ -3922,13 +3984,20 @@ mod tests {
     #[test]
     fn native_helper_is_required_only_for_install_methods_that_ship_it() {
         assert!(install_method_requires_package_approval_helper(
-            &InstallMethod::SelfManaged
+            &InstallMethod::SelfManaged,
+            true,
+        ));
+        assert!(!install_method_requires_package_approval_helper(
+            &InstallMethod::SelfManaged,
+            false,
         ));
         assert!(install_method_requires_package_approval_helper(
-            &InstallMethod::Apt
+            &InstallMethod::Apt,
+            false,
         ));
         assert!(install_method_requires_package_approval_helper(
-            &InstallMethod::Dnf
+            &InstallMethod::Dnf,
+            false,
         ));
         for method in [
             InstallMethod::Npm,
@@ -3937,7 +4006,48 @@ mod tests {
             InstallMethod::Aur,
             InstallMethod::Unknown,
         ] {
-            assert!(!install_method_requires_package_approval_helper(&method));
+            assert!(!install_method_requires_package_approval_helper(
+                &method, true
+            ));
+        }
+    }
+
+    #[test]
+    fn manual_install_without_helper_never_requests_elevation() {
+        use tirith_core::effects::CommandEffectKind;
+
+        let manages_helper =
+            install_method_updates_privileged_helper(&InstallMethod::SelfManaged, false, false);
+        assert!(!manages_helper);
+        let update = update_effects(manages_helper, false);
+        let rollback = rollback_effects(manages_helper);
+        assert!(update.contains(&CommandEffectKind::FilesystemWrite));
+        assert!(rollback.contains(&CommandEffectKind::FilesystemWrite));
+        assert!(!update.contains(&CommandEffectKind::ResourceEscalation));
+        assert!(!rollback.contains(&CommandEffectKind::ResourceEscalation));
+    }
+
+    #[test]
+    fn helper_backups_and_invalid_entries_keep_the_paired_update_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("helper");
+        let backup = directory.path().join("helper.previous");
+        let absent = directory.path().join("helper.previously-absent");
+        let paths = [live.as_path(), backup.as_path(), absent.as_path()];
+        assert!(!helper_state_present_at(&paths));
+        std::fs::write(&backup, b"previous-helper").unwrap();
+        assert!(helper_state_present_at(&paths));
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::write(&absent, b"").unwrap();
+        assert!(helper_state_present_at(&paths));
+        std::fs::remove_file(&absent).unwrap();
+        std::fs::create_dir(&live).unwrap();
+        assert!(helper_state_present_at(&paths));
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&live).unwrap();
+            std::os::unix::fs::symlink(directory.path().join("missing"), &live).unwrap();
+            assert!(helper_state_present_at(&paths));
         }
     }
 
