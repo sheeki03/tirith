@@ -1853,6 +1853,10 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
     for (seg_idx, segment) in segments.iter().enumerate() {
         let sink_context = is_sink_context(segment, &segments, shell);
         let resolved = resolve_segment_command_for_shell(segment, shell);
+        let curl_destinations = resolved
+            .as_ref()
+            .filter(|command| command.name == "curl")
+            .map(|command| crate::rules::command::curl_url_operands(&command.args, shell));
 
         // Suppress URL extraction ONLY for the arg span of a first-segment
         // tirith inspection subcommand — not the whole segment. Leading env
@@ -1951,7 +1955,37 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
             }
         }
         for source in &url_sources {
-            push_urls_from_source(source, shell, seg_idx, sink_context, &mut results);
+            push_urls_from_source_with_curl_operands(
+                source,
+                shell,
+                seg_idx,
+                sink_context,
+                curl_destinations.as_deref(),
+                &mut results,
+            );
+        }
+
+        if let Some(destinations) = &curl_destinations {
+            // curl does not use SCP's user@host:path shorthand. Its option
+            // grammar decides which words are URL operands; parse those as
+            // URL authorities even when the generic regex resembles SCP.
+            for raw in destinations {
+                let parsed = if has_leading_uri_scheme(raw) {
+                    // curl also accepts schemes outside URL_REGEX's generic
+                    // shortlist, including explicit scp:// and sftp:// URLs.
+                    parse_curl_destination(raw)
+                } else if let Some(parsed) = parse_schemeless_destination(raw) {
+                    parsed
+                } else {
+                    continue;
+                };
+                results.push(ExtractedUrl {
+                    raw: raw.clone(),
+                    parsed,
+                    segment_index: seg_idx,
+                    in_sink_context: sink_context,
+                });
+            }
         }
 
         // Schemeless URLs in sink contexts. Skip docker/podman/nerdctl — their
@@ -1959,7 +1993,7 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
         let is_docker_cmd = resolved
             .as_ref()
             .is_some_and(|cmd| matches!(cmd.name.as_str(), "docker" | "podman" | "nerdctl"));
-        if sink_context && !is_docker_cmd {
+        if sink_context && !is_docker_cmd && curl_destinations.is_none() {
             if let Some(cmd) = resolved.as_ref() {
                 // scp/rsync args are remote specs (parse_scp_remote_spec below)
                 // or local file paths — never schemeless domains. Skip the
@@ -2330,10 +2364,84 @@ fn push_urls_from_source(
     in_sink_context: bool,
     results: &mut Vec<ExtractedUrl>,
 ) {
+    push_urls_from_source_with_curl_operands(
+        source,
+        shell,
+        segment_index,
+        in_sink_context,
+        None,
+        results,
+    );
+}
+
+/// curl normalizes ordinary numeric IPv4 authorities independently of scheme.
+/// The URL crate leaves non-special schemes such as sftp as opaque domains.
+/// Keep this adjustment in curl operand context and retain the original host
+/// for diagnostics. Encoded/trailing-dot spellings have version-dependent curl
+/// behavior and are deliberately outside this normalization contract.
+fn parse_curl_destination(raw: &str) -> parse::UrlLike {
+    let mut value = parse::parse_url(raw);
+    if let parse::UrlLike::Standard { parsed, .. } = &mut value {
+        if let Some(url::Host::Domain(host)) = parsed.host() {
+            if !host.ends_with('.')
+                // WHATWG treats a bare hex prefix as zero; curl retains it as
+                // a hostname, including within a dotted authority.
+                && host.split('.').all(|part| !part.eq_ignore_ascii_case("0x"))
+                && host
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b'x' | b'X' | b'.'))
+            {
+                if let Ok(url::Host::Ipv4(address)) = url::Host::parse(host) {
+                    // A URL with a host is hierarchical, and the typed address
+                    // is valid independently of the URL's existing scheme.
+                    parsed
+                        .set_ip_host(std::net::IpAddr::V4(address))
+                        .expect("an existing hierarchical URL accepts a typed IP host");
+                }
+            }
+        }
+    }
+    value
+}
+
+fn push_urls_from_source_with_curl_operands(
+    source: &str,
+    shell: ShellType,
+    segment_index: usize,
+    in_sink_context: bool,
+    curl_operands: Option<&[String]>,
+    results: &mut Vec<ExtractedUrl>,
+) {
     let normalized = crate::rules::command::normalize_shell_token(source, shell);
     for mat in URL_REGEX.find_iter(&normalized) {
         let raw = mat.as_str().to_string();
-        let url = parse::parse_url(&raw);
+        if let Some(operands) = curl_operands {
+            if !has_leading_uri_scheme(&raw) {
+                continue;
+            }
+            // A selected sftp:// operand also matches the generic regex at
+            // ftp://. The complete operand below is authoritative; suppress
+            // only a proven suffix of that same spelling, including attached
+            // --url= / -x values. Other embedded URL text keeps its old scan.
+            let starts_inside_operand_scheme = operands.iter().any(|operand| {
+                if !has_leading_uri_scheme(operand) || operand.len() <= raw.len() {
+                    return false;
+                }
+                let suffix_start = operand.len() - raw.len();
+                let scheme_end = operand.find("://").unwrap();
+                suffix_start < scheme_end
+                    && operand.get(suffix_start..) == Some(raw.as_str())
+                    && normalized[..mat.start()].ends_with(&operand[..suffix_start])
+            });
+            if starts_inside_operand_scheme {
+                continue;
+            }
+        }
+        let url = if curl_operands.is_some_and(|operands| operands.contains(&raw)) {
+            parse_curl_destination(&raw)
+        } else {
+            parse::parse_url(&raw)
+        };
         results.push(ExtractedUrl {
             raw,
             parsed: url,
@@ -12499,7 +12607,9 @@ fn parse_schemeless_destination_inner(s: &str, apply_noise_heuristic: bool) -> O
         return None;
     }
 
-    let is_ip = host.parse::<std::net::IpAddr>().is_ok();
+    // host_str() retains brackets around IPv6; use the typed host so a bare
+    // bracketed IPv6 destination is not discarded by the file-noise filter.
+    let is_ip = matches!(parsed.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)));
     let has_explicit_port = parsed.port().is_some();
     let has_query_or_fragment = parsed.query().is_some() || parsed.fragment().is_some();
     let has_meaningful_path = parsed.path() != "/" && !parsed.path().is_empty();

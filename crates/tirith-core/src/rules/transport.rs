@@ -4,6 +4,16 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Run transport rules against a parsed URL.
 pub fn check(url: &UrlLike, in_sink_context: bool) -> Vec<Finding> {
+    check_with_raw_url(url, in_sink_context, None)
+}
+
+/// Use the extracted operand for schemeless evidence; raw_str() reconstructs
+/// this variant from its normalized host and can otherwise hide numeric syntax.
+pub(crate) fn check_with_raw_url(
+    url: &UrlLike,
+    in_sink_context: bool,
+    raw_url: Option<&str>,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     check_plain_http_to_sink(url, in_sink_context, &mut findings);
@@ -17,7 +27,11 @@ pub fn check(url: &UrlLike, in_sink_context: bool) -> Vec<Finding> {
             description:
                 "URL without explicit scheme passed to a command that downloads/executes content"
                     .to_string(),
-            evidence: vec![Evidence::Url { raw: url.raw_str() }],
+            evidence: vec![Evidence::Url {
+                raw: raw_url
+                    .map(schemeless_evidence)
+                    .unwrap_or_else(|| url.raw_str()),
+            }],
             human_view: None,
             agent_view: None,
             mitre_id: None,
@@ -26,6 +40,24 @@ pub fn check(url: &UrlLike, in_sink_context: bool) -> Vec<Finding> {
     }
 
     findings
+}
+
+// Keep the original destination spelling without introducing userinfo that the
+// previous host+path evidence omitted. Query/path text was already retained.
+fn schemeless_evidence(raw: &str) -> String {
+    let authority_start = if raw.starts_with("//") { 2 } else { 0 };
+    let tail_start = raw[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|offset| authority_start + offset)
+        .unwrap_or(raw.len());
+    match raw[authority_start..tail_start].rfind('@') {
+        Some(at) => format!(
+            "{}{}",
+            &raw[..authority_start],
+            &raw[authority_start + at + 1..]
+        ),
+        None => raw.to_string(),
+    }
 }
 
 fn check_plain_http_to_sink(url: &UrlLike, in_sink: bool, findings: &mut Vec<Finding>) {
@@ -194,6 +226,22 @@ fn scan_curl_short_options(argument: &str) -> CurlShortOptionScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schemeless_evidence_preserves_destination_without_credentials() {
+        for raw in [
+            "user:password@0x08080808:8080/path?x=1",
+            "user%40name:password@0x08080808:8080/path?x=1",
+        ] {
+            assert_eq!(schemeless_evidence(raw), "0x08080808:8080/path?x=1");
+            assert_eq!(
+                schemeless_evidence(&format!("//{raw}")),
+                "//0x08080808:8080/path?x=1"
+            );
+        }
+        assert_eq!(schemeless_evidence("8080"), "8080");
+        assert_eq!(schemeless_evidence("8080/path@name"), "8080/path@name");
+    }
 
     #[test]
     fn test_quoted_insecure_flags() {
