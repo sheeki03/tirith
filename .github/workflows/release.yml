@@ -1371,7 +1371,14 @@ jobs:
             -v "${GITHUB_WORKSPACE}:/workspace:ro" \
             "$DEBIAN_IMAGE" /bin/bash -c '
               set -euo pipefail
-              dpkg --unpack /workspace/tirith_*.deb
+              test -z "$(command -v sudo || true)"
+              test ! -e /usr/bin/sudo
+              apt-get update
+              apt-get install --yes --no-install-recommends ca-certificates
+              dpkg -i /workspace/tirith_*.deb
+              test "$(dpkg-query -W -f=\${Status} tirith)" = "install ok installed"
+              test -z "$(command -v sudo || true)"
+              test ! -e /usr/bin/sudo
               /bin/bash /workspace/.github/scripts/smoke-linux-release.sh 2.36 \
                 /usr/bin/tirith /usr/libexec/tirith-package-approval-authority
             '
@@ -1604,7 +1611,13 @@ jobs:
             -v "${GITHUB_WORKSPACE}/.github/scripts/smoke-linux-release.sh:/opt/smoke-linux-release.sh:ro" \
             "$RUNTIME_IMAGE" /bin/bash -c '
               set -euo pipefail
-              rpm -Uvh --replacepkgs --nodeps /packages/tirith-*.x86_64.rpm
+              test -z "$(command -v sudo || true)"
+              test ! -e /usr/bin/sudo
+              dnf install --assumeyes --setopt=install_weak_deps=False ca-certificates
+              rpm -Uvh --replacepkgs /packages/tirith-*.x86_64.rpm
+              rpm -q tirith
+              test -z "$(command -v sudo || true)"
+              test ! -e /usr/bin/sudo
               installed_tirith_sha=$(sha256sum /usr/bin/tirith)
               installed_tirith_sha=${installed_tirith_sha%% *}
               canonical_tirith_sha=$(sha256sum /canonical/tirith)

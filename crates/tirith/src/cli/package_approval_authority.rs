@@ -90,7 +90,7 @@ impl PackageApprovalIssuer for NativePackageApprovalAuthority {
         {
             let helper = find_installed_helper()?;
             let sudo = Path::new("/usr/bin/sudo");
-            validate_root_owned_executable(sudo)?;
+            validate_approval_sudo(sudo)?;
 
             let invalidated = std::process::Command::new(sudo)
                 .arg("-k")
@@ -212,6 +212,44 @@ fn find_installed_helper() -> Result<PathBuf, NativeAuthorityError> {
     Err(NativeAuthorityError::blocked(
         "the fixed root-owned package approval helper is not installed",
     ))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn validate_approval_sudo(path: &Path) -> Result<(), NativeAuthorityError> {
+    validate_root_owned_executable(path).map_err(|_| {
+        NativeAuthorityError::blocked(
+            "package approval requires a trusted /usr/bin/sudo for fresh administrator confirmation; ordinary command checks do not require sudo",
+        )
+    })
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod sudo_tests {
+    use super::validate_approval_sudo;
+
+    #[test]
+    fn unavailable_sudo_blocks_only_the_approval_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = validate_approval_sudo(&directory.path().join("sudo")).unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("blocked_native:"));
+        assert!(message.contains("trusted /usr/bin/sudo"));
+        assert!(message.contains("ordinary command checks do not require sudo"));
+    }
+
+    #[test]
+    fn untrusted_sudo_placeholder_cannot_satisfy_the_approval_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sudo");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(validate_approval_sudo(&path)
+            .unwrap_err()
+            .to_string()
+            .starts_with("blocked_native:"));
+    }
 }
 
 #[cfg(all(test, not(unix)))]

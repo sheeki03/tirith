@@ -153,7 +153,8 @@ windows = { version = "0.62", default-features = false, features = [
 [package.metadata.deb]
 maintainer = "Shivom Sharma <shivomsharma03@gmail.com>"
 section = "utils"
-depends = "ca-certificates, sudo"
+depends = "ca-certificates"
+suggests = "sudo"
 # Paths relative to crates/tirith/ (NOT repo root)
 assets = [
     ["target/release/tirith", "usr/bin/", "755"],

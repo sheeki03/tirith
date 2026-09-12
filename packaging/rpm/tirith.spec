@@ -10,7 +10,7 @@ License:        AGPL-3.0-only
 URL:            https://github.com/sheeki03/tirith
 
 Requires:       ca-certificates
-Requires:       sudo
+Suggests:       sudo
 
 %description
 Terminal security tool that intercepts commands and pasted text, detects
