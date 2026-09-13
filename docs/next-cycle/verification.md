@@ -792,3 +792,34 @@ retained artifact digest is
 local reevaluation is byte-identical to the CI evaluation. Two further independent
 admitted measurements and reviewed limits are still required. CPU classes are
 not pooled.
+
+### Fresh-terminal completion clock and closed protocol
+
+The private completion path now retains one native clock stamp after the exact
+setup-file postconditions have been observed. Existing completed records return
+before capture, so retry cannot make an old shell appear newer than setup. The
+stamp marks observed file completion before durable journal acknowledgment; it
+does not claim the shell started after the UI reported completion. Changed,
+cancelled or undone setup is rejected again by the retained file lease.
+
+An opaque core context authenticates the current process's direct parent through
+its protocol-v3 capability, native start/UID identity and executable. It is not
+serializable or clonable, and revalidation rejects use from another process.
+Three native context fixtures passed. Linux freshness uses a conservative tick
+ceiling and explicitly checked zero time-namespace coordinates; macOS compares
+raw Mach process-start ticks within the same boot/timebase. Persisted clock data
+alone is never activation authority or interception proof.
+
+The retained `activation-protocol-native-v19` harness passes all 67 selected
+CLI tests, including native-clock, completion/replay, journal, recommended-setup
+and closed-frame contracts. Strict workspace/all-target Clippy passes. The Mac
+Mach binding matches the retained SDK ABI and avoids deprecated libc wrappers.
+The scheduler protocol permits only fixed stages, canonical IDs and closed
+refusal reasons; no command, executable path or endpoint can appear in a frame.
+A `complete` scheduling frame is not a protection proof.
+
+Actual automatic activation remains unavailable while the direct-child broker,
+setup-bound core challenge mode, foreground deadlines and real installed Zsh
+hook journey are connected and qualified. Separate disposable Zsh mechanism
+experiments do not certify those product paths. Ordinary status and dashboard
+reads continue to report their own unverified scope.

@@ -363,6 +363,8 @@ struct Journal {
     setup_verification: Option<SetupVerificationIntent>,
     #[serde(default, skip_serializing_if = "is_false")]
     setup_verification_cancelled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    setup_completion: Option<setup_binding::SetupCompletionEvidence>,
     created_at: u64,
     updated_at: u64,
     state: JobState,
@@ -1312,7 +1314,7 @@ impl MutationService {
         )?;
         let payload_digest =
             setup_binding::bind_verification_digest(payload_digest, &setup_verification)?;
-        let record = Journal {
+        let mut record = Journal {
             schema_version: SCHEMA,
             operation_id: operation_id.into(),
             kind,
@@ -1334,6 +1336,7 @@ impl MutationService {
             agent_precondition,
             setup_verification,
             setup_verification_cancelled: false,
+            setup_completion: None,
             created_at: now(),
             updated_at: now(),
             state: if no_op {
@@ -1347,6 +1350,7 @@ impl MutationService {
             }),
             steps,
         };
+        setup_binding::capture_file_completion(&mut record);
         fs_helpers::ensure_private_directory(&self.root, &self.scope)?;
         fs_helpers::transactional_update_checked(
             &path,
@@ -1570,7 +1574,7 @@ impl MutationService {
             return Ok(self.update(operation_id, |record| { let recovery = record.steps.iter().any(|s| matches!(s.state, StepState::Applying | StepState::AppliedWithRecovery));
                 record.state = if recovery { JobState::CompletedWithRecovery } else { JobState::Completed };
                 record.detail = recovery.then(|| "owned postconditions are present; an interrupted publication/journal boundary requires retained-recovery review".into());
-                for step in &mut record.steps { step.state = if recovery { StepState::AppliedWithRecovery } else { StepState::Applied }; } Ok(()) })?.public());
+                for step in &mut record.steps { step.state = if recovery { StepState::AppliedWithRecovery } else { StepState::Applied }; } setup_binding::capture_file_completion(record); Ok(()) })?.public());
         }
         if let Err(error) = self.authorize(
             &record,
@@ -1792,6 +1796,7 @@ impl MutationService {
                     JobState::Completed
                 };
                 record.detail = None;
+                setup_binding::capture_file_completion(record);
                 Ok(())
             })?
             .public())

@@ -406,6 +406,102 @@ fn current_hook_instance(
     Ok(instance)
 }
 
+/// Live authentication of this process's registered parent shell. This is not
+/// interception evidence or authority to signal that process. The context is
+/// neither serializable nor clonable and must remain in its creating process.
+pub struct AuthenticatedShellContext {
+    shell_pid: u32,
+    #[cfg(unix)]
+    issuer_pid: u32,
+    #[cfg(unix)]
+    family: ShellHookFamily,
+    #[cfg(unix)]
+    session_id: String,
+    #[cfg(unix)]
+    secret: String,
+    #[cfg(unix)]
+    identity: ShellProcessIdentity,
+    #[cfg(unix)]
+    executable: TirithExecutableIdentity,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl AuthenticatedShellContext {
+    /// A read-only native observation coordinate, never a process handle.
+    pub fn shell_pid(&self) -> u32 {
+        self.shell_pid
+    }
+
+    pub fn revalidate(&self) -> Result<(), String> {
+        #[cfg(not(unix))]
+        {
+            Err("authenticated shell context is unsupported on this platform".into())
+        }
+        #[cfg(unix)]
+        {
+            if std::process::id() != self.issuer_pid {
+                return Err("authenticated shell context left its creating process".into());
+            }
+            validate_shell_hook_instance(
+                &self.secret,
+                self.shell_pid,
+                self.family,
+                &self.session_id,
+            )?;
+            let identity = shell_process_identity(self.shell_pid)
+                .map_err(|_| "authenticated shell process is no longer available")?;
+            if identity != self.identity || current_tirith_executable_identity()? != self.executable
+            {
+                return Err("authenticated shell context identity changed".into());
+            }
+            // Bracket the native identity observations with complete capability
+            // validation; no capability/global writer lock is held while idle.
+            validate_shell_hook_instance(
+                &self.secret,
+                self.shell_pid,
+                self.family,
+                &self.session_id,
+            )
+        }
+    }
+}
+
+/// Authenticate the protocol-v3 capability delivered privately to the current
+/// direct child. Caller supplied PIDs or inherited status markers cannot
+/// construct a context, and the result establishes no protection observation.
+pub fn authenticate_shell_context(
+    channel: ShellReceiptChannel,
+    session_id: &str,
+) -> Result<AuthenticatedShellContext, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (channel, session_id);
+        Err("authenticated shell context is unsupported on this platform".into())
+    }
+    #[cfg(unix)]
+    {
+        let secret = current_hook_instance(channel, session_id)?;
+        let parent = unsafe { libc::getppid() };
+        if parent <= 1 {
+            return Err("authenticated shell context has no live direct parent".into());
+        }
+        let shell_pid = parent as u32;
+        let context = AuthenticatedShellContext {
+            shell_pid,
+            issuer_pid: std::process::id(),
+            family: channel.hook_family()?,
+            session_id: session_id.into(),
+            secret,
+            identity: shell_process_identity(shell_pid)
+                .map_err(|_| "authenticated shell process is no longer available")?,
+            executable: current_tirith_executable_identity()?,
+            _same_thread: std::marker::PhantomData,
+        };
+        context.revalidate()?;
+        Ok(context)
+    }
+}
+
 #[cfg(unix)]
 fn current_cwd_binding_sha256(token: &str) -> Result<String, String> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -3474,6 +3570,49 @@ mod tests {
     fn isolated_state(test: impl FnOnce(&tempfile::TempDir, &str)) {
         isolated_state_with_guard(|temporary, session_id, _| {
             test(temporary, session_id);
+        });
+    }
+
+    #[test]
+    fn authenticated_context_keeps_live_native_identity_without_receipt_lock() {
+        isolated_state(|_, session| {
+            let context = authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
+            assert_eq!(context.shell_pid(), unsafe { libc::getppid() } as u32);
+            context.revalidate().unwrap();
+            // A second full validation must acquire the same short-lived lock.
+            current_hook_instance(ShellReceiptChannel::Zsh, session).unwrap();
+            assert!(authenticate_shell_context(ShellReceiptChannel::Fish, session).is_err());
+            assert!(authenticate_shell_context(ShellReceiptChannel::Zsh, "wrong-session").is_err());
+        });
+    }
+
+    #[test]
+    fn authenticated_context_refuses_revoked_capability_and_changed_identity() {
+        isolated_state(|_, session| {
+            let mut context =
+                authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
+            context.issuer_pid = context.issuer_pid.saturating_add(1);
+            assert!(context.revalidate().is_err());
+            context.issuer_pid = std::process::id();
+            context.identity.start_fingerprint.push('x');
+            assert!(context.revalidate().is_err());
+            let context = authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
+            let (capability, _) = active_capability_paths();
+            fs::remove_file(capability).unwrap();
+            assert!(context.revalidate().is_err());
+        });
+    }
+
+    #[test]
+    fn authenticated_context_cannot_be_constructed_from_unregistered_markers() {
+        isolated_unregistered_state_with_guard(|_, session, environment| {
+            environment.set_env("_TIRITH_RECEIPT_INSTANCE", OTHER_HOOK_INSTANCE);
+            environment.set_env(
+                "_TIRITH_RECEIPT_SHELL_PID",
+                (unsafe { libc::getppid() }).to_string(),
+            );
+            environment.set_env("_TIRITH_RECEIPT_FAMILY", "zsh");
+            assert!(authenticate_shell_context(ShellReceiptChannel::Zsh, session).is_err());
         });
     }
 

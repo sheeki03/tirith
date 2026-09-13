@@ -348,6 +348,57 @@ fn expected_payload_digest(record: &Journal) -> Result<String, String> {
     )
 }
 
+/// Private completion evidence is retained once, after complete setup-file
+/// postconditions are observed. It is not itself authority or hook proof.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum SetupCompletionEvidence {
+    Available {
+        stamp: super::super::activation_clock::CompletionStamp,
+    },
+    Unavailable {
+        reason: CompletionUnavailable,
+    },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompletionUnavailable {
+    PostconditionsChanged,
+    NativeClockUnavailable,
+}
+
+pub(super) fn capture_file_completion(record: &mut Journal) {
+    if record.setup_completion.is_some()
+        || record.kind != OperationKind::RecommendedSetup
+        || !matches!(
+            record.state,
+            JobState::Completed | JobState::CompletedWithRecovery
+        )
+        || record.setup_verification_cancelled
+    {
+        return;
+    }
+    let Some(verification) = &record.setup_verification else {
+        return;
+    };
+    let evidence = (|| {
+        let documents = verification
+            .retain_completed()
+            .map_err(|_| CompletionUnavailable::PostconditionsChanged)?;
+        let stamp = super::super::activation_clock::capture_completion()
+            .map_err(|_| CompletionUnavailable::NativeClockUnavailable)?;
+        for document in &documents {
+            document
+                .revalidate()
+                .map_err(|_| CompletionUnavailable::PostconditionsChanged)?;
+        }
+        Ok::<_, CompletionUnavailable>(SetupCompletionEvidence::Available { stamp })
+    })()
+    .unwrap_or_else(|reason| SetupCompletionEvidence::Unavailable { reason });
+    record.setup_completion = Some(evidence);
+}
+
 fn completion_fingerprint(record: &Journal) -> Result<String, String> {
     digest(&(
         "tirith-completed-setup-binding-v1",
@@ -361,6 +412,7 @@ fn completion_fingerprint(record: &Journal) -> Result<String, String> {
         &record.external_authorization,
         record.created_at,
         record.state,
+        &record.setup_completion,
     ))
 }
 
@@ -426,6 +478,7 @@ pub(crate) struct CompletedSetupLease {
     journal_directory: DirectoryIdentity,
     journal_file: BinaryIdentity,
     verification: SetupVerificationIntent,
+    completion: Option<SetupCompletionEvidence>,
     _execution_lock: fs_helpers::PlatformLock,
     _permit: WorkerPermit,
     _same_thread: PhantomData<Rc<()>>,
@@ -442,6 +495,19 @@ impl CompletedSetupLease {
 
     pub(crate) fn selected_shell(&self) -> ShellKind {
         self.verification.shell
+    }
+
+    pub(crate) fn require_fresh_shell(
+        &self,
+        shell: &tirith_core::execution_state::AuthenticatedShellContext,
+    ) -> Result<(), String> {
+        self.revalidate()?;
+        let Some(SetupCompletionEvidence::Available { stamp }) = &self.completion else {
+            return Err("setup has no qualified native completion clock; automatic activation is unavailable".into());
+        };
+        super::super::activation_clock::require_fresh_authenticated_shell(stamp, shell)
+            .map_err(|error| error.to_string())?;
+        self.revalidate()
     }
 
     pub(crate) fn resolution_cwd(&self) -> Option<&str> {
@@ -584,6 +650,7 @@ impl MutationService {
             journal_directory,
             journal_file,
             verification,
+            completion: record.setup_completion.clone(),
             _execution_lock: execution_lock,
             _permit: permit,
             _same_thread: PhantomData,
@@ -1084,6 +1151,58 @@ mod tests {
             let mut too_large = first;
             too_large.bytes = MAX_SETUP_FILE_BYTES as u64 + 1;
             assert!(SetupVerificationIntent::for_shell(ShellKind::Zsh, vec![too_large]).is_err());
+        });
+    }
+    #[test]
+    fn native_completion_is_retained_once_for_noop_and_applied_setup() {
+        for manual in [false, true] {
+            with_setup_env(|home, _| {
+                let (service, id) = plan(home, manual);
+                if !manual {
+                    assert!(service.read(&id).unwrap().setup_completion.is_none());
+                }
+                complete(&service, &id);
+                let before = service.read(&id).unwrap();
+                assert!(matches!(
+                    before.setup_completion,
+                    Some(SetupCompletionEvidence::Available { .. })
+                ));
+                let evidence = serde_json::to_value(&before.setup_completion).unwrap();
+                complete(&service, &id);
+                let after = service.read(&id).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after.setup_completion).unwrap(),
+                    evidence
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn completed_legacy_record_does_not_acquire_a_stamp_on_replay() {
+        with_setup_env(|home, _| {
+            let (service, id) = plan(home, true);
+            rewrite_record(&service, &id, |record| record.setup_completion = None);
+            complete(&service, &id);
+            assert!(service.read(&id).unwrap().setup_completion.is_none());
+            let lease = service
+                .completed_setup_lease(&id, fresh(&service, &id))
+                .unwrap()
+                .unwrap();
+            assert!(lease.completion.is_none());
+        });
+    }
+
+    #[test]
+    fn completion_evidence_change_invalidates_the_live_file_lease() {
+        with_setup_env(|home, _| {
+            let (service, id) = plan(home, true);
+            let lease = service
+                .completed_setup_lease(&id, fresh(&service, &id))
+                .unwrap()
+                .unwrap();
+            rewrite_record(&service, &id, |record| record.setup_completion = None);
+            assert!(lease.revalidate().is_err());
         });
     }
 }
