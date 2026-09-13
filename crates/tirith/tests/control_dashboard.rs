@@ -296,17 +296,32 @@ fn trickled_body_hits_overall_deadline_without_saving_a_plan() {
     let header=format!("POST /api/plans HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nOrigin: http://127.0.0.1:{}\r\nX-Tirith-CSRF: {}\r\nContent-Type: application/json\r\nContent-Length: 16000\r\n\r\n",server.port,server.token,server.port,server.csrf);
     stream.write_all(header.as_bytes()).unwrap();
     let start = std::time::Instant::now();
-    for _ in 0..10 {
-        if stream.write_all(b" ").is_err() {
-            break;
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let uploader_finished = std::sync::Arc::clone(&finished);
+    let mut upload = stream.try_clone().unwrap();
+    let uploader = std::thread::spawn(move || {
+        let mut sent = 0;
+        for _ in 0..10 {
+            if uploader_finished.load(std::sync::atomic::Ordering::Acquire)
+                || upload.write_all(b" ").is_err()
+            {
+                break;
+            }
+            sent += 1;
+            std::thread::sleep(Duration::from_millis(400));
         }
-        std::thread::sleep(Duration::from_millis(400));
-    }
+        sent
+    });
+    // Observe the server's response while uploading, as a full-duplex HTTP
+    // client does. Further writes after the deadline/close can independently
+    // reset the connection and discard queued response bytes on Windows.
     let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
+    let read_result = stream.read_to_string(&mut response);
+    finished.store(true, std::sync::atomic::Ordering::Release);
+    let sent = uploader.join().expect("join bounded trickle uploader");
     assert!(
         response.starts_with("HTTP/1.1 408"),
-        "unexpected deadline response: {response}"
+        "unexpected deadline response after {sent} body bytes: {response:?}; read: {read_result:?}"
     );
     assert!(start.elapsed() < Duration::from_secs(8));
     let (status, jobs) = server.request("GET", "/api/jobs", None);

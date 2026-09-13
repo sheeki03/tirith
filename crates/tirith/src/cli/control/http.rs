@@ -44,19 +44,91 @@ pub(super) fn read(
     stream: &mut TcpStream,
     authorize: impl Fn(&Request) -> Result<(), Error>,
 ) -> Result<Request, Error> {
+    #[cfg(windows)]
+    {
+        // A Windows accepted socket can inherit the nonblocking listener's
+        // mode. WouldBlock means wait, not immediate HTTP 408. Conversely,
+        // Winsock leaves a blocking connection indeterminate after SO_RCVTIMEO
+        // expires, so it cannot reliably carry the required response. Use an
+        // absolute application deadline, then restore blocking response writes.
+        stream
+            .set_read_timeout(None)
+            .map_err(|_| error(400, "cannot configure request deadline"))?;
+        stream
+            .set_nonblocking(true)
+            .map_err(|_| error(400, "cannot configure request deadline"))?;
+        let result = read_request(stream, authorize);
+        stream
+            .set_nonblocking(false)
+            .map_err(|_| error(400, "cannot restore response socket mode"))?;
+        result
+    }
+    #[cfg(not(windows))]
+    {
+        read_request(stream, authorize)
+    }
+}
+
+fn read_before_deadline(
+    stream: &mut TcpStream,
+    bytes: &mut [u8],
+    start: Instant,
+    message: &'static str,
+) -> Result<usize, Error> {
+    #[cfg(windows)]
+    loop {
+        let wait = remaining(start)?;
+        match stream.read(bytes) {
+            Ok(count) => return Ok(count),
+            Err(cause) if cause.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(cause) if cause.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(wait.min(Duration::from_millis(5)));
+            }
+            Err(_) => return Err(error(408, message)),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        stream
+            .set_read_timeout(Some(remaining(start)?))
+            .map_err(|_| error(400, "cannot configure request deadline"))?;
+        stream.read(bytes).map_err(|_| error(408, message))
+    }
+}
+
+fn read_request(
+    stream: &mut TcpStream,
+    authorize: impl Fn(&Request) -> Result<(), Error>,
+) -> Result<Request, Error> {
     let start = Instant::now();
     let mut headers = Vec::with_capacity(1024);
     loop {
         if headers.len() >= MAX_HEADERS {
             return Err(error(431, "request headers exceed limit"));
         }
-        stream
-            .set_read_timeout(Some(remaining(start)?))
-            .map_err(|_| error(400, "cannot configure request deadline"))?;
         let mut byte = [0];
-        stream
-            .read_exact(&mut byte)
-            .map_err(|_| error(408, "request was incomplete or exceeded its deadline"))?;
+        #[cfg(windows)]
+        if read_before_deadline(
+            stream,
+            &mut byte,
+            start,
+            "request was incomplete or exceeded its deadline",
+        )? == 0
+        {
+            return Err(error(
+                408,
+                "request was incomplete or exceeded its deadline",
+            ));
+        }
+        #[cfg(not(windows))]
+        {
+            stream
+                .set_read_timeout(Some(remaining(start)?))
+                .map_err(|_| error(400, "cannot configure request deadline"))?;
+            stream
+                .read_exact(&mut byte)
+                .map_err(|_| error(408, "request was incomplete or exceeded its deadline"))?;
+        }
         headers.push(byte[0]);
         if headers.ends_with(b"\r\n\r\n") {
             break;
@@ -68,12 +140,12 @@ pub(super) fn read(
     request.body.resize(length, 0);
     let mut consumed = 0;
     while consumed < length {
-        stream
-            .set_read_timeout(Some(remaining(start)?))
-            .map_err(|_| error(400, "cannot configure request deadline"))?;
-        let read = stream
-            .read(&mut request.body[consumed..])
-            .map_err(|_| error(408, "request body exceeded its deadline"))?;
+        let read = read_before_deadline(
+            stream,
+            &mut request.body[consumed..],
+            start,
+            "request body exceeded its deadline",
+        )?;
         if read == 0 {
             return Err(error(400, "request body is incomplete"));
         }
@@ -287,6 +359,45 @@ pub(super) fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn receive_deadline_keeps_the_socket_usable_for_http_408() {
+        for (request, initially_nonblocking) in [
+            ("GET / HTTP/1.1\r\nHost: loopback", true),
+            ("POST /api/plans HTTP/1.1\r\nHost: loopback\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n ", false),
+        ] {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+                stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                stream.write_all(request.as_bytes()).unwrap();
+                let mut response = String::new();
+                let read_result = stream.read_to_string(&mut response);
+                (response, read_result)
+            });
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(initially_nonblocking).unwrap();
+            let started = Instant::now();
+            let result = read(&mut stream, |_| Ok(()));
+            let elapsed = started.elapsed();
+            let read_timeout = stream.read_timeout();
+            let status = result.as_ref().err().map(|error| error.status);
+            let written = respond(&mut stream, status.unwrap_or(500), "text/plain", b"deadline");
+            drop(stream);
+            let (response, received) = client.join().expect("join bounded deadline client");
+            assert_eq!(status, Some(408));
+            assert!(elapsed >= READ_DEADLINE && elapsed < Duration::from_secs(8));
+            assert_eq!(read_timeout.unwrap(), None, "must not use Winsock SO_RCVTIMEO");
+            assert!(written.is_ok(), "deadline response write: {written:?}");
+            assert!(received.is_ok(), "deadline response read: {received:?}");
+            assert!(response.starts_with("HTTP/1.1 408"), "{response:?}");
+            assert!(response.ends_with("deadline"), "{response:?}");
+        }
+    }
+
     fn get(headers: &str) -> Request {
         parse_headers(format!("GET /api/state HTTP/1.1\r\n{headers}\r\n\r\n").as_bytes())
             .unwrap()
