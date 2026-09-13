@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      collect_pinned_reference:
+        description: Replay the explicitly pinned source and runner cohort
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,11 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # Separate EPYC 7763 reference cohort on the existing PR. Its product and
-      # measurement source stay frozen even as the workflow or PR advances.
-      # Retain three admitted executions; never pool these with EPYC 9V74.
-      # Other PRs and main retain their event source, ten samples and stable.
-      RESOURCE_REFERENCE_COHORT: ${{ github.event_name == 'pull_request' && github.event.pull_request.number == 250 }}
+      # Three admitted historical references are retained separately. Ordinary
+      # PRs and main now measure their event source; replaying the pinned cohort
+      # requires an explicit dispatch and still refuses a different runner.
+      RESOURCE_REFERENCE_COHORT: ${{ github.event_name == 'workflow_dispatch' && inputs.collect_pinned_reference }}
       RESOURCE_REFERENCE_SOURCE: 150e753a0adf8f9f13c8cc2b38f7a9325de40d91
       RESOURCE_REFERENCE_TREE: 53123b9d0aa615d4135ce6c42f37abe6a5cdca16
     steps:
