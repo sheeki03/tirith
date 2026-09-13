@@ -850,3 +850,26 @@ the read. Existing identity, generation, size and second-walk checks remain.
 Native fixtures cover a real mid-chunk write attempt, existing writer/mapping
 refusal and successful writes after lease release. These corrections require a
 new Windows run; the preceding successful process cleanup does not certify them.
+
+### Windows follow-up at 82389acc
+
+Run 34748687259, job 103701238877, completed with failures. Artifact
+10315217919 matched its API ZIP digest
+`e4320adbd010a28271d2426febabd926d95afde28cec27b92a40f62874ed0781`.
+LLVM compilation and doctests passed with all owned cleanup gates (1,207 and
+17 total processes respectively). The core passed 5,419 tests with one ignore;
+the CLI passed 1,563 tests with two failures. Stable build hashing and its native
+read-lease cases now pass. Both CLI failures show directory renames succeeding
+while a guard is held. Metadata-only Windows access does not participate in
+delete-sharing exclusion; control guards now request directory read access on
+every retained ancestor and leaf. Focused cases check sharing violations,
+preexisting delete handles, compatible readers and release.
+
+The first real standard-account dashboard test timed out at 840 seconds. The
+native Job contained four active processes of five created; this alone cannot
+identify whether the remaining Tirith process was the launcher or service.
+All cleanup gates passed. Source review found unrestricted inherited handles in
+the service spawn path, which can retain a launcher's captured pipe writers.
+That defect is being corrected with an explicit handle list; its role in this
+particular timeout and all nine dashboard tests require native revalidation.
+These remaining failures keep Windows qualification open.

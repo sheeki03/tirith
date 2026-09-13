@@ -431,7 +431,8 @@ mod native {
         CreateFileW, FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        READ_CONTROL,
     };
 
     fn handle(file: &File) -> HANDLE {
@@ -456,7 +457,10 @@ mod native {
             let native = unsafe {
                 CreateFileW(
                     PCWSTR(wide.as_ptr()),
-                    (FILE_READ_ATTRIBUTES | READ_CONTROL).0,
+                    // Metadata-only access does not participate in Windows
+                    // sharing checks. Directory read access makes omitting
+                    // FILE_SHARE_DELETE protect every retained ancestor/leaf.
+                    (FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL).0,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     None,
                     OPEN_EXISTING,
@@ -668,6 +672,95 @@ mod tests {
         );
         drop(mapping);
         assert!(BinaryIdentity::capture(&path).is_ok());
+    }
+
+    #[cfg(windows)]
+    mod windows_directory_leases {
+        use super::*;
+        use crate::cli::setup::fs_helpers;
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::io::FromRawHandle as _;
+        use windows::core::{HRESULT, PCWSTR};
+        use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+
+        fn open_delete(path: &Path) -> windows::core::Result<File> {
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // The contender shares all access itself: refusal must come from the
+            // retained guard, not an artificially restrictive contender handle.
+            let handle = unsafe {
+                CreateFileW(
+                    PCWSTR(wide.as_ptr()),
+                    DELETE.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    None,
+                )?
+            };
+            Ok(unsafe { File::from_raw_handle(handle.0) })
+        }
+
+        #[test]
+        fn directory_guards_deny_delete_access_on_leaf_and_ancestors_until_release() {
+            for private in [true, false] {
+                let temp = tempfile::tempdir().unwrap();
+                let scope = temp.path().canonicalize().unwrap();
+                let parent = scope.join("control");
+                let leaf = parent.join("v1");
+                fs_helpers::ensure_private_directory(&leaf, &scope).unwrap();
+                let guard = if private {
+                    DirectoryIdentity::capture(&leaf)
+                } else {
+                    DirectoryIdentity::capture_trusted(&leaf)
+                }
+                .unwrap();
+
+                for path in [&leaf, &parent] {
+                    assert_eq!(
+                        open_delete(path).unwrap_err().code(),
+                        HRESULT::from_win32(ERROR_SHARING_VIOLATION.0),
+                        "each retained directory must participate in delete sharing"
+                    );
+                    assert!(std::fs::rename(path, path.with_extension("moved")).is_err());
+                    // A no-delete lease does not exclude compatible readers.
+                    std::fs::read_dir(path).unwrap().count();
+                }
+                let sibling = parent.join("sibling");
+                std::fs::create_dir(&sibling).unwrap();
+                std::fs::remove_dir(&sibling).unwrap();
+                guard.revalidate().unwrap();
+
+                drop(guard);
+                drop(open_delete(&leaf).expect("leaf lease must close with the guard"));
+                drop(open_delete(&parent).expect("ancestor lease must close with the guard"));
+                std::fs::rename(&leaf, leaf.with_extension("moved")).unwrap();
+                std::fs::rename(&parent, parent.with_extension("moved")).unwrap();
+            }
+        }
+
+        #[test]
+        fn directory_guard_refuses_a_preexisting_delete_access_handle() {
+            for held_ancestor in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let scope = temp.path().canonicalize().unwrap();
+                let parent = scope.join("control");
+                let leaf = parent.join("v1");
+                fs_helpers::ensure_private_directory(&leaf, &scope).unwrap();
+                let contender = open_delete(if held_ancestor { &parent } else { &leaf }).unwrap();
+                assert!(DirectoryIdentity::capture(&leaf).is_err());
+                assert!(DirectoryIdentity::capture_trusted(&leaf).is_err());
+                drop(contender);
+                DirectoryIdentity::capture(&leaf)
+                    .unwrap()
+                    .revalidate()
+                    .unwrap();
+            }
+        }
     }
 
     #[test]

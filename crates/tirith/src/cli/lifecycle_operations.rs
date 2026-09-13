@@ -918,8 +918,12 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            assert!(std::fs::rename(&store.root, store.root.with_extension("retained")).is_err());
+            let root = store.root.clone();
+            let retained = root.with_extension("retained");
+            assert!(std::fs::rename(&root, &retained).is_err());
             store.revalidate().unwrap();
+            drop(store);
+            std::fs::rename(&root, &retained).expect("store release closes directory leases");
         }
     }
 
