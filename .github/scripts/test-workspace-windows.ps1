@@ -132,7 +132,7 @@ try {
         foreach ($char in ('Aa9!' + [Convert]::ToBase64String($random)).ToCharArray()) { $securePassword.AppendChar($char) }
         [Array]::Clear($random, 0, $random.Length)
         $securePassword.MakeReadOnly()
-        $newUser = New-LocalUser -Name $username -Password $securePassword -AccountNeverExpires -UserMayNotChangePassword -Description 'Disposable Tirith CI standard-account qualification'
+        $newUser = New-LocalUser -Name $username -Password $securePassword -AccountNeverExpires -UserMayNotChangePassword -Description 'Tirith CI standard-account qualification'
         $users = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
         if (@(Get-LocalGroupMember -SID $users | Where-Object { $_.SID.Value -eq $newUser.SID.Value }).Count -eq 0) {
             Add-LocalGroupMember -SID $users -Member $newUser

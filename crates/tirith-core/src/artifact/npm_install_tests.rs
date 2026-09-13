@@ -150,7 +150,19 @@ fn staged_fixture() -> (tempfile::TempDir, PathBuf, BTreeMap<String, NpmFile>) {
 #[test]
 fn exact_staged_members_pass_but_generated_hidden_lock_and_changed_bytes_refuse() {
     let (_temp, root, expected) = staged_fixture();
-    let retained = File::open(&root).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        // Windows needs BACKUP_SEMANTICS to open a directory handle. Keep the
+        // staged root itself retained without following a replaced reparse leaf.
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let retained = options.open(&root).unwrap();
     verify_tree(&root, &retained, &expected).unwrap();
     std::fs::write(root.join("node_modules/.package-lock.json"), b"{}").unwrap();
     assert_eq!(

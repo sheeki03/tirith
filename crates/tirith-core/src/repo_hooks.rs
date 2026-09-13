@@ -1478,6 +1478,13 @@ fn run_trusted_git_inner(
     .env("LC_ALL", "C")
     .env("GIT_OPTIONAL_LOCKS", "0")
     .env("GIT_TERMINAL_PROMPT", "0");
+    #[cfg(windows)]
+    {
+        // A custom Windows environment must retain the OS location needed by
+        // side-by-side assembly initialization, even with Git config disabled.
+        // This does not import PATH or any Git configuration overrides.
+        spec = spec.inherit_env(&["SystemRoot"]);
+    }
     if disable_hooks {
         spec = spec
             .env("GIT_CONFIG_NOSYSTEM", "1")

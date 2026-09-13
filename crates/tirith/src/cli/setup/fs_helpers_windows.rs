@@ -504,7 +504,17 @@ fn control_trustee_is_trusted(sid: PSID) -> bool {
     unsafe {
         let _ = LocalFree(Some(HLOCAL(encoded.0.cast())));
     }
-    matches!(text.as_deref(), Ok("S-1-5-18" | "S-1-5-32-544"))
+    // Windows Resource Protection delegates protected OS resources to this
+    // exact TrustedInstaller service SID, also recognized by trusted_child.
+    // This predicate applies only to ancestry; private leaves still require
+    // the current user's protected, single-trustee DACL.
+    // https://learn.microsoft.com/en-us/windows/win32/wfp/about-windows-file-protection
+    matches!(
+        text.as_deref(),
+        Ok("S-1-5-18"
+            | "S-1-5-32-544"
+            | "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
+    )
 }
 
 /// Ancestors may grant read/traverse rights to other users. Effective rights
@@ -3216,6 +3226,24 @@ mod tests {
         assert!(!control_ancestor_security_descriptor(&descriptor(
             "O:BUD:(A;;FA;;;SY)"
         )));
+
+        // Exact native descriptor retained from Windows CI run 34710579033.
+        // Its unprivileged effective ACEs grant read/traverse only; the broad
+        // inherited write grant is INHERIT_ONLY on this ancestor. The same
+        // descriptor must never authorize a private control leaf.
+        let observed = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464G:SYD:AI(A;;0x1000a1;;;S-1-15-3-65536-1888954469-739942743-1668119174-2468466756-4239452838-1296943325-355587736-700089176)(A;;LC;;;AU)(A;OICIIO;SDGXGWGR;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+        assert!(control_ancestor_security_descriptor(&descriptor(observed)));
+        assert!(!owner_only_security_descriptor(&descriptor(observed)));
+        for changed in [
+            // Another service SID is not the Windows servicing authority.
+            observed.replace("2271478464", "2271478465"),
+            // Removing INHERIT_ONLY makes AU's write ACE effective here.
+            observed.replace("OICIIO", "OICI"),
+            // A recognized owner cannot bless an untrusted effective writer.
+            observed.replace("0x1200a9;;;BU", "FA;;;BU"),
+        ] {
+            assert!(!control_ancestor_security_descriptor(&descriptor(&changed)));
+        }
     }
 
     fn overwrite_same_length_and_restore_last_write(path: &Path, content: &[u8]) {
@@ -3549,14 +3577,16 @@ mod tests {
             |_| Ok(FileUpdate::write_text("ours".into(), 0o644)),
             |stage| {
                 if stage == TestStage::TempSynced {
-                    fs::write(&path, "editor-change").unwrap();
+                    // Keep the original six-byte cap: this tests a changed
+                    // generation, independently of oversized-file refusal.
+                    fs::write(&path, "editor").unwrap();
                 }
                 Ok(())
             },
         );
         let error = result.unwrap_err();
         assert!(error.contains("changed"), "unexpected refusal: {error}");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "editor-change");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "editor");
         assert!(!fs::read_dir(root.path())
             .unwrap()
             .filter_map(Result::ok)
