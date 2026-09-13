@@ -257,7 +257,9 @@ mod native {
         if unsafe { libc::fstatfs(file.as_raw_fd(), fs.as_mut_ptr()) } != 0 {
             return Err(ClockRefusal::NativeRead);
         }
-        if unsafe { fs.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+        // statfs.f_type is unsigned on musl ARM and signed on GNU. The positive
+        // procfs magic fits both native fields; compare in the target's type.
+        if unsafe { fs.assume_init() }.f_type != libc::PROC_SUPER_MAGIC as _ {
             return Err(ClockRefusal::Unsupported);
         }
         Ok(())
