@@ -1,10 +1,15 @@
 use std::io::Read;
 use std::path::PathBuf;
+#[cfg(not(windows))]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::super::setup::fs_helpers;
 use serde::{Deserialize, Serialize};
+
+#[cfg(windows)]
+#[path = "windows_spawn.rs"]
+mod windows_spawn;
 
 pub(super) const PROTOCOL: u32 = 1;
 
@@ -349,35 +354,36 @@ pub(super) fn launch() -> Result<ServiceRecord, String> {
     let startup_id = uuid::Uuid::new_v4().to_string();
     directory_identity.revalidate()?;
     binary_identity.revalidate()?;
-    let mut command = Command::new(exe);
-    command
-        .args(["dashboard", "control-serve", "--startup-id", &startup_id])
-        .current_dir(&project)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Fixed native detach operation; no shell and no user-supplied program.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
-    }
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000 | 0x00000200); // no window, new process group
-    }
-    let mut child = command
-        .spawn()
+    let mut child = windows_spawn::spawn(exe, std::path::Path::new(&project), &startup_id)
         .map_err(|_| "cannot start the local dashboard service")?;
+    #[cfg(not(windows))]
+    let mut child = {
+        let mut command = Command::new(exe);
+        command
+            .args(["dashboard", "control-serve", "--startup-id", &startup_id])
+            .current_dir(&project)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Fixed native detach operation; no shell and no user-supplied program.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
+        command
+            .spawn()
+            .map_err(|_| "cannot start the local dashboard service")?
+    };
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(15) {
         directory_identity.revalidate()?;
