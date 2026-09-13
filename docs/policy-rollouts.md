@@ -49,8 +49,8 @@ in addition to the existing effective task-policy gate, never as its override.
 The distinct `set-managed-profile` operation binds its `local_managed` impact
 report and the exact authority document to the shared retained-target journal.
 Activation rechecks selection, ownership, external policy inputs and the complete
-preimage before publication. Undo restores only the profile's owned fields, but
-requires the whole managed document still to equal its published generation;
+preimage before publication. Undo restores the exact retained original document
+only when the whole managed document still equals its published generation;
 even an unrelated newer managed edit refuses rollback and remains untouched.
 Personal undo retains its existing ability to preserve unrelated edits. These
 are local content preconditions, not a server revision or distributed lock.
@@ -86,6 +86,16 @@ client observations are historical and their timestamps remain visible. Remote
 publication and verified fleet adoption are unavailable in this local workflow;
 the interface never claims that saving or activating one local profile updated
 other clients. No remote write falls back to local authority.
+
+CLI JSON exposes `live.impact_observation`; the local browser receives the same
+read-only age projection when preparing or refreshing a stored operation. It
+reports whether the review is recent, stale or future-dated, how many captured
+expiry times have been reached since the review, and how many recorded client
+timestamps are stale, future-dated or missing. These checks use the backend's
+current clock and leave the original impact attachment unchanged. They do not
+read the current grant inventory, contact clients, renew exceptions or establish
+adoption. A future-dated review has no valid elapsed-expiry count. Existing
+activation authorization and its 24-hour review limit remain unchanged.
 
 The existing remote contract fetches YAML with authenticated HTTPS from
 `GET /api/policy/fetch`. The remote policy replaces the local baseline; its cache

@@ -305,7 +305,48 @@ fn probe(record: &ServiceRecord) -> Result<bool, String> {
         && value["quiescing"] == false)
 }
 
-pub(super) fn launch() -> Result<ServiceRecord, String> {
+/// Return a validated live candidate or the ordinary launch fallback. Required
+/// reuse never returns the fallback, even if its service exits during a probe.
+fn select_existing_service(
+    record: Option<ServiceRecord>,
+    required_service_id: Option<&str>,
+    digest: &str,
+    project: &str,
+    probe_live: impl FnOnce(&ServiceRecord) -> Result<bool, String>,
+) -> Result<Option<ServiceRecord>, String> {
+    let unavailable = || {
+        if required_service_id.is_some() {
+            Err("required dashboard service is unavailable; no service was started".into())
+        } else {
+            Ok(None)
+        }
+    };
+    let Some(record) = record else {
+        return unavailable();
+    };
+    if required_service_id.is_some_and(|required| required != record.service_id) {
+        return Err("a different dashboard service is present; no service was started".into());
+    }
+    if !probe_live(&record)? {
+        return unavailable();
+    }
+    if record.protocol != PROTOCOL
+        || record.version != env!("CARGO_PKG_VERSION")
+        || record.binary_sha256 != digest
+    {
+        return Err("a different dashboard version is running; close its service from Settings before reopening".into());
+    }
+    if record.cwd != project {
+        return Err("the dashboard is attached to another project; close its service from Settings before opening this project".into());
+    }
+    Ok(Some(record))
+}
+
+pub(super) fn launch(required_service_id: Option<&str>) -> Result<ServiceRecord, String> {
+    // Validate even for internal callers, before state/lock creation or probes.
+    if let Some(required) = required_service_id {
+        super::parse_required_service_id(required)?;
+    }
     require_unprivileged()?;
     let paths = Paths::current()?;
     paths.prepare()?;
@@ -325,22 +366,16 @@ pub(super) fn launch() -> Result<ServiceRecord, String> {
     let digest = binary_identity.sha256();
     let project = cwd()?;
     directory_identity.revalidate()?;
-    if let Some(record) = paths.read()? {
-        if probe(&record)? {
-            if record.protocol != PROTOCOL
-                || record.version != env!("CARGO_PKG_VERSION")
-                || record.binary_sha256 != digest
-            {
-                return Err("a different dashboard version is running; close its service from Settings before reopening".into());
-            }
-            if record.cwd != project {
-                return Err("the dashboard is attached to another project; close its service from Settings before opening this project".into());
-            }
-            directory_identity.revalidate()?;
-            binary_identity.revalidate()?;
-            return Ok(record);
-        }
+    if let Some(record) =
+        select_existing_service(paths.read()?, required_service_id, digest, &project, probe)?
+    {
+        directory_identity.revalidate()?;
+        binary_identity.revalidate()?;
+        return Ok(record);
     }
+    // select_existing_service returns None only for ordinary launch. In
+    // required-reuse mode, death before/during its handshake cannot reach the
+    // replacement branch. Death after the handshake never causes a retry here.
     // A failed probe does not authorize killing a PID or replacing a live
     // service. Its independent lifetime lock is authoritative.
     let Some(service_lock) = fs_helpers::try_lock_operation(&paths.service_lock, &paths.scope)?
@@ -485,5 +520,123 @@ pub(super) fn open_browser(url: &str) -> Result<(), String> {
         } else {
             Err("default browser could not be launched".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod required_reuse_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const SERVICE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const OTHER: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const PROJECT: &str = "/synthetic-project";
+
+    fn record() -> ServiceRecord {
+        ServiceRecord {
+            protocol: PROTOCOL,
+            service_id: SERVICE.into(),
+            startup_id: OTHER.into(),
+            pid: 42,
+            port: 32123,
+            version: env!("CARGO_PKG_VERSION").into(),
+            binary_sha256: DIGEST.into(),
+            cwd: PROJECT.into(),
+            token: "d".repeat(64),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn required_reuse_missing_dead_or_mismatched_never_selects_spawn_fallback() {
+        assert!(
+            select_existing_service(None, Some(SERVICE), DIGEST, PROJECT, |_| {
+                panic!("missing discovery must not probe")
+            })
+            .is_err()
+        );
+        assert!(
+            select_existing_service(Some(record()), Some(OTHER), DIGEST, PROJECT, |_| {
+                panic!("mismatched identity must not probe")
+            })
+            .is_err()
+        );
+        assert!(
+            select_existing_service(Some(record()), Some(SERVICE), DIGEST, PROJECT, |_| Ok(
+                false
+            ))
+            .is_err()
+        );
+        assert!(
+            select_existing_service(Some(record()), Some(SERVICE), DIGEST, PROJECT, |_| Err(
+                "probe failed".into()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn required_reuse_live_service_preserves_all_existing_context_checks() {
+        let selected =
+            select_existing_service(Some(record()), Some(SERVICE), DIGEST, PROJECT, |_| Ok(true))
+                .unwrap()
+                .expect("live requested service");
+        assert_eq!(selected.service_id, SERVICE);
+        for field in ["protocol", "version", "binary", "project"] {
+            let mut wrong = record();
+            match field {
+                "protocol" => wrong.protocol += 1,
+                "version" => wrong.version = "other".into(),
+                "binary" => wrong.binary_sha256 = "e".repeat(64),
+                "project" => wrong.cwd = "/other-project".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                select_existing_service(Some(wrong), Some(SERVICE), DIGEST, PROJECT, |_| Ok(true))
+                    .is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_reuse_exit_race_never_requests_a_replacement() {
+        let alive = Cell::new(true);
+        let selected =
+            select_existing_service(Some(record()), Some(SERVICE), DIGEST, PROJECT, |_| {
+                // Successful handshake races with peer exit. The caller can detect
+                // the exit after return, but selection never authorizes spawning.
+                alive.set(false);
+                Ok(true)
+            })
+            .unwrap();
+        assert!(!alive.get());
+        assert!(selected.is_some());
+        assert!(
+            select_existing_service(Some(record()), Some(SERVICE), DIGEST, PROJECT, |_| Ok(
+                alive.get()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ordinary_launch_preserves_missing_and_dead_fallback_and_live_reuse() {
+        assert!(
+            select_existing_service(None, None, DIGEST, PROJECT, |_| panic!("missing record"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            select_existing_service(Some(record()), None, DIGEST, PROJECT, |_| Ok(false))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            select_existing_service(Some(record()), None, DIGEST, PROJECT, |_| Ok(true))
+                .unwrap()
+                .is_some()
+        );
     }
 }

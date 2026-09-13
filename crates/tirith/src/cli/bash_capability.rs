@@ -27,7 +27,9 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 /// Cache-file schema version. Bump when the cache format changes so an old
 /// hook reading a new file (or vice versa) treats the mismatch as stale.
-pub const CACHE_SCHEMA: u32 = 2;
+/// Schema 3 requires fresh rendered prompt boundaries: older probes could
+/// accept echoed setup text or a stale prompt before hook initialization.
+pub const CACHE_SCHEMA: u32 = 3;
 
 /// Name of the capability cache file inside `state_dir()`.
 pub const CACHE_FILENAME: &str = "bash-enter-capability";
@@ -285,10 +287,17 @@ impl ProbeSession {
 
     /// Block until `needle` appears in output, or `timeout` elapses. Returns
     /// `true` on match.
+    #[cfg(test)]
     fn wait_for(&mut self, needle: &str, timeout: Duration) -> bool {
+        self.wait_for_since(needle, 0, timeout)
+    }
+
+    /// Match only after this command's observed boundary. A fresh prompt frame
+    /// also excludes unread bytes from every earlier command/prompt.
+    fn wait_for_since(&mut self, needle: &str, offset: usize, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.buf.contains(needle) {
+            if response_after_boundary(&self.buf, offset, needle) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -296,6 +305,21 @@ impl ProbeSession {
             }
             self.pump(Duration::from_millis(80));
         }
+    }
+
+    /// A distinct prompt is rendered only after the complete input line and
+    /// PROMPT_COMMAND finish. Octal escapes keep the actual control-byte frame
+    /// out of echoed command text; a fresh nonce excludes queued old prompts.
+    fn synchronize_prompt(&mut self, hook: Option<&Path>) -> bool {
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let (mut line, expected) = prompt_handshake(&tag);
+        if let Some(hook) = hook {
+            line.push_str("; source ");
+            line.push_str(&posix_quote(hook));
+        }
+        let offset = self.buf.len();
+        self.send_line(&line);
+        self.wait_for_since(&expected, offset, PHASE_TIMEOUT)
     }
 
     /// Drain queued PTY output (blocking at most `slice`) so the reader channel
@@ -317,6 +341,21 @@ impl Drop for ProbeSession {
     fn drop(&mut self) {
         let _ = self.child.kill();
     }
+}
+
+/// The command contains printable escape spellings; only the resulting PS1
+/// contains the RS/US delimiters. The tag is a fresh internally generated UUID.
+fn prompt_handshake(tag: &str) -> (String, String) {
+    (
+        format!("builtin printf -v PS1 '\\036TIRITH_PROBE_READY_%s\\037 ' '{tag}'"),
+        format!("\u{1e}TIRITH_PROBE_READY_{tag}\u{1f} "),
+    )
+}
+
+fn response_after_boundary(output: &str, offset: usize, expected: &str) -> bool {
+    output
+        .get(offset..)
+        .is_some_and(|fresh| fresh.contains(expected))
 }
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
@@ -437,13 +476,11 @@ fn probe_delivery(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
             .map_err(|e| format!("PTY spawn failed: {e}"))?;
 
     // A fixed prompt the probe synchronises on.
-    sess.send_line("export PS1='TIRITH_PROBE> '");
-    if !sess.wait_for("TIRITH_PROBE> ", PHASE_TIMEOUT) {
+    if !sess.synchronize_prompt(None) {
         sess.kill();
         return Err("bash never reached the probe prompt".into());
     }
-    sess.send_line(&format!("source {}", posix_quote(&env.hook)));
-    if !sess.wait_for("TIRITH_PROBE> ", PHASE_TIMEOUT) {
+    if !sess.synchronize_prompt(Some(&env.hook)) {
         sess.kill();
         return Err("sourcing the hook did not return a prompt".into());
     }
@@ -491,13 +528,11 @@ fn probe_blocking(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
         ProbeSession::spawn(bash, &["--norc", "--noprofile", "-i"], &env.envs, &env.work)
             .map_err(|e| format!("PTY spawn failed: {e}"))?;
 
-    sess.send_line("export PS1='TIRITH_PROBE> '");
-    if !sess.wait_for("TIRITH_PROBE> ", PHASE_TIMEOUT) {
+    if !sess.synchronize_prompt(None) {
         sess.kill();
         return Err("bash never reached the probe prompt".into());
     }
-    sess.send_line(&format!("source {}", posix_quote(&env.hook)));
-    if !sess.wait_for("TIRITH_PROBE> ", PHASE_TIMEOUT) {
+    if !sess.synchronize_prompt(Some(&env.hook)) {
         sess.kill();
         return Err("sourcing the hook did not return a prompt".into());
     }
@@ -518,6 +553,15 @@ fn probe_blocking(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
         );
     }
 
+    if count_occurrences(
+        &std::fs::read_to_string(&allowed_marker).unwrap_or_default(),
+        allowed_nonce,
+    ) != 1
+    {
+        sess.kill();
+        return Err("anti-vacuous guard failed: allowed command did not run exactly once".into());
+    }
+
     // Local pipe-to-interpreter (blocked by `pipe_to_interpreter`); the
     // `&& touch` runs only if the pipeline executed. Marker expected absent —
     // poll the full timeout to be sure.
@@ -528,6 +572,15 @@ fn probe_blocking(bash: &Path, env: &ProbeEnv) -> Result<bool, String> {
     let blocked = !marker_stays_absent(&mut sess, &blocked_marker, MARKER_TIMEOUT);
     sess.kill();
 
+    // A delayed duplicate delivery also invalidates the guard. Preserve the
+    // full blocked-marker observation window and never retry either input.
+    if count_occurrences(
+        &std::fs::read_to_string(&allowed_marker).unwrap_or_default(),
+        allowed_nonce,
+    ) != 1
+    {
+        return Err("anti-vacuous guard failed: allowed command ran more than once".into());
+    }
     // Guard passed + blocked marker absent ⇒ genuinely blocked.
     Ok(!blocked)
 }
@@ -857,6 +910,32 @@ mod tests {
     }
 
     #[test]
+    fn prompt_handshake_refuses_echo_and_stale_prompt_bytes() {
+        let (line, expected) = prompt_handshake("current-nonce");
+        let (_, old) = prompt_handshake("previous-nonce");
+        // An echoed setup command contains the words, but never its rendered
+        // control-byte frame. This also covers the old echo-only false match.
+        assert!(line.contains("TIRITH_PROBE_READY_"));
+        assert!(!response_after_boundary(
+            &format!("{line}\r\n"),
+            0,
+            &expected
+        ));
+        let stale = format!("{expected}already observed");
+        let offset = stale.len();
+        assert!(!response_after_boundary(&stale, offset, &expected));
+        // Merely clearing a local buffer would miss queued prior prompt bytes.
+        // Their old nonce still cannot satisfy the new request after the offset.
+        let queued = format!("{stale}{old}{line}\r\n");
+        assert!(!response_after_boundary(&queued, offset, &expected));
+        assert!(response_after_boundary(
+            &format!("{queued}{expected}"),
+            offset,
+            &expected
+        ));
+    }
+
+    #[test]
     fn count_occurrences_is_non_overlapping() {
         assert_eq!(count_occurrences("", "x"), 0);
         assert_eq!(count_occurrences("abc", ""), 0);
@@ -1020,6 +1099,25 @@ mod tests {
     }
 
     #[test]
+    fn read_cache_rejects_pre_handshake_probe_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = isolated_state_home(dir.path());
+        let state = dir.path().join("tirith");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join(CACHE_FILENAME),
+            "schema=2\ntirith_version=0.4.2\nshell=bash\nbash_version=5.3.15\n\
+             bash_path=/opt/homebrew/bin/bash\nbash_fingerprint=1:1\n\
+             enter_capability=works\nreason=old prompt synchronization\n",
+        )
+        .unwrap();
+        assert!(
+            read_cache().is_none(),
+            "old readiness semantics cannot certify Works"
+        );
+    }
+
+    #[test]
     fn read_cache_rejects_wrong_schema() {
         let dir = tempfile::tempdir().unwrap();
         let _guard = isolated_state_home(dir.path());
@@ -1169,6 +1267,9 @@ mod tests {
     /// behaviour. `Works` isn't hard-pinned (delivery is build-dependent).
     #[test]
     fn probe_reaches_definite_verdict_on_modern_bash() {
+        // Discovery, probe_path and tempfile creation read process-global
+        // environment. Keep one native target/fixture while other tests mutate it.
+        let _environment = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let Some(bash) = probe_target_if_modern() else {
             eprintln!("skipping: no modern bash (>= 5) on PATH for the probe to target");
             return;
@@ -1213,6 +1314,9 @@ mod tests {
     /// reflect the build's real behaviour regardless of `tirith check` latency.
     #[test]
     fn probe_delivery_reaches_definite_verdict_on_modern_bash() {
+        // Discovery, probe_path and tempfile creation read process-global
+        // environment. Keep one native target/fixture while other tests mutate it.
+        let _environment = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let Some(bash) = probe_target_if_modern() else {
             eprintln!("skipping: no modern bash (>= 5) on PATH for the probe to target");
             return;
@@ -1234,6 +1338,9 @@ mod tests {
     /// here is the guard refusing to vouch, not a crash.
     #[test]
     fn probe_blocking_anti_vacuous_guard_holds_on_modern_bash() {
+        // Discovery, probe_path and tempfile creation read process-global
+        // environment. Keep one native target/fixture while other tests mutate it.
+        let _environment = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let Some(bash) = probe_target_if_modern() else {
             eprintln!("skipping: no modern bash (>= 5) on PATH for the probe to target");
             return;

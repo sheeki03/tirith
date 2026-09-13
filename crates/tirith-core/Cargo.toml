@@ -46,6 +46,8 @@ etcetera = { workspace = true }
 home = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
+# Mutual one-request Unix activation transport; already in the locked closure.
+hmac = "0.12.1"
 # Lowercase-hex decode for the artifact / file SHA-256 known-malicious lookup
 # (the `[u8; 32]` keys the v2 threat-DB hash indices take). Tiny, permissive
 # (MIT OR Apache-2.0), already in the dependency closure. Used only by

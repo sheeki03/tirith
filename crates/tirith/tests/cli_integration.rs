@@ -4295,7 +4295,7 @@ fn capability_cache_body(verdict: &str) -> String {
         })
         .unwrap_or_default();
     format!(
-        "schema=2\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+        "schema=3\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
          bash_path={bash_path}\nbash_fingerprint={fingerprint}\nenter_capability={verdict}\nreason=seeded by test\n"
     )
 }
@@ -4419,31 +4419,56 @@ fn bash_hook_runtime_delivery_failure_degrades_in_pty() {
         .unwrap();
     }
 
-    // Drive the runtime _tirith_enter failure path in a real interactive PTY: 1.
+    // Wait for rendered, framed prompts rather than text in an echoed command.
+    // The mode frame proves sourcing reached enter mode before inducing failure.
     let expect_script = r#"
 set timeout 20
 set hook $env(HOOK_PATH)
+set nonce $env(PROMPT_NONCE)
+proc await_prompt {phase} {
+  global nonce
+  expect {
+    -exact "\x1e${nonce}:${phase}\x1f" {}
+    timeout { exit 3 }
+    eof { exit 4 }
+  }
+}
 spawn -noecho bash --norc --noprofile -i
 expect -re {[$#] $}
-send -- "export PS1='PROMPT> '\r"
-expect "PROMPT> "
-send -- "source '$hook'\r"
-expect "PROMPT> "
-send -- "PROMPT_COMMAND=':'; readonly PROMPT_COMMAND\r"
-expect "PROMPT> "
+send -- "export PS1=\$'\\036${nonce}:before\\037'\r"
+await_prompt before
+send -- "source '$hook'; export PS1=\$'\\036${nonce}:loaded\\037'; printf '\\036mode:%s\\037' \"\$_TIRITH_BASH_MODE\"\r"
+expect {
+  -exact "\x1emode:enter\x1f" {}
+  timeout { exit 5 }
+  eof { exit 6 }
+}
+await_prompt loaded
+send -- "PROMPT_COMMAND=':'; readonly PROMPT_COMMAND; export PS1=\$'\\036${nonce}:armed\\037'\r"
+await_prompt armed
 send -- "echo PTY_RUNTIME_CHECK\r"
 expect {
   -re {protection downgraded|interception is off|enter mode failed} {}
   timeout { exit 2 }
 }
 send -- "\r"
-expect "PROMPT> "
+await_prompt armed
 send -- "exit\r"
 expect eof
 "#;
 
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_tirith"))
+        .parent()
+        .expect("built binary directory");
+    let mut entries = vec![bin_dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&existing));
+    }
+    let path_with_bin = std::env::join_paths(entries).expect("PATH with the built binary");
     let out = Command::new("expect")
         .args(["-c", expect_script])
+        .env("PATH", path_with_bin)
+        .env("PROMPT_NONCE", uuid::Uuid::new_v4().to_string())
         .env("HOOK_PATH", &hook)
         .env("XDG_STATE_HOME", tmpdir.path())
         .env_remove("TIRITH_BASH_MODE")

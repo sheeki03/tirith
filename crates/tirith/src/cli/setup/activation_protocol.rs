@@ -4,13 +4,13 @@
 const MAX_FRAME_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Id(uuid::Uuid);
+pub(crate) struct Id(uuid::Uuid);
 
 impl Id {
-    pub(super) fn parse(value: &str) -> Result<Self, &'static str> {
+    pub(crate) fn parse(value: &str) -> Result<Self, &'static str> {
         let id = uuid::Uuid::parse_str(value).map_err(|_| "invalid activation identifier")?;
-        if value != id.hyphenated().to_string() {
-            return Err("activation identifier is not canonical");
+        if id.is_nil() || value != id.hyphenated().to_string() {
+            return Err("activation identifier is not canonical and non-nil");
         }
         Ok(Self(id))
     }
@@ -25,7 +25,7 @@ impl std::fmt::Display for Id {
 macro_rules! closed_enum {
     ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub(super) enum $name { $($variant),+ }
+        pub(crate) enum $name { $($variant),+ }
         impl $name {
             fn parse(value: &str) -> Option<Self> {
                 match value { $($wire => Some(Self::$variant),)+ _ => None }
@@ -53,13 +53,13 @@ closed_enum!(Reason {
 });
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Attempt {
-    pub(super) operation: Id,
-    pub(super) attempt: Id,
+pub(crate) struct Attempt {
+    pub(crate) operation: Id,
+    pub(crate) attempt: Id,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Frame {
+pub(crate) enum Frame {
     None,
     Pending(Attempt),
     Stage {
@@ -78,7 +78,7 @@ pub(super) enum Frame {
 impl Frame {
     /// Decode exactly one complete wire frame, including its single newline.
     /// Socket reads and their absolute deadlines belong to the native owner.
-    pub(super) fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.len() > MAX_FRAME_BYTES {
             return Err("activation frame is over limit");
         }
@@ -136,7 +136,7 @@ impl Frame {
         })
     }
 
-    pub(super) fn encode(self) -> String {
+    pub(crate) fn encode(self) -> String {
         match self {
             Self::None => "TA1|none|-|-|-|none\n".into(),
             Self::Pending(ids) => format!("TA1|pending|{}|{}|-|none\n", ids.operation, ids.attempt),
@@ -171,7 +171,7 @@ impl Frame {
 /// An accepted request describes metadata coordination only. Every transition
 /// still requires the authenticated peer, completed setup lease and core proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Request {
+pub(crate) enum Request {
     Discover,
     Start(Attempt),
     Next(Attempt),
@@ -180,7 +180,7 @@ pub(super) enum Request {
 }
 
 impl Request {
-    pub(super) fn parse(
+    pub(crate) fn parse(
         action: &str,
         operation: &str,
         attempt: &str,
@@ -302,7 +302,14 @@ mod tests {
         for action in ["exec", "start sh", "start;id", "decline"] {
             assert!(Request::parse(action, OP, ATTEMPT, "none").is_err());
         }
-        for id in ["/tmp/endpoint", "../operation", "$(id)", "invalid", ""] {
+        for id in [
+            "/tmp/endpoint",
+            "../operation",
+            "$(id)",
+            "invalid",
+            "",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
             assert!(Request::parse("start", id, ATTEMPT, "none").is_err());
         }
     }

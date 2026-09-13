@@ -14,6 +14,7 @@ import re
 import statistics
 import stat
 import sys
+import uuid
 
 CAP = 1024 * 1024
 CLI = ("cli_version", "quick_status", "local_policy", "ordinary_check", "effective_policy", "profile_preview")
@@ -50,8 +51,56 @@ def digest(value, label):
     return value
 
 
+def revision(value, label):
+    require(type(value) is str and REV.fullmatch(value), label + ": expected immutable revision")
+    return value
+
+
+def boot_identity(value, label):
+    text(value, label, 36)
+    try:
+        boot = uuid.UUID(value)
+    except ValueError as error:
+        raise Invalid(label + ": invalid boot UUID") from error
+    require(str(boot) == value and boot.int != 0, label + ": noncanonical or zero boot UUID")
+    return value
+
+
+def tool_version(value, label):
+    require(type(value) is str and 0 < len(value) <= 8192 and value.strip() == value
+            and all(ord(char) >= 32 or char == "\n" for char in value), label + ": invalid verbose tool identity")
+    return value
+
+
+def manifest_hashes(value, label):
+    keys(value, ("Cargo.toml", "Cargo.lock"), label)
+    for name, identity in value.items():
+        digest(identity, label + "." + name)
+
+
+def workflow_path(value):
+    text(value, "provenance workflow ref", 1024)
+    parts = value.split("@")
+    require(len(parts) == 2 and parts[1].startswith("refs/") and len(parts[1]) > 5,
+            "provenance: ambiguous workflow ref")
+    require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", parts[0]),
+            "provenance: invalid workflow path")
+    return parts[0]
+
+
 def keys(value, expected, label):
     require(type(value) is dict and set(value) == set(expected), label + ": unexpected or missing fields")
+
+
+def identical(value, expected):
+    """JSON contract equality without Python's bool/int or float/int coercion."""
+    if type(value) is not type(expected):
+        return False
+    if type(value) is dict:
+        return value.keys() == expected.keys() and all(identical(value[key], expected[key]) for key in value)
+    if type(value) is list:
+        return len(value) == len(expected) and all(identical(a, b) for a, b in zip(value, expected))
+    return value == expected
 
 
 def unique_object(pairs):
@@ -151,7 +200,39 @@ def resources(row, n, label, out):
 
 
 def local_metrics(report):
-    require(report.get("schema_version") == 1 and type(report.get("schema_version")) is int, "local: unsupported schema")
+    require(type(report.get("schema_version")) is int and report["schema_version"] in (1, 2), "local: unsupported schema")
+    owned = report["schema_version"] == 2
+    if owned:
+        require(report.get("status") == "completed", "local: owned measurement did not complete")
+        digest(report.get("native_helper_sha256"), "local native helper")
+        require(report.get("native_helper_unchanged_during_run") is True, "local: native helper changed")
+        require(report.get("harness_unchanged_during_run") is True, "local: measurement producer changed")
+        ownership = report.get("owned_service", {})
+        require(ownership.get("exit") == 0 and type(ownership.get("exit")) is int
+                and ownership.get("failure") is None, "service: owned child did not exit successfully")
+        for fact in ("identity_validated", "launcher_reused", "quiesce_acknowledged"):
+            require(ownership.get(fact) is True, "service: missing owned lifecycle fact " + fact)
+        for identity in ("startup_id", "service_id"):
+            boot_identity(ownership.get(identity), "owned service " + identity)
+        require(ownership.get("binary_sha256") == report.get("binary_sha256"),
+                "service: owned executable differs from candidate")
+        require(1 < number(ownership.get("pid"), "owned service PID", integer=True) < 2 ** 31,
+                "service: invalid owned child PID")
+        cleanup = ownership.get("cleanup", {})
+        keys(cleanup, ("leader_reaped", "group_signaled_or_absent", "group_members_exited", "output_eof"), "owned service cleanup")
+        require(all(value is True for value in cleanup.values()), "service: native cleanup incomplete")
+        group = ownership.get("group_observation", {})
+        require(group.get("method") == {"Linux": "procfs", "Darwin": "libproc"}.get(report.get("host", {}).get("system"))
+                and group.get("leader_retained_waitable") is True, "service: native group observation unavailable")
+        members = group.get("members")
+        require(type(members) is list and len(members) <= 4096, "service: invalid native group members")
+        seen = set()
+        for member in members:
+            keys(member, ("pid", "state"), "native group member")
+            pid = number(member["pid"], "native group member PID", integer=True, positive=True)
+            require(1 < pid < 2 ** 31 and pid not in seen and member["state"] == "exited",
+                    "service: invalid, duplicate or live group member")
+            seen.add(pid)
     require(report.get("measurement_kind") == "local_candidate_characterization", "local: wrong measurement kind")
     require(report.get("binary_unchanged_during_run") is True, "local: binary changed or identity unavailable")
     digest(report.get("binary_sha256"), "local binary")
@@ -175,7 +256,8 @@ def local_metrics(report):
                        "response_bytes": 524288, "assertions_passed": True}
             and bounds.get("assertions_passed") is True, "local: coverage checks absent or changed")
     measurements = report.get("measurements")
-    keys(measurements, (*CLI, *HTTP, "service_launch"), "local workloads")
+    startup = ("service_direct_start", "service_launcher_reuse") if owned else ("service_launch",)
+    keys(measurements, (*CLI, *HTTP, *startup), "local workloads")
     out, counts = {}, []
     for name in CLI + HTTP:
         row = measurements[name]
@@ -212,12 +294,22 @@ def local_metrics(report):
                     "baseline: comparison workload differs")
             ratio = number(comparison.get("candidate_to_baseline_median_ratio"), "baseline ratio")
             require(row["median_ms"] > 0 and same(ratio, measurements[name]["median_ms"] / row["median_ms"]), "baseline: invalid ratio")
-    launch = measurements["service_launch"]
-    number(launch.get("ms"), "launch latency")
-    metric(out, "local.service_launch.latency_ms", [launch["ms"]], "ms")
-    resources(launch, 1, "local.service_launch", out)
+    for name in startup:
+        launch = measurements[name]
+        number(launch.get("ms"), name + ": latency")
+        metric(out, "local." + name + ".latency_ms", [launch["ms"]], "ms")
+        if name != "service_direct_start":
+            resources(launch, 1, "local." + name, out)
+        if owned:
+            expected_scope = {"service_direct_start": "owned direct spawn through validated discovery and authenticated session",
+                              "service_launcher_reuse": "public launcher reuse of the already running owned service"}[name]
+            require(launch.get("scope") == expected_scope, name + ": startup/reuse scope changed")
+            if name == "service_direct_start":
+                require("resources" not in launch, "service: live startup is not completed-child accounting")
     service = report.get("service_resources", {})
     require(service.get("availability") == "available" and service.get("errors") == [], "service: unavailable or incomplete sampling")
+    if owned:
+        require(service.get("sampler_joined") is True, "service: sampler did not join before cleanup")
     require(service.get("nominal_interval_ms") == 250 and service.get("sample_limit") == 4800, "service: sampling contract changed")
     samples = service.get("samples")
     require(type(samples) is list and 2 <= len(samples) <= 4800, "service: invalid sample count")
@@ -307,29 +399,96 @@ def context_check(context, local, allocation, hashes):
     require(context["executable_sha256"] == {"local": local["binary_sha256"], "allocation": allocation["instrumented_harness_sha256"]}, "context executable identities do not match")
 
 
-def evaluate(budget, context, local, allocation, metrics):
-    keys(budget, ("schema_version", "status", "review", "scope", "host", "runner", "producer_sha256", "history_fixture", "workload_samples", "baseline_evidence", "limits"), "budget")
-    require(type(budget["schema_version"]) is int and budget["schema_version"] == 1, "budget: unsupported schema")
+def provenance_check(provenance, context, local, allocation):
+    """Bind recorded build facts to these reports; not an attestation of the host."""
+    keys(provenance, ("schema_version", "source_revision", "source_tree", "selected_measurement_source",
+                     "expected_measurement_tree", "event_revision", "run_id", "workflow_ref", "workflow_sha",
+                     "runner_name", "runner_boot_id", "runner_class", "expected_reference_class",
+                     "source_clean_before_build", "rustc_verbose", "cargo_verbose", "build_profile",
+                     "build_manifest_sha256", "expected_build_manifest_sha256", "reference_cohort",
+                     "workload_samples", "admission_issues"), "build provenance")
+    require(type(provenance["schema_version"]) is int and provenance["schema_version"] == 1,
+            "provenance: unsupported schema")
+    for name in ("source_revision", "source_tree", "selected_measurement_source", "event_revision", "workflow_sha"):
+        revision(provenance[name], "provenance." + name)
+    require(provenance["source_revision"] == provenance["selected_measurement_source"] == context["source_revision"],
+            "provenance: measured source differs from context or selected source")
+    require(provenance["run_id"] == context["run_id"], "provenance: run differs from context")
+    require(provenance["workflow_sha"] == provenance["event_revision"], "provenance: workflow/event revision differs")
+    workflow_path(provenance["workflow_ref"])
+    text(provenance["runner_name"], "provenance runner name")
+    boot_identity(provenance["runner_boot_id"], "provenance boot")
+    runner_class = {**context["host"], **{name: value for name, value in context["runner"].items() if name != "label"}}
+    require(identical(provenance["runner_class"], runner_class), "provenance: runner class differs from context")
+    require(provenance["source_clean_before_build"] is True, "provenance: tracked source was not clean")
+    require(type(provenance["admission_issues"]) is list and provenance["admission_issues"] == [],
+            "provenance: build admission issues present")
+    require(provenance["build_profile"] == context["build_profile"] == "release", "provenance: release profile required")
+    for name in ("rustc_verbose", "cargo_verbose"):
+        tool_version(provenance[name], "provenance." + name)
+    manifest_hashes(provenance["build_manifest_sha256"], "provenance manifests")
+    count = number(provenance["workload_samples"], "provenance sample count", integer=True, positive=True)
+    require(count == local["measurements"][CLI[0]]["n"] == len(allocation["workloads"][0]["samples"]),
+            "provenance: sample count differs from reports")
+    reference = ("reference_cohort", "expected_measurement_tree", "expected_reference_class", "expected_build_manifest_sha256")
+    if all(provenance[name] is None for name in reference):
+        require(provenance["source_revision"] == provenance["event_revision"],
+                "provenance: ordinary measurement source differs from its event")
+    else:
+        require(all(provenance[name] is not None for name in reference), "provenance: incomplete reference admission")
+        text(provenance["reference_cohort"], "provenance reference cohort")
+        require(provenance["expected_measurement_tree"] == provenance["source_tree"], "provenance: reference tree differs")
+        require(identical(provenance["expected_reference_class"], runner_class), "provenance: reference class differs")
+        require(provenance["expected_build_manifest_sha256"] == provenance["build_manifest_sha256"],
+                "provenance: reference manifests differ")
+
+
+def build_contract_check(contract, provenance):
+    keys(contract, ("build_profile", "rustc_verbose", "cargo_verbose", "build_manifest_sha256", "workflow_path"), "build contract")
+    require(contract["build_profile"] == "release", "build contract: release profile required")
+    for name in ("rustc_verbose", "cargo_verbose"):
+        tool_version(contract[name], "build contract." + name)
+    manifest_hashes(contract["build_manifest_sha256"], "build contract manifests")
+    expected = {name: provenance[name] for name in ("build_profile", "rustc_verbose", "cargo_verbose", "build_manifest_sha256")}
+    expected["workflow_path"] = workflow_path(provenance["workflow_ref"])
+    require(identical(contract, expected), "budget: compiler/build contract differs; review compatibility")
+
+
+def evaluate(budget, context, local, allocation, metrics, provenance=None):
+    require(type(budget.get("schema_version")) is int and budget["schema_version"] == 2,
+            "budget: enforcement requires schema v2 with build provenance; v1 budgets require explicit migration")
+    helper_fields = ("native_helper_sha256",) if local["schema_version"] == 2 else ()
+    keys(budget, ("schema_version", "status", "review", "scope", "host", "runner", "producer_sha256", "history_fixture", "workload_samples", "baseline_evidence", "build_contract", "limits", *helper_fields), "budget")
+    if helper_fields:
+        digest(budget["native_helper_sha256"], "budget native helper")
+        require(budget["native_helper_sha256"] == local["native_helper_sha256"],
+                "budget: native helper changed; review compatibility")
     require(budget["status"] == "reviewed", "budget: draft/unreviewed limits cannot be enforced")
+    require(provenance is not None, "budget v2 requires build provenance")
+    provenance_check(provenance, context, local, allocation)
+    build_contract_check(budget["build_contract"], provenance)
     text(budget["review"], "budget review reference", 2048)
     text(budget["scope"], "budget scope", 2048)
-    require(budget["host"] == context["host"] and budget["runner"] == context["runner"], "budget: runner/host class differs")
+    require(identical(budget["host"], context["host"]) and identical(budget["runner"], context["runner"]), "budget: runner/host class differs")
     require(budget["producer_sha256"] == context["producer_sha256"], "budget: measurement producer changed; review compatibility")
-    require(budget["history_fixture"] == {"local": local["history_fixture"], "allocation": allocation["history_fixture"]}, "budget: workload fixture differs")
-    require(budget["workload_samples"] == {"local": local["measurements"][CLI[0]]["n"],
-                                          "allocation": len(allocation["workloads"][0]["samples"])}, "budget: measured workload sizes differ")
+    require(identical(budget["history_fixture"], {"local": local["history_fixture"], "allocation": allocation["history_fixture"]}), "budget: workload fixture differs")
+    require(identical(budget["workload_samples"], {"local": local["measurements"][CLI[0]]["n"],
+                                               "allocation": len(allocation["workloads"][0]["samples"])}), "budget: measured workload sizes differ")
     evidence = budget["baseline_evidence"]
     require(type(evidence) is list and 3 <= len(evidence) <= 100, "budget: at least three pinned independent baseline runs required")
-    run_ids, contexts = set(), set()
+    run_ids, contexts, builds, boots = set(), set(), set(), set()
     for row in evidence:
-        keys(row, ("run_id", "context_sha256", "source_revision", "build_profile", "derivation"), "baseline evidence")
+        keys(row, ("run_id", "context_sha256", "source_revision", "build_profile", "derivation", "build_provenance_sha256", "runner_boot_id"), "baseline evidence")
         text(row["run_id"], "baseline run ID")
         digest(row["context_sha256"], "baseline context")
         require(type(row["source_revision"]) is str and REV.fullmatch(row["source_revision"]), "baseline: invalid source revision")
         require(row["build_profile"] == "release", "baseline: debug evidence cannot set release budgets")
         text(row["derivation"], "baseline derivation reference", 2048)
+        digest(row["build_provenance_sha256"], "baseline build provenance")
+        boot_identity(row["runner_boot_id"], "baseline boot")
         run_ids.add(row["run_id"]); contexts.add(row["context_sha256"])
-    require(len(run_ids) == len(evidence) == len(contexts), "budget: duplicated baseline runs")
+        builds.add(row["build_provenance_sha256"]); boots.add(row["runner_boot_id"])
+    require(len(run_ids) == len(evidence) == len(contexts) == len(builds) == len(boots), "budget: duplicated baseline runs, provenance or boots")
     limits = budget["limits"]
     require(type(limits) is list and 1 <= len(limits) <= 512, "budget: empty/oversized limits")
     checked, seen = [], set()
@@ -354,6 +513,8 @@ def main():
     parser.add_argument("--local-report", required=True, type=Path)
     parser.add_argument("--allocation-report", required=True, type=Path)
     parser.add_argument("--context", type=Path)
+    parser.add_argument("--build-provenance", type=Path, action="append",
+                        help="Required once for v2 budget enforcement; optional with context during validation")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--validate-only", action="store_true")
     mode.add_argument("--budget", type=Path)
@@ -365,23 +526,34 @@ def main():
         if args.context:
             context, context_hash = load(args.context)
             context_check(context, local, allocation, hashes)
+        provenance, provenance_hash = None, None
+        if args.build_provenance is not None:
+            require(len(args.build_provenance) == 1, "ambiguous repeated build-provenance input")
+            require(context is not None, "build provenance requires matching context")
+            provenance, provenance_hash = load(args.build_provenance[0])
+            provenance_check(provenance, context, local, allocation)
         result = {"schema_version": 1, "report_sha256": hashes, "host": local["host"],
                   "scope": "selected measured workloads only; not full WP17 or native qualification", "metrics": metrics}
         if args.validate_only:
             result.update(status="validated_unbudgeted", budget_enforced=False,
                           context_verified=context is not None,
+                          build_provenance_verified=provenance is not None,
                           limitations=["Historical latency summaries without raw samples are ineligible for budgets.",
                                        "Producer context records provenance; it is not a signature or independent attestation."])
             code = 0
         else:
             require(context is not None, "budget evaluation requires pinned release measurement context")
             budget, budget_hash = load(args.budget)
-            checked = evaluate(budget, context, local, allocation, metrics)
+            checked = evaluate(budget, context, local, allocation, metrics, provenance)
             passed = all(row["passed"] for row in checked)
             result.update(status="passed" if passed else "budget_exceeded", budget_enforced=True,
-                          context_sha256=context_hash, budget_sha256=budget_hash,
+                          context_sha256=context_hash, budget_sha256=budget_hash, budget_schema_version=2,
                           checked=checked, unbudgeted_metric_count=len(metrics)-len(checked))
             code = 0 if passed else 1
+        if provenance is not None:
+            result.update(build_provenance_sha256=provenance_hash,
+                          measured_source_revision=provenance["source_revision"],
+                          measured_run_id=provenance["run_id"], runner_boot_id=provenance["runner_boot_id"])
     except (Invalid, OSError, KeyError, TypeError, AttributeError, OverflowError, RecursionError) as error:
         result, code = {"schema_version": 1, "status": "invalid", "budget_enforced": False,
                         "error": str(error)[:2048]}, 2

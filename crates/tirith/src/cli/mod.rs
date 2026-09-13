@@ -2,9 +2,11 @@ use std::io::Write;
 
 pub(crate) mod audit_health;
 pub mod audit_retention;
+pub(crate) mod automatic_deadline;
 pub mod feedback;
 pub mod project_review;
 pub mod recommended_setup;
+pub(crate) mod setup_activation;
 pub mod shell_verification;
 pub mod support_bundle;
 pub mod tuning;

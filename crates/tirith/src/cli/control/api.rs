@@ -312,7 +312,7 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
             let operations: Vec<_> = recent.operations.iter().map(|status| {
                 json!({"schema_version":status.schema_version,"operation_id":status.operation_id,
                 "kind":status.kind,"state":status.state,"no_op":status.no_op,"active_action":status.active_action,
-                "created_at":status.created_at,"updated_at":status.updated_at,"step_count":status.steps.len()})
+                "created_at":status.created_at,"updated_at":status.updated_at,"step_count":status.steps.len(),"setup_activation":status.setup_activation})
             }).collect();
             Ok(
                 json!({"schema_version":1,"kind":"recent_operations", "operations":operations,"coverage":recent.coverage}),
@@ -577,7 +577,9 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
             };
             let mut result = profile::status_projection(&status, &compiled)?;
             if let Some(review) = mutations.impact_review(&status.operation_id)? {
-                review.validate_stored()?;
+                result["impact_observation"] =
+                    serde_json::to_value(review.historical_evidence_status(chrono::Utc::now())?)
+                        .map_err(|_| "cannot project historical evidence status")?;
                 result["impact_review"] =
                     serde_json::to_value(review).map_err(|_| "cannot project reviewed impact")?;
                 if serde_json::to_vec_pretty(&result)

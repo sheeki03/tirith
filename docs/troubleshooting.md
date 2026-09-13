@@ -78,9 +78,22 @@ To recover full protection after a degrade, restart your shell (and see
 Strict protocol-v3 receipts are available only to interactive bash, zsh, and
 fish hooks. Each live shell process registers once, and the capability is bound
 to that process and start identity, shell family, session ID, effective user,
-and the pinned Tirith executable identity. Nested shells register independently
-even when they inherit the same session ID. Do not export or manually set any
-`_TIRITH_RECEIPT_*` variable.
+and the pinned Tirith executable identity. Each fresh Bash, Zsh, Fish, or
+PowerShell hook load assigns a new `TIRITH_SESSION_ID`, replacing an inherited
+value. This keeps multiplexer panes and nested shells from sharing one shell's
+receipt ledger or warning history. Re-sourcing an already loaded hook keeps its
+ID; ordinary commands launched from that shell still inherit it. Explicit
+`TIRITH_SESSION_ID` values remain supported for CLI and agent callers that do
+not load a shell hook. Do not export or manually set any `_TIRITH_RECEIPT_*`
+variable.
+
+If a competing decision advances the ledger before a command is committed,
+that command is refused and its unused receipt can be discarded immediately.
+Press Enter again for a fresh check. Older unresolved receipts are reconciled
+against their exact durable transition: a committed one stays consumed; a
+proven missing one is discarded without the old 30-second delay. Unreadable,
+unauthenticated, or conflicting state still refuses; do not clear private
+receipt variables to bypass it.
 
 If the hook reports that receipts are unavailable, and a line is printed
 directly under the legacy-mode or degraded-evidence warning, read that line

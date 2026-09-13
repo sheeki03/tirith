@@ -54,6 +54,150 @@ fn request<'a>(
     }
 }
 
+fn history_fixture() -> ImpactReport {
+    let now = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    ImpactReport {
+        schema_version: ROLLOUT_SCHEMA_VERSION,
+        id: id(),
+        candidate_id: id(),
+        baseline_policy_identity: id(),
+        scope: RolloutScope::LocalManaged,
+        candidate_coverage: CandidateCoverage::EffectivePolicy,
+        candidate_profile: None,
+        candidate_profile_version: None,
+        evaluated_at: now,
+        workflows: vec![],
+        exceptions: vec![],
+        exception_inventory_complete: false,
+        clients: vec![],
+        counts: ImpactCounts::default(),
+        gaps: vec![
+            ImpactGap::RemotePublicationUnavailable,
+            ImpactGap::FleetAdoptionUnavailable,
+            ImpactGap::NoWorkflows,
+            ImpactGap::ExceptionInventoryUnavailable,
+        ],
+        execution_permitted: false,
+        automatically_approved: false,
+        remote_publication_available: false,
+        fleet_adoption_verified: false,
+    }
+}
+
+#[test]
+fn historical_age_projection_preserves_original_states_and_incomplete_inventory() {
+    let mut report = history_fixture();
+    let now = report.evaluated_at;
+    report.clients = vec![
+        ClientImpact {
+            id: id(),
+            state: ClientState::LocalPolicyEquivalent,
+            observed_at: Some(now - chrono::Duration::seconds(EVIDENCE_MAX_AGE_SECONDS - 1)),
+        },
+        ClientImpact {
+            id: id(),
+            state: ClientState::UnverifiedReport,
+            observed_at: Some(now),
+        },
+        ClientImpact {
+            id: id(),
+            state: ClientState::InvalidTimestamp,
+            observed_at: Some(now + chrono::Duration::seconds(60)),
+        },
+        ClientImpact {
+            id: id(),
+            state: ClientState::Unavailable,
+            observed_at: None,
+        },
+    ];
+    report.counts.local_equivalent = 1;
+    report.counts.unverified_clients = 1;
+    report.counts.unavailable_clients = 2;
+    let original = serde_json::to_vec(&report).unwrap();
+    let initial = report.historical_evidence_status(now).unwrap();
+    assert_eq!(initial.stale_client_timestamps, 0);
+    let next = report
+        .historical_evidence_status(now + chrono::Duration::seconds(1))
+        .unwrap();
+    assert_eq!(next.stale_client_timestamps, 1);
+    assert_eq!(next.future_client_timestamps, 1);
+    assert_eq!(next.missing_client_timestamps, 1);
+    assert!(!next.current_client_policy_observed);
+    assert!(!next.current_grant_state_observed);
+    assert!(!next.fleet_adoption_verified);
+    assert_eq!(serde_json::to_vec(&report).unwrap(), original);
+    assert!(!report.exception_inventory_complete);
+}
+
+#[test]
+fn historical_age_projection_handles_exact_expiry_staleness_and_clock_boundaries() {
+    let mut report = history_fixture();
+    let now = report.evaluated_at;
+    for (seconds, before) in [(-1, GrantState::Expired), (15, GrantState::Effective)] {
+        report.exceptions.push(ExceptionImpact {
+            id: id(),
+            owner: ExceptionOwner::LocalOperator { id: id() },
+            scope: ExceptionScope::User,
+            before,
+            proposed: before,
+            expires_at: Some(now + chrono::Duration::seconds(seconds)),
+            permanent: false,
+            owner_verified: true,
+            proposed_eligibility_available: true,
+        });
+    }
+    report.counts.expired_exceptions = 1;
+    let at = |seconds| {
+        report
+            .historical_evidence_status(now + chrono::Duration::seconds(seconds))
+            .unwrap()
+    };
+    assert_eq!(at(14).expiries_reached_since_review, Some(0));
+    assert_eq!(at(15).expiries_reached_since_review, Some(1));
+    assert_eq!(at(-1).expiries_reached_since_review, None);
+    assert_eq!(
+        at(-1).review_freshness,
+        HistoricalReviewFreshness::InvalidTimestamp
+    );
+    assert_eq!(
+        at(EVIDENCE_MAX_AGE_SECONDS - 1).review_freshness,
+        HistoricalReviewFreshness::Recent
+    );
+    assert_eq!(
+        at(EVIDENCE_MAX_AGE_SECONDS).review_freshness,
+        HistoricalReviewFreshness::Stale
+    );
+    assert_eq!(report.counts.expired_exceptions, 1);
+    assert_eq!(report.exceptions[1].before, GrantState::Effective);
+}
+
+#[test]
+fn historical_age_projection_rejects_invalid_stored_authority_and_counts() {
+    let mut report = history_fixture();
+    report.execution_permitted = true;
+    assert!(report
+        .historical_evidence_status(report.evaluated_at)
+        .is_err());
+    report.execution_permitted = false;
+    report.counts.local_equivalent = 1;
+    assert!(report
+        .historical_evidence_status(report.evaluated_at)
+        .is_err());
+    report.counts = ImpactCounts::default();
+    report.clients = (0..=MAX_CLIENTS)
+        .map(|_| ClientImpact {
+            id: id(),
+            state: ClientState::Unavailable,
+            observed_at: None,
+        })
+        .collect();
+    assert!(report
+        .historical_evidence_status(report.evaluated_at)
+        .is_err());
+}
+
 #[test]
 fn frozen_impact_is_repeatable_and_never_approves_or_serializes_content() {
     let _state = GlobalStateGuard::new().unwrap();

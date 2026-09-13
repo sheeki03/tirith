@@ -146,6 +146,9 @@ jobs:
       - name: Native shell tracing does not disclose private capabilities
         if: matrix.name == 'Linux'
         run: python3 tests/shell-trace-capability.py --require-shell bash --require-shell zsh --require-shell fish
+      - name: Native shell private state stays out of child environments
+        if: matrix.name == 'Linux'
+        run: python3 tests/shell-private-environment.py --require-shell bash --require-shell zsh --require-shell fish
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ matrix.rust }}
@@ -281,6 +284,7 @@ jobs:
           --test bash_preexec_enforce
           --test bash_hook_exports
           --test shell_conformance
+          --test shell_session_identity
 
   msrv:
     name: MSRV (1.83)

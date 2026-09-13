@@ -1,5 +1,62 @@
 # Implementation verification
 
+## Integrated automatic activation and recovery qualification (2026-09-13)
+
+The local candidate built from 90 retained changed/new inputs at base
+`aab72fdf` has manifest SHA-256
+`42aa775c321e75281cdc78ec4ae5a9fd58efac6b46455c3d4ee31036450149f0`.
+Its full CLI unit executable passes 2,032 tests, zero failures and two existing
+ignores. The preceding full core executable passes 6,022 tests and two existing
+ignores; the subsequent rollout-only change passes all ten targeted tests.
+Strict workspace/all-target Clippy and formatting pass.
+
+The retained release binary SHA-256 is
+`b9710b2eaf7174fbeed4d5a9642a650b02ef181429589a577e4f7c002e288b8c`.
+All eleven unchanged first-entry cases pass, including its first invocation.
+An actual recommended setup followed by a fresh native macOS Zsh session now
+completes the ordered automatic sequence: one allowed execution, zero blocked
+executions and successful terminal-state restoration. This row uses the tested
+MONITOR-off configuration. It does not qualify default job control, other
+shells, unsupported native module generations or released packages.
+
+The actual browser journey passes all three history/undo checks. It displays
+the exact stored observation, retains it after setup undo, reports the startup
+files as changed and keeps current protection unknown. Historical records are
+operator-owned evidence, not durable cryptographic attestations of current
+interception. Real child processes with umasks 022/027 cover private activation
+parent creation and the narrowly authorized migration of existing parents.
+
+Full native integration executables pass 22 Bash export cases, 55 Bash
+enforcement cases, four shell-session identity cases and 37 shell-conformance
+cases, with two existing conformance ignores. An older CLI integration fixture
+could not find the binary under test and matched echoed prompt text. Its
+correction prepends the built binary directory and requires fresh framed prompts
+plus an observed enter-mode frame before inducing the runtime delivery failure.
+The corrected targeted case passes. The fresh complete CLI integration
+executable passes all 503 tests with one existing ignore, unchanged product
+bytes and all four owned cleanup checks passing.
+
+Actual fixed-capacity storage qualification passes seven signed audit recovery
+scenarios, including six stopped rotation boundaries and concurrent cancellation.
+A real HFS+ ENOSPC audit append preserves prior evidence and verdicts while
+reporting failure. A separately owned APFS volume passes actual profile ENOSPC,
+unchanged-policy refusal, freed-space same-ID retry, stable replay, exact undo
+and stable undo. All owned images were detached and fixture keys removed.
+Earlier failed admission and unsupported-filesystem reports remain retained.
+These rows do not qualify Windows durability or power loss. The registered
+storage runners pass all 36 portable lifecycle fixtures.
+
+The resource workflow now permits an explicit 100-sample collection of its
+current source. Earlier pinned references remain historical after producer
+changes. New comparable references and actual growth cases are still required
+before enabling allocation/RSS thresholds.
+
+The optional self-hosted policy service and the no-code local package
+materializer are being implemented separately. Neither is qualified by the
+results above. G0–G3 and release certification remain open.
+
+## Earlier retained qualification records
+
 Run date: 2026-09-12. Source: the reviewed foundation implementation on
 `codex/next-cycle-foundations`, based on
 `7fd35101568bb06ee0d361dc1d4a4d193c5f60fd` (0.4.2).

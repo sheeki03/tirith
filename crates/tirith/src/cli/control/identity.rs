@@ -68,6 +68,20 @@ impl DirectoryIdentity {
         }))
     }
 
+    /// Validate an existing operator-owned leaf before tightening its ordinary
+    /// read permissions. Never repair another owner's directory, a writable
+    /// shared directory, or a Darwin ACL that would survive private mode bits.
+    #[cfg(unix)]
+    pub(crate) fn make_private_leaf(&self) -> Result<(), String> {
+        self.revalidate()?;
+        let leaf = self
+            .held
+            .last()
+            .ok_or("private parent has no retained leaf")?;
+        native::make_private_leaf(&leaf.file)?;
+        self.revalidate()
+    }
+
     pub fn revalidate(&self) -> Result<(), String> {
         if self.requested.canonicalize().ok().as_ref() != Some(&self.canonical) {
             return Err("private control directory path changed; reopen the dashboard".into());
@@ -144,10 +158,23 @@ impl BinaryIdentity {
         Self::capture_with_empty_input(path, true)
     }
 
+    /// Apply a caller's smaller bound to the opened file before hashing it.
+    /// A preceding pathname size check cannot close a replacement race.
+    pub(crate) fn capture_input_capped(path: &Path, cap: u64) -> Result<Self, String> {
+        if cap == 0 || cap > 512 * 1024 * 1024 {
+            return Err("invalid retained input size limit".into());
+        }
+        Self::capture_with_limit(path, true, cap)
+    }
+
     fn capture_with_empty_input(path: &Path, allow_empty: bool) -> Result<Self, String> {
+        Self::capture_with_limit(path, allow_empty, 512 * 1024 * 1024)
+    }
+
+    fn capture_with_limit(path: &Path, allow_empty: bool, cap: u64) -> Result<Self, String> {
         let mut file = open_binary_identity_file(path)?;
         let generation = native::generation(&file)?;
-        if (!allow_empty && generation.size == 0) || generation.size > 512 * 1024 * 1024 {
+        if (!allow_empty && generation.size == 0) || generation.size > cap {
             return Err("binary size exceeds identity limit".into());
         }
         let mut hash = Sha256::new();
@@ -308,6 +335,27 @@ mod native {
         }
         validate_acl(file, private)?;
         Ok(())
+    }
+
+    pub(super) fn make_private_leaf(file: &File) -> Result<(), String> {
+        let metadata = file
+            .metadata()
+            .map_err(|_| "cannot inspect private parent")?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(
+                "private parent migration requires an unshared operator-owned directory".into(),
+            );
+        }
+        validate_acl(file, true)?;
+        // Mutate only the directory retained during the trusted ancestry check.
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o700) } != 0 {
+            return Err("cannot make retained activation parent private".into());
+        }
+        file.sync_all()
+            .map_err(|_| "cannot sync private activation parent".into())
     }
 
     #[cfg(target_vendor = "apple")]
@@ -564,6 +612,28 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn capped_input_identity_checks_the_opened_generation_before_hashing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("small-private-input");
+        std::fs::write(&path, b"1234").unwrap();
+        assert!(BinaryIdentity::capture_input_capped(&path, 3).is_err());
+        let held = BinaryIdentity::capture_input_capped(&path, 4).unwrap();
+        assert_eq!(held.sha256(), format!("{:x}", Sha256::digest(b"1234")));
+        drop(held);
+        assert!(BinaryIdentity::capture_input_capped(&path, 0).is_err());
+        assert!(BinaryIdentity::capture_input_capped(&path, 512 * 1024 * 1024 + 1).is_err());
+        std::fs::write(&path, b"").unwrap();
+        assert!(BinaryIdentity::capture_input_capped(&path, 4).is_ok());
+        assert!(
+            BinaryIdentity::capture(&path).is_err(),
+            "binary emptiness contract is unchanged"
+        );
+        std::fs::write(&path, vec![b'x'; 4097]).unwrap();
+        assert!(BinaryIdentity::capture_input_capped(&path, 4096).is_err());
+    }
 
     #[test]
     #[cfg(not(windows))]

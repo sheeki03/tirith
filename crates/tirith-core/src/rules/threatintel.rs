@@ -2491,4 +2491,29 @@ mod tests {
         assert_eq!(ip_rule, RuleId::ThreatMaliciousIp);
         assert_eq!(ip_sev, Severity::High);
     }
+    #[test]
+    fn curl_empty_hex_dns_indicator_survives_ingestion_and_lookup() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 97);
+        writer.add_hostname("0x7f.0x", ThreatSource::Urlhaus);
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        assert!(db.check_hostname("0x7f.0x").is_some());
+        assert!(db.check_hostname("127.0.0.0").is_none());
+        let input = "curl http://0x7f.0x/path";
+        let extracted = crate::extract::extract_urls(input, ShellType::Posix);
+        assert!(check(input, ShellType::Posix, &extracted, Some(&db))
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ThreatMaliciousUrl));
+        let backing = crate::engine::build_dsl_backing(
+            input,
+            ShellType::Posix,
+            crate::extract::ScanContext::Exec,
+            &extracted,
+            Some(&db),
+        );
+        assert_eq!(
+            backing.as_eval_context(None, None).urls[0].reputation,
+            crate::custom_rule_dsl::Reputation::Malicious
+        );
+    }
 }

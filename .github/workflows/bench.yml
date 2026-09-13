@@ -10,6 +10,11 @@ on:
         description: Replay the explicitly pinned source and runner cohort
         type: boolean
         default: false
+      resource_samples:
+        description: Samples per workload for the selected current source
+        type: choice
+        options: ['10', '100']
+        default: '10'
 
 permissions:
   contents: read
@@ -26,6 +31,7 @@ jobs:
       RESOURCE_REFERENCE_COHORT: ${{ github.event_name == 'workflow_dispatch' && inputs.collect_pinned_reference }}
       RESOURCE_REFERENCE_SOURCE: 150e753a0adf8f9f13c8cc2b38f7a9325de40d91
       RESOURCE_REFERENCE_TREE: 53123b9d0aa615d4135ce6c42f37abe6a5cdca16
+      RESOURCE_SAMPLES: ${{ github.event_name == 'workflow_dispatch' && inputs.collect_pinned_reference && '100' || github.event_name == 'workflow_dispatch' && inputs.resource_samples || '10' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,6 +61,10 @@ jobs:
                       'image': 'ubuntu24', 'image_version': '20260907.300.1',
                       'cpu_model': 'AMD EPYC 7763 64-Core Processor', 'logical_cpus': 4}
           reference = os.environ['RESOURCE_REFERENCE_COHORT'] == 'true'
+          sample_input = os.environ['RESOURCE_SAMPLES']
+          if sample_input not in ('10', '100'):
+              raise SystemExit('resource sample count must be 10 or 100')
+          sample_count = int(sample_input)
           revision = command('git', 'rev-parse', 'HEAD')
           source_tree = command('git', 'rev-parse', 'HEAD^{tree}')
           selected_source = os.environ['RESOURCE_REFERENCE_SOURCE'] if reference else os.environ['GITHUB_SHA']
@@ -103,7 +113,7 @@ jobs:
                    'build_manifest_sha256': manifest_hashes,
                    'expected_build_manifest_sha256': expected_manifests if reference else None,
                    'reference_cohort': 'pr250-release100-epyc7763-source150e753a' if reference else None,
-                   'workload_samples': 100 if reference else 10, 'admission_issues': issues}
+                   'workload_samples': sample_count, 'admission_issues': issues}
           with open('resource-build-provenance.json', 'x') as output:
               json.dump(value, output, indent=2, allow_nan=False)
               output.write('\n')
@@ -148,7 +158,7 @@ jobs:
         run: >-
           cargo bench --locked -p tirith-core --bench resource_counts --
           --output "$GITHUB_WORKSPACE/resource-allocations.json"
-          --samples ${{ env.RESOURCE_REFERENCE_COHORT == 'true' && '100' || '10' }}
+          --samples "$RESOURCE_SAMPLES"
 
       - name: Build release candidate for resource characterization
         run: cargo build --release --locked -p tirith --bin tirith
@@ -159,7 +169,7 @@ jobs:
           python3 scripts/measure-local-control.py
           --binary "$GITHUB_WORKSPACE/target/release/tirith"
           --output "$GITHUB_WORKSPACE/resource-local-control.json"
-          --resources --samples ${{ env.RESOURCE_REFERENCE_COHORT == 'true' && '100' || '10' }}
+          --resources --samples "$RESOURCE_SAMPLES"
           --history-rows 250000
 
       - name: Record exact native resource measurement context

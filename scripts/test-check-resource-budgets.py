@@ -25,6 +25,26 @@ measure = module("measure", "measure-local-control.py")
 record = module("record", "record-resource-context.py")
 
 
+def provenance_fixture(context):
+    return {"schema_version": 1, "source_revision": context["source_revision"], "source_tree": "2" * 40,
+            "selected_measurement_source": context["source_revision"], "expected_measurement_tree": None,
+            "event_revision": context["source_revision"], "run_id": context["run_id"],
+            "workflow_ref": "fixture/repo/.github/workflows/bench.yml@refs/heads/fixture",
+            "workflow_sha": context["source_revision"], "runner_name": "fixture runner",
+            "runner_boot_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "runner_class": {**context["host"], **{key: value for key, value in context["runner"].items() if key != "label"}},
+            "expected_reference_class": None, "source_clean_before_build": True,
+            "rustc_verbose": "SYNTHETIC rustc\nhost: fixture", "cargo_verbose": "SYNTHETIC cargo\nhost: fixture",
+            "build_profile": "release", "build_manifest_sha256": {"Cargo.toml": "e" * 64, "Cargo.lock": "f" * 64},
+            "expected_build_manifest_sha256": None, "reference_cohort": None, "workload_samples": 3, "admission_issues": []}
+
+
+def contract_fixture(provenance):
+    value = {key: copy.deepcopy(provenance[key]) for key in ("build_profile", "rustc_verbose", "cargo_verbose", "build_manifest_sha256")}
+    value["workflow_path"] = "fixture/repo/.github/workflows/bench.yml"
+    return value
+
+
 def fixtures():
     sample = {"availability": "available", "cpu_user_ms": 1.0, "cpu_system_ms": 2.0, "peak_rss_bytes": 4096}
     local = {"schema_version": 1, "measurement_kind": "local_candidate_characterization",
@@ -57,12 +77,15 @@ def fixtures():
                "host": copy.deepcopy(local["host"]), "runner": {"label": "fixture", "image": "fixture", "image_version": "1", "cpu_model": "fixture CPU", "logical_cpus": 2},
                "producer_sha256": {"local": "b" * 64, "allocation": "d" * 64}, "report_sha256": {},
                "executable_sha256": {"local": "a" * 64, "allocation": "c" * 64}}
-    budget = {"schema_version": 1, "status": "reviewed", "review": "SYNTHETIC FIXTURE ONLY", "scope": "four fixture metrics",
+    budget = {"schema_version": 2, "status": "reviewed", "review": "SYNTHETIC FIXTURE ONLY", "scope": "four fixture metrics",
               "host": copy.deepcopy(context["host"]), "runner": copy.deepcopy(context["runner"]), "producer_sha256": copy.deepcopy(context["producer_sha256"]),
               "history_fixture": {"local": local["history_fixture"], "allocation": allocation["history_fixture"]},
               "workload_samples": {"local": 3, "allocation": 3},
               "baseline_evidence": [{"run_id": "fixture-" + str(i), "context_sha256": str(i) * 64, "source_revision": "1" * 40,
-                                     "build_profile": "release", "derivation": "Synthetic fixture; never a performance claim"} for i in range(1, 4)],
+                                     "build_profile": "release", "derivation": "Synthetic fixture; never a performance claim",
+                                     "build_provenance_sha256": str(i + 3) * 64,
+                                     "runner_boot_id": f"0000000{i}-0000-4000-8000-000000000000"} for i in range(1, 4)],
+              "build_contract": contract_fixture(provenance_fixture(context)),
               "limits": [{"metric": name, "unit": unit, "maximum": maximum, "minimum_samples": 3,
                           "rationale": "Synthetic exact-boundary test, not a reviewed product threshold"} for name, unit, maximum in [
                               ("local.cli_version.latency_ms.p95", "ms", 3), ("local.cli_version.cpu_ms.median", "ms", 3),
@@ -71,15 +94,95 @@ def fixtures():
     return local, allocation, context, budget
 
 
+def owned_fixture(local):
+    local["schema_version"] = 2
+    local["status"] = "completed"
+    local["native_helper_sha256"] = "9" * 64
+    local["native_helper_unchanged_during_run"] = True
+    local["harness_unchanged_during_run"] = True
+    local["service_resources"]["sampler_joined"] = True
+    local["owned_service"] = {"pid": 42, "exit": 0, "failure": None,
+        "startup_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "service_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "binary_sha256": local["binary_sha256"],
+        "identity_validated": True, "launcher_reused": True, "quiesce_acknowledged": True,
+        "cleanup": {key: True for key in ("leader_reaped", "group_signaled_or_absent", "group_members_exited", "output_eof")},
+        "group_observation": {"method": "procfs", "leader_retained_waitable": True,
+                              "members": [{"pid": 42, "state": "exited"}]}}
+    launch = local["measurements"].pop("service_launch")
+    launch["scope"] = "public launcher reuse of the already running owned service"
+    local["measurements"]["service_launcher_reuse"] = launch
+    local["measurements"]["service_direct_start"] = {
+        "ms": 5, "scope": "owned direct spawn through validated discovery and authenticated session"}
+
+
+
 class ResourceBudgets(unittest.TestCase):
     def setUp(self):
         self.local, self.allocation, self.context, self.budget = fixtures()
+        self.provenance = provenance_fixture(self.context)
 
     def metrics(self):
         return {**check.local_metrics(self.local), **check.allocation_metrics(self.allocation)}
 
     def evaluate(self):
-        return check.evaluate(self.budget, self.context, self.local, self.allocation, self.metrics())
+        return check.evaluate(self.budget, self.context, self.local, self.allocation, self.metrics(), self.provenance)
+
+    def test_owned_startup_and_reuse_are_distinct_from_historical_launch(self):
+        historical = self.metrics()
+        self.assertIn("local.service_launch.latency_ms.max", historical)
+        owned_fixture(self.local)
+        current = self.metrics()
+        self.assertNotIn("local.service_launch.latency_ms.max", current)
+        self.assertEqual(current["local.service_direct_start.latency_ms.max"]["value"], 5)
+        self.assertIn("local.service_launcher_reuse.peak_rss_bytes.max", current)
+        self.assertNotIn("local.service_direct_start.peak_rss_bytes.max", current)
+
+    def test_owned_enforcement_requires_exact_helper_hash(self):
+        owned_fixture(self.local)
+        with self.assertRaises(check.Invalid): self.evaluate()
+        self.budget["native_helper_sha256"] = self.local["native_helper_sha256"]
+        self.assertTrue(all(row["passed"] for row in self.evaluate()))
+        self.budget["native_helper_sha256"] = "8" * 64
+        with self.assertRaisesRegex(check.Invalid, "native helper changed"): self.evaluate()
+
+    def test_owned_report_requires_each_real_cleanup_and_lifecycle_fact(self):
+        owned_fixture(self.local)
+        original = copy.deepcopy(self.local)
+        for field in ("identity_validated", "launcher_reused", "quiesce_acknowledged"):
+            self.local = copy.deepcopy(original)
+            self.local["owned_service"][field] = False
+            with self.assertRaises(check.Invalid): self.metrics()
+        for field in original["owned_service"]["cleanup"]:
+            for bad in (False, 1):
+                self.local = copy.deepcopy(original)
+                self.local["owned_service"]["cleanup"][field] = bad
+                with self.assertRaises(check.Invalid): self.metrics()
+        for field, bad in (("exit", -9), ("exit", False), ("failure", "timeout")):
+            self.local = copy.deepcopy(original)
+            self.local["owned_service"][field] = bad
+            with self.assertRaises(check.Invalid): self.metrics()
+
+    def test_owned_report_rejects_missing_native_observation_and_failed_run(self):
+        owned_fixture(self.local)
+        original = copy.deepcopy(self.local)
+        for mutate in (
+            lambda r: r.update(status="failed"),
+            lambda r: r.update(native_helper_unchanged_during_run=False),
+            lambda r: r.update(harness_unchanged_during_run=False),
+            lambda r: r.pop("harness_unchanged_during_run"),
+            lambda r: r["service_resources"].update(sampler_joined=False),
+            lambda r: r["service_resources"].pop("sampler_joined"),
+            lambda r: r["owned_service"].pop("group_observation"),
+            lambda r: r["owned_service"].update(binary_sha256="e" * 64),
+            lambda r: r["owned_service"].update(startup_id="forged"),
+            lambda r: r["owned_service"]["group_observation"].update(leader_retained_waitable=False),
+            lambda r: r["owned_service"]["group_observation"]["members"][0].update(state="live"),
+            lambda r: r["measurements"]["service_direct_start"].update(resources=[]),
+            lambda r: r["measurements"]["service_launcher_reuse"].update(scope="cold launch"),
+        ):
+            self.local = copy.deepcopy(original)
+            mutate(self.local)
+            with self.assertRaises(check.Invalid): self.metrics()
 
     def test_all_four_metric_families_pass_exact_maximum_and_fail_above(self):
         self.assertTrue(all(row["passed"] for row in self.evaluate()))
@@ -282,18 +385,26 @@ class ResourceBudgets(unittest.TestCase):
             for name, value in (("local", self.local), ("allocation", self.allocation)):
                 path = root/(name + ".json"); path.write_text(json.dumps(value)); paths[name] = path
                 self.context["report_sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
-            context, budget = root/"context.json", root/"budget.json"
+            context, budget, provenance = root/"context.json", root/"budget.json", root/"provenance.json"
             context.write_text(json.dumps(self.context)); budget.write_text(json.dumps(self.budget))
+            provenance.write_text(json.dumps(self.provenance))
             base = [sys.executable, str(Path(__file__).with_name("check-resource-budgets.py")), "--local-report", str(paths["local"]), "--allocation-report", str(paths["allocation"])]
-            cases = [(0, "validated_unbudgeted", ["--validate-only"]), (0, "passed", ["--context", str(context), "--budget", str(budget)]),
-                     (2, "invalid", ["--budget", str(budget)])]
+            enforcing = ["--context", str(context), "--build-provenance", str(provenance), "--budget", str(budget)]
+            cases = [(0, "validated_unbudgeted", ["--validate-only"]), (0, "passed", enforcing),
+                     (0, "validated_unbudgeted", ["--context", str(context), "--build-provenance", str(provenance), "--validate-only"]),
+                     (2, "invalid", ["--budget", str(budget)]),
+                     (2, "invalid", ["--context", str(context), "--budget", str(budget)]),
+                     (2, "invalid", enforcing + ["--build-provenance", str(provenance)])]
             for code, status, extra in cases:
                 result = subprocess.run(base + extra, capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, code, result.stdout)
                 self.assertEqual(json.loads(result.stdout)["status"], status)
+                if status == "passed":
+                    self.assertEqual(json.loads(result.stdout)["build_provenance_sha256"], hashlib.sha256(provenance.read_bytes()).hexdigest())
+                    self.assertEqual(json.loads(result.stdout)["budget_schema_version"], 2)
             self.budget["limits"][0]["maximum"] = 0
             budget.write_text(json.dumps(self.budget))
-            result = subprocess.run(base + ["--context", str(context), "--budget", str(budget)], capture_output=True, text=True, timeout=10)
+            result = subprocess.run(base + enforcing, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 1, result.stdout)
             self.assertEqual(json.loads(result.stdout)["status"], "budget_exceeded")
             self.local["sampling"] = None
@@ -301,6 +412,160 @@ class ResourceBudgets(unittest.TestCase):
             result = subprocess.run(base + ["--validate-only"], capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 2, result.stdout)
             self.assertEqual(json.loads(result.stdout)["status"], "invalid")
+
+    def test_v1_or_unsupported_budget_cannot_downgrade_provenance_requirement(self):
+        for version in (1, 0, 3, True, "2", None):
+            self.budget["schema_version"] = version
+            with self.subTest(version=version), self.assertRaisesRegex(check.Invalid, "schema v2"):
+                self.evaluate()
+        self.budget["schema_version"] = 2
+        with self.assertRaisesRegex(check.Invalid, "requires build provenance"):
+            check.evaluate(self.budget, self.context, self.local, self.allocation, self.metrics())
+
+    def test_every_provenance_field_is_required_and_unknown_fields_refuse(self):
+        for field in self.provenance:
+            value = copy.deepcopy(self.provenance)
+            del value[field]
+            with self.subTest(field=field), self.assertRaises(check.Invalid):
+                check.provenance_check(value, self.context, self.local, self.allocation)
+        self.provenance["other_source_revision"] = "3" * 40
+        with self.assertRaisesRegex(check.Invalid, "unexpected or missing"):
+            self.evaluate()
+
+    def test_provenance_mismatches_dirty_sources_and_admission_failures_refuse(self):
+        changes = {"schema_version": True, "source_revision": "3" * 40, "source_tree": "main",
+                   "selected_measurement_source": "3" * 40, "run_id": "other-run",
+                   "event_revision": "3" * 40, "workflow_sha": "3" * 40,
+                   "source_clean_before_build": 1, "build_profile": "debug", "admission_issues": ["wrong CPU"],
+                   "runner_name": "", "runner_boot_id": "0" * 36, "workload_samples": True,
+                   "runner_class": {}, "rustc_verbose": "bad\x00identity", "cargo_verbose": "x" * 8193,
+                   "build_manifest_sha256": {"Cargo.toml": "e" * 64},
+                   "workflow_ref": "fixture/repo/.github/workflows/bench.yml@refs/heads/a@refs/heads/b"}
+        for field, value in changes.items():
+            original = copy.deepcopy(self.provenance)
+            self.provenance[field] = value
+            with self.subTest(field=field), self.assertRaises(check.Invalid):
+                self.evaluate()
+            self.provenance = original
+
+    def test_consistent_new_product_source_and_workflow_revision_are_allowed(self):
+        self.context["source_revision"] = "3" * 40
+        for key in ("source_revision", "selected_measurement_source", "event_revision", "workflow_sha"):
+            self.provenance[key] = "3" * 40
+        self.provenance["source_tree"] = "4" * 40
+        self.provenance["run_id"] = self.context["run_id"] = "new-product-run"
+        self.provenance["workflow_ref"] = "fixture/repo/.github/workflows/bench.yml@refs/pull/99/merge"
+        self.assertTrue(all(row["passed"] for row in self.evaluate()))
+
+    def test_exact_compiler_cargo_manifests_and_workflow_path_contract_refuse_drift(self):
+        for field, value in (("rustc_verbose", "NEW rustc\nhost: fixture"), ("cargo_verbose", "NEW cargo\nhost: fixture"),
+                             ("build_manifest_sha256", {"Cargo.toml": "e" * 64, "Cargo.lock": "9" * 64}),
+                             ("workflow_ref", "fixture/repo/.github/workflows/other.yml@refs/heads/fixture")):
+            self.setUp()
+            self.provenance[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(check.Invalid, "compiler/build contract differs"):
+                self.evaluate()
+        self.setUp()
+        self.budget["build_contract"]["ambient_unchecked"] = "ignored"
+        with self.assertRaises(check.Invalid):
+            self.evaluate()
+
+    def test_reference_admission_allows_frozen_source_but_refuses_partial_or_changed_expectations(self):
+        self.provenance.update(reference_cohort="synthetic cohort", expected_measurement_tree=self.provenance["source_tree"],
+                               expected_reference_class=copy.deepcopy(self.provenance["runner_class"]),
+                               expected_build_manifest_sha256=copy.deepcopy(self.provenance["build_manifest_sha256"]),
+                               event_revision="3" * 40, workflow_sha="3" * 40)
+        self.assertTrue(all(row["passed"] for row in self.evaluate()))
+        original = copy.deepcopy(self.provenance)
+        for field, value in (("reference_cohort", None), ("expected_measurement_tree", None),
+                             ("expected_measurement_tree", "4" * 40), ("expected_reference_class", {}),
+                             ("expected_build_manifest_sha256", {})):
+            self.provenance = copy.deepcopy(original)
+            self.provenance[field] = value
+            with self.subTest(field=field), self.assertRaises(check.Invalid):
+                self.evaluate()
+
+    def test_baseline_provenance_hashes_and_distinct_canonical_boots_are_required(self):
+        for field, value in (("build_provenance_sha256", "missing"), ("runner_boot_id", "00000000-0000-0000-0000-000000000000"),
+                             ("runner_boot_id", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")):
+            self.setUp()
+            self.budget["baseline_evidence"][0][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(check.Invalid):
+                self.evaluate()
+        for field in ("build_provenance_sha256", "runner_boot_id"):
+            self.setUp()
+            self.budget["baseline_evidence"][1][field] = self.budget["baseline_evidence"][0][field]
+            with self.subTest(field=field), self.assertRaisesRegex(check.Invalid, "duplicated baseline"):
+                self.evaluate()
+
+    def test_provenance_and_budget_contracts_reject_numeric_type_coercion(self):
+        for target, field in (("provenance", "runner_class"), ("budget", "runner"), ("budget", "workload_samples")):
+            self.setUp()
+            value = self.provenance if target == "provenance" else self.budget
+            key = "local" if field == "workload_samples" else "logical_cpus"
+            value[field][key] = float(value[field][key])
+            with self.subTest(target=target, field=field), self.assertRaises(check.Invalid):
+                self.evaluate()
+        self.setUp()
+        self.budget["history_fixture"]["local"]["rows"] = 1000.0
+        with self.assertRaises(check.Invalid):
+            self.evaluate()
+
+    def test_raw_allocation_growth_is_recomputed_with_an_unchanged_limit(self):
+        self.assertTrue(all(row["passed"] for row in self.evaluate()))
+        self.allocation["workloads"][0]["samples"][1]["counts"]["allocation_calls"] = 4
+        checked = self.evaluate()
+        self.assertFalse(checked[-1]["passed"])
+        self.assertEqual(checked[-1]["maximum"], 3)
+        self.assertEqual(checked[-1]["value"], 4)
+        self.assertTrue(all(row["passed"] for row in checked[:-1]))
+
+    def test_checked_in_candidate_stays_draft_and_cannot_enforce(self):
+        path = Path(__file__).parent.parent / "docs/resource-budgets/pr250-epyc7763-v2.draft.json"
+        draft, _ = check.load(path)
+        self.assertEqual(draft["schema_version"], 2)
+        self.assertEqual(draft["status"], "draft")
+        with self.assertRaisesRegex(check.Invalid, "draft/unreviewed"):
+            check.evaluate(draft, self.context, self.local, self.allocation, self.metrics(), self.provenance)
+
+    def test_validate_only_legacy_summary_needs_no_new_provenance(self):
+        for name in check.CLI + check.HTTP:
+            del self.local["measurements"][name]["samples_ms"]
+            if name in check.CLI:
+                del self.local["measurements"][name]["subsequent"]["samples_ms"]
+        metrics = self.metrics()
+        self.assertFalse(metrics["local.cli_version.latency_ms.p95"]["raw_samples"])
+        check.provenance_check(self.provenance, self.context, self.local, self.allocation)
+
+    def test_provenance_file_uses_bounded_regular_nofollow_duplicate_safe_loader(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            paths = {}
+            for name, value in (("local", self.local), ("allocation", self.allocation)):
+                paths[name] = root / (name + ".json")
+                paths[name].write_text(json.dumps(value))
+                self.context["report_sha256"][name] = hashlib.sha256(paths[name].read_bytes()).hexdigest()
+            context, provenance, budget = root / "context.json", root / "provenance.json", root / "budget.json"
+            context.write_text(json.dumps(self.context)); budget.write_text(json.dumps(self.budget))
+            command = [sys.executable, str(Path(__file__).with_name("check-resource-budgets.py")),
+                       "--local-report", str(paths["local"]), "--allocation-report", str(paths["allocation"]),
+                       "--context", str(context), "--build-provenance", str(provenance), "--budget", str(budget)]
+            for raw in ('{"schema_version":1,"schema_version":1}', '[]', '{}', 'x' * (check.CAP + 1)):
+                provenance.write_text(raw)
+                result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(json.loads(result.stdout)["status"], "invalid")
+            provenance.unlink()
+            special = []
+            if hasattr(os, "symlink"):
+                special.append(lambda: provenance.symlink_to(context))
+            if hasattr(os, "mkfifo"):
+                special.append(lambda: os.mkfifo(provenance))
+            for create in special:
+                create()
+                result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                provenance.unlink()
 
 
 if __name__ == "__main__":

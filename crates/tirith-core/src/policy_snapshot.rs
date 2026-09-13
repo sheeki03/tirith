@@ -138,6 +138,7 @@ pub struct EffectivePolicySnapshot {
     pub custom_profile_overrides: Vec<String>,
     pub remote: RemotePolicyEvidence,
     witnesses: Vec<InputWitness>,
+    bounded_input_refused: bool,
     resolution_cwd: Option<String>,
 }
 
@@ -230,6 +231,7 @@ impl EffectivePolicySnapshot {
             custom_profile_overrides,
             remote: captured.remote,
             witnesses: captured.witnesses,
+            bounded_input_refused: crate::policy::bounded_runtime_refused(),
             resolution_cwd: cwd.map(str::to_string),
         }
     }
@@ -239,6 +241,12 @@ impl EffectivePolicySnapshot {
     /// A remote snapshot requires a new resolution for a remote-authorized
     /// mutation: a local recheck cannot prove the server has not changed.
     pub fn revalidate_inputs(&self) -> Result<(), PolicyConflict> {
+        if self.bounded_input_refused || crate::policy::bounded_runtime_refused() {
+            return Err(PolicyConflict {
+                reason: "bounded runtime policy input is unavailable".into(),
+                changed_revisions: Vec::new(),
+            });
+        }
         let changed_revisions: Vec<_> = self
             .witnesses
             .iter()
@@ -365,7 +373,11 @@ impl EffectivePolicySnapshot {
                         InputReader::Trusted(cap) => format!("trusted:{cap}"),
                         InputReader::NoFollow(cap) => format!("no_follow:{cap}"),
                         InputReader::Repository => "repository".into(),
-                        InputReader::UserList => "user_list".into(),
+                        // The bound restricts admission, not the interpreted input.
+                        // Keep valid setup intent replay identities compatible.
+                        InputReader::UserList | InputReader::BoundedUserList(_) => {
+                            "user_list".into()
+                        }
                     };
                     part(&mut hash, reader.as_bytes());
                     match expected {
@@ -433,7 +445,7 @@ pub(crate) fn resolve_runtime_policy(cwd: Option<&str>) -> Policy {
     policy.load_trust_entries(cwd);
     policy.load_context_labels(cwd);
     policy.load_ssh_host_labels(cwd);
-    policy
+    crate::policy::refuse_bounded_runtime_if_needed(policy)
 }
 
 #[derive(Clone, Copy)]
@@ -443,6 +455,9 @@ pub(crate) enum InputReader {
     Repository,
     /// Preserves the pre-existing unrestricted operator list reader.
     UserList,
+    /// Automatic input admission is retained for future witness reads, even
+    /// after the thread-local admission guard is dropped.
+    BoundedUserList(u64),
 }
 
 #[derive(Clone)]
@@ -523,18 +538,30 @@ impl InputWitness {
     }
 }
 
-fn read_input(path: &Path, reader: InputReader) -> Result<Vec<u8>, crate::util::OpenRegularError> {
+pub(crate) fn read_input(
+    path: &Path,
+    reader: InputReader,
+) -> Result<Vec<u8>, crate::util::OpenRegularError> {
     match reader {
         InputReader::Trusted(cap) => crate::util::read_regular_capped(path, cap),
         InputReader::NoFollow(cap) => crate::util::read_text_no_follow_capped(path, cap),
         InputReader::Repository => crate::policy::read_repository_policy(path),
-        InputReader::UserList => std::fs::read(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                crate::util::OpenRegularError::NotFound
-            } else {
-                crate::util::OpenRegularError::Io(error)
+        InputReader::BoundedUserList(cap) => crate::policy::read_bounded_user_list(path, cap),
+        InputReader::UserList => {
+            // An older ordinary snapshot revalidated inside an automatic scope
+            // must honor its admission bound too. Outside it, keep the original
+            // reader; bounded snapshots retain their own cap above regardless.
+            if let InputReader::BoundedUserList(cap) = crate::policy::user_list_reader() {
+                return crate::policy::read_bounded_user_list(path, cap);
             }
-        }),
+            std::fs::read(path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    crate::util::OpenRegularError::NotFound
+                } else {
+                    crate::util::OpenRegularError::Io(error)
+                }
+            })
+        }
     }
 }
 

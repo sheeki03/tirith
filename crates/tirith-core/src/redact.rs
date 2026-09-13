@@ -1029,6 +1029,36 @@ pub fn redact_blocked_output(input: &str) -> String {
     privacy_project_durable_text(input)
 }
 
+/// Exact fixed labels may survive repeated endpoint projection. This does not
+/// accept arbitrary marker text, suffixes, or labels from runtime configuration.
+pub(crate) fn is_fixed_redaction_marker(value: &str) -> bool {
+    if value == "[REDACTED]" {
+        return true;
+    }
+    let Some(label) = value
+        .strip_prefix("[REDACTED:")
+        .and_then(|v| v.strip_suffix(']'))
+    else {
+        return false;
+    };
+    matches!(
+        label,
+        "Bearer Token"
+            | "custom"
+            | "customer_id"
+            | "incomplete"
+            | "analysis_incomplete"
+            | "tirith_canary"
+            | "evm_private_key"
+            | "supported_secret"
+            | "path"
+            | "invalid_endpoint"
+    ) || BUILTIN_PATTERNS.iter().any(|(fixed, _)| *fixed == label)
+        || CREDENTIAL_REDACT_PATTERNS
+            .iter()
+            .any(|entry| entry.label == label)
+}
+
 /// Project a free-form key/value pair while retaining the key as context for
 /// short values such as `PASSWORD=hunter2` that are sensitive only when paired
 /// with a registered name. The output is fixed-label only; it never retains a

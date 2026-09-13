@@ -416,6 +416,91 @@ fn completion_fingerprint(record: &Journal) -> Result<String, String> {
     ))
 }
 
+/// Reconstruct only the immutable original completion identity after undo.
+/// This never reacquires a completion lease or authenticates a live shell.
+pub(super) fn historical_completion_binding(
+    record: &Journal,
+    completed_state: JobState,
+) -> Result<String, String> {
+    if record.schema_version != SCHEMA
+        || record.kind != OperationKind::RecommendedSetup
+        || !matches!(
+            completed_state,
+            JobState::Completed | JobState::CompletedWithRecovery
+        )
+        || !matches!(
+            &record.setup_completion,
+            Some(SetupCompletionEvidence::Available { .. })
+        )
+        || record.payload_digest != expected_payload_digest(record)?
+    {
+        return Err("historical setup completion identity is unavailable".into());
+    }
+    let intent = record
+        .setup_verification
+        .as_ref()
+        .ok_or("historical setup intent is missing")?;
+    intent.validate_for(
+        record.kind,
+        record.shell_precondition.as_ref(),
+        record.steps.iter().map(|step| step.target.clone()),
+    )?;
+    if intent.shell != ShellKind::Zsh || intent.planned_postconditions.len() != record.steps.len() {
+        return Err("historical setup channel or input binding does not match".into());
+    }
+    let mut original = record.clone();
+    original.state = completed_state;
+    completion_fingerprint(&original)
+}
+
+/// A bounded sample of recorded setup documents, not current process/policy or
+/// protection evidence. Never reads the executable or resolves runtime policy.
+pub(super) fn historical_setup_relation(
+    record: &Journal,
+    compare_inputs: bool,
+) -> activation_history::SetupRelation {
+    use activation_history::SetupRelation;
+    if record.active_action == Some(JobAction::Undo)
+        || record.undo_external_authorization.is_some()
+        || record.setup_verification_cancelled
+    {
+        return SetupRelation::Changed;
+    }
+    if !matches!(
+        record.state,
+        JobState::Completed | JobState::CompletedWithRecovery
+    ) {
+        return SetupRelation::Unknown;
+    }
+    if !compare_inputs {
+        return SetupRelation::NotChecked;
+    }
+    let checked: Result<SetupRelation, String> = (|| {
+        let intent = record
+            .setup_verification
+            .as_ref()
+            .ok_or("setup inputs unavailable")?;
+        intent.validate_documents()?;
+        let mut remaining = MAX_UNCHANGED_INPUT_BYTES as usize;
+        for input in intent
+            .unchanged_inputs
+            .iter()
+            .chain(&intent.planned_postconditions)
+        {
+            let snapshot =
+                fs_helpers::read_snapshot_scoped_capped(&input.path, &input.scope, remaining)?;
+            if let Some(bytes) = &snapshot.bytes {
+                remaining = remaining.saturating_sub(bytes.len());
+            }
+            if !input.matches(snapshot.bytes.as_deref()) {
+                return Ok(SetupRelation::Changed);
+            }
+        }
+        Ok(SetupRelation::RecordedInputsMatch)
+    })();
+    checked.unwrap_or(SetupRelation::Unknown)
+}
+
 fn validate_completed_record(record: &Journal) -> Result<(), String> {
     if record.kind != OperationKind::RecommendedSetup
         || record.client_version != env!("CARGO_PKG_VERSION")
@@ -491,6 +576,17 @@ impl CompletedSetupLease {
     }
     pub(crate) fn operation_id(&self) -> &str {
         &self.operation_id
+    }
+
+    /// Private correlation only. A persisted copy cannot reacquire this lease.
+    /// Freshness retains full lease checks before and after the authenticated
+    /// native clock observation; return the immutable binding after that check.
+    pub(super) fn automatic_claim_binding_for_shell(
+        &self,
+        shell: &tirith_core::execution_state::AuthenticatedShellContext,
+    ) -> Result<String, String> {
+        self.require_fresh_shell(shell)?;
+        Ok(self.fingerprint.clone())
     }
 
     pub(crate) fn selected_shell(&self) -> ShellKind {
@@ -1203,6 +1299,85 @@ mod tests {
                 .unwrap();
             rewrite_record(&service, &id, |record| record.setup_completion = None);
             assert!(lease.revalidate().is_err());
+        });
+    }
+
+    #[test]
+    fn automatic_discovery_refuses_multiple_explicit_completions_without_ordering() {
+        with_setup_env(|home, _| {
+            let (service, first) = plan(home, true);
+            complete(&service, &first);
+            let prepared = prepared(home, true);
+            let second = uuid::Uuid::new_v4().to_string();
+            save(&service, &second, &prepared);
+            complete(&service, &second);
+            let before_first = std::fs::read(service.path(&first).unwrap()).unwrap();
+            let before_second = std::fs::read(service.path(&second).unwrap()).unwrap();
+            assert!(service.unique_activation_candidate().is_err());
+            assert_eq!(
+                std::fs::read(service.path(&first).unwrap()).unwrap(),
+                before_first
+            );
+            assert_eq!(
+                std::fs::read(service.path(&second).unwrap()).unwrap(),
+                before_second
+            );
+            rewrite_record(&service, &second, |record| {
+                record.setup_verification_cancelled = true
+            });
+            assert_eq!(
+                service
+                    .unique_activation_candidate()
+                    .unwrap()
+                    .unwrap()
+                    .operation_id,
+                first
+            );
+        });
+    }
+
+    #[test]
+    fn automatic_discovery_requires_new_intent_after_running_or_ended_claim() {
+        with_setup_env(|home, _| {
+            let (service, first) = plan(home, true);
+            complete(&service, &first);
+            let before = std::fs::read(service.path(&first).unwrap()).unwrap();
+            let path = service
+                .scope
+                .join("automatic-activation-claims")
+                .join(format!("{first}.json"));
+            let mut claim = serde_json::json!({
+                "schema_version": 1, "operation_id": first,
+                "attempt_id": uuid::Uuid::new_v4().to_string(),
+                "setup_binding": "a".repeat(64), "shell_binding": "b".repeat(64),
+                "loaded": "c".repeat(64), "phase": "running",
+            });
+            for phase in ["running", "ended"] {
+                claim["phase"] = serde_json::json!(phase);
+                fs_helpers::atomic_write(&path, &service.scope, &claim.to_string(), 0o600).unwrap();
+                assert!(service.unique_activation_candidate().unwrap().is_none());
+            }
+            let second = uuid::Uuid::new_v4().to_string();
+            save(&service, &second, &prepared(home, true));
+            complete(&service, &second);
+            assert_eq!(
+                service
+                    .unique_activation_candidate()
+                    .unwrap()
+                    .unwrap()
+                    .operation_id,
+                second
+            );
+            claim["phase"] = serde_json::json!("pending");
+            fs_helpers::atomic_write(&path, &service.scope, &claim.to_string(), 0o600).unwrap();
+            assert!(service.unique_activation_candidate().is_err());
+            claim["phase"] = serde_json::json!("invented");
+            fs_helpers::atomic_write(&path, &service.scope, &claim.to_string(), 0o600).unwrap();
+            assert!(service.unique_activation_candidate().is_err());
+            assert_eq!(
+                std::fs::read(service.path(&first).unwrap()).unwrap(),
+                before
+            );
         });
     }
 }

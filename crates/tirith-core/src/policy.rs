@@ -6,6 +6,15 @@ use std::path::{Path, PathBuf};
 use crate::agent_origin::AgentOrigin;
 use crate::policy_snapshot::{self as snapshot, InputReader, PolicySource};
 
+#[path = "policy_bounded_runtime.rs"]
+mod bounded_runtime;
+#[doc(hidden)]
+pub use bounded_runtime::BoundedRuntimePolicyInputs;
+pub(crate) use bounded_runtime::{
+    bounded_runtime_refused, read_bounded_user_list, refuse_bounded_runtime_if_needed,
+    user_list_reader,
+};
+
 std::thread_local! {
     static POLICY_DIAGNOSTIC_CAPTURES: std::cell::RefCell<Vec<PolicyDiagnosticCaptureState>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -13,6 +22,7 @@ std::thread_local! {
 
 #[derive(Default)]
 struct PolicyDiagnosticCaptureState {
+    discard: bool,
     messages: Vec<String>,
     frozen_dlp_custom_patterns: Option<Vec<String>>,
 }
@@ -29,14 +39,26 @@ pub struct PolicyDiagnosticCapture {
 impl PolicyDiagnosticCapture {
     pub fn start() -> Self {
         POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
-            captures
-                .borrow_mut()
-                .push(PolicyDiagnosticCaptureState::default())
+            let discard = captures.borrow().iter().any(|capture| capture.discard);
+            captures.borrow_mut().push(PolicyDiagnosticCaptureState {
+                discard,
+                ..Default::default()
+            })
         });
         Self {
             active: true,
             _not_send: std::marker::PhantomData,
         }
+    }
+
+    /// Keep internal protocol routes silent, including nested normal captures.
+    /// Suppressed diagnostics are not formatted or retained in memory.
+    pub fn start_silent() -> Self {
+        let capture = Self::start();
+        POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
+            captures.borrow_mut().last_mut().unwrap().discard = true;
+        });
+        capture
     }
 
     /// Drain messages accumulated by the innermost active capture without
@@ -136,6 +158,14 @@ impl Drop for PolicyDiagnosticCapture {
 }
 
 fn emit_policy_diagnostic(arguments: std::fmt::Arguments<'_>) {
+    if POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
+        captures
+            .borrow()
+            .last()
+            .is_some_and(|capture| capture.discard)
+    }) {
+        return;
+    }
     let message = arguments.to_string();
     let captured = POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
         let mut captures = captures.borrow_mut();
@@ -1667,7 +1697,7 @@ impl Policy {
     pub fn discover(cwd: Option<&str>) -> Self {
         let mut p = Self::discover_resolved(cwd);
         p.apply_runtime_overrides();
-        p
+        refuse_bounded_runtime_if_needed(p)
     }
 
     /// Discover the EFFECTIVE policy OFFLINE — local resolution
@@ -3090,14 +3120,9 @@ impl Policy {
             for name in ["allowlist", "blocklist"] {
                 let path = config.join(name);
                 let before = snapshot::values(self);
-                let read = std::fs::read(&path).map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        crate::util::OpenRegularError::NotFound
-                    } else {
-                        crate::util::OpenRegularError::Io(error)
-                    }
-                });
-                snapshot::observe_read(&path, "user_list", InputReader::UserList, &read);
+                let reader = bounded_runtime::user_list_reader();
+                let read = snapshot::read_input(&path, reader);
+                snapshot::observe_read(&path, "user_list", reader, &read);
                 if let Ok(content) = read.and_then(|bytes| {
                     String::from_utf8(bytes).map_err(|error| {
                         crate::util::OpenRegularError::Io(std::io::Error::new(
@@ -3770,6 +3795,82 @@ fn merge_repo_package_tightening(
         if repo_max > baseline.repo_mismatch_check_max_packages_effective() {
             baseline.repo_mismatch_check_max_packages = Some(repo_max);
         }
+    }
+}
+
+/// Preserve a selected client's DNS identity when an extracted URL cannot be
+/// represented by the generic URL parser. Raw-only public policy APIs retain
+/// their existing semantics; only the engine has the required client context.
+pub(crate) fn allowlist_pattern_matches_parsed(
+    pattern: &str,
+    raw: &str,
+    parsed: &crate::parse::UrlLike,
+) -> bool {
+    if !matches!(
+        parsed,
+        crate::parse::UrlLike::Unparsed { .. } | crate::parse::UrlLike::SchemelessHostPath { .. }
+    ) {
+        return allowlist_pattern_matches(pattern, raw);
+    }
+    let Some(host) = parsed
+        .host()
+        .and_then(crate::parse::curl_empty_hex_dns_host)
+    else {
+        return allowlist_pattern_matches(pattern, raw);
+    };
+    let raw_url = if raw.contains("://") {
+        raw.trim().to_string()
+    } else {
+        // Exact schemeless trust resources have always implied HTTPS.
+        format!(
+            "https://{}",
+            raw.trim().strip_prefix("//").unwrap_or(raw.trim())
+        )
+    };
+    let Some(authority) = crate::parse::curl_empty_hex_dns_url_host(&raw_url) else {
+        // Once a client-specific DNS identity is selected, malformed raw
+        // authority cannot regain trust through the generic numeric parser.
+        return false;
+    };
+    if authority != host {
+        return false; // contradictory components cannot authorize a finding
+    }
+    let p = pattern.trim();
+    if validate_trust_pattern(p).is_err() {
+        return false;
+    }
+    match classify_trust_pattern(p) {
+        TrustScopeKind::Exact => {
+            let pattern_url = if p.contains("://") {
+                p.to_string()
+            } else if p.contains('/') {
+                format!("https://{p}")
+            } else {
+                return p == raw.trim();
+            };
+            let Some(pattern_host) = crate::parse::curl_empty_hex_dns_url_host(&pattern_url) else {
+                return false;
+            };
+            let (Ok(pattern), Ok(candidate)) =
+                (url::Url::parse(&pattern_url), url::Url::parse(&raw_url))
+            else {
+                return false;
+            };
+            // Full URL equality except that the retained DNS host is compared
+            // as DNS, never as the WHATWG parser's rewritten numeric address.
+            pattern_host == host
+                && pattern.scheme() == candidate.scheme()
+                && pattern.username() == candidate.username()
+                && pattern.password() == candidate.password()
+                && pattern.port() == candidate.port()
+                && pattern.path() == candidate.path()
+                && pattern.query() == candidate.query()
+                && pattern.fragment() == candidate.fragment()
+        }
+        TrustScopeKind::Domain | TrustScopeKind::Wildcard | TrustScopeKind::BareTld => {
+            domain_matches(&host, &p.to_lowercase())
+        }
+        TrustScopeKind::Substring => raw.to_lowercase().contains(&p.to_lowercase()),
     }
 }
 
@@ -7410,6 +7511,87 @@ mod snapshot_cache_tests {
             assert_eq!(snapshot.remote.availability, "cached");
             assert_eq!(snapshot.remote.freshness, "unknown");
             assert!(snapshot.remote.cache_age_seconds.is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod curl_client_authority_tests {
+    use super::*;
+    #[test]
+    fn curl_dns_trust_matching_uses_components_without_changing_raw_api() {
+        let raw = "http://user:secret@0x7f.0x:8080/path?q=1#f";
+        let parsed = crate::extract::parse_curl_destination(raw);
+        for pattern in ["127.0.0.0", "http://user:secret@127.0.0.0:8080/path?q=1#f"] {
+            assert!(
+                allowlist_pattern_matches(pattern, raw),
+                "generic compatibility: {pattern}"
+            );
+            assert!(
+                !allowlist_pattern_matches_parsed(pattern, raw, &parsed),
+                "curl DNS cannot inherit {pattern}"
+            );
+        }
+        for pattern in ["0x7f.0x", "*.0x", raw] {
+            assert!(
+                allowlist_pattern_matches_parsed(pattern, raw, &parsed),
+                "explicit DNS trust: {pattern}"
+            );
+        }
+        for wrong in [
+            "https://user:secret@0x7f.0x:8080/path?q=1#f",
+            "http://user:secret@0x7f.0x:8081/path?q=1#f",
+            "http://other:secret@0x7f.0x:8080/path?q=1#f",
+            "http://user:other@0x7f.0x:8080/path?q=1#f",
+            "http://user:secret@0x7f.0x:8080/other?q=1#f",
+            "http://user:secret@0x7f.0x:8080/path?q=2#f",
+            "http://user:secret@0x7f.0x:8080/path?q=1#other",
+        ] {
+            assert!(
+                !allowlist_pattern_matches_parsed(wrong, raw, &parsed),
+                "{wrong}"
+            );
+        }
+        let generic = crate::parse::parse_url(raw);
+        assert!(allowlist_pattern_matches_parsed("127.0.0.0", raw, &generic));
+        let raw = "0x7f.0x/path";
+        let urls =
+            crate::extract::extract_urls(&format!("curl {raw}"), crate::tokenize::ShellType::Posix);
+        assert!(allowlist_pattern_matches_parsed(
+            "https://0x7f.0x/path",
+            raw,
+            &urls[0].parsed
+        ));
+        assert!(!allowlist_pattern_matches_parsed(
+            "https://127.0.0.0/path",
+            raw,
+            &urls[0].parsed
+        ));
+    }
+}
+
+#[cfg(test)]
+mod malformed_client_authority_tests {
+    use super::*;
+
+    #[test]
+    fn selected_dns_identity_cannot_fall_back_to_generic_trust_on_malformed_authority() {
+        for raw in [
+            r"http://0x7f.0x\@127.0.0.0/path",
+            "http://0x7f.0x:99999/path",
+            "http://0x7f.0x:invalid/path",
+        ] {
+            let parsed = crate::parse::UrlLike::Unparsed {
+                raw: raw.into(),
+                raw_host: Some("0x7f.0x".into()),
+                raw_path: Some("/path".into()),
+            };
+            for pattern in ["127.0.0.0", "0x7f.0x", "*.0x", "substring:0x7f.0x"] {
+                assert!(
+                    !allowlist_pattern_matches_parsed(pattern, raw, &parsed),
+                    "{raw} {pattern}"
+                );
+            }
         }
     }
 }

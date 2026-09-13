@@ -192,6 +192,7 @@ mod presentation_tests {
     #[test]
     fn oversized_job_display_keeps_control_identity_and_marks_missing_destinations() {
         let status = OperationStatus {
+            setup_activation: None,
             schema_version: 1,
             operation_id: uuid::Uuid::new_v4().to_string(),
             kind: OperationKind::SetProfile,

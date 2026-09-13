@@ -907,6 +907,10 @@ Examples:
         /// Emit the launch result as JSON (no subcommand).
         #[arg(long)]
         json: bool,
+        /// Reuse this live service UUID; refuse instead of starting a service.
+        /// Supported only for dashboard and dashboard open.
+        #[arg(long, global = true, value_parser = cli::control::parse_required_service_id)]
+        require_service_id: Option<String>,
         #[command(subcommand)]
         action: Option<DashboardAction>,
     },
@@ -8101,10 +8105,63 @@ fn main() {
         cli::capsule_child::run_on_main_thread(&raw_args);
     }
 
+    // Automatic diagnostics have a fixed child-free ABI. Bound stdin, policy,
+    // capability and output work before any of it starts. Capsule containment
+    // must still run first, while there is no watchdog or worker thread.
+    let automatic = cli::automatic_deadline::match_zsh_automatic_diagnostic(&raw_args);
+    let coordinator = cli::automatic_deadline::match_zsh_automatic_coordinator(&raw_args);
+    if raw_args
+        .get(1)
+        .is_some_and(|arg| arg == "__setup-activation")
+        && !matches!(
+            automatic,
+            Some(
+                cli::automatic_deadline::DiagnosticInvocation::Probe(_)
+                    | cli::automatic_deadline::DiagnosticInvocation::Receipt(_)
+            )
+        )
+        && coordinator.is_none()
+    {
+        // No watchdog exists yet. Even an error write or buffered exit could
+        // wait on an unread pipe; the internal caller classifies this code.
+        unsafe { libc::_exit(2) }
+    }
+    let budget =
+        coordinator.or(automatic.map(|_| cli::automatic_deadline::DeadlineBudget::Diagnostic));
+    let _automatic_deadline = budget.map(|budget| {
+        cli::automatic_deadline::SelfDeadline::arm(budget).unwrap_or_else(|_| {
+            // Arming failed, so no operation or output may precede refusal.
+            unsafe { libc::_exit(125) }
+        })
+    });
+
     let handle = std::thread::Builder::new()
         .name("tirith-main".to_string())
         .stack_size(16 * 1024 * 1024)
-        .spawn(run)
+        .spawn(move || {
+            // Thread-local: enter inside the worker, before automatic stdin,
+            // authentication or policy work. Ordinary/manual routes are unchanged.
+            let _automatic_policy_inputs =
+                budget.map(|_| tirith_core::policy::BoundedRuntimePolicyInputs::enter());
+            if coordinator.is_some() {
+                std::process::exit(cli::setup_activation::run_coordinator(&raw_args));
+            }
+            if let Some(cli::automatic_deadline::DiagnosticInvocation::Receipt(action)) = automatic
+            {
+                std::process::exit(cli::setup_activation::run_receipt(action));
+            }
+            if matches!(
+                automatic,
+                Some(cli::automatic_deadline::DiagnosticInvocation::Probe(_))
+            ) {
+                // The raw matcher already bounded and validated these fields.
+                // Avoid the manual adapter and canonical current-status path.
+                let action = raw_args[3].to_str().expect("validated probe action");
+                let id = raw_args[7].to_str().expect("validated probe identifier");
+                std::process::exit(cli::setup_activation::run_probe(action, id));
+            }
+            run();
+        })
         .expect("failed to spawn tirith main thread");
     if handle.join().is_err() {
         // `run` panicked (hook already reported it); exit 101 without re-panicking.
@@ -9341,20 +9398,34 @@ fn run() {
             action,
             no_browser,
             json,
-        } => match action {
-            None => cli::control::open(no_browser, json),
-            Some(DashboardAction::Open { no_browser, json }) => {
-                cli::control::open(no_browser, json)
+            require_service_id,
+        } => {
+            if require_service_id.is_some()
+                && !matches!(&action, None | Some(DashboardAction::Open { .. }))
+            {
+                eprintln!("tirith dashboard: --require-service-id is supported only for dashboard and dashboard open");
+                1
+            } else {
+                match action {
+                    None => cli::control::open(no_browser, json, require_service_id.as_deref()),
+                    Some(DashboardAction::Open { no_browser, json }) => {
+                        cli::control::open(no_browser, json, require_service_id.as_deref())
+                    }
+                    Some(DashboardAction::ControlServe { startup_id }) => {
+                        cli::control::serve(&startup_id)
+                    }
+                    Some(DashboardAction::LifecycleWorker { operation_id }) => {
+                        cli::control::lifecycle_worker::run(&operation_id)
+                    }
+                    Some(DashboardAction::Export { out, json }) => {
+                        cli::dashboard::export(out.as_deref(), json)
+                    }
+                    Some(DashboardAction::Serve { port, json }) => {
+                        cli::dashboard::serve(port, json)
+                    }
+                }
             }
-            Some(DashboardAction::ControlServe { startup_id }) => cli::control::serve(&startup_id),
-            Some(DashboardAction::LifecycleWorker { operation_id }) => {
-                cli::control::lifecycle_worker::run(&operation_id)
-            }
-            Some(DashboardAction::Export { out, json }) => {
-                cli::dashboard::export(out.as_deref(), json)
-            }
-            Some(DashboardAction::Serve { port, json }) => cli::dashboard::serve(port, json),
-        },
+        }
 
         Commands::PromptStatus {
             short,
@@ -10403,6 +10474,72 @@ mod help_category_tests {
             .expect("spawn CLI parser test on enlarged stack")
             .join()
             .expect("CLI parser test panicked");
+    }
+
+    #[test]
+    fn dashboard_required_service_identity_is_canonical_and_global_to_open() {
+        with_large_cli_stack(|| {
+            let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            for args in [
+                vec![
+                    "tirith",
+                    "dashboard",
+                    "--require-service-id",
+                    id,
+                    "--no-browser",
+                    "--json",
+                ],
+                vec![
+                    "tirith",
+                    "dashboard",
+                    "open",
+                    "--require-service-id",
+                    id,
+                    "--no-browser",
+                    "--json",
+                ],
+                vec![
+                    "tirith",
+                    "dashboard",
+                    "--require-service-id",
+                    id,
+                    "open",
+                    "--json",
+                ],
+            ] {
+                let parsed = Cli::try_parse_from(args).expect("required reuse parses");
+                assert!(
+                    matches!(parsed.command, Commands::Dashboard { require_service_id: Some(value), .. } if value == id)
+                );
+            }
+            for bad in [
+                "",
+                "not-a-uuid",
+                "00000000-0000-0000-0000-000000000000",
+                "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+                "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa",
+                "{aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa}",
+                " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            ] {
+                assert!(
+                    Cli::try_parse_from(["tirith", "dashboard", "--require-service-id", bad])
+                        .is_err(),
+                    "{bad}"
+                );
+            }
+            for args in [
+                vec!["tirith", "dashboard"],
+                vec!["tirith", "dashboard", "open"],
+            ] {
+                assert!(matches!(
+                    Cli::try_parse_from(args).unwrap().command,
+                    Commands::Dashboard {
+                        require_service_id: None,
+                        ..
+                    }
+                ));
+            }
+        });
     }
 
     /// Every non-hidden top-level command must appear in the categorized help

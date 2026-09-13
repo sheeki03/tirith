@@ -31,10 +31,18 @@ use crate::tokenize::ShellType;
 use crate::verdict::{Action, Verdict};
 
 mod shell_receipt;
+#[cfg(unix)]
+pub use shell_receipt::{
+    activation_client_exchange, activation_server_receive, start_automatic_shell_verification,
+    ActivationExchangeId, ActivationReplyOwner, ActivationTransportError,
+    AutomaticShellVerification, AutomaticVerificationStage, ACTIVATION_REPLY_CAP,
+    ACTIVATION_REQUEST_CAP,
+};
 pub use shell_receipt::{
     arm_shell_execution_receipt, authenticate_shell_context, consume_shell_execution_receipt,
     create_shell_execution_receipt, discard_shell_execution_receipt,
-    execute_shell_verification_probe, finish_shell_verification,
+    execute_automatic_shell_verification_probe, execute_shell_verification_probe,
+    finish_automatic_shell_verification_status, finish_shell_verification,
     finish_shell_verification_authenticated, observe_shell_verification_hook,
     reconcile_shell_execution_receipt, register_shell_hook_instance,
     register_shell_hook_instance_with_delivery, shell_execution_receipt_context,
@@ -81,10 +89,22 @@ fn privacy_projected_command_sha256(command: &str) -> String {
 
 fn privacy_project_domain(domain: &str) -> String {
     let redacted = crate::redact::privacy_project_durable_text(domain);
+    if redacted.starts_with("[REDACTED:") || redacted.contains("://") {
+        // This boundary accepts selected domains, not arbitrary marker text or
+        // URLs that would be reinterpreted by the synthetic scheme below.
+        return "[REDACTED:invalid_endpoint]".into();
+    }
+    // Domains here already carry the extracting client's selected identity.
+    // Privacy projection must not turn curl's DNS host into WHATWG IPv4.
+    // Keep the mandatory secret projection above and all other RPC handling.
+    if let Some(host) = crate::parse::curl_empty_hex_dns_host(&redacted) {
+        return host;
+    }
     let endpoint = format!("https://{redacted}");
     crate::sensitive_assets::canonicalize_rpc_for_display(&endpoint)
         .and_then(|origin| origin.strip_prefix("https://").map(str::to_string))
-        .unwrap_or(redacted)
+        // Failed origin parsing cannot establish that opaque text is public.
+        .unwrap_or_else(|| "[REDACTED:invalid_endpoint]".to_string())
 }
 
 fn privacy_project_event_prototypes(events: &mut [EventPrototype]) {
@@ -627,22 +647,30 @@ fn first_ledger_sequence() -> u64 {
     1
 }
 
-fn derive_warning_prototypes(verdict: &Verdict) -> Result<Vec<WarningPrototype>, String> {
+fn derive_warning_prototypes(
+    verdict: &Verdict,
+    command: &str,
+    shell: ShellType,
+) -> Result<Vec<WarningPrototype>, String> {
     let should_record =
         matches!(verdict.action, Action::Warn | Action::WarnAck) || verdict.bypass_honored;
     if !should_record {
         return Ok(Vec::new());
     }
+    let urls = crate::extract::extract_urls(command, shell);
     let mut prototypes = Vec::new();
     for finding in verdict
         .findings
         .iter()
         .filter(|finding| finding.severity >= crate::verdict::Severity::Low)
     {
-        let mut domains = crate::session_warnings::extract_domains_from_evidence(&finding.evidence)
-            .into_iter()
-            .map(|domain| privacy_project_domain(&domain).to_lowercase())
-            .collect::<Vec<_>>();
+        let mut domains = crate::session_warnings::extract_domains_from_evidence_with_urls(
+            &finding.evidence,
+            &urls,
+        )
+        .into_iter()
+        .map(|domain| privacy_project_domain(&domain).to_lowercase())
+        .collect::<Vec<_>>();
         domains.sort();
         domains.dedup();
         if domains.len() > 32 || domains.iter().any(|domain| domain.len() > 255) {
@@ -769,7 +797,7 @@ impl ExecutionDraft {
         }
         privacy_project_event_prototypes(&mut provisional_events);
         privacy_project_escalation_hits(&mut escalation_hits);
-        let warning_prototypes = derive_warning_prototypes(effective_verdict)?;
+        let warning_prototypes = derive_warning_prototypes(effective_verdict, command, shell)?;
         // `origin` is duplicated outside the verdict inside draft/receipt
         // identities. Store the same mandatory projection used by public
         // Verdict serialization so an attacker-controlled origin label cannot
@@ -1052,7 +1080,11 @@ impl PreparedExecution {
             &self.draft.correlation_policy,
         )?;
         self.draft.interaction = InteractionResolution::for_decision(&self.draft.decision);
-        self.draft.warning_prototypes = derive_warning_prototypes(&self.draft.effective_verdict)?;
+        self.draft.warning_prototypes = derive_warning_prototypes(
+            &self.draft.effective_verdict,
+            &self.draft.command,
+            self.draft.shell,
+        )?;
         self.draft.draft_identity_sha256 = compute_draft_identity(&self.draft)?;
         Ok((self, honored))
     }
@@ -3625,11 +3657,14 @@ fn evaluate_against_session(
     let mut escalation_hits = Vec::new();
     if !policy.escalation.is_empty() && matches!(effective.action, Action::Warn | Action::WarnAck) {
         let strict_history = strict_history_session(ledger);
-        let (action, _causal, hits, reason) = crate::escalation::apply_escalation(
+        let urls = crate::extract::extract_urls(command, shell);
+        let (action, _causal, hits, reason) = crate::escalation::apply_escalation_at_with_urls(
             effective.action,
             &effective.findings,
             &strict_history,
             &policy.escalation,
+            chrono::Utc::now(),
+            &urls,
         );
         if action != effective.action {
             effective.escalation_reason = reason;
@@ -7079,5 +7114,101 @@ mod tests {
                 .expect("changed evidence");
             assert!(promote_record(&mut ledger, &draft, &changed_evidence).is_err());
         });
+    }
+}
+
+#[cfg(test)]
+mod contextual_warning_identity_tests {
+    use super::*;
+    use crate::verdict::{Evidence, Finding, RuleId, Severity};
+
+    fn finding() -> Finding {
+        Finding {
+            rule_id: RuleId::PlainHttpToSink,
+            severity: Severity::Medium,
+            title: "network warning".into(),
+            description: "context fixture".into(),
+            evidence: vec![Evidence::Url {
+                raw: "http://0x7f.0x/path".into(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }
+    }
+    fn verdict() -> Verdict {
+        let mut verdict = Verdict::allow_fast(3, Default::default());
+        verdict.action = Action::Warn;
+        verdict.findings.push(finding());
+        verdict
+    }
+
+    #[test]
+    fn strict_domain_projection_preserves_selected_dns_identity_and_privacy() {
+        for value in [
+            "providerToken123456789.0x7f.0x",
+            "[invalid-providerToken123456789",
+            "[REDACTED:providerToken123456789]",
+            "[REDACTED:foo]providerToken123456789.0x7f.0x",
+            "[REDACTED:invalid_endpoint]providerToken123456789",
+            "https://providerToken123456789.0x7f.0x/private",
+        ] {
+            assert_eq!(privacy_project_domain(value), "[REDACTED:invalid_endpoint]");
+        }
+        for (value, expected) in [
+            ("rpc.example", "rpc.example"),
+            ("[::1]", "[::1]"),
+            ("[REDACTED:GitHub PAT]", "[REDACTED:invalid_endpoint]"),
+            ("[REDACTED:invalid_endpoint]", "[REDACTED:invalid_endpoint]"),
+        ] {
+            assert_eq!(privacy_project_domain(value), expected);
+        }
+        assert_eq!(privacy_project_domain("0x7f.0x"), "0x7f.0x");
+        assert_eq!(privacy_project_domain("127.0.0.0"), "127.0.0.0");
+        assert_eq!(privacy_project_domain("0x7f.1"), "127.0.0.1");
+        let canary = format!("ghp_canary_{}", "L".repeat(30));
+        let projected = privacy_project_domain(&format!("{canary}.0x7f.0x"));
+        assert!(!projected.contains(&canary));
+        let mut events = vec![EventPrototype {
+            kind: crate::event_buffer::EventKind::Network,
+            rule_id: "network_egress".into(),
+            metadata: std::collections::BTreeMap::from([
+                ("host".into(), "0x7f.0x".into()),
+                ("domain".into(), "127.0.0.0".into()),
+            ]),
+        }];
+        privacy_project_event_prototypes(&mut events);
+        assert_eq!(events[0].metadata["host"], "0x7f.0x");
+        assert_eq!(events[0].metadata["domain"], "127.0.0.0");
+    }
+
+    #[test]
+    fn strict_warning_prototypes_keep_both_client_identities_including_bypass() {
+        let mut verdict = verdict();
+        for (command, expected) in [
+            ("curl http://0x7f.0x/path", vec!["0x7f.0x"]),
+            ("wget http://0x7f.0x/path", vec!["127.0.0.0"]),
+            (
+                "curl http://0x7f.0x/path; wget http://0x7f.0x/path",
+                vec!["0x7f.0x", "127.0.0.0"],
+            ),
+        ] {
+            let prototypes =
+                derive_warning_prototypes(&verdict, command, ShellType::Posix).unwrap();
+            assert_eq!(prototypes.len(), 1);
+            assert_eq!(prototypes[0].domains, expected);
+        }
+        verdict.action = Action::Block;
+        assert!(
+            derive_warning_prototypes(&verdict, "curl http://0x7f.0x/path", ShellType::Posix)
+                .unwrap()
+                .is_empty()
+        );
+        verdict.bypass_honored = true;
+        let prototypes =
+            derive_warning_prototypes(&verdict, "curl http://0x7f.0x/path", ShellType::Posix)
+                .unwrap();
+        assert_eq!(prototypes[0].domains, ["0x7f.0x"]);
     }
 }

@@ -306,7 +306,9 @@
     approval.append(row('Native package approval', state.package_approval.detail, state.package_approval.state), paragraph(state.package_approval.next_action), paragraph('Ordinary command checks and shell protection do not require sudo. This dashboard never requests administrator credentials.'));
     const recent = panel('Saved changes and recovery'); recent.append(paragraph('These are saved operation states. Open an operation to reconcile its current status; closing the browser does not cancel submitted work.'));
     if (!jobs.operations.length) recent.append(paragraph('No saved operations in the bounded inventory.', 'empty'));
-    for (const operation of jobs.operations) recent.append(row(operation.kind || 'Saved change', operation.operation_id, operation.no_op ? 'unchanged' : operation.state, [button('Open saved operation', () => requestDialog(() => api('/api/operations', {operation_id:operation.operation_id, action:'status'}), stored => { showDialog('Saved operation', stored); displayOperation(stored); }))]));
+    for (const operation of jobs.operations) { recent.append(row(operation.kind || 'Saved change', operation.operation_id, operation.no_op ? 'unchanged' : operation.state, [button('Open saved operation', () => requestDialog(() => api('/api/operations', {operation_id:operation.operation_id, action:'status'}), stored => { showDialog('Saved operation', stored); displayOperation(stored); }))]));
+      if (operation.setup_activation) recent.append(activationHistoryPanel(operation.setup_activation));
+    }
     recent.append(rawDetails('Inspect inventory coverage', jobs.coverage));
     const lifecycleId = field('Update or refresh operation ID', 'text', '', 'UUID retained from a lifecycle preview');
     recent.append(lifecycleId.label, button('Open saved lifecycle operation', () => requestDialog(() => api('/api/lifecycle/operation', {operation_id:lifecycleId.input.value.trim(), action:'status'}), displayLifecycle)));
@@ -434,7 +436,10 @@
       if (dialogGeneration !== epoch) return;
       showDialog(value.unchanged || value.operation === null ? 'No change required' : 'Review change plan', value);
       if (value.operation) {
-        if (value.impact) value.operation.impact_review = value.impact;
+        if (value.impact) {
+          value.operation.impact_review = value.impact;
+          value.operation.impact_observation = value.live?.impact_observation;
+        }
         displayOperation(value.operation);
         if (value.kind === 'audit_rotation_plan' && value.preview) operationContent.prepend(paragraph(`Retain ${value.preview.retained_records} records (${value.preview.retained_bytes} bytes). ${value.preview.signed_segment ? 'The signed segment was verified.' : 'This segment has no signed-chain proof.'} Undo is available only before additional records are appended.`, 'notice'));
       }
@@ -444,10 +449,38 @@
       pendingPlanActions(pending);
     } finally { if (planRequest === request) planRequest = null; }
   }
+  function activationHistoryPanel(history) {
+    const node = panel('Stored terminal observation');
+    const messages = {
+      missing: 'No automatic terminal result was recorded. Older setup records may have no result.',
+      incomplete: history.claim_phase === 'running'
+        ? 'An attempt was started but has no recorded terminal result. It may still be running or may have been interrupted.'
+        : 'An attempt was reserved or ended without a recorded terminal result. Its outcome is unknown.',
+      invalid: 'The private historical record could not be validated. Its outcome is unknown.',
+      recorded: 'This is a stored historical terminal observation.'
+    };
+    node.append(paragraph(messages[history.availability] || 'Historical outcome is unavailable.'),
+      paragraph('This recorded result does not tell us whether your current terminal is protected. Run verification in that terminal to check its protection.', 'notice'));
+    if (history.availability === 'recorded' && history.observation) {
+      const observed = history.observation;
+      const outcomes = {observed_blocking:'Blocking was observed', cancelled:'The attempt was cancelled', refused:'The attempt was refused'};
+      node.append(row(outcomes[observed.terminal?.outcome] || 'Historical outcome unavailable',
+        `Channel: ${observed.channel}; client: ${observed.client_version}; attempt: ${observed.attempt_id}`,
+        new Date(observed.recorded_unix_ms).toLocaleString()));
+    }
+    const relations = {changed:'Setup changed or was undone after this result. The historical observation is retained.',
+      recorded_inputs_match:'Recorded setup files matched during this read. This does not check the current shell, binary, or effective policy.',
+      not_checked:'Current setup files were not compared in this inventory. Open or refresh the saved operation to compare them.',
+      unknown:'Current setup inputs could not be compared.'};
+    node.append(paragraph(relations[history.setup_state] || relations.unknown, 'muted'));
+    return node;
+  }
   function displayOperation(operation) {
     const context = operationContext('settings', operation.operation_id); clearTimeout(pollTimer); operationContent.replaceChildren(badge(operation.no_op ? 'unchanged' : operation.state)); operationActions.replaceChildren();
     const descriptions = { planned: 'Review the destinations and changes below before applying.', running: 'The change continues if you close this page.', completed: 'The change was saved. Reload the relevant shell or host where required.', 'completed-with-recovery': 'The change was saved, with recovery material retained. Inspect the details before cleanup.', undone: 'The owned change was undone. Unrelated settings were preserved.', 'undone-with-recovery': 'Undo completed with recovery material retained.', 'refresh-required': 'Inputs changed. Refresh and review a new plan before continuing.', 'recovery-required': 'The operation needs recovery. Inspect its steps; do not assume every change was applied.', 'partially-applied': 'Only some steps completed. Inspect the recorded result before another action.', cancelled: 'The operation was cancelled.', 'cancel-requested': 'Cancellation was requested. Already completed steps remain recorded.' };
     operationContent.append(paragraph(operation.no_op ? 'No settings needed changing. This result is saved so retries cannot turn it into a different change.' : descriptions[operation.state] || 'Inspect the stored operation state.'));
+    if (operation.setup_activation) operationContent.append(activationHistoryPanel(operation.setup_activation));
+    else if (operation.kind === 'recommended-setup') operationContent.append(paragraph('Automatic terminal history has not been read in this response. Refresh stored status; current protection remains unknown.', 'notice'));
     if (operation.detail) operationContent.append(paragraph(operation.detail, 'notice'));
     if (operation.irreversible) operationContent.append(paragraph('This operation permanently deletes retained records. A checkpoint and tombstone remain, but these records cannot be restored by undo.', 'notice'));
     if (operation.impact_review) {
@@ -457,6 +490,15 @@
         paragraph(`Exception review: ${impact.counts.expired_exceptions} expired; ${impact.counts.unowned_exceptions} without verified ownership. Review captured ${impact.evaluated_at}.`, 'muted'),
         paragraph('This historical review does not prove execution, remote publication, or adoption by other clients. Missing evidence remains unavailable.', 'notice'),
         rawDetails('Inspect workflow impact, exception ownership and unavailable evidence', impact));
+      const observation = operation.impact_observation;
+      if (observation?.schema_version === 1) {
+        const freshness = {recent:'Recent', stale:'Stale', invalid_timestamp:'Future-dated review'}[observation.review_freshness] || 'Unavailable';
+        operationContent.append(paragraph(`Historical evidence age: ${freshness}. Checked ${observation.checked_at}.`, 'muted'));
+        if (observation.expiries_reached_since_review !== null) operationContent.append(paragraph(`Recorded exceptions whose expiry time has passed since this review: ${observation.expiries_reached_since_review}.`, 'muted'));
+        operationContent.append(paragraph(`Captured client timestamps: ${observation.stale_client_timestamps} stale, ${observation.future_client_timestamps} future-dated, ${observation.missing_client_timestamps} missing. These age checks do not contact clients or recheck current exceptions.`, 'notice'));
+      } else {
+        operationContent.append(paragraph('Read-time evidence age is unavailable. Inspect the captured timestamps; current exceptions and client adoption have not been rechecked.', 'notice'));
+      }
     }
     for (const step of operation.steps || []) operationContent.append(row(step.description, step.target, step.state));
     operationContent.append(rawDetails('Stored operation and recovery details', operation), paragraph(`Operation ID: ${context.id}`, 'muted'));

@@ -559,12 +559,13 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         raw_verdict
     } else {
         let session_id = crate::session::resolve_session_id();
-        crate::escalation::post_process_verdict(
+        crate::escalation::post_process_verdict_for_shell(
             &raw_verdict,
             &policy,
             command,
             &session_id,
             crate::escalation::CallerContext::McpServer,
+            shell,
         )
         // This MCP tool reports a check result; it does not execute `command`, so
         // it must not finalize typed execution events.

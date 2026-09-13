@@ -243,6 +243,8 @@ struct TransactionOptions {
     read_cap: usize,
     quiet: bool,
     retain_artifacts: bool,
+    #[cfg(unix)]
+    private_parent: bool,
 }
 impl TransactionOptions {
     fn ordinary(dry_run: bool) -> Self {
@@ -252,6 +254,8 @@ impl TransactionOptions {
             read_cap: MAX_SETUP_FILE_BYTES,
             quiet: false,
             retain_artifacts: true,
+            #[cfg(unix)]
+            private_parent: false,
         }
     }
 }
@@ -278,6 +282,8 @@ pub(crate) fn write_private_notice_bounded(
             read_cap: cap,
             quiet: true,
             retain_artifacts: false,
+            #[cfg(unix)]
+            private_parent: false,
         },
         |snapshot| {
             snapshot.require_private()?;
@@ -300,6 +306,91 @@ pub(crate) fn write_private_notice_bounded(
         #[cfg(test)]
         |_| Ok(()),
     )
+}
+
+/// Fixed small private activation claims share contained publication and the
+/// setup writer rendezvous. Inventory/authority validation runs again while
+/// that global lock is held, including when the transform is unchanged.
+#[cfg(unix)]
+pub(super) fn update_private_activation_claim<F, V>(
+    path: &Path,
+    scope: &Path,
+    mut transform: F,
+    revalidate: V,
+) -> Result<TransactionOutcome, String>
+where
+    F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
+    V: FnMut() -> Result<(), String>,
+{
+    transactional_update_impl(
+        path,
+        scope,
+        TransactionOptions {
+            dry_run: false,
+            lock_timeout: std::time::Duration::from_millis(100),
+            read_cap: 4096,
+            quiet: true,
+            retain_artifacts: false,
+            private_parent: true,
+        },
+        |snapshot| {
+            let update = transform(snapshot)?;
+            if matches!(&update, FileUpdate::Write { bytes, .. } if bytes.len() > 4096) {
+                return Err("automatic claim exceeds its fixed 4 KiB bound".into());
+            }
+            Ok(update)
+        },
+        revalidate,
+        |bytes| {
+            if bytes.len() > 4096 {
+                return Err("automatic claim exceeds its fixed 4 KiB bound".into());
+            }
+            Ok(())
+        },
+        #[cfg(test)]
+        |_| Ok(()),
+    )
+}
+
+/// Keep the existing ancestor and resulting private parent simultaneously
+/// retained. The earlier scoped snapshot walk already rejects symlinks below
+/// the authority root, traversal, and paths outside that root.
+#[cfg(unix)]
+fn prepare_private_activation_parent(
+    path: &Path,
+    scope_root: &Path,
+) -> Result<crate::cli::control::identity::DirectoryIdentity, String> {
+    use crate::cli::control::identity::DirectoryIdentity;
+    let parent = path
+        .parent()
+        .ok_or("private activation record has no parent")?;
+    let mut existing = parent;
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err("private activation parent is not a real directory".into());
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing
+                    .parent()
+                    .ok_or("private parent has no existing ancestor")?;
+            }
+            Err(_) => return Err("cannot inspect private activation parent".into()),
+        }
+    }
+    let ancestor = DirectoryIdentity::capture_trusted(existing)?;
+    if existing == parent {
+        ancestor.make_private_leaf()?;
+    } else {
+        super::fs_helpers::ensure_private_directory(parent, scope_root)?;
+    }
+    ancestor.revalidate()?;
+    let private = DirectoryIdentity::capture(parent)?;
+    ancestor.revalidate()?;
+    Ok(private)
 }
 
 fn transactional_update_impl<F, V, A>(
@@ -351,6 +442,17 @@ where
         update = transform(&snapshot)?;
         validate_update_size(&update)?;
     }
+    // Admission happens after the capped, locked transform and before any
+    // private record/artifact is written. An unchanged existing record may
+    // tighten its original owned parent, but an absent no-op creates nothing.
+    #[cfg(unix)]
+    let private_parent = if options.private_parent
+        && (snapshot.exists() || matches!(&update, FileUpdate::Write { .. }))
+    {
+        Some(prepare_private_activation_parent(path, scope_root)?)
+    } else {
+        None
+    };
     let FileUpdate::Write {
         bytes,
         mode,
@@ -367,6 +469,10 @@ where
     let transaction = PlatformTransaction::begin(path, scope_root, transaction_lock)?;
     let transaction_result = (|| -> Result<TransactionOutcome, String> {
         transaction.validate_snapshot(&snapshot.inner)?;
+        #[cfg(unix)]
+        if let Some(parent) = &private_parent {
+            parent.revalidate()?;
+        }
 
         let mut backup_guard = if backup && snapshot.exists() {
             Some(transaction.create_backup(&snapshot.inner)?)
@@ -388,6 +494,10 @@ where
         test_hook(TestStage::TempSynced)?;
 
         revalidate_selection()?;
+        #[cfg(unix)]
+        if let Some(parent) = &private_parent {
+            parent.revalidate()?;
+        }
         transaction.validate_snapshot(&snapshot.inner)?;
         #[cfg(test)]
         test_hook(TestStage::SnapshotValidated)?;
@@ -456,6 +566,10 @@ where
             .flatten()
             .map(|error| format!("could not enforce transaction-artifact retention: {error}"));
 
+        #[cfg(unix)]
+        if let Some(parent) = &private_parent {
+            parent.revalidate()?;
+        }
         match (publication_outcome, retention_warning) {
             (PublicationOutcome::Clean, None) => Ok(TransactionOutcome::Written),
             (PublicationOutcome::Clean, Some(message))
@@ -660,5 +774,85 @@ mod private_notice_tests {
         assert!(outcome.unwrap_err().contains("timed out"));
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(!target.exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod activation_parent_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn activation_parent_refuses_unsafe_aliases_permissions_and_outside_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let unsafe_parent = root.path().join("unsafe-parent");
+        std::fs::create_dir(&unsafe_parent).unwrap();
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let alias = root.path().join("alias");
+        symlink(outside.path(), &alias).unwrap();
+        for path in [
+            unsafe_parent.join("claim.json"),
+            alias.join("claim.json"),
+            outside.path().join("claim.json"),
+        ] {
+            assert!(update_private_activation_claim(
+                &path,
+                root.path(),
+                |_| Ok(FileUpdate::write_text("{}".into(), 0o600).with_exact_mode()),
+                || Ok(()),
+            )
+            .is_err());
+            assert!(!path.exists());
+        }
+        assert_eq!(
+            unsafe_parent.metadata().unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn activation_parent_admission_follows_locked_authorization_and_size_checks() {
+        for denied in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("never-created").join("claim.json");
+            let mut authority_calls = 0;
+            assert!(update_private_activation_claim(
+                &target,
+                root.path(),
+                |_| Ok(FileUpdate::write_text(
+                    if denied {
+                        "{}".into()
+                    } else {
+                        "x".repeat(4097)
+                    },
+                    0o600
+                )),
+                || {
+                    authority_calls += 1;
+                    if denied && authority_calls == 2 {
+                        Err("locked authority lost".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .is_err());
+            assert!(!target.parent().unwrap().exists());
+        }
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("absent-noop").join("claim.json");
+        assert_eq!(
+            update_private_activation_claim(
+                &target,
+                root.path(),
+                |_| Ok(FileUpdate::unchanged()),
+                || Ok(()),
+            )
+            .unwrap(),
+            TransactionOutcome::Unchanged
+        );
+        assert!(!target.parent().unwrap().exists());
     }
 }

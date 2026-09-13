@@ -473,4 +473,384 @@ mod native {
             assert!(start_shell_verification(CHANNEL, configs, LOADED).is_err());
         });
     }
+
+    fn automatic_owner<'a>(
+        context: &'a AuthenticatedShellContext,
+        configs: &[PathBuf],
+        id: &str,
+    ) -> AutomaticShellVerification<'a> {
+        start_automatic_shell_verification(
+            context,
+            &uuid::Uuid::new_v4().to_string(),
+            id,
+            configs,
+            LOADED,
+        )
+        .unwrap()
+    }
+
+    fn automatic_through_status(owner: &mut AutomaticShellVerification<'_>, id: &str) {
+        assert_eq!(
+            owner.issue_next().unwrap(),
+            AutomaticVerificationStage::Allowed
+        );
+        assert_eq!(
+            observe_shell_verification_hook(
+                &format!("{HELPER} {id} allowed"),
+                CHANNEL,
+                Some(LOADED)
+            )
+            .unwrap(),
+            ShellVerificationHookDecision::ContinueProbe
+        );
+        assert_eq!(
+            execute_automatic_shell_verification_probe(
+                id,
+                ShellVerificationProbe::Allowed,
+                CHANNEL,
+                LOADED
+            )
+            .unwrap()
+            .status,
+            ShellVerificationStatus::Pending
+        );
+        assert_eq!(
+            owner.issue_next().unwrap(),
+            AutomaticVerificationStage::Blocked
+        );
+        assert_eq!(
+            observe_shell_verification_hook(
+                &format!("{HELPER} {id} blocked"),
+                CHANNEL,
+                Some(LOADED)
+            )
+            .unwrap(),
+            ShellVerificationHookDecision::ForceDiagnosticBlock
+        );
+        assert_eq!(
+            owner.issue_next().unwrap(),
+            AutomaticVerificationStage::Status
+        );
+        observe_shell_verification_hook(&format!("{HELPER} {id} status"), CHANNEL, Some(LOADED))
+            .unwrap();
+        finish_automatic_shell_verification_status(id, CHANNEL, LOADED).unwrap();
+    }
+
+    #[test]
+    fn automatic_complete_sequence_requires_restoration_and_reports_historical_scope() {
+        fixture(|_, configs, secret, _| {
+            let context =
+                authenticate_shell_context(CHANNEL, &crate::session::resolve_session_id()).unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut owner = automatic_owner(&context, configs, &id);
+            assert!(start_shell_verification(CHANNEL, configs, LOADED).is_err());
+            assert!(start_automatic_shell_verification(
+                &context,
+                &uuid::Uuid::new_v4().to_string(),
+                &uuid::Uuid::new_v4().to_string(),
+                configs,
+                LOADED
+            )
+            .is_err());
+            automatic_through_status(&mut owner, &id);
+            {
+                let store = VerificationStore::open(secret).unwrap();
+                let record = store
+                    .load(secret, unix_time_ms().unwrap())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(record.phase, Phase::AwaitingRestoration);
+                assert!(record.observed_unix_ms.is_none());
+            }
+            assert_eq!(
+                owner.issue_next().unwrap(),
+                AutomaticVerificationStage::Restore
+            );
+            let report = owner.finish_restored(LOADED).unwrap();
+            assert_eq!(report.status, ShellVerificationStatus::ObservedBlocking);
+            assert_eq!(report.source, "fresh_terminal_activation");
+            assert_eq!(report.scope, "completed_setup_shell_observation");
+            let output = serde_json::to_string(&report).unwrap();
+            for private in [
+                secret,
+                LOADED,
+                configs[0].to_str().unwrap(),
+                "broker_identity",
+                "operation_id",
+            ] {
+                assert!(!output.contains(private));
+            }
+            assert!(finish_shell_verification_authenticated(&id, CHANNEL, LOADED).is_err());
+        });
+    }
+
+    #[test]
+    fn manual_and_automatic_body_routes_cannot_substitute_for_each_other() {
+        fixture(|_, configs, _, _| {
+            let challenge = start_shell_verification(CHANNEL, configs, LOADED).unwrap();
+            assert!(execute_automatic_shell_verification_probe(
+                &challenge.id,
+                ShellVerificationProbe::Allowed,
+                CHANNEL,
+                LOADED
+            )
+            .is_err());
+            assert!(
+                finish_automatic_shell_verification_status(&challenge.id, CHANNEL, LOADED).is_err()
+            );
+            allowed(&challenge);
+        });
+        fixture(|_, configs, _, _| {
+            let context =
+                authenticate_shell_context(CHANNEL, &crate::session::resolve_session_id()).unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut owner = automatic_owner(&context, configs, &id);
+            assert!(execute_shell_verification_probe(
+                &id,
+                ShellVerificationProbe::Allowed,
+                CHANNEL,
+                LOADED
+            )
+            .is_err());
+            assert!(finish_shell_verification_authenticated(&id, CHANNEL, LOADED).is_err());
+            automatic_through_status(&mut owner, &id);
+            assert_eq!(
+                owner.issue_next().unwrap(),
+                AutomaticVerificationStage::Restore
+            );
+            assert_eq!(
+                owner.finish_restored(LOADED).unwrap().status,
+                ShellVerificationStatus::ObservedBlocking
+            );
+        });
+    }
+
+    #[test]
+    fn automatic_lost_reply_repeated_hook_and_bypassed_block_cannot_complete() {
+        for scenario in [
+            "lost_reply",
+            "repeated_allow_hook",
+            "allowed_without_hook",
+            "block_executed",
+            "status_without_hook",
+            "repeated_status",
+            "restore_unissued",
+            "cancel",
+        ] {
+            fixture(|_, configs, _, _| {
+                let context =
+                    authenticate_shell_context(CHANNEL, &crate::session::resolve_session_id())
+                        .unwrap();
+                let id = uuid::Uuid::new_v4().to_string();
+                let mut owner = automatic_owner(&context, configs, &id);
+                if matches!(scenario, "repeated_status" | "restore_unissued") {
+                    automatic_through_status(&mut owner, &id);
+                    if scenario == "repeated_status" {
+                        assert!(
+                            finish_automatic_shell_verification_status(&id, CHANNEL, LOADED)
+                                .is_err()
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        owner.issue_next().unwrap(),
+                        AutomaticVerificationStage::Allowed
+                    );
+                    match scenario {
+                        "lost_reply" => {
+                            assert!(owner.issue_next().is_err());
+                        }
+                        "repeated_allow_hook" => {
+                            for _ in 0..2 {
+                                observe_shell_verification_hook(
+                                    &format!("{HELPER} {id} allowed"),
+                                    CHANNEL,
+                                    Some(LOADED),
+                                )
+                                .unwrap();
+                            }
+                            execute_automatic_shell_verification_probe(
+                                &id,
+                                ShellVerificationProbe::Allowed,
+                                CHANNEL,
+                                LOADED,
+                            )
+                            .unwrap();
+                        }
+                        "allowed_without_hook" => {
+                            execute_automatic_shell_verification_probe(
+                                &id,
+                                ShellVerificationProbe::Allowed,
+                                CHANNEL,
+                                LOADED,
+                            )
+                            .unwrap();
+                        }
+                        "block_executed" => {
+                            execute_automatic_shell_verification_probe(
+                                &id,
+                                ShellVerificationProbe::Blocked,
+                                CHANNEL,
+                                LOADED,
+                            )
+                            .unwrap();
+                        }
+                        "status_without_hook" => {
+                            assert!(finish_automatic_shell_verification_status(
+                                &id, CHANNEL, LOADED
+                            )
+                            .is_err());
+                        }
+                        "cancel" => {
+                            owner.cancel().unwrap();
+                            return;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                assert!(owner.finish_restored(LOADED).is_err(), "{scenario}");
+            });
+        }
+    }
+
+    #[test]
+    fn automatic_restoration_refuses_changed_configuration_policy_and_capability() {
+        for change in ["configuration", "policy", "loaded", "capability"] {
+            fixture(|root, configs, _, guard| {
+                let context =
+                    authenticate_shell_context(CHANNEL, &crate::session::resolve_session_id())
+                        .unwrap();
+                let id = uuid::Uuid::new_v4().to_string();
+                let mut owner = automatic_owner(&context, configs, &id);
+                automatic_through_status(&mut owner, &id);
+                assert_eq!(
+                    owner.issue_next().unwrap(),
+                    AutomaticVerificationStage::Restore
+                );
+                let loaded = match change {
+                    "configuration" => {
+                        std::fs::write(&configs[0], b"changed").unwrap();
+                        LOADED
+                    }
+                    "policy" => {
+                        std::fs::write(
+                            root.join("config/tirith/policy.yaml"),
+                            b"strict_warn: true\n",
+                        )
+                        .unwrap();
+                        LOADED
+                    }
+                    "loaded" => OTHER,
+                    "capability" => {
+                        guard.set_env("_TIRITH_RECEIPT_INSTANCE", "forged");
+                        LOADED
+                    }
+                    _ => unreachable!(),
+                };
+                assert!(owner.finish_restored(loaded).is_err(), "{change}");
+            });
+        }
+    }
+
+    #[test]
+    fn manual_record_omits_automatic_field_and_retains_legacy_seal_bytes() {
+        fixture(|_, configs, secret, _| {
+            start_shell_verification(CHANNEL, configs, LOADED).unwrap();
+            let store = VerificationStore::open(secret).unwrap();
+            let record = store
+                .load(secret, unix_time_ms().unwrap())
+                .unwrap()
+                .unwrap();
+            let mut value = serde_json::to_value(&record).unwrap();
+            assert!(value.get("automatic").is_none());
+            value["seal"] = serde_json::Value::Null;
+            assert_eq!(
+                record.seal,
+                secret_seal(secret, "tirith-caller-shell-verification-v1", &value)
+            );
+        });
+    }
+
+    fn rewrite_automatic_record(secret: &str, change: impl FnOnce(&mut serde_json::Value)) {
+        let store = VerificationStore::open(secret).unwrap();
+        let record = store
+            .load(secret, unix_time_ms().unwrap())
+            .unwrap()
+            .unwrap();
+        let mut value = serde_json::to_value(record).unwrap();
+        change(&mut value["automatic"]);
+        let mut record: VerificationRecord = serde_json::from_value(value).unwrap();
+        record.seal = record.seal_value(secret).unwrap();
+        store
+            .file
+            .write_atomic_if_observed(&serde_json::to_vec(&record).unwrap(), true)
+            .unwrap();
+    }
+
+    #[test]
+    fn automatic_valid_seal_cannot_authorize_expired_changed_clock_or_broker() {
+        for change in ["expired", "future", "coordinate", "broker", "operation"] {
+            fixture(|_, configs, secret, _| {
+                let context =
+                    authenticate_shell_context(CHANNEL, &crate::session::resolve_session_id())
+                        .unwrap();
+                let id = uuid::Uuid::new_v4().to_string();
+                let mut owner = automatic_owner(&context, configs, &id);
+                rewrite_automatic_record(secret, |automatic| match change {
+                    "expired" => {
+                        automatic["clock"]["started_ns"] = 1u64.into();
+                        automatic["clock"]["deadline_ns"] = 10_000_000_001u64.into();
+                    }
+                    "future" => {
+                        automatic["clock"]["started_ns"] = (u64::MAX - 10_000_000_000).into();
+                        automatic["clock"]["deadline_ns"] = u64::MAX.into();
+                    }
+                    "coordinate" => automatic["clock"]["coordinate"] = "different-clock".into(),
+                    "broker" => {
+                        automatic["broker_identity"]["start_fingerprint"] =
+                            "changed-native-start".into()
+                    }
+                    "operation" => {
+                        automatic["operation_id"] = uuid::Uuid::new_v4().to_string().into()
+                    }
+                    _ => unreachable!(),
+                });
+                assert!(owner.issue_next().is_err(), "{change}");
+            });
+        }
+    }
+
+    #[test]
+    fn automatic_projection_rechecks_deadline_after_final_capability_work() {
+        fixture(|_, configs, secret, _| {
+            let context =
+                authenticate_shell_context(CHANNEL, &crate::session::resolve_session_id()).unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut owner = automatic_owner(&context, configs, &id);
+            automatic_through_status(&mut owner, &id);
+            assert_eq!(
+                owner.issue_next().unwrap(),
+                AutomaticVerificationStage::Restore
+            );
+            let now = automatic::monotonic_now().unwrap().1;
+            rewrite_automatic_record(secret, |binding| {
+                binding["clock"]["started_ns"] = (now - 9_000_000_000).into();
+                binding["clock"]["deadline_ns"] = (now + 1_000_000_000).into();
+            });
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    PROJECTION_FINAL_DELAY.with(|delay| delay.set(None));
+                }
+            }
+            let _reset = Reset;
+            PROJECTION_FINAL_DELAY
+                .with(|delay| delay.set(Some(std::time::Duration::from_millis(1250))));
+            assert!(owner.finish_restored(LOADED).is_err());
+            assert!(
+                PROJECTION_FINAL_DELAY.with(|delay| delay.get().is_none()),
+                "must reach the final capability boundary while the shorter deadline is live"
+            );
+        });
+    }
 }

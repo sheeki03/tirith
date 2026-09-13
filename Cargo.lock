@@ -3239,6 +3239,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hickory-resolver",
+ "hmac",
  "home",
  "is-terminal",
  "jsonschema",

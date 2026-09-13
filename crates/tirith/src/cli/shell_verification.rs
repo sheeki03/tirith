@@ -45,7 +45,7 @@ fn fingerprint(bytes: &[u8]) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn read_fingerprint() -> Result<String, String> {
+pub(super) fn read_fingerprint() -> Result<String, String> {
     use std::io::IsTerminal as _;
     if std::io::stdin().is_terminal() {
         return Err("loaded shell state must arrive through the authenticated helper input".into());
@@ -76,7 +76,9 @@ pub(crate) fn observe_check(
     execution_state::observe_shell_verification_hook(command, channel, capture.as_deref())
 }
 
-fn configuration_paths(channel: ShellReceiptChannel) -> Result<Vec<std::path::PathBuf>, String> {
+pub(super) fn configuration_paths(
+    channel: ShellReceiptChannel,
+) -> Result<Vec<std::path::PathBuf>, String> {
     let family = match channel {
         ShellReceiptChannel::BashEnter | ShellReceiptChannel::BashPreexec => "bash",
         ShellReceiptChannel::Zsh => "zsh",

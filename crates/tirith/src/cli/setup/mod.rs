@@ -15,7 +15,7 @@ pub(crate) use fs_transaction::{write_private_notice_bounded, TransactionOutcome
 #[allow(dead_code)] // Fresh-terminal coordinator integration remains private and unavailable.
 mod activation_clock;
 #[allow(dead_code)] // Closed protocol only; the authenticated broker is not enabled.
-mod activation_protocol;
+pub(crate) mod activation_protocol;
 pub(crate) mod audit_segments;
 pub(crate) mod audit_service;
 pub(crate) mod change_plan;

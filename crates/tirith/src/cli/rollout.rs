@@ -270,23 +270,16 @@ fn project_output(
     compiled: &CompiledCustomPatterns,
     diagnostics: &[String],
 ) -> Result<Value, String> {
-    report.validate_stored()?;
     let operation = super::profile::status_projection(status, compiled)?;
     let selected = snapshot
         .requested_profile
         .as_ref()
         .map(|selection| json!({"name":selection.name,"version":selection.version}));
     let now = Utc::now();
-    let freshness = if report.evaluated_at > now {
-        "invalid_timestamp"
-    } else if (now - report.evaluated_at).num_seconds() >= policy_rollout::EVIDENCE_MAX_AGE_SECONDS
-    {
-        "stale"
-    } else {
-        "recent"
-    };
+    let history = report.historical_evidence_status(now)?;
+    let freshness = history.review_freshness.as_str();
     let mut output = json!({"schema_version":1,"kind":"policy_rollout","operation":operation,"impact":report,
-        "live":{"observed_at":now,"impact_freshness":freshness,"historical_client_observations":true,"policy_identity":snapshot.identity,"selected_profile":selected,"personal_target_effective":snapshot.operator_targets.iter().find(|target|target.scope=="user").is_some_and(|target|target.effective),
+        "live":{"observed_at":now,"impact_freshness":freshness,"impact_observation":history,"historical_client_observations":true,"policy_identity":snapshot.identity,"selected_profile":selected,"personal_target_effective":snapshot.operator_targets.iter().find(|target|target.scope=="user").is_some_and(|target|target.effective),
             "organization_target_effective":snapshot.operator_targets.iter().find(|target|target.scope=="org").is_some_and(|target|target.effective),
             "selection_is_not_adoption_proof":true,"remote_publication":"unavailable","fleet_adoption":"unavailable"},
         "diagnostics":diagnostics.iter().take(32).map(|value|{let redacted=tirith_core::redact::redact_sanitize_redact_with_compiled(value,compiled);if redacted.len()>1024 {"[withheld: diagnostic exceeds display limit]".into()}else{redacted}}).collect::<Vec<String>>(),"omitted_diagnostics":diagnostics.len().saturating_sub(32)});
@@ -542,6 +535,7 @@ mod tests {
         })
         .unwrap();
         let status = OperationStatus {
+            setup_activation: None,
             schema_version: 1,
             operation_id: id.clone(),
             kind: OperationKind::SetProfile,
@@ -573,5 +567,18 @@ mod tests {
         assert_eq!(value["operation"]["operation_id"], id);
         assert_eq!(value["impact"]["candidate_id"], id);
         assert_eq!(value["operation"]["state"], "planned");
+        assert_eq!(value["live"]["impact_observation"]["schema_version"], 1);
+        assert_eq!(
+            value["live"]["impact_observation"]["current_grant_state_observed"],
+            false
+        );
+        assert_eq!(
+            value["live"]["impact_observation"]["current_client_policy_observed"],
+            false
+        );
+        assert_eq!(
+            value["live"]["impact_freshness"],
+            value["live"]["impact_observation"]["review_freshness"]
+        );
     }
 }

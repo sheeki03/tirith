@@ -3,10 +3,20 @@
 //! environment string cannot substitute for its live-process authentication.
 
 use super::*;
+
+#[cfg(unix)]
+#[path = "shell_automatic.rs"]
+mod automatic;
 #[cfg(unix)]
 use crate::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayGuard, ResolutionMode};
 #[cfg(unix)]
 use crate::util::{ContainedAtomicFile, OpenRegularError};
+#[cfg(unix)]
+use automatic::AutomaticBinding;
+#[cfg(unix)]
+pub use automatic::{
+    start_automatic_shell_verification, AutomaticShellVerification, AutomaticVerificationStage,
+};
 
 #[cfg(unix)]
 const VERIFICATION_SCHEMA: u32 = 1;
@@ -99,6 +109,14 @@ struct ProjectionBinding {
     record_seal: String,
     issuer_pid: u32,
     issued_at: std::time::Instant,
+    automatic_record: bool,
+    automatic_owner: bool,
+}
+
+#[cfg(unix)]
+std::thread_local! {
+    #[cfg(test)]
+    static PROJECTION_FINAL_DELAY: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(unix)]
@@ -141,7 +159,15 @@ impl ShellVerificationProof {
         let record = store
             .load(&secret, now)?
             .ok_or("caller-shell verification challenge is unavailable")?;
-        if record.id != self.observation.challenge_id
+        if record.automatic.is_some() != self.binding.automatic_record
+            || (record.automatic.is_some()
+                && (!self.binding.automatic_owner
+                    || record.phase != Phase::Verified
+                    || record
+                        .automatic
+                        .as_ref()
+                        .is_none_or(|binding| binding.broker_pid != std::process::id())))
+            || record.id != self.observation.challenge_id
             || record.family != self.binding.channel.hook_family()?
             || record.hook_binding != token_sha256(&secret)
             || record.seal != self.binding.record_seal
@@ -151,6 +177,15 @@ impl ShellVerificationProof {
             return Err("caller-shell observation context changed".into());
         }
         current_hook_instance(self.binding.channel, &session)?;
+        #[cfg(test)]
+        PROJECTION_FINAL_DELAY.with(|delay| {
+            if let Some(duration) = delay.take() {
+                std::thread::sleep(duration);
+            }
+        });
+        if let Some(automatic) = &record.automatic {
+            automatic.live()?;
+        }
         if self.binding.issued_at.elapsed() >= PROJECTION_TTL
             || unix_time_ms()? >= self.observation.expires_unix_ms
         {
@@ -169,6 +204,7 @@ enum Phase {
     AllowedExecuted,
     BlockChecked,
     StatusChecked,
+    AwaitingRestoration,
     Verified,
     Failed,
 }
@@ -199,6 +235,8 @@ struct VerificationRecord {
     phase: Phase,
     allowed_executions: u32,
     blocked_executions: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    automatic: Option<AutomaticBinding>,
     seal: String,
 }
 
@@ -216,6 +254,9 @@ impl VerificationRecord {
     }
 
     fn validate(&self, secret: &str, now: u64) -> Result<(), String> {
+        if let Some(automatic) = &self.automatic {
+            automatic.validate()?;
+        }
         if self.schema_version != VERIFICATION_SCHEMA
             || uuid::Uuid::parse_str(&self.id)
                 .map(|id| id.to_string())
@@ -233,6 +274,7 @@ impl VerificationRecord {
                 .any(|config| !valid_config_path(&config.path) || !digest_is_valid(&config.seal))
             || self.created_unix_ms > now
             || self.expires_unix_ms != self.created_unix_ms.saturating_add(VERIFICATION_TTL_MS)
+            || (self.phase == Phase::AwaitingRestoration && self.automatic.is_none())
             || self.allowed_executions > 2
             || self.blocked_executions > 1
             || (self.phase == Phase::Verified
@@ -271,6 +313,9 @@ impl VerificationRecord {
     }
 
     fn hook_event(&mut self, kind: ProbeCommand) -> ShellVerificationHookDecision {
+        if let Some(automatic) = &mut self.automatic {
+            return automatic.hook(&mut self.phase, kind);
+        }
         match kind {
             ProbeCommand::Allowed => {
                 match self.phase {
@@ -320,6 +365,19 @@ impl VerificationRecord {
     }
 
     fn finish(&mut self, now: u64) {
+        if let Some(automatic) = &mut self.automatic {
+            if self.phase == Phase::StatusChecked
+                && self.allowed_executions == 1
+                && self.blocked_executions == 0
+                && automatic.status_bodies == 0
+            {
+                automatic.status_bodies = 1;
+                self.phase = Phase::AwaitingRestoration;
+            } else {
+                self.phase = Phase::Failed;
+            }
+            return;
+        }
         if self.phase == Phase::StatusChecked
             && self.allowed_executions == 1
             && self.blocked_executions == 0
@@ -496,6 +554,9 @@ fn context_status(
     loaded_hook_state: Option<&str>,
     now: u64,
 ) -> Result<Option<ShellVerificationStatus>, String> {
+    if let Some(automatic) = &record.automatic {
+        automatic.live()?;
+    }
     if now >= record.expires_unix_ms {
         return Ok(Some(ShellVerificationStatus::Expired));
     }
@@ -519,6 +580,9 @@ fn context_status(
     snapshot
         .revalidate_inputs()
         .map_err(|_| "policy changed during shell verification")?;
+    if let Some(automatic) = &record.automatic {
+        automatic.live()?;
+    }
     Ok(None)
 }
 
@@ -559,6 +623,9 @@ impl VerificationStore {
     }
 
     fn publish(&self, record: &mut VerificationRecord, secret: &str) -> Result<(), String> {
+        if let Some(automatic) = &record.automatic {
+            automatic.live()?;
+        }
         record.seal = record.seal_value(secret)?;
         record.validate(secret, unix_time_ms()?)?;
         let bytes =
@@ -576,6 +643,9 @@ impl VerificationStore {
         self.file
             .write_atomic_if_observed(&bytes, true)
             .map_err(|_| "shell verification publication conflicted")?;
+        if let Some(automatic) = &record.automatic {
+            automatic.live()?;
+        }
         Ok(())
     }
 
@@ -671,10 +741,18 @@ pub fn start_shell_verification(
             phase: Phase::Challenged,
             allowed_executions: 0,
             blocked_executions: 0,
+            automatic: None,
             seal: String::new(),
         };
         let store = VerificationStore::open(&secret)?;
         let prior = store.load(&secret, now)?;
+        if prior
+            .as_ref()
+            .and_then(|record| record.automatic.as_ref())
+            .is_some_and(|automatic| automatic.live().is_ok())
+        {
+            return Err("an automatic verification attempt is active in this shell".into());
+        }
         if prior.is_none() {
             store.reserve_capacity(now)?;
         }
@@ -746,10 +824,11 @@ fn record_body(
     channel: ShellReceiptChannel,
     loaded_hook_state: &str,
     probe: Option<ShellVerificationProbe>,
+    automatic_only: bool,
 ) -> Result<ShellVerificationProof, String> {
     #[cfg(not(unix))]
     {
-        let _ = (id, channel, loaded_hook_state, probe);
+        let _ = (id, channel, loaded_hook_state, probe, automatic_only);
         Err("caller-shell verification is unsupported on this platform".into())
     }
     #[cfg(unix)]
@@ -770,6 +849,9 @@ fn record_body(
         let mut record = store
             .load(&secret, now)?
             .ok_or("caller-shell verification challenge is unavailable")?;
+        if record.automatic.is_some() != automatic_only {
+            return Err("shell verification body does not match its automatic/manual route".into());
+        }
         if record.id != id
             || record.family != channel.hook_family()?
             || record.hook_binding != token_sha256(&secret)
@@ -797,6 +879,8 @@ fn record_body(
                 record_seal: record.seal.clone(),
                 issuer_pid: std::process::id(),
                 issued_at: std::time::Instant::now(),
+                automatic_record: record.automatic.is_some(),
+                automatic_owner: false,
             },
         })
     }
@@ -810,7 +894,7 @@ pub fn execute_shell_verification_probe(
     channel: ShellReceiptChannel,
     loaded_hook_state: &str,
 ) -> Result<ShellVerificationObservation, String> {
-    record_body(id, channel, loaded_hook_state, Some(probe)).map(|result| result.observation)
+    record_body(id, channel, loaded_hook_state, Some(probe), false).map(|result| result.observation)
 }
 
 /// Requires a later authenticated status-hook observation before it can turn
@@ -820,7 +904,7 @@ pub fn finish_shell_verification(
     channel: ShellReceiptChannel,
     loaded_hook_state: &str,
 ) -> Result<ShellVerificationObservation, String> {
-    record_body(id, channel, loaded_hook_state, None).map(|result| result.observation)
+    record_body(id, channel, loaded_hook_state, None, false).map(|result| result.observation)
 }
 
 /// The final authenticated helper's canonical-status route. A previous DTO or
@@ -831,7 +915,39 @@ pub fn finish_shell_verification_authenticated(
     channel: ShellReceiptChannel,
     loaded_hook_state: &str,
 ) -> Result<ShellVerificationProof, String> {
-    record_body(id, channel, loaded_hook_state, None)
+    let proof = record_body(id, channel, loaded_hook_state, None, false)?;
+    #[cfg(unix)]
+    if proof.binding.automatic_record {
+        return Err(
+            "automatic verification requires its live owner and terminal restoration".into(),
+        );
+    }
+    Ok(proof)
+}
+
+/// Automatic inert bodies cannot use a manual challenge or canonical-status
+/// route. The CLI arms its process deadline before reading helper input.
+pub fn execute_automatic_shell_verification_probe(
+    id: &str,
+    probe: ShellVerificationProbe,
+    channel: ShellReceiptChannel,
+    loaded_hook_state: &str,
+) -> Result<ShellVerificationObservation, String> {
+    record_body(id, channel, loaded_hook_state, Some(probe), true).map(|proof| proof.observation)
+}
+
+/// Records the actual automatic status body without issuing a current-shell
+/// proof. The original owner must still authenticate terminal restoration.
+pub fn finish_automatic_shell_verification_status(
+    id: &str,
+    channel: ShellReceiptChannel,
+    loaded_hook_state: &str,
+) -> Result<(), String> {
+    let proof = record_body(id, channel, loaded_hook_state, None, true)?;
+    if proof.observation.status != ShellVerificationStatus::Pending {
+        return Err("automatic status body was repeated or out of order".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -104,6 +104,15 @@ fn scoped_parent(
     scope_root: &Path,
     create: bool,
 ) -> Result<Option<ScopedParent>, String> {
+    scoped_parent_with_creation_mode(path, scope_root, create, 0o755)
+}
+
+fn scoped_parent_with_creation_mode(
+    path: &Path,
+    scope_root: &Path,
+    create: bool,
+    creation_mode: libc::mode_t,
+) -> Result<Option<ScopedParent>, String> {
     let path = absolute(path)?;
     let root = absolute(scope_root)?;
     let components = relative_components(&path, &root)?;
@@ -137,7 +146,8 @@ fn scoped_parent(
         match open_dir_at(&dir, &component) {
             Ok(next) => dir = next,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-                let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), component.as_ptr(), 0o755) };
+                let rc =
+                    unsafe { libc::mkdirat(dir.as_raw_fd(), component.as_ptr(), creation_mode) };
                 let created = rc == 0;
                 if rc < 0 {
                     let mkdir_error = std::io::Error::last_os_error();
@@ -928,8 +938,11 @@ pub fn read_to_string_scoped(path: &Path, scope_root: &Path) -> Result<Option<St
 /// Create a private journal directory using the same no-follow parent walk as
 /// setup files. Permissions are changed through the held directory descriptor.
 pub(crate) fn ensure_private_directory(path: &Path, scope_root: &Path) -> Result<(), String> {
-    let parent = scoped_parent(&path.join(".journal-entry"), scope_root, true)?
-        .ok_or("cannot create private journal directory")?;
+    // Private callers never briefly expose a new directory under a permissive
+    // umask. Ordinary setup parent creation retains its separate 0755 contract.
+    let parent =
+        scoped_parent_with_creation_mode(&path.join(".journal-entry"), scope_root, true, 0o700)?
+            .ok_or("cannot create private journal directory")?;
     let metadata = parent.dir.metadata().map_err(|e| e.to_string())?;
     if metadata.uid() != unsafe { libc::geteuid() } {
         return Err("private journal directory is not owned by the current operator".into());

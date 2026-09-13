@@ -186,12 +186,13 @@ impl FrozenEvaluation {
         match &self.session {
             SessionEvidence::Captured(session) => {
                 if matches!(verdict.action, Action::Warn | Action::WarnAck) {
-                    let (action, _, _, reason) = crate::escalation::apply_escalation_at(
+                    let (action, _, _, reason) = crate::escalation::apply_escalation_at_with_urls(
                         verdict.action,
                         &verdict.findings,
                         session,
                         &policy.escalation,
                         self.captured_at,
+                        self.observed.extracted_urls(),
                     );
                     if action != verdict.action {
                         verdict.escalation_reason = reason;
@@ -200,10 +201,11 @@ impl FrozenEvaluation {
                 }
                 let mut events = session.typed_events.iter().cloned().collect::<Vec<_>>();
                 events.extend(
-                    crate::escalation::derive_event_prototypes_for_shell(
+                    crate::escalation::derive_event_prototypes_with_urls(
                         &self.context.input,
                         &verdict,
                         self.context.shell,
+                        self.observed.extracted_urls(),
                     )
                     .into_iter()
                     .map(|event| {

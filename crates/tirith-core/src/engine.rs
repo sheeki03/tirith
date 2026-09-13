@@ -2388,6 +2388,46 @@ fn urls_associated_with_finding(
     urls
 }
 
+/// Raw URL evidence can be shared by distinct client occurrences. Suppression
+/// must cover every retained interpretation, rather than allowing the first
+/// generic/loopback match to authorize a curl DNS destination with equal text.
+fn finding_url_is_allowlisted(
+    policy: &Policy,
+    finding: &Finding,
+    raw: &str,
+    extracted: &[crate::extract::ExtractedUrl],
+) -> bool {
+    let rule_id = finding.rule_id.to_string();
+    let matches = |parsed: Option<&crate::parse::UrlLike>| {
+        let pattern_matches = |pattern: &str| {
+            parsed.map_or_else(
+                || crate::policy::allowlist_pattern_matches(pattern, raw),
+                |parsed| crate::policy::allowlist_pattern_matches_parsed(pattern, raw, parsed),
+            )
+        };
+        policy
+            .allowlist
+            .iter()
+            .any(|pattern| pattern_matches(pattern))
+            || policy.allowlist_rules.iter().any(|rule| {
+                (rule.rule_id.eq_ignore_ascii_case(&rule_id)
+                    || finding
+                        .custom_rule_id
+                        .as_deref()
+                        .is_some_and(|id| rule.rule_id.eq_ignore_ascii_case(id)))
+                    && rule.patterns.iter().any(|pattern| pattern_matches(pattern))
+            })
+    };
+    let mut candidates = extracted
+        .iter()
+        .filter(|url| url.raw == raw || url.parsed.raw_str() == raw)
+        .peekable();
+    if candidates.peek().is_none() {
+        return matches(None);
+    }
+    candidates.all(|url| matches(Some(&url.parsed)))
+}
+
 /// M10 ch5 — anomaly baseline. Opt-in (D2): a no-op unless
 /// `policy.baseline_enabled`. When enabled and a rule already fired, builds the
 /// privacy-hashed tuple `(rule_id, host_hash, ecosystem, sudo_flag, cwd_repo_hash)`
@@ -3671,6 +3711,10 @@ pub(crate) struct ObservedAnalysis {
 }
 
 impl ObservedAnalysis {
+    pub(crate) fn extracted_urls(&self) -> &[crate::extract::ExtractedUrl] {
+        &self.extracted
+    }
+
     pub(crate) fn approval_policy_bound(&self) -> bool {
         self.approval_policy_bound
     }
@@ -3744,13 +3788,6 @@ pub(crate) fn evaluate_observed(
                 return true;
             }
 
-            let rule_allowlisted = |url: &str| {
-                policy.is_allowlisted_for_rule(&f.rule_id.to_string(), url)
-                    || f.custom_rule_id.as_deref().is_some_and(|custom_rule_id| {
-                        policy.is_allowlisted_for_rule(custom_rule_id, url)
-                    })
-            };
-
             // Keep if any referenced URL is blocklisted; else drop only when every
             // referenced URL is allowlisted for this finding.
             urls_in_evidence
@@ -3758,7 +3795,7 @@ pub(crate) fn evaluate_observed(
                 .any(|url| blocklisted_urls.contains(&url.as_str()))
                 || !urls_in_evidence
                     .iter()
-                    .all(|url| policy.is_allowlisted(url) || rule_allowlisted(url))
+                    .all(|url| finding_url_is_allowlisted(policy, f, url, &extracted))
         });
     }
 
@@ -9613,5 +9650,45 @@ mod tests {
         assert_eq!(baseline_ecosystem_for_leader("cargo"), Some("crates"));
         assert_eq!(baseline_ecosystem_for_leader("kubectl"), Some("k8s"));
         assert_eq!(baseline_ecosystem_for_leader("ls"), None);
+    }
+    #[test]
+    fn curl_dns_suppression_preserves_rule_scope_and_sibling_client_identity() {
+        let raw = "http://0x7f.0x/path";
+        let mut finding = Finding {
+            rule_id: RuleId::PlainHttpToSink,
+            severity: crate::verdict::Severity::Medium,
+            title: String::new(),
+            description: String::new(),
+            evidence: vec![crate::verdict::Evidence::Url { raw: raw.into() }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let curl = crate::extract::extract_urls(&format!("curl {raw}"), ShellType::Posix);
+        let wget = crate::extract::extract_urls(&format!("wget {raw}"), ShellType::Posix);
+        let mixed =
+            crate::extract::extract_urls(&format!("wget {raw}; curl {raw}"), ShellType::Posix);
+        let mut policy = Policy {
+            allowlist: vec!["127.0.0.0".into()],
+            ..Policy::default()
+        };
+        assert!(!finding_url_is_allowlisted(&policy, &finding, raw, &curl));
+        assert!(!finding_url_is_allowlisted(&policy, &finding, raw, &mixed));
+        assert!(finding_url_is_allowlisted(&policy, &finding, raw, &wget));
+        policy.allowlist = vec!["0x7f.0x".into()];
+        assert!(finding_url_is_allowlisted(&policy, &finding, raw, &curl));
+        policy.allowlist.clear();
+        policy.allowlist_rules = vec![crate::policy::AllowlistRule {
+            rule_id: finding.rule_id.to_string(),
+            patterns: vec!["127.0.0.0".into()],
+        }];
+        assert!(!finding_url_is_allowlisted(&policy, &finding, raw, &curl));
+        policy.allowlist_rules[0].patterns = vec![raw.into()];
+        assert!(finding_url_is_allowlisted(&policy, &finding, raw, &curl));
+        policy.allowlist_rules[0].rule_id = "custom-only".into();
+        assert!(!finding_url_is_allowlisted(&policy, &finding, raw, &curl));
+        finding.custom_rule_id = Some("custom-only".into());
+        assert!(finding_url_is_allowlisted(&policy, &finding, raw, &curl));
     }
 }

@@ -15,12 +15,11 @@ set -g _TIRITH_FISH_LOADED 1
 # A fresh load must not retain an inherited or failed integration label.
 set -e TIRITH_INTEGRATION_VERSION; set -e TIRITH_INTEGRATION_SHELL
 
-# Session tracking: generate ID per shell session if not inherited
-if not set -q TIRITH_SESSION_ID
-    set -gx TIRITH_SESSION_ID (builtin printf '%x-%x-%x-%x' \
-        "$fish_pid" (builtin random) (builtin random) (builtin random))
-end
-
+# Each freshly loaded shell owns its session, even when its parent exported
+# an ID. The double-source guard preserves this value in the same live shell;
+# ordinary child commands still inherit it for that shell's correlation.
+set -gx TIRITH_SESSION_ID (builtin printf '%x-%x-%x-%x' \
+    "$fish_pid" (builtin random) (builtin random) (builtin random))
 # Pin the executable before any repository command can mutate PATH. Refuse an
 # interactive hook when fish cannot resolve an absolute executable path.
 if test (count $argv) -eq 2; and test "$argv[1]" = --tirith-executable

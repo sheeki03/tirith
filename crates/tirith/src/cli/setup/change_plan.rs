@@ -16,8 +16,18 @@ use tirith_core::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayG
 use super::fs_helpers;
 use super::fs_transaction::{FileUpdate, TransactionOutcome, MAX_SETUP_FILE_BYTES};
 
+#[path = "change_plan_activation_history.rs"]
+mod activation_history;
+#[cfg(unix)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[path = "change_plan_automatic_claim.rs"]
+mod automatic_claim;
 #[path = "change_plan_setup_binding.rs"]
 mod setup_binding;
+#[cfg(unix)]
+pub(crate) use automatic_claim::{
+    FinishedActivationClaim, PendingActivationClaim, RunningActivationClaim,
+};
 pub(crate) use setup_binding::{SetupVerificationDocument, SetupVerificationIntent};
 
 const SCHEMA: u32 = 1;
@@ -396,6 +406,8 @@ pub(crate) struct OperationStatus {
     pub updated_at: u64,
     pub detail: Option<String>,
     pub steps: Vec<StepStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_activation: Option<activation_history::SetupActivationHistory>,
 }
 
 #[derive(Serialize)]
@@ -434,6 +446,7 @@ impl Journal {
             created_at: self.created_at,
             updated_at: self.updated_at,
             detail: self.detail.clone(),
+            setup_activation: None,
             steps: self
                 .steps
                 .iter()
@@ -656,7 +669,7 @@ impl MutationService {
                 {
                     return Err("operation record identity does not match".to_owned());
                 }
-                Ok(record.public())
+                Ok(record)
             })();
             match result {
                 Ok(status) => operations.push(status),
@@ -676,6 +689,10 @@ impl MutationService {
                 JobState::Running | JobState::CancelRequested
             )
         });
+        let operations = operations
+            .iter()
+            .map(|record| self.public_with_activation_history(record, false))
+            .collect();
         Ok(RecentOperations {
             schema_version: 1,
             operations,
@@ -1451,7 +1468,8 @@ impl MutationService {
 
     /// Read the private persisted result without crash reconciliation or writes.
     pub(crate) fn read_status(&self, operation_id: &str) -> Result<OperationStatus, String> {
-        self.read(operation_id).map(|record| record.public())
+        self.read(operation_id)
+            .map(|record| self.public_with_activation_history(&record, true))
     }
 
     pub(crate) fn status(&self, operation_id: &str) -> Result<OperationStatus, String> {
@@ -1461,16 +1479,16 @@ impl MutationService {
             if let Some(_lock) = fs_helpers::try_lock_operation(&lock_path, &self.scope)? {
                 let record = self.read(operation_id)?;
                 if matches!(record.state, JobState::Running | JobState::CancelRequested) {
-                    return Ok(self.update(operation_id, |record| {
+                    return Ok(self.public_with_activation_history(&self.update(operation_id, |record| {
                         record.state = JobState::RecoveryRequired;
                         record.detail = Some("worker ended without a terminal journal result; inspect owned postconditions before retry or undo".into());
                         Ok(())
-                    })?.public());
+                    })?, true));
                 }
-                return Ok(record.public());
+                return Ok(self.public_with_activation_history(&record, true));
             }
         }
-        Ok(record.public())
+        Ok(self.public_with_activation_history(&record, true))
     }
 
     pub(crate) fn cancel(&self, operation_id: &str) -> Result<OperationStatus, String> {

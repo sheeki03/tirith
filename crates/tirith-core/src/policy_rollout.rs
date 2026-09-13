@@ -240,7 +240,89 @@ pub struct ImpactReport {
     pub fleet_adoption_verified: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalReviewFreshness {
+    Recent,
+    Stale,
+    InvalidTimestamp,
+}
+impl HistoricalReviewFreshness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Stale => "stale",
+            Self::InvalidTimestamp => "invalid_timestamp",
+        }
+    }
+}
+
+/// Read-time age checks on a validated historical attachment. No current grant
+/// inventory, client contact, policy evaluation or adoption observation occurs.
+/// This separate projection never changes the durable reviewed report.
+#[derive(Clone, Debug, Serialize)]
+pub struct HistoricalEvidenceStatus {
+    pub schema_version: u32,
+    pub checked_at: DateTime<Utc>,
+    pub review_freshness: HistoricalReviewFreshness,
+    /// Null when the review itself is future-dated; no elapsed interval exists.
+    pub expiries_reached_since_review: Option<usize>,
+    pub stale_client_timestamps: usize,
+    pub future_client_timestamps: usize,
+    pub missing_client_timestamps: usize,
+    pub current_grant_state_observed: bool,
+    pub current_client_policy_observed: bool,
+    pub fleet_adoption_verified: bool,
+}
+
 impl ImpactReport {
+    pub fn historical_evidence_status(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<HistoricalEvidenceStatus, String> {
+        self.validate_stored()?;
+        let review_freshness = if self.evaluated_at > now {
+            HistoricalReviewFreshness::InvalidTimestamp
+        } else if (now - self.evaluated_at).num_seconds() >= EVIDENCE_MAX_AGE_SECONDS {
+            HistoricalReviewFreshness::Stale
+        } else {
+            HistoricalReviewFreshness::Recent
+        };
+        let expiries_reached_since_review = (self.evaluated_at <= now).then(|| {
+            self.exceptions
+                .iter()
+                .filter(|exception| {
+                    exception
+                        .expires_at
+                        .is_some_and(|at| self.evaluated_at < at && at <= now)
+                })
+                .count()
+        });
+        let mut result = HistoricalEvidenceStatus {
+            schema_version: 1,
+            checked_at: now,
+            review_freshness,
+            expiries_reached_since_review,
+            stale_client_timestamps: 0,
+            future_client_timestamps: 0,
+            missing_client_timestamps: 0,
+            current_grant_state_observed: false,
+            current_client_policy_observed: false,
+            fleet_adoption_verified: false,
+        };
+        for client in &self.clients {
+            match client.observed_at {
+                Some(at) if at > now => result.future_client_timestamps += 1,
+                Some(at) if (now - at).num_seconds() >= EVIDENCE_MAX_AGE_SECONDS => {
+                    result.stale_client_timestamps += 1;
+                }
+                None => result.missing_client_timestamps += 1,
+                _ => {}
+            }
+        }
+        Ok(result)
+    }
+
     /// Validate a private stored attachment before public projection. No flag in
     /// a deserialized report may turn historical impact into execution authority.
     pub fn validate_stored(&self) -> Result<(), String> {

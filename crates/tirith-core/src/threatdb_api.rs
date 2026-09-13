@@ -1567,6 +1567,28 @@ fn safe_browsing_candidate_url(
         UrlLike::Standard { parsed, .. } if matches!(parsed.scheme(), "http" | "https") => {
             parsed.as_str()
         }
+        UrlLike::Unparsed {
+            raw_host: Some(host),
+            ..
+        } if matches!(parsed.scheme(), Some("http" | "https")) => {
+            let metadata = url::Url::parse(raw).ok()?;
+            if let Some(domain) = crate::parse::curl_empty_hex_dns_url_host(raw) {
+                if domain != *host {
+                    return None;
+                }
+                // Re-parsing the host would silently change the subject to
+                // an IP. DNS-classify the retained client authority, then
+                // build the scrubbed origin directly without its secrets.
+                return privacy_scrub_authority(
+                    metadata.scheme(),
+                    url::Host::Domain(domain.as_str()),
+                    metadata.port(),
+                    resolver,
+                    dns_budget,
+                );
+            }
+            raw
+        }
         UrlLike::Unparsed { .. } if raw.starts_with("http://") || raw.starts_with("https://") => {
             raw
         }
@@ -1590,18 +1612,32 @@ fn privacy_scrub_url(
     resolver: Option<&dyn crate::network::DnsResolver>,
     dns_budget: &mut crate::network::DnsRequestBudget,
 ) -> Option<String> {
-    let mut parsed = url::Url::parse(raw).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
+    let parsed = url::Url::parse(raw).ok()?;
+    privacy_scrub_authority(
+        parsed.scheme(),
+        parsed.host()?,
+        parsed.port(),
+        resolver,
+        dns_budget,
+    )
+}
+
+/// Host kind has already been selected by the originating parser. Never
+/// reinterpret a retained client DNS name as a WHATWG numeric address here.
+fn privacy_scrub_authority(
+    scheme: &str,
+    host: url::Host<&str>,
+    port: Option<u16>,
+    resolver: Option<&dyn crate::network::DnsResolver>,
+    dns_budget: &mut crate::network::DnsRequestBudget,
+) -> Option<String> {
+    if !matches!(scheme, "http" | "https") {
         return None;
     }
-    let _ = parsed.set_username("");
-    let _ = parsed.set_password(None);
-    parsed.set_query(None);
-    parsed.set_fragment(None);
-    // Local-only classification (no DNS — we never connect to the candidate,
-    // we only transmit its scrubbed string): reject non-public IP literals and
-    // intranet-style hostnames so internal URLs never leave the machine.
-    match parsed.host()? {
+    // Classify literals locally and DNS names through the bounded resolver.
+    // Never connect to the candidate; only its scrubbed origin can leave the
+    // machine after every observed address has passed the public-address check.
+    match host {
         url::Host::Ipv4(v4) => {
             if !crate::url_validate::is_public_addr(&std::net::SocketAddr::new(
                 std::net::IpAddr::V4(v4),
@@ -1641,8 +1677,8 @@ fn privacy_scrub_url(
     }
     // Keep only the origin. Secrets embedded in path segments are as sensitive
     // as query tokens, and Safe Browsing does not justify disclosing them.
-    parsed.set_path("/");
-    Some(parsed.into())
+    let port = port.map(|port| format!(":{port}")).unwrap_or_default();
+    Some(format!("{scheme}://{host}{port}/"))
 }
 
 fn ecosystem_label(ecosystem: Ecosystem) -> Option<&'static str> {
@@ -2631,6 +2667,66 @@ mod tests {
             all.description.contains("incompletely analyzed"),
             "the verdict wording must say it is not clean: {}",
             all.description
+        );
+    }
+    #[test]
+    fn curl_empty_hex_safe_browsing_preserves_dns_and_scrubs_origin() {
+        let raw = "HTTP://trusted.example:password@0x7f.%30x:8080/private?secret=yes#token";
+        let parsed = crate::extract::parse_curl_destination(raw);
+        let resolver = FakeDns::public_for(&["0x7f.0x"]);
+        assert_eq!(
+            safe_browsing_candidate_url(&parsed, raw, Some(&resolver), &mut dns_budget()),
+            Some("http://0x7f.0x:8080/".to_string())
+        );
+        assert_eq!(*resolver.calls.lock().unwrap(), vec!["0x7f.0x"]);
+        let private = FakeDns::public_for(&[])
+            .with_answer("0x7f.0x", Some(vec!["127.0.0.1".parse().unwrap()]));
+        assert_eq!(
+            safe_browsing_candidate_url(&parsed, raw, Some(&private), &mut dns_budget()),
+            None
+        );
+        assert_eq!(*private.calls.lock().unwrap(), vec!["0x7f.0x"]);
+        assert_eq!(
+            safe_browsing_candidate_url(&parsed, raw, None, &mut dns_budget()),
+            None
+        );
+    }
+    #[test]
+    fn curl_dns_origin_requires_consistent_authority_and_all_public_answers() {
+        let raw = "http://0x7f.0x:8080/private?token=secret";
+        let parsed = crate::extract::parse_curl_destination(raw);
+        for answers in [
+            None,
+            Some(Vec::new()),
+            Some(vec![
+                "93.184.216.34".parse().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            ]),
+        ] {
+            let resolver = FakeDns::public_for(&[]).with_answer("0x7f.0x", answers);
+            assert_eq!(
+                safe_browsing_candidate_url(&parsed, raw, Some(&resolver), &mut dns_budget()),
+                None
+            );
+        }
+        let contradictory = UrlLike::Unparsed {
+            raw: raw.to_string(),
+            raw_host: Some("example.com".to_string()),
+            raw_path: None,
+        };
+        let resolver = FakeDns::public_for(&["0x7f.0x", "example.com"]);
+        assert_eq!(
+            safe_browsing_candidate_url(&contradictory, raw, Some(&resolver), &mut dns_budget()),
+            None
+        );
+        assert!(resolver.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            privacy_scrub_url(
+                "https://user:secret@[2606:4700:4700::1111]:8080/path?token=secret",
+                None,
+                &mut dns_budget()
+            ),
+            Some("https://[2606:4700:4700::1111]:8080/".to_string())
         );
     }
 }

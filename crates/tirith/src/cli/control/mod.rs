@@ -109,8 +109,18 @@ impl Service {
     }
 }
 
-pub(crate) fn open(no_browser: bool, json: bool) -> i32 {
-    match lifecycle::launch() {
+/// A service identity is public routing context, never a bearer credential.
+pub(crate) fn parse_required_service_id(value: &str) -> Result<String, String> {
+    let id = uuid::Uuid::parse_str(value)
+        .map_err(|_| "required service identity must be a canonical non-nil UUID")?;
+    if id.is_nil() || id.to_string() != value {
+        return Err("required service identity must be a canonical non-nil UUID".into());
+    }
+    Ok(value.to_string())
+}
+
+pub(crate) fn open(no_browser: bool, json: bool, required_service_id: Option<&str>) -> i32 {
+    match lifecycle::launch(required_service_id) {
         Ok(record) => {
             let url = record.browser_url();
             let browser_opened = !no_browser && lifecycle::open_browser(&url).is_ok();
