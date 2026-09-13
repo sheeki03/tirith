@@ -823,3 +823,30 @@ setup-bound core challenge mode, foreground deadlines and real installed Zsh
 hook journey are connected and qualified. Separate disposable Zsh mechanism
 experiments do not certify those product paths. Ordinary status and dashboard
 reads continue to report their own unverified scope.
+
+### Windows follow-up at 11689356
+
+The Windows workspace run 34746043256, job 103694063081, completed with failures.
+Its retained artifact 10314501317 matched the API ZIP digest
+`873d902e7c595361ccc8358bebd24c8300ff8d225bb39432c04d6f4d262a99ca`.
+LLVM compilation and doctests completed with all native Job, leader and pipe
+cleanup gates passing (1,207 and 17 total processes respectively). The real
+standard account launched with medium integrity and no Administrators membership;
+all nine dashboard tests then failed ancestor ACL validation. The ordinary core
+harness passed 5,416 tests with one failure and one ignore; the CLI passed 1,544
+with ten failures. Other ordinary harnesses passed.
+
+The remaining C-volume ACL failure is an explicit create-subdirectory right at an
+intermediate ancestor. Directory guards now distinguish that case from a terminal
+parent: the exception requires the next child to be independently validated and
+held without delete sharing. Terminal directories, private leaves, deletion,
+replacement and security-changing grants retain their existing restrictions.
+Native disposable-chain fixtures cover the distinction and guard release.
+
+The build-file failure admitted a mixed digest of two different same-size file
+generations. Windows build hashing now selects a capability-relative read lease
+that refuses existing writable handles/mappings and denies new writers throughout
+the read. Existing identity, generation, size and second-walk checks remain.
+Native fixtures cover a real mid-chunk write attempt, existing writer/mapping
+refusal and successful writes after lease release. These corrections require a
+new Windows run; the preceding successful process cleanup does not certify them.

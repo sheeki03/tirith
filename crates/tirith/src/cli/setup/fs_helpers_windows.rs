@@ -517,11 +517,13 @@ fn control_trustee_is_trusted(sid: PSID) -> bool {
     )
 }
 
-/// Ancestors may grant read/traverse rights to other users. Effective rights
-/// that can create, replace, delete or change security must have trusted owners.
-/// Unrecognized effective ACE forms fail closed; native qualification is still
-/// required for the supported Windows volume/profile ACL combinations.
-fn control_ancestor_security_descriptor(bytes: &[u8]) -> bool {
+/// An intermediate ancestor may permit creation of sibling subdirectories:
+/// the next child already exists, is separately validated, and remains held
+/// without delete sharing. A final trusted directory has no such exception,
+/// because callers can use it to retain an absent input or install a new file.
+/// Replacement, deletion, security changes and generic write still require a
+/// trusted trustee at every level. Private leaves use the stricter validator.
+fn control_ancestor_security_descriptor(bytes: &[u8], has_held_child: bool) -> bool {
     if bytes.is_empty() {
         return false;
     }
@@ -559,6 +561,16 @@ fn control_ancestor_security_descriptor(bytes: &[u8]) -> bool {
     // FILE_ADD_FILE/SUBDIRECTORY, WRITE_EA, DELETE_CHILD, WRITE_ATTRIBUTES;
     // DELETE, WRITE_DAC, WRITE_OWNER; MAXIMUM_ALLOWED, GENERIC_ALL/WRITE.
     const MUTATION_RIGHTS: u32 = 0x0000_0156 | 0x000d_0000 | 0x5200_0000;
+    // SDDL "LC" encodes 0x4. For a filesystem directory this is
+    // FILE_ADD_SUBDIRECTORY, not FILE_LIST_DIRECTORY (0x1). It cannot modify
+    // an existing child. Do not extend this to the final directory, generic
+    // writes, FILE_ADD_FILE, FILE_DELETE_CHILD or the child's own descriptor.
+    // https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants
+    let mutation_rights = if has_held_child {
+        MUTATION_RIGHTS & !0x0000_0004
+    } else {
+        MUTATION_RIGHTS
+    };
     for index in 0..size.AceCount {
         let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
         if unsafe { GetAce(dacl, index, &mut ace) }.is_err() || ace.is_null() {
@@ -578,7 +590,7 @@ fn control_ancestor_security_descriptor(bytes: &[u8]) -> bool {
         let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
         let mask = unsafe { (*allowed).Mask };
         let sid = unsafe { PSID((&mut (*allowed).SidStart as *mut u32).cast()) };
-        if mask & MUTATION_RIGHTS != 0 && !control_trustee_is_trusted(sid) {
+        if mask & mutation_rights != 0 && !control_trustee_is_trusted(sid) {
             return false;
         }
     }
@@ -602,9 +614,12 @@ pub(crate) fn validate_control_directory_handle(file: &fs::File) -> Result<(), S
     Ok(())
 }
 
-pub(crate) fn validate_control_ancestor_handle(file: &fs::File) -> Result<(), String> {
+pub(crate) fn validate_control_ancestor_handle(
+    file: &fs::File,
+    has_held_child: bool,
+) -> Result<(), String> {
     let descriptor = control_directory_descriptor(file)?;
-    if !control_ancestor_security_descriptor(&descriptor) {
+    if !control_ancestor_security_descriptor(&descriptor, has_held_child) {
         #[cfg(test)]
         eprintln!(
             "Unsupported native test ancestor ACL: {}",
@@ -3207,43 +3222,149 @@ mod tests {
         let user = current_user_sid_string().unwrap();
         let private = descriptor(&format!("O:{user}D:P(A;;FA;;;{user})"));
         assert!(owner_only_security_descriptor(&private));
-        assert!(control_ancestor_security_descriptor(&private));
-        assert!(control_ancestor_security_descriptor(&descriptor(
-            "O:SYD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)(A;OICIIO;GW;;;BU)"
-        )));
-        for rights in ["GW", "GA", "WD", "WO", "DC", "WDAC", "0x00000002"] {
-            // WDAC is spelled numerically in SDDL; the other values are
-            // filesystem or standard-right abbreviations.
-            let rights = if rights == "WDAC" {
-                "0x00040000"
-            } else {
-                rights
-            };
-            assert!(!control_ancestor_security_descriptor(&descriptor(
-                &format!("O:SYD:(A;;FA;;;SY)(A;;{rights};;;BU)")
-            )));
+        for has_held_child in [false, true] {
+            assert!(control_ancestor_security_descriptor(
+                &private,
+                has_held_child
+            ));
+            assert!(control_ancestor_security_descriptor(
+                &descriptor("O:SYD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)(A;OICIIO;GW;;;BU)"),
+                has_held_child
+            ));
+            // Numeric file rights avoid misleading directory-service SDDL
+            // aliases: add-file=2, delete-child=0x40, not SDDL "DC"=2.
+            for rights in [
+                "GW",
+                "GA",
+                "WD",
+                "WO",
+                "SD",
+                "0x00000002",
+                "0x00000010",
+                "0x00000040",
+                "0x00000100",
+                "0x02000000",
+                "0x00040000",
+                "0x00000044",
+            ] {
+                assert!(
+                    !control_ancestor_security_descriptor(
+                        &descriptor(&format!("O:SYD:(A;;FA;;;SY)(A;;{rights};;;BU)")),
+                        has_held_child
+                    ),
+                    "untrusted {rights}, child={has_held_child}"
+                );
+            }
+            assert!(!control_ancestor_security_descriptor(
+                &descriptor("O:BUD:(A;;FA;;;SY)"),
+                has_held_child
+            ));
         }
-        assert!(!control_ancestor_security_descriptor(&descriptor(
-            "O:BUD:(A;;FA;;;SY)"
-        )));
+        for rights in ["LC", "0x00000004"] {
+            let create_sibling = descriptor(&format!("O:SYD:(A;;FA;;;SY)(A;;{rights};;;AU)"));
+            assert!(control_ancestor_security_descriptor(&create_sibling, true));
+            assert!(!control_ancestor_security_descriptor(
+                &create_sibling,
+                false
+            ));
+            assert!(!owner_only_security_descriptor(&create_sibling));
+        }
 
-        // Exact native descriptor retained from Windows CI run 34710579033.
-        // Its unprivileged effective ACEs grant read/traverse only; the broad
-        // inherited write grant is INHERIT_ONLY on this ancestor. The same
-        // descriptor must never authorize a private control leaf.
+        // Exact native C:\ descriptor retained from Windows CI run 34746043256.
+        // AU can create subdirectories at this intermediate ancestor; it cannot
+        // replace the already held next child. Its broad write ACE is inherit-
+        // only here. This descriptor cannot authorize a terminal directory or
+        // a private control leaf.
         let observed = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464G:SYD:AI(A;;0x1000a1;;;S-1-15-3-65536-1888954469-739942743-1668119174-2468466756-4239452838-1296943325-355587736-700089176)(A;;LC;;;AU)(A;OICIIO;SDGXGWGR;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
-        assert!(control_ancestor_security_descriptor(&descriptor(observed)));
-        assert!(!owner_only_security_descriptor(&descriptor(observed)));
+        let rendered = observed.to_string();
+        let observed = descriptor(observed);
+        assert!(control_ancestor_security_descriptor(&observed, true));
+        assert!(!control_ancestor_security_descriptor(&observed, false));
+        assert!(!owner_only_security_descriptor(&observed));
         for changed in [
-            // Another service SID is not the Windows servicing authority.
-            observed.replace("2271478464", "2271478465"),
-            // Removing INHERIT_ONLY makes AU's write ACE effective here.
-            observed.replace("OICIIO", "OICI"),
-            // A recognized owner cannot bless an untrusted effective writer.
-            observed.replace("0x1200a9;;;BU", "FA;;;BU"),
+            rendered.replace("2271478464", "2271478465"),
+            rendered.replace("OICIIO", "OICI"),
+            rendered.replace("0x1200a9;;;BU", "FA;;;BU"),
+            // FILE_DELETE_CHILD would let AU delete protected children.
+            rendered.replace("LC;;;AU", "0x00000044;;;AU"),
         ] {
-            assert!(!control_ancestor_security_descriptor(&descriptor(&changed)));
+            assert_ne!(
+                changed, rendered,
+                "negative fixture must change the descriptor"
+            );
+            assert!(!control_ancestor_security_descriptor(
+                &descriptor(&changed),
+                true
+            ));
         }
+    }
+
+    #[test]
+    fn control_chain_allows_sibling_creation_only_above_held_children() {
+        use crate::cli::control::identity::DirectoryIdentity;
+
+        fn create_with_sddl(path: &Path, sddl: &str) {
+            let encoded: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+            let mut value = PSECURITY_DESCRIPTOR::default();
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(encoded.as_ptr()),
+                    SDDL_REVISION_1,
+                    &mut value,
+                    None,
+                )
+            }
+            .unwrap();
+            let value = LocalSecurityDescriptor(value);
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: value.0 .0,
+                bInheritHandle: BOOL(0),
+            };
+            unsafe { CreateDirectoryW(PCWSTR(wide(path).as_ptr()), Some(&attributes)) }.unwrap();
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let user = current_user_sid_string().unwrap();
+        let parent = fixture.path().join("sibling-creation-parent");
+        create_with_sddl(
+            &parent,
+            &format!("O:{user}D:P(A;;FA;;;{user})(A;;0x4;;;AU)"),
+        );
+        let leaf = parent.join("private-child");
+        create_with_sddl(&leaf, &format!("O:{user}D:P(A;;FA;;;{user})"));
+        assert!(
+            DirectoryIdentity::capture_trusted(&parent).is_err(),
+            "a terminal parent cannot authorize planting an absent input"
+        );
+        let guard = DirectoryIdentity::capture(&leaf).expect("independently protected held child");
+        assert!(
+            std::fs::rename(&leaf, parent.join("moved-child")).is_err(),
+            "held child retains its no-delete lease"
+        );
+        guard.revalidate().unwrap();
+        let unsafe_parent = fixture.path().join("delete-child-parent");
+        create_with_sddl(
+            &unsafe_parent,
+            &format!("O:{user}D:P(A;;FA;;;{user})(A;;0x44;;;AU)"),
+        );
+        let protected_child = unsafe_parent.join("private-child");
+        create_with_sddl(&protected_child, &format!("O:{user}D:P(A;;FA;;;{user})"));
+        assert!(
+            DirectoryIdentity::capture(&protected_child).is_err(),
+            "FILE_DELETE_CHILD remains forbidden above a protected leaf"
+        );
+        let untrusted_child = parent.join("untrusted-child");
+        create_with_sddl(
+            &untrusted_child,
+            &format!("O:{user}D:P(A;;FA;;;{user})(A;;FA;;;AU)"),
+        );
+        assert!(
+            DirectoryIdentity::capture(&untrusted_child).is_err(),
+            "the ancestor exception cannot authorize the child's broad DACL"
+        );
+        drop(guard);
+        std::fs::rename(&leaf, parent.join("moved-child"))
+            .expect("guard release closes every lease");
     }
 
     fn overwrite_same_length_and_restore_last_write(path: &Path, content: &[u8]) {

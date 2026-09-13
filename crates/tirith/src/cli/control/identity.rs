@@ -80,6 +80,7 @@ impl DirectoryIdentity {
             native::validate_directory(
                 &before.file,
                 self.private_leaf && index + 1 == self.held.len(),
+                index + 1 < self.held.len(),
             )?;
             if native::identity(&before.file)? != before.identity || before.identity != now.identity
             {
@@ -97,7 +98,7 @@ fn capture_directories(path: &Path, private_leaf: bool) -> Result<Vec<HeldDirect
     let mut held = Vec::with_capacity(files.len());
     let count = files.len();
     for (index, file) in files.into_iter().enumerate() {
-        native::validate_directory(&file, private_leaf && index + 1 == count)?;
+        native::validate_directory(&file, private_leaf && index + 1 == count, index + 1 < count)?;
         let identity = native::identity(&file)?;
         held.push(HeldDirectory { file, identity });
     }
@@ -281,7 +282,11 @@ mod native {
         Ok(files)
     }
 
-    pub fn validate_directory(file: &File, private: bool) -> Result<(), String> {
+    pub fn validate_directory(
+        file: &File,
+        private: bool,
+        _has_held_child: bool,
+    ) -> Result<(), String> {
         let metadata = file
             .metadata()
             .map_err(|_| "cannot inspect control directory")?;
@@ -477,11 +482,18 @@ mod native {
         Ok(files)
     }
 
-    pub fn validate_directory(file: &File, private: bool) -> Result<(), String> {
+    pub fn validate_directory(
+        file: &File,
+        private: bool,
+        has_held_child: bool,
+    ) -> Result<(), String> {
         if private {
             super::super::super::setup::fs_helpers::validate_control_directory_handle(file)
         } else {
-            super::super::super::setup::fs_helpers::validate_control_ancestor_handle(file)
+            super::super::super::setup::fs_helpers::validate_control_ancestor_handle(
+                file,
+                has_held_child,
+            )
         }
     }
 
@@ -534,7 +546,7 @@ mod native {
     pub fn open_chain(_: &Path) -> Result<Vec<File>, String> {
         Err("retained directory identities are unsupported".into())
     }
-    pub fn validate_directory(_: &File, _: bool) -> Result<(), String> {
+    pub fn validate_directory(_: &File, _: bool, _: bool) -> Result<(), String> {
         Err("directory permissions are unsupported".into())
     }
     pub fn identity(_: &File) -> Result<(u64, u64), String> {
