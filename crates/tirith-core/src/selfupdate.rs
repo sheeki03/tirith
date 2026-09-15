@@ -37,6 +37,14 @@ pub enum InstallMethod {
     Npm,
     /// Scoop (Windows) — path under `scoop\apps`.
     Scoop,
+    /// Chocolatey (Windows) — package tools behind the generated shim.
+    Chocolatey,
+    /// Nix store binary; immutable and generally built from source.
+    Nix,
+    /// mise-managed install (GitHub release or Cargo backend).
+    Mise,
+    /// asdf-managed install.
+    Asdf,
     /// AUR / pacman — a system path owned by pacman.
     Aur,
     /// Debian/Ubuntu `.deb` (`apt`, `dpkg`).
@@ -56,6 +64,10 @@ impl InstallMethod {
             InstallMethod::Cargo => "cargo",
             InstallMethod::Npm => "npm",
             InstallMethod::Scoop => "scoop",
+            InstallMethod::Chocolatey => "chocolatey",
+            InstallMethod::Nix => "nix",
+            InstallMethod::Mise => "mise",
+            InstallMethod::Asdf => "asdf",
             InstallMethod::Aur => "aur",
             InstallMethod::Apt => "apt",
             InstallMethod::Dnf => "dnf",
@@ -78,16 +90,20 @@ impl InstallMethod {
             InstallMethod::Cargo => Some("cargo install tirith --force"),
             InstallMethod::Npm => Some("npm install -g tirith@latest"),
             InstallMethod::Scoop => Some("scoop update tirith"),
+            InstallMethod::Chocolatey => Some("choco upgrade tirith"),
+            InstallMethod::Nix => Some("update the tirith entry in its owning Nix profile, flake, or Home Manager configuration"),
+            InstallMethod::Mise => Some("mise upgrade tirith --no-prune"),
+            InstallMethod::Asdf => Some("asdf install tirith latest, then select that version with `asdf set` in the intended project or user scope"),
             InstallMethod::Aur => {
                 Some("update via your AUR helper, e.g. `yay -S tirith` or `paru -S tirith`")
             }
             InstallMethod::Apt => {
                 // Not in the Debian/Ubuntu archives; the .deb is a GitHub release
                 // artifact, so `apt upgrade` won't find it.
-                Some("download the latest tirith_*.deb from the GitHub releases page and `sudo dpkg -i` it")
+                Some("download the latest tirith_*.deb from the GitHub releases page and install it with `dpkg -i` from a root session, or use `sudo dpkg -i`")
             }
             InstallMethod::Dnf => {
-                Some("download the latest tirith-*.rpm from the GitHub releases page and `sudo rpm -U` it")
+                Some("download the latest tirith-*.rpm from the GitHub releases page and install it with `rpm -U` from a root session, or use `sudo rpm -U`")
             }
             InstallMethod::SelfManaged | InstallMethod::Unknown => None,
         }
@@ -111,6 +127,33 @@ pub fn detect_install_method(canonical_path: &Path) -> InstallMethod {
         .collect();
 
     let has = |needle: &str| components.contains(&needle);
+
+    // These managers can run on Debian/Fedora as well. Recognize their actual
+    // resolved storage before any OS-family refinement or user-local heuristic.
+    if path_lower.starts_with("/nix/store/") {
+        return InstallMethod::Nix;
+    }
+    if components
+        .windows(3)
+        .any(|parts| parts == ["chocolatey", "lib", "tirith"])
+    {
+        return InstallMethod::Chocolatey;
+    }
+    if components.windows(3).any(|parts| {
+        parts[0] == "mise"
+            && parts[1] == "installs"
+            && matches!(
+                parts[2],
+                "tirith" | "github-sheeki03-tirith" | "cargo-tirith"
+            )
+    }) {
+        return InstallMethod::Mise;
+    }
+    if components.windows(3).any(|parts| {
+        matches!(parts[0], "asdf" | ".asdf") && parts[1] == "installs" && parts[2] == "tirith"
+    }) {
+        return InstallMethod::Asdf;
+    }
 
     // npm: anywhere under a `node_modules` tree.
     if has("node_modules") {
@@ -194,6 +237,28 @@ pub fn refine_system_pm(method: InstallMethod, os_release_ids: &[String]) -> Ins
         return InstallMethod::Aur;
     }
     InstallMethod::Unknown
+}
+
+/// Classify the resolved executable, retaining uncertainty if resolution failed.
+/// Distribution family only refines actual system installation directories; a
+/// Nix/mise/asdf/custom path on Ubuntu is not evidence of dpkg ownership.
+pub fn classify_install_method(
+    path: &Path,
+    path_resolved: bool,
+    os_release_ids: &[String],
+) -> InstallMethod {
+    if !path_resolved {
+        return InstallMethod::Unknown;
+    }
+    let method = detect_install_method(path);
+    if matches!(
+        path.parent().and_then(Path::to_str),
+        Some("/usr/bin" | "/usr/local/bin" | "/bin")
+    ) {
+        refine_system_pm(method, os_release_ids)
+    } else {
+        method
+    }
 }
 
 /// The target triple this binary was built for, as used in release archive names.
@@ -505,6 +570,10 @@ mod tests {
             InstallMethod::Cargo,
             InstallMethod::Npm,
             InstallMethod::Scoop,
+            InstallMethod::Chocolatey,
+            InstallMethod::Nix,
+            InstallMethod::Mise,
+            InstallMethod::Asdf,
             InstallMethod::Aur,
             InstallMethod::Apt,
             InstallMethod::Dnf,
@@ -539,6 +608,15 @@ mod tests {
         assert!(InstallMethod::Aur.upgrade_command().is_some());
         assert!(InstallMethod::Apt.upgrade_command().is_some());
         assert!(InstallMethod::Dnf.upgrade_command().is_some());
+        for method in [
+            InstallMethod::Chocolatey,
+            InstallMethod::Nix,
+            InstallMethod::Mise,
+            InstallMethod::Asdf,
+        ] {
+            assert!(method.upgrade_command().is_some());
+            assert!(!method.is_self_replaceable());
+        }
         // Self-managed and unknown have no PM command.
         assert_eq!(InstallMethod::SelfManaged.upgrade_command(), None);
         assert_eq!(InstallMethod::Unknown.upgrade_command(), None);
@@ -589,6 +667,51 @@ mod tests {
     fn refine_system_pm_unknown_os_stays_unknown() {
         let m = refine_system_pm(InstallMethod::Unknown, &["plan9".to_string()]);
         assert_eq!(m, InstallMethod::Unknown);
+    }
+
+    #[test]
+    fn resolved_channels_are_never_refined_into_the_host_distribution_manager() {
+        let debian = vec!["debian".to_string()];
+        for (path, expected) in [
+            ("/nix/store/abc-tirith-0.4.2/bin/tirith", InstallMethod::Nix),
+            (
+                "/home/user/.local/share/mise/installs/tirith/0.4.2/bin/tirith",
+                InstallMethod::Mise,
+            ),
+            (
+                "/home/user/.local/share/mise/installs/cargo-tirith/0.4.2/bin/tirith",
+                InstallMethod::Mise,
+            ),
+            (
+                "/home/user/.asdf/installs/tirith/0.4.2/bin/tirith",
+                InstallMethod::Asdf,
+            ),
+            (
+                "C:\\ProgramData\\chocolatey\\lib\\tirith\\tools\\tirith.exe",
+                InstallMethod::Chocolatey,
+            ),
+            ("/opt/custom/tirith", InstallMethod::Unknown),
+            (
+                "/opt/mise/project/installs/other/tirith",
+                InstallMethod::Unknown,
+            ),
+            ("/usr/bin/tirith", InstallMethod::Apt),
+            ("/usr/bin/custom/tirith", InstallMethod::Unknown),
+        ] {
+            let method = classify_install_method(Path::new(path), true, &debian);
+            assert_eq!(method, expected, "{path}");
+            assert!(!method.is_self_replaceable(), "{path}");
+        }
+        for unresolved in [
+            "/home/user/.local/bin/tirith",
+            "/usr/bin/tirith",
+            "/nix/store/abc/bin/tirith",
+        ] {
+            assert_eq!(
+                classify_install_method(Path::new(unresolved), false, &debian),
+                InstallMethod::Unknown
+            );
+        }
     }
 
     #[test]

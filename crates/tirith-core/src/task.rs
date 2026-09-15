@@ -751,6 +751,13 @@ pub fn infer_effects_detailed_with_context(
             // Even when the launcher is recognized, install lifecycle scripts
             // and fetched entrypoints remain unanalyzed.
             complete &= !npm_package_operation && !npm_unmodelled_behaviour;
+            // Bounded Python/Cargo intent contributes effects, never a positive
+            // completeness grant. Runtime hooks and entrypoints remain unknown.
+            for shell in shells {
+                let family = crate::task_command_families::analyze_input(command, *shell);
+                effects.extend(family.effects);
+                complete &= !family.unknown_runtime && !family.limits_reached;
+            }
         }
         ProposedAction::PackageInstall { .. } => {
             effects.insert(CommandEffectKind::PackageInstall);

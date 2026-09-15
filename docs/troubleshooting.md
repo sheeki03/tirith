@@ -78,9 +78,22 @@ To recover full protection after a degrade, restart your shell (and see
 Strict protocol-v3 receipts are available only to interactive bash, zsh, and
 fish hooks. Each live shell process registers once, and the capability is bound
 to that process and start identity, shell family, session ID, effective user,
-and the pinned Tirith executable identity. Nested shells register independently
-even when they inherit the same session ID. Do not export or manually set any
-`_TIRITH_RECEIPT_*` variable.
+and the pinned Tirith executable identity. Each fresh Bash, Zsh, Fish, or
+PowerShell hook load assigns a new `TIRITH_SESSION_ID`, replacing an inherited
+value. This keeps multiplexer panes and nested shells from sharing one shell's
+receipt ledger or warning history. Re-sourcing an already loaded hook keeps its
+ID; ordinary commands launched from that shell still inherit it. Explicit
+`TIRITH_SESSION_ID` values remain supported for CLI and agent callers that do
+not load a shell hook. Do not export or manually set any `_TIRITH_RECEIPT_*`
+variable.
+
+If a competing decision advances the ledger before a command is committed,
+that command is refused and its unused receipt can be discarded immediately.
+Press Enter again for a fresh check. Older unresolved receipts are reconciled
+against their exact durable transition: a committed one stays consumed; a
+proven missing one is discarded without the old 30-second delay. Unreadable,
+unauthenticated, or conflicting state still refuses; do not clear private
+receipt variables to bypass it.
 
 If the hook reports that receipts are unavailable, and a line is printed
 directly under the legacy-mode or degraded-evidence warning, read that line
@@ -398,6 +411,22 @@ tirith's Tier 1 fast path (no URLs detected) targets <2ms. If you notice latency
 1. Run `tirith check --format json -- "your command"` and check `timings_ms`
 2. If Tier 1 is slow, check for extremely long command strings
 3. Policy file loading (Tier 2) adds ~1ms. Use `tirith doctor` to see policy paths
+
+## Numeric curl destinations and ports
+
+`curl HOST PORT` supplies two URL operands. For example, curl interprets the
+second operand in `curl -sv 203.0.113.10 8080` as the numeric IPv4 host
+`0.0.31.144`. A destination port belongs in the URL:
+`curl -sv http://203.0.113.10:8080/`.
+
+Curl also accepts decimal, hexadecimal, octal and shortened dotted IPv4 hosts.
+Tirith preserves those destinations in analysis and shows both the original host
+and its canonical address when they differ. Values consumed by options such as
+`--local-port 8080` or `--output 8080` are not additional destinations. Netcat's
+separate `HOST PORT` grammar is different.
+
+See curl's [URL operand rules](https://curl.se/docs/manpage.html#URL) and
+[numeric address syntax](https://curl.se/docs/url-syntax.html#numerical-ipv4-addresses).
 
 ## False positives
 

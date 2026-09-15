@@ -325,7 +325,11 @@ fn write_paste_json(
         obj.insert("clipboard_source".to_string(), source);
     }
     let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(custom_patterns);
-    tirith_core::redact::redact_json_strings(&mut value, &compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::Verdict,
+        &compiled,
+    );
     let value = tirith_core::verdict::bound_json_value_for_output(value);
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &value)?;

@@ -79,9 +79,9 @@ pub const SENSITIVE_ENV_PREFIXES: &[&str] = &[
 /// applies rlimits -> `PR_SET_NO_NEW_PRIVS` -> Landlock -> seccomp -> env cleanup
 /// in a freshly-`exec`'d single-threaded child, NOT inside `pre_exec`. Gated to
 /// Linux so macOS / Windows targets compile without Landlock. The extrasafe
-/// seccomp builder is additionally gated to x86_64; unsupported Linux
-/// architectures report absent raw-network denial and fail closed when the
-/// requested coverage requires it.
+/// seccomp filters cover native x86_64 and AArch64. Unsupported architectures,
+/// emulator limitations, and missing kernel enforcement report absent coverage
+/// and fail closed when the requested surface requires it.
 #[cfg(target_os = "linux")]
 pub mod linux;
 

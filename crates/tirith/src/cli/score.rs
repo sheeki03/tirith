@@ -116,7 +116,11 @@ fn build_json_value(
     // Apply the recursive boundary to the completed projection before its
     // presentation bound. This covers nested evidence and protects against a
     // control/invisible separator whose removal reconstitutes a custom secret.
-    tirith_core::redact::redact_json_strings(&mut value, &compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::Score,
+        &compiled,
+    );
     tirith_core::verdict::bound_json_value_for_output(value)
 }
 

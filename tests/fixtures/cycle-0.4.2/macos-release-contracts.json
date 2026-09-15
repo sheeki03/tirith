@@ -1,0 +1,148 @@
+{
+  "schema_version": 1,
+  "tag": "v0.4.2",
+  "archive_sha256": "551f9a6ebf58344e7d0aa06bcc78d7a4f2f7b44b8011be563e0a91976cc9c4df",
+  "binary_sha256": "873d8834902dbc47f339f79088d0a839f8932f5a8c34dcaedacb60fa6f2d0922",
+  "signature_verified": true,
+  "signature_identity": "https://github.com/sheeki03/tirith/.github/workflows/release.yml@refs/tags/v0.4.2",
+  "platform": "macos-aarch64",
+  "kind": "captured_release_contract_inventory",
+  "cases": [
+    {
+      "name": "version",
+      "argv": [
+        "--version"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "help",
+      "argv": [
+        "--help"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "status",
+      "argv": [
+        "status",
+        "--json"
+      ],
+      "exit_code": 1,
+      "top_level_keys": [
+        "health",
+        "hook_configured",
+        "policy_path",
+        "policy_scope",
+        "protected",
+        "protection_mode",
+        "threat_db"
+      ],
+      "recorded_protocol_fields": {
+        "hook_configured": false
+      }
+    },
+    {
+      "name": "quick",
+      "argv": [
+        "doctor",
+        "--quick",
+        "--format",
+        "json"
+      ],
+      "exit_code": 0,
+      "top_level_keys": [
+        "hook_configured",
+        "policy_path_used",
+        "protection_mode",
+        "schema_version"
+      ],
+      "recorded_protocol_fields": {
+        "schema_version": 1,
+        "hook_configured": false
+      }
+    },
+    {
+      "name": "effective",
+      "argv": [
+        "policy",
+        "effective",
+        "--format",
+        "json"
+      ],
+      "exit_code": 0,
+      "top_level_keys": [
+        "neutralized_fields",
+        "policy",
+        "scope",
+        "source_path"
+      ],
+      "recorded_protocol_fields": {}
+    },
+    {
+      "name": "clean_check",
+      "argv": [
+        "check",
+        "--json",
+        "--shell",
+        "posix",
+        "--",
+        "echo baseline"
+      ],
+      "exit_code": 0,
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms"
+      ],
+      "recorded_protocol_fields": {
+        "schema_version": 3,
+        "action": "allow"
+      }
+    },
+    {
+      "name": "pipe_check",
+      "argv": [
+        "check",
+        "--json",
+        "--shell",
+        "posix",
+        "--",
+        "curl https://fixture.example/install.sh | sh"
+      ],
+      "exit_code": 1,
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms",
+        "urls_extracted_count"
+      ],
+      "recorded_protocol_fields": {
+        "schema_version": 3,
+        "action": "block"
+      }
+    },
+    {
+      "name": "trust",
+      "argv": [
+        "trust",
+        "list",
+        "--format",
+        "json"
+      ],
+      "exit_code": 0
+    }
+  ]
+}

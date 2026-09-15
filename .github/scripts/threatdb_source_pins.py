@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from collections import Counter
 from datetime import datetime, timezone
 import json
+from email.utils import parsedate_to_datetime
 import os
 from pathlib import Path
 import re
 import tempfile
+import time
+import socket
 from typing import Any, Protocol
 import urllib.error
 import urllib.request
@@ -144,6 +148,7 @@ def write_json(path: Path, document: Any) -> None:
 class GitHubClient:
     def __init__(self, token: str | None) -> None:
         self.token = token
+        self.deadline = time.monotonic() + 120
 
     def _get(self, endpoint: str) -> Any:
         headers = {
@@ -156,17 +161,49 @@ class GitHubClient:
         request = urllib.request.Request(
             f"https://api.github.com{endpoint}", headers=headers
         )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                if response.status != 200:
-                    raise PinError(
-                        f"GitHub API returned HTTP {response.status} for {endpoint}"
-                    )
-                return json.load(response)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-            raise PinError(
-                f"GitHub API request failed for {endpoint}: {error}"
-            ) from error
+        for attempt in range(3):
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise PinError("GitHub observation transport exceeded overall 120s deadline")
+            try:
+                with urllib.request.urlopen(request, timeout=min(30, remaining)) as response:
+                    if response.status != 200:
+                        raise PinError(f"GitHub API permanent HTTP {response.status} for {endpoint}")
+                    data = response.read(4 * 1024 * 1024 + 1)
+                    if len(data) > 4 * 1024 * 1024:
+                        raise PinError("GitHub observation exceeded response byte cap")
+                    # Parsing is outside transport recovery: invalid HTTP 200 is
+                    # a validation failure, never permission to retry bad data.
+                    try:
+                        return json.loads(data)
+                    except (ValueError, UnicodeDecodeError) as error:
+                        raise PinError(f"GitHub API schema failure for {endpoint}") from error
+            except urllib.error.HTTPError as error:
+                retryable = error.code in {408, 429, 500, 502, 503, 504}
+                category = "rate_limit" if error.code == 429 else "transport"
+                retry_after = error.headers.get("Retry-After")
+                if error.code == 403 and error.headers.get("X-RateLimit-Remaining") == "0":
+                    retryable = True
+                    category = "rate_limit"
+                    try:
+                        retry_after = str(max(0, int(error.headers["X-RateLimit-Reset"]) - int(time.time())))
+                    except (ValueError, TypeError):
+                        retryable = False
+                if not retryable:
+                    raise PinError(f"GitHub API permanent HTTP {error.code} for {endpoint}") from error
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+                reason = getattr(error, "reason", error)
+                retryable = isinstance(reason, (TimeoutError, ConnectionError)) or (
+                    isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN
+                )
+                if not retryable:
+                    raise PinError(f"GitHub API identity or non-transient transport failure for {endpoint}") from error
+                category, retry_after = "transport", None
+            delay = retry_delay(retry_after, attempt, self.deadline - time.monotonic())
+            if delay is None:
+                raise PinError(f"GitHub API {category} failure exhausted bounded recovery for {endpoint}")
+            time.sleep(delay)
+        raise PinError("GitHub observation recovery exhausted")
 
     def commits(self, repository: str, page: int = 1) -> Any:
         return self._get(
@@ -175,6 +212,52 @@ class GitHubClient:
 
     def compare(self, repository: str, base: str, head: str) -> Any:
         return self._get(f"/repos/{repository}/compare/{base}...{head}")
+
+
+def retry_delay(retry_after: str | None, attempt: int, remaining: float) -> float | None:
+    if attempt >= 2:
+        return None
+    if retry_after is None:
+        delay = float(2**attempt)
+    else:
+        try:
+            delay = float(int(retry_after))
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(retry_after)
+                if parsed.tzinfo is None:
+                    return None
+                delay = max(0.0, parsed.timestamp() - time.time())
+            except (ValueError, TypeError, OverflowError):
+                return None
+    return delay if 0 <= delay < remaining else None
+
+
+def observation_document(selected_at: str, changes: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "checked_at": selected_at,
+        "sources": {
+            item["source"]: {
+                "pinned_commit": item["old_commit"],
+                "candidate_commit": item["candidate"]["commit"],
+                "candidate_timestamp": item["candidate"]["commit_timestamp"],
+                "ahead_by": item.get("comparison", {}).get("ahead_by", 0),
+                "max_lag_hours": item["max_lag_hours"],
+                "review_required": item["changed"],
+            }
+            for item in changes
+        },
+    }
+
+
+def command_observe(arguments: argparse.Namespace) -> int:
+    manifest = load_manifest(arguments.manifest)
+    selected_at = arguments.now or format_timestamp(datetime.now(timezone.utc))
+    client = FixtureClient(arguments.api_fixture) if arguments.api_fixture else GitHubClient(os.environ.get("GITHUB_TOKEN"))
+    _, changes = update_pins(copy.deepcopy(manifest), client, selected_at)
+    write_json(arguments.result, observation_document(selected_at, changes))
+    return 0
 
 
 class FixtureClient:
@@ -441,6 +524,7 @@ def command_update(arguments: argparse.Namespace) -> int:
         "changed_sources": [item["source"] for item in changes if item["changed"]],
         "selected_at": selected_at,
         "stale_sources": [item["source"] for item in changes if item["stale"]],
+        "upstream_observations": observation_document(selected_at, changes),
     }
     write_json(arguments.result, result)
     print(json.dumps(result, sort_keys=True))
@@ -466,6 +550,13 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--report", type=Path, required=True)
     update.add_argument("--result", type=Path, required=True)
     update.set_defaults(handler=command_update)
+
+    observe = subparsers.add_parser("observe", help="report upstream lag without adopting any pins")
+    observe.add_argument("manifest", type=Path)
+    observe.add_argument("--api-fixture", type=Path)
+    observe.add_argument("--now")
+    observe.add_argument("--result", type=Path, required=True)
+    observe.set_defaults(handler=command_observe)
     return parser
 
 

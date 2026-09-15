@@ -256,7 +256,7 @@ run_fetch git clone --depth 1 --filter=blob:none --sparse --no-checkout \
 pids+=("$!")
 labels+=("ecosyste.ms typosquatting-dataset")
 
-run_fetch curl -sSfL \
+run_fetch curl -sSfL --retry 2 --retry-connrefused --retry-max-time 240 \
   --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
   --max-time "$CURL_MAX_TIME_SECONDS" \
   --max-filesize "$FEODO_MAX_BYTES" \
@@ -265,7 +265,7 @@ run_fetch curl -sSfL \
 pids+=("$!")
 labels+=("Feodo Tracker")
 
-run_fetch curl -sSfL \
+run_fetch curl -sSfL --retry 2 --retry-connrefused --retry-max-time 240 \
   --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
   --max-time "$CURL_MAX_TIME_SECONDS" \
   --max-filesize "$CISA_KEV_MAX_BYTES" \
