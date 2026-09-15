@@ -14,12 +14,13 @@ if [[ -n "$_TIRITH_ZSH_LOADED" ]]; then
 fi
 _TIRITH_ZSH_LOADED=1
 
-# Session tracking: generate ID per shell session if not inherited
-if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
-  builtin printf -v TIRITH_SESSION_ID '%x-%x-%x-%x' \
-    "$$" "${SECONDS:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
-  export TIRITH_SESSION_ID
-fi
+# Each freshly loaded shell owns its session. Inherited IDs from a parent
+# shell or terminal multiplexer must not join independent receipt ledgers.
+# The double-source guard above preserves this ID in the same live shell;
+# ordinary child commands still inherit it for that shell's correlation.
+builtin printf -v TIRITH_SESSION_ID '%x-%x-%x-%x' \
+  "$$" "${SECONDS:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
+export TIRITH_SESSION_ID
 
 # Pin the executable before any repository command can mutate PATH. All hook
 # callbacks use this absolute path for the lifetime of the shell session.
