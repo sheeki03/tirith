@@ -3,11 +3,11 @@
   "sources": {
     "datadog_malicious_software_packages": {
       "candidate_policy": "default_branch_head",
-      "commit": "31a2ba215bcf891cfc751c3cb769e272bc6158c5",
-      "commit_timestamp": "2026-09-11T08:15:54Z",
+      "commit": "8fff54014596bdd8cf5811ff7eaf0f272527f603",
+      "commit_timestamp": "2026-09-14T08:13:27Z",
       "max_lag_hours": 168,
       "repository": "DataDog/malicious-software-packages-dataset",
-      "selected_at": "2026-09-11T11:43:22Z"
+      "selected_at": "2026-09-15T07:59:32Z"
     },
     "ecosystems_typosquatting_dataset": {
       "candidate_policy": "default_branch_head",
@@ -19,11 +19,11 @@
     },
     "ossf_malicious_packages": {
       "candidate_policy": "latest_assign_ids",
-      "commit": "fed4af1871531557d07163a06e148ddf3b643140",
-      "commit_timestamp": "2026-09-11T08:26:52Z",
+      "commit": "8cf2a4fc7af54b825c32462ce6b543d548ae8afc",
+      "commit_timestamp": "2026-09-15T06:24:53Z",
       "max_lag_hours": 48,
       "repository": "ossf/malicious-packages",
-      "selected_at": "2026-09-11T11:43:22Z"
+      "selected_at": "2026-09-15T07:59:32Z"
     }
   }
 }
