@@ -93,7 +93,6 @@ object = { version = "0.39", default-features = false, features = [
     "pe",
     "std",
 ] }
-arboard = { workspace = true }
 # OS RNG for the per-install anomaly-baseline salt (M10 ch5). Tiny, OS-only
 # entropy source; already present transitively. Used by `baseline::load_or_create_salt`.
 getrandom = "0.3"
@@ -171,6 +170,14 @@ landlock = "0.4"
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 extrasafe = "0.5"
+
+# arboard (clipboard) ships X11/Wayland/Windows/macOS backends only — its
+# `platform` module has no Android/Bionic implementation and fails to compile on
+# aarch64-linux-android (E0433/E0425: no `platform::Get/Set/Clear`). Gate it off
+# for Android; `clipboard.rs` supplies a `NoBackend` degradation there — the same
+# soft-fail path desktop Linux uses when headless. All other targets unchanged.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { workspace = true }
 
 [build-dependencies]
 toml = "0.8"
