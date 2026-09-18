@@ -1330,10 +1330,18 @@ mod fd {
     /// clear, a stale non-zero `errno` makes the read look failed. That is the
     /// fail-closed direction: the copy refuses instead of returning a listing it
     /// cannot vouch for.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     fn clear_errno() {
         // SAFETY: __errno_location returns this thread's errno slot.
-        unsafe { *libc::__errno_location() = 0 };
+        unsafe { *libc::__errno_location() = 0 }
+    }
+
+    /// Bionic (Android) exposes this thread's errno slot as `__errno()`;
+    /// `__errno_location` is glibc-only and does not exist there.
+    #[cfg(target_os = "android")]
+    fn clear_errno() {
+        // SAFETY: __errno returns this thread's errno slot.
+        unsafe { *libc::__errno() = 0 }
     }
 
     #[cfg(any(
