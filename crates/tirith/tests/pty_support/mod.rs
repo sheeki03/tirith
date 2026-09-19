@@ -16,6 +16,7 @@
 // inevitably has items a given file does not touch.
 #![allow(dead_code)]
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,17 +34,107 @@ use tempfile::TempDir;
 /// so the two never interleave on the PTY master.
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
-/// Absolute path to an embedded shell hook under `assets/shell/lib/`
-/// (`embedded_shell_hooks_match_repo_hooks` guarantees it matches `shell/lib/`).
+/// Certification overrides are paired to prevent combining a shipped binary
+/// with repository hook assets accidentally. Explicit invalid overrides fail.
+fn candidate_paths() -> Option<(PathBuf, PathBuf)> {
+    match (
+        std::env::var_os("TIRITH_CERTIFY_BINARY"),
+        std::env::var_os("TIRITH_CERTIFY_HOOK_DIR"),
+    ) {
+        (None, None) => None,
+        (Some(binary), Some(hooks)) => {
+            let binary = PathBuf::from(binary);
+            let hooks = PathBuf::from(hooks);
+            assert!(
+                binary.is_absolute() && binary.is_file(),
+                "certification binary must be an existing absolute file"
+            );
+            assert_eq!(
+                binary.file_name().and_then(|s| s.to_str()),
+                Some("tirith"),
+                "certification binary must be named tirith for hook PATH resolution"
+            );
+            assert!(
+                hooks.is_absolute() && hooks.is_dir(),
+                "certification hook directory must be an existing absolute directory"
+            );
+            Some((binary, hooks))
+        }
+        _ => panic!("TIRITH_CERTIFY_BINARY and TIRITH_CERTIFY_HOOK_DIR must be set together"),
+    }
+}
+
+fn selected_shell(family: &str, candidate: Option<PathBuf>) -> Option<PathBuf> {
+    let key = format!("TIRITH_CERTIFY_{}", family.to_ascii_uppercase());
+    let candidate = match std::env::var_os(key) {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            assert!(
+                path.is_absolute() && path.is_file(),
+                "explicit certification shell must be an existing absolute file"
+            );
+            Some(path)
+        }
+        None => candidate,
+    };
+    if std::env::var("TIRITH_CERTIFY_SHELLS")
+        .unwrap_or_default()
+        .split(',')
+        .any(|value| value == family)
+    {
+        assert!(
+            candidate.is_some(),
+            "required certification shell {family} is unavailable"
+        );
+    }
+    candidate
+}
+
+/// Hook from the exact candidate bundle in certification mode, otherwise the
+/// embedded repository copy used by ordinary development tests.
 pub fn embedded_hook(file: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/shell/lib")
-        .join(file)
+    assert!(
+        Path::new(file).components().count() == 1,
+        "hook name must be a basename"
+    );
+    let path = candidate_paths()
+        .map(|(_, hooks)| hooks)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib"))
+        .join(file);
+    assert!(
+        path.is_file(),
+        "candidate hook is unavailable: {}",
+        path.display()
+    );
+    path
+}
+
+/// Fixed loader beside the candidate bundle's lib directory. A separate
+/// accessor keeps embedded_hook basename-only instead of admitting traversal.
+pub fn embedded_loader() -> PathBuf {
+    let root = candidate_paths()
+        .map(|(_, hooks)| {
+            assert_eq!(
+                hooks.file_name().and_then(|name| name.to_str()),
+                Some("lib"),
+                "candidate hooks must use the packaged lib directory"
+            );
+            hooks
+                .parent()
+                .expect("absolute packaged lib has a parent")
+                .to_path_buf()
+        })
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell"));
+    let loader = root.join("tirith.sh");
+    assert!(loader.is_file(), "candidate source loader is unavailable");
+    loader
 }
 
 /// Path to the freshly-built `tirith` binary under test.
 pub fn tirith_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_tirith"))
+    candidate_paths()
+        .map(|(binary, _)| binary)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_tirith")))
 }
 
 /// Directory of the freshly-built `tirith` binary. The hooks resolve `tirith`
@@ -60,6 +151,14 @@ pub fn tirith_bin_dir() -> PathBuf {
 /// Locate a modern bash (>= 5). macOS's `/bin/bash` is 3.2 (too old for enter
 /// mode); checks the Homebrew paths and whatever's on `PATH`. `None` ⇒ skip.
 pub fn modern_bash() -> Option<PathBuf> {
+    if std::env::var_os("TIRITH_CERTIFY_BASH").is_some() {
+        let path = selected_shell("bash", None).unwrap();
+        assert!(
+            bash_major_version(&path).is_some_and(|version| version >= 5),
+            "certification Bash must be >= 5"
+        );
+        return Some(path);
+    }
     let mut candidates: Vec<PathBuf> = vec![
         PathBuf::from("/opt/homebrew/bin/bash"),
         PathBuf::from("/usr/local/bin/bash"),
@@ -73,9 +172,12 @@ pub fn modern_bash() -> Option<PathBuf> {
             }
         }
     }
-    candidates
-        .into_iter()
-        .find(|p| p.exists() && bash_major_version(p).map(|v| v >= 5).unwrap_or(false))
+    selected_shell(
+        "bash",
+        candidates
+            .into_iter()
+            .find(|p| p.exists() && bash_major_version(p).map(|v| v >= 5).unwrap_or(false)),
+    )
 }
 
 /// Parse the major version of the bash binary at `path`.
@@ -116,18 +218,21 @@ pub fn bash_version_string(path: &Path) -> Option<String> {
 
 /// Locate a fish shell. Returns `None` when fish is not installed.
 pub fn fish_bin() -> Option<PathBuf> {
-    let out = Command::new("sh")
-        .args(["-c", "command -v fish"])
-        .output()
-        .ok()?;
+    if std::env::var_os("TIRITH_CERTIFY_FISH").is_some() {
+        return selected_shell("fish", None);
+    }
+    let out = Command::new("sh").args(["-c", "command -v fish"]).output();
+    let Ok(out) = out else {
+        return selected_shell("fish", None);
+    };
     if !out.status.success() {
-        return None;
+        return selected_shell("fish", None);
     }
     let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if p.is_empty() {
-        None
+        selected_shell("fish", None)
     } else {
-        Some(PathBuf::from(p))
+        selected_shell("fish", Some(PathBuf::from(p)))
     }
 }
 
@@ -142,7 +247,7 @@ pub fn zsh_bin() -> Option<PathBuf> {
             }
         }
     }
-    candidates.into_iter().find(|path| path.is_file())
+    selected_shell("zsh", candidates.into_iter().find(|path| path.is_file()))
 }
 
 /// A fresh, fully-isolated environment for one PTY session: holds the temp dirs
@@ -156,6 +261,10 @@ pub struct IsolatedEnv {
     /// A scratch directory the test may use as the shell's cwd.
     pub workdir: PathBuf,
     env: HashMap<String, String>,
+    // PID identifies which fixture capability supplies the observed session.
+    // It is never used to signal a process.
+    shell_pid: Cell<Option<u32>>,
+    loaded_session_id: RefCell<Option<String>>,
 }
 
 impl IsolatedEnv {
@@ -184,9 +293,9 @@ impl IsolatedEnv {
             config_home.display().to_string(),
         );
         env.insert("TERM".to_string(), "xterm-256color".to_string());
-        // Unique session id per IsolatedEnv so per-session state never collides
-        // between concurrent tests (`process::id()` is shared across a run, so
-        // pair it with a per-call counter).
+        // An inherited correlation ID deliberately exercises fresh-hook
+        // isolation. Receipt assertions use the ID actually registered by the
+        // spawned shell, never this parent value.
         use std::sync::atomic::{AtomicU64, Ordering};
         static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
         env.insert(
@@ -199,6 +308,19 @@ impl IsolatedEnv {
         );
         // Audit log off: tests assert on terminal behaviour, not the log.
         env.insert("TIRITH_LOG".to_string(), "0".to_string());
+        // Delivery evidence must not depend on DNS/HTTP enrichment or a
+        // background ThreatDB refresh, including package certification runs.
+        env.insert("TIRITH_OFFLINE".to_string(), "1".to_string());
+        if let Some((_, hooks)) = candidate_paths() {
+            env.insert(
+                "TIRITH_SHELL_DIR".into(),
+                hooks
+                    .parent()
+                    .expect("candidate lib directory has a parent")
+                    .display()
+                    .to_string(),
+            );
+        }
 
         Self {
             _root: root,
@@ -208,6 +330,8 @@ impl IsolatedEnv {
             config_home,
             workdir,
             env,
+            shell_pid: Cell::new(None),
+            loaded_session_id: RefCell::new(None),
         }
     }
 
@@ -223,11 +347,57 @@ impl IsolatedEnv {
         self
     }
 
-    /// Stable session identity injected into the shell under test.
-    pub fn session_id(&self) -> &str {
-        self.env
-            .get("TIRITH_SESSION_ID")
-            .expect("pty harness: session id must be present")
+    /// Observe the session that this actual spawned shell registered. This is
+    /// test metadata, not a capability or an execution-proof shortcut: the
+    /// conformance assertions still independently inspect the durable ledger.
+    pub fn session_id(&self) -> String {
+        if let Some(id) = self.loaded_session_id.borrow().as_ref() {
+            return id.clone();
+        }
+        let pid = self
+            .shell_pid
+            .get()
+            .expect("pty harness: spawned shell PID");
+        let directory = self.state_home.join("tirith/sessions/execution-receipts");
+        let mut matching = Vec::new();
+        for entry in std::fs::read_dir(directory).expect("registered shell capability directory") {
+            let path = entry.expect("capability directory entry").path();
+            if path.extension().and_then(|part| part.to_str()) != Some("capability") {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path).expect("capability metadata");
+            assert!(metadata.is_file() && metadata.len() <= 16 * 1024);
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .expect("read fixture capability")
+                .take(16 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(bytes.len() <= 16 * 1024);
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("fixture capability must be valid JSON");
+            if value["shell_pid"].as_u64() == Some(u64::from(pid)) {
+                let id = value["session_id"].as_str().expect("registered session ID");
+                assert!(!id.is_empty() && id.len() <= 128);
+                assert!(id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+                matching.push(id.to_owned());
+            }
+        }
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one capability for the spawned shell"
+        );
+        let id = matching.pop().unwrap();
+        assert_ne!(
+            Some(&id),
+            self.env.get("TIRITH_SESSION_ID"),
+            "a fresh hook must not reuse the injected parent session ID"
+        );
+        *self.loaded_session_id.borrow_mut() = Some(id.clone());
+        id
     }
 
     /// Fixed-slot execution ledger created by protocol-v3 receipt consumption.
@@ -267,7 +437,7 @@ impl IsolatedEnv {
         let path = self.bash_enter_capability_file();
         std::fs::create_dir_all(path.parent().expect("capability cache parent"))
             .expect("pty harness: create state dir");
-        // Schema 2 mirrors `CACHE_SCHEMA` (repo-0211 binds mtime+size).
+        // Schema 3 mirrors `CACHE_SCHEMA` (repo-0211 binds mtime+size).
         // tirith_version is blank: the hook only enforces it when a sibling
         // `.hooks-version` exists, which the harness (sourcing the hook
         // directly) does not create.
@@ -283,7 +453,7 @@ impl IsolatedEnv {
             })
             .unwrap_or_default();
         let body = format!(
-            "schema=2\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+            "schema=3\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
              bash_path={}\nbash_fingerprint={}\nenter_capability={verdict}\n\
              reason=seeded by pty conformance harness\n",
             bash_path.display(),
@@ -396,6 +566,8 @@ impl PtySession {
             .slave
             .spawn_command(cmd)
             .expect("pty harness: spawn shell");
+        env.shell_pid.set(child.process_id());
+        *env.loaded_session_id.borrow_mut() = None;
         // Drop the slave once the child holds it, or the master never sees EOF.
         drop(pair.slave);
 

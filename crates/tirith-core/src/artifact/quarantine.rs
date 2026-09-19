@@ -1427,6 +1427,33 @@ impl QuarantineTransaction {
         }
     }
 
+    /// Materialize one local npm artifact under a digest-derived filename.
+    /// This crate-private seam accepts no caller-selected extension or path and
+    /// retains the same independent-copy, rehash and native publication contract
+    /// as wheel materialization. Unsupported native capability targets refuse.
+    pub(crate) fn materialize_npm_blob(&self, digest: &str) -> Result<PathBuf, QuarantineError> {
+        if !is_hex_sha256(digest) || digest.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err(QuarantineError::BlobNotFound(digest.to_owned()));
+        }
+        let filename = format!("npm-{digest}.tgz");
+        #[cfg(unix)]
+        {
+            self.materialize_blob_unix(digest, &filename)
+        }
+        #[cfg(windows)]
+        {
+            self.materialize_blob_windows(digest, &filename)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = filename;
+            Err(QuarantineError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "npm quarantine requires native retained publication capabilities",
+            )))
+        }
+    }
+
     #[cfg(windows)]
     fn materialize_blob_windows(
         &self,

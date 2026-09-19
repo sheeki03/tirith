@@ -61,10 +61,10 @@ use windows_sys::Win32::System::SystemServices::{
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
     InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, STARTUPINFOW,
+    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 /// Bounded post-termination verification allowance. The runtime deadline never
@@ -951,6 +951,11 @@ impl WindowsChild {
         startup.lpAttributeList = attributes.as_ptr();
         let mut child_command_line = assigned_helper.protect(wide_nul_units(&command_line))?;
         let mut process_info = PROCESS_INFORMATION::default();
+        // These bounded children communicate only through the three explicit
+        // standard handles. Do not attach a console inherited from the nominal
+        // parent: the handle container deliberately never initializes its DLLs
+        // or console state. This also works when Tirith itself has no console.
+        // https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
         // All remaining launch failures have explicit cleanup paths below.
         assigned_helper.disarm();
         // SAFETY: every pointer references a live NUL-terminated/mutable buffer;
@@ -962,7 +967,10 @@ impl WindowsChild {
                 null(),
                 null(),
                 1,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                CREATE_SUSPENDED
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | CREATE_NO_WINDOW
+                    | EXTENDED_STARTUPINFO_PRESENT,
                 environment.as_mut_ptr().cast(),
                 cwd.as_ptr(),
                 &startup.StartupInfo,
@@ -1181,7 +1189,7 @@ fn launch_suspended_handle_container(
             null(),
             null(),
             0,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             environment.as_mut_ptr().cast(),
             cwd.as_ptr(),
             &startup,

@@ -1,0 +1,706 @@
+{
+  "schema_version": 1,
+  "kind": "synthetic_input_native_reader_capture",
+  "platform": {
+    "machine": "arm64",
+    "release": "27.0.0",
+    "system": "Darwin"
+  },
+  "versions": {
+    "baseline": "0.4.2",
+    "candidate": "0.4.2"
+  },
+  "binary_sha256": {
+    "baseline": "873d8834902dbc47f339f79088d0a839f8932f5a8c34dcaedacb60fa6f2d0922",
+    "candidate": "fad9af58fa5ba5e902d61e1571b7d934645d3bce5b07b15136247014f9714f39"
+  },
+  "runner_sha256": "ebe9b14e6007de4b0d8127f45ee860359c7c3ac011ea191886b41653b7c16ee1",
+  "process_helper_sha256": "913a3499bd78b39c6870b9dc280fcaad8a49739db7f2781bbfe914ff4db12e75",
+  "report_sha256": "854c90c1ca7795431604b9ddc14fad53149993abc1359ea9278e28e7f534b2c7",
+  "baseline_provenance_fixture": "macos-release-contracts.json",
+  "scope": "synthetic policy, legacy trust and download-receipt reader fixtures; inherited shell mode reporting is not live shell verification",
+  "not_certified": [
+    "native shell interception",
+    "receipt producer/signature/publication authority",
+    "all historical receipt schemas",
+    "final release installation"
+  ],
+  "cases": [
+    {
+      "case": "clean-command",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms"
+      ],
+      "selected_fields": {
+        "schema_version": 3,
+        "action": "allow"
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "clean-command",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms"
+      ],
+      "selected_fields": {
+        "schema_version": 3,
+        "action": "allow"
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "blocked-command",
+      "client": "baseline",
+      "exit_code": 1,
+      "json_kind": "object",
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms",
+        "urls_extracted_count"
+      ],
+      "selected_fields": {
+        "schema_version": 3,
+        "action": "block"
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "blocked-command",
+      "client": "candidate",
+      "exit_code": 1,
+      "json_kind": "object",
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms",
+        "urls_extracted_count"
+      ],
+      "selected_fields": {
+        "schema_version": 3,
+        "action": "block"
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "personal-policy",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "neutralized_fields",
+        "policy",
+        "scope",
+        "source_path"
+      ],
+      "selected_fields": {
+        "scope": "user",
+        "policy_paranoia": 3,
+        "neutralized_fields": []
+      },
+      "fixture_sha256": [
+        "adff7e75b821cfd2829f68233fb311ff6596705df1ecb482e572c48783f80f29"
+      ]
+    },
+    {
+      "case": "personal-policy",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "neutralized_fields",
+        "policy",
+        "resolution",
+        "schema_version",
+        "scope",
+        "source_path"
+      ],
+      "selected_fields": {
+        "schema_version": 1,
+        "scope": "user",
+        "policy_paranoia": 3,
+        "neutralized_fields": []
+      },
+      "fixture_sha256": [
+        "adff7e75b821cfd2829f68233fb311ff6596705df1ecb482e572c48783f80f29"
+      ]
+    },
+    {
+      "case": "repository-policy",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "neutralized_fields",
+        "policy",
+        "scope",
+        "source_path"
+      ],
+      "selected_fields": {
+        "scope": "repo",
+        "policy_paranoia": 1,
+        "neutralized_fields": [
+          "allowlist"
+        ]
+      },
+      "fixture_sha256": [
+        "76a995f727bb6741fbd0fbb5d4d9844ab91ec4b4fde241a56c38de791d60f937"
+      ]
+    },
+    {
+      "case": "repository-policy",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "neutralized_fields",
+        "policy",
+        "resolution",
+        "schema_version",
+        "scope",
+        "source_path"
+      ],
+      "selected_fields": {
+        "schema_version": 1,
+        "scope": "repo",
+        "policy_paranoia": 1,
+        "neutralized_fields": [
+          "allowlist"
+        ]
+      },
+      "fixture_sha256": [
+        "76a995f727bb6741fbd0fbb5d4d9844ab91ec4b4fde241a56c38de791d60f937"
+      ]
+    },
+    {
+      "case": "legacy-trust-permanent",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms",
+        "urls_extracted_count"
+      ],
+      "selected_fields": {
+        "schema_version": 3,
+        "action": "allow"
+      },
+      "fixture_sha256": [
+        "a22cd2f95282ed90a354ca74392f7dc7f7f964d4193715476b341cccba44dcf6"
+      ]
+    },
+    {
+      "case": "legacy-trust-permanent",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms",
+        "urls_extracted_count"
+      ],
+      "selected_fields": {
+        "schema_version": 3,
+        "action": "allow"
+      },
+      "fixture_sha256": [
+        "a22cd2f95282ed90a354ca74392f7dc7f7f964d4193715476b341cccba44dcf6"
+      ]
+    },
+    {
+      "case": "legacy-trust-expired",
+      "client": "baseline",
+      "exit_code": 1,
+      "json_kind": "object",
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms",
+        "urls_extracted_count"
+      ],
+      "selected_fields": {
+        "schema_version": 3,
+        "action": "block"
+      },
+      "fixture_sha256": [
+        "e4b4207cd4f04e9b6b25e69474b688496a6084206116462164614e740fa6b830"
+      ]
+    },
+    {
+      "case": "legacy-trust-expired",
+      "client": "candidate",
+      "exit_code": 1,
+      "json_kind": "object",
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms",
+        "urls_extracted_count"
+      ],
+      "selected_fields": {
+        "schema_version": 3,
+        "action": "block"
+      },
+      "fixture_sha256": [
+        "e4b4207cd4f04e9b6b25e69474b688496a6084206116462164614e740fa6b830"
+      ]
+    },
+    {
+      "case": "legacy-trust-invalid-expiry",
+      "client": "baseline",
+      "exit_code": 1,
+      "json_kind": "object",
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms",
+        "urls_extracted_count"
+      ],
+      "selected_fields": {
+        "schema_version": 3,
+        "action": "block"
+      },
+      "fixture_sha256": [
+        "3f710ad5bab5c0fb49b53b8f4f50ab81e9d4386eec7b72fb411a7123fc3b4d76"
+      ]
+    },
+    {
+      "case": "legacy-trust-invalid-expiry",
+      "client": "candidate",
+      "exit_code": 1,
+      "json_kind": "object",
+      "top_level_keys": [
+        "action",
+        "bypass_honored",
+        "bypass_requested",
+        "findings",
+        "interactive_detected",
+        "policy_path_used",
+        "schema_version",
+        "tier_reached",
+        "timings_ms",
+        "urls_extracted_count"
+      ],
+      "selected_fields": {
+        "schema_version": 3,
+        "action": "block"
+      },
+      "fixture_sha256": [
+        "3f710ad5bab5c0fb49b53b8f4f50ab81e9d4386eec7b72fb411a7123fc3b4d76"
+      ]
+    },
+    {
+      "case": "reported-shell-blocks",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "hook_configured",
+        "policy_path_used",
+        "protection_mode",
+        "schema_version"
+      ],
+      "selected_fields": {
+        "schema_version": 1,
+        "protection_mode": "guarded",
+        "hook_configured": false
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "reported-shell-blocks",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "hook_configured",
+        "policy_path_used",
+        "protection_evidence",
+        "protection_mode",
+        "schema_version"
+      ],
+      "selected_fields": {
+        "schema_version": 1,
+        "protection_mode": "guarded",
+        "hook_configured": false,
+        "verified_blocking": false
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "reported-shell-warn-only",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "hook_configured",
+        "policy_path_used",
+        "protection_mode",
+        "schema_version"
+      ],
+      "selected_fields": {
+        "schema_version": 1,
+        "protection_mode": "warn-only",
+        "hook_configured": false
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "reported-shell-warn-only",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "hook_configured",
+        "policy_path_used",
+        "protection_evidence",
+        "protection_mode",
+        "schema_version"
+      ],
+      "selected_fields": {
+        "schema_version": 1,
+        "protection_mode": "warn-only",
+        "hook_configured": false,
+        "verified_blocking": false
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "reported-shell-degraded",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "hook_configured",
+        "policy_path_used",
+        "protection_mode",
+        "schema_version"
+      ],
+      "selected_fields": {
+        "schema_version": 1,
+        "protection_mode": "degraded",
+        "hook_configured": false
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "reported-shell-degraded",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "hook_configured",
+        "policy_path_used",
+        "protection_evidence",
+        "protection_mode",
+        "schema_version"
+      ],
+      "selected_fields": {
+        "schema_version": 1,
+        "protection_mode": "degraded",
+        "hook_configured": false,
+        "verified_blocking": false
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "reported-shell-off",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "hook_configured",
+        "policy_path_used",
+        "protection_mode",
+        "schema_version"
+      ],
+      "selected_fields": {
+        "schema_version": 1,
+        "protection_mode": "off",
+        "hook_configured": false
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "reported-shell-off",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "hook_configured",
+        "policy_path_used",
+        "protection_evidence",
+        "protection_mode",
+        "schema_version"
+      ],
+      "selected_fields": {
+        "schema_version": 1,
+        "protection_mode": "off",
+        "hook_configured": false,
+        "verified_blocking": false
+      },
+      "fixture_sha256": []
+    },
+    {
+      "case": "download-receipt-list",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "array",
+      "top_level_keys": null,
+      "selected_fields": {
+        "sha256": "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223"
+      },
+      "fixture_sha256": [
+        "d692aee71fc663bd31b120645047db2b9cad39350f5e0c20049f15101cb3313a",
+        "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223"
+      ]
+    },
+    {
+      "case": "download-receipt-list",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "array",
+      "top_level_keys": null,
+      "selected_fields": {
+        "sha256": "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223"
+      },
+      "fixture_sha256": [
+        "d692aee71fc663bd31b120645047db2b9cad39350f5e0c20049f15101cb3313a",
+        "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223"
+      ]
+    },
+    {
+      "case": "download-receipt-last",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "analysis_method",
+        "domains_referenced",
+        "final_url",
+        "git_branch",
+        "git_repo",
+        "paths_referenced",
+        "privilege",
+        "redirects",
+        "sha256",
+        "size",
+        "timestamp",
+        "url"
+      ],
+      "selected_fields": {
+        "sha256": "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223"
+      },
+      "fixture_sha256": [
+        "d692aee71fc663bd31b120645047db2b9cad39350f5e0c20049f15101cb3313a",
+        "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223"
+      ]
+    },
+    {
+      "case": "download-receipt-last",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "analysis_method",
+        "domains_referenced",
+        "final_url",
+        "git_branch",
+        "git_repo",
+        "paths_referenced",
+        "privilege",
+        "redirects",
+        "sha256",
+        "size",
+        "timestamp",
+        "url"
+      ],
+      "selected_fields": {
+        "sha256": "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223"
+      },
+      "fixture_sha256": [
+        "d692aee71fc663bd31b120645047db2b9cad39350f5e0c20049f15101cb3313a",
+        "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223"
+      ]
+    },
+    {
+      "case": "download-receipt-verify",
+      "client": "baseline",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "sha256",
+        "url",
+        "valid"
+      ],
+      "selected_fields": {
+        "sha256": "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223",
+        "valid": true
+      },
+      "fixture_sha256": [
+        "d692aee71fc663bd31b120645047db2b9cad39350f5e0c20049f15101cb3313a",
+        "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223"
+      ]
+    },
+    {
+      "case": "download-receipt-verify",
+      "client": "candidate",
+      "exit_code": 0,
+      "json_kind": "object",
+      "top_level_keys": [
+        "sha256",
+        "url",
+        "valid"
+      ],
+      "selected_fields": {
+        "sha256": "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223",
+        "valid": true
+      },
+      "fixture_sha256": [
+        "d692aee71fc663bd31b120645047db2b9cad39350f5e0c20049f15101cb3313a",
+        "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223"
+      ]
+    },
+    {
+      "case": "download-receipt-cache-changed",
+      "client": "baseline",
+      "exit_code": 1,
+      "json_kind": "object",
+      "top_level_keys": [
+        "sha256",
+        "url",
+        "valid"
+      ],
+      "selected_fields": {
+        "sha256": "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223",
+        "valid": false
+      },
+      "fixture_sha256": [
+        "d692aee71fc663bd31b120645047db2b9cad39350f5e0c20049f15101cb3313a",
+        "d67e2e944994496c8d8ec76eed0cf9f09679448d584b532bebf941852a37f5ed"
+      ]
+    },
+    {
+      "case": "download-receipt-cache-changed",
+      "client": "candidate",
+      "exit_code": 1,
+      "json_kind": "object",
+      "top_level_keys": [
+        "sha256",
+        "url",
+        "valid"
+      ],
+      "selected_fields": {
+        "sha256": "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223",
+        "valid": false
+      },
+      "fixture_sha256": [
+        "d692aee71fc663bd31b120645047db2b9cad39350f5e0c20049f15101cb3313a",
+        "d67e2e944994496c8d8ec76eed0cf9f09679448d584b532bebf941852a37f5ed"
+      ]
+    },
+    {
+      "case": "download-receipt-cache-missing",
+      "client": "baseline",
+      "exit_code": 1,
+      "json_kind": "object",
+      "top_level_keys": [
+        "sha256",
+        "url",
+        "valid"
+      ],
+      "selected_fields": {
+        "sha256": "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223",
+        "valid": false
+      },
+      "fixture_sha256": [
+        "d692aee71fc663bd31b120645047db2b9cad39350f5e0c20049f15101cb3313a"
+      ]
+    },
+    {
+      "case": "download-receipt-cache-missing",
+      "client": "candidate",
+      "exit_code": 1,
+      "json_kind": "object",
+      "top_level_keys": [
+        "sha256",
+        "url",
+        "valid"
+      ],
+      "selected_fields": {
+        "sha256": "7995096397546403a45ee7ba931a2fd0d01f75ffb8be9c7723cd23805d8fc223",
+        "valid": false
+      },
+      "fixture_sha256": [
+        "d692aee71fc663bd31b120645047db2b9cad39350f5e0c20049f15101cb3313a"
+      ]
+    }
+  ]
+}

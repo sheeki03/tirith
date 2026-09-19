@@ -1684,13 +1684,13 @@ fn seed_capability_cache(state_dir: &Path, verdict: &str) {
     let (bash_version, bash_path) = spawned_bash_identity();
     let cache_dir = state_dir.join("tirith");
     fs::create_dir_all(&cache_dir).unwrap();
-    // Schema 2 mirrors cli::bash_capability::CACHE_SCHEMA and binds the bash
+    // Schema 3 mirrors cli::bash_capability::CACHE_SCHEMA and binds the bash
     // binary's mtime+size fingerprint (repo-0211). Blank tirith_version: the
     // hook only enforces a version match when a sibling `.hooks-version`
     // exists, which the assets/ hook lacks.
     let fingerprint = bash_fingerprint(&bash_path);
     let body = format!(
-        "schema=2\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+        "schema=3\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
          bash_path={bash_path}\nbash_fingerprint={fingerprint}\n\
          enter_capability={verdict}\nreason=seeded by test\n"
     );
@@ -1968,7 +1968,7 @@ fn capability_stale_cache_falls_back_and_installs_debug_trap() {
     fs::write(
         cache_dir.join("bash-enter-capability"),
         format!(
-            "schema=2\ntirith_version=\nshell=bash\nbash_version=0.0.0-stale\n\
+            "schema=3\ntirith_version=\nshell=bash\nbash_version=0.0.0-stale\n\
              bash_path={bash_path}\nenter_capability=works\nreason=stale\n"
         ),
     )

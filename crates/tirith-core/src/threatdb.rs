@@ -29,6 +29,8 @@
 //!
 //! Signature covers bytes `[0..108)` (header before sig) ++ bytes `[172..)` (all section data).
 
+pub mod operations;
+
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -869,9 +871,16 @@ fn fnv1a_hash(data: &[u8]) -> u32 {
 /// Canonical DNS identity shared by threat-indicator ingestion and lookup.
 /// `url::Host::parse` applies the crate's single WHATWG/IDNA policy; removing
 /// the terminal root label first makes `example.test` and `example.test.` the
-/// same DNS name. Invalid and IP-shaped inputs are not hostname indicators.
+/// same DNS name. Invalid and unambiguous IP inputs are not hostname indicators;
+/// curl's validated empty-hex-component DNS names remain hostname indicators.
 pub fn canonical_threat_hostname(host: &str) -> Option<String> {
     let without_root = host.trim_end_matches('.');
+    // These are DNS names for curl, not IPv4 literals. Keep the hostname feed
+    // identity available at both ingestion and lookup; URL-client parsing
+    // still decides whether a particular command uses DNS or a numeric host.
+    if let Some(domain) = crate::parse::curl_empty_hex_dns_host(without_root) {
+        return Some(domain);
+    }
     if without_root.is_empty() {
         return None;
     }

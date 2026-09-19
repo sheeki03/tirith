@@ -1,0 +1,87 @@
+name: Native ARM containment
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/docker/native-arm-builder.Dockerfile'
+      - '.github/scripts/*native*'
+      - '.github/workflows/native-arm-containment.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: native-arm-containment-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-artifact:
+    name: Native ARM (${{ matrix.target }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require a native ARM kernel and identify source
+        id: source
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          digest=$(git archive --format=tar HEAD | sha256sum | cut -d ' ' -f 1)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/native-arm/target" "$RUNNER_TEMP/native-arm/artifact"
+      - name: Prepare pinned MSRV builder
+        run: docker build --platform linux/arm64 -t tirith-native-arm-builder -f .github/docker/native-arm-builder.Dockerfile .github/docker
+      - name: Build candidate archive from this source
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          docker run --rm --cpus 3 --memory 10g --memory-swap 10g --pids-limit 1024 \
+            -e CARGO_TARGET_DIR=/build \
+            -v "$GITHUB_WORKSPACE:/source:ro" -v "$RUNNER_TEMP/native-arm/target:/build" \
+            -w /source tirith-native-arm-builder \
+            cargo build -p tirith --bin tirith --release --locked --target "$TARGET" -j 3
+          tar -czf "$RUNNER_TEMP/native-arm/artifact/tirith-$TARGET.tar.gz" \
+            -C "$RUNNER_TEMP/native-arm/target/$TARGET/release" tirith
+      - name: Qualify exact candidate archive without elevation
+        env:
+          TARGET: ${{ matrix.target }}
+          SOURCE_SHA256: ${{ steps.source.outputs.sha256 }}
+        run: |
+          .github/scripts/test-native-arm-artifact.sh \
+            "$RUNNER_TEMP/native-arm/artifact/tirith-$TARGET.tar.gz" \
+            "$TARGET" "$SOURCE_SHA256" "$RUNNER_TEMP/native-arm/evidence"
+      - name: Native ARM syscall and breakpoint contracts
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          docker run --rm --cpus 3 --memory 10g --memory-swap 10g --pids-limit 1024 \
+            -e CARGO_TARGET_DIR=/build \
+            -v "$GITHUB_WORKSPACE:/source:ro" -v "$RUNNER_TEMP/native-arm/target:/build" \
+            -w /source tirith-native-arm-builder sh -c '
+              cargo test -p tirith-core --lib --locked -j 3 capsule::linux::aarch64_seccomp::tests -- --test-threads=1 &&
+              cargo test -p tirith-core --lib --locked -j 3 production_policy_allows_local_readiness_without_network_or_signal_escape -- --test-threads=1 &&
+              cargo test -p tirith --bin tirith --locked -j 3 cli::capsule_child::aarch64_trace::tests -- --test-threads=1 &&
+              cargo test -p tirith --bin tirith --locked -j 3 cli::capsule_child::parent_lifetime::tests -- --test-threads=1
+            '
+      - name: Preserve native evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-arm-evidence-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/native-arm/evidence/*.json
+            ${{ runner.temp }}/native-arm/evidence/*.txt
+          if-no-files-found: warn
+          retention-days: 14

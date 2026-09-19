@@ -3,6 +3,28 @@
 
 $ErrorActionPreference = 'Stop'
 
+function Get-TirithWindowsReleaseAsset {
+    param($Release)
+    $assetName = 'tirith-x86_64-pc-windows-msvc.zip'
+    $selectedAssets = @($Release.assets | Where-Object { $_.name -ceq $assetName })
+    if ($selectedAssets.Count -ne 1) {
+        throw "Expected exactly one $assetName release asset; found $($selectedAssets.Count)"
+    }
+    return $selectedAssets[0]
+}
+
+function Get-TirithReleaseCertificateIdentity {
+    param([string]$Tag)
+    if ($Tag -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
+        throw 'The release tag is not a Tirith version'
+    }
+    return "https://github.com/sheeki03/tirith/.github/workflows/release.yml@refs/tags/$Tag"
+}
+
+if ($env:TIRITH_INSTALL_PS_LIB -eq '1') {
+    return
+}
+
 $installDir = "$env:LOCALAPPDATA\tirith\bin"
 $profileLine = "Invoke-Expression (& `"$installDir\tirith.exe`" init --shell powershell)"
 
@@ -17,15 +39,11 @@ if (!(Test-Path $installDir)) {
 $repo = "sheeki03/tirith"
 $releaseUrl = "https://api.github.com/repos/$repo/releases/latest"
 $release = Invoke-RestMethod -Uri $releaseUrl
-$asset = $release.assets | Where-Object { $_.name -like "*Windows*" } | Select-Object -First 1
+$asset = Get-TirithWindowsReleaseAsset $release
+$certificateIdentity = Get-TirithReleaseCertificateIdentity $release.tag_name
 $checksums = $release.assets | Where-Object { $_.name -eq "checksums.txt" } | Select-Object -First 1
 $checksumsSig = $release.assets | Where-Object { $_.name -eq "checksums.txt.sig" } | Select-Object -First 1
 $checksumsPem = $release.assets | Where-Object { $_.name -eq "checksums.txt.pem" } | Select-Object -First 1
-
-if (!$asset) {
-    Write-Error "Could not find Windows release asset"
-    exit 1
-}
 
 $zipPath = "$env:TEMP\tirith.zip"
 $checksumsPath = "$env:TEMP\tirith-checksums.txt"
@@ -103,7 +121,7 @@ if (!$cosign) {
         & cosign verify-blob `
             --signature $sigPath `
             --certificate $pemPath `
-            --certificate-identity-regexp '^https://github\.com/sheeki03/tirith/\.github/workflows/' `
+            --certificate-identity $certificateIdentity `
             --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' `
             $checksumsPath
         if ($LASTEXITCODE -ne 0) {

@@ -34,6 +34,7 @@ jobs:
           - normalizer
           - byte_scanner
           - artifact_wheel
+          - npm_artifact
           - lexical_path
           - npm_command
           - task_envelope
@@ -49,18 +50,24 @@ jobs:
           toolchain: nightly-2026-06-01
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --version 0.13.2 --locked
+        run: cargo +nightly-2026-06-01 install cargo-fuzz --version 0.13.2 --locked
 
       - name: Preflight locked fuzz dependencies
         run: |
           git ls-files --error-unmatch fuzz/Cargo.lock
-          cargo +nightly fetch --manifest-path fuzz/Cargo.toml --locked
+          cargo +nightly-2026-06-01 fetch --manifest-path fuzz/Cargo.toml --locked
           git diff --exit-code -- fuzz/Cargo.lock
 
       - name: Run fuzzer
         run: |
           cd fuzz
-          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+          fuzz_args=(-max_total_time=300)
+          if [[ '${{ matrix.target }}' == 'npm_artifact' ]]; then
+            mkdir -p corpus/npm_artifact
+            cp seeds/npm_artifact/* corpus/npm_artifact/
+            fuzz_args+=(-max_len=262144 -rss_limit_mb=1024 -timeout=10)
+          fi
+          cargo +nightly-2026-06-01 fuzz run ${{ matrix.target }} -- "${fuzz_args[@]}"
         env:
           CARGO_NET_OFFLINE: "true"
           RUSTFLAGS: "-C debuginfo=0"

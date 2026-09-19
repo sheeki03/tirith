@@ -276,7 +276,11 @@ fn build_run_json(
         "exit_code": exit_code,
     });
     append_run_policy_diagnostics(&mut value, compiled);
-    tirith_core::redact::redact_json_strings(&mut value, compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::Run,
+        compiled,
+    );
     tirith_core::verdict::bound_json_value_for_output(value)
 }
 
@@ -295,7 +299,11 @@ fn build_run_error_json(
         "error": error,
     });
     append_run_policy_diagnostics(&mut value, compiled);
-    tirith_core::redact::redact_json_strings(&mut value, compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::Run,
+        compiled,
+    );
     tirith_core::verdict::bound_json_value_for_output(value)
 }
 

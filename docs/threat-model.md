@@ -42,9 +42,10 @@
   detection layer, not a containment boundary. There is one narrow, opt-in
   exception (see "Opt-in runtime containment" below): the Linux-only live
   every live `tirith run` (`--capsule` remains a legacy spelling),
-  `tirith temp-run --capsule`, `tirith gateway run --capsule`, and (future) `tirith
-  pkg install` surfaces route the program they launch through an OS containment
-  capsule. This is an explicit, per-invocation choice for tirith-launched
+  `tirith temp-run --capsule` and `tirith gateway run --capsule` surfaces route
+  the program they launch through an OS containment capsule. Contained
+  `tirith pkg install` execution is currently disabled pending private-input
+  qualification. This is an explicit, per-invocation choice for tirith-launched
   processes, not blanket containment of the shell.
 - **Network monitoring**: tirith does not inspect network traffic after command execution
 - **Malware detection**: tirith analyzes command structure, not payload content (except via `run`)
@@ -162,11 +163,16 @@ tirith-launched surfaces can route their child process through:
   of the temp-dir file isolation.
 - `tirith gateway run --capsule` spawns the upstream MCP server contained
   (deny-network).
-- `tirith pkg install` (a later milestone) installs only inside the capsule.
+- `tirith pkg install` currently refuses on every host before resolver,
+  quarantine, checkpoint, or package execution. Its private named-input backend
+  has not been qualified for immutable inputs throughout the complete target
+  lifetime against another process owned by the same user. Generic capsule
+  coverage does not establish that additional guarantee.
 - `tirith capsule run --preset untrusted-project` copies an untrusted project
   into a held ephemeral directory and runs an exact argv there. It is
-  enforceable on x86_64 Linux with a usable Landlock ABI and refuses on every
-  other host before anything is copied or spawned, with no degraded fallback.
+  enforceable on native x86_64 and AArch64 Linux with usable Landlock and
+  seccomp. Hosts missing any required control refuse before anything is copied
+  or spawned, with no degraded fallback.
   Domain allow-listing is not offered by the preset, because
   `domain_proxy_enforced` is false in every backend.
 
@@ -174,8 +180,7 @@ The capsule is **honest about what it enforces**. Every backend reports a
 per-capability coverage ledger and never claims a control it did not apply. The
 loopback egress broker is a broker, NOT the boundary: domain-egress is only
 claimed where the OS backend blocks raw outbound sockets except to the broker.
-Enforcing surfaces (`pkg install`, the contained gateway, and Linux
-live `tirith run`)
+Enabled enforcing surfaces (the contained gateway and Linux live `tirith run`)
 **fail closed** when the host backend cannot deliver the required containment;
 `temp-run --capsule` is a best-effort hardening that runs uncontained, and says
 so, when no backend is available. `tirith doctor` reports the real per-platform

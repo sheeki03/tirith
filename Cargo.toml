@@ -79,6 +79,13 @@ arboard = { version = "3", default-features = false }
 # anything but 127.0.0.1.
 tiny_http = "0.12"
 
+# Native identity tests hash real executables repeatedly. Sampling the debug
+# shell-change tests showed software SHA-256 consuming the writer deadline;
+# optimize that computation without skipping any byte/generation checks. The
+# test profile inherits this dev dependency override; release is already optimized.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 strip = true
