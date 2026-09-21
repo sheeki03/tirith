@@ -81,20 +81,32 @@ def tracked(root, relative):
     return full
 
 
-def host_identity():
+def host_identity(observed=None):
+    # Refusal diagnostics are observations only, never an admitted native host.
+    # Populate before each check so a failed admission retains the actual fact
+    # that failed. Facts not reached (such as boot after CPU refusal) stay absent.
+    if observed is None:
+        observed = {}
+    observed.update(system=platform.system(), release=platform.release(), machine=platform.machine(),
+                    image=os.environ.get("ImageOS"), image_version=os.environ.get("ImageVersion"),
+                    runner_name=os.environ.get("RUNNER_NAME"), logical_cpus=os.cpu_count(),
+                    python_version=sys.version, python_optimize=sys.flags.optimize,
+                    python_optimize_env=bool(os.environ.get("PYTHONOPTIMIZE")))
     require(sys.version_info >= (3, 11) and sys.flags.optimize == 0 and not os.environ.get("PYTHONOPTIMIZE"),
             "native producer needs Python3.11+ with assertions enabled")
-    require(platform.system() == "Darwin" and platform.machine() == "arm64", "native Darwin ARM64 required")
+    require(observed["system"] == "Darwin" and observed["machine"] == "arm64", "native Darwin ARM64 required")
     cpu = command("/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string")
+    observed["cpu_model"] = cpu
     require(cpu == "Apple M1", "runner differs from the explicitly selected Apple M1 platform")
-    boot = str(uuid.UUID(command("/usr/sbin/sysctl", "-n", "kern.bootsessionuuid")))
+    observed["boot_raw"] = command("/usr/sbin/sysctl", "-n", "kern.bootsessionuuid")
+    boot = str(uuid.UUID(observed["boot_raw"]))
     require(uuid.UUID(boot).int != 0, "native boot UUID is zero")
-    image, image_version = os.environ.get("ImageOS"), os.environ.get("ImageVersion")
+    image, image_version = observed["image"], observed["image_version"]
     require(image and image_version, "native runner image identity is unavailable")
     return {"boot": boot, "runner_name": os.environ["RUNNER_NAME"],
-            "class": {"system": "Darwin", "release": platform.release(), "machine": "arm64",
+            "class": {"system": "Darwin", "release": observed["release"], "machine": "arm64",
                       "image": image, "image_version": image_version,
-                      "cpu_model": cpu, "logical_cpus": os.cpu_count()}}
+                      "cpu_model": cpu, "logical_cpus": observed["logical_cpus"]}}
 
 
 def same_host(before, after):
@@ -359,10 +371,11 @@ def main():
     evidence = args.output / "evidence"; evidence.mkdir(mode=0o700)
     result = {"status": "refused", "budget_enforced": False,
               "scope": "selected native byte workloads; not whole WP17 or release qualification"}
+    observed_host = {}
     code = 2
     try:
         require(os.environ.get("RESOURCE_LEGACY_REFERENCE") == "false", "native and legacy reference modes must not be mixed")
-        host = host_identity(); write(evidence / "native-host.json", host)
+        host = host_identity(observed_host); write(evidence / "native-host.json", host)
         require(git(root, "rev-parse", "HEAD") == os.environ["GITHUB_SHA"] == os.environ["GITHUB_WORKFLOW_SHA"],
                 "controller must be the exact workflow event source")
         spec = importlib.util.spec_from_file_location("resource_check", tracked(root, CHECKER))
@@ -387,6 +400,9 @@ def main():
         code = 0
     except (ValueError, OSError, KeyError, TypeError, AttributeError, OverflowError, RecursionError, subprocess.SubprocessError) as error:
         result["error"] = str(error)[:2048]
+        result["host_observation"] = {"scope": "diagnostic_only_not_admitted",
+                                      "expected": {"system": "Darwin", "machine": "arm64", "cpu_model": "Apple M1"},
+                                      "observed": observed_host}
     write(evidence / "result.json", result)
     print(json.dumps(result, indent=2, allow_nan=False))
     return code

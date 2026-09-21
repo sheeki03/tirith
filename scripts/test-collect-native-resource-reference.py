@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Collector contracts only; no builds, native workloads or product execution."""
 import copy
+from contextlib import redirect_stdout
+import io
 import hashlib
 import importlib.util
 import json
@@ -171,6 +173,57 @@ class CollectorContracts(unittest.TestCase):
     def test_unexpected_mac_cpu_refuses_instead_of_relabeling(self):
         with self.assertRaisesRegex(ValueError, "Apple M1"):
             self.host(cpu="Apple M2")
+
+    def test_main_retains_actual_host_facts_when_cpu_admission_refuses(self):
+        # No native commands, builds or measurement evidence: exercise the real
+        # output/refusal path with synthetic host observations only.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            output = root / "new-output"
+            argv = ["collector", "--source", str(root), "--output", str(output), "--experiment", "baseline"]
+            with patch.object(collector.sys, "argv", argv), \
+                 patch.object(collector.platform, "system", return_value="Darwin"), \
+                 patch.object(collector.platform, "machine", return_value="arm64"), \
+                 patch.object(collector.platform, "release", return_value="fixture-kernel"), \
+                 patch.object(collector.os, "cpu_count", return_value=6), \
+                 patch.object(collector, "command", return_value="Apple M2") as command, \
+                 patch.object(collector, "collect") as collect, \
+                 patch.object(collector, "git") as git, \
+                 patch.dict(collector.os.environ, {"RESOURCE_LEGACY_REFERENCE": "false", "ImageOS": "macos15",
+                                                  "ImageVersion": "fixture-image", "RUNNER_NAME": "fixture-runner"}), \
+                 redirect_stdout(io.StringIO()) as logged:
+                self.assertEqual(collector.main(), 2)
+            report = json.loads((output / "evidence/result.json").read_text())
+            self.assertEqual(json.loads(logged.getvalue()), report)
+            self.assertEqual(report["status"], "refused")
+            self.assertFalse(report["budget_enforced"])
+            self.assertIn("Apple M1", report["error"])
+            diagnostic = report["host_observation"]
+            self.assertEqual(diagnostic["scope"], "diagnostic_only_not_admitted")
+            self.assertEqual(diagnostic["expected"]["cpu_model"], "Apple M1")
+            for key, value in {"cpu_model": "Apple M2", "system": "Darwin", "machine": "arm64",
+                               "release": "fixture-kernel", "logical_cpus": 6, "image": "macos15",
+                               "image_version": "fixture-image", "runner_name": "fixture-runner"}.items():
+                self.assertEqual(diagnostic["observed"][key], value)
+            self.assertNotIn("boot_raw", diagnostic["observed"])
+            self.assertFalse((output / "evidence/native-host.json").exists())
+            self.assertFalse((output / "evidence/baseline").exists())
+            command.assert_called_once_with("/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string")
+            collect.assert_not_called()
+            git.assert_not_called()
+
+    def test_unavailable_cpu_is_not_invented_after_platform_refusal(self):
+        observed = {}
+        with patch.object(collector.platform, "system", return_value="Linux"), \
+             patch.object(collector.platform, "machine", return_value="aarch64"), \
+             patch.object(collector, "command") as command, \
+             self.assertRaisesRegex(ValueError, "Darwin ARM64"):
+            collector.host_identity(observed)
+        self.assertEqual(observed["system"], "Linux")
+        self.assertEqual(observed["machine"], "aarch64")
+        self.assertNotIn("cpu_model", observed)
+        self.assertNotIn("boot_raw", observed)
+        command.assert_not_called()
 
     def test_pair_does_not_accept_different_boot_even_when_cpu_matches(self):
         observed = self.host()
