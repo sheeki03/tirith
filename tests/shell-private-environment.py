@@ -29,6 +29,7 @@ CAP = "c" * 64
 TOKEN = "d" * 64
 STATE = "inert-private-state-8e52ae99"
 COMMAND = "printf inert-private-command-e320ce6e"
+OBSERVED_EVENTS = []
 PLACEHOLDERS = ("buf", "scan_target", "pending_eval", "pending_command", "pending_receipt", "expected",
                 "command_text", "line", "state", "token", "receipt_token", "candidate_token",
                 "receipt_line", "_tirith_verification_capture", "verification_capture",
@@ -40,9 +41,10 @@ CLEANUP = {"leader_reaped", "group_signaled_or_absent", "group_members_exited", 
 
 
 class Fixture:
-    def __init__(self, root, family, shell, source, mode="allow", verification=False):
+    def __init__(self, root, family, shell, source, mode="allow", verification=False, operation_exit=0, ack_exit=0):
         self.root, self.family, self.shell, self.source = root, family, shell, source
         self.mode, self.verification = mode, verification
+        self.operation_exit, self.ack_exit = operation_exit, ack_exit
         self.command = "_tirith_verification_probe inert-private-command-e320ce6e allowed" if verification else COMMAND
         interpreter = str(Path(sys.executable).resolve())
         owned.require(not any(c.isspace() for c in interpreter), "fixture interpreter needs a simple shebang path")
@@ -51,7 +53,7 @@ class Fixture:
 from pathlib import Path
 root=Path({str(root)!r});role=Path(sys.argv[0]).name;args=sys.argv[1:]
 cap={CAP!r};token={TOKEN!r};state={STATE!r};command={self.command!r};issues=[]
-receipt=role=='tirith' and args[:1]==['__execution-receipt'] and len(args)>1 and args[1] in ('consume','discard','reconcile')
+receipt=role=='tirith' and args[:1]==['__execution-receipt'] and len(args)>1 and args[1] in ('consume','discard','reconcile','acknowledge')
 checker=role=='tirith' and args[:1]==['check']
 module_check=role=='tirith' and args==['__setup-activation','modules','--channel','zsh']
 intended=receipt or checker or module_check
@@ -81,7 +83,8 @@ elif role=='tirith':
  if args[:2]==['__execution-receipt','capability']:print('TIRITH_EXECUTION_RECEIPT_PROTOCOL=3')
  elif args[:2]==['__execution-receipt','register']:print(cap)
  elif module_check:raise SystemExit(74) # Inert endpoint never qualifies or loads native modules.
- elif receipt or args[:2]==['env','snapshot']:pass
+ elif receipt:raise SystemExit({ack_exit!r} if args[1]=='acknowledge' else {operation_exit!r})
+ elif args[:2]==['env','snapshot']:pass
  else:raise SystemExit(74)
 elif role!='ordinary':raise SystemExit(75)
 ''')
@@ -107,12 +110,13 @@ elif role!='ordinary':raise SystemExit(75)
         environment.update({"XDG_" + kind + "_HOME": str(self.root / kind.lower())
                             for kind in ("CONFIG", "STATE", "DATA", "CACHE")})
         environment.update({name: "inert-exported-placeholder" for name in PLACEHOLDERS})
-        row = owned.finish([owned.Job(name, [self.shell, *options, "-c", script], self.root,
-                                      environment, timeout=8)])[0]
+        trace.run_native(name, [self.shell, *options, "-c", script], self.root, environment, 8)
+        row = trace.NATIVE_ROWS[-1]
         owned.require(set(row.get("cleanup", {})) == CLEANUP and
                       all(value is True for value in row["cleanup"].values()), "owned cleanup incomplete")
         owned.success(row)
         events = [json.loads(line) for line in (self.root / "events").read_text().splitlines()]
+        OBSERVED_EVENTS.append({"fixture_root": str(self.root), "name": name, "events": events})
         owned.require(all(not item["issues"] for item in events),
                       "private environment or intended instance mismatch: " +
                       str([(item["role"], item["issues"]) for item in events if item["issues"]]))
@@ -179,6 +183,7 @@ def checker(fixture, outer_preexec=False):
                  "_tirith_new_capture_file", "_tirith_capture_file_is_private", "_tirith_remove_capture_file",
                  "_tirith_read_single_capture_line", "_tirith_parse_v3_receipt_response",
                  "_tirith_fixed_fd_is_valid", "_tirith_open_exact_input_pipe", "_tirith_close_pending_fd"]
+        names.append("_tirith_receipt_acknowledge_untraced")
         names += ["_tirith_receipt_" + kind + suffix for kind in ("consume", "discard", "reconcile") for suffix in ("", "_untraced")]
         if outer_preexec:
             names.append("_tirith_preexec")
@@ -193,7 +198,7 @@ _TIRITH_PREEXEC_RECEIPTS_TRUSTED=1
         invoke = "_tirith_preexec 12 1 " + fixture.q(fixture.command) if outer_preexec else "_tirith_preexec_receipt_check " + fixture.q(fixture.command) + " no"
     elif fixture.family == "zsh":
         names = ["_tirith_accept_line", "_tirith_v3_new_capture_file", "_tirith_v3_remove_capture_files",
-                 "_tirith_receipt_consume_at", "_tirith_receipt_discard_at", "_tirith_receipt_reconcile_at",
+                 "_tirith_receipt_acknowledge_at", "_tirith_receipt_consume_at", "_tirith_receipt_discard_at", "_tirith_receipt_reconcile_at",
                  "_tirith_receipt_discard_or_retain", "_tirith_unresolved_receipt_cleanup"]
         stubs = f"""BUFFER={fixture.q(fixture.command)}
 unset _TIRITH_UNRESOLVED_RECEIPT
@@ -204,18 +209,15 @@ zle() {{ builtin printf '%s\\n' "$*" >> {fixture.q(fixture.root / 'editor')}; }}
 """
         invoke = "_tirith_accept_line"
     else:
-        names = ["_tirith_check_command"]
+        names = ["_tirith_check_command", "_tirith_receipt_acknowledge_at", "_tirith_receipt_consume_at", "_tirith_receipt_discard_at", "_tirith_receipt_reconcile_at", "_tirith_receipt_discard_or_retain", "_tirith_unresolved_receipt_cleanup"]
         stubs = f"""function commandline
  if test (count $argv) -eq 0; builtin printf '%s\\n' {fixture.q(fixture.command)}
  else; builtin printf '%s\\n' "$argv" >> {fixture.q(fixture.root / 'editor')}; end
 end
-function _tirith_unresolved_receipt_cleanup; return 0; end
 function _tirith_v3_new_capture_file; command {fixture.q(fixture.root / 'mktemp')}; end
 function _tirith_v3_remove_capture_files; command {fixture.q(fixture.root / 'rm')} -f -- $argv; end
 function _tirith_output; return 0; end
 function _tirith_escape_preview; builtin printf '%s' "$argv[1]"; end
-function _tirith_receipt_discard_or_retain; return 0; end
-function _tirith_receipt_consume_at; return 0; end
 function _tirith_verification_state; builtin printf '%s\\n' {fixture.q(STATE)}; end
 """
         invoke = "_tirith_check_command"
@@ -232,14 +234,39 @@ function _tirith_verification_state; builtin printf '%s\\n' {fixture.q(STATE)}; 
     expected_wc = 2 if fixture.family != "bash" else 0 if fixture.mode == "block" else 1
     counts = {role: sum(item["role"] == role for item in events) for role in ("mktemp", "wc", "rm", "ordinary")}
     owned.require(counts == {"mktemp": 1 if fixture.family == "bash" else 2, "wc": expected_wc, "rm": 1, "ordinary": 1}, "required helper observers missing: " + str(counts))
-    if fixture.family != "fish":
-        receipts = [(item["args"][1], item["stdin"]) for item in events if item["role"] == "tirith" and item["args"][:1] == ["__execution-receipt"]]
-        expected = [] if fixture.mode == "block" else [("consume", TOKEN + "\n" + fixture.command)] if fixture.mode == "allow" else [("discard", TOKEN)]
-        owned.require(receipts == expected, "receipt operation/bytes changed")
+    receipts = [(item["args"][1], item["stdin"]) for item in events if item["role"] == "tirith" and item["args"][:1] == ["__execution-receipt"]]
+    expected = [] if fixture.mode == "block" else [("consume", TOKEN + "\n" + fixture.command), ("acknowledge", TOKEN)] if fixture.mode == "allow" else [("discard", TOKEN), ("acknowledge", TOKEN)]
+    owned.require(receipts == expected, "receipt operation/bytes changed: " + repr(receipts))
     if fixture.family != "bash":
         editor = (fixture.root / "editor").read_text()
         expected = (".accept-line\n" if fixture.mode == "allow" else "send-break\n") if fixture.family == "zsh" else ("-f execute\n" if fixture.mode == "allow" else "-r \n-f repaint\n")
         owned.require(editor == expected, "inert editor effect changed")
+
+
+def receipt_operation(fixture, operation):
+    if fixture.family == "bash":
+        names = ["_tirith_trace_preserve_status", "_tirith_fixed_fd_is_valid", "_tirith_open_exact_input_pipe", "_tirith_close_pending_fd",
+                 "_tirith_receipt_acknowledge_untraced", "_tirith_receipt_" + operation, "_tirith_receipt_" + operation + "_untraced"]
+        body = "_tirith_receipt_parent_context_is_valid() { return 0; }\nset -a\n"
+        call = "_tirith_receipt_" + operation + " bash-preexec " + fixture.q(TOKEN)
+    else:
+        names = ["_tirith_receipt_acknowledge_at", "_tirith_receipt_" + operation + "_at"]
+        body = "set -a\n" if fixture.family == "zsh" else ""
+        call = "_tirith_receipt_" + operation + "_at " + fixture.q(TOKEN)
+    if operation == "consume":
+        call += " " + fixture.q(COMMAND)
+    if fixture.family != "bash":
+        call += " " + fixture.q(fixture.root)
+    tail = ("set -l result $status\n" if fixture.family == "fish" else "result=$?\n")
+    script = fixture.setup() + fixture.definitions(names) + "\n" + body + call + "\n" + tail + fixture.ordinary() + "\nbuiltin printf 'RESULT=%s\\n' $result\nbuiltin true\n"
+    row, events = fixture.run("receipt-operation", script)
+    owned.require(row["stdout"].splitlines() == ["RESULT=" + str(fixture.operation_exit)], "ACK changed original receipt status")
+    receipts = [(item["args"][1], item["stdin"]) for item in events if item["role"] == "tirith"]
+    expected = [(operation, TOKEN + ("\n" + COMMAND if operation == "consume" else ""))]
+    if fixture.operation_exit == 0:
+        expected.append(("acknowledge", TOKEN))
+    owned.require(receipts == expected, "ACK order or frame mismatch")
+    owned.require(sum(item["role"] == "ordinary" for item in events) == 1, "ordinary child missing")
 
 
 def prompt(fixture, initial, choice):
@@ -258,6 +285,7 @@ def prompt(fixture, initial, choice):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--require-shell", action="append", choices=trace.FILES, default=[])
+    parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     available = trace.shells()
     missing = set(args.require_shell) - {family for family, _ in available}
@@ -265,7 +293,7 @@ def main():
         parser.error("required native shells missing: " + ", ".join(sorted(missing)))
     owned.require_process_observation()
     sources = {}
-    snapshots = {}
+    snapshots = {p: owned.file_sha(p) for p in (Path(__file__), ROOT / "tests/shell-trace-capability.py", ROOT / "tools/qualification/mixed_audit_native.py", Path(sys.executable).resolve())}
     for family, filename in trace.FILES.items():
         source = ROOT / "shell/lib" / filename
         embedded = ROOT / "crates/tirith/assets/shell/lib" / filename
@@ -275,12 +303,15 @@ def main():
         snapshots.update({source: owned.sha(data), embedded: owned.sha(data)})
     snapshots.update({Path(path): owned.file_sha(Path(path)) for _, path in available})
     cases, failures = 0, []
-    with tempfile.TemporaryDirectory(prefix="tirith-private-env-") as temporary:
+    admission = {"passed": False}
+    with trace.retained_directory(prefix="tirith-private-env-", admission=admission) as temporary:
         parent = Path(temporary).resolve()
         for family, shell in available:
             plans = [("startup", startup, {})]
             plans += [(f"checker-{mode}-{verify}", checker, {"mode": mode, "verification": verify})
                       for mode in ("allow", "block", "malformed") for verify in (False, True)]
+            plans += [(f"receipt-{operation}-{operation_exit}-{ack_exit}", lambda f, op=operation: receipt_operation(f, op), {"operation_exit": operation_exit, "ack_exit": ack_exit})
+                      for operation in ("consume", "discard", "reconcile") for operation_exit, ack_exit in ((0, 0), (0, 99), (7, 0))]
             if family == "zsh":
                 plans.append(("module-consumer-boundary", module_consumer_boundary, {}))
             if family == "bash":
@@ -296,8 +327,11 @@ def main():
                     print(json.dumps({"shell": shell, "case": name, "passed": True}), flush=True)
                 except (AssertionError, RuntimeError, OSError, ValueError) as error:
                     failures.append({"shell": shell, "case": name, "error": str(error)[:2000]})
+        admission["passed"] = not failures
     for path, digest in snapshots.items():
         owned.require(owned.file_sha(path) == digest, "source/executable changed during regression run")
+    if args.report:
+        args.report.write_text(json.dumps({"cases": cases, "failures": failures, "native_processes": trace.NATIVE_ROWS, "observed_events": OBSERVED_EVENTS, "retained_roots": trace.RETAINED_ROOTS, "inputs": {str(p): d for p, d in snapshots.items()}}, indent=2) + "\n")
     print(json.dumps({"cases": cases, "failures": failures, "scope": "inert privacy fixtures only"}), flush=True)
     raise SystemExit(1 if failures else 0)
 

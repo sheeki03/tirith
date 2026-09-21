@@ -35,6 +35,11 @@ pub use shell_verification::{
 };
 
 const RECEIPT_SCHEMA_VERSION: u32 = 3;
+// Schema 4 is only a caller-acknowledged, non-authorizing terminal record.
+// Active and recoverable unacknowledged records continue to use schema 3.
+const ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION: u32 = 4;
+pub const SHELL_RECEIPT_READ_VERSIONS: &[u32] =
+    &[RECEIPT_SCHEMA_VERSION, ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION];
 const LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION: u32 = 2;
 const HOOK_CAPABILITY_SCHEMA_VERSION: u32 = 3;
@@ -219,6 +224,25 @@ enum ReceiptState {
         observation: String,
         evidence_id: String,
         generation: Option<u64>,
+        finished_unix_ms: u64,
+    },
+    Discarded {
+        finished_unix_ms: u64,
+    },
+    Acknowledged {
+        outcome: AcknowledgedReceiptOutcome,
+    },
+}
+
+/// Retain the exact terminal answer until garbage collection. Acknowledging an
+/// answer never authorizes execution, reconciliation of a conflict, or replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum AcknowledgedReceiptOutcome {
+    Committed {
+        observation: String,
+        evidence_id: String,
+        generation: u64,
         finished_unix_ms: u64,
     },
     Discarded {
@@ -2340,8 +2364,12 @@ fn read_receipt(_path: &Path) -> Result<(ShellReceipt, FileIdentity), String> {
 }
 
 fn validate_receipt(receipt: &ShellReceipt, token: &str) -> Result<(), String> {
-    if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
-        return Err("shell receipt schema is unsupported".to_string());
+    let acknowledged = matches!(receipt.state, ReceiptState::Acknowledged { .. });
+    if !matches!(
+        (receipt.schema_version, acknowledged),
+        (RECEIPT_SCHEMA_VERSION, false) | (ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION, true)
+    ) {
+        return Err("shell receipt schema/state combination is unsupported".to_string());
     }
     validate_receipt_common(receipt, token)
 }
@@ -2377,7 +2405,7 @@ fn validate_receipt_common(receipt: &ShellReceipt, token: &str) -> Result<(), St
         }
     }
     match receipt.schema_version {
-        RECEIPT_SCHEMA_VERSION => {
+        RECEIPT_SCHEMA_VERSION | ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION => {
             if receipt.cwd_sha256.is_some() {
                 return Err("current shell receipt retains a legacy raw-cwd digest".to_string());
             }
@@ -2408,7 +2436,9 @@ fn validate_receipt_common(receipt: &ShellReceipt, token: &str) -> Result<(), St
                 return Err("schema-v1 shell receipt contains a future command binding".to_string());
             }
         }
-        LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION | RECEIPT_SCHEMA_VERSION => {
+        LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION
+        | RECEIPT_SCHEMA_VERSION
+        | ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION => {
             let command_binding = receipt
                 .command_binding_sha256
                 .as_deref()
@@ -2534,7 +2564,11 @@ fn validate_receipt_state(receipt: &ShellReceipt, token: &str) -> Result<(), Str
     };
 
     match &receipt.state {
-        ReceiptState::Prepared | ReceiptState::Discarded { .. } => Ok(()),
+        ReceiptState::Prepared
+        | ReceiptState::Discarded { .. }
+        | ReceiptState::Acknowledged {
+            outcome: AcknowledgedReceiptOutcome::Discarded { .. },
+        } => Ok(()),
         ReceiptState::Armed {
             approval,
             warn_ack_proof_sha256,
@@ -2569,6 +2603,14 @@ fn validate_receipt_state(receipt: &ShellReceipt, token: &str) -> Result<(), Str
             observation,
             evidence_id,
             ..
+        }
+        | ReceiptState::Acknowledged {
+            outcome:
+                AcknowledgedReceiptOutcome::Committed {
+                    observation,
+                    evidence_id,
+                    ..
+                },
         } => {
             if observation != receipt.channel.observation_tag() {
                 return Err("shell receipt committed observation changed".to_string());
@@ -2876,6 +2918,12 @@ fn receipt_is_cleanup_eligible(
     ) {
         return false;
     }
+    if receipt.schema_version == ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION {
+        // Only the bearer-authenticated, context-bound acknowledgement writer
+        // creates this format. Deletion grants no execution authority. As with
+        // age-based GC, this private-store scan cannot verify token-keyed seals.
+        return matches!(receipt.state, ReceiptState::Acknowledged { .. });
+    }
     if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
         return false;
     }
@@ -2896,6 +2944,7 @@ fn receipt_is_cleanup_eligible(
         | ReceiptState::Discarded { finished_unix_ms } => {
             finished_unix_ms.saturating_add(terminal_retention_ms) <= now
         }
+        ReceiptState::Acknowledged { .. } => false,
     }
 }
 
@@ -3246,6 +3295,9 @@ pub fn shell_execution_receipt_context(
             Err("shell execution receipt ended in a durable identity conflict".to_string())
         }
         ReceiptState::Discarded { .. } => Err("shell execution receipt was discarded".to_string()),
+        ReceiptState::Acknowledged { .. } => Err(
+            "shell execution receipt was acknowledged and cannot authorize execution".to_string(),
+        ),
     }
 }
 
@@ -3343,6 +3395,9 @@ pub fn arm_shell_execution_receipt(
             Err("shell receipt cannot be armed after consumption began".to_string())
         }
         ReceiptState::Discarded { .. } => Err("shell receipt was discarded".to_string()),
+        ReceiptState::Acknowledged { .. } => {
+            Err("shell receipt was acknowledged and cannot be armed".to_string())
+        }
     }
 }
 
@@ -3361,17 +3416,216 @@ pub fn discard_shell_execution_receipt(
             };
             locked.publish()
         }
-        ReceiptState::Discarded { .. } => Ok(()),
+        ReceiptState::Discarded { .. }
+        | ReceiptState::Acknowledged {
+            outcome: AcknowledgedReceiptOutcome::Discarded { .. },
+        } => Ok(()),
         ReceiptState::Consuming { .. } => {
             Err("shell receipt cannot be discarded after consumption began".to_string())
         }
-        ReceiptState::Committed { .. } => {
-            Err("shell receipt was already durably consumed".to_string())
-        }
+        ReceiptState::Committed { .. }
+        | ReceiptState::Acknowledged {
+            outcome: AcknowledgedReceiptOutcome::Committed { .. },
+        } => Err("shell receipt was already durably consumed".to_string()),
         ReceiptState::Conflict { .. } => {
             Err("shell receipt ended in a durable identity conflict".to_string())
         }
     }
+}
+
+#[cfg(unix)]
+fn acknowledged_clean_retention_end(
+    previous: u64,
+    committed: u64,
+    acknowledged: u64,
+) -> Result<u64, String> {
+    if acknowledged < committed {
+        return Err("shell acknowledgement clock precedes its durable commit".to_string());
+    }
+    Ok(previous.min(acknowledged))
+}
+
+#[cfg(unix)]
+fn wait_for_acknowledged_retention_end(
+    retained_until: u64,
+    deadline: Instant,
+    mut clock: impl FnMut() -> Result<u64, String>,
+) -> Result<(), String> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(
+                "shell acknowledgement retention boundary did not elapse before its deadline"
+                    .to_string(),
+            );
+        }
+        if clock()? > retained_until {
+            return Ok(());
+        }
+        // Existing pressure GC expires records strictly before `now`. Wait for
+        // real time to cross that boundary rather than subtracting a fictitious
+        // millisecond or changing unacknowledged records' expiry semantics.
+        std::thread::sleep(
+            Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+/// End retention only for the exact clean shell-boundary record whose terminal
+/// answer this caller acknowledges. Keep the observation until ordinary pressure
+/// cleanup; never upgrade evidence or shorten any security-history window.
+fn expire_acknowledged_clean_shell_transition(
+    receipt: &ShellReceipt,
+    outcome: &AcknowledgedReceiptOutcome,
+) -> Result<(), String> {
+    let AcknowledgedReceiptOutcome::Committed {
+        evidence_id,
+        generation,
+        ..
+    } = outcome
+    else {
+        return Ok(());
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = (receipt, evidence_id, generation);
+        Err("strict shell-receipt retirement is unsupported on this platform".to_string())
+    }
+    #[cfg(unix)]
+    {
+        // Same receipt -> session order as consume/reconcile. Lock acquisition,
+        // durable mutation and any same-millisecond wait share one deadline.
+        let deadline = Instant::now()
+            .checked_add(RECEIPT_LOCK_TIMEOUT)
+            .ok_or_else(|| "shell receipt retirement deadline overflowed".to_string())?;
+        let state_path = crate::session_warnings::session_state_path(&receipt.session_id)
+            .ok_or_else(|| "shell receipt has an invalid session id".to_string())?;
+        let lock_path = crate::session_warnings::session_lock_path(&receipt.session_id)
+            .ok_or_else(|| "shell receipt has no stable session lock".to_string())?;
+        let parent = state_path
+            .parent()
+            .ok_or_else(|| "shell receipt session path has no parent".to_string())?;
+        ensure_secure_session_directory(parent)?;
+        let lock = ReceiptLock(
+            open_and_lock_secure(&lock_path, deadline).map_err(|error| error.to_string())?,
+        );
+        let lock_identity = secure_regular_identity(&lock, "shell receipt retirement lock")?;
+        let (mut file, mut ledger, active_slot, path, identity) =
+            open_or_initialize_strict_state(parent, &receipt.session_id, None, None)?;
+        validate_execution_ledger(&ledger, &receipt.session_id)?;
+        require_strict_anchor(&lock, &lock_path, &ledger)?;
+        let existing = ledger
+            .confirmed
+            .iter()
+            .chain(ledger.unresolved.iter())
+            .find(|record| record.execution_id == receipt.execution_id);
+        let Some(record) = existing else {
+            // An earlier explicit ACK may have ended retention, then lost its
+            // receipt publication/result before ordinary pressure GC reclaimed
+            // the clean observation. Its Committed receipt remains a known,
+            // non-replayable answer; absence never creates execution evidence.
+            return if ledger.generation > *generation {
+                Ok(())
+            } else {
+                Err("acknowledged shell execution lost its durable identity".to_string())
+            };
+        };
+        if record.evidence_grade != ExecutionEvidenceGrade::ShellBoundaryUnresolved
+            || record.evidence_history.len() != 1
+            || !record.warning_events.is_empty()
+            || !record.escalation_events.is_empty()
+            || !record.events.is_empty()
+        {
+            return Ok(());
+        }
+        if record.evidence_id != *evidence_id
+            || record.generation != *generation
+            || record.command_sha256 != receipt.command_sha256
+            || record.policy_basis_sha256 != receipt.policy_basis_sha256
+        {
+            return Err("acknowledged shell execution has different durable evidence".to_string());
+        }
+        let retained_until = acknowledged_clean_retention_end(
+            record.retention_until_unix_ms,
+            record.committed_unix_ms,
+            unix_time_ms()?,
+        )?;
+        if retained_until != record.retention_until_unix_ms {
+            let record = ledger
+                .unresolved
+                .iter_mut()
+                .find(|record| record.execution_id == receipt.execution_id)
+                .ok_or_else(|| {
+                    "clean shell execution is not in the unresolved ledger".to_string()
+                })?;
+            record.retention_until_unix_ms = retained_until;
+            advance_ledger(&mut ledger)?;
+            validate_execution_ledger(&ledger, &receipt.session_id)?;
+            if path_identity(&lock_path, "shell receipt retirement lock")? != lock_identity {
+                return Err("shell receipt retirement lock changed while held".to_string());
+            }
+            write_strict_state(
+                &lock,
+                &lock_path,
+                &mut file,
+                &path,
+                identity,
+                active_slot,
+                &ledger,
+                PublishFailureInjection::default(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        drop(file);
+        drop(lock); // No session lock is held during the bounded clock wait.
+        wait_for_acknowledged_retention_end(retained_until, deadline, unix_time_ms)
+    }
+}
+
+/// A caller may acknowledge only a terminal answer it has already observed.
+/// This is best-effort cleanup, never a prerequisite for executing a command.
+/// Keep unacknowledged outcomes recoverable after a lost consume/discard reply.
+/// Once acknowledged, the next normal GC pass may reclaim the record; a missing
+/// old token then fails closed rather than becoming a fresh authorization.
+pub fn acknowledge_shell_execution_receipt(
+    token: &str,
+    expected_channel: ShellReceiptChannel,
+) -> Result<(), String> {
+    let mut locked = lock_receipt(token)?;
+    ensure_receipt_context(&locked.receipt, token, expected_channel)?;
+    let outcome = match &locked.receipt.state {
+        ReceiptState::Committed {
+            observation,
+            evidence_id,
+            generation,
+            finished_unix_ms,
+        } => AcknowledgedReceiptOutcome::Committed {
+            observation: observation.clone(),
+            evidence_id: evidence_id.clone(),
+            generation: *generation,
+            finished_unix_ms: *finished_unix_ms,
+        },
+        ReceiptState::Discarded { finished_unix_ms } => AcknowledgedReceiptOutcome::Discarded {
+            finished_unix_ms: *finished_unix_ms,
+        },
+        ReceiptState::Acknowledged { .. } => return Ok(()),
+        ReceiptState::Prepared
+        | ReceiptState::Armed { .. }
+        | ReceiptState::Consuming { .. }
+        | ReceiptState::Conflict { .. } => {
+            return Err(
+                "shell receipt has no successful terminal outcome to acknowledge".to_string(),
+            )
+        }
+    };
+    // Durably end only clean observation retention before publishing an ACK
+    // eligible for receipt GC. A crash between these writes leaves Committed,
+    // which still answers reconciliation and refuses replay. Repeated ACK does
+    // not extend the shortened window or duplicate the ledger mutation.
+    expire_acknowledged_clean_shell_transition(&locked.receipt, &outcome)?;
+    locked.receipt.state = ReceiptState::Acknowledged { outcome };
+    locked.receipt.schema_version = ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION;
+    // publish refreshes both seals, including the immutable schema identity.
+    locked.publish()
 }
 
 /// Reconcile a prior consume attempt without authorizing or promoting any new
@@ -3398,16 +3652,22 @@ pub fn reconcile_shell_execution_receipt(
         committed_policy_basis_sha256,
         committed_verdict_basis_sha256,
     ) = match &locked.receipt.state {
-        ReceiptState::Committed { .. } => return Ok(true),
+        ReceiptState::Committed { .. }
+        | ReceiptState::Acknowledged {
+            outcome: AcknowledgedReceiptOutcome::Committed { .. },
+        } => return Ok(true),
         ReceiptState::Conflict { .. } => {
             return Err(
                 "shell receipt ended in a durable identity conflict; refusing reconciliation"
                     .to_string(),
             )
         }
-        ReceiptState::Prepared | ReceiptState::Armed { .. } | ReceiptState::Discarded { .. } => {
-            return Ok(false);
-        }
+        ReceiptState::Prepared
+        | ReceiptState::Armed { .. }
+        | ReceiptState::Discarded { .. }
+        | ReceiptState::Acknowledged {
+            outcome: AcknowledgedReceiptOutcome::Discarded { .. },
+        } => return Ok(false),
         ReceiptState::Consuming {
             observation,
             evidence_id,
@@ -3504,6 +3764,12 @@ pub fn consume_shell_execution_receipt(
         }
         ReceiptState::Discarded { .. } => {
             return Err("shell execution receipt was discarded".to_string())
+        }
+        ReceiptState::Acknowledged { .. } => {
+            return Err(
+                "shell execution receipt was acknowledged and cannot authorize execution"
+                    .to_string(),
+            )
         }
     };
 
@@ -4211,6 +4477,802 @@ mod tests {
         };
         locked.publish().expect("publish consuming receipt");
         evidence_id
+    }
+
+    fn commit_allow_receipt(token: &str, command: &str, session_id: &str) {
+        arm_allow(token);
+        assert!(matches!(
+            consume_shell_execution_receipt(
+                token,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&allow_verdict(), &Policy::default(), command, session_id),
+                Duration::from_secs(1),
+            )
+            .expect("commit allow receipt"),
+            PromotionOutcome::Committed { .. }
+        ));
+    }
+
+    #[test]
+    fn acknowledged_terminal_schema_preserves_outcome_but_never_authorizes_replay() {
+        isolated_state(|_, session| {
+            let command = "printf acknowledged";
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            commit_allow_receipt(&token, command, session);
+            let original = lock_receipt(&token).unwrap().receipt;
+            assert_eq!(original.schema_version, RECEIPT_SCHEMA_VERSION);
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            let acknowledged = lock_receipt(&token).unwrap().receipt;
+            assert_eq!(
+                acknowledged.schema_version,
+                ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION
+            );
+            assert_ne!(
+                acknowledged.immutable_seal_sha256,
+                original.immutable_seal_sha256
+            );
+            let ReceiptState::Committed {
+                observation,
+                evidence_id,
+                generation,
+                finished_unix_ms,
+            } = original.state
+            else {
+                panic!("not committed")
+            };
+            assert_eq!(
+                acknowledged.state,
+                ReceiptState::Acknowledged {
+                    outcome: AcknowledgedReceiptOutcome::Committed {
+                        observation,
+                        evidence_id,
+                        generation,
+                        finished_unix_ms
+                    },
+                }
+            );
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+            assert!(shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh).is_err());
+            assert!(
+                arm_shell_execution_receipt(&token, ShellReceiptChannel::Zsh, None, false).is_err()
+            );
+            assert!(discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            assert!(consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&allow_verdict(), &Policy::default(), command, session),
+                Duration::from_secs(1)
+            )
+            .is_err());
+            assert_eq!(strict_generation(session), 2);
+            let _next = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            assert!(!receipt_path(&token).exists());
+            assert!(!receipt_lock_path(&token).exists());
+            assert!(acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .is_err());
+            assert!(shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh).is_err());
+            assert_eq!(strict_generation(session), 2);
+        });
+    }
+
+    #[test]
+    fn acknowledgement_rejects_wrong_context_token_and_unresolved_states() {
+        isolated_state_with_guard(|_, session, environment| {
+            let command = "printf ack-scoped";
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            assert!(acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            arm_allow(&token);
+            assert!(acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            let mut prepared = prepare(&allow_verdict(), &Policy::default(), command, session);
+            force_consuming(&token, &mut prepared);
+            assert!(acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            {
+                let mut locked = lock_receipt(&token).unwrap();
+                locked.receipt.state = ReceiptState::Conflict {
+                    observation: ShellReceiptChannel::Zsh.observation_tag().to_string(),
+                    evidence_id: evidence_id(&locked.receipt),
+                    generation: None,
+                    finished_unix_ms: unix_time_ms().unwrap(),
+                };
+                locked.publish().unwrap();
+            }
+            assert!(acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            let discarded = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            discard_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh).unwrap();
+            let bytes = fs::read(receipt_path(&discarded)).unwrap();
+            assert!(
+                acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Fish).is_err()
+            );
+            assert!(
+                acknowledge_shell_execution_receipt(&"0".repeat(64), ShellReceiptChannel::Zsh)
+                    .is_err()
+            );
+            assert!(
+                acknowledge_shell_execution_receipt("invalid", ShellReceiptChannel::Zsh).is_err()
+            );
+            // The process resolver caches TIRITH_SESSION_ID. Bind an actual
+            // authenticated fixture to another session rather than pretending
+            // an environment mutation changes that already-resolved identity.
+            assert_ne!(session, "ack-other-session");
+            {
+                let mut wrong_session = lock_receipt(&discarded).unwrap();
+                wrong_session.receipt.session_id = "ack-other-session".into();
+                wrong_session.publish().unwrap();
+            }
+            let wrong_session_bytes = fs::read(receipt_path(&discarded)).unwrap();
+            assert!(
+                acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh)
+                    .unwrap_err()
+                    .contains("different shell session")
+            );
+            assert_eq!(
+                fs::read(receipt_path(&discarded)).unwrap(),
+                wrong_session_bytes
+            );
+            replace_receipt_bytes(&discarded, &bytes);
+            let instance = std::env::var("_TIRITH_RECEIPT_INSTANCE").unwrap();
+            environment.set_env("_TIRITH_RECEIPT_INSTANCE", OTHER_HOOK_INSTANCE);
+            assert!(
+                acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh).is_err()
+            );
+            environment.set_env("_TIRITH_RECEIPT_INSTANCE", instance);
+            assert_eq!(fs::read(receipt_path(&discarded)).unwrap(), bytes);
+            {
+                let mut wrong_cwd = lock_receipt(&discarded).unwrap();
+                wrong_cwd.receipt.cwd_binding_sha256 = Some("0".repeat(64));
+                wrong_cwd.publish().unwrap();
+            }
+            assert!(
+                acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh)
+                    .unwrap_err()
+                    .contains("different working directory")
+            );
+            replace_receipt_bytes(&discarded, &bytes);
+            acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh).unwrap();
+            assert!(!reconcile_shell_execution_receipt(
+                &discarded,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+            discard_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh).unwrap();
+            acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh).unwrap();
+        });
+    }
+
+    #[test]
+    fn acknowledged_schema_requires_terminal_shape_private_bindings_and_both_seals() {
+        isolated_state(|_, session| {
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                "printf ack-schema",
+                session,
+                false,
+            );
+            let original = lock_receipt(&token).unwrap().receipt;
+            let mut future_live = original.clone();
+            future_live.schema_version = ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION;
+            refresh_receipt_seals(&mut future_live, &token).unwrap();
+            assert!(validate_receipt(&future_live, &token).is_err());
+            let mut unversioned_ack = original.clone();
+            unversioned_ack.state = ReceiptState::Acknowledged {
+                outcome: AcknowledgedReceiptOutcome::Discarded {
+                    finished_unix_ms: unix_time_ms().unwrap(),
+                },
+            };
+            refresh_receipt_seals(&mut unversioned_ack, &token).unwrap();
+            assert!(validate_receipt(&unversioned_ack, &token).is_err());
+            discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            let acknowledged = lock_receipt(&token).unwrap().receipt;
+            let mut missing_binding = acknowledged.clone();
+            missing_binding.cwd_binding_sha256 = None;
+            refresh_receipt_seals(&mut missing_binding, &token).unwrap();
+            assert!(validate_receipt(&missing_binding, &token).is_err());
+            let mut missing_command = acknowledged.clone();
+            missing_command.command_binding_sha256 = None;
+            refresh_receipt_seals(&mut missing_command, &token).unwrap();
+            assert!(validate_receipt(&missing_command, &token).is_err());
+            let mut schema_tamper = acknowledged.clone();
+            schema_tamper.schema_version = RECEIPT_SCHEMA_VERSION;
+            assert!(validate_receipt(&schema_tamper, &token).is_err());
+            let mut immutable_tamper = acknowledged.clone();
+            immutable_tamper.immutable_seal_sha256 = original.immutable_seal_sha256;
+            assert!(validate_receipt(&immutable_tamper, &token).is_err());
+            let mut state_tamper = acknowledged;
+            state_tamper.state = ReceiptState::Acknowledged {
+                outcome: AcknowledgedReceiptOutcome::Discarded {
+                    finished_unix_ms: 1,
+                },
+            };
+            assert!(validate_receipt(&state_tamper, &token).is_err());
+        });
+    }
+
+    fn mutate_test_receipt_ledger(session: &str, mutate: impl FnOnce(&mut ExecutionLedger)) {
+        let state = crate::session_warnings::session_state_path(session).unwrap();
+        let lock_path = crate::session_warnings::session_lock_path(session).unwrap();
+        let lock = ReceiptLock(
+            open_and_lock_secure(&lock_path, Instant::now() + Duration::from_secs(1)).unwrap(),
+        );
+        let (mut file, mut ledger, active_slot, path, identity) =
+            open_or_initialize_strict_state(state.parent().unwrap(), session, None, None).unwrap();
+        require_strict_anchor(&lock, &lock_path, &ledger).unwrap();
+        mutate(&mut ledger);
+        validate_execution_ledger(&ledger, session).unwrap();
+        write_strict_state(
+            &lock,
+            &lock_path,
+            &mut file,
+            &path,
+            identity,
+            active_slot,
+            &ledger,
+            PublishFailureInjection::default(),
+        )
+        .unwrap();
+    }
+
+    fn seed_test_receipt_ledger_pressure(session: &str) {
+        mutate_test_receipt_ledger(session, |ledger| {
+            let template = ledger.unresolved.front().unwrap().clone();
+            while ledger.unresolved.len() < MAX_UNRESOLVED_EXECUTIONS {
+                let mut record = template.clone();
+                let (generation, sequence) = advance_ledger(ledger).unwrap();
+                record.execution_id = format!("pressure-execution-{generation}");
+                record.evidence_id = format!("pressure-evidence-{generation}");
+                record.generation = generation;
+                record.ledger_sequence = sequence;
+                record.evidence_history = vec![EvidenceTransition {
+                    evidence_id: record.evidence_id.clone(),
+                    grade: record.evidence_grade,
+                    observed_unix_ms: record.committed_unix_ms,
+                    ledger_sequence: sequence,
+                    generation,
+                }];
+                ledger.unresolved.push_back(record);
+            }
+        });
+    }
+
+    fn test_receipt_ledger(session: &str) -> ExecutionLedger {
+        let state = crate::session_warnings::session_state_path(session).unwrap();
+        let (file, ledger, _, _, _) =
+            open_or_initialize_strict_state(state.parent().unwrap(), session, None, None).unwrap();
+        drop(file);
+        ledger
+    }
+
+    #[test]
+    fn acknowledged_clean_record_keeps_observation_until_pressure_but_ends_retention() {
+        isolated_state(|_, session| {
+            let command = "printf ack-recent-observation";
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            commit_allow_receipt(&token, command, session);
+            let before = test_receipt_ledger(session);
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            let after = test_receipt_ledger(session);
+            assert_eq!(after.unresolved.len(), 1);
+            assert!(after.confirmed.is_empty());
+            assert_eq!(after.generation, before.generation + 1);
+            let original = &before.unresolved[0];
+            let actual = &after.unresolved[0];
+            assert!(actual.retention_until_unix_ms >= actual.committed_unix_ms);
+            assert!(actual.retention_until_unix_ms < unix_time_ms().unwrap());
+            assert!(actual.retention_until_unix_ms < original.retention_until_unix_ms);
+            let mut expected = original.clone();
+            expected.retention_until_unix_ms = actual.retention_until_unix_ms;
+            assert_eq!(
+                *actual, expected,
+                "only the clean retention deadline changes"
+            );
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            assert_eq!(test_receipt_ledger(session), after);
+        });
+    }
+
+    #[test]
+    fn acknowledged_retention_uses_real_clock_boundary_without_extending_or_fabricating_time() {
+        assert_eq!(
+            acknowledged_clean_retention_end(200, 100, 120).unwrap(),
+            120
+        );
+        assert_eq!(
+            acknowledged_clean_retention_end(120, 100, 150).unwrap(),
+            120
+        );
+        assert!(acknowledged_clean_retention_end(200, 100, 99).is_err());
+        let mut times = [120, 121].into_iter();
+        wait_for_acknowledged_retention_end(120, Instant::now() + Duration::from_secs(1), || {
+            Ok(times.next().unwrap())
+        })
+        .unwrap();
+        assert!(wait_for_acknowledged_retention_end(
+            120,
+            Instant::now() + Duration::from_millis(3),
+            || Ok(120)
+        )
+        .is_err());
+        assert!(wait_for_acknowledged_retention_end(
+            120,
+            Instant::now() + Duration::from_millis(3),
+            || Ok(119)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn acknowledged_retirement_crash_before_receipt_publish_preserves_known_answer() {
+        isolated_state(|_, session| {
+            let command = "printf ack-retirement-crash";
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            commit_allow_receipt(&token, command, session);
+            seed_test_receipt_ledger_pressure(session);
+            let pressure_generation = strict_generation(session);
+            let mut duplicate = prepare(&allow_verdict(), &Policy::default(), command, session);
+            let locked = lock_receipt(&token).unwrap();
+            duplicate
+                .draft
+                .replace_execution_id(locked.receipt.execution_id.clone())
+                .unwrap();
+            let ReceiptState::Committed {
+                observation,
+                evidence_id,
+                generation,
+                finished_unix_ms,
+            } = &locked.receipt.state
+            else {
+                panic!("not committed")
+            };
+            let outcome = AcknowledgedReceiptOutcome::Committed {
+                observation: observation.clone(),
+                evidence_id: evidence_id.clone(),
+                generation: *generation,
+                finished_unix_ms: *finished_unix_ms,
+            };
+            let bytes = fs::read(receipt_path(&token)).unwrap();
+            expire_acknowledged_clean_shell_transition(&locked.receipt, &outcome).unwrap();
+            drop(locked); // Simulate losing the process before receipt ACK publication.
+            assert_eq!(fs::read(receipt_path(&token)).unwrap(), bytes);
+            assert_eq!(strict_generation(session), pressure_generation + 1);
+            let ledger = test_receipt_ledger(session);
+            assert_eq!(ledger.unresolved.len(), MAX_UNRESOLVED_EXECUTIONS);
+            let observed = ledger
+                .unresolved
+                .iter()
+                .find(|record| record.execution_id == duplicate.draft.execution_id)
+                .unwrap();
+            assert!(observed.retention_until_unix_ms < unix_time_ms().unwrap());
+            assert!(
+                ExecutionGate::acquire(duplicate.draft, Duration::from_secs(1))
+                    .unwrap_err()
+                    .contains("stale")
+            );
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+            assert!(consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&allow_verdict(), &Policy::default(), command, session),
+                Duration::from_secs(1)
+            )
+            .is_err());
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            assert_eq!(
+                strict_generation(session),
+                pressure_generation + 1,
+                "repeated cleanup does not fabricate another execution or mutation"
+            );
+            assert!(test_receipt_ledger(session).confirmed.is_empty());
+        });
+    }
+
+    #[test]
+    fn acknowledged_retirement_preserves_security_history_later_evidence_and_mismatches() {
+        for case in [
+            "warning",
+            "escalation",
+            "typed_event",
+            "later_transition",
+            "binding_mismatch",
+        ] {
+            isolated_state(|_, session| {
+                let command = "printf ack-retained-history";
+                let token = create(
+                    &allow_verdict(),
+                    &Policy::default(),
+                    command,
+                    session,
+                    false,
+                );
+                commit_allow_receipt(&token, command, session);
+                seed_test_receipt_ledger_pressure(session);
+                mutate_test_receipt_ledger(session, |ledger| {
+                    let mut record = ledger.unresolved.pop_front().unwrap();
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    match case {
+                        "warning" => {
+                            record
+                                .warning_events
+                                .push(crate::session_warnings::WarningEvent {
+                                    timestamp,
+                                    rule_id: "non_ascii_hostname".into(),
+                                    severity: "medium".into(),
+                                    title: "retained warning".into(),
+                                    command_redacted: "printf fixture".into(),
+                                    domains: vec![],
+                                })
+                        }
+                        "escalation" => record.escalation_events.push(
+                            crate::session_warnings::EscalationEvent {
+                                timestamp,
+                                rule_id: "non_ascii_hostname".into(),
+                                domain: None,
+                            },
+                        ),
+                        "typed_event" => {
+                            record.events.push(crate::event_buffer::TypedEvent {
+                                event_id: "retained-event".into(),
+                                sequence: ledger.next_event_sequence,
+                                provenance: crate::event_buffer::EventProvenance::Unresolved,
+                                timestamp,
+                                kind: crate::event_buffer::EventKind::ProcessExec,
+                                rule_id: "retained-rule".into(),
+                                metadata: Default::default(),
+                            });
+                            ledger.next_event_sequence += 1;
+                        }
+                        "later_transition" => {
+                            let (generation, sequence) = advance_ledger(ledger).unwrap();
+                            record.evidence_id = "later-kernel-proof".into();
+                            record.evidence_grade = ExecutionEvidenceGrade::KernelExecStop;
+                            record.generation = generation;
+                            record.ledger_sequence = sequence;
+                            record.evidence_history.push(EvidenceTransition {
+                                evidence_id: record.evidence_id.clone(),
+                                grade: record.evidence_grade,
+                                observed_unix_ms: unix_time_ms().unwrap(),
+                                ledger_sequence: sequence,
+                                generation,
+                            });
+                        }
+                        "binding_mismatch" => record.command_sha256 = "0".repeat(64),
+                        _ => unreachable!(),
+                    }
+                    if record.evidence_grade.is_confirmed() {
+                        ledger.confirmed.push_back(record);
+                    } else {
+                        ledger.unresolved.push_front(record);
+                    }
+                });
+                let before = test_receipt_ledger(session);
+                let result = acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh);
+                if case == "binding_mismatch" {
+                    assert!(result.is_err());
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(
+                    test_receipt_ledger(session),
+                    before,
+                    "{case} must not be retired or promoted"
+                );
+                assert!(reconcile_shell_execution_receipt(
+                    &token,
+                    ShellReceiptChannel::Zsh,
+                    Duration::from_secs(1)
+                )
+                .unwrap());
+                if case == "warning" {
+                    let next = create(
+                        &allow_verdict(),
+                        &Policy::default(),
+                        command,
+                        session,
+                        false,
+                    );
+                    arm_allow(&next);
+                    let error = consume_shell_execution_receipt(
+                        &next,
+                        ShellReceiptChannel::Zsh,
+                        command,
+                        prepare(&allow_verdict(), &Policy::default(), command, session),
+                        Duration::from_secs(1),
+                    )
+                    .unwrap_err();
+                    assert!(error.contains("full of live security-bearing correlation evidence"));
+                    assert_eq!(
+                        test_receipt_ledger(session),
+                        before,
+                        "ACK cannot evict unrelated records to make room"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn acknowledged_all_allow_burst_exceeds_receipt_capacity_without_cap_growth() {
+        isolated_state(|_, session| {
+            let command = "printf allow-capacity";
+            for _ in 0..(MAX_RECEIPTS + 8) {
+                let token = create(
+                    &allow_verdict(),
+                    &Policy::default(),
+                    command,
+                    session,
+                    false,
+                );
+                commit_allow_receipt(&token, command, session);
+                acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            }
+            let commits = MAX_RECEIPTS + 8;
+            assert_eq!(
+                strict_generation(session),
+                2 * commits as u64,
+                "one commit and one explicit clean-ACK retention mutation per command"
+            );
+            let (file, ledger, _, _, _) = open_or_initialize_strict_state(
+                crate::session_warnings::session_state_path(session)
+                    .unwrap()
+                    .parent()
+                    .unwrap(),
+                session,
+                None,
+                None,
+            )
+            .unwrap();
+            drop(file);
+            assert!(ledger.confirmed.is_empty());
+            assert_eq!(ledger.unresolved.len(), commits % MAX_UNRESOLVED_EXECUTIONS);
+            assert!(ledger
+                .unresolved
+                .iter()
+                .all(|record| record.evidence_grade
+                    == ExecutionEvidenceGrade::ShellBoundaryUnresolved));
+            let count = fs::read_dir(receipt_directory().unwrap())
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == "json")
+                })
+                .count();
+            assert_eq!(
+                count, 1,
+                "acknowledged tombstones must not consume the live capacity"
+            );
+        });
+    }
+
+    #[test]
+    fn acknowledged_clean_history_cannot_strand_a_warning_at_capacity() {
+        isolated_state(|_, session| {
+            let policy = Policy::default();
+            let command = "printf acknowledged-clean-before-warning";
+            for _ in 0..(MAX_UNRESOLVED_EXECUTIONS - 1) {
+                let token = create(&allow_verdict(), &policy, command, session, false);
+                commit_allow_receipt(&token, command, session);
+                acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            }
+            assert_eq!(
+                test_receipt_ledger(session).unresolved.len(),
+                MAX_UNRESOLVED_EXECUTIONS - 1
+            );
+            let warning_command = "printf acknowledged-warning";
+            let warning = warning_verdict(false, None);
+            let prepared = prepare(&warning, &policy, warning_command, session);
+            let warn_ack = prepared.requires_warn_ack();
+            let token = create_shell_execution_receipt(
+                &prepared,
+                ShellReceiptChannel::Zsh,
+                true,
+                false,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            arm_shell_execution_receipt(&token, ShellReceiptChannel::Zsh, None, warn_ack).unwrap();
+            consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                warning_command,
+                prepare(&warning, &policy, warning_command, session),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            let execution_id = lock_receipt(&token).unwrap().receipt.execution_id;
+            let full = test_receipt_ledger(session);
+            assert_eq!(full.unresolved.len(), MAX_UNRESOLVED_EXECUTIONS);
+            let retained_warning = full
+                .unresolved
+                .iter()
+                .find(|record| record.execution_id == execution_id)
+                .unwrap()
+                .clone();
+            assert!(!retained_warning.warning_events.is_empty());
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            assert_eq!(
+                test_receipt_ledger(session),
+                full,
+                "ACK does not shorten security history"
+            );
+            let next = create(&allow_verdict(), &policy, command, session, false);
+            commit_allow_receipt(&next, command, session);
+            acknowledge_shell_execution_receipt(&next, ShellReceiptChannel::Zsh).unwrap();
+            let after = test_receipt_ledger(session);
+            assert_eq!(
+                after.unresolved.len(),
+                2,
+                "ordinary pressure GC reclaims only previously acknowledged clean records"
+            );
+            assert!(after.confirmed.is_empty());
+            assert_eq!(
+                after
+                    .unresolved
+                    .iter()
+                    .find(|record| record.execution_id == execution_id)
+                    .unwrap(),
+                &retained_warning
+            );
+        });
+    }
+
+    #[test]
+    fn acknowledged_mixed_burst_preserves_unacknowledged_lost_responses() {
+        isolated_state(|_, session| {
+            let command = "printf mixed-capacity";
+            let lost_commit = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            commit_allow_receipt(&lost_commit, command, session);
+            let lost_discard = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            discard_shell_execution_receipt(&lost_discard, ShellReceiptChannel::Zsh).unwrap();
+            let consuming = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            arm_allow(&consuming);
+            let mut prepared = prepare(&allow_verdict(), &Policy::default(), command, session);
+            force_consuming(&consuming, &mut prepared);
+            let untouched_prepared = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            let untouched_armed = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            arm_allow(&untouched_armed);
+            let preserved = [
+                &lost_commit,
+                &lost_discard,
+                &consuming,
+                &untouched_prepared,
+                &untouched_armed,
+            ];
+            for token in preserved {
+                let mut locked = lock_receipt(token).unwrap();
+                locked.receipt.expires_unix_ms = locked.receipt.created_unix_ms
+                    + u64::try_from(MAX_RECEIPT_TTL.as_millis()).unwrap();
+                locked.publish().unwrap();
+            }
+            let before = preserved.map(|token| fs::read(receipt_path(token)).unwrap());
+            for index in 0..(MAX_RECEIPTS + 8) {
+                let token = create(
+                    &allow_verdict(),
+                    &Policy::default(),
+                    command,
+                    session,
+                    false,
+                );
+                if index % 2 == 0 {
+                    commit_allow_receipt(&token, command, session);
+                } else {
+                    discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+                }
+                acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            }
+            for (token, bytes) in preserved.into_iter().zip(before) {
+                assert_eq!(fs::read(receipt_path(token)).unwrap(), bytes);
+            }
+            assert!(reconcile_shell_execution_receipt(
+                &lost_commit,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+            assert!(!reconcile_shell_execution_receipt(
+                &lost_discard,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+            discard_shell_execution_receipt(&lost_discard, ShellReceiptChannel::Zsh).unwrap();
+            assert!(!reconcile_shell_execution_receipt(
+                &consuming,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+        });
     }
 
     #[test]

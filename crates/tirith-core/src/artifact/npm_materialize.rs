@@ -17,9 +17,9 @@ mod namespace;
 use namespace::ProtectedNamespace;
 
 #[path = "npm_materialize_decision.rs"]
-mod decision;
+pub(super) mod decision;
 use crate::threatdb::materialization_source::MaterializationThreatSource;
-use decision::MaterializationDecision;
+use decision::ArtifactDecision;
 
 #[path = "npm_materialize_recovery.rs"]
 mod recovery;
@@ -120,7 +120,7 @@ pub struct MaterializationPlan {
     namespace: ProtectedNamespace,
     policy_guard: PrivatePolicyReplayGuard,
     private_digest: String,
-    decision: MaterializationDecision,
+    decision: ArtifactDecision,
     envelope: TaskEnvelopeInput,
     expected: BTreeMap<String, ExpectedEntry>,
     summary: MaterializationSummary,
@@ -165,7 +165,7 @@ impl MaterializationPlan {
         let namespace =
             ProtectedNamespace::capture(destination.parent.path(), destination.identity)?;
         let (expected, bytes) = capture_expected(&artifacts)?;
-        let decision = MaterializationDecision::capture(&artifacts, policy, source)?;
+        let decision = ArtifactDecision::capture(&artifacts, policy, source)?;
         let (threat_db_sequence, signed_build_timestamp) = decision.publication();
         let inventory_digest =
             digest(&serde_json::to_vec(&expected).map_err(|_| Refusal::ResourceLimit)?);

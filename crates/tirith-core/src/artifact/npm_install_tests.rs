@@ -253,6 +253,94 @@ fn preparation_permit(
 }
 
 #[test]
+fn public_preparation_requires_a_verified_live_threat_source() {
+    let _environment = tirith_test_support::GlobalStateGuard::new().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = retained_fixture(root.path());
+    let snapshot =
+        EffectivePolicySnapshot::resolve(None, crate::policy_snapshot::ResolutionMode::Runtime);
+    assert!(matches!(
+        NpmInstallPlan::prepare(
+            &uuid::Uuid::new_v4().to_string(),
+            &artifacts,
+            NewNpmDestination::capture(&root.path().join("installed")).unwrap(),
+            &snapshot,
+        ),
+        Err(NpmInstallRefusal::ThreatDataUnavailable)
+    ));
+    assert!(!root.path().join("installed").exists());
+}
+
+#[test]
+fn retained_malicious_artifact_cannot_reach_preparation_authority() {
+    let _environment = tirith_test_support::GlobalStateGuard::new().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = retained_fixture(root.path());
+    let snapshot =
+        EffectivePolicySnapshot::resolve(None, crate::policy_snapshot::ResolutionMode::Runtime);
+    let hash: [u8; 32] = hex::decode(artifacts[0].sha256())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(matches!(
+        NpmInstallPlan::prepare_with_source(
+            &uuid::Uuid::new_v4().to_string(),
+            &artifacts,
+            NewNpmDestination::capture(&root.path().join("installed")).unwrap(),
+            &snapshot,
+            MaterializationThreatSource::fixture_blocking_artifact(hash),
+        ),
+        Err(NpmInstallRefusal::ArtifactPolicyRefused)
+    ));
+    assert!(!root.path().join("installed").exists());
+}
+
+#[test]
+fn incomplete_artifact_analysis_cannot_become_a_prepared_install() {
+    let _environment = tirith_test_support::GlobalStateGuard::new().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut artifacts = retained_fixture(root.path());
+    artifacts[0].inspection.coverage.static_analysis_complete = false;
+    let snapshot =
+        EffectivePolicySnapshot::resolve(None, crate::policy_snapshot::ResolutionMode::Runtime);
+    assert!(matches!(
+        NpmInstallPlan::prepare_with_source(
+            &uuid::Uuid::new_v4().to_string(),
+            &artifacts,
+            NewNpmDestination::capture(&root.path().join("installed")).unwrap(),
+            &snapshot,
+            MaterializationThreatSource::fixture_empty(),
+        ),
+        Err(NpmInstallRefusal::AnalysisIncomplete)
+    ));
+    assert!(!root.path().join("installed").exists());
+}
+
+#[test]
+fn preparation_requires_non_nil_canonical_operation_ids() {
+    let _environment = tirith_test_support::GlobalStateGuard::new().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = retained_fixture(root.path());
+    let snapshot =
+        EffectivePolicySnapshot::resolve(None, crate::policy_snapshot::ResolutionMode::Runtime);
+    for id in [
+        "00000000-0000-0000-0000-000000000000",
+        "A1234567-89AB-4CDE-8123-456789ABCDEF",
+        "a123456789ab4cde8123456789abcdef",
+    ] {
+        assert!(matches!(
+            NpmInstallPlan::prepare(
+                id,
+                &artifacts,
+                NewNpmDestination::capture(&root.path().join("installed")).unwrap(),
+                &snapshot,
+            ),
+            Err(NpmInstallRefusal::InvalidOperationId)
+        ));
+    }
+}
+
+#[test]
 fn staged_leaf_retry_keeps_exact_inputs_but_never_replays_a_started_execution() {
     let _environment = tirith_test_support::GlobalStateGuard::new().unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -261,12 +349,12 @@ fn staged_leaf_retry_keeps_exact_inputs_but_never_replays_a_started_execution() 
     let snapshot =
         EffectivePolicySnapshot::resolve(None, crate::policy_snapshot::ResolutionMode::Runtime);
     let id = uuid::Uuid::new_v4().to_string();
-    let plan = NpmInstallPlan::prepare(
+    let plan = NpmInstallPlan::prepare_with_source(
         &id,
         &artifacts,
         NewNpmDestination::capture(&target).unwrap(),
         &snapshot,
-        "fixture-sequence-1",
+        MaterializationThreatSource::fixture_empty(),
     )
     .unwrap();
     assert_eq!(
@@ -342,12 +430,12 @@ fn different_operation_permit_refuses_before_journal_or_input_creation() {
     let snapshot =
         EffectivePolicySnapshot::resolve(None, crate::policy_snapshot::ResolutionMode::Runtime);
     let make_plan = |target: &str| {
-        NpmInstallPlan::prepare(
+        NpmInstallPlan::prepare_with_source(
             &uuid::Uuid::new_v4().to_string(),
             &artifacts,
             NewNpmDestination::capture(&root.path().join(target)).unwrap(),
             &snapshot,
-            "fixture-sequence-1",
+            MaterializationThreatSource::fixture_empty(),
         )
         .unwrap()
     };
@@ -385,17 +473,17 @@ fn same_id_with_changed_review_identity_cannot_rewrite_prepared_journal() {
         EffectivePolicySnapshot::resolve(None, crate::policy_snapshot::ResolutionMode::Runtime);
     let id = uuid::Uuid::new_v4().to_string();
     let make_plan = |sequence| {
-        NpmInstallPlan::prepare(
+        NpmInstallPlan::prepare_with_source(
             &id,
             &artifacts,
             NewNpmDestination::capture(&root.path().join("installed")).unwrap(),
             &snapshot,
-            sequence,
+            MaterializationThreatSource::fixture_empty_at(sequence),
         )
         .unwrap()
     };
-    let plan = make_plan("fixture-sequence-1");
-    let other = make_plan("fixture-sequence-2");
+    let plan = make_plan(1);
+    let other = make_plan(2);
     let store = QuarantineStore::with_root(root.path().join("quarantine")).unwrap();
     let staged = plan
         .stage(
@@ -432,12 +520,12 @@ fn public_boundary_binding_does_not_publish_a_secret_policy_fingerprint() {
         std::fs::write(&policy_path, format!("policy_server_api_key: {secret}\n")).unwrap();
         let snapshot =
             EffectivePolicySnapshot::resolve(None, crate::policy_snapshot::ResolutionMode::Runtime);
-        NpmInstallPlan::prepare(
+        NpmInstallPlan::prepare_with_source(
             &id,
             &artifacts,
             NewNpmDestination::capture(&root.path().join("installed")).unwrap(),
             &snapshot,
-            "fixture-sequence-1",
+            MaterializationThreatSource::fixture_empty(),
         )
         .unwrap()
     };

@@ -67,7 +67,7 @@ pub struct MaterializationRecovery {
     operator: String,
     policy_guard: PrivatePolicyReplayGuard,
     artifacts: Vec<VerifiedNpmArtifact>,
-    decision: Option<MaterializationDecision>,
+    decision: Option<ArtifactDecision>,
     destination: NewNpmDestination,
     namespace: ProtectedNamespace,
     parent: File,
@@ -268,9 +268,7 @@ impl MaterializationRecovery {
                 #[cfg(not(test))]
                 let source =
                     MaterializationThreatSource::capture().map_err(decision::source_error)?;
-                Some(MaterializationDecision::capture(
-                    &artifacts, policy, source,
-                )?)
+                Some(ArtifactDecision::capture(&artifacts, policy, source)?)
             }
         };
         let remaining_entries = entries.len();

@@ -2476,6 +2476,30 @@ pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
     }
 }
 
+pub fn acknowledge_receipt(channel: ShellReceiptChannel) -> i32 {
+    let bytes = match read_receipt_stdin() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("tirith: {error}");
+            return 1;
+        }
+    };
+    let token = match parse_receipt_token_frame(&bytes) {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("tirith: {error}");
+            return 1;
+        }
+    };
+    match execution_state::acknowledge_shell_execution_receipt(token, channel) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("tirith: failed to acknowledge shell execution receipt: {error}");
+            1
+        }
+    }
+}
+
 pub fn reconcile_receipt(channel: ShellReceiptChannel) -> i32 {
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,

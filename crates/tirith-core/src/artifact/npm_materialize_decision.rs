@@ -6,12 +6,12 @@ use crate::threatdb::materialization_source::{MaterializationThreatSource, Sourc
 use crate::threatdb::{Confidence, Ecosystem, PackageThreatAssessment};
 use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings};
 
-pub(super) struct MaterializationDecision {
+pub(in crate::artifact::npm_install) struct ArtifactDecision {
     source: MaterializationThreatSource,
     decision_digest: String,
 }
-impl MaterializationDecision {
-    pub(super) fn capture(
+impl ArtifactDecision {
+    pub(in crate::artifact::npm_install) fn capture(
         artifacts: &[VerifiedNpmArtifact],
         policy: &EffectivePolicySnapshot,
         source: MaterializationThreatSource,
@@ -43,13 +43,16 @@ impl MaterializationDecision {
             decision_digest,
         })
     }
-    pub(super) fn revalidate(&self, full: bool) -> MaterializationResult<()> {
+    pub(in crate::artifact::npm_install) fn revalidate(
+        &self,
+        full: bool,
+    ) -> MaterializationResult<()> {
         self.source.revalidate(full).map_err(source_error)
     }
-    pub(super) fn private_commitment(&self) -> &str {
+    pub(in crate::artifact::npm_install) fn private_commitment(&self) -> &str {
         &self.decision_digest
     }
-    pub(super) fn publication(&self) -> (u64, u64) {
+    pub(in crate::artifact::npm_install) fn publication(&self) -> (u64, u64) {
         self.source.publication()
     }
 }

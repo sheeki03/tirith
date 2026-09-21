@@ -31,25 +31,26 @@ use crate::tokenize::ShellType;
 use crate::verdict::{Action, Verdict};
 
 mod shell_receipt;
+pub use shell_receipt::{
+    acknowledge_shell_execution_receipt, arm_shell_execution_receipt, authenticate_shell_context,
+    consume_shell_execution_receipt, create_shell_execution_receipt,
+    discard_shell_execution_receipt, execute_automatic_shell_verification_probe,
+    execute_shell_verification_probe, finish_automatic_shell_verification_status,
+    finish_shell_verification, finish_shell_verification_authenticated,
+    observe_shell_verification_hook, reconcile_shell_execution_receipt,
+    register_shell_hook_instance, register_shell_hook_instance_with_delivery,
+    shell_execution_receipt_context, start_shell_verification, validate_shell_hook_instance,
+    AuthenticatedShellContext, ShellApprovalOutcome, ShellHookFamily, ShellReceiptChannel,
+    ShellReceiptContext, ShellVerificationChallenge, ShellVerificationHookDecision,
+    ShellVerificationObservation, ShellVerificationProbe, ShellVerificationProof,
+    ShellVerificationStatus, SHELL_RECEIPT_READ_VERSIONS,
+};
 #[cfg(unix)]
 pub use shell_receipt::{
     activation_client_exchange, activation_server_receive, start_automatic_shell_verification,
     ActivationExchangeId, ActivationReplyOwner, ActivationTransportError,
     AutomaticShellVerification, AutomaticVerificationStage, ACTIVATION_REPLY_CAP,
     ACTIVATION_REQUEST_CAP,
-};
-pub use shell_receipt::{
-    arm_shell_execution_receipt, authenticate_shell_context, consume_shell_execution_receipt,
-    create_shell_execution_receipt, discard_shell_execution_receipt,
-    execute_automatic_shell_verification_probe, execute_shell_verification_probe,
-    finish_automatic_shell_verification_status, finish_shell_verification,
-    finish_shell_verification_authenticated, observe_shell_verification_hook,
-    reconcile_shell_execution_receipt, register_shell_hook_instance,
-    register_shell_hook_instance_with_delivery, shell_execution_receipt_context,
-    start_shell_verification, validate_shell_hook_instance, AuthenticatedShellContext,
-    ShellApprovalOutcome, ShellHookFamily, ShellReceiptChannel, ShellReceiptContext,
-    ShellVerificationChallenge, ShellVerificationHookDecision, ShellVerificationObservation,
-    ShellVerificationProbe, ShellVerificationProof, ShellVerificationStatus,
 };
 
 pub const EXECUTION_LEDGER_SCHEMA_VERSION: u32 = 3;

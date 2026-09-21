@@ -36,7 +36,8 @@ GENERATOR_INPUTS = ("Cargo.toml", ".github/scripts/release-compatibility.py",
                     "crates/tirith/src/cli/control/lifecycle.rs",
                     "crates/tirith-core/src/policy_team.rs",
                     "crates/tirith/src/cli/npm_materialize.rs",
-                    "crates/tirith-core/src/artifact/npm_materialize.rs")
+                    "crates/tirith-core/src/artifact/npm_materialize.rs",
+                    "crates/tirith-core/src/execution_state/shell_receipt.rs")
 
 
 def require(value, message):

@@ -722,21 +722,39 @@ _tirith_activation_receipt_frame() {
 
 }
 
+_tirith_activation_acknowledge_receipt() {
+  builtin setopt localoptions noxtrace noallexport
+  local -h +x token="$1" original_cwd="$2"
+  [[ -n "$token" && "$PWD" == "$original_cwd" ]] || return 0
+  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+  _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+  _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+    command "$_TIRITH_BIN" __setup-activation receipt-acknowledge --channel zsh \
+      <<<"$token" >/dev/null 2>&1 || true
+  return 0
+}
+
 _tirith_activation_retire_receipt() {
   builtin setopt localoptions noxtrace noallexport
   local -h +x token="$1" original_cwd="$2"
   [[ -n "$token" ]] || return 1
   if [[ "$PWD" == "$original_cwd" ]]; then
-  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-  _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-  _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    command "$_TIRITH_BIN" __setup-activation receipt-reconcile --channel zsh \
-      <<<"$token" >/dev/null 2>&1 && return 0
-  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-  _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-  _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    command "$_TIRITH_BIN" __setup-activation receipt-discard --channel zsh \
-      <<<"$token" >/dev/null 2>&1 && return 0
+    if _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+      command "$_TIRITH_BIN" __setup-activation receipt-reconcile --channel zsh \
+        <<<"$token" >/dev/null 2>&1; then
+      _tirith_activation_acknowledge_receipt "$token" "$original_cwd" || true
+      return 0
+    fi
+    if _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+      command "$_TIRITH_BIN" __setup-activation receipt-discard --channel zsh \
+        <<<"$token" >/dev/null 2>&1; then
+      _tirith_activation_acknowledge_receipt "$token" "$original_cwd" || true
+      return 0
+    fi
   fi
   # Uncertain commitment never allows a body or a fresh user receipt. The
   # existing hook recovery path retains the original working-directory guard.
@@ -796,6 +814,7 @@ _tirith_activation_accept_line() {
       _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
         command "$_TIRITH_BIN" __setup-activation receipt-consume --channel zsh \
           <<<"$_tirith_act_receipt"$'\n'"$expected" >/dev/null 2>&1 || return 1
+      _tirith_activation_acknowledge_receipt "$_tirith_act_receipt" "$original_cwd" || true
       # Acknowledged commitment cannot be discarded or used again. If input
       # arrives before accept-line, only core's conservative committed
       # observation remains; this is not a local unresolved-token guard.
@@ -873,6 +892,24 @@ _tirith_escape_preview() {
   printf '%q' -- "$1"
 }
 
+# Best-effort retirement after the caller observes a successful terminal
+# transition. An unavailable ACK route cannot change that known outcome.
+_tirith_receipt_acknowledge_at() {
+  builtin setopt localoptions noxtrace noallexport
+  local -h +x token="$1" original_cwd="$2"
+  [[ $_TIRITH_V3_HELPERS_READY -eq 1 && -n "$token" && -n "$original_cwd" ]] \
+    || return 0
+  builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
+    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+    _TIRITH_RECEIPT_CWD="$original_cwd" \
+    _TIRITH_BIN="$_TIRITH_BIN" \
+    "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt acknowledge --channel zsh' \
+    >/dev/null 2>&1 || true
+  return 0
+}
+
 _tirith_receipt_reconcile_at() {
   builtin setopt localoptions noxtrace noallexport
   local -h +x token="$1" original_cwd="$2"
@@ -886,6 +923,11 @@ _tirith_receipt_reconcile_at() {
     _TIRITH_BIN="$_TIRITH_BIN" \
     "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt reconcile --channel zsh' \
     >/dev/null 2>&1
+  local rc=$?
+  if (( rc == 0 )); then
+    _tirith_receipt_acknowledge_at "$token" "$original_cwd" || true
+  fi
+  return "$rc"
 }
 
 _tirith_receipt_consume_at() {
@@ -901,6 +943,11 @@ _tirith_receipt_consume_at() {
     _TIRITH_BIN="$_TIRITH_BIN" \
     "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt consume --channel zsh' \
     >/dev/null
+  local rc=$?
+  if (( rc == 0 )); then
+    _tirith_receipt_acknowledge_at "$token" "$original_cwd" || true
+  fi
+  return "$rc"
 }
 
 _tirith_receipt_discard_at() {
@@ -916,6 +963,11 @@ _tirith_receipt_discard_at() {
     _TIRITH_BIN="$_TIRITH_BIN" \
     "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt discard --channel zsh' \
     >/dev/null 2>&1
+  local rc=$?
+  if (( rc == 0 )); then
+    _tirith_receipt_acknowledge_at "$token" "$original_cwd" || true
+  fi
+  return "$rc"
 }
 
 _tirith_unresolved_receipt_cleanup() {

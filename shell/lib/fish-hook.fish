@@ -135,6 +135,25 @@ function _tirith_escape_preview
     string escape -- $argv[1]
 end
 
+# Retirement is best effort after observing a successful terminal transition;
+# older binaries without this route cannot change that known outcome.
+function _tirith_receipt_acknowledge_at
+    set -l fish_trace
+    set -l token "$argv[1]"
+    set -l original_cwd "$argv[2]"
+    test $_TIRITH_V3_HELPERS_READY -eq 1; or return 0
+    test -n "$token"; and test -n "$original_cwd"; or return 0
+    builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
+        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+        _TIRITH_RECEIPT_CWD="$original_cwd" \
+        _TIRITH_BIN="$_TIRITH_BIN" \
+        "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt acknowledge --channel fish' \
+        >/dev/null 2>&1
+    return 0
+end
+
 function _tirith_receipt_consume_at
     set -l fish_trace
     set -l token "$argv[1]"
@@ -150,6 +169,11 @@ function _tirith_receipt_consume_at
         _TIRITH_BIN="$_TIRITH_BIN" \
         "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt consume --channel fish' \
         >/dev/null
+    set -l receipt_status $status
+    if test $receipt_status -eq 0
+        _tirith_receipt_acknowledge_at "$token" "$original_cwd"
+    end
+    return $receipt_status
 end
 
 function _tirith_receipt_reconcile_at
@@ -166,6 +190,11 @@ function _tirith_receipt_reconcile_at
         _TIRITH_BIN="$_TIRITH_BIN" \
         "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt reconcile --channel fish' \
         >/dev/null 2>&1
+    set -l receipt_status $status
+    if test $receipt_status -eq 0
+        _tirith_receipt_acknowledge_at "$token" "$original_cwd"
+    end
+    return $receipt_status
 end
 
 function _tirith_receipt_discard_at
@@ -182,6 +211,11 @@ function _tirith_receipt_discard_at
         _TIRITH_BIN="$_TIRITH_BIN" \
         "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt discard --channel fish' \
         >/dev/null 2>&1
+    set -l receipt_status $status
+    if test $receipt_status -eq 0
+        _tirith_receipt_acknowledge_at "$token" "$original_cwd"
+    end
+    return $receipt_status
 end
 
 function _tirith_unresolved_receipt_cleanup

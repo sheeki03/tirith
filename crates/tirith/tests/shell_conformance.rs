@@ -1330,14 +1330,21 @@ fn fish_allowed_command_output_visible() {
         }
     };
 
-    sess.send_line("echo fish_nonce_3471");
-    let out = sess.expect("fish_nonce_3471");
+    // The complete sentinel is absent from the typed command, so editor echo
+    // and autosuggestion redraws cannot satisfy the output assertion.
+    let command = "builtin printf '\\n%s%s\\n' 'fish_nonce_' '3471'";
+    let sentinel = "fish_nonce_3471";
+    assert!(!command.contains(sentinel));
+    sess.clear_buffer();
+    sess.send_line(command);
+    sess.expect(&format!("\r\n{sentinel}\r\n"));
     sess.close();
+    let out = sess.output();
 
-    let n = count_occurrences(&out, "fish_nonce_3471");
-    assert!(
-        (1..=3).contains(&n),
-        "fish: command output must be visible (echo + autosuggest + output), saw {n}"
+    assert_eq!(
+        count_occurrences(out, &format!("\r\n{sentinel}\r\n")),
+        1,
+        "fish: expected one standalone execution-output sentinel, got {out:?}"
     );
 }
 

@@ -1,5 +1,61 @@
 # Implementation verification
 
+## Platform and capacity follow-up (2026-09-21)
+
+At revision `415565d307c39e7000255955150185f3287581a6`, the [Windows
+workspace job](https://github.com/sheeki03/tirith/actions/runs/35573060680/job/106248663775)
+passes all sixty harnesses. The retained artifacts include successful native
+Job ownership, leader observation, output drainage and no-leak checks. Nine
+dashboard tests run under a medium-integrity account with no administrator
+membership or elevation. Six PowerShell 7.6.5 noninteractive cases also pass;
+these do not certify interactive Windows interception or automatic setup.
+Both artifact archive digests and the extracted report hashes were verified.
+
+The same revision passes the [native ARM GNU/musl
+workflow](https://github.com/sheeki03/tirith/actions/runs/35573060661) and the
+[PR release compatibility workflow](https://github.com/sheeki03/tirith/actions/runs/35573060878),
+including all six target builds, npm assembly and Linux package runtime checks.
+Publication steps remain skipped. The overall CI run still fails Unix PTY
+cleanup checks and six Linux setup checks reporting an undifferentiated binary
+identity error. The follow-up retains the original process group while draining
+the PTY to observed EOF and adds bounded, path-free identity diagnostics plus
+CI test-image sizes. The production binary size limit is unchanged; its role in
+the Linux failures is still a hypothesis awaiting native evidence.
+
+Three independent macOS ARM resource runs at that revision (35573095026,
+35573107325 and 35573122692) pass with the exact Apple M1 (Virtual), three-CPU
+cohort and distinct boots. All five allocation counters are identical across
+the runs; ordinary-check peak RSS ranges from 42,663,936 to 44,613,632 bytes.
+Archive digests, all 63 extracted file hashes, source/toolchain/runtime identity
+and cohort agreement were reviewed. Draft thresholds received an independent
+review. No regression limit is enabled: actual growth sensitivity and the
+final-feature source remain separate requirements.
+
+The retained full terminal timing attempt exposed a product capacity failure:
+acknowledged terminal outcomes occupied the receipt registry until expiry.
+It remains failed and supplies no admitted timing baseline. Explicit terminal
+acknowledgment now distinguishes received answers from lost-response recovery;
+active receipts remain schema 3 and acknowledged, non-authorizing outcomes use
+schema 4. Acknowledgment may end only its own exact clean shell-boundary
+record's retention at the actual acknowledgment time; ordinary pressure cleanup
+can later reclaim it. Normal reads retain the observation until existing ledger
+or stale-session cleanup; security history retains its original window. This avoids stranding a
+warning behind a ledger full of acknowledged clean observations. All ten core
+regressions pass, including 264-command bursts, the clean/warning capacity
+boundary, authenticated context/seals, lost responses, crash ordering and clock
+boundaries. Strict workspace/all-target Clippy passes. Thirty-two selected CLI
+framing, deadline, identity and stored-format cases pass on the preceding ACK
+test image with all owned cleanup checks. Actual terminal verification on the
+newly captured product remains in progress.
+
+The corresponding hook fixtures pass 79 private-environment cases and 192
+trace cases across source and embedded Bash, Zsh and Fish hooks, including
+Bash 3.2 and 5.3. Observers check exact input frames, success-before-ACK ordering,
+unchanged original status when ACK fails, and absence of private capability
+values from ordinary children and trace output. Every native process cleanup
+check passes; these recording fixtures do not independently prove receipt
+authority or final product behavior.
+
 ## Integrated native checks (2026-09-21)
 
 The second retained macOS ARM release product, SHA-256

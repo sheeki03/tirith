@@ -61,6 +61,7 @@ before another publication.
 | Operation journal | Schema 1 with the exact originating client version | Another client version cannot silently replay or undo an old mutation. |
 | Local control service | Protocol 1, exact binary version and SHA-256 | Reuse requires the full identity; an update must quiesce writes and reconcile pending jobs. |
 | Team connection, enrollment, report and rollout records | Each schema 1; team policy semantics 1 | Candidates must retain team Runtime enforcement and explicit report/rollout recovery. A missing reader or capability refuses update and rollback, even if the old binary has the same package version. |
+| Shell execution receipts | Schema 3 active/unacknowledged records; schema 4 acknowledged terminal records | A hook acknowledges only an observed terminal result. Schema 4 is non-authorizing and eligible for the next locked cleanup; schema 3 recovery windows are preserved. Schema 1/2 are authenticated retirement inputs only. Older readers reject schema 4; missing reader declarations refuse update/rollback. Hook capability schema 3 is unchanged. Explicit ACK may end only its own exact clean shell-boundary record's retention at the actual acknowledgment time, advancing the ledger generation without upgrading its unresolved evidence. The observation remains available to normal reads until existing pressure or stale-session cleanup reclaims it; warnings, escalation, typed events and later transitions keep their existing retention. |
 | Local materialization intent/events, target checkpoints and recovery inventory | Each schema 1 | Linux recovery continues to require fresh policy, task authorization and exact current ownership. Format compatibility never authorizes a replay or removes retained records. |
 
 The closed `persisted_formats` contract names these readers separately. A missing
@@ -69,7 +70,10 @@ not filled from the running client's capabilities. Publication checks the actual
 writer/reader constants and refuses an unreviewed format change.
 
 Inventory reads only fixed private team files, the bounded team rollout directory,
-and the bounded materialization intent/event directory. The same captured bytes
+the bounded materialization intent/event directory, and shell receipt declarations
+in the private session receipt directory. Known receipt locks and hook capability
+filenames are skipped; this inventory does not authenticate or declare compatibility
+for their payloads. The same captured bytes
 also expose document schemas and policy semantics inside enrollment caches and
 both rollout policy documents; future or malformed nested declarations refuse.
 It uses the existing

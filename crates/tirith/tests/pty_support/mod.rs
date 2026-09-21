@@ -942,6 +942,38 @@ impl PtySession {
                 thread::sleep(Duration::from_millis(10));
             }
         }
+        // A failed interactive `exit` (for example, vi command mode), and
+        // ordinary Drop, still need the reader alive when the actual owned
+        // group terminates. Stopping it first would manufacture missing EOF.
+        if self.reader_end.is_none() {
+            self.reader_end = self.reader_done.try_recv().ok();
+        }
+        let leader_exited_before_reader_drain = match self.child.exited() {
+            Ok(exited) => Some(exited),
+            Err(error) => {
+                errors.push(error.to_string());
+                None
+            }
+        };
+        let mut original_group_stop_requested_before_reader_drain = false;
+        let mut group_signal_permission_denied_before_reader_drain = false;
+        if self.reader.is_some()
+            && self.reader_end.is_none()
+            && !self.reader_stop.load(Ordering::Acquire)
+        {
+            original_group_stop_requested_before_reader_drain = true;
+            match self.child.stop_original_group() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // As in native cleanup, this is a diagnostic, never proof
+                    // of exit. Require actual EOF and the later native facts.
+                    group_signal_permission_denied_before_reader_drain = true;
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+            self.reader_end = self.reader_done.recv_timeout(Duration::from_secs(1)).ok();
+        }
+        let reader_stop_fallback = self.reader.is_some() && self.reader_end.is_none();
         self.reader_stop.store(true, Ordering::Release);
         let mut reader_joined = self.reader.is_none();
         if self.reader.is_some() {
@@ -977,6 +1009,11 @@ impl PtySession {
         let report = serde_json::json!({"schema_version":1,
             "id":self.id,"pid":self.child.pid,"scope":"original_owned_pty_session",
             "passed":self.cleanup_passed,"native":native,"native_eof":native_eof,
+            "graceful_exit_requested":graceful,
+            "leader_exited_before_reader_drain":leader_exited_before_reader_drain,
+            "original_group_stop_requested_before_reader_drain":original_group_stop_requested_before_reader_drain,
+            "group_signal_permission_denied_before_reader_drain":group_signal_permission_denied_before_reader_drain,
+            "reader_stop_fallback":reader_stop_fallback,
             "reader_joined":reader_joined,"private_pty_handles_released":private_pty_handles_released,"errors":errors,
             "descriptor_release":"portable-pty RAII handles dropped after reader acknowledgement/join; opaque Drop does not report close syscall status",
             "scope_limit":"No escaped-session, arbitrary process-tree or external-interruption claim"});

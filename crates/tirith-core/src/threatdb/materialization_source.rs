@@ -1,4 +1,4 @@
-//! Exact offline source lease for inert materialization. Does not use cached()
+//! Exact offline source lease for local npm artifact decisions. Does not use cached()
 //! or its polling interval, fetch data, publish cache state, or accept a caller
 //! supplied DB/sequence/report. All selected AND fallback slots are bound.
 use super::*;
@@ -26,7 +26,7 @@ struct Pin {
     generation: Option<FileGeneration>,
     sha256: Option<String>,
 }
-/// Never serialized. Handles remain live through the materialization operation.
+/// Never serialized. Handles remain live through the bound local operation.
 pub(crate) struct MaterializationThreatSource {
     slots: Vec<Pin>,
     context: Vec<Option<PathBuf>>,
@@ -139,7 +139,7 @@ impl MaterializationThreatSource {
     pub(crate) fn publication(&self) -> (u64, u64) {
         (self.db.build_sequence, self.db.build_timestamp)
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn fixture_blocking_artifact(sha256: [u8; 32]) -> Self {
         let mut writer = ThreatDbWriter::new(1, 1);
         writer.add_artifact_sha256(
@@ -161,9 +161,13 @@ impl MaterializationThreatSource {
     }
     #[cfg(test)]
     pub(crate) fn fixture_empty() -> Self {
+        Self::fixture_empty_at(1)
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_empty_at(sequence: u64) -> Self {
         // Unit-only data constructor, never used by native qualification or a
         // product build. Signature admission has separate negative tests.
-        let mut writer = ThreatDbWriter::new(1, 1);
+        let mut writer = ThreatDbWriter::new(1, sequence);
         let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let data = writer.build_format(ThreatDbFormat::V2, &key).unwrap();
         let commitment = hex::encode(Sha256::digest(&data));

@@ -47,7 +47,9 @@ def contract(root: Path, version: str) -> dict:
     intent = source_constant(root, "crates/tirith/src/cli/npm_materialize.rs", "INTENT_SCHEMA_VERSION")
     checkpoint = source_constant(root, "crates/tirith/src/cli/npm_materialize.rs", "CHECKPOINT_SCHEMA_VERSION")
     inventory = source_constant(root, "crates/tirith-core/src/artifact/npm_materialize.rs", "RECOVERY_INVENTORY_VERSION")
-    if (team, semantics, intent, checkpoint, inventory) != (1, 1, 1, 1, 1):
+    receipt = source_constant(root, "crates/tirith-core/src/execution_state/shell_receipt.rs", "RECEIPT_SCHEMA_VERSION")
+    acknowledged_receipt = source_constant(root, "crates/tirith-core/src/execution_state/shell_receipt.rs", "ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION")
+    if (team, semantics, intent, checkpoint, inventory, receipt, acknowledged_receipt) != (1, 1, 1, 1, 1, 3, 4):
         raise ValueError("persisted format implementation changed; review the compatibility contract before release")
     # A changed format needs a reviewed reader/migration contract, not an
     # automatically widened claim that every intervening version is supported.
@@ -62,6 +64,7 @@ def contract(root: Path, version: str) -> dict:
         "legacy_trust_read_versions": [1],
         "scoped_grant_read_versions": [1],
         "persisted_formats": {
+            "shell_execution_receipt": [receipt, acknowledged_receipt],
             "team_connection": [team],
             "team_enrollment": [team],
             "team_report": [team],

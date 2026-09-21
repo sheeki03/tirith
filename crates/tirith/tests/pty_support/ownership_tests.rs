@@ -62,6 +62,18 @@ fn disconnected_reader_channel_does_not_release_live_leader_ownership() {
         !session.child.exited().unwrap(),
         "actual finite child must still be retained and live"
     );
+    // Echo input through the real PTY after disconnecting the receiver, so
+    // the reader acknowledges the failed send before group termination. A
+    // disconnected channel alone cannot determine a later native EOF result.
+    session.send_raw(b"CHANNEL_DISCONNECTED\r");
+    session.reader_end = Some(
+        session
+            .reader_done
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader must acknowledge its disconnected output channel"),
+    );
+    assert!(!session.reader_end.as_ref().unwrap().native_eof);
+    assert!(!session.child.exited().unwrap());
     session.finish(false);
     let reports = env.fixture.reports.lock().unwrap();
     assert_eq!(reports.len(), 1);
@@ -111,6 +123,15 @@ fn forced_reader_stop_does_not_invent_eof() {
     let env = IsolatedEnv::new();
     let root = env.fixture.root.as_ref().unwrap().path().to_path_buf();
     let mut session = PtySession::spawn(&env, Path::new("/bin/sh"), &["-c", "sleep 2"]);
+    session.reader_stop.store(true, Ordering::Release);
+    session.reader_end = Some(
+        session
+            .reader_done
+            .recv_timeout(Duration::from_secs(1))
+            .expect("forced reader stop must acknowledge completion"),
+    );
+    assert!(!session.reader_end.as_ref().unwrap().native_eof);
+    assert!(!session.child.exited().unwrap());
     session.finish(false);
     let reports = env.fixture.reports.lock().unwrap();
     assert!(native_complete(&reports[0]));
@@ -121,4 +142,36 @@ fn forced_reader_stop_does_not_invent_eof() {
     drop(session);
     drop(env);
     assert!(root.is_dir());
+}
+
+#[test]
+#[ignore = "explicit owned native PTY qualification control"]
+fn owned_termination_drains_real_eof_before_reader_stop_and_reap() {
+    let env = IsolatedEnv::new();
+    let root = env.fixture.root.as_ref().unwrap().path().to_path_buf();
+    let mut session = PtySession::spawn(&env, Path::new("/bin/sh"), &["-c", "sleep 2"]);
+    assert!(!session.child.exited().unwrap());
+    assert!(session.reader_end.is_none());
+    session.finish(false);
+    let reports = env.fixture.reports.lock().unwrap();
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0];
+    assert!(native_complete(report));
+    assert_eq!(report["graceful_exit_requested"], false);
+    assert_eq!(report["leader_exited_before_reader_drain"], false);
+    assert_eq!(
+        report["original_group_stop_requested_before_reader_drain"],
+        true
+    );
+    assert_eq!(report["reader_stop_fallback"], false);
+    assert_eq!(report["native_eof"], true);
+    assert_eq!(report["reader_joined"], true);
+    assert_eq!(report["passed"], true);
+    drop(reports);
+    drop(session);
+    drop(env);
+    assert!(
+        !root.exists(),
+        "fully observed forced cleanup permits fixture removal"
+    );
 }

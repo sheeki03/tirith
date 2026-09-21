@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.util
+import ast
 import gzip
 import io
 from pathlib import Path
@@ -55,22 +56,53 @@ class PublicationTests(unittest.TestCase):
             "team_connection", "team_enrollment", "team_report", "team_rollout",
             "team_policy_document", "team_policy_semantics", "npm_materialization_intent",
             "npm_materialization_checkpoint", "npm_materialization_inventory",
-            "npm_materialization_recovery_rule",
+            "npm_materialization_recovery_rule", "shell_execution_receipt",
         })
         self.assertTrue(all(value == [1] for name, value in readers.items()
-                            if name != "npm_materialization_recovery_rule"))
+                            if name not in ("npm_materialization_recovery_rule", "shell_execution_receipt")))
+        self.assertEqual(readers["shell_execution_receipt"], [3, 4])
         self.assertEqual(readers["npm_materialization_recovery_rule"],
                          "linux_only_fresh_policy_and_exact_current_ownership_required")
         self.assertTrue({"team_policy_runtime_v1", "team_policy_recovery_v1",
                          "npm_materialization_recovery_v1"} <= set(result["features"]))
         original = MODULE.source_constant
         for changed in ("SCHEMA_VERSION", "POLICY_SEMANTICS_VERSION", "INTENT_SCHEMA_VERSION",
-                        "CHECKPOINT_SCHEMA_VERSION", "RECOVERY_INVENTORY_VERSION"):
+                        "CHECKPOINT_SCHEMA_VERSION", "RECOVERY_INVENTORY_VERSION",
+                        "RECEIPT_SCHEMA_VERSION", "ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION"):
             def replaced(root, path, name):
                 return 99 if name == changed else original(root, path, name)
             with self.subTest(changed=changed), patch.object(MODULE, "source_constant", replaced):
                 with self.assertRaisesRegex(ValueError, "persisted format implementation changed"):
                     MODULE.contract(ROOT, VERSION)
+
+    def test_signed_fixture_holds_every_literal_generator_source_dependency(self):
+        # The fixture invokes this generator only while its declared inputs are
+        # held and equal across the test/product builds. A new source_constant
+        # call must therefore extend that explicit retained-input contract.
+        generator = ast.parse((ROOT / ".github/scripts/release-compatibility.py").read_text())
+        required = {"Cargo.toml", ".github/scripts/release-compatibility.py"}
+        calls = [node for node in ast.walk(generator) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "source_constant"]
+        self.assertTrue(calls, "generator source dependencies disappeared; review capture contract")
+        for call in calls:
+            self.assertEqual(len(call.args), 3, "review changed source_constant calling convention")
+            self.assertFalse(call.keywords, "review dynamic generator dependency arguments")
+            path = call.args[1]
+            self.assertIsInstance(path, ast.Constant, "generator dependency must remain explicit")
+            self.assertIsInstance(path.value, str)
+            required.add(path.value)
+        capture = ast.parse((ROOT / "tools/qualification/signed_replacement_inputs.py").read_text())
+        declarations = [node.value for node in capture.body if isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == "GENERATOR_INPUTS"
+                                for target in node.targets)]
+        self.assertEqual(len(declarations), 1, "review changed capture input declaration")
+        declared = ast.literal_eval(declarations[0])
+        self.assertIsInstance(declared, tuple)
+        self.assertTrue(all(isinstance(path, str) for path in declared))
+        self.assertEqual(len(declared), len(set(declared)))
+        self.assertFalse(required - set(declared),
+                         "signed fixture does not retain generator dependencies: " +
+                         repr(sorted(required - set(declared))))
 
     def test_missing_or_substituted_archive_changes_evidence(self):
         before = MODULE.build(ROOT, self.artifacts, VERSION)

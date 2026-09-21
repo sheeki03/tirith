@@ -9,13 +9,15 @@ use std::time::{Duration, Instant};
 pub(crate) const RECOVERY_RULE: &str =
     "linux_only_fresh_policy_and_exact_current_ownership_required";
 pub(crate) const INVENTORY_SCOPE: &str =
-    "fixed_team_records_and_bounded_rollout_and_materialization_intents; external_target_checkpoints_not_discovered";
+    "fixed_team_records_and_bounded_rollout_materialization_intents_and_shell_receipts; external_target_checkpoints_not_discovered";
 
 /// Missing contracts deserialize to empty readers and fail compatibility.
 /// Unknown fields are refused: adding a stored surface requires review.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedFormats {
+    #[serde(default)]
+    pub shell_execution_receipt: Vec<u32>,
     pub team_connection: Vec<u32>,
     pub team_enrollment: Vec<u32>,
     pub team_report: Vec<u32>,
@@ -31,6 +33,8 @@ impl PersistedFormats {
     pub(crate) fn current() -> Self {
         let team = tirith_core::policy_team::SCHEMA_VERSION;
         Self {
+            shell_execution_receipt: tirith_core::execution_state::SHELL_RECEIPT_READ_VERSIONS
+                .to_vec(),
             team_connection: vec![team],
             team_enrollment: vec![team],
             team_report: vec![team],
@@ -47,8 +51,9 @@ impl PersistedFormats {
             npm_materialization_recovery_rule: RECOVERY_RULE.into(),
         }
     }
-    pub(crate) fn readers(&self) -> [(&'static str, &Vec<u32>); 9] {
+    pub(crate) fn readers(&self) -> [(&'static str, &Vec<u32>); 10] {
         [
+            ("shell_execution_receipt", &self.shell_execution_receipt),
             ("team_connection", &self.team_connection),
             ("team_enrollment", &self.team_enrollment),
             ("team_report", &self.team_report),
@@ -323,6 +328,92 @@ fn directory_facts(
         facts.push(unknown(surface, "recovery_unsupported_on_this_platform"));
     }
 }
+fn lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn receipt_auxiliary_name(name: &str) -> bool {
+    name == ".receipt-registry.lock"
+        || name
+            .strip_suffix(".lock")
+            .is_some_and(|stem| lower_hex(stem, 64))
+        || name.strip_prefix(".hook-").is_some_and(|rest| {
+            rest.strip_suffix(".capability")
+                .or_else(|| rest.strip_suffix(".capability.lock"))
+                .is_some_and(|stem| lower_hex(stem, 64))
+        })
+}
+
+/// Observe receipt format declarations only. The known lock/capability names
+/// are not receipt payloads; this does not claim to authenticate those stores.
+fn shell_receipt_facts(scope: &Path, budget: &mut Budget, facts: &mut Vec<FormatFact>) {
+    const SURFACE: &str = "shell_execution_receipt";
+    let directory = scope.join("sessions/execution-receipts");
+    if !budget.available() {
+        facts.push(unknown(SURFACE, "inventory_limited"));
+        return;
+    }
+    let (mut names, limited) =
+        match fs_helpers::private_directory_names(&directory, scope, DIRECTORY_CAP) {
+            Ok(result) => result,
+            Err(_) => {
+                facts.push(unknown(SURFACE, "unreadable"));
+                return;
+            }
+        };
+    names.sort();
+    if limited {
+        facts.push(unknown(SURFACE, "inventory_limited"));
+    }
+    let mut observed = false;
+    for name in &names {
+        if !budget.available() {
+            facts.push(unknown(SURFACE, "inventory_limited"));
+            break;
+        }
+        if name.to_str().is_some_and(receipt_auxiliary_name) {
+            continue;
+        }
+        observed = true;
+        if !name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .is_some_and(|stem| lower_hex(stem, 64))
+        {
+            facts.push(unknown(SURFACE, "unknown_entry"));
+            continue;
+        }
+        let (fact, _) = private_observation(
+            &directory.join(name),
+            scope,
+            SURFACE,
+            "schema_version",
+            64 * 1024,
+            budget,
+        );
+        facts.push(if fact.state == "absent" {
+            unknown(SURFACE, "inventory_changed")
+        } else {
+            fact
+        });
+    }
+    if !observed && !limited {
+        facts.push(unknown(SURFACE, "absent"));
+    }
+    match fs_helpers::private_directory_names(&directory, scope, DIRECTORY_CAP) {
+        Ok((mut after, after_limited)) => {
+            after.sort();
+            if after != names || after_limited != limited {
+                facts.push(unknown(SURFACE, "inventory_changed"));
+            }
+        }
+        Err(_) => facts.push(unknown(SURFACE, "inventory_changed")),
+    }
+}
+
 pub(super) fn observe(config: Option<&Path>, state: Option<&Path>) -> Vec<FormatFact> {
     let mut budget = Budget::new();
     let mut facts = Vec::new();
@@ -376,6 +467,7 @@ pub(super) fn observe(config: Option<&Path>, state: Option<&Path>) -> Vec<Format
         }
     }
     if let Some(scope) = state {
+        shell_receipt_facts(scope, &mut budget, &mut facts);
         directory_facts(
             &scope.join("materialization-intents"),
             scope,
@@ -385,6 +477,7 @@ pub(super) fn observe(config: Option<&Path>, state: Option<&Path>) -> Vec<Format
             &mut facts,
         );
     } else {
+        facts.push(unknown("shell_execution_receipt", "state_root_unavailable"));
         facts.push(unknown(
             "npm_materialization_intent",
             "state_root_unavailable",
@@ -424,6 +517,16 @@ mod tests {
                 );
             }
         }
+        let mut old = serde_json::to_value(&current).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("shell_execution_receipt");
+        let old: PersistedFormats = serde_json::from_value(old).unwrap();
+        assert!(old.shell_execution_receipt.is_empty());
+        assert!(!old.supports_current_recovery());
+        let mut schema_three_only = current.clone();
+        schema_three_only.shell_execution_receipt = vec![3];
+        assert!(!schema_three_only.supports_current_recovery());
         let mut raw = serde_json::to_value(&current).unwrap();
         raw["future_store"] = serde_json::json!([1]);
         assert!(serde_json::from_value::<PersistedFormats>(raw).is_err());
@@ -455,13 +558,53 @@ mod tests {
         fn absent_optional_stores_are_observed_without_creating_them() {
             let temp = scope();
             let facts = observe(Some(temp.path()), Some(temp.path()));
-            assert_eq!(facts.len(), 5);
+            assert_eq!(facts.len(), 6);
             assert!(facts.iter().all(|fact| fact.state == "absent"));
             assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
             assert!(observe(None, None)
                 .iter()
                 .all(|fact| fact.declared_version.is_none() && fact.state != "absent"));
         }
+        #[test]
+        fn receipt_inventory_distinguishes_ack_schema_without_exposing_private_payloads() {
+            let temp = scope();
+            let receipts = temp.path().join("sessions/execution-receipts");
+            file(&receipts.join(".receipt-registry.lock"), b"");
+            file(
+                &receipts.join(format!(".hook-{}.capability", "a".repeat(64))),
+                b"not inventoried",
+            );
+            for (index, version) in [3, 4, 99].into_iter().enumerate() {
+                file(
+                    &receipts.join(format!("{index:064x}.json")),
+                    format!(r#"{{"schema_version":{version},"private":"receipt-secret"}}"#)
+                        .as_bytes(),
+                );
+                file(&receipts.join(format!("{index:064x}.lock")), b"");
+            }
+            let facts = observe(None, Some(temp.path()));
+            let receipts_facts: Vec<_> = facts
+                .iter()
+                .filter(|fact| fact.surface == "shell_execution_receipt")
+                .collect();
+            assert_eq!(receipts_facts.len(), 3);
+            assert_eq!(
+                receipts_facts
+                    .iter()
+                    .map(|fact| fact.declared_version)
+                    .collect::<Vec<_>>(),
+                vec![Some(3), Some(4), Some(99)]
+            );
+            assert!(!serde_json::to_string(&facts)
+                .unwrap()
+                .contains("receipt-secret"));
+            file(&receipts.join("unexpected.json"), b"{}");
+            assert!(observe(None, Some(temp.path()))
+                .iter()
+                .any(|fact| fact.surface == "shell_execution_receipt"
+                    && fact.state == "unknown_entry"));
+        }
+
         #[test]
         fn fixed_team_stores_and_journals_preserve_future_versions_without_private_contents() {
             let temp = scope();

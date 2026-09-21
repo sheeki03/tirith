@@ -35,6 +35,14 @@ content-addressed quarantine from retained regular-file handles; arbitrary
 browser paths, user-provided argv, pointers and raw filesystem writes are not
 plan inputs.
 
+Preparation now captures the actual signed offline threat source and evaluates
+the retained artifact bytes under the current effective policy. It refuses
+missing or stale threat data, incomplete analysis and any decision other than
+Allow. A caller-supplied threat generation or inspection report cannot substitute
+for that decision. The plan retains the source handles and private decision
+commitment and revalidates them before staging or other effects. This closes the
+preparation authority gap; it does not enable the contained install launcher.
+
 Before launch, the operation revalidates policy and every bound tool/input/
 destination generation under its retained authority boundary. Any changed byte,
 resolution input, expiry or destination refuses. A successful preview is not an

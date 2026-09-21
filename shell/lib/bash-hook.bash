@@ -438,6 +438,25 @@ _tirith_escape_preview() {
 # Restore an entry status without touching any secret-bearing argument.
 _tirith_trace_preserve_status() { return "$1"; }
 
+# Receipt retirement is separate from authorization. Call only after observing
+# successful consume/discard/reconcile; old binaries may not implement it.
+_tirith_receipt_acknowledge_untraced() {
+  local channel="$1" token="$2" input_fd
+  builtin export -n token
+  [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" ]] || return 0
+  _tirith_receipt_parent_context_is_valid || return 0
+  _tirith_open_exact_input_pipe "$token" || return 0
+  input_fd="$_TIRITH_OPENED_FD"
+  unset _TIRITH_OPENED_FD
+  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+    _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt acknowledge \
+    --channel "$channel" <&"$input_fd" >/dev/null 2>&1 || true
+  _tirith_close_pending_fd "$input_fd" 2>/dev/null || true
+  return 0
+}
+
 _tirith_receipt_discard_untraced() {
   local channel="$1" token="$2"
   builtin export -n token
@@ -454,6 +473,9 @@ _tirith_receipt_discard_untraced() {
     --channel "$channel" <&"$input_fd" >/dev/null 2>&1
   rc=$?
   _tirith_close_pending_fd "$input_fd" 2>/dev/null || rc=1
+  if [[ $rc -eq 0 ]]; then
+    _tirith_receipt_acknowledge_untraced "$channel" "$token" || true
+  fi
   return "$rc"
 }
 
@@ -491,6 +513,9 @@ _tirith_receipt_consume_untraced() {
     --channel "$channel" <&"$input_fd" >/dev/null
   rc=$?
   _tirith_close_pending_fd "$input_fd" 2>/dev/null || rc=1
+  if [[ $rc -eq 0 ]]; then
+    _tirith_receipt_acknowledge_untraced "$channel" "$token" || true
+  fi
   return "$rc"
 }
 
@@ -528,6 +553,9 @@ _tirith_receipt_reconcile_untraced() {
     --channel "$channel" <&"$input_fd" >/dev/null 2>&1
   rc=$?
   _tirith_close_pending_fd "$input_fd" 2>/dev/null || rc=1
+  if [[ $rc -eq 0 ]]; then
+    _tirith_receipt_acknowledge_untraced "$channel" "$token" || true
+  fi
   return "$rc"
 }
 

@@ -218,6 +218,10 @@ enum ExecutionReceiptAction {
         #[arg(long, value_enum)]
         channel: ShellReceiptChannelArg,
     },
+    Acknowledge {
+        #[arg(long, value_enum)]
+        channel: ShellReceiptChannelArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -8221,6 +8225,9 @@ fn run() {
             }
             ExecutionReceiptAction::Discard { channel } => {
                 cli::check::discard_receipt(channel.into())
+            }
+            ExecutionReceiptAction::Acknowledge { channel } => {
+                cli::check::acknowledge_receipt(channel.into())
             }
         },
         Commands::Daemon { action } => match action {

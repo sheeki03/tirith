@@ -55,6 +55,7 @@ pub(crate) enum ReceiptAction {
     Consume,
     Reconcile,
     Discard,
+    Acknowledge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,13 +87,14 @@ pub(crate) fn match_zsh_automatic_diagnostic(argv: &[OsString]) -> Option<Diagno
                 && channel_flag == "--channel"
                 && channel == "zsh" =>
         {
-            if verb.len() > "receipt-reconcile".len() {
+            if verb.len() > "receipt-acknowledge".len() {
                 return None;
             }
             let action = match verb.to_str()? {
                 "receipt-consume" => ReceiptAction::Consume,
                 "receipt-reconcile" => ReceiptAction::Reconcile,
                 "receipt-discard" => ReceiptAction::Discard,
+                "receipt-acknowledge" => ReceiptAction::Acknowledge,
                 _ => return None,
             };
             Some(DiagnosticInvocation::Receipt(action))
@@ -439,6 +441,7 @@ mod tests {
             ("receipt-consume", ReceiptAction::Consume),
             ("receipt-reconcile", ReceiptAction::Reconcile),
             ("receipt-discard", ReceiptAction::Discard),
+            ("receipt-acknowledge", ReceiptAction::Acknowledge),
         ] {
             let good: Vec<OsString> = ["tirith", "__setup-activation", verb, "--channel", "zsh"]
                 .into_iter()

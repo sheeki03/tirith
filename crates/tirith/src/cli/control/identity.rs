@@ -258,8 +258,21 @@ fn open_binary_identity_file(path: &Path) -> Result<File, String> {
     }
     #[cfg(not(windows))]
     {
-        tirith_core::util::open_read_no_follow_capped(path, 512 * 1024 * 1024)
-            .map_err(|_| "cannot retain running binary".into())
+        use tirith_core::util::OpenRegularError;
+        tirith_core::util::open_read_no_follow_capped(path, 512 * 1024 * 1024).map_err(|error| {
+            match error {
+                OpenRegularError::TooLarge => "binary size exceeds identity limit (512 MiB)".into(),
+                OpenRegularError::NotFound => "binary is unavailable at its retained path".into(),
+                OpenRegularError::NotRegularFile => {
+                    "binary is not a regular file or its final path is a symlink".into()
+                }
+                OpenRegularError::Io(error) => format!(
+                    "cannot retain running binary: {:?} (OS error {:?})",
+                    error.kind(),
+                    error.raw_os_error()
+                ),
+            }
+        })
     }
 }
 
@@ -633,6 +646,16 @@ mod tests {
         );
         std::fs::write(&path, vec![b'x'; 4097]).unwrap();
         assert!(BinaryIdentity::capture_input_capped(&path, 4096).is_err());
+        // A sparse oversized executable must refuse before hashing, with a
+        // useful size diagnosis instead of an indistinguishable open failure.
+        File::create(&path)
+            .unwrap()
+            .set_len(512 * 1024 * 1024 + 1)
+            .unwrap();
+        assert_eq!(
+            BinaryIdentity::capture(&path).err().as_deref(),
+            Some("binary size exceeds identity limit (512 MiB)")
+        );
     }
 
     #[test]

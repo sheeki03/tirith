@@ -14,6 +14,7 @@ enum Frame<'a> {
     Consume { token: &'a str, command: &'a str },
     Reconcile { token: &'a str },
     Discard { token: &'a str },
+    Acknowledge { token: &'a str },
 }
 
 fn valid_token(token: &str) -> bool {
@@ -40,13 +41,14 @@ fn parse(action: ReceiptAction, bytes: &[u8]) -> Option<Frame<'_>> {
             parse_zsh_automatic_probe_command(command)?;
             Some(Frame::Consume { token, command })
         }
-        ReceiptAction::Reconcile | ReceiptAction::Discard => {
+        ReceiptAction::Reconcile | ReceiptAction::Discard | ReceiptAction::Acknowledge => {
             if !valid_token(text) {
                 return None;
             }
             Some(match action {
                 ReceiptAction::Reconcile => Frame::Reconcile { token: text },
                 ReceiptAction::Discard => Frame::Discard { token: text },
+                ReceiptAction::Acknowledge => Frame::Acknowledge { token: text },
                 ReceiptAction::Consume => unreachable!(),
             })
         }
@@ -95,6 +97,12 @@ fn execute(action: ReceiptAction) -> Result<(), String> {
         Frame::Discard { token } => {
             execution_state::discard_shell_execution_receipt(token, channel)?;
         }
+        Frame::Acknowledge { token } => {
+            // A separate caller-issued request after the hook observed a
+            // terminal outcome. Never retire from inside consume/reconcile:
+            // losing that child's result must remain recoverable.
+            execution_state::acknowledge_shell_execution_receipt(token, channel)?;
+        }
     }
     Ok(())
 }
@@ -125,7 +133,11 @@ mod tests {
 
     #[test]
     fn cleanup_frames_accept_no_command_or_extra_terminator() {
-        for action in [ReceiptAction::Reconcile, ReceiptAction::Discard] {
+        for action in [
+            ReceiptAction::Reconcile,
+            ReceiptAction::Discard,
+            ReceiptAction::Acknowledge,
+        ] {
             for terminator in ["", "\n"] {
                 let bytes = format!("{TOKEN}{terminator}");
                 assert_eq!(
@@ -133,6 +145,7 @@ mod tests {
                     Some(match action {
                         ReceiptAction::Reconcile => Frame::Reconcile { token: TOKEN },
                         ReceiptAction::Discard => Frame::Discard { token: TOKEN },
+                        ReceiptAction::Acknowledge => Frame::Acknowledge { token: TOKEN },
                         ReceiptAction::Consume => unreachable!(),
                     })
                 );
@@ -173,6 +186,7 @@ mod tests {
             ReceiptAction::Consume,
             ReceiptAction::Reconcile,
             ReceiptAction::Discard,
+            ReceiptAction::Acknowledge,
         ] {
             for token in [
                 String::new(),

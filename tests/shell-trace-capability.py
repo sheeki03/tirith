@@ -7,20 +7,87 @@ records that it was called in a private temporary directory.
 """
 
 import argparse
+from contextlib import contextmanager
+import importlib.util
+import hashlib
 import json
 import os
 import pathlib
 import re
 import shlex
 import shutil
-import subprocess
+import sys
+from types import SimpleNamespace
 import tempfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CAPABILITY = "controlled-trace-capability-4537106a-do-not-use"
 LOADED_STATE = "controlled-loaded-state-23616330-do-not-use"
+NATIVE_ROWS = []
+RETAINED_ROOTS = []
+OWNER_SHA256 = "913a3499bd78b39c6870b9dc280fcaad8a49739db7f2781bbfe914ff4db12e75"
 FILES = {"bash": "bash-hook.bash", "zsh": "zsh-hook.zsh", "fish": "fish-hook.fish"}
+
+
+def owner_runtime():
+    path = ROOT / "tools/qualification/mixed_audit_native.py"
+    if hashlib.sha256(path.read_bytes()).hexdigest() != OWNER_SHA256:
+        raise ValueError("native owner helper differs from reviewed implementation")
+    spec = importlib.util.spec_from_file_location("trace_owned", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != OWNER_SHA256:
+        raise ValueError("native owner helper changed while loading")
+    module.require_process_observation()
+    return module
+
+
+def run_native(name, argv, directory, env, timeout):
+    owned = owner_runtime()
+    job = None
+    error = None
+    try:
+        job = owned.Job(name, argv, directory, env, timeout=timeout)
+        owned.finish([job])
+    except BaseException as caught:
+        error = caught
+    finally:
+        if job is not None:
+            try:
+                job.kill()
+            except BaseException as caught:
+                error = error or caught
+            for stream in (job.process.stdout, job.process.stderr):
+                try:
+                    stream.close()
+                except BaseException as caught:
+                    error = error or caught
+            row = job.result()
+            NATIVE_ROWS.append(row)
+    if error is not None:
+        raise error
+    owned.require(all(row['cleanup'].values()) and row['failure'] is None,
+                  'native fixture cleanup/execution incomplete')
+    return SimpleNamespace(returncode=row['exit'], stdout=row['stdout'], stderr=row['stderr'])
+
+
+@contextmanager
+def retained_directory(prefix, admission):
+    directory = pathlib.Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+    first = len(NATIVE_ROWS)
+    passed = False
+    try:
+        yield str(directory)
+        passed = True
+    finally:
+        rows = NATIVE_ROWS[first:]
+        if passed and admission['passed'] and rows and all(all(row['cleanup'].values()) for row in rows):
+            shutil.rmtree(directory)
+        else:
+            RETAINED_ROOTS.append(str(directory))
+            print(json.dumps({"retained_fixture_root": str(directory)}), file=sys.stderr, flush=True)
+
 
 
 def extract(text, family, name):
@@ -111,7 +178,7 @@ builtin printf 'TIRITH_TEST_RESULT=%s\\n' "$test_result"
     return setup
 
 
-def run_case(family, shell, tree, function, trace):
+def run_case(family, shell, tree, function, trace, operation_exit=0, ack_exit=0):
     source = (tree / FILES[family]).read_text()
     definition = extract(source, family, function)
     if family == "bash":
@@ -119,6 +186,9 @@ def run_case(family, shell, tree, function, trace):
             extract(source, family, "_tirith_trace_preserve_status"),
             extract(source, family, function + "_untraced"), definition,
         ])
+    if function != "_tirith_verification_probe":
+        ack_name = "_tirith_receipt_acknowledge_untraced" if family == "bash" else "_tirith_receipt_acknowledge_at"
+        definition += "\n" + extract(source, family, ack_name)
     if function == "_tirith_verification_probe":
         invocation = f"{function} start"
     elif family == "bash":
@@ -130,22 +200,26 @@ def run_case(family, shell, tree, function, trace):
         if function == "_tirith_receipt_consume_at":
             invocation += " true"
         invocation += " /"
-    with tempfile.TemporaryDirectory(prefix="tirith-shell-trace-") as temp:
+    admission = {"passed": False}
+    with retained_directory(prefix="tirith-shell-trace-", admission=admission) as temp:
         directory = pathlib.Path(temp)
         executable = directory / "fake-tirith"
         calls = directory / "calls"
         executable.write_text(
             "#!/bin/sh\n"
             "test \"$_TIRITH_RECEIPT_INSTANCE\" = " + shlex.quote(CAPABILITY) + " || exit 91\n"
-            "printf 'called\\n' >> \"$TIRITH_TRACE_TEST_CALLS\"\n"
+            "printf '%s\\n' \"$2\" >> \"$TIRITH_TRACE_TEST_CALLS\"\n"
+            "if test \"$2\" = acknowledge; then exit " + str(ack_exit) + "; fi\n"
+            "exit " + str(operation_exit) + "\n"
         )
         executable.chmod(0o700)
         script = body(family, definition, invocation, executable, calls, trace)
-        result = subprocess.run(
-            [shell, "-c", script], capture_output=True, text=True, timeout=10,
-            env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": str(directory), "LC_ALL": "C"},
-        )
-        invoked = calls.exists() and calls.read_text() == "called\n"
+        result = run_native("trace-helper", [shell, "-c", script], directory,
+                            {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": str(directory), "LC_ALL": "C"}, 10)
+        expected_calls = ["start"] if function == "_tirith_verification_probe" else [function.split("_receipt_")[1].split("_")[0]]
+        if function != "_tirith_verification_probe" and operation_exit == 0:
+            expected_calls.append("acknowledge")
+        invoked = calls.exists() and calls.read_text().splitlines() == expected_calls
         output = result.stdout + result.stderr
         expected_state = "on" if trace else "off"
         status = re.search(r"^TIRITH_TEST_RESULT=(\d+)$", result.stdout, re.M)
@@ -154,17 +228,19 @@ def run_case(family, shell, tree, function, trace):
             "capability_absent": CAPABILITY not in output,
             "loaded_state_absent_from_trace": LOADED_STATE not in result.stderr,
             "trace_restored": f"TIRITH_TEST_TRACE_STATE={expected_state}" in result.stdout,
-            "body_called_once": invoked,
-            "result": bool(status) and status[1] == "0",
+            "exact_calls_in_order": invoked,
+            "result": bool(status) and status[1] == str(operation_exit),
         }
+        admission["passed"] = all(checks.values())
         return {"shell": shell, "family": family, "source": str(tree.relative_to(ROOT)),
-                "function": function, "trace": trace,
+                "function": function, "trace": trace, "operation_exit": operation_exit, "ack_exit": ack_exit,
                 "passed": all(checks.values()), "checks": checks}
 
 
 def run_registration(family, shell, tree, trace, inherited_export=False):
     capability = "45bcb43f30d36c8e1b50d2ecfc3c3ffb8fce9bced081bd331e572e49232402fa"
-    with tempfile.TemporaryDirectory(prefix="tirith-shell-registration-trace-") as temp:
+    admission = {"passed": False}
+    with retained_directory(prefix="tirith-shell-registration-trace-", admission=admission) as temp:
         directory = pathlib.Path(temp)
         calls = directory / "register-calls"
         executable = directory / "fake-tirith"
@@ -212,7 +288,7 @@ set +x
                "ZDOTDIR": str(directory), "TERM": "xterm", "LC_ALL": "C"}
         if inherited_export:
             env["_TIRITH_RECEIPT_INSTANCE"] = "preexported-controlled-placeholder"
-        result = subprocess.run([shell, *options, script], capture_output=True, text=True, timeout=15, env=env)
+        result = run_native("trace-registration", [shell, *options, script], directory, env, 15)
         expected_state = "on" if trace else "off"
         checks = {
             "shell_completed": result.returncode == 0,
@@ -222,6 +298,7 @@ set +x
             "not_globally_exported": "TIRITH_TEST_CAPABILITY_EXPORTED=no" in result.stdout,
             "trace_restored": f"TIRITH_TEST_TRACE_STATE={expected_state}" in result.stdout,
         }
+        admission["passed"] = all(checks.values())
         return {"shell": shell, "family": family, "source": str(tree.relative_to(ROOT)),
                 "function": "full_source_registration", "trace": trace, "inherited_export": inherited_export,
                 "passed": all(checks.values()), "checks": checks}
@@ -230,6 +307,7 @@ set +x
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--require-shell", action="append", choices=FILES, default=[])
+    parser.add_argument("--report", type=pathlib.Path)
     args = parser.parse_args()
     available = shells()
     missing = set(args.require_shell) - {family for family, _ in available}
@@ -239,6 +317,8 @@ def main():
         parser.error("no supported native shells available")
     failures = 0
     cases = 0
+    values = []
+    snapshots = {p: owner_runtime().file_sha(p) for p in [pathlib.Path(__file__), ROOT / "tools/qualification/mixed_audit_native.py", *[ROOT / tree / file for tree in ("shell/lib", "crates/tirith/assets/shell/lib") for file in FILES.values()], *[pathlib.Path(path) for _, path in available]]}
     for family, shell in available:
         functions = ["_tirith_verification_probe"]
         functions += [f"_tirith_receipt_{kind}{'' if family == 'bash' else '_at'}"
@@ -246,16 +326,24 @@ def main():
         for tree in [ROOT / "shell/lib", ROOT / "crates/tirith/assets/shell/lib"]:
             for function in functions:
                 for trace in [False, True]:
-                    value = run_case(family, shell, tree, function, trace)
-                    print(json.dumps(value), flush=True)
-                    cases += 1
-                    failures += not value["passed"]
+                    outcomes = [(0, 0)] if function == "_tirith_verification_probe" else [(0, 0), (0, 99), (7, 0)]
+                    for operation_exit, ack_exit in outcomes:
+                        value = run_case(family, shell, tree, function, trace, operation_exit, ack_exit)
+                        print(json.dumps(value), flush=True)
+                        values.append(value)
+                        cases += 1
+                        failures += not value["passed"]
             for trace in [False, True]:
                 for inherited in [False, True]:
                     value = run_registration(family, shell, tree, trace, inherited)
                     print(json.dumps(value), flush=True)
+                    values.append(value)
                     cases += 1
                     failures += not value["passed"]
+    for path, digest in snapshots.items():
+        owner_runtime().require(owner_runtime().file_sha(path) == digest, "trace input changed during run")
+    if args.report:
+        args.report.write_text(json.dumps({"cases": values, "failures": failures, "native_processes": NATIVE_ROWS, "retained_roots": RETAINED_ROOTS, "inputs": {str(p): d for p, d in snapshots.items()}}, indent=2) + "\n")
     print(json.dumps({"cases": cases, "failures": failures,
                       "capabilities": "controlled_fake_values_only"}))
     raise SystemExit(1 if failures else 0)

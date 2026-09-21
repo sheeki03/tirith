@@ -155,10 +155,23 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes fish zsh
       - name: Native shell tracing does not disclose private capabilities
         if: matrix.name == 'Linux'
-        run: python3 tests/shell-trace-capability.py --require-shell bash --require-shell zsh --require-shell fish
+        run: python3 tests/shell-trace-capability.py --require-shell bash --require-shell zsh --require-shell fish --report "$RUNNER_TEMP/tirith-shell-trace.json"
       - name: Native shell private state stays out of child environments
         if: matrix.name == 'Linux'
-        run: python3 tests/shell-private-environment.py --require-shell bash --require-shell zsh --require-shell fish
+        run: python3 tests/shell-private-environment.py --require-shell bash --require-shell zsh --require-shell fish --report "$RUNNER_TEMP/tirith-shell-private-environment.json"
+      - name: Receipt acknowledgment preserves observed outcomes
+        if: matrix.name == 'Linux'
+        run: python3 scripts/test-shell-receipt-ack.py --report "$RUNNER_TEMP/tirith-shell-receipt-ack.json"
+      - name: Retain shell privacy and acknowledgment evidence
+        if: always() && matrix.name == 'Linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shell-privacy-and-receipts-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/tirith-shell-trace.json
+            ${{ runner.temp }}/tirith-shell-private-environment.json
+            ${{ runner.temp }}/tirith-shell-receipt-ack.json
+          if-no-files-found: warn
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ matrix.rust }}
@@ -170,6 +183,20 @@ jobs:
       - name: Workspace tests
         if: matrix.name != 'Windows'
         run: cargo test --workspace --locked --no-fail-fast
+      - name: Record native CLI test binary sizes
+        if: always() && matrix.name != 'Windows'
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re
+          root = pathlib.Path('target/debug/deps')
+          records = []
+          if root.is_dir():
+              for path in sorted(root.iterdir()):
+                  if re.fullmatch(r'tirith-[0-9a-f]{16}', path.name) and path.is_file():
+                      records.append({'file': path.name, 'bytes': path.stat().st_size})
+          print(json.dumps({'binary_identity_limit_bytes': 512 * 1024 * 1024,
+                            'cli_test_images': records}, indent=2))
+          PY
       - name: Windows workspace and standard-account dashboard tests
         if: matrix.name == 'Windows'
         shell: pwsh

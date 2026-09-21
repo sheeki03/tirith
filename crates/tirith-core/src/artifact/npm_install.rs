@@ -24,12 +24,14 @@ use crate::task_boundary::{
     self, BoundaryOperation, OwnedBoundary, PackageInstallPreparationBoundary,
     PackageOperationBinding, PackageTargetIdentity, TaskBoundaryEffectLease, TaskBoundaryPermit,
 };
+use crate::threatdb::materialization_source::{MaterializationThreatSource, SourceRefusal};
 use crate::util::dirfd::{
     file_generation, file_identity, DirCapability, EntryKind, FileGeneration,
 };
 
 #[path = "npm_materialize.rs"]
 pub mod materialize;
+use materialize::decision::ArtifactDecision;
 
 #[path = "npm_install_execution.rs"]
 mod execution;
@@ -79,9 +81,37 @@ pub enum NpmInstallRefusal {
     ToolClosureChanged,
     ExecutionLayoutUnsupported,
     ExecutionStateConflict,
+    AnalysisIncomplete,
+    ArtifactPolicyRefused,
+    ThreatDataUnavailable,
+    ThreatDataChanged,
+    ThreatDataStale,
 }
 
 type Result<T> = std::result::Result<T, NpmInstallRefusal>;
+
+fn install_source_refusal(error: SourceRefusal) -> NpmInstallRefusal {
+    match error {
+        SourceRefusal::Stale => NpmInstallRefusal::ThreatDataStale,
+        SourceRefusal::Changed | SourceRefusal::Rollback => NpmInstallRefusal::ThreatDataChanged,
+        SourceRefusal::ResourceLimit => NpmInstallRefusal::ResourceLimit,
+        _ => NpmInstallRefusal::ThreatDataUnavailable,
+    }
+}
+
+fn install_decision_refusal(error: materialize::MaterializationRefusal) -> NpmInstallRefusal {
+    use materialize::MaterializationRefusal as Refusal;
+    match error {
+        Refusal::AnalysisIncomplete => NpmInstallRefusal::AnalysisIncomplete,
+        Refusal::ArtifactPolicyRefused => NpmInstallRefusal::ArtifactPolicyRefused,
+        Refusal::ThreatDataUnavailable => NpmInstallRefusal::ThreatDataUnavailable,
+        Refusal::ThreatDataChanged => NpmInstallRefusal::ThreatDataChanged,
+        Refusal::ThreatDataStale => NpmInstallRefusal::ThreatDataStale,
+        Refusal::ResourceLimit => NpmInstallRefusal::ResourceLimit,
+        Refusal::ArchiveUnsupported => NpmInstallRefusal::ArchiveUnsupported,
+        _ => NpmInstallRefusal::AuthorizationRefused,
+    }
+}
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -471,6 +501,7 @@ pub struct NpmInstallPlan {
     artifacts: Vec<(String, LeafManifest)>,
     expected: BTreeMap<String, NpmFile>,
     destination: NewNpmDestination,
+    decision: ArtifactDecision,
 }
 
 impl NpmInstallPlan {
@@ -479,15 +510,32 @@ impl NpmInstallPlan {
         artifacts: &[VerifiedNpmArtifact],
         destination: NewNpmDestination,
         policy: &EffectivePolicySnapshot,
-        threat_generation: &str,
     ) -> Result<Self> {
-        let id = uuid::Uuid::parse_str(id)
-            .map_err(|_| NpmInstallRefusal::InvalidOperationId)?
-            .to_string();
-        if artifacts.is_empty() || artifacts.len() > MAX_ARTIFACTS || threat_generation.len() > 256
-        {
+        Self::validate_request(id, artifacts)?;
+        let source = MaterializationThreatSource::capture().map_err(install_source_refusal)?;
+        Self::prepare_with_source(id, artifacts, destination, policy, source)
+    }
+
+    fn validate_request(id: &str, artifacts: &[VerifiedNpmArtifact]) -> Result<()> {
+        let parsed =
+            uuid::Uuid::parse_str(id).map_err(|_| NpmInstallRefusal::InvalidOperationId)?;
+        if parsed.is_nil() || parsed.to_string() != id {
+            return Err(NpmInstallRefusal::InvalidOperationId);
+        }
+        if artifacts.is_empty() || artifacts.len() > MAX_ARTIFACTS {
             return Err(NpmInstallRefusal::ResourceLimit);
         }
+        Ok(())
+    }
+
+    fn prepare_with_source(
+        id: &str,
+        artifacts: &[VerifiedNpmArtifact],
+        destination: NewNpmDestination,
+        policy: &EffectivePolicySnapshot,
+        source: MaterializationThreatSource,
+    ) -> Result<Self> {
+        Self::validate_request(id, artifacts)?;
         policy
             .revalidate_for_mutation()
             .map_err(|_| NpmInstallRefusal::PolicyChanged)?;
@@ -525,6 +573,9 @@ impl NpmInstallPlan {
         {
             return Err(NpmInstallRefusal::ResourceLimit);
         }
+        let decision = ArtifactDecision::capture(artifacts, policy, source)
+            .map_err(install_decision_refusal)?;
+        let (threat_db_sequence, signed_build_timestamp) = decision.publication();
         let bindings: Vec<_> = artifacts
             .iter()
             .map(|artifact| (artifact.sha256().to_owned(), artifact.leaf.clone()))
@@ -549,10 +600,12 @@ impl NpmInstallPlan {
         .map_err(|_| NpmInstallRefusal::ResourceLimit)?;
         let public_binding = serde_json::json!({"contract":CONTRACT,"operation_id":id,"artifacts":bindings,
             "tool_closure":{"node_sha256":tools::NODE_SHA256,"npm_tree_sha256":tools::NPM_TREE_SHA256},
-            "threat_generation":threat_generation,"package_envelope":envelope});
+            "threat_db_sequence":threat_db_sequence,"signed_build_timestamp":signed_build_timestamp,
+            "package_envelope":envelope});
         let public_digest =
             digest(crate::audit::canonical_json_for_hash(&public_binding).as_bytes());
-        let private_binding = serde_json::json!({"operation":public_binding,"policy":policy_guard});
+        let private_binding = serde_json::json!({"operation":public_binding,"policy":policy_guard,
+            "artifact_decision":decision.private_commitment()});
         let plan_digest =
             digest(crate::audit::canonical_json_for_hash(&private_binding).as_bytes());
         // Boundary projections may be public. They bind the complete leaf
@@ -561,13 +614,14 @@ impl NpmInstallPlan {
         envelope.sources[0].content =
             format!("tirith-npm-leaf-preparation:v1:sha256:{public_digest}");
         Ok(Self {
-            id,
+            id: id.into(),
             policy_guard,
             digest: plan_digest,
             envelope,
             artifacts: bindings,
             expected,
             destination,
+            decision,
         })
     }
 
@@ -598,6 +652,9 @@ impl NpmInstallPlan {
             return Err(NpmInstallRefusal::PolicyChanged);
         }
         self.destination.revalidate()?;
+        self.decision
+            .revalidate(true)
+            .map_err(install_decision_refusal)?;
         for (artifact, (hash, manifest)) in artifacts.iter().zip(&self.artifacts) {
             artifact.revalidate()?;
             if artifact.sha256() != hash

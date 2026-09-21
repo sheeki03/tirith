@@ -117,6 +117,12 @@ impl Leader {
         Ok(())
     }
 
+    /// Request termination while the real leader remains unreaped. The PTY
+    /// reader must remain alive until it observes EOF or its bounded deadline.
+    pub fn stop_original_group(&mut self) -> io::Result<()> {
+        self.signal(true)
+    }
+
     pub fn cleanup(&mut self) -> Cleanup {
         let mut result = Cleanup::default();
         if self.reaped {
