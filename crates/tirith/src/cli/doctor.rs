@@ -1067,6 +1067,7 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
 
 #[derive(serde::Serialize)]
 struct DoctorInfo {
+    protection_evidence: crate::cli::protection_evidence::ProtectionEvidence,
     audit_recording: super::audit_health::AuditHealth,
     package_approval: super::package_approval_authority::PackageApprovalAvailability,
     version: String,
@@ -1088,15 +1089,14 @@ struct DoctorInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_requested_require_enter: Option<String>,
     /// Effective bash mode exported by the hook (`TIRITH_BASH_EFFECTIVE_MODE`).
-    /// Absent means the hook was not sourced in this process.
+    /// Inherited diagnostic only; absence does not prove missing activation.
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_mode: Option<String>,
     /// Effective protection exported by the hook (`TIRITH_BASH_EFFECTIVE_PROTECTION`).
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_protection: Option<String>,
-    /// Live protection status from `TIRITH_STATUS` (`blocks` / `warn-only` /
-    /// `degraded` / `off`); `degraded` = downgraded mid-session. Absent means no
-    /// hook was sourced in this process.
+    /// Raw reported `TIRITH_STATUS` (`blocks` / `warn-only` / `degraded` / `off`).
+    /// An inherited marker cannot verify blocking or current activation.
     #[serde(skip_serializing_if = "Option::is_none")]
     tirith_status: Option<String>,
     /// Cached bash enter-mode capability verdict from the last self-test
@@ -1173,7 +1173,7 @@ struct ThreatDbDoctorInfo {
 pub(crate) struct QuickDoctorInfo {
     /// Schema version for the polled shape; bumped only on a breaking change.
     pub(crate) schema_version: u32,
-    /// Live protection mode from `TIRITH_STATUS`, using the SAME vocabulary as
+    /// Legacy reported mode from inherited environment, using the SAME vocabulary as
     /// `tirith prompt-status`: `guarded` (blocking), `warn-only`, `degraded`,
     /// `off`; unknown values passed through verbatim.
     pub(crate) protection_mode: String,
@@ -1198,9 +1198,9 @@ pub(crate) fn gather_quick_info() -> QuickDoctorInfo {
     // status` / `doctor --quick` is an EXTERNAL process, and `TIRITH_STATUS` is
     // deliberately NON-exported (prompt-only), so a protected shell never passes
     // it down — reading it alone makes a protected shell look "off". The bash hook
-    // re-exports `TIRITH_BASH_EFFECTIVE_PROTECTION` on every state change PRECISELY
-    // so an external check sees the truth; fall back to `TIRITH_STATUS` only for a
-    // user/shell that does export it.
+    // re-exports `TIRITH_BASH_EFFECTIVE_PROTECTION` on state changes. Both are
+    // inherited reports, not authenticated current-shell blocking evidence.
+    // Fall back to `TIRITH_STATUS` only for a user/shell that does export it.
     let live_protection = std::env::var("TIRITH_BASH_EFFECTIVE_PROTECTION")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1303,7 +1303,7 @@ fn gather_info() -> DoctorInfo {
         .ok()
         .filter(|s| !s.is_empty());
 
-    // Live state exported by the hook; absence = bash hook not sourced here.
+    // Raw inherited reports; neither presence nor absence proves activation.
     let bash_effective_mode = std::env::var("TIRITH_BASH_EFFECTIVE_MODE")
         .ok()
         .filter(|s| !s.is_empty());
@@ -1311,8 +1311,8 @@ fn gather_info() -> DoctorInfo {
         .ok()
         .filter(|s| !s.is_empty());
 
-    // `TIRITH_STATUS`: cross-shell live protection indicator from every hook.
-    // Absence = no hook ran here (typically a non-interactive subshell).
+    // TIRITH_STATUS is normally not exported. Preserve a supplied value as a
+    // diagnostic, without treating it as a current-shell observation.
     let tirith_status = std::env::var("TIRITH_STATUS")
         .ok()
         .filter(|s| !s.is_empty());
@@ -1373,7 +1373,16 @@ fn gather_info() -> DoctorInfo {
         }
     };
 
+    let reported_mode = crate::cli::prompt_status::protection_mode_from_status(
+        bash_effective_protection
+            .as_deref()
+            .or(tirith_status.as_deref()),
+    );
     DoctorInfo {
+        protection_evidence: crate::cli::protection_evidence::gather(
+            &reported_mode,
+            hook_configured,
+        ),
         audit_recording: super::audit_health::read(),
         package_approval: super::package_approval_authority::availability(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1592,6 +1601,7 @@ struct PsCompatInfo {
 /// Machine-readable compatibility report for `tirith doctor --compat --format json`.
 #[derive(serde::Serialize)]
 struct CompatReport {
+    protection_evidence: crate::cli::protection_evidence::ProtectionEvidence,
     version: String,
     binary_path: String,
     detected_shell: String,
@@ -1599,13 +1609,13 @@ struct CompatReport {
     /// Requested bash mode (`TIRITH_BASH_MODE`); absent = default.
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_requested_mode: Option<String>,
-    /// Effective bash mode exported by the hook; absent = hook not sourced here.
+    /// Reported effective bash mode; inherited values do not prove activation.
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_mode: Option<String>,
     /// Effective protection exported by the hook.
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_protection: Option<String>,
-    /// Live cross-shell protection status exported as `TIRITH_STATUS`
+    /// Raw reported cross-shell protection status from `TIRITH_STATUS`
     /// (`blocks` / `warn-only` / `degraded` / `off`).
     #[serde(skip_serializing_if = "Option::is_none")]
     tirith_status: Option<String>,
@@ -1668,6 +1678,7 @@ fn gather_compat() -> CompatReport {
     let visual_audit = gather_visual_audit_compat();
 
     CompatReport {
+        protection_evidence: info.protection_evidence,
         version: info.version,
         binary_path: info.binary_path,
         detected_shell: info.detected_shell,
@@ -2037,24 +2048,24 @@ pub(crate) fn build_bundle_text(home: Option<&std::path::Path>) -> String {
     line(format!("detected shell: {}", info.detected_shell));
     line(format!("interactive:    {}", info.interactive));
     line(format!(
-        "live status:    {} (TIRITH_STATUS)",
-        info.tirith_status.as_deref().unwrap_or("(hook not loaded)")
+        "reported status: {} (TIRITH_STATUS; blocking unverified)",
+        info.tirith_status.as_deref().unwrap_or("(not reported)")
     ));
     line(format!(
         "requested mode: {}",
         info.bash_requested_mode.as_deref().unwrap_or("(default)")
     ));
     line(format!(
-        "effective mode: {}",
+        "effective mode: {} (reported; activation unverified)",
         info.bash_effective_mode
             .as_deref()
-            .unwrap_or("(hook not loaded)")
+            .unwrap_or("(not reported)")
     ));
     line(format!(
-        "protection:     {}",
+        "protection:     {} (reported; blocking unverified)",
         info.bash_effective_protection
             .as_deref()
-            .unwrap_or("(hook not loaded)")
+            .unwrap_or("(not reported)")
     ));
     line(format!("bash safe mode: {}", info.bash_safe_mode));
     line(format!(
@@ -2203,18 +2214,42 @@ fn run_bundle(json: bool) -> i32 {
     super::support_bundle::run(false, Vec::new(), Vec::new(), json)
 }
 
-/// The `protection status:` line for `tirith doctor --compat`, from
-/// `TIRITH_STATUS`; `None` to omit. Surfaced for EVERY shell (the var is
-/// exported by every hook), not just bash — a previous bash-only gate dropped it
-/// for e.g. a degraded zsh session. `degraded` gets an explicit callout.
+/// Surface a reported marker for every shell without promoting inherited state.
 fn compat_protection_status_line(status: Option<&str>) -> Option<String> {
-    match status {
-        Some("degraded") => Some(
-            "  protection status:    DEGRADED (downgraded to warn-only this session)".to_string(),
-        ),
-        Some(status) => Some(format!("  protection status:    {status}")),
-        None => None,
-    }
+    status.map(|status| {
+        let label = if status == "degraded" {
+            "DEGRADED"
+        } else {
+            status
+        };
+        format!("  protection status:    {label} (reported by TIRITH_STATUS; blocking unverified)")
+    })
+}
+
+/// Full and compatibility reports use the same canonical evidence as quick
+/// status. Ordinary diagnostic capture never carries a live verification proof.
+fn format_protection_evidence(
+    evidence: &crate::cli::protection_evidence::ProtectionEvidence,
+) -> String {
+    use crate::cli::protection_evidence::ProtectionState;
+    let state = match evidence.state {
+        ProtectionState::Configured => "configured",
+        ProtectionState::ActivationRequired => "activation-required",
+        ProtectionState::ObservedBlocking => "observed-blocking",
+        ProtectionState::WarnOnly => "warn-only",
+        ProtectionState::Degraded => "degraded",
+        ProtectionState::Off => "off",
+        ProtectionState::Unknown => "unknown",
+    };
+    let blocking = if evidence.verified_blocking {
+        "blocking observed"
+    } else {
+        "blocking unverified"
+    };
+    format!(
+        "  protection evidence: {state} ({blocking}; source: {})",
+        evidence.source
+    )
 }
 
 /// Render the full `tirith doctor --compat` human report into a string.
@@ -2236,10 +2271,10 @@ fn format_compat_human(r: &CompatReport) -> String {
     line("");
 
     // Bash is the only shell with a requested-vs-effective split; others just
-    // report what the hook exported.
+    // report inherited hook markers.
     line("Shell hook mode");
-    // Cross-shell `TIRITH_STATUS` — emitted unconditionally (every hook exports
-    // it), NOT gated behind the bash-only branch below.
+    line(&format_protection_evidence(&r.protection_evidence));
+    // A supplied TIRITH_STATUS is not gated behind the bash-only branch.
     if let Some(status_line) = compat_protection_status_line(r.tirith_status.as_deref()) {
         line(&status_line);
     }
@@ -2254,11 +2289,15 @@ fn format_compat_human(r: &CompatReport) -> String {
             r.bash_effective_protection.as_deref(),
         ) {
             (Some(mode), Some(protection)) => {
-                line(&format!("  effective bash mode:  {mode}"));
-                line(&format!("  effective protection: {protection}"));
+                line(&format!(
+                    "  effective bash mode:  {mode} (reported; activation unverified)"
+                ));
+                line(&format!(
+                    "  effective protection: {protection} (reported; blocking unverified)"
+                ));
             }
             _ => {
-                line("  effective bash mode:  hook not loaded in this process");
+                line("  effective bash mode:  not reported to this process");
             }
         }
         match r.bash_enter_capability.as_deref() {
@@ -2435,37 +2474,23 @@ fn print_compat_human(r: &CompatReport) {
     print!("{}", format_compat_human(r));
 }
 
-/// Render the cross-shell `protection:` line from `TIRITH_STATUS`. A `degraded`
-/// status gets an explicit callout so a downgrade is never something to infer.
-fn print_protection_status(status: Option<&str>) {
-    match status {
-        Some("blocks") => {
-            println!("  protection:   blocks (a dangerous command is stopped before it runs)");
-        }
-        Some("warn-only") => {
-            println!("  protection:   warn-only (commands are checked but NOT blocked)");
-        }
-        Some("degraded") => {
-            println!("  protection:   DEGRADED — downgraded to warn-only this session");
-            println!();
-            println!("  WARNING: tirith protection was downgraded mid-session.");
-            println!("  Commands are still checked, but a dangerous one is NO LONGER blocked.");
-            println!("  Restart your shell to recover full protection. See the bash section");
-            println!("  below (and 'tirith doctor --bundle' for a full diagnostic report).");
-            println!();
-        }
-        Some("off") => {
-            println!("  protection:   off (the tirith hook installed nothing in this shell)");
-        }
-        Some(other) => {
-            // Forward-compatible: unrecognised value shown verbatim.
-            println!("  protection:   {other}");
-        }
-        None => {
-            // No hook ran (usually a non-interactive subshell); the bash block
-            // below prints the fuller "not loaded" diagnostic.
-        }
+/// A raw environment marker is useful diagnostic detail, never blocking proof.
+fn format_protection_status(status: Option<&str>) -> String {
+    let Some(status) = status else {
+        return String::new();
+    };
+    let label = if status == "degraded" {
+        "DEGRADED"
+    } else {
+        status
+    };
+    let mut out =
+        format!("  protection:   {label} (reported by TIRITH_STATUS; blocking unverified)\n");
+    if status == "degraded" {
+        out.push_str("  The inherited marker reports a downgrade to warn-only. Resolve any hook\n");
+        out.push_str("  warning, then restart your shell and verify blocking there.\n");
     }
+    out
 }
 
 fn print_human(info: &DoctorInfo) {
@@ -2542,8 +2567,11 @@ fn print_human(info: &DoctorInfo) {
         }
         println!();
     }
-    // Cross-shell live protection status from `TIRITH_STATUS`.
-    print_protection_status(info.tirith_status.as_deref());
+    println!("{}", format_protection_evidence(&info.protection_evidence));
+    print!(
+        "{}",
+        format_protection_status(info.tirith_status.as_deref())
+    );
     // Bash-only block: requested vs effective state. Also shown whenever any
     // bash env var is present (e.g. a zsh parent that spawns bash).
     let has_any_bash_env = info.bash_requested_mode.is_some()
@@ -2588,11 +2616,11 @@ fn print_human(info: &DoctorInfo) {
             info.bash_effective_protection.as_deref(),
         ) {
             (Some(mode), Some(protection)) => {
-                println!("  bash mode:            {mode}");
-                println!("  effective protection: {protection}");
+                println!("  bash mode:            {mode} (reported; activation unverified)");
+                println!("  effective protection: {protection} (reported; blocking unverified)");
             }
             _ => {
-                println!("  bash hook:            not loaded in this process");
+                println!("  bash hook:            state not reported to this process");
             }
         }
 
@@ -2663,7 +2691,7 @@ fn print_human(info: &DoctorInfo) {
             } else if live_enforcement_degraded {
                 println!("  to restore blocking:  TIRITH_BASH_PREEXEC_ENFORCE is set, but this");
                 println!(
-                    "                        shell is not blocking. Resolve any hook warning,"
+                    "                        hook reports reduced protection. Resolve its warning,"
                 );
                 println!("                        then start a new shell.");
             }
@@ -3848,10 +3876,7 @@ mod tests {
     // --- protection-status rendering --------------------------------------
 
     #[test]
-    fn print_protection_status_does_not_panic_on_any_input() {
-        // Smoke: every variant (including an unknown value and None) renders
-        // without panicking. The content assertions live in the integration
-        // tests; this just guards the match arms.
+    fn full_doctor_human_markers_do_not_claim_verified_protection() {
         for s in [
             Some("blocks"),
             Some("warn-only"),
@@ -3860,7 +3885,19 @@ mod tests {
             Some("future-value"),
             None,
         ] {
-            print_protection_status(s);
+            let rendered = format_protection_status(s);
+            if let Some(marker) = s {
+                let label = if marker == "degraded" {
+                    "DEGRADED"
+                } else {
+                    marker
+                };
+                assert!(rendered.contains(label));
+                assert!(rendered.contains("reported by TIRITH_STATUS; blocking unverified"));
+                assert!(!rendered.contains("a dangerous command is stopped"));
+            } else {
+                assert!(rendered.is_empty());
+            }
         }
     }
 
@@ -4133,6 +4170,11 @@ mod tests {
     /// with every other field at a benign default. Used by the F3 tests.
     fn compat_report_for(detected_shell: &str, tirith_status: Option<&str>) -> CompatReport {
         CompatReport {
+            protection_evidence: crate::cli::protection_evidence::ProtectionEvidence::configuration(
+                &crate::cli::prompt_status::protection_mode_from_status(tirith_status),
+                false,
+                true,
+            ),
             version: "0.0.0-test".to_string(),
             binary_path: "/tmp/tirith".to_string(),
             detected_shell: detected_shell.to_string(),
@@ -4219,13 +4261,68 @@ mod tests {
     fn compat_protection_status_line_is_shell_independent() {
         assert_eq!(
             compat_protection_status_line(Some("degraded")).as_deref(),
-            Some("  protection status:    DEGRADED (downgraded to warn-only this session)")
+            Some(
+                "  protection status:    DEGRADED (reported by TIRITH_STATUS; blocking unverified)"
+            )
         );
         assert_eq!(
             compat_protection_status_line(Some("blocks")).as_deref(),
-            Some("  protection status:    blocks")
+            Some("  protection status:    blocks (reported by TIRITH_STATUS; blocking unverified)")
         );
         assert_eq!(compat_protection_status_line(None), None);
+    }
+
+    #[test]
+    fn full_and_compat_doctor_do_not_promote_inherited_blocking() {
+        let mut environment = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        environment.set_env("TIRITH_VERIFIED_BLOCKING", "1");
+        environment.set_env("TIRITH_INTEGRATION_VERSION", "0.4.2");
+        environment.set_env("TIRITH_INTEGRATION_SHELL", "bash");
+        // Suppress optional host-tool detection; this is an inherited-marker
+        // regression, not a PowerShell or external capsule-helper qualification.
+        let empty_path = environment.roots().home.join("empty-path");
+        std::fs::create_dir(&empty_path).unwrap();
+        environment.set_env("PATH", empty_path.as_os_str());
+        for (reported, effective) in [("blocks", None), ("off", Some("blocks"))] {
+            environment.set_env("TIRITH_STATUS", reported);
+            if let Some(effective) = effective {
+                environment.set_env("TIRITH_BASH_EFFECTIVE_PROTECTION", effective);
+            } else {
+                environment.remove_env("TIRITH_BASH_EFFECTIVE_PROTECTION");
+            }
+            let full = gather_info();
+            let compat = gather_compat();
+            let quick = gather_quick_info();
+            for value in [
+                serde_json::to_value(&full).unwrap(),
+                serde_json::to_value(&compat).unwrap(),
+            ] {
+                assert_eq!(value["tirith_status"], reported);
+                if let Some(effective) = effective {
+                    assert_eq!(value["bash_effective_protection"], effective);
+                } else {
+                    assert!(value.get("bash_effective_protection").is_none());
+                }
+                let evidence = &value["protection_evidence"];
+                assert_eq!(evidence["verified_blocking"], false);
+                assert_eq!(evidence["fresh"], false);
+                assert_eq!(evidence["source"], "inherited-environment-unverified");
+                assert_ne!(evidence["state"], "observed-blocking");
+                assert!(evidence["observed_at"].is_null());
+                assert!(evidence["expires_at"].is_null());
+                assert!(evidence["invalidation_reason"].is_string());
+                assert_eq!(
+                    evidence,
+                    &serde_json::to_value(&quick.protection_evidence).unwrap()
+                );
+            }
+            let human = format_compat_human(&compat);
+            assert!(human.contains("blocking unverified"));
+            assert!(human.contains("reported by TIRITH_STATUS"));
+            assert!(!human.contains("observed-blocking"));
+            assert!(format_protection_evidence(&full.protection_evidence)
+                .contains("blocking unverified"));
+        }
     }
 
     #[test]

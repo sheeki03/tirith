@@ -537,7 +537,13 @@ fn public_boundary_binding_does_not_publish_a_secret_policy_fingerprint() {
         public,
         serde_json::to_value(second.operation().envelope).unwrap()
     );
-    let public = public.to_string();
+    let summary = serde_json::to_value(first.summary()).unwrap();
+    assert_eq!(summary, serde_json::to_value(second.summary()).unwrap());
+    assert_eq!(summary["code_safety"], "not_established");
+    assert_eq!(summary["lifecycle_scripts"], "disabled");
+    assert_eq!(summary["dependency_graph"], "local_leaf_only");
+    assert_eq!(first.private_plan_digest(), first.digest);
+    let public = format!("{}{}", public, summary);
     for private in [
         &first.digest,
         &second.digest,

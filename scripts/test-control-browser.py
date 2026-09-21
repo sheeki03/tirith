@@ -609,7 +609,38 @@ def run(binary, output):
                     page.get_by_role("button", name="Close change details").click()
                     report["checks"].append("shell_setup_plan_apply_undo_uses_owned_startup_blocks")
                     page.get_by_label("Personal setup shell", exact=True).select_option("bash")
-                    page.get_by_role("button", name="Review personal setup", exact=True).click()
+                    selected_agent = page.get_by_label("Include Claude Code", exact=True)
+                    assert not selected_agent.is_checked(), "agent configuration requires explicit selection"
+                    # This real-backend case deliberately has no Claude host.
+                    # It qualifies browser selection/refusal, not installed-agent
+                    # activation or successful native Claude configuration.
+                    assert shutil.which("claude", path=env["PATH"]) is None, "refusal fixture unexpectedly has a Claude host"
+                    before_agent_policy = policy.read_bytes()
+                    before_agent_profiles = {path.name: path.read_bytes() for path in (root / "home").glob(".bash*") if path.is_file()}
+                    assert not (root / "home/.claude").exists()
+                    selected_agent.check()
+                    with page.expect_response(lambda response: urllib.parse.urlsplit(response.url).path == "/api/plans") as refused_plan:
+                        page.get_by_role("button", name="Review personal setup", exact=True).click()
+                    refused_response = refused_plan.value
+                    refused_request = refused_response.request.post_data_json
+                    assert refused_request["kind"] == "recommended_setup"
+                    assert refused_request["change"] == {"scope":"user", "shell":"bash", "profile":"balanced", "agents":["claude-code"]}
+                    assert str(uuid.UUID(refused_request["operation_id"])) == refused_request["operation_id"]
+                    assert refused_response.status == 409, "unsupported agent must refuse the whole plan"
+                    refused_body = refused_response.json()
+                    assert "agent executable" in refused_body["error"] or "qualified native macOS host evidence" in refused_body["error"], refused_body
+                    page.get_by_role("button", name="Leave this plan unapplied", exact=True).wait_for()
+                    assert page.get_by_role("button", name="Apply reviewed change", exact=True).count() == 0
+                    assert policy.read_bytes() == before_agent_policy
+                    assert {path.name: path.read_bytes() for path in (root / "home").glob(".bash*") if path.is_file()} == before_agent_profiles
+                    assert not (root / "home/.claude").exists()
+                    report["checks"].append("explicit_claude_selection_reaches_real_backend_and_unavailable_host_preserves_all_configuration")
+                    page.get_by_role("button", name="Leave this plan unapplied", exact=True).click()
+                    selected_agent.uncheck()
+                    with page.expect_response(lambda response: urllib.parse.urlsplit(response.url).path == "/api/plans") as shell_only_plan:
+                        page.get_by_role("button", name="Review personal setup", exact=True).click()
+                    assert shell_only_plan.value.status == 200
+                    assert shell_only_plan.value.request.post_data_json["change"]["agents"] == []
                     combined_started = time.monotonic()
                     page.get_by_role("button", name="Apply reviewed change", exact=True).click()
                     # The first three-step debug run was still making recorded

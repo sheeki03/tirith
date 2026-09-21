@@ -12,8 +12,23 @@ use super::*;
 pub(super) const USER_CONFIG: &str = "npm-user.npmrc";
 pub(super) const GLOBAL_CONFIG: &str = "npm-global.npmrc";
 
-/// A clone of an already-validated retained input. The closed CLI adapter still
-/// validates its grammar and seals these exact bytes before target execution.
+/// A public identity projection used to bind a sealed artifact descriptor.
+/// This contains no execution authority; the retained preparation validates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpmArtifactIdentity {
+    pub package_name: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// The launcher's actual sealed descriptor operand for one retained artifact.
+/// It must be matched by digest before generating expected npm metadata.
+pub struct NpmArtifactOperand {
+    pub sha256: String,
+    pub operand: OsString,
+}
+
+/// Retained input bytes that the closed launcher must independently seal.
 pub struct NpmExecutionInput {
     pub name: String,
     pub sha256: String,
@@ -168,8 +183,13 @@ impl<'a> PreparedNpmExecution<'a> {
         self.tools.entrypoint()
     }
 
-    pub fn read_roots(&self) -> Vec<PathBuf> {
+    pub fn read_roots(&self) -> Result<Vec<PathBuf>> {
         self.tools.read_roots()
+    }
+
+    pub fn clone_runtime_read_files(&self) -> Result<Vec<tools::NpmRuntimeReadFile>> {
+        self.revalidate()?;
+        self.tools.clone_read_files()
     }
 
     pub fn target_policy_path(&self) -> PathBuf {
@@ -178,6 +198,19 @@ impl<'a> PreparedNpmExecution<'a> {
             .parent
             .path()
             .join(&self.plan.destination.component)
+    }
+
+    pub fn artifact_identities(&self) -> Result<Vec<NpmArtifactIdentity>> {
+        self.revalidate()?;
+        Ok(self
+            .artifacts
+            .iter()
+            .map(|artifact| NpmArtifactIdentity {
+                package_name: artifact.leaf.name.clone(),
+                sha256: artifact.sha256().to_owned(),
+                size: artifact.compressed.len() as u64,
+            })
+            .collect())
     }
 
     pub fn clone_inputs(&self) -> Result<Vec<NpmExecutionInput>> {
@@ -222,7 +255,12 @@ impl<'a> PreparedNpmExecution<'a> {
     }
 
     fn revalidate_sources(&self) -> Result<()> {
-        self.plan.revalidate(self.artifacts, self.policy)?;
+        self.revalidate_inputs()?;
+        self.plan.destination.revalidate()
+    }
+
+    fn revalidate_inputs(&self) -> Result<()> {
+        self.plan.revalidate_inputs(self.artifacts, self.policy)?;
         self.tools.revalidate()?;
         self.staged.revalidate_identity()?;
         self.staged
@@ -244,6 +282,7 @@ impl<'a> PreparedNpmExecution<'a> {
         target_operand: &OsStr,
         target_visible_root: &Path,
         target_identity: (u64, u64),
+        artifact_operands: &[NpmArtifactOperand],
     ) -> Result<()> {
         if self.layout.is_some() || self.resume_authorized {
             return Err(NpmInstallRefusal::ExecutionStateConflict);
@@ -262,7 +301,7 @@ impl<'a> PreparedNpmExecution<'a> {
         }
         let expected_lock = expected_hidden_lock(
             self.artifacts,
-            staging_root,
+            artifact_operands,
             Path::new(target_operand),
             target_visible_root,
         )?;
@@ -388,6 +427,43 @@ impl<'a> PreparedNpmExecution<'a> {
         verified.revalidate()
     }
 
+    /// After a no-replace publication, revalidate authority and the exact held
+    /// verified tree at the bound destination. The old private pathname is no
+    /// longer expected to exist, and a different public inode is never accepted.
+    pub fn revalidate_published(&self, verified: &VerifiedNpmTree) -> Result<()> {
+        if !self.resume_authorized {
+            return Err(NpmInstallRefusal::ExecutionStateConflict);
+        }
+        self.revalidate_inputs()?;
+        self.plan.destination.revalidate_parent()?;
+        let layout = self
+            .layout
+            .as_ref()
+            .ok_or(NpmInstallRefusal::ExecutionStateConflict)?;
+        let published_path = self.target_policy_path();
+        let published = canonical_directory(&published_path)?;
+        if file_identity(&verified.retained).map_err(layout_error)? != layout.target_identity
+            || file_identity(&layout.target_file).map_err(layout_error)? != layout.target_identity
+            || published.identity().map_err(layout_error)? != layout.target_identity
+        {
+            return Err(NpmInstallRefusal::DestinationChanged);
+        }
+        let pack = self
+            .pins
+            .iter()
+            .find(|pin| pin.name == runtime_pack::FILE_NAME)
+            .ok_or(NpmInstallRefusal::ToolClosureChanged)?;
+        let expected_summary = receipt_evidence::NpmVerificationSummary::from_verified(
+            self.plan,
+            &pack.sha256,
+            &verified.expected,
+        )?;
+        if verified.npm_receipt.as_ref() != Some(&expected_summary) {
+            return Err(NpmInstallRefusal::ExecutionStateConflict);
+        }
+        verify_tree(&published_path, &verified.retained, &verified.expected)
+    }
+
     fn write_phase(&self, phase: PreparationPhase) -> Result<()> {
         self.revalidate_sources()?;
         let record = PreparationRecord {
@@ -432,7 +508,7 @@ fn validate_target_operand(operand: &OsStr) -> Result<()> {
         || !descriptor.bytes().all(|byte| byte.is_ascii_digit())
         || !descriptor
             .parse::<u32>()
-            .is_ok_and(|fd| (3..=1_048_575).contains(&fd))
+            .is_ok_and(|fd| (3..=255).contains(&fd))
     {
         return Err(NpmInstallRefusal::ExecutionLayoutUnsupported);
     }
@@ -505,14 +581,18 @@ impl PinnedInput {
 
 fn expected_hidden_lock(
     artifacts: &[VerifiedNpmArtifact],
-    staging: &Path,
+    artifact_operands: &[NpmArtifactOperand],
     target_operand: &Path,
     target: &Path,
 ) -> Result<Value> {
+    let expected_hashes: Vec<_> = artifacts.iter().map(VerifiedNpmArtifact::sha256).collect();
+    let sources = bind_artifact_operands(&expected_hashes, artifact_operands, target_operand)?;
     let mut packages = serde_json::Map::new();
     for artifact in artifacts {
         let installed = target.join("node_modules").join(&artifact.leaf.name);
-        let source = staging.join(format!("npm-{}.tgz", artifact.sha256()));
+        let source = sources
+            .get(artifact.sha256())
+            .ok_or(NpmInstallRefusal::ExecutionLayoutUnsupported)?;
         let integrity = format!(
             "sha512-{}",
             base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&artifact.compressed))
@@ -522,7 +602,7 @@ fn expected_hidden_lock(
             metadata::leaf_row(
                 &artifact.leaf.version,
                 &integrity,
-                &format!("file:{}", relative_posix(target_operand, &source)?),
+                &format!("file:{}", relative_posix(target_operand, source)?),
                 &artifact.leaf.manager_metadata,
             ),
         );
@@ -532,6 +612,43 @@ fn expected_hidden_lock(
         return Err(NpmInstallRefusal::ResourceLimit);
     }
     Ok(lock)
+}
+
+// Exact set equality prevents missing, duplicate or substituted artifact sources.
+// Descriptor operands are layout facts supplied by the closed launcher, never
+// package-selected paths. The launcher independently validates seals and bytes.
+fn bind_artifact_operands<'a>(
+    expected_hashes: &[&str],
+    operands: &'a [NpmArtifactOperand],
+    target: &Path,
+) -> Result<BTreeMap<&'a str, &'a Path>> {
+    validate_target_operand(target.as_os_str())?;
+    if expected_hashes.is_empty()
+        || expected_hashes.len() > MAX_ARTIFACTS
+        || operands.len() != expected_hashes.len()
+    {
+        return Err(NpmInstallRefusal::ExecutionLayoutUnsupported);
+    }
+    let mut sources = BTreeMap::new();
+    let mut paths = BTreeSet::new();
+    for input in operands {
+        validate_target_operand(&input.operand)?;
+        let path = Path::new(&input.operand);
+        if path == target
+            || !expected_hashes.contains(&input.sha256.as_str())
+            || !paths.insert(path)
+            || sources.insert(input.sha256.as_str(), path).is_some()
+        {
+            return Err(NpmInstallRefusal::ExecutionLayoutUnsupported);
+        }
+    }
+    if !expected_hashes
+        .iter()
+        .all(|hash| sources.contains_key(hash))
+    {
+        return Err(NpmInstallRefusal::ExecutionLayoutUnsupported);
+    }
+    Ok(sources)
 }
 
 // Node path.relative is lexical; npm's FD prefix remains the lockfile base even
@@ -588,6 +705,55 @@ mod tests {
     }
 
     #[test]
+    fn hidden_lock_sources_bind_each_exact_descriptor_and_digest() {
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+        let target = Path::new("/proc/self/fd/17");
+        let operands = vec![
+            NpmArtifactOperand {
+                sha256: hash_b.clone(),
+                operand: "/proc/self/fd/71".into(),
+            },
+            NpmArtifactOperand {
+                sha256: hash_a.clone(),
+                operand: "/proc/self/fd/64".into(),
+            },
+        ];
+        let sources = bind_artifact_operands(&[&hash_a, &hash_b], &operands, target).unwrap();
+        assert_eq!(
+            relative_posix(target, sources[hash_a.as_str()]).unwrap(),
+            "../64"
+        );
+        assert_eq!(
+            relative_posix(target, sources[hash_b.as_str()]).unwrap(),
+            "../71"
+        );
+        for (hash, operand) in [
+            (hash_a.clone(), "/proc/self/fd/71"),  // duplicate digest
+            ("c".repeat(64), "/proc/self/fd/71"),  // substituted artifact
+            (hash_b.clone(), "/proc/self/fd/64"),  // shared descriptor
+            (hash_b.clone(), "/proc/self/fd/17"),  // target is not an artifact
+            (hash_b.clone(), "/tmp/npm.tgz"),      // mutable path is not a descriptor
+            (hash_b.clone(), "/proc/self/fd/071"), // noncanonical operand
+        ] {
+            let changed = vec![
+                NpmArtifactOperand {
+                    sha256: hash_a.clone(),
+                    operand: "/proc/self/fd/64".into(),
+                },
+                NpmArtifactOperand {
+                    sha256: hash,
+                    operand: operand.into(),
+                },
+            ];
+            assert!(bind_artifact_operands(&[&hash_a, &hash_b], &changed, target).is_err());
+        }
+        assert!(bind_artifact_operands(&[&hash_a], &operands, target).is_err());
+        assert!(bind_artifact_operands(&[&hash_a, &hash_b], &operands[..1], target).is_err());
+        assert!(bind_artifact_operands(&[], &[], target).is_err());
+    }
+
+    #[test]
     fn target_operand_refuses_wrappers_aliases_and_unreserved_standard_fds() {
         for value in [
             "/proc/self/fd/0",
@@ -596,6 +762,7 @@ mod tests {
             "/proc/self/fd/3/..",
             "/dev/fd/3",
             "/proc/self/fd/999999999999",
+            "/proc/self/fd/256",
         ] {
             assert!(
                 validate_target_operand(OsStr::new(value)).is_err(),

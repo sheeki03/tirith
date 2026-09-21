@@ -736,18 +736,18 @@ fn doctor_explains_blocking_when_preexec_has_no_enforcement() {
 }
 
 #[test]
-fn doctor_reports_not_loaded_when_exports_absent() {
+fn doctor_reports_unknown_activation_when_exports_absent() {
     // User set a bash knob but the hook exported no effective state (e.g. the
     // shell was non-interactive, so the hook no-op'd).
     let stdout = doctor_stdout(&[("TIRITH_BASH_MODE", "enter")]);
     assert!(
-        stdout.contains("bash hook:            not loaded in this process"),
-        "expected not-loaded marker, got:\n{stdout}"
+        stdout.contains("bash hook:            state not reported to this process"),
+        "absent exports must not prove missing activation, got:\n{stdout}"
     );
     // No effective protection claimed when nothing exported.
     assert!(
         !stdout.contains("effective protection:"),
-        "should not print effective protection when hook not loaded, got:\n{stdout}"
+        "should not print effective protection when no marker was exported, got:\n{stdout}"
     );
     // Requested mode still renders so the user sees their setting.
     assert!(

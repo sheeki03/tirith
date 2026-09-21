@@ -43,7 +43,10 @@ pub mod receipt_evidence;
 pub mod runtime_pack;
 #[path = "npm_install_tools.rs"]
 pub mod tools;
-pub use execution::{NpmExecutionInput, NpmPreparationAuthorization, PreparedNpmExecution};
+pub use execution::{
+    NpmArtifactIdentity, NpmArtifactOperand, NpmExecutionInput, NpmPreparationAuthorization,
+    PreparedNpmExecution,
+};
 
 pub const CONTRACT: &str = "LocalLeafNoScriptsV1";
 pub const MAX_ARTIFACTS: usize = 8;
@@ -453,16 +456,26 @@ impl NewNpmDestination {
         Ok(result)
     }
 
-    pub fn revalidate(&self) -> Result<()> {
+    fn revalidate_parent(&self) -> Result<()> {
         let visible = DirCapability::open_root(self.parent.path())
             .map_err(|_| NpmInstallRefusal::DestinationChanged)?;
         if visible
             .identity()
             .map_err(|_| NpmInstallRefusal::DestinationChanged)?
             != self.identity
+            || self
+                .parent
+                .identity()
+                .map_err(|_| NpmInstallRefusal::DestinationChanged)?
+                != self.identity
         {
             return Err(NpmInstallRefusal::DestinationChanged);
         }
+        Ok(())
+    }
+
+    pub fn revalidate(&self) -> Result<()> {
+        self.revalidate_parent()?;
         let (entries, truncated) = self
             .parent
             .read_entries(MAX_INSTALLED_ENTRIES)
@@ -491,10 +504,32 @@ impl NewNpmDestination {
     }
 }
 
+/// Descriptive review output. No execution or publication API accepts this
+/// projection as authority; the private retained plan must be revalidated.
+#[derive(Clone, Serialize)]
+pub struct NpmInstallSummary {
+    pub schema_version: u32,
+    pub contract: String,
+    pub operation_id: String,
+    pub public_plan_digest: String,
+    pub packages: Vec<materialize::MaterializationPackageSummary>,
+    pub compressed_bytes: usize,
+    pub installed_bytes: u64,
+    pub installed_entries: usize,
+    pub threat_db_sequence: u64,
+    pub signed_build_timestamp: u64,
+    pub node_version: String,
+    pub npm_version: String,
+    pub lifecycle_scripts: receipt_evidence::NpmLifecycleMode,
+    pub dependency_graph: receipt_evidence::NpmDependencyGraph,
+    pub code_safety: receipt_evidence::NpmCodeSafety,
+}
+
 /// A private, immutable preparation binding. It is intentionally not a saved
 /// inspection report and does not claim native execution qualification.
 pub struct NpmInstallPlan {
     id: String,
+    summary: NpmInstallSummary,
     policy_guard: PrivatePolicyReplayGuard,
     digest: String,
     envelope: TaskEnvelopeInput,
@@ -613,8 +648,33 @@ impl NpmInstallPlan {
         // the private journal comparison and mandatory pre-effect revalidation.
         envelope.sources[0].content =
             format!("tirith-npm-leaf-preparation:v1:sha256:{public_digest}");
+        let summary = NpmInstallSummary {
+            schema_version: 1,
+            contract: CONTRACT.into(),
+            operation_id: id.into(),
+            public_plan_digest: public_digest,
+            packages: artifacts
+                .iter()
+                .map(|artifact| materialize::MaterializationPackageSummary {
+                    name: artifact.leaf.name.clone(),
+                    version: artifact.leaf.version.clone(),
+                    compressed_sha256: artifact.sha256().into(),
+                })
+                .collect(),
+            compressed_bytes: compressed,
+            installed_bytes: total,
+            installed_entries: expected.len(),
+            threat_db_sequence,
+            signed_build_timestamp,
+            node_version: tools::NODE_VERSION.into(),
+            npm_version: tools::NPM_VERSION.into(),
+            lifecycle_scripts: receipt_evidence::NpmLifecycleMode::Disabled,
+            dependency_graph: receipt_evidence::NpmDependencyGraph::LocalLeafOnly,
+            code_safety: receipt_evidence::NpmCodeSafety::NotEstablished,
+        };
         Ok(Self {
             id: id.into(),
+            summary,
             policy_guard,
             digest: plan_digest,
             envelope,
@@ -623,6 +683,16 @@ impl NpmInstallPlan {
             destination,
             decision,
         })
+    }
+
+    pub fn summary(&self) -> &NpmInstallSummary {
+        &self.summary
+    }
+
+    /// Secret-bearing comparison commitment for a private immutable intent.
+    /// This must never be included in a public preview, receipt or error.
+    pub fn private_plan_digest(&self) -> &str {
+        &self.digest
     }
 
     pub fn operation(&self) -> BoundaryOperation<'_> {
@@ -643,6 +713,17 @@ impl NpmInstallPlan {
         artifacts: &[VerifiedNpmArtifact],
         policy: &EffectivePolicySnapshot,
     ) -> Result<()> {
+        self.revalidate_inputs(artifacts, policy)?;
+        self.destination.revalidate()
+    }
+
+    // Input/task evidence survives the publication rename. Destination checking
+    // is phase-specific: absent before publication, exact verified vnode after.
+    fn revalidate_inputs(
+        &self,
+        artifacts: &[VerifiedNpmArtifact],
+        policy: &EffectivePolicySnapshot,
+    ) -> Result<()> {
         policy
             .revalidate_for_mutation()
             .map_err(|_| NpmInstallRefusal::PolicyChanged)?;
@@ -651,7 +732,6 @@ impl NpmInstallPlan {
         {
             return Err(NpmInstallRefusal::PolicyChanged);
         }
-        self.destination.revalidate()?;
         self.decision
             .revalidate(true)
             .map_err(install_decision_refusal)?;

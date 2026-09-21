@@ -272,10 +272,12 @@
     const recommended = panel('Personal setup');
     const recommendedShell = select('Personal setup shell', [['', 'Choose your shell'], ['bash','Bash'], ['zsh','Zsh'], ['fish','Fish']]);
     const recommendedProfile = select('Personal setup profile', [['balanced','Balanced'], ['comfortable','Comfortable'], ['strict','Strict']]);
-    recommended.append(paragraph('Review one plan for your personal shell integration and protection profile. Existing manual settings are preserved. A fresh shell and its verification handshake are required after applying. Agent hosts require their separate setup and verification workflows.'), recommendedShell.label, recommendedProfile.label,
+    const recommendedClaude = field('Include Claude Code', 'checkbox');
+    recommended.append(paragraph('Review one plan for your personal shell integration, protection profile and any selected agent. Existing manual settings are preserved. A fresh shell and its verification handshake are required after applying.'), recommendedShell.label, recommendedProfile.label, recommendedClaude.label,
+      paragraph('Optional Claude Code setup currently supports selected macOS hosts. The review checks your installed Claude Code and Python versions and refuses unsupported or unavailable combinations before changing configuration. After applying, reload Claude Code and verify its hook; saved configuration does not prove a running agent is protected.', 'muted'),
       button('Review personal setup', () => {
         if (!recommendedShell.input.value) throw new Error('Choose the shell whose personal startup configuration you intend to change.');
-        return plan({kind:'recommended_setup', change:{scope:'user', shell:recommendedShell.input.value, profile:recommendedProfile.input.value, agents:[]}});
+        return plan({kind:'recommended_setup', change:{scope:'user', shell:recommendedShell.input.value, profile:recommendedProfile.input.value, agents:recommendedClaude.input.checked ? ['claude-code'] : []}});
       }, 'primary'));
     return [surface, recommended, setup, verify];
   }

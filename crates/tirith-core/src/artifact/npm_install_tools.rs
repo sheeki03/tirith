@@ -1,6 +1,7 @@
 //! Retained root-managed tool binding for one characterized npm runtime.
 //! Capturing these inputs performs no child execution or package installation.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use crate::trusted_child::TrustedExecutable;
@@ -15,6 +16,16 @@ pub const NPM_ENTRYPOINT: &str = "/usr/local/lib/node_modules/npm/bin/npm-cli.js
 pub const NODE_SHA256: &str = "9507fea66ea788dfb2bbef1380ef6ef8940697ef1de15bee62b279e6cfef035c";
 pub const NPM_TREE_SHA256: &str =
     "3a34157a11136a4e01f691b297bed524edee9b8cc3bc30e34ad195b17dd8c60e";
+
+/// One exact root-managed runtime file retained for a descriptor-based rule.
+/// The file grant does not authorize its containing directory. The tool closure
+/// keeps its original generation and revalidates it at the launch boundary.
+pub struct NpmRuntimeReadFile {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub size: u64,
+    pub file: File,
+}
 
 /// This proves a tool closure only. It does not qualify native containment,
 /// authorize an operation, or permit scripts/dependency resolution.
@@ -78,10 +89,31 @@ impl QualifiedNpmToolClosure {
         }
     }
 
-    pub fn read_roots(&self) -> Vec<PathBuf> {
-        // Valid only after the closed launcher has replaced BOTH roots with
-        // the verified private runtime; never grant the host /etc as fallback.
-        vec![PathBuf::from("/usr"), PathBuf::from("/etc")]
+    /// Exact canonical loader/library/cache files, with no directory grant.
+    /// JavaScript and configuration inputs are carried separately as sealed
+    /// descriptors; the host npm tree is never a filesystem read root.
+    pub fn read_roots(&self) -> Result<Vec<PathBuf>> {
+        self.revalidate()?;
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        {
+            Ok(self.inner.read_roots())
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+        {
+            Err(NpmInstallRefusal::ToolClosureUnsupported)
+        }
+    }
+
+    pub fn clone_read_files(&self) -> Result<Vec<NpmRuntimeReadFile>> {
+        self.revalidate()?;
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        {
+            self.inner.clone_read_files()
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+        {
+            Err(NpmInstallRefusal::ToolClosureUnsupported)
+        }
     }
 }
 
@@ -296,6 +328,30 @@ mod native {
                 );
             }
             encode(entries.into_values().collect())
+        }
+
+        pub(super) fn read_roots(&self) -> Vec<PathBuf> {
+            self.libraries
+                .iter()
+                .map(|library| PathBuf::from(&library.pin.canonical))
+                .collect()
+        }
+
+        pub(super) fn clone_read_files(&self) -> Result<Vec<NpmRuntimeReadFile>> {
+            self.libraries
+                .iter()
+                .map(|library| {
+                    Ok(NpmRuntimeReadFile {
+                        path: PathBuf::from(&library.pin.canonical),
+                        sha256: library.pin.sha256.clone(),
+                        size: library.pin.size,
+                        file: library
+                            .file
+                            .try_clone()
+                            .map_err(|_| NpmInstallRefusal::ToolClosureChanged)?,
+                    })
+                })
+                .collect()
         }
 
         pub(super) fn revalidate(&self) -> Result<()> {

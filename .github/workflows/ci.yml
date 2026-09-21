@@ -118,6 +118,10 @@ jobs:
   test:
     name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    env:
+      # Full test debuginfo makes the CLI harness exceed the production binary
+      # identity limit. Keep line tables without weakening that 512 MiB limit.
+      CARGO_PROFILE_TEST_DEBUG: 1
     # A wedge detector, not a capacity budget. The suite has grown past what
     # this comment used to assume: `Test (Linux)` measures 10min on the base of
     # this stack and 19min at its head, so a 20min cap left about a minute of

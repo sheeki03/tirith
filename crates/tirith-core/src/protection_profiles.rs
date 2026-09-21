@@ -121,7 +121,7 @@ pub fn definition(name: ProtectionProfile, version: u32) -> Result<ProfileDefini
             for rule in ["raw_ip_url", "non_standard_port", "non_ascii_path"] {
                 settings.insert(format!("severity_overrides.{rule}"), json!("LOW"));
             }
-            ("compact", "incomplete analysis remains an advisory; existing hard blocks remain blocks",
+            ("compact", "incomplete analysis keeps its existing severity and action; hard incomplete-analysis blocks remain blocks",
                 "remaining Medium findings are advisory; three reviewed address/path heuristics are Low")
         }
         ProtectionProfile::Balanced => {
@@ -430,6 +430,29 @@ mod tests {
                     "a hard block must not become approvable"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_profile_preserves_hard_blocks_for_unresolved_shell_execution() {
+        let _state = GlobalStateGuard::new().unwrap();
+        for name in ProtectionProfile::ALL {
+            let verdict = evaluate(
+                "\"$TIRITH_UNRESOLVED_COMMAND\" --help",
+                &policy(name),
+                CallerContext::Cli,
+            );
+            assert!(
+                verdict.findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::AnalysisIncomplete
+                        && finding.severity == crate::verdict::Severity::High
+                }),
+                "{} must preserve the actual parser gap: {:?}",
+                name.as_str(),
+                verdict.findings
+            );
+            assert_eq!(verdict.action, Action::Block, "{}", name.as_str());
+            assert_ne!(verdict.requires_approval, Some(true));
         }
     }
 

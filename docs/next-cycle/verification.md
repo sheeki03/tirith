@@ -1,5 +1,103 @@
 # Implementation verification
 
+
+## September 21 follow-up: test failures and npm descriptor compatibility
+
+At `094c72a9862fc0b44858b4ffda5ad59457451b5b`, release workflow
+35580008125, native ARM 35580007924, fuzz 35580007914 and benchmarks
+35580007911 pass. CI 35580007926 fails independently of those results:
+
+- The release compatibility test assumes schema 1 for every stored surface,
+  although shell execution receipts correctly declare readers 3 and 4. The
+  correction tests every declared reader and explicit unsupported/unknown states,
+  while independently asserting receipt readers `[3, 4]`.
+- Linux's actual CLI test executable is 548,346,312 bytes, above the production
+  536,870,912-byte identity bound. Six setup tests refuse it. Test jobs now select
+  line-table debug information; the production bound is unchanged. A fresh Linux
+  build and execution are still needed to confirm the correction.
+- The Windows artifact digest
+  `e09c48ec0dedb8b8b69499877e5332ec72a266aa8797aa4e43f1b37f8dd28e0a`
+  verifies. Fifty-nine of sixty harnesses pass; the one failing CLI harness has
+  only the stale receipt fixture failure. Primary totals are 8,322 passed, one
+  failed and three ignored. Nine dashboard cases pass with a verified standard
+  account token; this does not classify the other harnesses as standard-account
+  runs or certify an interactive PowerShell integration.
+
+The updated doctor passes 67 focused tests plus the integration case for absent
+shell exports. All eight profile tests and six release compatibility tests pass.
+Forty-four npm preparation/layout tests pass locally, including exact descriptor
+mapping and path-free public summaries. Strict workspace/all-target Clippy and
+formatting pass. These source tests do not qualify npm execution.
+
+The embedded dashboard passes the complete browser run on local debug binary
+`a261c2c124d20497c39872b6b2db3f21246ced7b8897fd653963f33ab1465f0b`.
+The 21 recorded checks include explicit Claude selection reaching the real
+backend, unavailable-host refusal with unchanged configuration, combined setup
+and undo, all six pages, history, policy, exceptions and narrow layout. Wide and
+narrow screenshots were inspected. Report digest:
+`fe2bd31d1d617f54e21fbfa77ea88c8b3b74a60a09da2cf18841837d92e173ef`.
+Candidate/harness/helper hashes match before and after, with owned control-service
+and CLI cleanup observed. Browser process-tree cleanup was not independently
+proved, and this debug result does not certify final release bytes.
+
+The fixed Node 26.7.0/npm 11.19.0 bootstrap
+`41183108651b825e4712922f9056d1caf5766814f992167ac36fd200d9daa4d7`
+now passes native ARM Linux compatibility probes with both an empty target and
+an independently planted hostile project `.npmrc`. Actual stock npm receives
+retained descriptor inputs. Its exact project configuration read returns the
+bound empty configuration, without reading or adopting the hostile file. Installed
+leaf bytes and the complete hidden lock match independently derived expectations.
+Arborist keys the package by the physical target relative to the FD prefix;
+artifact sources remain relative to the actual artifact descriptor. The core
+verifier already models this distinction. Earlier fixture-only key mismatches
+remain retained as failures.
+
+Clean report digest:
+`78f04503cea64f324ed44da79a505dedf72aa7c314f8c63fc62eddc069cba177`.
+Hostile report digest:
+`469f62267cb19f9a1bf056fa5c2342ef372ab2f4dddfce600f2bf18902fd9eb4`.
+Both runs observe ordinary child exit, same-user peer memory/runtime-FD denial,
+owned command cleanup, exact container removal and input postchecks. These probes
+exercise stock npm compatibility under the fixture boundary; they do not execute
+the product native containment or output verifier. The hostile file remains and
+must cause the product's independent output verifier to refuse publication.
+Full native launch, transaction, publication and recovery qualification remain.
+
+## Packaged shell and receipt-capacity verification (2026-09-21)
+
+The retained macOS ARM release product from `094c72a9`, SHA-256
+`862ef1c5784c691cd6611c9bb5be2afd63c46d5275a32bc3d1c93e1d7e70144b`,
+passes the serial fixture-key signed replacement/rollback check and all **32
+packaged shell cases**: nineteen Bash, six Zsh and seven Fish. All 33 owned
+PTY sessions reach actual EOF, native original-group/session exit and leader
+reaping; the twelve outer commands also pass every cleanup check. The shell
+harness has separate captured build/source identity. This is local archive
+qualification, not an official published release or arbitrary escaped-tree proof.
+
+The unchanged full terminal workload then passes **600 measured submissions
+plus six warmups** across one-terminal and two-terminal scenarios. Every allowed
+marker appears exactly once and every blocked `curl_pipe_shell` body remains
+unexecuted. The shared two-terminal scenario completes 404 framed operations,
+plus setup traffic, beyond the old 256-receipt lifecycle failure. It does not
+measure peak registry occupancy or cross the separate per-session ledger limit;
+the core burst and clean/warning boundary regressions cover that limit.
+
+Whole-terminal wall-clock p50/p95 in milliseconds on this Apple M4/macOS 27 host:
+
+| Scenario | Allowed | Blocked |
+| --- | --- | --- |
+| One terminal | 447.7 / 588.5 | 248.7 / 366.8 |
+| Two terminals, first | 586.5 / 689.2 | 332.7 / 394.2 |
+| Two terminals, second | 577.8 / 707.4 | 330.3 / 392.6 |
+
+These include terminal scheduling, policy checks and receipt/ACK persistence;
+they are not isolated hook CPU times or universal budgets. All three shells
+exit normally, every native cleanup check passes, and all 607 captured source
+inputs match through the final postcheck. The report digest is
+`c7a19f60a2277464edc1e708b7b5702f62b2fa32f8bb6c1c9c21e5c1a5d6a2c2`.
+Later doctor, profile-description, dashboard and npm changes require their own
+checks; they are not part of this retained product.
+
 ## Platform and capacity follow-up (2026-09-21)
 
 At revision `415565d307c39e7000255955150185f3287581a6`, the [Windows

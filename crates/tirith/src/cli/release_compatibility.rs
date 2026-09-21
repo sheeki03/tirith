@@ -576,14 +576,31 @@ mod tests {
                 .require_compatible()
                 .is_err()
         );
-        for (surface, _) in current.persisted_formats.readers() {
-            for (version, state, expected) in [
-                (Some(1), "declared_local_unverified", true),
-                (Some(99), "declared_local_unverified", false),
+        // Keep an independent assertion for the receipt format transition:
+        // deriving every expectation from readers() would miss a stale contract.
+        assert_eq!(current.persisted_formats.shell_execution_receipt, [3, 4]);
+        for (surface, supported) in current.persisted_formats.readers() {
+            assert!(!supported.is_empty(), "{surface} has no declared readers");
+            let mut cases: Vec<_> = supported
+                .iter()
+                .map(|&version| (Some(version), "declared_local_unverified", true))
+                .collect();
+            // Include schema 1 explicitly: it is valid for several older stores
+            // but is never a readable shell execution receipt format.
+            cases.extend(
+                [0, 1, 2, 5, 99, u32::MAX]
+                    .into_iter()
+                    .filter(|version| !supported.contains(version))
+                    .map(|version| (Some(version), "declared_local_unverified", false)),
+            );
+            cases.extend([
+                (None, "absent", true),
+                (None, "unknown", false),
                 (None, "unreadable", false),
                 (None, "inventory_limited", false),
                 (None, "unknown_entry", false),
-            ] {
+            ]);
+            for (version, state, expected) in cases {
                 let facts = vec![super::super::lifecycle::FormatFact {
                     surface,
                     declared_version: version,
@@ -602,8 +619,23 @@ mod tests {
                 preview(&candidate, "fixture", vec![])
                     .require_compatible()
                     .is_err(),
-                "missing {surface}"
+                "empty readers for {surface}"
             );
+            let mut raw = serde_json::to_value(&current).unwrap();
+            raw["persisted_formats"]
+                .as_object_mut()
+                .unwrap()
+                .remove(surface);
+            // Older receipt contracts deserialize the omitted field as empty;
+            // other required fields can refuse at parsing. Neither is support.
+            if let Ok(candidate) = serde_json::from_value::<Document>(raw) {
+                assert!(
+                    preview(&candidate, "fixture", vec![])
+                        .require_compatible()
+                        .is_err(),
+                    "missing reader declaration for {surface}"
+                );
+            }
         }
     }
 
