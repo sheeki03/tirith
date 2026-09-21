@@ -33,6 +33,21 @@ note does not replace the final action or reinterpret incomplete coverage as
 proof of malicious content. Findings continue to provide the specific gap and
 reason.
 
+For example, `BIN=/bin/echo; "$BIN" --help` still has an unresolved command
+name. The earlier assignment does not prove the live shell variable's
+attributes or that the assignment succeeded. Quoting the variable preserves
+argument boundaries; it does not establish the selected executable. Use the
+literal command path, `/bin/echo --help`, when that is the intended command,
+then check that exact command again. Adding `&&` guards an assignment failure
+but does not prove the variable's attributes, so it is not a general fix.
+
+JSON clients can distinguish this limitation through
+`findings[].rule_id == "analysis_incomplete"` while continuing to honor the
+returned `action` and show any other findings. A coverage limitation is not a
+malicious-content finding. Normal command JSON does not expose a universal
+coverage-status boolean; file and project scan reports have their own coverage
+fields.
+
 A URL or domain trust hint is labelled as an exception to review. It covers the
 shown target and rule only if policy permits it, tells the operator to re-check
 the command, and names up to five other reported rules requiring review. A

@@ -32,7 +32,7 @@ def review(directories):
         check.context_check(context, local, allocation, hashes)
         check.provenance_check(provenance, context, local, allocation)
         check.require(context["host"]["system"] == "Darwin" and context["host"]["machine"] == "arm64" and
-                      context["runner"]["label"] == "macos-15" and context["runner"]["cpu_model"] == "Apple M1",
+                      context["runner"]["label"] == "macos-15" and context["runner"]["cpu_model"] == "Apple M1 (Virtual)",
                       "baseline is outside the explicitly selected native Mac cohort")
         before, before_sha = check.load(root / "source-before.json")
         after, after_sha = check.load(root / "source-after.json")

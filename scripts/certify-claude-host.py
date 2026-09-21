@@ -11,6 +11,7 @@ import errno
 from contextlib import contextmanager
 import hashlib
 import http.server
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ import socket
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -39,22 +41,34 @@ custom_rules:
 """
 
 
+_ACTIVE_FIXTURES = set()
+_RETAINED_FIXTURES = set()
+
+
 @contextmanager
 def fixture_directory(prefix):
-    directory = tempfile.TemporaryDirectory(prefix=prefix)
+    # Failed ownership/cleanup must not remove a live descendant's private root.
+    # Use an explicit directory: TemporaryDirectory's finalizer also deletes it.
+    root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+    _ACTIVE_FIXTURES.add(root)
+    completed = False
     try:
-        yield Path(directory.name)
+        yield root
+        if root in _RETAINED_FIXTURES:
+            raise RuntimeError(f"owned process cleanup incomplete; private fixture retained: {root}")
+        completed = True
     finally:
-        # Existing hooks emit short detached telemetry writes. Let those finish
-        # before removing their private root; never target other host state.
-        for attempt in range(25):
-            try:
-                directory.cleanup()
-                break
-            except OSError:
-                if attempt == 24:
-                    raise
-                time.sleep(0.1)
+        _ACTIVE_FIXTURES.discard(root)
+        _RETAINED_FIXTURES.discard(root)
+        if completed:
+            for attempt in range(25):
+                try:
+                    shutil.rmtree(root)
+                    break
+                except OSError:
+                    if attempt == 24:
+                        raise
+                    time.sleep(0.1)
 
 
 def digest(path):
@@ -67,6 +81,24 @@ def digest(path):
 
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
+NATIVE_PATH = Path(__file__).resolve().parents[1] / "tools/qualification/mixed_audit_native.py"
+NATIVE_SHA256 = "913a3499bd78b39c6870b9dc280fcaad8a49739db7f2781bbfe914ff4db12e75"
+_NATIVE = None
+
+
+def owned_native():
+    global _NATIVE
+    if digest(NATIVE_PATH) != NATIVE_SHA256:
+        raise RuntimeError("reviewed owned-process helper changed")
+    if _NATIVE is None:
+        spec = importlib.util.spec_from_file_location("claude_owned_native", NATIVE_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.require_process_observation()
+        if digest(NATIVE_PATH) != NATIVE_SHA256:
+            raise RuntimeError("owned-process helper changed while loading")
+        _NATIVE = module
+    return _NATIVE
 
 
 def bytes_evidence(value):
@@ -77,27 +109,47 @@ class BoundedProcess:
     """Own one new process group, bounded pipes and a finite reap deadline."""
 
     def __init__(self, argv, root, env, interactive=False, output_limit=MAX_OUTPUT_BYTES):
-        self.process = subprocess.Popen(
-            argv, cwd=root, env=env,
-            stdin=subprocess.PIPE if interactive else subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-        )
+        self.native = owned_native()
+        self.fixture_root = next((fixture for fixture in _ACTIVE_FIXTURES
+                                  if Path(root).resolve().is_relative_to(fixture)), None)
+        # Selector creation can fail before any child exists. Once spawn returns,
+        # retain enough initialized state to close every pipe and reap on error.
         self.selector = selectors.DefaultSelector()
+        self.process = None
+        self.stdin = None
         self.stdout, self.stderr = bytearray(), bytearray()
         self.output_limit = output_limit
         self.failure = None
         self.closed = False
         self.record_offset = 0
-        for stream, name in [(self.process.stdout, "stdout"), (self.process.stderr, "stderr")]:
-            os.set_blocking(stream.fileno(), False)
-            self.selector.register(stream, selectors.EVENT_READ, name)
-        if interactive:
-            os.set_blocking(self.process.stdin.fileno(), False)
+        self.pipe_eof = set()
+        try:
+            self.process = self.native.OwnedProcess(
+                argv, cwd=root, env=env,
+                stdin=subprocess.PIPE if interactive else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+            )
+            # Borrow the retained child's input pipe, without transferring any
+            # process/reap authority or changing the shared native helper.
+            self.stdin = self.process._child.stdin
+            for stream, name in [(self.process.stdout, "stdout"), (self.process.stderr, "stderr")]:
+                os.set_blocking(stream.fileno(), False)
+                self.selector.register(stream, selectors.EVENT_READ, name)
+            if interactive:
+                os.set_blocking(self.stdin.fileno(), False)
+        except BaseException:
+            if self.process is None:
+                self.selector.close()
+            else:
+                self.failure = "pipe_setup"
+                self.close()
+            raise
 
     def pump(self, timeout):
         for key, _ in self.selector.select(timeout):
             data = os.read(key.fileobj.fileno(), 65536)
             if not data:
+                self.pipe_eof.add(key.data)
                 self.selector.unregister(key.fileobj)
                 continue
             remaining = self.output_limit - len(self.stdout) - len(self.stderr)
@@ -113,13 +165,13 @@ class BoundedProcess:
             raise ValueError("fixture input exceeds its bound")
         deadline = time.monotonic() + 5
         with selectors.DefaultSelector() as ready:
-            ready.register(self.process.stdin, selectors.EVENT_WRITE)
+            ready.register(self.stdin, selectors.EVENT_WRITE)
             while payload:
                 if time.monotonic() >= deadline or self.process.poll() is not None:
                     raise RuntimeError("native host input deadline or early exit")
                 if ready.select(min(0.1, max(0, deadline - time.monotonic()))):
                     try:
-                        count = os.write(self.process.stdin.fileno(), payload)
+                        count = os.write(self.stdin.fileno(), payload)
                     except BlockingIOError:
                         continue
                     payload = payload[count:]
@@ -155,65 +207,90 @@ class BoundedProcess:
     def close(self):
         if self.closed:
             return self.cleanup
-        # Publish a complete conservative result before cleanup can encounter an
-        # error. A second close always returns that same recorded result.
         self.cleanup = {"leader_reaped": False, "output_eof": False,
-                        "process_group_cleanup_requested": False}
+                        "process_group_cleanup_requested": False,
+                        "process_group_exited": False}
+        self.group_observation = None
         self.cleanup_error = None
         self.closed = True
         deadline = time.monotonic() + 3
+
+        def observe_group():
+            # Every numeric group observation is made while our actual waitable
+            # child still pins that group id. Observed members are never targets.
+            if self.process.reaped or self.process.ownership_lost:
+                raise RuntimeError("owned leader no longer pins its original group")
+            self.process.poll()  # WNOWAIT; external reap refuses before signaling.
+            members = self.native.group_members(self.process.pid)
+            self.group_observation = {"method": "libproc" if sys.platform == "darwin" else "procfs",
+                                      "leader_retained_waitable": True, "members": members,
+                                      "scope": "original owned process group; exited zombies may await their parent"}
+            exited = all(member["state"] == "exited" for member in members)
+            self.cleanup["process_group_exited"] = exited
+            if exited:
+                # Keep the legacy field for readers: an independently observed
+                # exited group, like ESRCH, needs no further signal request.
+                self.cleanup["process_group_cleanup_requested"] = True
+            return exited
+
         try:
             while time.monotonic() < deadline:
+                if self.process.reaped or self.process.ownership_lost:
+                    raise RuntimeError("original process group ownership lost")
+                if self.process.poll() is not None and observe_group():
+                    break
                 try:
                     os.killpg(self.process.pid, signal.SIGKILL)
                     self.cleanup["process_group_cleanup_requested"] = True
-                except OSError as error:
-                    if error.errno == errno.ESRCH:
-                        self.cleanup["process_group_cleanup_requested"] = True
-                    elif error.errno != errno.EPERM:
-                        self.cleanup_error = "process_group_signal_error"
-                        break
-                    # Darwin may return EPERM while this owned child is exiting.
-                    # Wait only for our child and retry; permission denial alone
-                    # never establishes either group cleanup or successful reap.
-                try:
-                    self.process.wait(timeout=min(0.05, max(0, deadline - time.monotonic())))
-                    self.cleanup["leader_reaped"] = True
-                except subprocess.TimeoutExpired:
-                    pass
-                if all((self.cleanup["leader_reaped"], self.cleanup["process_group_cleanup_requested"])):
+                except ProcessLookupError:
+                    self.cleanup["process_group_cleanup_requested"] = True
+                except PermissionError:
+                    pass  # Denied signaling is not evidence that children exited.
+                if self.process.poll() is not None and observe_group():
                     break
                 time.sleep(0.01)
-            if not self.cleanup["process_group_cleanup_requested"] and self.cleanup_error is None:
-                self.cleanup_error = "process_group_permission_deadline"
-            if not self.cleanup["leader_reaped"]:
-                # Last bounded attempt targets only the Popen-owned leader.
-                # It cannot repair a failed group cleanup claim.
-                try:
-                    self.process.kill()
-                except OSError:
-                    self.cleanup_error = self.cleanup_error or "owned_child_signal_error"
-                try:
-                    self.process.wait(timeout=2)
-                    self.cleanup["leader_reaped"] = True
-                except subprocess.TimeoutExpired:
-                    self.cleanup_error = self.cleanup_error or "owned_child_reap_deadline"
-            deadline = time.monotonic() + 2
-            while self.selector.get_map() and time.monotonic() < deadline and self.failure is None:
-                try:
-                    self.pump(0.05)
-                except (OSError, RuntimeError):
-                    self.cleanup_error = self.cleanup_error or "output_drain_error"
-                    break
-            self.cleanup["output_eof"] = not self.selector.get_map()
+            if not self.cleanup["process_group_exited"]:
+                self.cleanup_error = "process_group_exit_unproven"
+        except (OSError, RuntimeError, AssertionError) as error:
+            self.cleanup_error = "process_group_observation_failed"
+            self.group_observation = {"error": str(error)[:1000]}
         finally:
-            self.selector.close()
-            for stream in [self.process.stdin, self.process.stdout, self.process.stderr]:
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        self.cleanup_error = self.cleanup_error or "pipe_close_error"
+            # Reap only the retained child. Failure cannot authorize a signal to
+            # a sampled descendant or to a group after its leader was reaped.
+            try:
+                if not self.process.reaped and not self.process.ownership_lost:
+                    self.process.kill()
+                    self.process.wait(timeout=2)
+                    if not self.cleanup["process_group_exited"]:
+                        try:
+                            observe_group()
+                        except (OSError, RuntimeError, AssertionError) as error:
+                            self.cleanup_error = self.cleanup_error or "process_group_observation_failed"
+                            self.group_observation = {"error": str(error)[:1000]}
+                    self.process.reap()
+                    self.cleanup["leader_reaped"] = True
+                else:
+                    self.cleanup_error = self.cleanup_error or "owned_child_ownership_lost"
+            except (OSError, RuntimeError, AssertionError, subprocess.TimeoutExpired):
+                self.cleanup_error = self.cleanup_error or "owned_child_reap_deadline"
+            try:
+                deadline = time.monotonic() + 2
+                while self.selector.get_map() and time.monotonic() < deadline and self.failure is None:
+                    self.pump(0.05)
+                self.cleanup["output_eof"] = self.pipe_eof == {"stdout", "stderr"}
+            except (OSError, RuntimeError):
+                self.cleanup_error = self.cleanup_error or "output_drain_error"
+            finally:
+                self.selector.close()
+                for stream in [self.stdin, self.process.stdout, self.process.stderr]:
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            self.cleanup_error = self.cleanup_error or "pipe_close_error"
+                if self.cleanup_error or not all(self.cleanup.values()):
+                    if self.fixture_root is not None:
+                        _RETAINED_FIXTURES.add(self.fixture_root)
         return self.cleanup
 
 
@@ -239,7 +316,7 @@ def execute(argv, root, env, timeout=45):
     return {"exit": exit_code, "timed_out": timed_out,
             "elapsed_seconds": round(time.monotonic() - started, 3),
             "output_limit_exceeded": child.failure == "output_limit", "cleanup": cleanup,
-            "cleanup_error": child.cleanup_error,
+            "cleanup_error": child.cleanup_error, "group_observation": child.group_observation,
             "stdout": bytes_evidence(stdout), "stderr": bytes_evidence(stderr)}, stdout, stderr
 
 
@@ -247,6 +324,7 @@ def execution_ok(result):
     return (result["exit"] == 0 and not result["timed_out"]
             and not result.get("output_limit_exceeded", False) and not result.get("cleanup_error")
             and result.get("cleanup", {}).get("leader_reaped", False)
+            and result.get("cleanup", {}).get("process_group_exited", False)
             and result.get("cleanup", {}).get("output_eof", False))
 
 
@@ -260,6 +338,7 @@ def policy_check_ok(result, output, action):
             and not result.get("timed_out", True) and not result.get("output_limit_exceeded", True)
             and not result.get("cleanup_error")
             and result.get("cleanup", {}).get("leader_reaped", False)
+            and result.get("cleanup", {}).get("process_group_exited", False)
             and result.get("cleanup", {}).get("output_eof", False))
 
 
@@ -886,7 +965,7 @@ def main():
     if args.setup_mode == "recommended":
         if claude_invocation is None or claude_invocation.name != "claude" or claude_invocation.resolve() != host:
             parser.error("recommended setup requires --claude-invocation selecting the same native host")
-    with tempfile.TemporaryDirectory(prefix="tirith-native-claude-version-") as temp:
+    with fixture_directory(prefix="tirith-native-claude-version-") as temp:
         root = Path(temp)
         env = isolated_env(root, binary, python, claude_invocation)
         discovered, runtime_output, _ = execute([str(python), "-I", "-S", "-c", "import sys;print(sys.executable)"], root, env)
@@ -905,6 +984,7 @@ def main():
         versions["claude-invocation"] = {"path": str(claude_invocation),
                                          "resolved_path": str(claude_invocation.resolve()),
                                          "sha256": digest(claude_invocation)}
+    owned_native()  # Admit the frozen native substrate before real host cases.
     source_hash = digest(Path(__file__))
     cases = []
     selected_cases = (args.cases or BASELINE_CASES + (FAILURE_CASES if args.failure_controls else ())) if args.route == "hooks" else (
@@ -934,8 +1014,9 @@ def main():
             postcheck[name] = {"unavailable": True}
     unchanged = all(postcheck[name].get("sha256") == value["sha256"]
                     and postcheck[name].get("resolved_path") == value.get("resolved_path", str(Path(value["path"]).resolve()))
-                    for name, value in versions.items()) and digest(Path(__file__)) == source_hash
+                    for name, value in versions.items()) and digest(Path(__file__)) == source_hash and digest(NATIVE_PATH) == NATIVE_SHA256
     report = {"schema_version": 1, "evidence_kind": "scripted-provider-native-host", "harness_sha256": source_hash, "inputs_postcheck": postcheck,
+              "owned_helper": {"path": str(NATIVE_PATH), "sha256": NATIVE_SHA256},
               "recorded_unix": int(time.time()), "os": platform.platform(), "versions": versions,
               "scope": f"{args.settings_loading} settings; {args.route} route on this host; standalone candidate bytes",
               "fixture_cleanup_completed": all(case.get("fixture_cleanup_completed", False) for case in cases),

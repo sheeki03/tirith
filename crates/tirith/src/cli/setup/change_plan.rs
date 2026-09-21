@@ -2526,9 +2526,14 @@ impl MutationService {
 }
 
 #[cfg(test)]
-static WORKER_TEST_GATES: OnceLock<
-    Mutex<std::collections::BTreeMap<String, std::sync::mpsc::Receiver<()>>>,
-> = OnceLock::new();
+struct WorkerTestPause {
+    receiver: std::sync::mpsc::Receiver<()>,
+    timeout: Duration,
+}
+
+#[cfg(test)]
+static WORKER_TEST_GATES: OnceLock<Mutex<std::collections::BTreeMap<String, WorkerTestPause>>> =
+    OnceLock::new();
 
 #[cfg(test)]
 fn after_worker_admission_for_test(id: &str) {
@@ -2538,7 +2543,58 @@ fn after_worker_admission_for_test(id: &str) {
         .unwrap()
         .remove(id);
     if let Some(gate) = gate {
-        let _ = gate.recv_timeout(Duration::from_secs(10));
+        let _ = gate.receiver.recv_timeout(gate.timeout);
+    }
+}
+
+/// Only the explicitly selected native service fixture needs a gate longer
+/// than the production updater's ten-second drain deadline. Ordinary unit
+/// worker gates retain their original ten-second cap.
+#[cfg(all(test, unix))]
+pub(crate) struct ServiceFixtureWorkerGate {
+    id: String,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+
+#[cfg(all(test, unix))]
+impl ServiceFixtureWorkerGate {
+    pub(crate) fn new(id: &str) -> Self {
+        assert_eq!(uuid::Uuid::parse_str(id).unwrap().to_string(), id);
+        let (release, gate) = std::sync::mpsc::channel();
+        let previous = WORKER_TEST_GATES
+            .get_or_init(|| Mutex::new(Default::default()))
+            .lock()
+            .unwrap()
+            .insert(
+                id.into(),
+                WorkerTestPause {
+                    receiver: gate,
+                    timeout: Duration::from_secs(30),
+                },
+            );
+        assert!(previous.is_none(), "fixture operation gate already exists");
+        Self {
+            id: id.into(),
+            release: Some(release),
+        }
+    }
+
+    pub(crate) fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        WORKER_TEST_GATES
+            .get_or_init(|| Mutex::new(Default::default()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for ServiceFixtureWorkerGate {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -2932,7 +2988,13 @@ mod tests {
             .get_or_init(|| Mutex::new(Default::default()))
             .lock()
             .unwrap()
-            .insert(id.into(), gate);
+            .insert(
+                id.into(),
+                WorkerTestPause {
+                    receiver: gate,
+                    timeout: Duration::from_secs(10),
+                },
+            );
         release
     }
 

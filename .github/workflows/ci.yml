@@ -47,10 +47,20 @@ jobs:
       - name: Validate native host certification bounds
         run: |
           python3 scripts/test-certify-claude-host.py
+          python3 scripts/test-certify-shell-package.py
           python3 scripts/test-certify-powershell-hook.py
+          python3 scripts/test-control-browser-fixtures.py
+          python3 scripts/test-collect-native-resource-reference.py
           python3 tools/qualification/test_mixed_audit_native.py
           python3 tools/qualification/test_compatibility_capture.py
           python3 tools/qualification/test_durable_boundaries_native.py
+          python3 tools/qualification/test_service_coordination_native.py
+      - name: Validate managed browser qualification predicates
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/managed-browser-fixtures"
+          "$RUNNER_TEMP/managed-browser-fixtures/bin/python" -m pip install PyYAML==6.0.3
+          "$RUNNER_TEMP/managed-browser-fixtures/bin/python" scripts/test-managed-rollout-browser-fixtures.py
       - name: Validate ThreatDB manifest transition fixtures
         run: bash .github/scripts/test-threatdb-manifest-transition.sh
       - name: Refuse a stale ThreatDB manifest transition
@@ -164,6 +174,44 @@ jobs:
         if: matrix.name == 'Windows'
         shell: pwsh
         run: ./.github/scripts/test-workspace-windows.ps1
+      - name: Native pending-job update coordination
+        if: matrix.name != 'Windows'
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/tirith-service-coordination"
+          mkdir "$evidence"
+          cargo test --locked -p tirith --bin tirith --no-run --message-format=json \
+            > "$evidence/cargo.jsonl" 2> "$evidence/build.stderr"
+          python3 - "$evidence" <<'PY'
+          import hashlib, json, pathlib, subprocess, sys
+          output = pathlib.Path(sys.argv[1])
+          source = pathlib.Path.cwd().resolve()
+          records = [json.loads(line) for line in (output / 'cargo.jsonl').read_text().splitlines()]
+          selected = [r for r in records if r.get('reason') == 'compiler-artifact'
+                      and r.get('executable') and r.get('profile', {}).get('test') is True
+                      and r.get('target', {}).get('name') == 'tirith'
+                      and pathlib.Path(r['manifest_path']).resolve() == source / 'crates/tirith/Cargo.toml']
+          if len(selected) != 1:
+              raise SystemExit('expected one current Tirith CLI test executable')
+          binary = pathlib.Path(selected[0]['executable']).resolve(strict=True)
+          digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+          (output / 'selected-test.json').write_text(json.dumps({
+              'cargo_artifact': selected[0], 'sha256': digest,
+              'source_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'scope': 'instrumented test fixture, not signed replacement or release qualification'
+          }, indent=2) + '\n')
+          subprocess.run([sys.executable, '-B', 'tools/qualification/service_coordination_native.py',
+                          '--test-executable', str(binary), '--sha256', digest,
+                          '--output', str(output / 'native')], check=True)
+          PY
+      - name: Retain native update coordination evidence
+        if: always() && matrix.name != 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: service-coordination-${{ matrix.name }}
+          path: ${{ runner.temp }}/tirith-service-coordination
+          if-no-files-found: warn
+          retention-days: 7
       - name: Retain Windows native qualification evidence
         if: always() && matrix.name == 'Windows'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

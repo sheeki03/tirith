@@ -39,6 +39,108 @@ passes 2,077 tests with no failures and three ignores, with all four owned
 cleanup checks passing. The precise scheduling cause of the preceding suite
 failure is not established; that failed run remains separately retained.
 
+At pushed revision `c3445508`, all six task-family integration cases and strict
+workspace/all-target Clippy pass. The full core run passes 6,138 tests and fails
+the additional unquoted-backtick function-name diagnostic regression, with two
+ignores and all four owned cleanup checks passing. The input still receives a
+High incomplete-analysis block; its specific curl-to-shell finding is missing.
+The follow-up rejects backticks as literal function-name bytes and retains the
+existing bounded substitution scanner. Its thirteen issue-family regressions
+and existing extended function-name case now pass on a newly built native core
+test executable, with all four owned cleanup checks. The complete corrected
+core suite subsequently passes 6,141 tests with zero failures and two ignores;
+all four owned cleanup checks pass. The preceding failed run remains retained.
+
+The corresponding new CLI suite passes 2,076 tests and fails one preview
+filesystem-isolation check, with three ignores. The same test passes in isolation
+on the identical executable. Its unexpected audit record matches a concurrent
+self-update authorization test. Two runtime-audit tests lacked the shared
+environment guard and could write into another test's temporary roots. Both now
+take that guard; production logging and the preview's exact no-write assertion
+are unchanged. The rebuilt suite passes 2,077 tests with zero failures and four
+ignores, including the newly added explicit native-fixture ignore. All four owned
+cleanup checks pass; the executable SHA-256 is
+`7e3f7e1a53cc94ec98dde7fcc4085cf45231c01bdaae6391b510ef7be992ebb6`.
+The preceding failed run remains retained.
+
+The parser-corrected release product, SHA-256
+`cc5558cda58e51555a87829da011cc4635f73e8499d368968ba162bbaeab5437`,
+passes the signed replacement/rollback fixture with 604 retained source inputs
+and all four outer cleanup checks. All seventeen read-only documentation cases
+and thirty-two actual 0.4.2/candidate reader cases also pass on those exact bytes.
+Later test-only Windows-path and test-isolation changes are not part of that
+captured source; their verification remains separate.
+
+The same parser-corrected product passes three fresh default-MONITOR Zsh
+activation runs and all three terminal removal scenarios. These cover a custom
+ZDOTDIR, preservation of unrelated profiles and history, loaded versus fresh
+shell behavior, edited owned blocks and malformed-block refusal. The actual
+Claude 2.1.268 host passes all nine hook/failure cases, retained-host reload
+observations and the MCP-only boundary control. The host executable, invoked
+path and Python runtime identities are retained; this does not qualify a newer
+Claude version or a real-model workflow.
+
+The complete browser suite passes eighteen workflow checks plus owned-service
+startup and cleanup checks on those same product bytes. Five separate delayed
+response cases also pass. Both use embedded assets without a source override;
+all owned CLI/service cleanup observations and input rechecks pass. Wide and
+narrow screenshots were inspected. The preceding attempt failed before page
+checks because the Playwright-matched Chromium executable was absent; its
+failed report and private fixture are retained separately. Installing the
+matching browser dependency allowed the fresh attempt to proceed.
+
+The managed-policy browser attempt applies the organization profile and then
+refuses a harness path comparison: the CLI correctly projects `/Users/<name>`
+as `[REDACTED:home_path]`. An owned read-only forensic clone confirms the exact
+organization scope, balanced settings and profile selection; both fixture trees
+remain unchanged. The harness now checks the source-derived public projection
+and records actual policy/output before comparing them. Twenty predicate controls
+pass, including refusal of raw private paths and different fixture/file suffixes.
+The fresh managed browser run subsequently passes review, organization-only
+activation, exact undo and newer-document rollback refusal, plus identified
+service startup/cleanup. Its private root is removed after success, all native
+cleanup facts pass, and the activated-state screenshot was inspected.
+
+A separately compiled ignored native service fixture exercises real HTTP worker
+admission, stale discovery refusal and the ten-second update drain deadline.
+Its first native run correctly refuses the prepared mutation because the fixture
+used a different policy resolution scope from the service. All outer cleanup
+observations pass and the failed root is retained. The fixture now prepares from
+the actual service context; freshness checks and the required completed mutation
+remain unchanged. The rebuilt test executable, SHA-256
+`3afa04bb4d6ff9564f84416f1092d4538f26410e18fbf5018527ff9ff24aa448`,
+passes the complete native fixture: an admitted worker remains active across
+the 10.252-second drain refusal, new mutations are refused, the released worker
+finishes before service exit, and a later service requires its new identity.
+Both service threads acknowledge completion and join; the update guard retains
+both locks. All four outer cleanup facts pass and the successful private root
+is removed. The earlier failed fixture remains retained.
+
+The corresponding release product, SHA-256
+`8399644b183e62f6d610f59bb8c5091dd8b83590693b1c61d367002dde49288b`,
+is unchanged from the preceding build; the new source capture retains 607
+inputs. Its same-version signed replacement/rollback fixture passes with exact
+restored bytes and all outer cleanup facts. The first attempt timed out after
+the extractor completion marker while the service fixture and shell compilation
+were also running. Its failure and unknown nested cleanup remain retained.
+A fresh serial attempt uses identical images and the unchanged 45-second child
+limit and completes the selected Rust fixture in 26.611 seconds. The overlap
+does not establish the precise cause of the preceding timeout. Neither run
+establishes an official signed release or a numeric version upgrade.
+
+The lock-corrected release product, SHA-256
+`9f3f54647f0d619ef967e97bf1fc4841ce609187d75e40124ef783980b78a6f1`,
+also passes the same-version signed replacement/rollback fixture with identical
+test/product source inputs and all four outer cleanup checks. Its scope remains
+the fixture-key mechanism described above.
+
+The agent-host and packaged-shell qualification runners now retain child
+ownership through process-group observation and final reap. Twenty-seven agent
+runner controls and seventeen shell runner controls pass, including immediate
+post-spawn failures, closed output pipes and bounded cleanup failures. These
+harmless controls execute no product candidate and do not certify a host or
+package. Failed or incompletely cleaned fixture roots remain available.
+
 Fifteen publication verifier/report controls pass after the ThreatDB corrections.
 They cover complete signed declarations before lag retries, duplicate and type
 refusals, discovery-surface disagreement, source-sidecar binding, partial upload
@@ -46,6 +148,19 @@ reporting and recovery after a failed prior attempt. They use local fixture keys
 and downloads; no remote publication or concurrent publisher success is inferred.
 Seven release-compatibility generator controls, twelve native resource collector
 controls, installer platform controls and npm launcher controls also pass.
+
+The first three macOS resource attempts on `c3445508` (runs `35565819502`,
+`35565843602` and `35565863397`) all refuse the selected Apple M1 CPU-class
+check before measurement. Their three artifact archives match the GitHub API
+digests and are retained. No cancellation occurred: the runs had already failed
+when cancellation was requested. The initial refusal did not retain the actual
+CPU string; a diagnostic correction records observed host facts without changing
+admission or enabling any budget. These attempts establish no baseline.
+Diagnostic run `35566520786` observes the actual CPU label `Apple M1 (Virtual)`
+and also remains refused. The collector and reviewer now explicitly select that
+exact virtual-machine class for a new cohort; fifteen controls pass, including
+refusal of bare M1, M2 and altered labels. Three fresh matching, independent
+baselines are required before threshold review; no budget is enabled.
 
 ## Shell and platform family corrections (2026-09-21)
 
@@ -96,6 +211,28 @@ an overwrite fallback, fixes the test lints, and updates Rustls to 0.23.45 in
 both workspaces. Strict macOS workspace/all-target Clippy passes on that source;
 the corrected Windows/musl jobs still need to run. The local locked workspace
 advisory check subsequently passes with Rustls 0.23.45.
+
+At `c3445508`, [CI run 35565787098](https://github.com/sheeki03/tirith/actions/runs/35565787098)
+passes compilation on Windows and the strict formatting, Clippy, advisory,
+installer, artifact-protocol and workflow-fixture checks. Linux, macOS and Rust
+1.83 each fail only the additional backtick core regression described above.
+The digest-verified Windows artifact records successful standard-account
+dashboard execution, exact-account cleanup and all other workspace harnesses
+passing. Its core harness has two failures: that same parser case and a local
+package effect fixture whose Unix-only destination is not absolute on Windows.
+The overall Windows job remains failed. The separate [native ARM run
+35565787206](https://github.com/sheeki03/tirith/actions/runs/35565787206) passes
+both GNU and musl jobs after the syscall correction.
+
+The [PR release validation run 35565787403](https://github.com/sheeki03/tirith/actions/runs/35565787403)
+builds all six release targets and passes native ARM, GNU distribution, macOS,
+Windows, Debian/RPM and release-compatibility checks. npm assembly alone fails
+because its exact package-file allowlist omitted the newly added README. A
+one-line correction retains exact membership checking; local offline pack
+controls reproduce the old refusal, accept all six corrected fixture packages,
+and refuse a missing README, an unexpected member and changed embedded bytes.
+These are inert fixture packages; the corrected CI run must validate actual
+candidate archives. Publishing jobs remain skipped on this PR.
 
 The signed replacement fixture's independent source review identified and
 closed a native-target type mismatch and missing Cargo-to-checkout association.

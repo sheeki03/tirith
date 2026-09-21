@@ -1929,7 +1929,12 @@ mod local_package_tree_tests {
         LocalPackageTreeAction::new(
             "11111111-1111-4111-8111-111111111111",
             vec!["leaf@1.0.0".into()],
-            "/tmp/exact-new-tree".into(),
+            if cfg!(windows) {
+                r"C:\tirith-test\exact-new-tree"
+            } else {
+                "/tmp/exact-new-tree"
+            }
+            .into(),
             "a".repeat(64),
         )
     }

@@ -24,6 +24,8 @@ with patch.dict("sys.modules", {"playwright": types.ModuleType("playwright"),
 
 class Process:
     pid = 43210
+    stdout = types.SimpleNamespace(close=lambda: None)
+    stderr = types.SimpleNamespace(close=lambda: None)
     def poll(self):
         return None
 
@@ -63,7 +65,7 @@ class Predicates(unittest.TestCase):
                          **copy.deepcopy(HARNESS.BALANCED), "protection_profile": copy.deepcopy(HARNESS.SELECTION)}
         self.effective = {"scope": "org", "source_path": str(self.path),
                           "policy": copy.deepcopy(HARNESS.BALANCED),
-                          "resolution": {"effective_profile": copy.deepcopy(HARNESS.SELECTION)}}
+                          "resolution": {"effective_profile": copy.deepcopy(HARNESS.SELECTION), "policy_is_redacted_display": True}}
     def write_record(self):
         self.path.write_text(json.dumps(self.record))
         self.path.chmod(0o600)
@@ -139,6 +141,25 @@ class Predicates(unittest.TestCase):
                        "protection_profile": HARNESS.SELECTION}
         with self.assertRaises(AssertionError):
             HARNESS.verify_balanced(yaml.safe_dump(marker_only), self.effective, self.path)
+    def test_balanced_matches_exact_public_home_path_projection(self):
+        suffix = "/unique-fixture/organization/.tirith/policy.yml"
+        for prefix in ("/Users/operator", "/home/operator"):
+            managed = Path(prefix + suffix)
+            effective = copy.deepcopy(self.effective)
+            effective["source_path"] = "[REDACTED:home_path]" + suffix
+            HARNESS.verify_balanced(yaml.safe_dump(self.document), effective, managed)
+            for incorrect in (str(managed), "[REDACTED:home_path]/different/organization/.tirith/policy.yml",
+                              "[REDACTED:home_path]" + suffix.replace("policy.yml", "policy.yaml")):
+                with self.subTest(prefix=prefix, incorrect=incorrect), self.assertRaisesRegex(AssertionError, "source differs"):
+                    HARNESS.verify_balanced(yaml.safe_dump(self.document), {**effective, "source_path": incorrect}, managed)
+    def test_balanced_requires_explicit_public_display_contract(self):
+        effective = copy.deepcopy(self.effective)
+        effective["resolution"]["policy_is_redacted_display"] = False
+        with self.assertRaisesRegex(AssertionError, "public display contract"):
+            HARNESS.verify_balanced(yaml.safe_dump(self.document), effective, self.path)
+    def test_public_projection_preserves_nonhome_paths_exactly(self):
+        path = Path("/private/tmp/unique-fixture/organization/.tirith/policy.yml")
+        self.assertEqual(HARNESS.expected_public_policy_path(path), str(path))
     def test_restore_rejects_every_residual_field_and_empty_map(self):
         HARNESS.verify_restore(HARNESS.ORIGINAL)
         for suffix in ("fail_mode: open\n", "severity_overrides: {}\n", "allow_bypass_env: true\n",
@@ -151,7 +172,7 @@ class Predicates(unittest.TestCase):
              patch.object(HARNESS.NATIVE, "finish", return_value=[row()]):
             report = {}
             HARNESS.finish_service(self.job, ("origin", "token", "csrf"), report)
-            self.assertFalse(self.job.killed)
+            self.assertTrue(self.job.killed)  # Idempotent finish wrapper always closes ownership.
             self.assertEqual(report["owned_service"]["exit"], 0)
         for fact in row()["cleanup"]:
             bad = row(); bad["cleanup"][fact] = False

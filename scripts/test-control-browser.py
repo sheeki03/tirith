@@ -4,12 +4,19 @@
 Requires Python Playwright and its Chromium runtime. No user policy, trust store,
 project content or audit history is read or changed by the fixture environment.
 """
+if not __debug__:
+    raise RuntimeError("qualification assertions require Python without -O/PYTHONOPTIMIZE")
+
 import argparse
+from contextlib import contextmanager
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
-import subprocess
+import shutil
+import signal
+import stat
 import tempfile
 import time
 import urllib.parse
@@ -17,6 +24,307 @@ import urllib.request
 import uuid
 
 from playwright.sync_api import sync_playwright
+
+
+NATIVE_PATH = Path(__file__).resolve().parents[1] / "tools/qualification/mixed_audit_native.py"
+NATIVE_SHA256 = "913a3499bd78b39c6870b9dc280fcaad8a49739db7f2781bbfe914ff4db12e75"
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def native_helper():
+    assert digest(NATIVE_PATH) == NATIVE_SHA256, "native owner helper changed before load"
+    spec = importlib.util.spec_from_file_location("control_browser_native", NATIVE_PATH)
+    native = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(native)
+    assert digest(NATIVE_PATH) == NATIVE_SHA256, "native owner helper changed during load"
+    native.require_process_observation()
+    return native
+
+
+def safe_diagnostic(error, authentication):
+    message = str(error)
+    for secret in authentication[1:] if authentication else ():
+        if secret:
+            message = message.replace(secret, "[withheld]")
+    return message[:4096]
+
+
+_JOURNEY = None
+
+
+@contextmanager
+def journey_deadline(seconds):
+    global _JOURNEY
+    assert _JOURNEY is None, "another journey owns the process deadline"
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0), "an existing alarm owns this process"
+    assert signal.SIGALRM not in signal.pthread_sigmask(signal.SIG_BLOCK, set()), \
+        "journey deadline requires an initially unblocked SIGALRM"
+    previous = signal.getsignal(signal.SIGALRM)
+    state = {"depth": 0, "expired": False, "deadline": time.monotonic() + seconds}
+
+    def expired(signum, frame):
+        state["expired"] = True
+        if state["depth"] == 0:
+            raise TimeoutError(f"browser journey exceeded its {seconds} second deadline")
+        # No exception until the constructor's actual owned handle is retained.
+
+    _JOURNEY = state
+    try:
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        yield
+    finally:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        finally:
+            _JOURNEY = None
+            signal.signal(signal.SIGALRM, previous)
+
+
+@contextmanager
+def retain_spawn():
+    """Defer our timer's exception until the caller retains the new Job.
+
+    The one-shot timer keeps running; neither its interval nor the child's
+    signal mask changes. This is not a pre-spawn watchdog: if construction
+    stalls, expiry is raised as soon as it returns and the handle is retained.
+    """
+    state = _JOURNEY
+    if state is None:
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0), \
+            "cannot protect acquisition from an unmanaged timer"
+        yield
+        return
+    state["depth"] += 1
+    try:
+        yield
+    finally:
+        state["depth"] -= 1
+        if state["depth"] == 0 and (state["expired"] or time.monotonic() >= state["deadline"]):
+            raise TimeoutError("journey deadline expired while retaining an owned process")
+
+
+@contextmanager
+def retained_fixture_directory(report, prefix, directory=None):
+    """A failed journey must keep its files even when cleanup was successful."""
+    root = Path(tempfile.mkdtemp(prefix=prefix, dir=directory)).resolve()
+    report.update(fixture_root=str(root), fixture_retained=True)
+    try:
+        yield root
+    finally:
+        service = report.get("owned_service") or {}
+        if report.get("passed") and service.get("exit") == 0 and service.get("failure") is None \
+                and service.get("cleanup") and all(service["cleanup"].values()) \
+                and all(all(row["cleanup"].values()) for row in report.get("cli_observations", [])):
+            shutil.rmtree(root)
+            report["fixture_retained"] = False
+
+
+def read_discovery(path, job, startup_id, binary_sha256, project):
+    # The record is authentication evidence, never authority to signal a PID.
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as source:
+        info = os.fstat(source.fileno())
+        assert stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+        assert stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1
+        body = source.read(16385)
+    assert len(body) <= 16384, "discovery record exceeds its bound"
+    record = json.loads(body)
+    assert type(record["protocol"]) is int and record["protocol"] == 1
+    assert type(record["pid"]) is int and record["pid"] == job.process.pid
+    assert record["startup_id"] == startup_id
+    assert record["binary_sha256"] == binary_sha256 and record["cwd"] == str(project)
+    assert type(record["port"]) is int and 0 < record["port"] < 65536
+    assert str(uuid.UUID(record["service_id"])) == record["service_id"]
+    assert len(record["token"]) == 64 and all(c in "0123456789abcdef" for c in record["token"])
+    assert job.process.poll() is None, "owned service exited before discovery validation"
+    return record
+
+
+def await_discovery(path, job, startup_id, binary_sha256, project):
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        assert job.process.poll() is None, "owned control-serve exited during startup"
+        try:
+            return read_discovery(path, job, startup_id, binary_sha256, project)
+        except FileNotFoundError:
+            time.sleep(0.025)
+    raise TimeoutError("owned control-serve did not publish private discovery")
+
+
+def verify_launch(launch, record):
+    expected = f"http://127.0.0.1:{record['port']}/#token={record['token']}"
+    assert launch["kind"] == "dashboard_launch" and launch["service_id"] == record["service_id"]
+    assert launch["url"] == expected, "launcher did not reuse the owned service"
+    assert launch["browser_opened"] is False and launch["protection_changed"] is False
+
+
+def reuse_owned_service(cli, record):
+    # Without require-service-id the public launcher may detach a replacement
+    # if our retained service exits during the probe. This path must only reuse.
+    launch = cli("dashboard", "--no-browser", "--json",
+                 "--require-service-id", record["service_id"])
+    verify_launch(launch, record)
+    return launch
+
+
+def process_observation(row):
+    # In particular, launcher stdout contains a bearer URL and is not retained.
+    return {key: row[key] for key in ("name", "pid", "exit", "failure", "cleanup",
+                                    "group_observation", "elapsed_seconds")}
+
+
+def finish_owned(native, job):
+    # Job.finish allocates its selector before its try/finally. Retain cleanup
+    # even if that allocation (or another pre-drain operation) fails.
+    try:
+        return native.finish([job])[0]
+    finally:
+        try:
+            job.kill()
+        finally:
+            for name in ("stdout", "stderr"):
+                getattr(job.process, name).close()
+
+
+def owned_cli(native, name, argv, project, env, report, timeout=40):
+    job = None
+    try:
+        with retain_spawn():
+            job = native.Job(name, argv, project, env, timeout=timeout)
+        return finish_owned(native, job)
+    except BaseException:
+        # A deferred constructor expiry may be raised before finish starts.
+        if job is not None and not job.cleanup_attempted:
+            job.failure = job.failure or "cli-interrupted"
+            job.kill()
+            finish_owned(native, job)
+        raise
+    finally:
+        if job is not None:
+            report["cli_observations"].append(process_observation(job.result()))
+
+
+class BrowserOwner:
+    def __init__(self, native, binary, root, report, seconds):
+        self.native, self.binary, self.root, self.report = native, binary, root, report
+        self.seconds, self.service, self.authentication = seconds, None, None
+
+    def cli(self, project, env, *args, timeout=40):
+        row = owned_cli(self.native, "browser-cli", [str(self.binary), *args], project, env,
+                        self.report, timeout=timeout)
+        assert row["failure"] is None and row["exit"] == 0, "candidate CLI failed"
+        assert all(row["cleanup"].values()), "candidate CLI cleanup incomplete"
+        return row["stdout"]
+
+    def launch(self, project, env):
+        assert self.service is None, "this journey already owns a service"
+        startup_id = str(uuid.uuid4())
+        self.report["service_startup"] = {"startup_id": startup_id,
+            "binary_sha256": self.report["binary_sha256"], "cwd": str(project)}
+        with retain_spawn():
+            self.service = self.native.Job("browser-control-serve",
+                [str(self.binary), "dashboard", "control-serve", "--startup-id", startup_id],
+                project, env, timeout=self.seconds + 30)
+            self.report["service_startup"]["owned_pid"] = self.service.process.pid
+        discovery = self.root / "state/tirith/control/v1/service.json"
+        record = await_discovery(discovery, self.service, startup_id,
+                                 self.report["binary_sha256"], project)
+        origin, token = f"http://127.0.0.1:{record['port']}", record["token"]
+        self.authentication = (origin, token, None)
+        csrf = request(origin, token, "", "/api/session")["csrf"]
+        assert isinstance(csrf, str) and csrf, "service did not return CSRF authentication"
+        self.authentication = (origin, token, csrf)
+        self.report["service_identity"] = {key: record[key] for key in
+            ("protocol", "pid", "startup_id", "service_id", "binary_sha256")}
+        launch = reuse_owned_service(
+            lambda *args: json.loads(self.cli(project, env, *args, timeout=45)), record)
+        assert read_discovery(discovery, self.service, startup_id,
+                              self.report["binary_sha256"], project) == record
+        self.report["checks"].append("launcher_reuses_owned_service_and_startup_identity")
+        return launch, origin, token, csrf
+
+    def finish(self):
+        job = self.service
+        if job is None:
+            return
+        try:
+            # This separate bound runs after the UI alarm has been disarmed.
+            with journey_deadline(15):
+                assert job.process.poll() is None, "owned service exited before requested quiesce"
+                assert self.authentication, "startup failed before service authentication"
+                origin, token, csrf = self.authentication
+                if csrf is None:
+                    csrf = request(origin, token, "", "/api/session")["csrf"]
+                response = request(origin, token, csrf, "/api/quiesce", {})
+                assert response["state"] == "draining" and response["new_mutations_accepted"] is False
+                self.report["quiesce_response"] = {key: response[key] for key in
+                                                    ("state", "new_mutations_accepted")}
+        except BaseException as error:
+            self.report["shutdown_error"] = safe_diagnostic(error, self.authentication)
+            job.failure = job.failure or "service-quiesce"
+            job.kill()  # Authority is the retained child, never the discovery PID.
+        finally:
+            job.timeout = min(job.timeout, time.monotonic() - job.started + 12)
+            try:
+                row = finish_owned(self.native, job)
+            finally:
+                self.report["owned_service"] = process_observation(job.result())
+        assert row["failure"] is None and row["exit"] == 0, "owned service did not exit gracefully"
+        assert all(row["cleanup"].values()), "owned service cleanup incomplete"
+        self.report["checks"].append("owned_service_exited_and_original_group_cleanup_observed")
+
+
+@contextmanager
+def browser_fixture(binary, output, report, prefix, seconds):
+    output.mkdir(parents=True, exist_ok=False)
+    report.update(passed=False, cli_observations=[], native_helper_sha256=NATIVE_SHA256,
+                  fixture_retained=False, journey_deadline_seconds=seconds,
+                  deadline_semantics="constructor expiry deferred until handle retention; no pre-spawn watchdog",
+                  cleanup_scope="owned CLI/control-service original groups; no browser process-tree proof")
+    owner, error = None, None
+    try:
+        assert os.name == "posix" and os.geteuid() != 0 and os.geteuid() == os.getuid(), \
+            "browser qualification requires a native ordinary POSIX owner"
+        native = native_helper()
+        root = Path(tempfile.mkdtemp(prefix=prefix, dir=output)).resolve()
+        report.update(fixture_root=str(root), fixture_retained=True)
+        owner = BrowserOwner(native, binary, root, report, seconds)
+        with journey_deadline(seconds):
+            yield owner
+    except BaseException as caught:
+        error = caught
+        report["error"] = safe_diagnostic(caught, owner.authentication if owner else None)
+    finally:
+        if owner:
+            try:
+                owner.finish()
+            except BaseException as caught:
+                report["cleanup_error"] = safe_diagnostic(caught, owner.authentication)
+                error = error or caught
+        try:
+            report["binary_unchanged_during_run"] = report["binary_sha256"] == digest(binary)
+            report["harness_unchanged_during_run"] = report["harness_sha256"] == digest(Path(__file__))
+            report["native_helper_unchanged_during_run"] = digest(NATIVE_PATH) == NATIVE_SHA256
+            assert report["binary_unchanged_during_run"] and report["harness_unchanged_during_run"] \
+                and report["native_helper_unchanged_during_run"], "qualification inputs changed during run"
+            assert owner is not None and owner.service is not None, "no owned service was qualified"
+            if error is None:
+                # Acknowledgement alone cannot admit fixture removal or success.
+                observed = report["owned_service"]
+                assert observed["failure"] is None and observed["exit"] == 0
+                assert all(observed["cleanup"].values())
+                assert all(all(row["cleanup"].values()) for row in report["cli_observations"])
+                shutil.rmtree(owner.root)
+                report.update(passed=True, fixture_retained=False)
+        except BaseException as caught:
+            report["admission_error"] = safe_diagnostic(caught, owner.authentication if owner else None)
+            error = error or caught
+        (output / "browser-results.json").write_text(json.dumps(report, indent=2) + "\n")
+    if error is not None:
+        raise error
 
 
 def request(origin, token, csrf, path, body=None):
@@ -27,23 +335,23 @@ def request(origin, token, csrf, path, body=None):
         headers.update({"Origin": origin, "X-Tirith-CSRF": csrf, "Content-Type": "application/json"})
     req = urllib.request.Request(origin + path, data=data, headers=headers)
     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=40) as response:
-        return json.load(response)
+        body = response.read(4 * 1024 * 1024 + 1)
+        assert len(body) <= 4 * 1024 * 1024, "control response exceeds fixture bound"
+        return json.loads(body)
 
 
 def run(binary, output):
-    output.mkdir(parents=True, exist_ok=True)
     report = {"schema_version": 1, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "checks": [], "operation_observations": [], "api_observations": [],
               "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "execution_claim": "local_control_workflow_only"}
-    with tempfile.TemporaryDirectory(prefix="tirith-browser-fixture-") as raw_root:
-        root = Path(raw_root).resolve()
+    with browser_fixture(binary, output, report, "tirith-browser-fixture-", 900) as owner:
+        root = owner.root
         names = {"HOME": "home", "USERPROFILE": "home", "XDG_CONFIG_HOME": "home/.config",
                  "XDG_CONFIG_DIRS": "config-dirs", "XDG_DATA_HOME": "data", "XDG_STATE_HOME": "state",
                  "XDG_CACHE_HOME": "cache", "XDG_RUNTIME_DIR": "runtime", "APPDATA": "appdata",
                  "LOCALAPPDATA": "local-appdata", "TMPDIR": "temp", "TMP": "temp", "TEMP": "temp"}
-        env = {key: value for key, value in os.environ.items()
-               if not key.startswith("TIRITH_") and key not in {"TIRITH", "SUDO_USER", "SUDO_UID", "SUDO_GID"}}
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"}
         for key, suffix in names.items():
             directory = root / suffix
             directory.mkdir(parents=True, exist_ok=True)
@@ -68,22 +376,15 @@ def run(binary, output):
         audit.write_text(prior_checks + json.dumps({"timestamp": "2026-09-12T00:00:00Z", "action": "WarnAck",
                                     "event_id": event_id,
                                     "command_redacted": hostile, "rule_ids": ["curl_pipe_shell"]}) + "\n")
-        launched = subprocess.run([str(binary), "dashboard", "--no-browser", "--json"], cwd=project,
-                                  env=env, capture_output=True, text=True, timeout=45)
-        if launched.returncode:
-            raise AssertionError("candidate service failed to launch: " + launched.stderr)
-        launch = json.loads(launched.stdout)
-        parsed = urllib.parse.urlsplit(launch["url"])
-        origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
-        token = urllib.parse.parse_qs(parsed.fragment)["token"][0]
-        session = request(origin, token, "", "/api/session")
-        csrf = session["csrf"]
+        launch, origin, token, csrf = owner.launch(project, env)
         errors = []
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(headless=True, timeout=30000)
                 page = browser.new_page(viewport={"width": 1440, "height": 1050})
-                page.on("pageerror", lambda error: errors.append(str(error)))
+                page.set_default_timeout(30000)
+                page.set_default_navigation_timeout(30000)
+                page.on("pageerror", lambda error: errors.append(safe_diagnostic(error, owner.authentication)))
                 observed_started = time.monotonic()
                 def observe_response(response):
                     path = urllib.parse.urlsplit(response.url).path
@@ -234,8 +535,8 @@ def run(binary, output):
                     # The hostile history row above is deliberately a legacy
                     # display fixture. Add an actual writer-produced chain tail
                     # before requesting a verified rotation checkpoint.
-                    written = subprocess.run([str(binary), "hook-event", "--integration", "browser-fixture", "--hook-type", "retention", "--event", "before"], cwd=project, env=env, capture_output=True, text=True, timeout=40)
-                    assert written.returncode == 0, written.stderr
+                    owner.cli(project, env, "hook-event", "--integration", "browser-fixture",
+                              "--hook-type", "retention", "--event", "before")
                     original_audit = audit.read_bytes()
                     page.get_by_role("button", name="Review audit rotation", exact=True).click()
                     page.get_by_role("button", name="Apply reviewed change", exact=True).wait_for()
@@ -336,31 +637,23 @@ def run(binary, output):
                     report["checks"].append("narrow_layout_has_no_horizontal_overflow")
                     assert not errors, errors
                 except Exception as error:
-                    report.update(passed=False, error=str(error), browser_errors=errors)
+                    report.update(passed=False, error=safe_diagnostic(error, owner.authentication), browser_errors=errors)
                     (output / "browser-results.json").write_text(json.dumps(report, indent=2) + "\n")
                     page.screenshot(path=str(output / "failure.png"), full_page=True)
                     (output / "failure-view.txt").write_text(page.locator("body").inner_text())
                     (output / "failure-details.json").write_text(json.dumps(page.locator("#operation-content pre").all_text_contents(), indent=2))
                     raise
-                browser.close()
+                finally:
+                    browser.close()
         finally:
-            try:
-                request(origin, token, csrf, "/api/quiesce", {})
-            except Exception:
-                pass
-            # Give the service a bounded opportunity to release open Windows
-            # directory handles before the temporary fixture is removed.
-            time.sleep(1)
+            report["browser_errors"] = errors
         report["binary_unchanged_during_run"] = report["binary_sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
         assert report["binary_unchanged_during_run"], "candidate binary changed during browser run"
-        report["passed"] = True
-        (output / "browser-results.json").write_text(json.dumps(report, indent=2) + "\n")
-        print(json.dumps({"passed": True, "checks": report["checks"], "binary_sha256": report["binary_sha256"]}))
+    print(json.dumps({"passed": report["passed"], "checks": report["checks"], "binary_sha256": report["binary_sha256"]}))
 
 
 def run_response_order(binary, output, app_js=None):
     """Delay real API responses; all plans, mutations and lifecycle state are real."""
-    output.mkdir(parents=True, exist_ok=True)
     source = app_js.read_bytes() if app_js else None
     report = {"schema_version": 1, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "source_override": source is not None,
@@ -368,10 +661,9 @@ def run_response_order(binary, output, app_js=None):
               "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "execution_claim": "real_backend_response_order_with_source_override" if source else "embedded_candidate_response_order",
               "checks": [], "requests": [], "delayed_responses": []}
-    with tempfile.TemporaryDirectory(prefix="tirith-browser-order-") as temporary:
-        root = Path(temporary).resolve()
-        env = {key: value for key, value in os.environ.items()
-               if not key.startswith("TIRITH_") and key not in {"TIRITH", "SUDO_USER", "SUDO_UID", "SUDO_GID"}}
+    with browser_fixture(binary, output, report, "tirith-browser-order-", 360) as owner:
+        root = owner.root
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"}
         for key, suffix in {"HOME":"home", "USERPROFILE":"home", "XDG_CONFIG_HOME":"home/.config",
                             "XDG_CONFIG_DIRS":"config-dirs", "XDG_DATA_HOME":"data", "XDG_STATE_HOME":"state",
                             "XDG_CACHE_HOME":"cache", "XDG_RUNTIME_DIR":"runtime", "APPDATA":"appdata",
@@ -386,20 +678,15 @@ def run_response_order(binary, output, app_js=None):
         policy = root / "home/.config/tirith/policy.yml"
         policy.parent.mkdir()
         policy.write_text("custom_operator_note: preserve-response-order-fixture\n")
-        launched = subprocess.run([str(binary), "dashboard", "--no-browser", "--json"], cwd=project,
-                                  env=env, capture_output=True, text=True, timeout=45)
-        assert launched.returncode == 0, launched.stderr
-        launch = json.loads(launched.stdout)
-        parsed = urllib.parse.urlsplit(launch["url"])
-        origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
-        token = urllib.parse.parse_qs(parsed.fragment)["token"][0]
-        csrf = request(origin, token, "", "/api/session")["csrf"]
+        launch, origin, token, csrf = owner.launch(project, env)
         errors, rules, held = [], [], []
         try:
             with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
+                browser = playwright.chromium.launch(headless=True, timeout=30000)
                 page = browser.new_page(viewport={"width":1440, "height":1050})
-                page.on("pageerror", lambda error: errors.append(str(error)))
+                page.set_default_timeout(30000)
+                page.set_default_navigation_timeout(30000)
+                page.on("pageerror", lambda error: errors.append(safe_diagnostic(error, owner.authentication)))
                 if source is not None:
                     page.route(origin + "/app.js", lambda route: route.fulfill(status=200, content_type="text/javascript", body=source))
 
@@ -579,7 +866,7 @@ def run_response_order(binary, output, app_js=None):
                     assert "preserve-response-order-fixture" in policy.read_text()
                     page.screenshot(path=str(output / "response-order-complete.png"), full_page=True)
                 except Exception as error:
-                    report.update(passed=False, error=str(error), browser_errors=errors)
+                    report.update(passed=False, error=safe_diagnostic(error, owner.authentication), browser_errors=errors)
                     page.screenshot(path=str(output / "failure.png"), full_page=True)
                     (output / "failure-view.txt").write_text(page.locator("body").inner_text())
                     raise
@@ -587,17 +874,11 @@ def run_response_order(binary, output, app_js=None):
                     (output / "browser-results.json").write_text(json.dumps(report, indent=2) + "\n")
                     browser.close()
         finally:
-            try:
-                request(origin, token, csrf, "/api/quiesce", {})
-            except Exception:
-                pass
-            time.sleep(1)
+            report["browser_errors"] = errors
         assert report["binary_sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
         if app_js:
             assert source == app_js.read_bytes(), "source override changed during the run"
-        report["passed"] = True
-        (output / "browser-results.json").write_text(json.dumps(report, indent=2) + "\n")
-        print(json.dumps({"passed":True, "checks":report["checks"], "source_override":report["source_override"]}))
+    print(json.dumps({"passed":report["passed"], "checks":report["checks"], "source_override":report["source_override"]}))
 
 
 if __name__ == "__main__":

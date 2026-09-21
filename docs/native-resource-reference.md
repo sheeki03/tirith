@@ -8,9 +8,22 @@ remains valid for its original cohort; the five Linux class refusals remain
 refusals. A new cohort never relabels those attempts.
 
 The current [GitHub runner specifications](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
-list `macos-15` as a standard native three-core M1 runner. The collector requires
-Darwin/ARM64 and an actual `Apple M1` CPU identity, records the native boot UUID,
-kernel, image/version and CPU count, and rechecks all these facts between roles.
+list `macos-15` as a standard three-core M1 virtual machine. The collector and
+baseline reviewer require Darwin/ARM64 and the exact native `sysctl` CPU identity
+`Apple M1 (Virtual)`. Bare `Apple M1`, other CPU names and normalized aliases are
+not admitted or mixed with this cohort. The collector records the native boot
+UUID, kernel, image/version and CPU count, and rechecks these facts between roles.
+
+The [diagnostic run 35566520786](https://github.com/sheeki03/tirith/actions/runs/35566520786)
+reported `Apple M1 (Virtual)`, three logical CPUs, Darwin `24.6.0`, image `macos15`
+and image version `20260907.0337.1`. These are initial observed host facts, not a
+baseline, reviewed budget or promise that future jobs have the same image.
+The diagnostic and the three earlier runs `35565819502`, `35565843602` and
+`35565863397` remain refused attempts. They are not reclassified by this explicit
+cohort change. Collect three new independent final-source baselines with matching
+host, runtime, source and build contracts before selecting any ceiling. A changed
+kernel, image or CPU count must remain a separate cohort for review.
+
 The current [macOS 15 ARM image manifest](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md)
 lists Python 3.14.7 and Rust/Cargo 1.98.1. The collector still checks the actual
 runtime and toolchain before using them.

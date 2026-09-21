@@ -4283,6 +4283,8 @@ mod tests {
 
     #[test]
     fn selfupdate_policy_deny_precedes_any_temp_or_destination_write() {
+        // Runtime authorization records audit/session state through process-global roots.
+        let _environment = tirith_test_support::GlobalStateGuard::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("tirith");
         let envelope = self_boundary_envelope(
@@ -4407,6 +4409,8 @@ mod tests {
 
     #[test]
     fn retained_selfupdate_authorization_rejects_operation_swap() {
+        // Runtime authorization records audit/session state through process-global roots.
+        let _environment = tirith_test_support::GlobalStateGuard::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("tirith");
         let envelope = self_boundary_envelope(

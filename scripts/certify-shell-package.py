@@ -6,14 +6,16 @@ platforms absent from this run remain unavailable, never inferred from config.
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -23,6 +25,10 @@ import time
 import zipfile
 
 MAX_BINARY_BYTES = 512 * 1024 * 1024
+MAX_PROCESS_OUTPUT_BYTES = 4 * 1024 * 1024
+OWNER_HELPER_SHA256 = "913a3499bd78b39c6870b9dc280fcaad8a49739db7f2781bbfe914ff4db12e75"
+OWNER_HELPER = Path(__file__).resolve().parents[1] / "tools/qualification/mixed_audit_native.py"
+_OWNER_RUNTIME = None
 HOOKS = ("bash-hook.bash", "zsh-hook.zsh", "fish-hook.fish",
          "powershell-hook.ps1", "nushell-hook.nu")
 
@@ -70,19 +76,157 @@ def bounded_digest(stream):
     return digest.hexdigest()
 
 
-def run(command, env, timeout=15):
-    process = subprocess.Popen(command, env=env, text=True, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, start_new_session=True)
+def owner_runtime():
+    global _OWNER_RUNTIME
+    if sha256(OWNER_HELPER) != OWNER_HELPER_SHA256:
+        raise ValueError("owned-process helper differs from the reviewed implementation")
+    if _OWNER_RUNTIME is None:
+        spec = importlib.util.spec_from_file_location("shell_package_owned", OWNER_HELPER)
+        _OWNER_RUNTIME = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_OWNER_RUNTIME)
+        if sha256(OWNER_HELPER) != OWNER_HELPER_SHA256:
+            _OWNER_RUNTIME = None
+            raise ValueError("owned-process helper changed while loading")
+    _OWNER_RUNTIME.require_process_observation()
+    return _OWNER_RUNTIME
+
+
+def merged_job(command, env, timeout):
+    """Keep the existing merged pipe/input contract with shared owned cleanup.
+
+    Job.kill owns original-group signals, WNOWAIT observations and final reap.
+    Its usual two-stream finish() is not used: this wrapper must preserve the
+    native ordering of merged stdout/stderr and its larger bounded test log.
+    """
+    owned = owner_runtime()
+
+    class MergedJob(owned.Job):
+        def __init__(self):
+            self.name, self.argv, self.started = "shell-package-command", list(map(str, command)), time.monotonic()
+            self.timeout = timeout
+            self.output = {"stdout": bytearray(), "stderr": bytearray()}
+            self.failure = None
+            self.pipe_deadline = None
+            self.cleanup = {"leader_reaped": False, "group_signaled_or_absent": False,
+                            "group_members_exited": False, "output_eof": False}
+            self.group_observation = None
+            self.cleanup_attempted = False
+            # stdin and cwd remain inherited, as in the original wrapper.
+            self.process = owned.OwnedProcess(self.argv, env=env, stdout=subprocess.PIPE,
+                                              stderr=subprocess.STDOUT, start_new_session=True)
+
+    return MergedJob()
+
+
+def run(command, env, timeout=15, observations=None):
+    # Selector allocation cannot leave an already spawned child unowned.
+    selector = selectors.DefaultSelector()
+    job = None
+    error = None
     try:
-        output, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
-        raise
-    return subprocess.CompletedProcess(command, process.returncode, output)
+        job = merged_job(command, env, timeout)
+        process = job.process
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while process.poll() is None or selector.get_map():
+            now = time.monotonic()
+            if process.poll() is not None:
+                # Clean descendants even after a quick leader exit, including
+                # descendants that retain the pipe or closed it before sleeping.
+                job.kill()
+            elif now - job.started >= timeout:
+                job.failure = job.failure or "timeout"
+                job.kill()
+            if job.pipe_deadline is not None and now >= job.pipe_deadline:
+                # Cleanup can fail with a still-live leader whose pipes have
+                # already closed. An empty selector is not process-exit proof.
+                job.failure = job.failure or ("output-drain-timeout" if selector.get_map()
+                                              else "process-cleanup-timeout")
+                break
+            for event, _ in selector.select(0.02):
+                block = os.read(event.fileobj.fileno(), 16384)
+                if not block:
+                    selector.unregister(event.fileobj)
+                    job.cleanup["output_eof"] = True
+                    continue
+                room = MAX_PROCESS_OUTPUT_BYTES - len(job.output["stdout"])
+                job.output["stdout"].extend(block[:room])
+                if len(block) > room:
+                    job.failure = job.failure or "output-limit"
+                    job.kill()
+    except BaseException as caught:
+        error = caught
+    finally:
+        try:
+            selector.close()
+        finally:
+            if job is not None:
+                job.kill()
+                job.process.stdout.close()
+    if job is None:
+        raise error
+    process = job.process
+    result = job.result()
+    # Match text=True's newline normalization; the evidence digest below stays
+    # over the exact bounded merged bytes read from the native pipe.
+    output = result.pop("stdout").replace("\r\n", "\n").replace("\r", "\n")
+    result.pop("stderr")
+    result["merged_output_bytes"] = len(job.output["stdout"])
+    result["merged_output_sha256"] = hashlib.sha256(job.output["stdout"]).hexdigest()
+    result["cleanup_scope"] = "owned original process group; test-owned PTY sessions require their own cleanup"
+    if observations is not None:
+        observations.append(result)
+    if error is not None:
+        error.qualification = result
+        raise error
+    if not all(result["cleanup"].values()):
+        error = ValueError("native command cleanup is incomplete")
+    elif result["failure"] == "timeout":
+        error = subprocess.TimeoutExpired(command, timeout, output=output)
+    elif result["failure"] is not None:
+        error = ValueError("native command failed qualification: " + result["failure"])
+    if error is not None:
+        error.qualification = result
+        raise error
+    completed = subprocess.CompletedProcess(command, process.returncode, output)
+    completed.qualification = result
+    return completed
 
 
-def shell_path(family):
+def pty_cleanup_evidence(output):
+    """Admit the test-owned sessions separately from the outer command group."""
+    starts, ends = {}, {}
+    for line in output.splitlines():
+        for marker, destination in (("TIRITH_PTY_OWNED_BEGIN ", starts),
+                                    ("TIRITH_PTY_OWNED_CLEANUP ", ends)):
+            if marker not in line:
+                continue
+            value = json.loads(line.split(marker, 1)[1])
+            identity = value["id"]
+            if (not isinstance(identity, str) or not identity or identity in destination
+                    or value["schema_version"] != 1
+                    or value["scope"] != "original_owned_pty_session"
+                    or type(value["pid"]) is not int or value["pid"] <= 0):
+                raise ValueError("invalid or duplicate native PTY ownership record")
+            destination[identity] = value
+    if not starts or set(starts) != set(ends):
+        raise ValueError("missing native PTY ownership or completion evidence")
+    for identity, value in ends.items():
+        if value["pid"] != starts[identity]["pid"]:
+            raise ValueError("native PTY owner changed")
+        if (any(value.get(key) is not True for key in
+                ("passed", "native_eof", "reader_joined", "private_pty_handles_released"))
+                or any(value["native"].get(key) is not True for key in
+                ("leader_reaped", "original_group_exited", "original_session_exited",
+                 "reaped_after_native_observation"))
+                or value["native"].get("errors") != [] or value.get("errors") != []):
+            raise ValueError("test-owned native PTY cleanup is incomplete")
+    return {"scope": "original owned PTY groups/sessions, separately retained before reap",
+            "sessions": list(ends.values()),
+            "limitations": "No escaped-session, arbitrary process-tree, opaque Drop close-status or external-interruption claim"}
+
+
+def shell_path(family, observations=None):
     candidates = [shutil.which(family)]
     if family == "bash":
         candidates = ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"] + candidates
@@ -90,7 +234,8 @@ def shell_path(family):
         if candidate and Path(candidate).is_file():
             path = Path(candidate).resolve()
             if family == "bash":
-                version = run([str(path), "--version"], {"PATH": os.defpath}).stdout
+                version = run([str(path), "--version"], {"PATH": os.defpath},
+                              observations=observations).stdout
                 match = re.search(r"version (\d+)\.", version)
                 if not match or int(match[1]) < 5:
                     continue
@@ -114,6 +259,24 @@ def save_report(path, report):
     os.replace(temporary, path)
 
 
+@contextmanager
+def certification_root(report):
+    """Retain failures, especially when process ownership/EOF is unproved."""
+    root = Path(tempfile.mkdtemp(prefix="tirith-package-certification-")).resolve()
+    report["fixture_root"] = str(root)
+    report["fixture_removed"] = False
+    completed = False
+    try:
+        yield root
+        completed = True
+    finally:
+        processes = report["processes"]
+        if (completed and report["state"] == "supported" and processes
+                and all(all(row["cleanup"].values()) for row in processes)):
+            shutil.rmtree(root)
+            report["fixture_removed"] = True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", required=True, type=Path, help="candidate .tar.gz or .zip")
@@ -132,6 +295,9 @@ def main():
     report = {
         "schema_version": 1, "started_at": int(time.time()),
         "runner_sha256": sha256(Path(__file__).resolve()),
+        "owner_helper_sha256": sha256(OWNER_HELPER),
+        "process_output_limit_bytes": MAX_PROCESS_OUTPUT_BYTES,
+        "processes": [],
         "platform": {"system": os.uname().sysname, "release": os.uname().release,
                      "architecture": os.uname().machine},
         "package": {"name": package.name, "sha256": sha256(package)},
@@ -147,8 +313,7 @@ def main():
     try:
         if packaged_binary_digest(package) != report["binary"]["sha256"]:
             raise ValueError("binary does not match the candidate package")
-        with tempfile.TemporaryDirectory(prefix="tirith-package-certification-") as temporary:
-            root = Path(temporary).resolve()
+        with certification_root(report) as root:
             candidate = root / "installation" / "bin" / "tirith"
             candidate.parent.mkdir(parents=True)
             shutil.copy2(binary, candidate)
@@ -156,11 +321,12 @@ def main():
             env = isolated_env(root, candidate)
             for key in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"):
                 Path(env[key]).mkdir()
-            version = run([str(candidate), "--version"], env)
+            version = run([str(candidate), "--version"], env, observations=report["processes"])
             if version.returncode != 0:
                 raise ValueError("candidate version probe failed")
             report["binary"]["version"] = version.stdout.strip()
-            initialized = run([str(candidate), "init", "--shell", "bash"], env)
+            initialized = run([str(candidate), "init", "--shell", "bash"], env,
+                              observations=report["processes"])
             lines = [line for line in initialized.stdout.splitlines() if line.startswith("source ")]
             if initialized.returncode != 0 or len(lines) != 1:
                 raise ValueError("candidate could not materialize its own hook bundle")
@@ -175,26 +341,30 @@ def main():
             for family in families:
                 row = {"family": family, "state": "running"}
                 report["shells"].append(row)
-                shell = shell_path(family)
+                shell = shell_path(family, observations=report["processes"])
                 if shell is None:
                     row.update(state="unavailable", reason="native executable is absent or unsupported")
                     save_report(args.report, report)
                     continue
                 row["executable"] = str(shell)
-                row["version"] = run([str(shell), "--version"], env).stdout.strip()
+                row["version"] = run([str(shell), "--version"], env,
+                                     observations=report["processes"]).stdout.strip()
                 row["executable_sha256"] = sha256(shell)
                 env["TIRITH_CERTIFY_" + family.upper()] = str(shell)
                 env["TIRITH_CERTIFY_SHELLS"] = family
-                listing = run([str(harness), family + "_", "--list"], env)
+                listing = run([str(harness), family + "_", "--list"], env,
+                              observations=report["processes"])
                 tests = [line.removesuffix(": test") for line in listing.stdout.splitlines()
                          if line.endswith(": test")]
                 row["tests"] = tests
                 if listing.returncode != 0 or not tests:
                     raise ValueError(f"harness has no {family} test cases")
-                output = run([str(harness), family + "_", "--test-threads=1", "--nocapture"], env, 1200)
+                output = run([str(harness), family + "_", "--test-threads=1", "--nocapture"], env, 1200,
+                             observations=report["processes"])
                 log = args.report.with_name(args.report.stem + "-" + family + ".log")
                 log.write_text(output.stdout)
                 row["log"] = str(log.resolve())
+                row["pty_cleanup"] = pty_cleanup_evidence(output.stdout)
                 summary = re.search(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", output.stdout)
                 passed = bool(output.returncode == 0 and summary and
                               int(summary[1]) == len(tests) and summary[2] == "0" and summary[3] == "0"
@@ -203,7 +373,11 @@ def main():
                 save_report(args.report, report)
             report["state"] = "supported" if all(row["state"] == "supported"
                                                   for row in report["shells"]) else "incomplete"
-    except (OSError, ValueError, subprocess.TimeoutExpired, tarfile.TarError, zipfile.BadZipFile) as error:
+            if sha256(OWNER_HELPER) != OWNER_HELPER_SHA256:
+                report["state"] = "failed"
+                raise ValueError("owned-process helper changed during qualification")
+    except (OSError, ValueError, RuntimeError, AssertionError, subprocess.TimeoutExpired,
+            tarfile.TarError, zipfile.BadZipFile, KeyboardInterrupt) as error:
         report.update(state="failed", reason=str(error))
         for row in report["shells"]:
             if row["state"] == "running":

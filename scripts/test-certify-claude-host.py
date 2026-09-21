@@ -164,24 +164,158 @@ class BoundedExecution(unittest.TestCase):
         finally:
             self.assertTrue(all(child.close().values()))
 
-    def test_fast_exiting_process_retries_permission_race(self):
-        import errno
+    def test_natural_exit_remains_owned_through_observation_and_reap(self):
         import sys
         child = h.BoundedProcess([sys.executable, "-I", "-S", "-c", "pass"], Path.cwd(), {})
-        actual_killpg = os.killpg
-        attempts = []
-        def racing_killpg(pid, signum):
-            self.assertEqual(pid, child.process.pid)
-            attempts.append(pid)
-            if len(attempts) <= 2:
-                raise PermissionError(errno.EPERM, "controlled exit race")
-            return actual_killpg(pid, signum)
-        with mock.patch.object(h.os, "killpg", side_effect=racing_killpg):
+        child.process.wait(timeout=2)  # Native WNOWAIT, not an ordinary Popen wait.
+        self.assertFalse(child.process.reaped)
+        actual_observe, actual_reap = child.native.group_members, child.process.reap
+        stages = []
+        def observe(group):
+            self.assertEqual(group, child.process.pid)
+            self.assertFalse(child.process.reaped)
+            self.assertFalse(child.process.ownership_lost)
+            stages.append("observe")
+            return actual_observe(group)
+        def reap():
+            self.assertTrue(child.cleanup["process_group_exited"])
+            stages.append("reap")
+            return actual_reap()
+        with mock.patch.object(child.native, "group_members", side_effect=observe), \
+                mock.patch.object(child.process, "reap", side_effect=reap), \
+                mock.patch.object(h.os, "killpg") as signal_group:
             cleanup = child.close()
         self.assertTrue(all(cleanup.values()), cleanup)
         self.assertIsNone(child.cleanup_error)
-        self.assertGreaterEqual(len(attempts), 3)
+        self.assertEqual(stages[-1], "reap")
+        self.assertIn("observe", stages[:-1])
+        signal_group.assert_not_called()
         self.assertIs(child.close(), cleanup)
+
+    def test_permission_refusal_does_not_authorize_signaling_after_reap(self):
+        import errno
+        import sys
+        child = h.BoundedProcess([sys.executable, "-I", "-S", "-c", "import time;time.sleep(0.05)"], Path.cwd(), {})
+        attempts = []
+        def refusal(pid, signum):
+            self.assertEqual(pid, child.process.pid)
+            self.assertFalse(child.process.reaped)
+            self.assertFalse(child.process.ownership_lost)
+            attempts.append(pid)
+            raise PermissionError(errno.EPERM, "controlled exit race")
+        with mock.patch.object(h.os, "killpg", side_effect=refusal):
+            cleanup = child.close()
+        self.assertTrue(all(cleanup.values()), cleanup)
+        self.assertIsNone(child.cleanup_error)
+        self.assertIs(child.close(), cleanup)
+
+    def test_external_reap_never_authorizes_a_numeric_group_signal(self):
+        import sys
+        child = h.BoundedProcess([sys.executable, "-I", "-S", "-c", "pass"], Path.cwd(), {})
+        child.process.wait(timeout=2)
+        child.process.reap()  # Simulate a caller violating retained ownership.
+        with mock.patch.object(h.os, "killpg") as signal_group:
+            cleanup = child.close()
+        signal_group.assert_not_called()
+        self.assertFalse(cleanup["process_group_exited"])
+        self.assertIsNotNone(child.cleanup_error)
+
+    def test_unavailable_group_observation_cannot_be_reported_as_clean(self):
+        import sys
+        child = h.BoundedProcess([sys.executable, "-I", "-S", "-c", "pass"], Path.cwd(), {})
+        child.process.wait(timeout=2)
+        with mock.patch.object(child.native, "group_members", side_effect=RuntimeError("controlled unavailable observation")):
+            cleanup = child.close()
+        self.assertTrue(cleanup["leader_reaped"])
+        self.assertFalse(cleanup["process_group_exited"])
+        self.assertEqual(child.cleanup_error, "process_group_observation_failed")
+
+    def test_incomplete_cleanup_retains_only_its_private_fixture(self):
+        import sys
+        root = None
+        try:
+            with self.assertRaisesRegex(RuntimeError, "private fixture retained"):
+                with h.fixture_directory("tirith-host-owner-test-") as root:
+                    child = h.BoundedProcess([sys.executable, "-I", "-S", "-c", "pass"], root, {})
+                    child.process.wait(timeout=2)
+                    with mock.patch.object(child.native, "group_members", side_effect=RuntimeError("controlled unavailable observation")):
+                        cleanup = child.close()
+                    self.assertTrue(cleanup["leader_reaped"])
+                    self.assertFalse(cleanup["process_group_exited"])
+            self.assertTrue(root.is_dir())
+        finally:
+            # This control independently knows its one inert child was reaped;
+            # it deliberately injected only observation failure, no descendant.
+            if root is not None:
+                import shutil
+                shutil.rmtree(root)
+
+    def test_selector_creation_failure_precedes_spawn(self):
+        native = h.owned_native()
+        with mock.patch.object(h.selectors, "DefaultSelector", side_effect=OSError("controlled selector failure")), \
+                mock.patch.object(native, "OwnedProcess") as spawn:
+            with self.assertRaisesRegex(OSError, "controlled selector failure"):
+                h.BoundedProcess(["inert-not-started"], Path.cwd(), {})
+        spawn.assert_not_called()
+
+    def check_pipe_setup_failure(self, failure_kind):
+        import sys
+        import shutil
+        native = h.owned_native()
+        actual_spawn, actual_close = native.OwnedProcess, h.BoundedProcess.close
+        actual_nonblocking = os.set_blocking
+        spawned, closed, calls = [], [], []
+        def spawn(*args, **kwargs):
+            owner = actual_spawn(*args, **kwargs)
+            spawned.append(owner)
+            return owner
+        def close(child):
+            closed.append(child)
+            return actual_close(child)
+        def nonblocking(fd, value):
+            calls.append(fd)
+            if len(calls) == failure_kind:
+                raise OSError("controlled pipe setup failure")
+            return actual_nonblocking(fd, value)
+        selector = h.selectors.DefaultSelector() if failure_kind == "register" else None
+        root = None
+        try:
+            with self.assertRaisesRegex(RuntimeError, "private fixture retained"):
+                with h.fixture_directory("tirith-host-pipe-test-") as root:
+                    with mock.patch.object(native, "OwnedProcess", side_effect=spawn), \
+                            mock.patch.object(h.BoundedProcess, "close", new=close):
+                        if selector is not None:
+                            with mock.patch.object(h.selectors, "DefaultSelector", return_value=selector), \
+                                    mock.patch.object(selector, "register", side_effect=OSError("controlled pipe setup failure")):
+                                with self.assertRaisesRegex(OSError, "controlled pipe setup failure"):
+                                    h.BoundedProcess([sys.executable, "-I", "-S", "-c", "import time;time.sleep(20)"], root, {}, interactive=True)
+                        else:
+                            with mock.patch.object(h.os, "set_blocking", side_effect=nonblocking):
+                                with self.assertRaisesRegex(OSError, "controlled pipe setup failure"):
+                                    h.BoundedProcess([sys.executable, "-I", "-S", "-c", "import time;time.sleep(20)"], root, {}, interactive=True)
+                    self.assertEqual(len(spawned), 1)
+                    self.assertEqual(len(closed), 1)
+                    self.assertTrue(spawned[0].reaped)
+                    self.assertTrue(closed[0].cleanup["process_group_exited"])
+                    self.assertFalse(closed[0].cleanup["output_eof"], "unregistered or undrained pipes have no EOF proof")
+                    for stream in (closed[0].stdin, spawned[0].stdout, spawned[0].stderr):
+                        self.assertTrue(stream.closed)
+            self.assertTrue(root.is_dir())
+        finally:
+            if selector is not None:
+                selector.close()
+            if root is not None:
+                # Every control created one inert child only and independently
+                # established its group exit and reap before deleting this root.
+                if spawned and not spawned[0].reaped:
+                    closed[0].close()
+                if spawned and spawned[0].reaped:
+                    shutil.rmtree(root)
+
+    def test_immediate_and_partial_pipe_setup_failures_release_owned_child(self):
+        for failure_kind in (1, 2, 3, "register"):
+            with self.subTest(failure_kind=failure_kind):
+                self.check_pipe_setup_failure(failure_kind)
 
     def test_persistent_permission_failure_is_recorded_and_owned_child_reaped(self):
         import errno
@@ -191,8 +325,7 @@ class BoundedExecution(unittest.TestCase):
         with mock.patch.object(h.os, "killpg", side_effect=PermissionError(errno.EPERM, "controlled refusal")):
             cleanup = child.close()
         self.assertTrue(cleanup["leader_reaped"])
-        self.assertFalse(cleanup["process_group_cleanup_requested"])
-        self.assertEqual(child.cleanup_error, "process_group_permission_deadline")
+        self.assertEqual(child.cleanup_error, "process_group_exit_unproven")
         self.assertLess(time.monotonic() - started, 7)
         self.assertIs(child.close(), cleanup)
         self.assertFalse(h.execution_ok({"exit": 0, "timed_out": False, "cleanup": cleanup,
@@ -210,6 +343,7 @@ class BoundedExecution(unittest.TestCase):
         finally:
             child.process.kill()
             child.process.wait(timeout=2)
+            child.process.reap()
 
     def test_fast_pty_and_process_exit_sequence(self):
         # The outer fixture owns and reaps each PTY child; no PTY or descendant
@@ -235,7 +369,7 @@ class BoundaryEvidence(unittest.TestCase):
 
     def test_nonzero_checker_failure_is_not_a_policy_block(self):
         result = {"exit": 1, "timed_out": False, "output_limit_exceeded": False,
-                  "cleanup": {"leader_reaped": True, "output_eof": True}}
+                  "cleanup": {"leader_reaped": True, "output_eof": True, "process_group_exited": True}}
         self.assertTrue(h.policy_check_ok(result, b'{"action":"block"}', "block"))
         for output in [b"checker failed", b'{"error":"unavailable"}', b'{"action":"allow"}', b'[]']:
             self.assertFalse(h.policy_check_ok(result, output, "block"))
@@ -348,7 +482,7 @@ else:complete()
                 if argv[0] == str(binary):
                     if argv[1] == "check":
                         return {"exit": 1, "timed_out": False, "output_limit_exceeded": False,
-                                "cleanup": {"leader_reaped": True, "output_eof": True}}, b'{"action":"block"}', b""
+                                "cleanup": {"leader_reaped": True, "output_eof": True, "process_group_exited": True}}, b'{"action":"block"}', b""
                     self.assertEqual(argv[1:3], ["setup", "recommended"])
                     setups.append(1)
                     # Real recommended setup may add a profile while preserving the marker rule.
@@ -361,7 +495,7 @@ else:complete()
                     settings.write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"command":
                         h.combined_command([str(binary), str(hook_python), str(hook)])}]}]}}))
                     status = {"kind": "recommended-setup", "state": "completed", "steps": [{"activation": "claude-code", "state": "applied"}]}
-                    return {"exit": 0, "timed_out": False, "cleanup": {"leader_reaped": True, "output_eof": True}}, json.dumps(status).encode(), b""
+                    return {"exit": 0, "timed_out": False, "cleanup": {"leader_reaped": True, "output_eof": True, "process_group_exited": True}}, json.dumps(status).encode(), b""
                 return real_execute(argv, cwd, env, timeout)
             with mock.patch.object(h, "execute", side_effect=execute):
                 result = h.run_reload(binary, host, hook_python, host, hook_python)
@@ -410,7 +544,7 @@ print(json.dumps({'type':'result','is_error':False}),flush=True)
                     if argv[0] != str(binary):
                         return real_execute(argv, cwd, env, timeout)
                     ok = {"exit": 0, "timed_out": False, "output_limit_exceeded": False,
-                          "cleanup": {"leader_reaped": True, "output_eof": True}}
+                          "cleanup": {"leader_reaped": True, "output_eof": True, "process_group_exited": True}}
                     if argv[1] == "check":
                         return dict(ok, exit=1), b'{"action":"block"}', b""
                     settings = Path(env["HOME"]) / ".claude/settings.json"

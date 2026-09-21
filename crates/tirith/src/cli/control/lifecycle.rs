@@ -640,3 +640,7 @@ mod required_reuse_tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "lifecycle_native_fixture.rs"]
+mod native_fixture;

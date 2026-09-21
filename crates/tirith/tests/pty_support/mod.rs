@@ -21,8 +21,10 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+mod owned;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -252,8 +254,24 @@ pub fn zsh_bin() -> Option<PathBuf> {
 
 /// A fresh, fully-isolated environment for one PTY session: holds the temp dirs
 /// alive and exposes the env var map for the spawned shell. Drop cleans up.
+/// The root outlives every actual PTY owner, including an unwinding caller.
+struct Fixture {
+    root: Option<TempDir>,
+    failed: AtomicBool,
+    reports: Mutex<Vec<serde_json::Value>>,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if self.failed.load(Ordering::Acquire) || thread::panicking() {
+            if let Some(root) = self.root.take() {
+                eprintln!("TIRITH_PTY_FIXTURE_RETAINED {}", root.keep().display());
+            }
+        }
+    }
+}
+
 pub struct IsolatedEnv {
-    _root: TempDir,
+    fixture: Arc<Fixture>,
     pub home: PathBuf,
     pub state_home: PathBuf,
     pub data_home: PathBuf,
@@ -323,7 +341,11 @@ impl IsolatedEnv {
         }
 
         Self {
-            _root: root,
+            fixture: Arc::new(Fixture {
+                root: Some(root),
+                failed: AtomicBool::new(false),
+                reports: Mutex::new(Vec::new()),
+            }),
             home,
             state_home,
             data_home,
@@ -509,12 +531,27 @@ fn answer_terminal_queries(writer: &SharedWriter, data: &[u8]) {
 /// A live shell running inside a PTY. `send`/`expect`/`drain` drive it;
 /// `output()` returns all read so far. Killed on `Drop` as a backstop, but
 /// callers should still [`PtySession::close`] for a clean exit.
+#[derive(Default, Clone, serde::Serialize)]
+struct ReaderEnd {
+    native_eof: bool,
+    error: Option<String>,
+}
+
 pub struct PtySession {
-    writer: SharedWriter,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Option<SharedWriter>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    child: owned::Leader,
+    fixture: Arc<Fixture>,
+    reader: Option<thread::JoinHandle<()>>,
+    reader_done: mpsc::Receiver<ReaderEnd>,
+    reader_end: Option<ReaderEnd>,
+    reader_stop: Arc<AtomicBool>,
     rx: mpsc::Receiver<Vec<u8>>,
     buf: String,
+    output_closed: bool,
     closed: bool,
+    id: String,
+    cleanup_passed: bool,
 }
 
 /// How long any single `expect` may wait WITHOUT NEW OUTPUT before failing.
@@ -527,9 +564,32 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 /// purpose: it is a backstop, not the thing that decides a test's verdict.
 const MAX_TOTAL_WAIT: Duration = Duration::from_secs(180);
 
+fn clone_master_file(master: &dyn portable_pty::MasterPty) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let original = master
+        .as_raw_fd()
+        .ok_or_else(|| std::io::Error::other("native PTY FD missing"))?;
+    // The master object retains original throughout this call. fcntl creates
+    // a new owned descriptor; no sampled or borrowed descriptor is closed.
+    let duplicate = unsafe { libc::fcntl(original, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(duplicate) })
+}
+
 impl PtySession {
     /// Spawn `program` with `args` in a fresh PTY under `env` (cwd = `workdir`).
     pub fn spawn(env: &IsolatedEnv, program: &Path, args: &[&str]) -> Self {
+        Self::spawn_with_setup(env, program, args, || {})
+    }
+
+    fn spawn_with_setup(
+        env: &IsolatedEnv,
+        program: &Path,
+        args: &[&str],
+        after_spawn: impl FnOnce(),
+    ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 40,
@@ -562,55 +622,119 @@ impl PtySession {
         }
         cmd.cwd(&env.workdir);
 
+        owned::require_reaper().expect("pty harness: waitable child contract");
+        // Configure the shared open-file description before any child exists.
+        // Reader shutdown can therefore be bounded without closing a numeric
+        // descriptor from a different thread or retrying an ambiguous close.
+        let fd = pair
+            .master
+            .as_raw_fd()
+            .expect("pty harness: native master FD");
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0
+        );
+        let id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (done_tx, reader_done) = mpsc::channel();
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let fixture = Arc::clone(&env.fixture);
         let child = pair
             .slave
             .spawn_command(cmd)
             .expect("pty harness: spawn shell");
-        env.shell_pid.set(child.process_id());
-        *env.loaded_session_id.borrow_mut() = None;
-        // Drop the slave once the child holds it, or the master never sees EOF.
         drop(pair.slave);
-
-        // `take_writer` is single-shot, so the one writer is mutex-shared between
-        // the reader thread (answers terminal queries inline, promptly enough for
-        // fish's startup probes, and forwards output on `tx`) and the driver.
-        let writer: SharedWriter = Arc::new(Mutex::new(
-            pair.master.take_writer().expect("pty harness: take_writer"),
-        ));
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .expect("pty harness: clone_reader");
-        // Master no longer needed (reader cloned, writer taken).
-        drop(pair.master);
-
-        // Drain on a background thread so a chatty shell can't deadlock us by
-        // filling the kernel pipe buffer while we write.
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let answer_writer = Arc::clone(&writer);
-        thread::spawn(move || {
-            let mut chunk = [0u8; 4096];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        answer_terminal_queries(&answer_writer, &chunk[..n]);
-                        if tx.send(chunk[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Self {
-            writer,
-            child,
+        // Establish the RAII owner before any subsequent fallible setup.
+        let mut session = Self {
+            writer: None,
+            master: Some(pair.master),
+            child: owned::Leader::new(child),
+            fixture,
+            reader: None,
+            reader_done,
+            reader_end: None,
+            reader_stop,
             rx,
             buf: String::new(),
+            output_closed: false,
             closed: false,
-        }
+            id,
+            cleanup_passed: false,
+        };
+        eprintln!(
+            "TIRITH_PTY_OWNED_BEGIN {}",
+            serde_json::json!({"schema_version":1,
+            "id":session.id,"pid":session.child.pid,"scope":"original_owned_pty_session",
+            "fixture_root":session.fixture.root.as_ref().map(|root| root.path())})
+        );
+        assert!(
+            session.child.valid_group(),
+            "pty harness: native original session/group required"
+        );
+        after_spawn();
+        env.shell_pid.set(Some(session.child.pid as u32));
+        *env.loaded_session_id.borrow_mut() = None;
+        // portable-pty's UnixMasterWriter Drop writes newline/EOT. Fresh
+        // owned CLOEXEC File duplicates release this PTY without injecting
+        // further input during teardown, including failure/unwind paths.
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(
+            clone_master_file(session.master.as_ref().unwrap().as_ref())
+                .expect("pty harness: writer handle"),
+        )));
+        session.writer = Some(Arc::clone(&writer));
+        let mut reader = clone_master_file(session.master.as_ref().unwrap().as_ref())
+            .expect("pty harness: reader handle");
+        drop(session.master.take());
+        let stop = Arc::clone(&session.reader_stop);
+        session.reader = Some(
+            thread::Builder::new()
+                .name("tirith-pty-reader".into())
+                .spawn(move || {
+                    let mut outcome = ReaderEnd::default();
+                    let mut chunk = [0u8; 4096];
+                    let mut total = 0usize;
+                    while !stop.load(Ordering::Acquire) {
+                        match reader.read(&mut chunk) {
+                            Ok(0) => {
+                                outcome.native_eof = true;
+                                break;
+                            }
+                            Ok(n) => {
+                                total += n;
+                                if total > 8 * 1024 * 1024 {
+                                    outcome.error = Some("PTY transcript bound exceeded".into());
+                                    break;
+                                }
+                                answer_terminal_queries(&writer, &chunk[..n]);
+                                if tx.send(chunk[..n].to_vec()).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(5))
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                continue
+                            }
+                            // Unix PTY masters report EIO when the final slave closes.
+                            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                                outcome.native_eof = true;
+                                break;
+                            }
+                            Err(error) => {
+                                outcome.error = Some(error.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    // Close both cloned descriptors before acknowledging completion.
+                    drop(reader);
+                    drop(writer);
+                    let _ = done_tx.send(outcome);
+                })
+                .expect("pty harness: reader thread"),
+        );
+        session
     }
 
     /// Pull available output into the buffer, blocking at most `slice` for the
@@ -619,7 +743,7 @@ impl PtySession {
         match self.rx.recv_timeout(slice) {
             Ok(bytes) => self.buf.push_str(&String::from_utf8_lossy(&bytes)),
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => self.closed = true,
+            Err(RecvTimeoutError::Disconnected) => self.output_closed = true,
         }
         // Greedily absorb any further queued chunks.
         while let Ok(bytes) = self.rx.try_recv() {
@@ -629,7 +753,12 @@ impl PtySession {
 
     /// Write raw bytes to the shell's stdin (the PTY master).
     pub fn send_raw(&mut self, bytes: &[u8]) {
-        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut w = self
+            .writer
+            .as_ref()
+            .expect("live PTY writer")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         w.write_all(bytes).expect("pty harness: write to pty");
         w.flush().expect("pty harness: flush pty");
     }
@@ -682,7 +811,7 @@ impl PtySession {
                     self.buf.trim_end()
                 );
             }
-            if self.closed && self.rx.try_recv().is_err() {
+            if self.output_closed && self.rx.try_recv().is_err() {
                 panic!(
                     "pty harness: shell exited before {:?} appeared\n\
                      ---- captured output ----\n{}\n-------------------------",
@@ -717,7 +846,7 @@ impl PtySession {
             if last_progress.elapsed() >= timeout || started.elapsed() >= MAX_TOTAL_WAIT {
                 return self.buf.clone();
             }
-            if self.closed && self.rx.try_recv().is_err() {
+            if self.output_closed && self.rx.try_recv().is_err() {
                 return self.buf.clone();
             }
             self.pump(Duration::from_millis(100));
@@ -773,34 +902,96 @@ impl PtySession {
         }
     }
 
-    /// Send `exit` and wait briefly for the shell to terminate.
+    /// Normal close requires separate output, reader, owner and native-session
+    /// evidence. EOF never implies process exit, and no wait reaps early.
     pub fn close(&mut self) {
+        self.finish(true);
+        assert!(
+            self.cleanup_passed,
+            "pty harness: native cleanup incomplete; fixture retained"
+        );
+    }
+
+    fn finish(&mut self, graceful: bool) {
         if self.closed {
             return;
         }
-        // Best-effort: the shell may already be mid-prompt.
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(b"exit\r");
-            let _ = w.flush();
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                self.closed = true;
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.child.kill();
         self.closed = true;
+        let mut errors = Vec::new();
+        if graceful {
+            if let Some(writer) = self.writer.as_ref() {
+                if let Ok(mut writer) = writer.lock() {
+                    if let Err(error) = writer.write_all(b"exit\r").and_then(|_| writer.flush()) {
+                        errors.push(error.to_string());
+                    }
+                }
+            }
+            let until = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < until {
+                if self.reader_end.is_none() {
+                    self.reader_end = self.reader_done.try_recv().ok();
+                }
+                match self.child.exited() {
+                    Ok(true) if self.reader_end.is_some() => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        errors.push(error.to_string());
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.reader_stop.store(true, Ordering::Release);
+        let mut reader_joined = self.reader.is_none();
+        if self.reader.is_some() {
+            if self.reader_end.is_none() {
+                self.reader_end = self.reader_done.recv_timeout(Duration::from_secs(1)).ok();
+            }
+            // A completion acknowledgement precedes join; never join a known
+            // live/unresponsive reader whose descriptor ownership is unknown.
+            if self.reader_end.is_some() {
+                reader_joined = self.reader.take().unwrap().join().is_ok();
+            }
+        }
+        drop(self.master.take());
+        drop(self.writer.take());
+        let private_pty_handles_released = reader_joined;
+        let native = self.child.cleanup();
+        let native_eof = self.reader_end.as_ref().is_some_and(|end| end.native_eof);
+        if let Some(error) = self.reader_end.as_ref().and_then(|end| end.error.as_ref()) {
+            errors.push(error.clone());
+        }
+        self.cleanup_passed = native.leader_reaped
+            && native.original_group_exited
+            && native.original_session_exited
+            && native.reaped_after_native_observation
+            && native.errors.is_empty()
+            && native_eof
+            && private_pty_handles_released
+            && reader_joined
+            && errors.is_empty();
+        if !self.cleanup_passed || thread::panicking() {
+            self.fixture.failed.store(true, Ordering::Release);
+        }
+        let report = serde_json::json!({"schema_version":1,
+            "id":self.id,"pid":self.child.pid,"scope":"original_owned_pty_session",
+            "passed":self.cleanup_passed,"native":native,"native_eof":native_eof,
+            "reader_joined":reader_joined,"private_pty_handles_released":private_pty_handles_released,"errors":errors,
+            "descriptor_release":"portable-pty RAII handles dropped after reader acknowledgement/join; opaque Drop does not report close syscall status",
+            "scope_limit":"No escaped-session, arbitrary process-tree or external-interruption claim"});
+        self.fixture
+            .reports
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(report.clone());
+        eprintln!("TIRITH_PTY_OWNED_CLEANUP {report}");
     }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        if !self.closed {
-            let _ = self.child.kill();
-        }
+        self.finish(false);
     }
 }
 
@@ -851,3 +1042,7 @@ pub fn wait_for_marker_count(
         thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "ownership_tests.rs"]
+mod ownership_tests;
