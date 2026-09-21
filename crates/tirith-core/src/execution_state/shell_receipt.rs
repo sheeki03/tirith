@@ -337,8 +337,25 @@ struct ShellHookCapabilityAnchor {
     state: ShellHookCapabilityAnchorState,
 }
 
+/// Owns the advisory lock independently of duplicated descriptor lifetime.
+/// Construct immediately after acquisition so validation errors also release.
+struct ReceiptLock(File);
+
+impl std::ops::Deref for ReceiptLock {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for ReceiptLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 struct LockedReceipt {
-    _lock_file: File,
+    _lock_file: ReceiptLock,
     token: String,
     receipt_path: PathBuf,
     receipt_identity: FileIdentity,
@@ -1190,7 +1207,7 @@ fn publish_capability_anchor(
 fn create_capability_anchor(
     path: &Path,
     prepared: &ShellHookCapabilityAnchor,
-) -> Result<File, String> {
+) -> Result<ReceiptLock, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = OpenOptions::new()
@@ -1209,6 +1226,7 @@ fn create_capability_anchor(
         })?;
     let identity = secure_regular_identity(&file, "shell hook capability anchor")?;
     lock_capability_file(&file)?;
+    let file = ReceiptLock(file);
     if path_identity(path, "shell hook capability anchor")? != identity {
         return Err("shell hook capability anchor changed while locked".to_string());
     }
@@ -1219,12 +1237,12 @@ fn create_capability_anchor(
 }
 
 #[cfg(unix)]
-fn open_capability_anchor(path: &Path) -> Result<File, String> {
+fn open_capability_anchor(path: &Path) -> Result<ReceiptLock, String> {
     open_capability_anchor_for(path, RECEIPT_LOCK_TIMEOUT)
 }
 
 #[cfg(unix)]
-fn open_capability_anchor_for(path: &Path, timeout: Duration) -> Result<File, String> {
+fn open_capability_anchor_for(path: &Path, timeout: Duration) -> Result<ReceiptLock, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = OpenOptions::new()
@@ -1235,6 +1253,7 @@ fn open_capability_anchor_for(path: &Path, timeout: Duration) -> Result<File, St
         .map_err(|error| format!("open shell hook capability anchor: {error}"))?;
     secure_regular_identity(&file, "shell hook capability anchor")?;
     lock_capability_file_for(&file, timeout)?;
+    let file = ReceiptLock(file);
     if path_identity(path, "shell hook capability anchor")?
         != secure_regular_identity(&file, "shell hook capability anchor")?
     {
@@ -1247,7 +1266,7 @@ fn open_capability_anchor_for(path: &Path, timeout: Duration) -> Result<File, St
 fn open_or_create_capability_anchor(
     path: &Path,
     prepared: &ShellHookCapabilityAnchor,
-) -> Result<(File, ShellHookCapabilityAnchor), String> {
+) -> Result<(ReceiptLock, ShellHookCapabilityAnchor), String> {
     match create_capability_anchor(path, prepared) {
         Ok(file) => Ok((file, prepared.clone())),
         Err(error) if error.contains("already has a protocol-v3 registration") => {
@@ -1270,7 +1289,7 @@ fn open_or_create_capability_anchor(
 }
 
 #[cfg(unix)]
-fn open_capability_registry_lock(directory: &Path) -> Result<File, String> {
+fn open_capability_registry_lock(directory: &Path) -> Result<ReceiptLock, String> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     // The receipt directory is already a durable, owner-only identity shared
@@ -1299,6 +1318,7 @@ fn open_capability_registry_lock(directory: &Path) -> Result<File, String> {
         inode: metadata.ino(),
     };
     lock_capability_file(&file)?;
+    let file = ReceiptLock(file);
     let path_metadata = fs::symlink_metadata(directory).map_err(|error| {
         format!("inspect shell hook capability registry directory path: {error}")
     })?;
@@ -2188,7 +2208,7 @@ fn receipt_directory() -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
-fn open_receipt_lock(path: &Path, timeout: Duration, create: bool) -> Result<File, String> {
+fn open_receipt_lock(path: &Path, timeout: Duration, create: bool) -> Result<ReceiptLock, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let mut options = OpenOptions::new();
@@ -2207,7 +2227,7 @@ fn open_receipt_lock(path: &Path, timeout: Duration, create: bool) -> Result<Fil
         .ok_or_else(|| "shell receipt lock deadline overflowed".to_string())?;
     loop {
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(ReceiptLock(file)),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     return Err("timed out acquiring shell receipt lock".to_string());
@@ -2225,7 +2245,7 @@ fn receipt_registry_lock_path(directory: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn open_receipt_registry_lock(directory: &Path) -> Result<File, String> {
+fn open_receipt_registry_lock(directory: &Path) -> Result<ReceiptLock, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let path = receipt_registry_lock_path(directory);
@@ -2269,6 +2289,7 @@ fn open_receipt_registry_lock(directory: &Path) -> Result<File, String> {
             Err(error) => return Err(format!("lock shell receipt registry: {error}")),
         }
     }
+    let file = ReceiptLock(file);
     if path_identity(&path, "shell receipt registry lock")? != identity {
         return Err("shell receipt registry lock changed while locked".to_string());
     }
@@ -2276,7 +2297,11 @@ fn open_receipt_registry_lock(directory: &Path) -> Result<File, String> {
 }
 
 #[cfg(not(unix))]
-fn open_receipt_lock(_path: &Path, _timeout: Duration, _create: bool) -> Result<File, String> {
+fn open_receipt_lock(
+    _path: &Path,
+    _timeout: Duration,
+    _create: bool,
+) -> Result<ReceiptLock, String> {
     Err("strict shell execution receipts are unsupported on this platform".to_string())
 }
 
@@ -4189,6 +4214,54 @@ mod tests {
     }
 
     #[test]
+    fn receipt_lock_owner_releases_before_duplicate_descriptor_closes() {
+        isolated_state(|_, session_id| {
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                "echo fixture",
+                session_id,
+                false,
+            );
+            let path = receipt_lock_path(&token);
+            let first = lock_receipt(&token).unwrap();
+            let retained = first._lock_file.try_clone().unwrap();
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(first);
+            let next = open_receipt_lock(&path, Duration::ZERO, false)
+                .expect("receipt lock release does not wait for duplicate descriptors");
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(retained);
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(next);
+            assert!(lock_receipt(&token).is_ok());
+            assert!(
+                receipt_path(&token).is_file(),
+                "lock release preserves receipt history"
+            );
+        });
+    }
+
+    #[test]
+    fn receipt_registry_lock_owner_releases_before_duplicate_descriptor_closes() {
+        isolated_unregistered_state(|_, _| {
+            let directory = receipt_directory().unwrap();
+            let first = open_receipt_registry_lock(&directory).unwrap();
+            let retained = first.try_clone().unwrap();
+            let path = receipt_registry_lock_path(&directory);
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(first);
+            let next = open_receipt_registry_lock(&directory)
+                .expect("registry lock release does not wait for duplicate descriptors");
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(retained);
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(next);
+            assert!(open_receipt_registry_lock(&directory).is_ok());
+        });
+    }
+
+    #[test]
     fn allow_receipt_consumes_once_and_durable_json_excludes_bearer_and_raw_command() {
         isolated_state(|_, session_id| {
             let command = "curl -H 'Authorization: Bearer sk-proj-receipt-secret-never-persist' https://example.invalid/really-long-private-command";
@@ -4380,6 +4453,81 @@ mod tests {
             assert_ne!(retry, partially_delivered);
             validate_shell_hook_instance(&retry, shell_pid, ShellHookFamily::Zsh, session_id)
                 .expect("validate retry bearer");
+        });
+    }
+
+    #[test]
+    fn capability_anchor_lock_release_covers_error_and_retained_descriptor() {
+        isolated_unregistered_state(|_, _| {
+            let shell_pid = unsafe { libc::getppid() } as u32;
+            let shell_identity = shell_process_identity(shell_pid).unwrap();
+            let (_, path) = capability_paths(
+                unsafe { libc::geteuid() },
+                shell_pid,
+                &shell_identity.start_fingerprint,
+            )
+            .unwrap();
+            let prepared = prepared_capability_anchor(
+                unsafe { libc::geteuid() },
+                shell_pid,
+                &shell_identity.start_fingerprint,
+            )
+            .unwrap();
+            let mut retained = None;
+            let refused: Result<(), String> = (|| {
+                let first = create_capability_anchor(&path, &prepared)?;
+                retained = Some(first.try_clone().unwrap());
+                assert!(open_capability_anchor_for(&path, Duration::ZERO).is_err());
+                Err("refused validation after anchor acquisition".to_string())
+            })();
+            assert!(refused.is_err());
+            let next = open_capability_anchor_for(&path, Duration::ZERO)
+                .expect("failed validation releases before duplicate descriptors close");
+            let retained_next = next.try_clone().unwrap();
+            assert!(open_capability_anchor_for(&path, Duration::ZERO).is_err());
+            drop(retained);
+            assert!(open_capability_anchor_for(&path, Duration::ZERO).is_err());
+            drop(next);
+            let final_owner = open_capability_anchor_for(&path, Duration::ZERO)
+                .expect("opened anchor owner also releases before its duplicate closes");
+            drop(retained_next);
+            assert!(open_capability_anchor_for(&path, Duration::ZERO).is_err());
+            assert!(matches!(
+                read_capability_anchor(&final_owner).unwrap().state,
+                ShellHookCapabilityAnchorState::Prepared { .. }
+            ));
+            drop(final_owner);
+            assert!(path.is_file(), "lock release preserves the process anchor");
+        });
+    }
+
+    #[test]
+    fn capability_registry_lock_releases_before_duplicate_descriptor_closes() {
+        isolated_unregistered_state(|_, _| {
+            let directory = receipt_directory().unwrap();
+            let first = open_capability_registry_lock(&directory).unwrap();
+            let retained = first.try_clone().unwrap();
+            let competitor = File::open(&directory).unwrap();
+            assert_eq!(
+                competitor.try_lock_exclusive().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(first);
+            let next = open_capability_registry_lock(&directory)
+                .expect("capability registry owner releases before duplicate descriptors close");
+            assert_eq!(
+                competitor.try_lock_exclusive().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(retained);
+            assert_eq!(
+                competitor.try_lock_exclusive().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(next);
+            let final_owner = open_capability_registry_lock(&directory).unwrap();
+            drop(final_owner);
+            assert!(directory.is_dir());
         });
     }
 

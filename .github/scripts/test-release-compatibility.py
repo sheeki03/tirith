@@ -5,6 +5,7 @@ import io
 from pathlib import Path
 import tarfile
 import tempfile
+from unittest.mock import patch
 import tomllib
 import unittest
 import zipfile
@@ -46,6 +47,30 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(result, MODULE.build(ROOT, self.artifacts, VERSION))
         with self.assertRaisesRegex(ValueError, "workspace"):
             MODULE.build(ROOT, self.artifacts, "999.0.0")
+
+    def test_persisted_readers_and_recovery_capabilities_are_bound_to_source(self):
+        result = MODULE.contract(ROOT, VERSION)
+        readers = result["persisted_formats"]
+        self.assertEqual(set(readers), {
+            "team_connection", "team_enrollment", "team_report", "team_rollout",
+            "team_policy_document", "team_policy_semantics", "npm_materialization_intent",
+            "npm_materialization_checkpoint", "npm_materialization_inventory",
+            "npm_materialization_recovery_rule",
+        })
+        self.assertTrue(all(value == [1] for name, value in readers.items()
+                            if name != "npm_materialization_recovery_rule"))
+        self.assertEqual(readers["npm_materialization_recovery_rule"],
+                         "linux_only_fresh_policy_and_exact_current_ownership_required")
+        self.assertTrue({"team_policy_runtime_v1", "team_policy_recovery_v1",
+                         "npm_materialization_recovery_v1"} <= set(result["features"]))
+        original = MODULE.source_constant
+        for changed in ("SCHEMA_VERSION", "POLICY_SEMANTICS_VERSION", "INTENT_SCHEMA_VERSION",
+                        "CHECKPOINT_SCHEMA_VERSION", "RECOVERY_INVENTORY_VERSION"):
+            def replaced(root, path, name):
+                return 99 if name == changed else original(root, path, name)
+            with self.subTest(changed=changed), patch.object(MODULE, "source_constant", replaced):
+                with self.assertRaisesRegex(ValueError, "persisted format implementation changed"):
+                    MODULE.contract(ROOT, VERSION)
 
     def test_missing_or_substituted_archive_changes_evidence(self):
         before = MODULE.build(ROOT, self.artifacts, VERSION)

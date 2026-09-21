@@ -340,14 +340,12 @@ A repo policy carrying `web3_guard.networks` and `web3_guard.allowed_signers`
 prints them as neutralized while keeping its `deny_rpc` and `deny_destinations`
 entries, because denial is the only direction a repository may move.
 
-Note that surviving the merge is not the same as being enforced. Of the
-`web3_guard` fields, only `networks`, `allowed_signers`, `deny_rpc`, and
-`action_unclassified_rpc` are read by a rule. `deny_destinations`,
-`require_command_card`, `command_card_key_ids`, `selector_aliases`,
-`action_incomplete_analysis`, and `action_ambiguous_hardhat_production_run` are
-parsed, validated, and merged, but no rule consults them, so a destination
-listed in `deny_destinations` is not flagged. See
-[web3-command-guard.md](security/web3-command-guard.md#declared-but-not-yet-wired).
+The current engine also enforces destination denials, configured incomplete
+analysis and ambiguous-Hardhat actions, selector aliases, and required exact
+command cards. Card approval remains unavailable when executable identity or
+artifact consumption cannot be bound at the execution boundary. Review the
+[current field limits](security/web3-command-guard.md#policy-fields-and-current-limits)
+before requiring cards for a workflow.
 
 ## 9. Untrusted-Task Gate (observation first)
 

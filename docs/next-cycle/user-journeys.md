@@ -17,6 +17,11 @@ tirith setup recommended --scope user --shell zsh
 ```
 
 Choose `bash`, `zsh` or `fish` for the supported initial personal setup scope.
+If `package_approval` is unavailable, ordinary checks and shell protection still
+work. Only explicit native package approval on x86_64 Linux needs its protected
+helper and fresh administrator confirmation. An unsupported backend cannot be
+enabled with sudo.
+
 The default profile is Balanced. `--profile comfortable` or `--profile strict`
 changes the reviewed selection while preserving explicit manual settings.
 `--plan-only --json` saves a review without applying it. Keep the operation UUID
@@ -25,6 +30,13 @@ for status, retry, cancellation or owned undo:
 ```sh
 tirith policy operation OPERATION_UUID
 tirith policy operation OPERATION_UUID --action apply
+```
+
+Cancel a pending plan or undo an applied, owned change only when that is your
+intended action; these are alternatives, not follow-up setup steps:
+
+```sh
+tirith policy operation OPERATION_UUID --action cancel
 tirith policy operation OPERATION_UUID --action undo
 ```
 
@@ -47,6 +59,11 @@ Select the actual host and scope explicitly. For example:
 tirith setup codex --scope user --dry-run
 tirith setup codex --scope user
 ```
+
+For Codex, this sets up the MCP gateway. MCP only covers calls the host routes
+through it; it does not establish blocking for native terminal tools. Consult
+the [host integration matrix](../../mcp/clients/mcp-only-agents.md) for the
+selected host, scope and required restart.
 
 Restart the host and inspect its configured hook or MCP integration. Run a
 harmless check through that actual host and inspect its returned decision.
@@ -74,17 +91,22 @@ Run from the project you intend to review:
 ```sh
 tirith review --json
 tirith review --path package.json --path .mcp.json --json
-tirith pkg inspect ./package.tgz --json
-tirith pkg diff ./old-package.tgz ./new-package.tgz --json
+tirith pkg inspect ./package.tgz --format json
+tirith pkg diff ./old-package.tgz ./new-package.tgz --format json
 ```
 
 Project review examines known surfaces or the selected relative files. It does
 not recursively discover every workspace, start an MCP server, run hooks or
 install dependencies. Missing, unsupported and oversized content has explicit
-coverage states. The browser's Overview page offers the same explicit review
+coverage states. Exit status 2 can accompany a collected report when findings
+or coverage gaps remain; read the report before deciding what needs more review.
+The browser's Overview page offers the same explicit review
 and can recheck retained file identities. Package inspection and comparison
 report exact artifact identity where available, with bounded static evidence;
-neither authorizes installation.
+neither authorizes installation. `pkg install` remains disabled on every host;
+flags, sudo and administrator access cannot enable that unqualified backend.
+The separate Linux `pkg materialize` workflow copies eligible local archive data
+without executing package code and has its own reviewed plan and apply steps.
 
 ## Resolve an interruption
 
@@ -102,10 +124,25 @@ tirith policy simulate 'echo representative-command' --shell posix --interactive
 Tuning reads at most 500 recent records within a 2 MiB history read, and selects
 at most 50 private expectation records. It shows recurring blockers even when
 no relaxation is supported. Redacted historical examples are references, so
-supply the actual representative command explicitly for simulation.
+supply the actual representative command explicitly for simulation. With no
+audit history, tuning reports `availability: absent` and exits with status 1; it
+does not suggest or apply a policy change.
 
-Use a profile change or an exact rule-and-target exception only after reviewing
-its effective constraints. For example, `tirith trust add URL --rule RULE
+Preview a personal profile change, then apply it only if the reviewed changes
+fit the intended workflow:
+
+```sh
+tirith policy profile balanced --dry-run --json
+tirith policy profile balanced --json
+```
+
+Use `comfortable` or `strict` instead of `balanced` when appropriate; `reset`
+removes profile-owned settings. Explicit manual settings and organization,
+remote, project and incident restrictions can still apply. Keep the returned
+operation UUID for status or owned undo.
+
+Use an exact rule-and-target exception only after reviewing its effective
+constraints. For example, `tirith trust add URL --rule RULE
 --ttl 1h` records an expiring grant where the current policy permits it;
 `tirith trust explain URL` explains eligibility. Other restrictions may still
 block the operation. Use the actual execution boundary's supported one-use
@@ -137,8 +174,11 @@ tirith setup shell --shell zsh --remove --dry-run
 tirith setup shell --shell zsh --remove
 ```
 
-Reload the shell, then remove Tirith through its owning package manager or
-delete its user-owned standalone binary. Remove actual agent integrations
+Managed removal preserves manually added `tirith init` lines. Review and remove
+those lines separately from the actual startup files, including custom shell
+roots. Open a fresh terminal so the old loaded hook is no longer active. Then
+remove Tirith through its owning package manager or delete its user-owned
+standalone binary. Remove actual agent integrations
 using the steps for that host in [uninstall](../uninstall.md). Review local
 history and recovery data separately; uninstalling a binary does not imply
 deletion of those records. Shared administrator-owned helper and key material
@@ -146,11 +186,13 @@ requires the documented administrator cleanup after its users are gone.
 
 ## Review local data before sharing or deleting
 
-`tirith doctor --bundle-preview --bundle-incident EVENT_UUID --json` previews
-selected diagnostics. Add `--bundle-operation OPERATION_UUID` to include a
-saved setup or lifecycle operation. `--bundle` saves the freshly redacted
-selection privately; nothing is uploaded. The dashboard has the same selection
-and fresh-redaction download flow.
+`tirith doctor --bundle --bundle-preview --bundle-incident EVENT_UUID --json`
+previews selected diagnostics. Add `--bundle-operation OPERATION_UUID` to include
+a saved setup or lifecycle operation. Keep `--bundle` and omit `--bundle-preview`
+to save the freshly redacted selection privately; nothing is uploaded. Review
+the resulting file before deliberately sharing it. Selection is bounded and an
+unavailable incident is not evidence that the event never happened. The
+dashboard has the same selection and fresh-redaction download flow.
 
 Audit rotation is reviewed with `tirith audit rotate`. Its saved operation UUID
 identifies the retained segment. `tirith audit export-segment --segment-id UUID`

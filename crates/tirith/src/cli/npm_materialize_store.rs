@@ -52,8 +52,34 @@ mod linux {
         file: File,
         bytes: Vec<u8>,
     }
+    /// Owns a lock from acquisition through validation and the final store or
+    /// checkpoint lifetime. No lock descriptor is transferred to a writer.
+    pub(crate) struct MaterializationLock(File);
+
+    impl MaterializationLock {
+        pub(crate) fn try_acquire(file: File) -> std::io::Result<Self> {
+            file.try_lock_exclusive()?;
+            Ok(Self(file))
+        }
+    }
+
+    impl std::ops::Deref for MaterializationLock {
+        type Target = File;
+        fn deref(&self) -> &File {
+            &self.0
+        }
+    }
+
+    impl Drop for MaterializationLock {
+        fn drop(&mut self) {
+            // Closing only this descriptor can leave flock held by a duplicate
+            // or fork-inherited copy. Only this guard owns the lock lifetime.
+            let _ = fs2::FileExt::unlock(&self.0);
+        }
+    }
+
     pub(crate) struct OperationStore {
-        directory: File,
+        directory: MaterializationLock,
         path: PathBuf,
         identity: (u64, u64),
         operation: String,
@@ -81,7 +107,7 @@ mod linux {
             }
             let directory = open_directory_nofollow(&path)?;
             check_directory(&directory)?;
-            directory.try_lock_exclusive()?;
+            let directory = MaterializationLock::try_acquire(directory)?;
             let identity = file_identity(&directory)?;
             let result = Self {
                 directory,
@@ -258,6 +284,52 @@ mod linux {
         check_record(file)?;
         Ok(())
     }
+
+    fn directory_names(parent: &File) -> std::io::Result<Vec<OsString>> {
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let result = (|| {
+            let mut names = Vec::new();
+            loop {
+                unsafe { *libc::__errno_location() = 0 };
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    let n = unsafe { *libc::__errno_location() };
+                    if n != 0 {
+                        return Err(std::io::Error::from_raw_os_error(n));
+                    }
+                    return Ok(names);
+                }
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                if name != b"." && name != b".." {
+                    if names.len() >= RECORD_COUNT_CAP {
+                        return Err(refusal("materialization history capacity exceeded"));
+                    }
+                    use std::os::unix::ffi::OsStringExt;
+                    names.push(OsString::from_vec(name.to_vec()));
+                }
+            }
+        })();
+        let close = unsafe { libc::closedir(stream) };
+        if close < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        result
+    }
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -304,6 +376,72 @@ mod linux {
             }
         }
         #[test]
+        fn store_lock_release_is_not_extended_by_a_retained_descriptor() {
+            let _scope = GlobalStateGuard::new().unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            let first = OperationStore::open(&id, true).unwrap();
+            let retained = first.directory.try_clone().unwrap();
+            assert!(OperationStore::open(&id, false).is_err());
+            drop(first);
+            let next = OperationStore::open(&id, false)
+                .expect("the store owner releases before duplicate descriptors close");
+            assert!(OperationStore::open(&id, false).is_err());
+            drop(retained);
+            assert!(OperationStore::open(&id, false).is_err());
+            drop(next);
+            assert!(OperationStore::open(&id, false).is_ok());
+        }
+
+        #[test]
+        fn checkpoint_lock_release_covers_failure_before_owner_construction() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("lock");
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let competitor = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut retained = None;
+            let refused: std::io::Result<()> = (|| {
+                let lock = MaterializationLock::try_acquire(file)?;
+                retained = Some(lock.try_clone()?);
+                assert_eq!(
+                    competitor.try_lock_exclusive().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                // Both checkpoint constructors perform fallible work here,
+                // after acquisition but before their final owner exists.
+                Err(std::io::Error::other("refused checkpoint validation"))
+            })();
+            assert!(refused.is_err());
+            let next = MaterializationLock::try_acquire(competitor)
+                .expect("failed construction releases the held file lock");
+            let third = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            drop(retained);
+            assert_eq!(
+                third.try_lock_exclusive().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(next);
+            let final_owner = MaterializationLock::try_acquire(third).unwrap();
+            drop(final_owner);
+            assert!(
+                path.exists(),
+                "releasing a lock never deletes its checkpoint"
+            );
+        }
+
+        #[test]
         fn global_store_lock_rejects_competing_operation_without_start() {
             let _scope = GlobalStateGuard::new().unwrap();
             let first = OperationStore::open(&uuid::Uuid::new_v4().to_string(), true).unwrap();
@@ -329,51 +467,8 @@ mod linux {
             assert_eq!(std::fs::read(unknown).unwrap(), b"preserve");
         }
     }
-    fn directory_names(parent: &File) -> std::io::Result<Vec<OsString>> {
-        let fd = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                c".".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let stream = unsafe { libc::fdopendir(fd) };
-        if stream.is_null() {
-            let e = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(e);
-        }
-        let result = (|| {
-            let mut names = Vec::new();
-            loop {
-                unsafe { *libc::__errno_location() = 0 };
-                let entry = unsafe { libc::readdir(stream) };
-                if entry.is_null() {
-                    let n = unsafe { *libc::__errno_location() };
-                    if n != 0 {
-                        return Err(std::io::Error::from_raw_os_error(n));
-                    }
-                    return Ok(names);
-                }
-                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-                if name != b"." && name != b".." {
-                    if names.len() >= RECORD_COUNT_CAP {
-                        return Err(refusal("materialization history capacity exceeded"));
-                    }
-                    use std::os::unix::ffi::OsStringExt;
-                    names.push(OsString::from_vec(name.to_vec()));
-                }
-            }
-        })();
-        let close = unsafe { libc::closedir(stream) };
-        if close < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        result
-    }
 }
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{canonical_operation, OperationStore, RecordKind, RECORD_CAP};
+pub(crate) use linux::{
+    canonical_operation, MaterializationLock, OperationStore, RecordKind, RECORD_CAP,
+};

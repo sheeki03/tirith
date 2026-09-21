@@ -115,7 +115,7 @@ impl VerifiedMaterializedTree<'_, '_> {
         self.revalidate()?;
         let writer = self.writer;
         Ok(MaterializationRecoveryInventory {
-            schema: 1,
+            schema: RECOVERY_INVENTORY_VERSION,
             contract: CONTRACT.into(),
             operation_id: writer.plan.id.clone(),
             public_plan_digest: writer.plan.summary.public_plan_digest.clone(),
@@ -794,8 +794,12 @@ pub(super) mod native {
     ) -> MaterializationResult<()> {
         let component = name(component)?;
         let destination = name(STAGING_COMPONENT)?;
+        // Use the kernel syscall on GNU and musl alike. Some libc targets do
+        // not expose the wrapper; failure still refuses without a replacing
+        // rename fallback.
         if unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 parent.as_raw_fd(),
                 component.as_ptr(),
                 journal.as_raw_fd(),

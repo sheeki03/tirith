@@ -436,7 +436,7 @@ fn build_next_actions(tirith: &TirithState, template: &str) -> Vec<String> {
     }
     if !tirith.policy_present {
         actions.push(if template == "balanced" {
-            "run `tirith policy profile apply balanced` to record personal settings through the shared change plan".into()
+            "run `tirith policy profile balanced` to record personal settings through the shared change plan".into()
         } else { format!("run `tirith policy init --template {template}` for the explicitly selected legacy template") });
     }
     if actions.is_empty() {
@@ -734,7 +734,7 @@ mod tests {
         assert!(fresh.iter().any(|a| a.contains("tirith init")));
         assert!(fresh
             .iter()
-            .any(|a| a.contains("tirith policy profile apply balanced")));
+            .any(|a| a.contains("tirith policy profile balanced")));
 
         // Fully set up: a single "already set up" line.
         let done = build_next_actions(

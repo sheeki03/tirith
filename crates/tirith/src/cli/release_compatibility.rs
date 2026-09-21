@@ -13,6 +13,9 @@ const REQUIRED_FEATURES: &[&str] = &[
     "scoped_trust_grants_v1",
     "protection_profiles_v1",
     "owned_change_journals_v1",
+    "team_policy_runtime_v1",
+    "team_policy_recovery_v1",
+    "npm_materialization_recovery_v1",
 ];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -33,6 +36,8 @@ struct Document {
     mcp_lock_authorize_versions: Vec<u32>,
     legacy_trust_read_versions: Vec<u32>,
     scoped_grant_read_versions: Vec<u32>,
+    #[serde(default)]
+    persisted_formats: super::lifecycle::PersistedFormats,
     operation_journal_version: u32,
     operation_journal_client_rule: String,
     control_service_protocol: u32,
@@ -84,6 +89,7 @@ impl Document {
                 );
             }
         }
+        self.persisted_formats.validate()?;
         if self.targets.iter().any(|(target, identity)| {
             identity.archive != selfupdate::release_archive_name(target)
                 || !digest(&identity.archive_sha256)
@@ -104,6 +110,7 @@ impl Document {
             mcp_lock_authorize_versions: vec![tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION],
             legacy_trust_read_versions: vec![1],
             scoped_grant_read_versions: vec![tirith_core::trust_grants::STORE_VERSION],
+            persisted_formats: super::lifecycle::PersistedFormats::current(),
             operation_journal_version: 1,
             operation_journal_client_rule: "exact_client_version_required".into(),
             control_service_protocol: 1,
@@ -162,6 +169,9 @@ fn preview(
             "mcp_lock" => &document.mcp_lock_read_versions,
             "legacy_trust" => &document.legacy_trust_read_versions,
             "scoped_grants" => &document.scoped_grant_read_versions,
+            surface if document.persisted_formats.versions(surface).is_some() => {
+                document.persisted_formats.versions(surface).unwrap()
+            }
             _ => {
                 issues.push(
                     "an observed stored surface has no candidate compatibility contract".into(),
@@ -182,7 +192,10 @@ fn preview(
         .iter()
         .any(|required| !document.features.iter().any(|feature| feature == required))
     {
-        issues.push("candidate lacks a required policy, scoped-grant, profile, or owned-journal capability; automatic downgrade is unsupported".into());
+        issues.push("candidate lacks a required policy, scoped-grant, profile, team Runtime/recovery, materialization recovery, or owned-journal capability; automatic downgrade is unsupported".into());
+    }
+    if !document.persisted_formats.supports_current_recovery() {
+        issues.push("candidate lacks the current team or materialization format/recovery contract; preserve this binary and retained records for explicit recovery".into());
     }
     if document.operation_journal_version != 1
         || document.operation_journal_client_rule != "exact_client_version_required"
@@ -234,7 +247,59 @@ pub(super) struct VerifiedCandidate {
     evidence: &'static str,
 }
 
+fn verify_compatibility_checksum(release: &super::ReleaseSet, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() as u64 > LIMIT {
+        return Err("candidate compatibility document exceeds its limit".into());
+    }
+    let expected = selfupdate::checksum_for(&release.checksums_txt, ASSET)
+            .map_err(|_| "release checksums are malformed")?
+            .ok_or("release has no checksum-bound compatibility document; automatic update is unsupported, use the owning installation channel after reviewing format compatibility")?;
+    if !selfupdate::digest_eq(&super::hex_sha256(bytes), &expected) {
+        return Err("candidate compatibility document does not match the release checksum".into());
+    }
+    Ok(())
+}
+
 impl VerifiedCandidate {
+    /// Test harness authority only. RFC8032 section 7.1 test vector 1 is public
+    /// fixture key material; it cannot establish an official release signature.
+    /// No released binary compiles this constructor or accepts its authority.
+    #[cfg(test)]
+    pub(super) fn verify_fixture_key(
+        release: &super::ReleaseSet,
+        bytes: &[u8],
+        target: &str,
+        signature: &[u8],
+    ) -> Result<Self, String> {
+        const KEY: [u8; 32] = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        if release.checksums_txt.len() as u64 > super::MAX_METADATA_SIZE {
+            return Err("fixture checksum payload exceeds its bound".into());
+        }
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&KEY)
+            .map_err(|_| "fixed fixture public key is invalid")?;
+        let signature = ed25519_dalek::Signature::from_slice(signature)
+            .map_err(|_| "fixture signature must contain exactly 64 bytes")?;
+        key.verify_strict(release.checksums_txt.as_bytes(), &signature)
+            .map_err(|_| "fixture checksum signature failed")?;
+        verify_compatibility_checksum(release, bytes)?;
+        // This lane deliberately packages exactly one native target. No
+        // multi-target or official-publication inference is made by the fixture.
+        let verified = Self::from_bound_bytes(
+            release,
+            bytes,
+            target,
+            "fixture_key_signed_checksums_not_official_release",
+        )?;
+        if verified.document.targets.len() != 1 {
+            return Err("fixture compatibility must contain exactly one native target".into());
+        }
+        Ok(verified)
+    }
+
     pub(super) fn verify(
         release: &super::ReleaseSet,
         bytes: &[u8],
@@ -252,17 +317,7 @@ impl VerifiedCandidate {
         allow_unsigned: bool,
         cosign: Option<&Path>,
     ) -> Result<Self, String> {
-        if bytes.len() as u64 > LIMIT {
-            return Err("candidate compatibility document exceeds its limit".into());
-        }
-        let expected = selfupdate::checksum_for(&release.checksums_txt, ASSET)
-            .map_err(|_| "release checksums are malformed")?
-            .ok_or("release has no checksum-bound compatibility document; automatic update is unsupported, use the owning installation channel after reviewing format compatibility")?;
-        if !selfupdate::digest_eq(&super::hex_sha256(bytes), &expected) {
-            return Err(
-                "candidate compatibility document does not match the release checksum".into(),
-            );
-        }
+        verify_compatibility_checksum(release, bytes)?;
         let evidence = match super::verify_cosign_signature_with_program(release, cosign) {
             super::CosignOutcomeInternal::Verified => "signed_release_checksums",
             super::CosignOutcomeInternal::Unavailable(_) if allow_unsigned => {
@@ -489,6 +544,172 @@ impl VerifiedRollback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_and_older_contracts_cannot_drop_team_or_materialization_recovery() {
+        let current = Document::current();
+        assert!(preview(&current, "fixture", vec![])
+            .require_compatible()
+            .is_ok());
+        for feature in [
+            "team_policy_runtime_v1",
+            "team_policy_recovery_v1",
+            "npm_materialization_recovery_v1",
+        ] {
+            let mut missing = current.clone();
+            missing.features.retain(|value| value != feature);
+            assert!(
+                preview(&missing, "fixture", vec![])
+                    .require_compatible()
+                    .is_err(),
+                "{feature}"
+            );
+        }
+        // An older signed document or captured rollback receipt can still be
+        // parsed, but absent reader declarations must never imply support.
+        let mut legacy = serde_json::to_value(&current).unwrap();
+        legacy.as_object_mut().unwrap().remove("persisted_formats");
+        let legacy: Document = serde_json::from_value(legacy).unwrap();
+        legacy.validate().unwrap();
+        assert!(
+            preview(&legacy, "captured_previous_running_binary_contract", vec![])
+                .require_compatible()
+                .is_err()
+        );
+        for (surface, _) in current.persisted_formats.readers() {
+            for (version, state, expected) in [
+                (Some(1), "declared_local_unverified", true),
+                (Some(99), "declared_local_unverified", false),
+                (None, "unreadable", false),
+                (None, "inventory_limited", false),
+                (None, "unknown_entry", false),
+            ] {
+                let facts = vec![super::super::lifecycle::FormatFact {
+                    surface,
+                    declared_version: version,
+                    state,
+                }];
+                assert_eq!(
+                    preview(&current, "fixture", facts).compatible,
+                    expected,
+                    "{surface}: {state} {version:?}"
+                );
+            }
+            let mut raw = serde_json::to_value(&current).unwrap();
+            raw["persisted_formats"][surface] = serde_json::json!([]);
+            let candidate: Document = serde_json::from_value(raw).unwrap();
+            assert!(
+                preview(&candidate, "fixture", vec![])
+                    .require_compatible()
+                    .is_err(),
+                "missing {surface}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_crypto_rejects_wrong_key_and_modified_bound_material() {
+        use ed25519_dalek::Signer;
+        // Public RFC8032 vector seed, never a production signing secret.
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ]);
+        let target = "x86_64-unknown-linux-gnu";
+        let mut document = Document::current();
+        let archive = selfupdate::release_archive_name(target);
+        document.targets.insert(
+            target.into(),
+            Target {
+                archive: archive.clone(),
+                archive_sha256: "a".repeat(64),
+                binary_sha256: "b".repeat(64),
+            },
+        );
+        let raw = serde_json::to_vec(&document).unwrap();
+        let checksums = |bytes: &[u8]| {
+            format!(
+                "{}  {}\n{}  {}\n",
+                "a".repeat(64),
+                archive,
+                super::super::hex_sha256(bytes),
+                ASSET
+            )
+        };
+        let mut release = super::super::ReleaseSet {
+            tag: format!("v{}", document.version),
+            archive_path: PathBuf::from(&archive),
+            checksums_txt: checksums(&raw),
+            sig_path: None,
+            cert_path: None,
+            checksums_path: PathBuf::from("checksums.txt"),
+        };
+        let signature = signer.sign(release.checksums_txt.as_bytes()).to_bytes();
+        let verified =
+            VerifiedCandidate::verify_fixture_key(&release, &raw, target, &signature).unwrap();
+        assert_eq!(
+            verified.evidence,
+            "fixture_key_signed_checksums_not_official_release"
+        );
+        assert_eq!(verified.archive_sha256(), "a".repeat(64));
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        assert!(VerifiedCandidate::verify_fixture_key(
+            &release,
+            &raw,
+            target,
+            &wrong.sign(release.checksums_txt.as_bytes()).to_bytes()
+        )
+        .is_err());
+        let mut changed_signature = signature;
+        changed_signature[0] ^= 1;
+        assert!(
+            VerifiedCandidate::verify_fixture_key(&release, &raw, target, &changed_signature)
+                .is_err()
+        );
+        let mut changed_bytes = raw.clone();
+        changed_bytes[0] ^= 1;
+        assert!(VerifiedCandidate::verify_fixture_key(
+            &release,
+            &changed_bytes,
+            target,
+            &signature
+        )
+        .is_err());
+        release.checksums_txt.push(' ');
+        assert!(VerifiedCandidate::verify_fixture_key(&release, &raw, target, &signature).is_err());
+        for variation in [
+            "missing_target",
+            "extra_target",
+            "version",
+            "archive_binding",
+        ] {
+            let mut changed = document.clone();
+            match variation {
+                "missing_target" => changed.targets.clear(),
+                "extra_target" => {
+                    changed.targets.insert(
+                        "aarch64-unknown-linux-gnu".into(),
+                        Target {
+                            archive: selfupdate::release_archive_name("aarch64-unknown-linux-gnu"),
+                            archive_sha256: "a".repeat(64),
+                            binary_sha256: "b".repeat(64),
+                        },
+                    );
+                }
+                "version" => changed.version = "999.0.0".into(),
+                _ => changed.targets.get_mut(target).unwrap().archive_sha256 = "c".repeat(64),
+            }
+            let bytes = serde_json::to_vec(&changed).unwrap();
+            release.checksums_txt = checksums(&bytes);
+            let signature = signer.sign(release.checksums_txt.as_bytes()).to_bytes();
+            assert!(
+                VerifiedCandidate::verify_fixture_key(&release, &bytes, target, &signature)
+                    .is_err(),
+                "{variation}"
+            );
+        }
+    }
 
     #[test]
     fn format_preview_refuses_unknown_future_and_unsupported_downgrades() {

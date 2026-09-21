@@ -1,5 +1,130 @@
 # Implementation verification
 
+## Integrated native checks (2026-09-21)
+
+The second retained macOS ARM release product, SHA-256
+`fa4c656e1322e25665ebabe0ca578d031391d1e81bb7a735583caadc177808fe`,
+has 604 captured source inputs and independent before/after build records. Its
+same-version fixture-key replacement and rollback passes with the new persisted
+format contract, configuration preservation, exact restored bytes and all four
+owned outer-process cleanup checks. This remains a test-image/release-product
+fixture, with the official-release and lifecycle limits described below.
+
+Three real newly opened Zsh sessions on that product now pass with native job
+control enabled (`MONITOR=on`). Each actual recommended setup produces one
+completion notice, one allowed marker, no blocked marker, and one observation
+from each allow-hook, block-hook and status body. The durable phase is verified;
+seeded history is restored, the shell exits naturally with PTY EOF, all four
+cleanup observations pass, and the isolated home is removed. The separately
+reviewed harmless PTY control observes a foreground job in a different process
+group within the original session. This qualifies the retained macOS Zsh tuple,
+not other shells, platforms, escaped sessions or later source changes.
+
+All seventeen isolated read-only/dry-run command examples also pass on that
+product. The runner checks the exact expected JSON contracts: project coverage
+gaps retain exit 2, and tuning without audit history retains exit 1. The first
+attempt incorrectly expected zero for those two cases; its failed report is
+preserved separately. Binary, helper, runner and relevant source identities are
+unchanged, and every command passes all four owned cleanup checks. These smoke
+checks do not substitute for the six complete installed/native user journeys.
+
+The corresponding full CLI test run passed 2,075 cases and failed one lifecycle
+retention case, with three ignores. Investigation found Unix lock owners that
+relied on descriptor closure: a duplicate or fork-inherited descriptor can keep
+the advisory lock held. Explicit owner release and deterministic retained-copy
+regressions are integrated across the affected operation, receipt, capability and
+materialization paths. The corrected CLI executable, SHA-256
+`8aa00180b4c155f735431df480fdfdaaeb45e313b1041e3eb1e065c575b27deb`,
+passes 2,077 tests with no failures and three ignores, with all four owned
+cleanup checks passing. The precise scheduling cause of the preceding suite
+failure is not established; that failed run remains separately retained.
+
+Fifteen publication verifier/report controls pass after the ThreatDB corrections.
+They cover complete signed declarations before lag retries, duplicate and type
+refusals, discovery-surface disagreement, source-sidecar binding, partial upload
+reporting and recovery after a failed prior attempt. They use local fixture keys
+and downloads; no remote publication or concurrent publisher success is inferred.
+Seven release-compatibility generator controls, twelve native resource collector
+controls, installer platform controls and npm launcher controls also pass.
+
+## Shell and platform family corrections (2026-09-21)
+
+The latest public reports remain issues 260, 261 and 264. The shell correction
+allows static bracket conditions, bounded numeric arithmetic and proven Python
+data pipelines while retaining unknown command identity and executable child
+bodies. Eleven focused Rust regressions pass on the corrected native macOS core
+test executable, SHA-256
+`c1f17322cb41ac5fbec131131fea8240c3d4e65fd0630d2c7d1ff89571275917`.
+All four owned process-group cleanup checks pass. The preceding complete core
+run passed 6,131 cases and failed the newly added Zsh function-name case; the
+correction now retains both name substitutions and literal body threats. That
+failed attempt remains distinct from the focused corrected result.
+
+Actual CLI comparisons on the preceding retained candidate allow the reported
+bracket, numeric arithmetic and simple Python data cases. Dangerous arithmetic
+and stdin code execution remain blocked. Variable executable names still report
+incomplete analysis with explicit-path guidance; a literal assignment cannot
+establish live shell state, so issue 264 is not claimed wholly resolved.
+
+Android changes incorporate contributor PR 262 at
+`74a6f0aa5ca43d977ba52388852e0c8d260e306d`, with unavailable-backend guidance and
+installer refusal added. No native Android or BSD qualification is claimed.
+The related release-selection correction preserves the full Cargo target,
+including libc and ABI. Installer controls reject unknown libc and 32-bit GNU
+userlands, and npm controls check glibc without diagnostic-report networking.
+Shell/npm tests pass on the retained source; native GNU/musl build and provenance
+checks remain part of the next CI run. Ordinary protection requires no elevation.
+
+## Platform CI and corrective checks (2026-09-21)
+
+For pushed head `5aa893e6`, [CI run 35558439054](https://github.com/sheeki03/tirith/actions/runs/35558439054)
+tests GitHub's merge snapshot `be5ff29d` against main `800ffb3b`. It
+records 9,925 Linux test passes across 70 harness results, 9,761 macOS passes
+across 69 results, and 9,924 Rust 1.83 passes across 69 results, with no test
+failures in those three jobs. These are aggregate harness counts, not a count
+of distinct tests. Linux includes 40 core materialization cases, 63 core team
+policy cases and 23 team CLI cases, plus the materializer CLI/recovery cases.
+Native PowerShell and capsule interruption/receipt steps also pass on Linux. The downstream release-compatibility gate correctly fails because Windows/musl build failures skip required package-validation jobs.
+
+The same head fails Windows compilation because the pure exact-mode transform
+was gated to Unix, and ARM musl compilation because a newly added rename used
+a libc wrapper unavailable on that target. Linux Clippy rejects test-module
+ordering and explicit drops of non-Drop evidence values. Cargo Deny reports
+RUSTSEC-2026-0285 in the locked Rustls version. The corrective source removes
+the inappropriate method gate, uses the existing Linux syscall pattern without
+an overwrite fallback, fixes the test lints, and updates Rustls to 0.23.45 in
+both workspaces. Strict macOS workspace/all-target Clippy passes on that source;
+the corrected Windows/musl jobs still need to run. The local locked workspace
+advisory check subsequently passes with Rustls 0.23.45.
+
+The signed replacement fixture's independent source review identified and
+closed a native-target type mismatch and missing Cargo-to-checkout association.
+Its 16 Python parser/crypto controls and six selected Rust parser/crypto/private
+storage tests pass. The subsequent actual native macOS ARM fixture passes in
+30.2 seconds overall, with the selected native test completing in 20.66 seconds.
+The retained release product SHA-256 is
+`7c933bf0c4f00d03891dc482722bcce10065650c5da72511746bd994529eb1c8`;
+the original test-image SHA-256 is
+`db0a51e1f59753d95ad6539b95a92fa49e90162c527af2e3f5f9a41324f3319a`.
+All 603 captured source files are retained with matching hashes. Actual signed
+archive admission, production extraction/replacement, rollback receipt checks,
+stale-generation refusals, configuration preservation and final destination/
+backup readback pass. Both owned outer jobs pass all four cleanup checks; the
+separate trusted extractor is observed completing normally.
+
+This is same-version test-image to release-product to original-test-image
+replacement using a public fixture key. It does not establish official release
+signing, numeric upgrade, startup of the swapped-in product, shell/host reload,
+service migration, crash/power-loss durability, Windows, or process-tree cleanup.
+
+All twelve historical resource experiment artifacts have been retained and
+checked. Only the `url_first` control/growth pair matches the reviewed EPYC 7763
+cohort: its actual allocation increase is 33,554,429 bytes, and only its selected
+ceiling is crossed. The other five pairs are refused because their CPU classes
+differ. Their successful workflows are not admitted growth evidence. Resource
+budgets remain disabled pending comparable qualification and current-source
+measurements.
+
 ## Optional team policy and local materialization (2026-09-21)
 
 The resumed source matches all 62 retained changed/new inputs at base
@@ -28,7 +153,8 @@ The optional server, typed client protocol, local connection/enrollment and
 CLI/browser rollout controls are implemented. Personal operation remains
 independent of a server. The Linux-only local package materializer has explicit
 plan/apply/status/undo/recovery contracts and does not execute package code. Its
-native Linux write/recovery paths still require the new platform CI result.
+native Linux write/recovery cases subsequently pass on `5aa893e6` as recorded
+above. Final installed-artifact and broader storage-fault qualification remain.
 General npm/Python private-input execution remains disabled.
 
 Three retained release100 measurements at source `6b1aed52` share the exact

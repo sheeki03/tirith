@@ -95,7 +95,6 @@ object = { version = "0.39", default-features = false, features = [
     "pe",
     "std",
 ] }
-arboard = { workspace = true }
 # OS RNG for the per-install anomaly-baseline salt (M10 ch5). Tiny, OS-only
 # entropy source; already present transitively. Used by `baseline::load_or_create_salt`.
 getrandom = "0.3"
@@ -177,6 +176,11 @@ extrasafe = "0.5"
 
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
 seccompiler = { version = "0.4", default-features = false }
+
+# arboard has no Android backend. The clipboard wrapper reports NoBackend
+# on Android while the existing desktop backends remain unchanged.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { workspace = true }
 
 [build-dependencies]
 toml = "0.8"

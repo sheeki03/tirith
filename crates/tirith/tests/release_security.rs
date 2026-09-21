@@ -959,3 +959,32 @@ fn linux_release_keeps_glibc_and_canonical_package_contracts() {
         );
     }
 }
+
+#[cfg(all(unix, not(target_os = "android")))]
+#[test]
+fn installer_refuses_termux_before_tools_downloads_or_destination_changes() {
+    let root = tempfile::tempdir().expect("fixture");
+    let destination = root.path().join("must-not-exist");
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = std::process::Command::new("/bin/sh")
+        .arg(repository.join("scripts/install.sh"))
+        .env_clear()
+        .env("PATH", "/missing")
+        .env("TERMUX_VERSION", "fixture")
+        .env("TIRITH_VERSION", "invalid-android-fixture")
+        .env("TIRITH_INSTALL_DIR", &destination)
+        .env("TIRITH_INSTALL_APPROVAL_HELPER", "1")
+        .current_dir(root.path())
+        .output()
+        .expect("run installer");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Android/Termux release installation is not supported"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Do not use sudo"), "{stderr}");
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}

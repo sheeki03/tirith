@@ -75,12 +75,26 @@ and source provenance. It then runs the actual CLI with empty data/state caches
 and verifies its installed generation and authenticated freshness. A failure
 prevents pruning and is retained as an operational artifact.
 
+The independent verifier rejects duplicate JSON fields, non-integer schema or
+sequence declarations, mixed immutable asset generations and same-sequence
+primary/fallback or legacy/index disagreement. All signed pointer declarations
+are checked before an older pointer is treated as propagation lag. Only that
+validated lag receives up to three observations with 10/20-second delays;
+invalid successful responses are not retried. Transport retries retain their
+separate curl limits. Verification failures also retain a refused report.
+The cold-client step creates a fresh private temporary cache directory each time.
+
 Each run has one structured `threatdb-run-report.json` and one summary. Stable
 incident keys group repeats by failed phase. The prior completed workflow outcome
 distinguishes recovery from ordinary success. Failure before publication reports
-the retained generation; failure after upload reports partial/unverified
+the retained generation; a failed or cancelled publication attempt reports partial/unverified
 publication and instructs the operator to check both discovery surfaces. These
 reports do not post new issues or adopt pins automatically.
+Every named publication/retirement/commit/prune phase is recorded. A failure
+after successful cold-client verification still requires recovery review, while
+preserving the fact that discovery and the client were verified. Reruns bind
+recovery to the previous attempt of the same run when that record is available;
+missing API evidence does not establish an earlier failure or recovery.
 
 ## Count calibration and verification
 
@@ -98,3 +112,9 @@ provenance tampering, transient retry/backoff limits, invalid successful respons
 partial upload, replayed pointers, stable incident keys and recovery. Existing
 tests cover missing/empty required sources, transactional cleanup, signed baseline
 loss, generation commit failures, rollback and same-second cache replacement.
+Publication tests use an in-memory download map and a local fixture signing key;
+they prove verifier, retry and incident-report behavior, not remote publication.
+The workflow serializes scheduled/manual runs and retains the monotonic signed
+sequence allocator and stale-source guard. Actual overlapping/rerun workflow,
+partial remote upload and cold-client recovery evidence must come from retained
+workflow executions; parser fixtures do not satisfy those remote checks.

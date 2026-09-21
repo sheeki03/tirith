@@ -634,33 +634,16 @@ nix profile install github:sheeki03/tirith      # from upstream flake
 
 ### Android (Termux)
 
-Android/Termux runs on Bionic libc, not glibc, so the `aarch64-unknown-linux-gnu`
-build cannot run there, it needs glibc's dynamic linker. Use the **musl** build
-instead: `tirith-aarch64-unknown-linux-musl.tar.gz` is statically linked and runs
-on Termux without an external libc.
+Android uses Bionic libc. A GNU/Linux release archive is not an Android build,
+and a Linux musl smoke test does not qualify Android behavior. The release
+installer therefore refuses Android/Termux before downloading or requesting
+administrator access.
 
-```bash
-# In Termux:
-pkg install curl tar
-# Download the musl build from the latest GitHub release:
-curl -fsSL -o tirith.tar.gz \
-  https://github.com/sheeki03/tirith/releases/latest/download/tirith-aarch64-unknown-linux-musl.tar.gz
-tar xzf tirith.tar.gz
-install -Dm755 tirith "$PREFIX/bin/tirith"
-tirith --version
-```
-
-Then activate the shell hook in `~/.bashrc` (Termux's default shell is bash):
-
-```bash
-eval "$(tirith init --shell bash)"   # add to ~/.bashrc
-```
-
-> [!NOTE]
-> Termux support is best-effort. The musl artifact is built and smoke-tested in
-> CI, but tirith is not yet continuously tested on a real Android device.
-> If a hook misbehaves under Termux, please open an issue with `tirith doctor`
-> output.
+Android source builds are experimental. See [Android/Termux](docs/android-termux.md)
+for build instructions, feature limits, and the checks needed before enabling a
+shell hook. No native Android release asset or continuously tested Android
+support is currently provided. Ordinary command analysis does not require sudo;
+sudo cannot supply the missing Android clipboard or containment backends.
 
 ### Windows
 
@@ -987,7 +970,7 @@ Explicit, opt-in surfaces. None of these run implicitly, and none has a daemon o
 | `tirith pkg attest-npm` | Ask the project's own npm to verify its installed packages' registry signatures, bound to the exact lockfile and install tree |
 | `tirith attest {build,verify-build,deployment,verify-deployment}` | Point-in-time receipts over two trees and over deployed routes. Not a reproducible-build claim, and not continuous monitoring |
 
-That is the daily-driver set. tirith ships 78 top-level commands in all, in 8 groups: scan & analyze, status & health, setup, policy & trust, shell & system guards (`hygiene`, `persistence`, `exec`, `path`, `context`, `ssh`, `sudo`, `iac`), supply-chain, AI-agent integrations, and forensics & response. Run `tirith --help` for the categorized list, or see the **[full command reference](docs/commands.md)**. The global `--quiet` flag (or `TIRITH_QUIET=1`) silences advisory output without hiding errors, verdicts, or security notices.
+That is the daily-driver set. tirith groups its commands into 8 categories: scan & analyze, status & health, setup, policy & trust, shell & system guards (`hygiene`, `persistence`, `exec`, `path`, `context`, `ssh`, `sudo`, `iac`), supply-chain, AI-agent integrations, and forensics & response. Run `tirith --help` for the categorized list, or see the **[full command reference](docs/commands.md)**. The global `--quiet` flag (or `TIRITH_QUIET=1`) silences advisory output without hiding errors, verdicts, or security notices.
 
 ---
 

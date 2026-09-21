@@ -6,6 +6,15 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      native_resource_experiment:
+        description: Explicit macOS ARM baseline or same-runner growth pair; none preserves Linux benchmarks
+        type: choice
+        options: ['none', 'baseline', 'clean_first', 'clean_subsequent', 'url_first', 'url_subsequent', 'history_requests', 'ordinary_rss']
+        default: 'none'
+      native_resource_protocol:
+        description: Tracked reviewed protocol path for the selected native growth pair
+        type: string
+        default: ''
       collect_pinned_reference:
         description: Replay the explicitly pinned source and runner cohort
         type: boolean
@@ -21,6 +30,7 @@ permissions:
 
 jobs:
   benchmark:
+    if: github.event_name != 'workflow_dispatch' || inputs.native_resource_experiment == 'none'
     name: Performance
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -219,6 +229,47 @@ jobs:
           name: benchmark-output-${{ github.run_id }}-${{ github.run_attempt }}
           path: bench-output.txt
           if-no-files-found: error
+
+  native-resource-reference:
+    if: github.event_name == 'workflow_dispatch' && inputs.native_resource_experiment != 'none'
+    name: Native macOS ARM resource reference
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      RESOURCE_EXPERIMENT: ${{ inputs.native_resource_experiment }}
+      RESOURCE_PROTOCOL: ${{ inputs.native_resource_protocol }}
+      RESOURCE_RUNNER_LABEL: macos-15
+      RESOURCE_LEGACY_REFERENCE: ${{ inputs.collect_pinned_reference }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: '1.98.1'
+
+      - name: Check collector contracts
+        run: python3 -B scripts/test-collect-native-resource-reference.py
+
+      - name: Collect one baseline or one serial control/growth pair
+        run: >-
+          python3 -B scripts/collect-native-resource-reference.py
+          --source "$GITHUB_WORKSPACE"
+          --output "$RUNNER_TEMP/native-resource-reference"
+          --experiment "$RESOURCE_EXPERIMENT"
+          --protocol "$RESOURCE_PROTOCOL"
+
+      - name: Retain every collected observation and refusal
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-resource-reference-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-resource-reference/evidence
+          if-no-files-found: error
+          retention-days: 90
 
   publish-baseline:
     name: Publish trusted main benchmark baseline

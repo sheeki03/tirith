@@ -42,6 +42,13 @@ def contract(root: Path, version: str) -> dict:
     grants = source_constant(root, "crates/tirith-core/src/trust_grants.rs", "STORE_VERSION")
     journal = source_constant(root, "crates/tirith/src/cli/setup/change_plan.rs", "SCHEMA")
     protocol = source_constant(root, "crates/tirith/src/cli/control/lifecycle.rs", "PROTOCOL")
+    team = source_constant(root, "crates/tirith-core/src/policy_team.rs", "SCHEMA_VERSION")
+    semantics = source_constant(root, "crates/tirith-core/src/policy_team.rs", "POLICY_SEMANTICS_VERSION")
+    intent = source_constant(root, "crates/tirith/src/cli/npm_materialize.rs", "INTENT_SCHEMA_VERSION")
+    checkpoint = source_constant(root, "crates/tirith/src/cli/npm_materialize.rs", "CHECKPOINT_SCHEMA_VERSION")
+    inventory = source_constant(root, "crates/tirith-core/src/artifact/npm_materialize.rs", "RECOVERY_INVENTORY_VERSION")
+    if (team, semantics, intent, checkpoint, inventory) != (1, 1, 1, 1, 1):
+        raise ValueError("persisted format implementation changed; review the compatibility contract before release")
     # A changed format needs a reviewed reader/migration contract, not an
     # automatically widened claim that every intervening version is supported.
     if (policy, lock, grants, journal, protocol) != (2, 8, 1, 1, 1):
@@ -54,12 +61,24 @@ def contract(root: Path, version: str) -> dict:
         "mcp_lock_authorize_versions": [8],
         "legacy_trust_read_versions": [1],
         "scoped_grant_read_versions": [1],
+        "persisted_formats": {
+            "team_connection": [team],
+            "team_enrollment": [team],
+            "team_report": [team],
+            "team_rollout": [team],
+            "team_policy_document": [team],
+            "team_policy_semantics": [semantics],
+            "npm_materialization_intent": [intent],
+            "npm_materialization_checkpoint": [checkpoint],
+            "npm_materialization_inventory": [inventory],
+            "npm_materialization_recovery_rule": "linux_only_fresh_policy_and_exact_current_ownership_required",
+        },
         "operation_journal_version": journal,
         "operation_journal_client_rule": "exact_client_version_required",
         "control_service_protocol": protocol,
         "control_service_reuse_rule": "exact_protocol_version_and_binary_sha256_required",
         "configuration_update_rule": "preserve_existing_bytes",
-        "features": ["effective_policy_snapshot_v1", "scoped_trust_grants_v1", "protection_profiles_v1", "owned_change_journals_v1"],
+        "features": ["effective_policy_snapshot_v1", "scoped_trust_grants_v1", "protection_profiles_v1", "owned_change_journals_v1", "team_policy_runtime_v1", "team_policy_recovery_v1", "npm_materialization_recovery_v1"],
     }
 
 

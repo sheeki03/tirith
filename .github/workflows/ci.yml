@@ -343,6 +343,8 @@ jobs:
           persist-credentials: false
       - name: Shell syntax check
         run: sh -n scripts/install.sh
+      - name: Linux libc and platform selection tests
+        run: sh tests/install-sh/platform.sh
       - name: verify_sha256 regression tests
         run: sh tests/install-sh/verify_sha256.sh
       - name: package-approval helper return-path tests

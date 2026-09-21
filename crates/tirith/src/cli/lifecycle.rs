@@ -7,6 +7,10 @@ use serde::Serialize;
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
 use tirith_core::selfupdate::SemVer;
 
+#[path = "lifecycle_formats.rs"]
+mod stored_formats;
+pub(crate) use stored_formats::PersistedFormats;
+
 #[derive(Debug, Serialize)]
 pub(crate) struct VersionObservation {
     pub version: Option<String>,
@@ -37,6 +41,8 @@ pub(crate) struct CompatibilityFacts {
     pub mcp_lock_read_versions: Vec<u32>,
     pub legacy_trust_read_versions: Vec<u32>,
     pub scoped_grant_read_versions: Vec<u32>,
+    pub persisted_formats: PersistedFormats,
+    pub persisted_inventory_scope: &'static str,
     pub operation_journal_version: u32,
     pub operation_journal_client_rule: &'static str,
     pub control_service_protocol: u32,
@@ -213,6 +219,10 @@ fn observed_formats() -> Vec<FormatFact> {
             None,
         ));
     }
+    formats.extend(stored_formats::observe(
+        tirith_core::policy::config_dir().as_deref(),
+        tirith_core::policy::state_dir().as_deref(),
+    ));
     formats
 }
 
@@ -282,6 +292,8 @@ pub(super) fn gather(
             mcp_lock_read_versions: (4..=tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION).collect(),
             legacy_trust_read_versions: vec![1],
             scoped_grant_read_versions: vec![tirith_core::trust_grants::STORE_VERSION],
+            persisted_formats: PersistedFormats::current(),
+            persisted_inventory_scope: stored_formats::INVENTORY_SCOPE,
             operation_journal_version: 1,
             operation_journal_client_rule: "exact_client_version_required",
             control_service_protocol: 1,

@@ -4,10 +4,10 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::super::materialization_store::MaterializationLock;
     use super::super::{
         c_component, entry_identity_at, file_identity, open_directory_nofollow, openat_directory,
     };
-    use fs2::FileExt as _;
     use serde::Deserialize;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::{
@@ -56,7 +56,7 @@ mod linux {
         root_identity: (u64, u64),
         journal: File,
         journal_name: OsString,
-        lock: File,
+        lock: MaterializationLock,
         records: BTreeMap<String, Record>,
         pending: bool,
         inventory: Vec<u8>,
@@ -85,7 +85,7 @@ mod linux {
             if lock.metadata()?.len() != 0 {
                 return Err(refusal("recovery lock is not empty"));
             }
-            lock.try_lock_exclusive()?;
+            let lock = MaterializationLock::try_acquire(lock)?;
             let actual = names(&journal)?;
             let pending = actual.contains("pending-target");
             if !actual.contains("lock")
@@ -118,7 +118,7 @@ mod linux {
                     .map_err(|_| refusal("checkpoint has ambiguous JSON"))?;
                 let event: CheckpointEvent = serde_json::from_value(value)
                     .map_err(|_| refusal("checkpoint schema refused"))?;
-                if event.schema_version != 1
+                if event.schema_version != crate::cli::npm_materialize::CHECKPOINT_SCHEMA_VERSION
                     || event.contract != "LocalLeafMaterializeV1"
                     || event.operation_id != id
                     || event.private_plan_digest != private_digest
@@ -262,82 +262,7 @@ mod linux {
             Ok(())
         }
     }
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::cli::package_checkpoint::create_file_at;
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt;
-        fn fixture() -> (tempfile::TempDir, PathBuf, String, (u64, u64), PathBuf) {
-            let root = tempfile::tempdir().unwrap();
-            let target = root.path().join("target");
-            let id = uuid::Uuid::new_v4().to_string();
-            let identity = file_identity(&open_directory_nofollow(root.path()).unwrap()).unwrap();
-            let journal = root.path().join(format!(".tirith-materialize-{id}"));
-            std::fs::create_dir(&journal).unwrap();
-            std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let held = open_directory_nofollow(&journal).unwrap();
-            create_file_at(held.as_raw_fd(), OsStr::new("lock"), 0o600).unwrap();
-            std::fs::create_dir(journal.join("pending-target")).unwrap();
-            std::fs::set_permissions(
-                journal.join("pending-target"),
-                std::fs::Permissions::from_mode(0o700),
-            )
-            .unwrap();
-            let root_id =
-                file_identity(&open_directory_nofollow(&journal.join("pending-target")).unwrap())
-                    .unwrap();
-            for (name, inventory) in [
-                ("00-staging.json", false),
-                ("01-verified-private.json", true),
-            ] {
-                // Input-reader fixture only, not a core recovery proof. The
-                // core must reject this deliberately incomplete inventory.
-                let event=CheckpointEvent{schema_version:1,contract:"LocalLeafMaterializeV1".into(),operation_id:id.clone(),private_plan_digest:"a".repeat(64),event:name.into(),target_identity:[root_id.0,root_id.1],observation:inventory.then(||serde_json::json!({"descriptive":true})),recovery_inventory:inventory.then(||serde_json::json!({"root":{"identity":[root_id.0,root_id.1]},"reader_fixture_only":true})),package_code_executed:false,execution_authority:false};
-                let mut file = create_file_at(held.as_raw_fd(), OsStr::new(name), 0o600).unwrap();
-                file.write_all(&serde_json::to_vec(&event).unwrap())
-                    .unwrap();
-            }
-            (root, target, id, identity, journal)
-        }
-        #[test]
-        fn retained_checkpoint_reader_refuses_extra_entries_and_keeps_them() {
-            let (_root, target, id, parent, journal) = fixture();
-            let reader = RecoveryCheckpoint::open(&target, &id, parent, &"a".repeat(64)).unwrap();
-            std::fs::write(journal.join("unexpected"), b"preserve").unwrap();
-            assert!(reader.revalidate().is_err());
-            drop(reader);
-            assert_eq!(
-                std::fs::read(journal.join("unexpected")).unwrap(),
-                b"preserve"
-            );
-        }
-        #[test]
-        fn missing_inventory_and_cross_operation_records_refuse_before_core_capture() {
-            let (_root, target, id, parent, journal) = fixture();
-            let path = journal.join("01-verified-private.json");
-            let bytes = std::fs::read(&path).unwrap();
-            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            value["operation_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
-            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-            assert!(RecoveryCheckpoint::open(&target, &id, parent, &"a".repeat(64)).is_err());
-            std::fs::remove_file(&path).unwrap();
-            assert!(RecoveryCheckpoint::open(&target, &id, parent, &"a".repeat(64)).is_err());
-            assert!(journal.join("pending-target").is_dir());
-        }
-        #[test]
-        fn checkpoint_reader_holds_original_lock_and_rejects_record_replacement() {
-            let (_root, target, id, parent, journal) = fixture();
-            let reader = RecoveryCheckpoint::open(&target, &id, parent, &"a".repeat(64)).unwrap();
-            assert!(RecoveryCheckpoint::open(&target, &id, parent, &"a".repeat(64)).is_err());
-            let path = journal.join("01-verified-private.json");
-            let bytes = std::fs::read(&path).unwrap();
-            std::fs::rename(&path, journal.join("displaced")).unwrap();
-            std::fs::write(&path, bytes).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            assert!(reader.revalidate().is_err());
-        }
-    }
+
     fn refusal(message: &str) -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::InvalidData, message)
     }
@@ -460,6 +385,101 @@ mod linux {
             return Err(std::io::Error::last_os_error());
         }
         result
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::cli::package_checkpoint::create_file_at;
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        fn fixture() -> (tempfile::TempDir, PathBuf, String, (u64, u64), PathBuf) {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("target");
+            let id = uuid::Uuid::new_v4().to_string();
+            let identity = file_identity(&open_directory_nofollow(root.path()).unwrap()).unwrap();
+            let journal = root.path().join(format!(".tirith-materialize-{id}"));
+            std::fs::create_dir(&journal).unwrap();
+            std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let held = open_directory_nofollow(&journal).unwrap();
+            create_file_at(held.as_raw_fd(), OsStr::new("lock"), 0o600).unwrap();
+            std::fs::create_dir(journal.join("pending-target")).unwrap();
+            std::fs::set_permissions(
+                journal.join("pending-target"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let root_id =
+                file_identity(&open_directory_nofollow(&journal.join("pending-target")).unwrap())
+                    .unwrap();
+            for (name, inventory) in [
+                ("00-staging.json", false),
+                ("01-verified-private.json", true),
+            ] {
+                // Input-reader fixture only, not a core recovery proof. The
+                // core must reject this deliberately incomplete inventory.
+                let event=CheckpointEvent{schema_version:1,contract:"LocalLeafMaterializeV1".into(),operation_id:id.clone(),private_plan_digest:"a".repeat(64),event:name.into(),target_identity:[root_id.0,root_id.1],observation:inventory.then(||serde_json::json!({"descriptive":true})),recovery_inventory:inventory.then(||serde_json::json!({"root":{"identity":[root_id.0,root_id.1]},"reader_fixture_only":true})),package_code_executed:false,execution_authority:false};
+                let mut file = create_file_at(held.as_raw_fd(), OsStr::new(name), 0o600).unwrap();
+                file.write_all(&serde_json::to_vec(&event).unwrap())
+                    .unwrap();
+            }
+            (root, target, id, identity, journal)
+        }
+        #[test]
+        fn retained_checkpoint_reader_refuses_extra_entries_and_keeps_them() {
+            let (_root, target, id, parent, journal) = fixture();
+            let reader = RecoveryCheckpoint::open(&target, &id, parent, &"a".repeat(64)).unwrap();
+            std::fs::write(journal.join("unexpected"), b"preserve").unwrap();
+            assert!(reader.revalidate().is_err());
+            drop(reader);
+            assert_eq!(
+                std::fs::read(journal.join("unexpected")).unwrap(),
+                b"preserve"
+            );
+        }
+        #[test]
+        fn missing_inventory_and_cross_operation_records_refuse_before_core_capture() {
+            let (_root, target, id, parent, journal) = fixture();
+            let path = journal.join("01-verified-private.json");
+            let bytes = std::fs::read(&path).unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            value["operation_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(RecoveryCheckpoint::open(&target, &id, parent, &"a".repeat(64)).is_err());
+            std::fs::remove_file(&path).unwrap();
+            assert!(RecoveryCheckpoint::open(&target, &id, parent, &"a".repeat(64)).is_err());
+            assert!(journal.join("pending-target").is_dir());
+        }
+        #[test]
+        fn checkpoint_reader_releases_lock_before_duplicate_descriptor_closes() {
+            let (_root, target, id, parent, journal) = fixture();
+            let digest = "a".repeat(64);
+            let first = RecoveryCheckpoint::open(&target, &id, parent, &digest).unwrap();
+            let retained = first.lock.try_clone().unwrap();
+            assert!(RecoveryCheckpoint::open(&target, &id, parent, &digest).is_err());
+            drop(first);
+            let next = RecoveryCheckpoint::open(&target, &id, parent, &digest)
+                .expect("the checkpoint reader releases before duplicate descriptors close");
+            assert!(RecoveryCheckpoint::open(&target, &id, parent, &digest).is_err());
+            drop(retained);
+            assert!(RecoveryCheckpoint::open(&target, &id, parent, &digest).is_err());
+            drop(next);
+            assert!(RecoveryCheckpoint::open(&target, &id, parent, &digest).is_ok());
+            assert!(journal.join("01-verified-private.json").is_file());
+            assert!(journal.join("pending-target").is_dir());
+        }
+
+        #[test]
+        fn checkpoint_reader_holds_original_lock_and_rejects_record_replacement() {
+            let (_root, target, id, parent, journal) = fixture();
+            let reader = RecoveryCheckpoint::open(&target, &id, parent, &"a".repeat(64)).unwrap();
+            assert!(RecoveryCheckpoint::open(&target, &id, parent, &"a".repeat(64)).is_err());
+            let path = journal.join("01-verified-private.json");
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::rename(&path, journal.join("displaced")).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(reader.revalidate().is_err());
+        }
     }
 }
 #[cfg(target_os = "linux")]

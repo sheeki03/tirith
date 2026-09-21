@@ -5,6 +5,14 @@
 #   TIRITH_VERSION=0.1.3 curl -fsSL ... | sh
 set -eu
 
+# Detect Android before replacing PATH: Termux tools are outside the FHS paths
+# below, and uname reports Linux even though GNU release assets require glibc.
+# This refusal uses only shell builtins and never downloads or requests root.
+if [ -n "${TERMUX_VERSION:-}" ] || [ -e /system/bin/linker ] || [ -e /system/bin/linker64 ]; then
+  printf '%s\n' 'error: Android/Termux release installation is not supported by this installer. Build the Android target from source; see https://github.com/sheeki03/tirith/blob/main/docs/android-termux.md. Do not use sudo or a GNU/Linux release archive.' >&2
+  exit 1
+fi
+
 REPO="sheeki03/tirith"
 INSTALL_DIR="${TIRITH_INSTALL_DIR:-$HOME/.local/bin}"
 # A release installer that later crosses a sudo boundary must never let a
@@ -191,7 +199,23 @@ detect_platform() {
   ARCH="$(uname -m)"
 
   case "$OS" in
-    Linux)  PLATFORM="unknown-linux-gnu" ;;
+    Linux)
+      # uname cannot distinguish a musl host from a glibc host. Select only
+      # an archive whose runtime is established before downloading anything.
+      if linux_libc="$(getconf GNU_LIBC_VERSION 2>/dev/null)" &&
+         case "$linux_libc" in glibc\ [0-9]*) true ;; *) false ;; esac; then
+        if [ "$(getconf LONG_BIT 2>/dev/null || :)" != "64" ]; then
+          err "GNU release archives require a 64-bit userland; kernel architecture alone is insufficient. Install through a compatible package channel or build from source with cargo install tirith; no administrator privileges are required for a user installation."
+        fi
+        PLATFORM="unknown-linux-gnu"
+      else
+        linux_libc="$(ldd --version 2>&1 || :)"
+        case "$linux_libc" in
+          *"musl libc"*) PLATFORM="unknown-linux-musl" ;;
+          *) err "Cannot determine a supported Linux libc. Install through a compatible package channel or build from source with cargo install tirith; no administrator privileges are required for a user installation." ;;
+        esac
+      fi
+      ;;
     Darwin) PLATFORM="apple-darwin" ;;
     *)      err "Unsupported OS: $OS" ;;
   esac
@@ -201,6 +225,10 @@ detect_platform() {
     aarch64|arm64)   ARCH="aarch64" ;;
     *)               err "Unsupported architecture: $ARCH" ;;
   esac
+
+  if [ "$PLATFORM" = "unknown-linux-musl" ] && [ "$ARCH" != "aarch64" ]; then
+    err "No release archive is published for ${ARCH} Linux musl. Install through a compatible package channel or build from source with cargo install tirith; no administrator privileges are required for a user installation."
+  fi
 
   TARGET="${ARCH}-${PLATFORM}"
   ARCHIVE="tirith-${TARGET}.tar.gz"

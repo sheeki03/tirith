@@ -36,6 +36,8 @@ pub use writer::{
 
 pub const CONTRACT: &str = "LocalLeafMaterializeV1";
 pub const WRITER_VERSION: u32 = 1;
+/// Exact persisted inventory reader/writer schema, separately bound at release.
+pub const RECOVERY_INVENTORY_VERSION: u32 = 1;
 pub const MAX_ENTRIES: usize = 512;
 pub const STAGING_COMPONENT: &str = "pending-target";
 const MAX_OUTPUT_PATH_BYTES: usize = 1024 * 1024;

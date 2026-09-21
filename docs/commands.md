@@ -3,7 +3,10 @@
 `tirith --help` prints the available top-level commands
 grouped by category, and `tirith <command> --help` documents any one in detail.
 The groups below mirror that built-in grouping. The [README](../README.md)
-covers the everyday subset; this is the complete reference.
+covers the everyday subset; this is the complete reference. The unreleased
+[cycle journeys](next-cycle/user-journeys.md) cover terminal and agent setup,
+project review, interruptions, upgrade and removal; their final-candidate
+qualification remains tracked separately.
 
 ## Scan & analyze
 
@@ -36,7 +39,7 @@ covers the everyday subset; this is the complete reference.
 | Command | What it does |
 |---------|-------------|
 | `tirith status` | "Am I protected?": protection mode, hook health, active policy, threat-DB freshness; exits non-zero when protection is provably reduced (`--json`) |
-| `tirith doctor` | Diagnose install / hooks / policy. `--fix` auto-fixes, `--compat` is a shell/terminal report, `--quick` is a fast pollable snapshot (`--format json`) |
+| `tirith doctor` | Diagnose install / hooks / policy. `--fix` auto-fixes, `--compat` is a static shell/terminal report, `--quick` is a pollable snapshot, and `--verify-shell` gives the actual caller-shell challenge. Use `--bundle --bundle-preview` to review selected diagnostics before private export (`--bundle-incident`, `--bundle-operation`) |
 | `tirith prompt-status` | One-line protection and active-context indicator for your prompt (`--short`, `--json`; 30s cache) |
 | `tirith dashboard` | Open authenticated loopback controls for personal setup, protection, exceptions, history, project review and lifecycle operations (`--no-browser --json` for headless access); `export` retains the static report route |
 | `tirith warnings` | Session warnings (`--summary` for shell exit hooks, `--clear`, `--format json`) |
@@ -65,7 +68,8 @@ covers the everyday subset; this is the complete reference.
 | Command | What it does |
 |---------|-------------|
 | `tirith policy {init,validate,test,tune,effective}` | Scaffold (`--template`), validate, dry-run, suggest from audit, and inspect policy. `effective` defaults to a local-only diagnostic; `effective --runtime` uses the enforcement resolver, including configured remote policy and separate overlays ([coverage](next-cycle/policy-snapshots.md)) |
-| `tirith trust {add,list,explain,diff,remove,gc,last,from-last-trigger}` | Manage trusted patterns (narrow scope, 30-day TTL by default); `from-last-trigger` turns a block into a targeted trust |
+| `tirith policy {profile,setting,operation,simulate}` | Preview/apply typed personal changes, inspect/retry/cancel/undo saved operations, and compare effective decisions for a captured command without executing it |
+| `tirith trust {add,list,explain,diff,remove,gc,last,from-last-trigger}` | Manage trusted patterns (narrow scope, 30-day TTL by default); `from-last-trigger` suggests targeted trust; only explicit `--apply` writes it, and other restrictions remain |
 | `tirith rule {test,validate,explain}` | Author and test custom detection rules (regex or the `when:` semantic DSL) |
 | `tirith output wrap {on,off,status}` | Install or remove the `tirith-out` wrapper that runs a command's output through `tirith view` |
 

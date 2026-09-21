@@ -60,6 +60,26 @@ before another publication.
 | Scoped trust grants | Store schema 1 | 0.4.2 ignores the separate grant store; downgrade loses these exceptions rather than making them global. Unknown newer schemas are inactive. |
 | Operation journal | Schema 1 with the exact originating client version | Another client version cannot silently replay or undo an old mutation. |
 | Local control service | Protocol 1, exact binary version and SHA-256 | Reuse requires the full identity; an update must quiesce writes and reconcile pending jobs. |
+| Team connection, enrollment, report and rollout records | Each schema 1; team policy semantics 1 | Candidates must retain team Runtime enforcement and explicit report/rollout recovery. A missing reader or capability refuses update and rollback, even if the old binary has the same package version. |
+| Local materialization intent/events, target checkpoints and recovery inventory | Each schema 1 | Linux recovery continues to require fresh policy, task authorization and exact current ownership. Format compatibility never authorizes a replay or removes retained records. |
+
+The closed `persisted_formats` contract names these readers separately. A missing
+contract in older signed metadata or rollback evidence means unsupported; it is
+not filled from the running client's capabilities. Publication checks the actual
+writer/reader constants and refuses an unreviewed format change.
+
+Inventory reads only fixed private team files, the bounded team rollout directory,
+and the bounded materialization intent/event directory. The same captured bytes
+also expose document schemas and policy semantics inside enrollment caches and
+both rollout policy documents; future or malformed nested declarations refuse.
+It uses the existing
+guarded native readers, caps directory entries and total bytes, and reports
+unknown names, partial scans, changed inventories and unreadable records as
+incompatible. These observations expose no credentials, stored contents or paths.
+Target-local materialization checkpoints are **not discovered** by this inventory;
+the required recovery contract preserves the reader capability, and an explicit
+recovery must recapture its exact target and journals. This is not a claim that
+all pending operations have been discovered, reconciled, or successfully recovered.
 
 Local format observations report only the surface, declared version, and
 readability. They omit policy contents, grant patterns, service credentials,

@@ -1469,7 +1469,7 @@ fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<std::borrow::Cow<
 /// Split the first unquoted, unescaped redirection suffix from a preceding argv
 /// word. Returns the argv prefix plus whether the operator consumes the next
 /// shell word. Process substitutions stay part of the word.
-fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
+pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
         None,
@@ -1589,7 +1589,7 @@ fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
 /// token (`2> /tmp/log`) rather than carrying an attached target
 /// (`2>/tmp/log`, `2>&1`). Quoted or escaped lookalikes remain ordinary delete
 /// operands.
-fn shell_redirection_token(word: &str) -> Option<bool> {
+pub(crate) fn shell_redirection_token(word: &str) -> Option<bool> {
     let mut rest = word;
     rest = rest.trim_start_matches(|ch: char| ch.is_ascii_digit());
 

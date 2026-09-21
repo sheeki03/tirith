@@ -952,23 +952,27 @@ fn stat_at(parent: i32, name: &std::ffi::CStr) -> std::io::Result<libc::stat> {
 /// clear, a stale non-zero `errno` makes the read look failed. That is the
 /// fail-closed direction: the walk reports an enumeration gap instead of
 /// returning a listing it cannot vouch for.
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+#[cfg(all(unix, any(target_os = "linux", target_os = "dragonfly")))]
 fn clear_errno() {
-    // SAFETY: __errno_location returns this thread's errno slot.
+    // SAFETY: the target accessor returns this thread's live errno slot.
     unsafe { *libc::__errno_location() = 0 };
 }
 
 #[cfg(all(
     unix,
-    any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "dragonfly"
-    )
+    any(target_os = "android", target_os = "openbsd", target_os = "netbsd")
 ))]
 fn clear_errno() {
-    // SAFETY: __error returns this thread's errno slot.
+    // SAFETY: the target accessor returns this thread's live errno slot.
+    unsafe { *libc::__errno() = 0 };
+}
+
+#[cfg(all(
+    unix,
+    any(target_os = "macos", target_os = "ios", target_os = "freebsd")
+))]
+fn clear_errno() {
+    // SAFETY: the target accessor returns this thread's live errno slot.
     unsafe { *libc::__error() = 0 };
 }
 
@@ -980,7 +984,9 @@ fn clear_errno() {
         target_os = "macos",
         target_os = "ios",
         target_os = "freebsd",
-        target_os = "dragonfly"
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
     ))
 ))]
 fn clear_errno() {}
@@ -1042,6 +1048,25 @@ impl Drop for DirStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn directory_eof_does_not_inherit_an_unrelated_errno() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let file = std::fs::File::open(root.path()).expect("directory");
+        let mut stream = DirStream::adopt(file.into()).expect("directory stream");
+        while stream.next_name().expect("listing").is_some() {}
+        // SAFETY: -1 is never a valid descriptor; close sets this thread's errno.
+        assert_eq!(unsafe { libc::close(-1) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(stream
+            .next_name()
+            .expect("clean end of directory")
+            .is_none());
+    }
 
     #[test]
     fn a_listing_reports_every_entry_kind() {

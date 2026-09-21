@@ -95,9 +95,9 @@ impl FileUpdate {
         }
     }
 
-    /// Hook scripts must become executable in the same atomic publication,
-    /// rather than through a later chmod of the live path.
-    #[cfg(unix)]
+    /// Publish the requested Unix mode atomically, for executable hooks and
+    /// private records. Windows keeps its native private ACL validation; it
+    /// does not interpret a Unix mode as Windows permission authority.
     pub(crate) fn with_exact_mode(mut self) -> Self {
         if let Self::Write {
             preserve_existing_mode,

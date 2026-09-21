@@ -1338,19 +1338,17 @@ fn prompt_signal_from_code(code: u8) -> Option<libc::c_int> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "dragonfly"))]
 unsafe fn prompt_errno_location() -> *mut libc::c_int {
     unsafe { libc::__errno_location() }
 }
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "dragonfly",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
+#[cfg(any(target_os = "android", target_os = "openbsd", target_os = "netbsd"))]
+unsafe fn prompt_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno() }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 unsafe fn prompt_errno_location() -> *mut libc::c_int {
     unsafe { libc::__error() }
 }

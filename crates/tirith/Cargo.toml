@@ -116,6 +116,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
 [dev-dependencies]
+# Strict bounded USTAR fixture admission only; already in the workspace lock.
+flate2 = "1"
 tirith-core = { workspace = true, features = ["test-network-seams"] }
 tirith-test-support = { workspace = true }
 mockito = "1"

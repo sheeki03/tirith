@@ -3,12 +3,17 @@
 Baseline revision: `7fd35101568bb06ee0d361dc1d4a4d193c5f60fd` (0.4.2).
 See [baseline.md](baseline.md) for source findings and fixture provenance.
 
-Every row below is **open**. Existing tests are starting points, not an assertion
-that they passed at this revision or satisfy all scenarios. A completion record
-must name code revision, OS/toolchain/host versions, exact command, result artifact,
-skips and expected versus observed side effects. Keep local source tests, native
-host tests and final packaged-release evidence separate. No PR or CI run was
-attached by this inventory.
+This matrix began as an inventory at the baseline above. All final acceptance
+rows remain **open**; later source tests and native observations qualify only
+their recorded candidates and scenarios. A completion record must name code
+revision, OS/toolchain/host versions, exact command, result artifact, skips and
+expected versus observed side effects. Keep local source tests, native host tests
+and final packaged-release evidence separate.
+
+The initial inventory attached no PR or CI run. Subsequent native, PR and platform
+CI results, including retained failures and corrective runs still pending, are
+recorded in [implementation verification](verification.md). The platform rows
+below incorporate that later evidence without closing the final release gates.
 
 | Case | Work packages / gate | Scenario and expected result | Expected side effects | Required evidence / reusable starting point |
 |---|---|---|---|---|
@@ -39,21 +44,24 @@ attached by this inventory.
 
 ## First automatic-setup qualification matrix
 
-No platform/host is certified for the proposed automatic journey by this inventory.
-The first **candidate** is Linux x86_64 with Bash 5.3, using the existing pinned
-Bash CI job and PTY harness. It must pass A04, A06–A08, A10, A15 and final package
-checks before being advertised. This narrow starting point is a qualification
-decision, not a reduction of existing manual workflows.
+The initial inventory selected Linux x86_64 with Bash 5.3 as its first
+**candidate**, using the pinned Bash CI job and PTY harness. Later retained
+macOS Zsh and Claude host observations now establish narrower native results as
+listed below. Each advertised release row must still pass A04, A06–A08, A10, A15
+and final package checks on its own final bytes. A passing development candidate
+or platform test job does not close that requirement or reduce existing manual
+workflows.
 
 | Surface | Existing source evidence | Next-cycle status and missing proof |
 |---|---|---|
 | Linux x86_64, Bash 5.3 | Dedicated CI job builds pinned Bash 5.3; enter/preexec and PTY marker/receipt tests exist | Candidate only; capture exact patch version and installed-package default setup, fresh-shell, upgrade/removal and failure results |
-| macOS arm64, Zsh | Native PTY protocol-v3 delivery tests and current inventory host | Manual workflow retained; no packaged automatic setup result recorded |
+| macOS arm64, Apple Zsh 5.9 | Three actual recommended-setup/fresh-PTY runs pass with default MONITOR on, ordered allow/block/status evidence and restored history on retained release product `fa4c656e…808fe`; see [verification](verification.md#integrated-native-checks-2026-09-21) | Exact native tuple qualified on those bytes; final tag-produced package, later source changes, other profiles and complete upgrade/removal acceptance remain |
 | Linux/macOS, Fish | PTY allow/block/warn/noninteractive tests | Manual workflow retained; exact shell versions and installed fresh-shell target paths unverified |
 | Other Bash versions/startup modes | Version-gated PTY suite; fallback/capability tests | Conditional until tested; missing/old shell skips must be listed |
-| PowerShell 5.1/7, Unix PowerShell | Trusted helper probes and config tests; ignored PTY follow-up stub | No next-cycle native blocking certification; target resolution and interception evidence required |
+| PowerShell 5.1/7, Unix PowerShell | Native Unix PowerShell 7.6.6 passed 22 cases using hook bytes extracted from retained `39f6acc9`; later Linux CI also passes its native PowerShell step; see [verification](verification.md) | Unix hook evidence does not qualify Windows terminals or automatic receipt adapters; native Windows target/interception and final package evidence remain |
 | Nushell | Hook/config source; ignored PTY follow-up stub | No next-cycle native blocking certification |
-| Real agents and MCP clients | Adapter tests and unfilled E2E checklist | No selected agent certified here; record actual host version, enabled configuration, invocation and refusal separately |
+| Real agents and MCP clients | Actual macOS ARM Claude Code 2.1.268 dispatch passes configured-hook/boundary controls on retained candidates; recommended setup, MCP-only and retained-host/fresh-host observations pass on `39f6acc9`; see [Claude evidence](claude-native-evidence.md) and [verification](verification.md) | Qualified evidence is specific to the recorded host, interpreter, settings and candidate; unmatched tools, shortened host deadlines and disabled hooks remain explicit limits. Other hosts, later candidates and beginner/final release journeys remain |
+| Workspace/platform CI | Recorded run `35558439054` passes Linux, macOS and Rust 1.83 test jobs at merge snapshot `be5ff29d`; prior native Windows runs include real standard-account, ACL and owned-process observations; see [platform CI](verification.md#platform-ci-and-corrective-checks-2026-09-21) | That run fails Windows and ARM musl compilation, so dependent package-validation/release gates remain unqualified. Corrective source and older partial native passes require a new matching platform run; no Windows completion is claimed |
 | Linux containment | Native ARM GNU and musl local archives each pass all 16 cases from source manifest `7d9788bf…5d317`; independent GNU/musl CI archives at `71070bbb` also pass all 16, including supervisor/guard interruption | These are distinct exact-source and exact-commit proofs. Final tag-produced release artifacts and later npm boundary changes require separate qualification; see containment-aarch64.md |
 
 ## Reproducible starting commands

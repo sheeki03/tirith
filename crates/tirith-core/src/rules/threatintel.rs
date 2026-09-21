@@ -107,8 +107,38 @@ pub fn extract_packages_detail_for_shell(
     let mut truncated = false;
 
     for seg in segments {
+        // Remove only operators belonging to the original outer shell. This
+        // must precede wrapper resolution: `env -S` produces literal argv,
+        // where a `>` argument remains data and cannot consume the next package.
+        let outer = if matches!(shell, ShellType::Posix | ShellType::Fish)
+            && seg
+                .args
+                .iter()
+                .any(|arg| crate::escalation::shell_redirection_token(arg).is_some())
+            && segment_has_original_shell_arguments(seg, shell)
+        {
+            let mut filtered = seg.clone();
+            let mut skip_target = false;
+            filtered.args.retain(|arg| {
+                if skip_target {
+                    skip_target = false;
+                    return false;
+                }
+                if let Some(separate) = crate::escalation::shell_redirection_token(arg) {
+                    skip_target = separate;
+                    return false;
+                }
+                true
+            });
+            Some(filtered)
+        } else {
+            None
+        };
         let (resolved_command, resolved_args) =
-            match crate::extract::resolve_wrapped_command_for_shell(seg, shell) {
+            match crate::extract::resolve_wrapped_command_for_shell(
+                outer.as_ref().unwrap_or(seg),
+                shell,
+            ) {
                 Some(resolved) => resolved,
                 None => continue,
             };
@@ -158,6 +188,15 @@ pub fn extract_packages_detail_for_shell(
         packages,
         truncated,
     }
+}
+
+/// Synthetic/resolved segments can carry literal argv that resembles shell
+/// syntax. Only the original single-command lexical view grants permission to
+/// remove redirection words. Failure keeps all argv available for inspection.
+fn segment_has_original_shell_arguments(segment: &Segment, shell: ShellType) -> bool {
+    let parsed = crate::tokenize::tokenize(&segment.raw, shell);
+    matches!(parsed.as_slice(), [original]
+        if original.command == segment.command && original.args == segment.args)
 }
 
 const MAX_EXECUTABLE_PACKAGE_DEPTH: usize = 8;
@@ -258,6 +297,8 @@ const PIP_ARG_FLAGS: &[&str] = &[
     "--cert",
     "--client-cert",
     "--cache-dir",
+    "--report",
+    "--log",
 ];
 
 fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
@@ -1135,6 +1176,74 @@ mod tests {
     fn tokenize_and_extract_for_shell(input: &str, shell: ShellType) -> Vec<PackageRef> {
         let segments = tokenize::tokenize(input, shell);
         extract_packages_for_shell(&segments, shell)
+    }
+
+    #[test]
+    fn issue_264_package_redirections_are_not_registry_operands() {
+        for input in [
+            "pip install pytest 2>&1 | tail -10",
+            "pip install 2> /tmp/errors pytest",
+            "pip install pytest > /tmp/output 2>&1",
+            "pip install --index-url 2>&1 https://pypi.org/simple pytest",
+            "pip install pytest {log}>/tmp/output",
+            "npm install left-pad 2>&1 | tail -10",
+            "cargo install ripgrep 2> /tmp/errors",
+            "gem install rake 1>&2",
+        ] {
+            let packages = tokenize_and_extract(input);
+            assert_eq!(packages.len(), 1, "{input}: {packages:?}");
+            assert!(matches!(
+                packages[0].name.as_str(),
+                "pytest" | "left-pad" | "ripgrep" | "rake"
+            ));
+        }
+        for input in ["pip install pytest '2>&1'", "pip install pytest 2\\>\\&1"] {
+            assert!(
+                tokenize_and_extract(input).len() > 1,
+                "quoted/escaped argv was dropped: {input}"
+            );
+        }
+        for input in [
+            "env -S 'pip install --report > malicious-package'",
+            "env -S 'pip install --log > malicious-package'",
+            "sudo env -S 'pip install --report > malicious-package' 2>&1",
+            "env -S 'pip install --report > malicious-package' 2> /tmp/errors",
+        ] {
+            let packages = tokenize_and_extract(input);
+            assert_eq!(packages.len(), 1, "{input}: {packages:?}");
+            assert_eq!(
+                packages[0].name, "malicious-package",
+                "literal argv was reinterpreted: {input}"
+            );
+        }
+        for raw in [
+            "",
+            "__tirith_env_split_literal_v1__ 'pip' 'install' '--report' '>' 'malicious-package'",
+        ] {
+            let literal = Segment {
+                raw: raw.to_owned(),
+                command: Some("pip".to_owned()),
+                args: ["install", "--report", ">", "malicious-package"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                preceding_separator: None,
+                byte_range: 0..0,
+            };
+            let packages = extract_packages_for_shell(&[literal], ShellType::Posix);
+            assert!(
+                packages
+                    .iter()
+                    .any(|package| package.name == "malicious-package"),
+                "literal/synthetic argv lost its package: {raw}: {packages:?}"
+            );
+        }
+        let packages = extract_packages_from_input(
+            "pip install pytest 2>$(npm install left-pad)",
+            ShellType::Posix,
+        );
+        assert!(packages.iter().any(|package| package.name == "pytest"));
+        assert!(packages.iter().any(|package| package.name == "left-pad"));
     }
 
     #[test]

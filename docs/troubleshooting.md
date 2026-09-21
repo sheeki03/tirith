@@ -20,32 +20,35 @@ If hooks are not found:
 
 ## Filing a bug report: `tirith doctor --bundle`
 
-To attach a complete, **redacted** diagnostic to a bug report, run:
+Preview local diagnostics before saving or sharing them:
 
+```sh
+tirith doctor --bundle --bundle-preview --json
 ```
-tirith doctor --bundle
+
+Select an incident from `tirith audit recent --json` or a saved setup/lifecycle
+operation when it is relevant. Use the actual event or operation UUID:
+
+```sh
+tirith doctor --bundle --bundle-preview --bundle-incident EVENT_UUID --bundle-operation OPERATION_UUID --json
 ```
 
-It writes a single text file (path printed on completion, under
-`~/.local/state/tirith/`) containing the doctor info, tirith and hook
-versions, shell / mode / effective protection, hook-chain state, policy
-discovery, threat-DB status, and a curated slice of the environment. The
-aliases `tirith doctor --redacted-report` and `tirith doctor --shell-trace`
-produce the same file.
+Selections are explicit, with at most ten incidents and operations combined.
+Incident lookup searches a bounded recent page, not the entire history. Missing,
+ambiguous and withheld entries are reported; the bundle does not verify audit
+integrity or prove that an operation executed.
 
-The bundle is **redacted by design**:
+Omit `--bundle-preview` to save the same selection with fresh redaction. The
+candidate writes a private JSON file under Tirith's state directory, normally
+`~/.local/state/tirith/support/` (or `$XDG_STATE_HOME/tirith/support/`).
+`--json` reports `bundle_path` and `shared: false`; no upload occurs. The aliases
+`--redacted-report` and `--shell-trace` select the same bundle mode.
 
-- Only a curated allowlist of tirith-relevant environment variables is
-  included — unrelated cloud credentials and API keys are never even
-  candidates.
-- Any value that still looks like a token or secret is masked as
-  `<redacted>`.
-- The literal home-directory path is replaced with `~`, so absolute paths in
-  the report do not reveal your username.
-
-It is safe to attach to a public issue. Review it first if you want to be
-sure. Add `--format json` to get `{"bundle_path": "..."}` instead of the
-human summary.
+The report includes bounded doctor diagnostics, a curated environment allowlist
+and only the records selected above. Mandatory and configured secret redaction
+run again at export, and the home path is shortened. Review the saved file before
+attaching it to a public issue: redaction cannot establish that every remaining
+project name, command detail or operational fact is suitable for publication.
 
 ## Protection downgraded (`degraded` status)
 

@@ -681,7 +681,7 @@ fn decode(bytes: &[u8]) -> MaterializationResult<StoredInventory> {
     let value: StoredInventory =
         serde_json::from_value(json).map_err(|_| Refusal::RecoveryRequired)?;
     validate_id(&value.operation_id)?;
-    if value.schema != 1
+    if value.schema != RECOVERY_INVENTORY_VERSION
         || value.contract != CONTRACT
         || !matches!(value.phase.as_str(), "private" | "published")
         || !sha(&value.private_plan_digest)

@@ -172,7 +172,6 @@ mod linux {
             .join(STAGING_COMPONENT);
         assert!(pending.is_dir());
         assert_eq!(std::fs::read_dir(pending).unwrap().count(), 0);
-        drop(observation);
         assert!(owner.undo_private(&AtomicBool::new(false)).is_err());
     }
     #[test]
@@ -207,7 +206,6 @@ mod linux {
         assert!(observed.summary().root_relocated_since_observation);
         assert!(!pending.exists());
         assert!(plan.target_path().is_dir());
-        drop(observed);
         assert!(owner.relocate_for_undo().is_err());
         assert!(owner.undo_private(&AtomicBool::new(false)).is_err());
     }

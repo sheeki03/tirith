@@ -53,6 +53,9 @@ def main():
     kernel=subprocess.check_output(base+['uname','-m','-r'],text=True).strip()
     if not kernel.endswith('aarch64'): raise SystemExit('requires native aarch64 Docker kernel')
     version=subprocess.check_output(base+['/binary/tirith','--version'],text=True).strip()
+    provenance=json.loads(subprocess.check_output(base+['/binary/tirith','version','--provenance','--json'],text=True))
+    if provenance.get('target') != args.target:
+        raise SystemExit('native archive provenance selected a different release target')
     results=[]
     tests=[('clean',['/bin/sh','-c','set -C; printf marker > written.txt'],0,0),('child_status',['/bin/sh','-c','exit 7'],3,7),('sleep',['/bin/sleep','0.01'],0,0)]
     tests.extend((case,['./probe',case],0,0) for case in ['network','escape','filesystem','resources','process_limit','readiness','fork','inherited'])
@@ -78,7 +81,7 @@ def main():
         item={'case':name,'passed':all(checks.values()),'checks':checks,'returncode':result.returncode,'seconds':round(time.monotonic()-started,3),'receipt':value,'stderr':result.stderr[-4000:]}
         results.append(item)
         print(json.dumps({'case':name,'passed':item['passed'],'checks':checks}),flush=True)
-        args.output.write_text(json.dumps({'snapshot_sha256':args.snapshot_sha256,'harness_sha256':sha(pathlib.Path(__file__)),'binary_sha256':sha(binary),'probe_sha256':sha(probe),'kernel':kernel,'version':version,'operator_uid':65534,'image':IMAGE,'docker_engine_architecture':engine_arch,'source_revision':os.environ.get('GITHUB_SHA'),'artifact_sha256':args.artifact_sha256,'build_target':args.target,'results':results},indent=2)+'\n')
+        args.output.write_text(json.dumps({'snapshot_sha256':args.snapshot_sha256,'harness_sha256':sha(pathlib.Path(__file__)),'binary_sha256':sha(binary),'probe_sha256':sha(probe),'kernel':kernel,'version':version,'operator_uid':65534,'image':IMAGE,'docker_engine_architecture':engine_arch,'source_revision':os.environ.get('GITHUB_SHA'),'artifact_sha256':args.artifact_sha256,'build_target':args.target,'provenance_target':provenance['target'],'results':results},indent=2)+'\n')
         if not item['passed']: raise SystemExit(1)
     cancellation_probe = args.cancellation_probe.resolve()
     cancellation_base = base[:-1] + ['-v', f'{cancellation_probe}:/usr/bin/tirith-cancellation-probe:ro', IMAGE]

@@ -4,7 +4,9 @@ This matrix describes Tirith 0.4.2. The
 [0.4.2 release notes](release-notes-0.4.2.md) cover what that patch release
 changes, and the [0.4.0 release notes](release-notes-0.4.0.md) summarize the
 0.4 line's published capabilities, compatibility boundaries, and remaining
-limitations.
+limitations. The working tree also contains unreleased cycle features; their
+[task guides](next-cycle/user-journeys.md) and [verification record](next-cycle/verification.md)
+do not establish published-package or final-release qualification.
 
 ## Stability Tiers
 
@@ -55,7 +57,7 @@ what an experimental command must satisfy to move to stable.
 | `mcp-server` | Experimental | MCP server mode (JSON-RPC over stdio). |
 | `lab` | Experimental | Adversarial training corpus runner. Offline. `--filter` narrows by tag; `--score` adds a 0-100 risk score per scenario. |
 | `task check` | Preview | Diagnostic task-envelope assessment. Reports what an envelope would be allowed to do; executes, fetches, resolves, and writes nothing, and declares `enforceability: observe_only`. |
-| `capsule run` | Experimental | Fail-closed contained run of an untrusted project. Enforceable on x86_64 Linux only; every other host refuses before anything is copied or spawned, with no degraded fallback. |
+| `capsule run` | Experimental | Fail-closed contained run of an untrusted project. The candidate supports native x86_64 and AArch64 Linux with required Landlock and seccomp controls; unsupported hosts or missing controls refuse before project copy/spawn, with no degraded fallback. Final integrated release-artifact qualification remains separate. |
 | `browser audit` | Experimental | Read-only Chromium-family extension integrity audit. Chrome, Chromium, Brave, and Edge; Firefox and XPI are refused by name. |
 | `pkg attest-npm` | Experimental | Point-in-time npm signature and provenance receipt over an installed project. |
 | `attest` | Experimental | Point-in-time build and deployment receipts (`build`, `verify-build`, `deployment`, `verify-deployment`). |
@@ -193,7 +195,7 @@ it.
 
 | Document | Schema field | Notes |
 |---|---|---|
-| Command card | `schema_version` | Defaults to 1 and is SKIPPED when it equals 1, so a v1 card's signing bytes are byte-identical to what they were before schema 2 existed and every checked-in v1 signature still verifies. `web3` is likewise omitted when unset |
+| Command card | `schema_version` | New authoring uses schema 3 with a shell-bound command digest instead of raw command text. Legacy schema 1/2 verification and explicit signing migration retain their own contracts; a valid legacy signature does not satisfy exact Web3 authorization |
 | Browser extension baseline | `schema` plus an independent `format_version` | The hashing rules version is separate so a stale baseline reports one `schema_upgrade_required` entry rather than phantom drift on every extension |
 | npm provenance receipt | `schema` | |
 | Build receipt | `schema` | |

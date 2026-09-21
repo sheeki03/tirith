@@ -50,6 +50,7 @@ jobs:
       # direct manifest/index commits: those change publication state, not compiler
       # code, and scheduled runs commonly start while one is at the tip.
       - name: Refuse stale workflow reruns
+        id: stale_source
         run: |
           set -euo pipefail
 
@@ -118,6 +119,7 @@ jobs:
       # false, `TRUE`, and every other value become false. Every later shell and
       # workflow gate consumes only this normalized value.
       - name: Normalize fail-closed v2 activation gate
+        id: activation
         env:
           REQUESTED_ENABLE_THREATDB_V2: ${{ vars.ENABLE_THREATDB_V2 }}
         run: |
@@ -137,12 +139,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build compiler
+        id: build
         run: cargo build --locked --release -p tirith --bin tirith-threatdb-compile --bin tirith
 
       # Exercise the exact fetch transaction with fixture commands. A failed
       # background child must stop the job before compilation/publication and
       # must never expose a partial compiler-visible source set.
       - name: Validate fail-closed source fetch orchestration
+        id: fetch_controls
         run: bash .github/scripts/test-fetch-threatdb-sources.sh
 
       # Fetch Phase A sources in parallel. Each PID is waited explicitly and the
@@ -176,6 +180,7 @@ jobs:
 
       # Bail early if signing key is not configured
       - name: Check signing key
+        id: signing_key
         env:
           TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
         run: |
@@ -446,6 +451,7 @@ jobs:
       # hostname list from a repo secret. No real list ships in-tree; when the
       # THREATDB_EXFIL_ENDPOINTS secret is unset the build simply skips the feed.
       - name: Materialize exfil-endpoint feed
+        id: optional_feed
         env:
           THREATDB_EXFIL_ENDPOINTS: ${{ secrets.THREATDB_EXFIL_ENDPOINTS }}
         run: |
@@ -590,6 +596,7 @@ jobs:
           fi
 
       - name: Remove compiler input state
+        id: source_cleanup
         if: ${{ always() }}
         env:
           PERSISTED_STATE_DIR: ${{ env.THREATDB_PUBLISH_STATE_DIR }}
@@ -609,6 +616,7 @@ jobs:
 
       # Generate + sign manifest for client discovery
       - name: Generate signed manifest
+        id: manifest
         env:
           TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
         run: |
@@ -659,6 +667,7 @@ jobs:
       # later v2-side failure must never skip it (which would strand v1 clients on a
       # stale manifest pointing at a since-pruned asset).
       - name: Commit v1 manifest to main
+        id: commit_legacy
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -678,6 +687,7 @@ jobs:
       # clients on the rolling-release fallback; removing data first would leave
       # prune and clients following a dangling signed pointer.
       - name: Retire rolling-release v2 index when disabled
+        id: retire_index
         if: ${{ env.ENABLE_THREATDB_V2 != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -736,6 +746,7 @@ jobs:
           fi
 
       - name: Retire main v2 index when disabled
+        id: retire_main_index
         if: ${{ env.ENABLE_THREATDB_V2 != 'true' }}
         run: |
           set -euo pipefail
@@ -762,6 +773,7 @@ jobs:
       # signature, and select the highest compatible asset (here v2), falling back
       # to the legacy manifest on any failure.
       - name: Validate compiler-generated signed generation index
+        id: validate_index
         # Gated by the ENABLE_THREATDB_V2 rollback switch (DB-C runbook). When false, the
         # v2 index is not (re)generated; the v1 asset + legacy manifest below are
         # untouched and still publish, so old clients keep updating.
@@ -909,6 +921,7 @@ jobs:
       # first created (we deliberately do NOT set target_commitish).
       #
       - name: Publish release (immutable v2 asset)
+        id: publish_v2
         # Gated by the ENABLE_THREATDB_V2 rollback switch (DB-C runbook). When false, the
         # v2 asset and index are not uploaded; the v1 step above still ran, so old
         # clients keep updating. The v2 index file is only generated when the gate
@@ -930,6 +943,7 @@ jobs:
       # later rollback can delete both live indexes without erasing the v2-only
       # anti-drop baseline needed for safe reactivation.
       - name: Publish release (retained non-discovery v2 baseline)
+        id: publish_baseline
         if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
@@ -967,6 +981,7 @@ jobs:
       # Committed ONLY when ENABLE_THREATDB_V2 is on: under the rollback switch the next cron run
       # must stop re-committing the v2 index so a manual revert of it sticks.
       - name: Commit v2 index to main
+        id: commit_index
         if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
         run: |
           set -euo pipefail
@@ -1000,20 +1015,21 @@ jobs:
             --sequence "$BUILD_SEQUENCE" --v2 "$ENABLE_THREATDB_V2" \
             --verify-key crates/tirith/assets/keys/threatdb-verify.pub \
             --output "$RUNNER_TEMP/threatdb-publication-verification.json"
-          cold="$RUNNER_TEMP/threatdb-cold-client"
-          mkdir -p "$cold/config" "$cold/data" "$cold/state"
+          cold=$(mktemp -d "$RUNNER_TEMP/threatdb-cold-client.XXXXXX")
+          mkdir "$cold/config" "$cold/data" "$cold/state"
           export XDG_CONFIG_HOME="$cold/config" XDG_DATA_HOME="$cold/data" XDG_STATE_HOME="$cold/state"
           export TIRITH_THREATDB_PATH="$cold/data/tirith-threatdb.dat"
           export TIRITH_THREATDB_SUPPLEMENTAL_PATH="$cold/data/supplemental.dat"
           ./target/release/tirith threat-db update
-          ./target/release/tirith threat-db health --json > "$cold/health.json"
+          ./target/release/tirith threat-db health --json > "$RUNNER_TEMP/threatdb-cold-client-health.json"
           jq -e --argjson sequence "$BUILD_SEQUENCE" \
-            '.signature_valid == true and .build_sequence == $sequence and .error == null' "$cold/health.json"
+            '.signature_valid == true and .build_sequence == $sequence and .error == null' "$RUNNER_TEMP/threatdb-cold-client-health.json"
           if [ "$ENABLE_THREATDB_V2" = true ]; then
-            jq -e '.freshness.source_evidence == "signature_verified_for_installed_database" and (.freshness.sources | length > 0)' "$cold/health.json"
+            jq -e '.freshness.source_evidence == "signature_verified_for_installed_database" and (.freshness.sources | length > 0)' "$RUNNER_TEMP/threatdb-cold-client-health.json"
           fi
 
       - name: Prune old threatdb assets
+        id: prune
         # Keep recovery assets until both discovery surfaces and a cold client
         # verify. Repeated failures are visible in the run report and require
         # repair before pruning; a partially uploaded generation is not success.
@@ -1220,16 +1236,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_STEPS: ${{ toJSON(steps) }}
+          RUN_STATUS: ${{ job.status }}
         run: |
           set -euo pipefail
           printf '%s' "$RUN_STEPS" > "$RUNNER_TEMP/threatdb-steps.json"
           gh api "repos/$GITHUB_REPOSITORY/actions/workflows/threatdb.yml/runs?branch=main&status=completed&per_page=5" \
             > "$RUNNER_TEMP/threatdb-previous-runs.json" || printf '{}' > "$RUNNER_TEMP/threatdb-previous-runs.json"
+          printf '{}' > "$RUNNER_TEMP/threatdb-previous-attempt.json"
+          if (( RUN_ATTEMPT > 1 )); then
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$((RUN_ATTEMPT - 1))" \
+              > "$RUNNER_TEMP/threatdb-previous-attempt.json" || printf '{}' > "$RUNNER_TEMP/threatdb-previous-attempt.json"
+          fi
           python3 .github/scripts/threatdb-run-report.py \
             --steps "$RUNNER_TEMP/threatdb-steps.json" \
             --previous "$RUNNER_TEMP/threatdb-previous-runs.json" \
             --provenance "threatdb-source-provenance-${RUN_ID}-${RUN_ATTEMPT}.json" \
-            --run-id "$RUN_ID" --output "$RUNNER_TEMP/threatdb-run-report.json" \
+            --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --job-status "$RUN_STATUS" \
+            --previous-attempt "$RUNNER_TEMP/threatdb-previous-attempt.json" \
+            --output "$RUNNER_TEMP/threatdb-run-report.json" \
             --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Retain operational evidence
@@ -1241,6 +1265,6 @@ jobs:
             ${{ runner.temp }}/threatdb-run-report.json
             ${{ runner.temp }}/threatdb-upstream-observations.json
             ${{ runner.temp }}/threatdb-publication-verification.json
-            ${{ runner.temp }}/threatdb-cold-client/health.json
+            ${{ runner.temp }}/threatdb-cold-client-health.json
           if-no-files-found: error
           retention-days: 30

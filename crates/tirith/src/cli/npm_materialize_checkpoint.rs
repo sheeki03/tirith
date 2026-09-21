@@ -1,14 +1,15 @@
 //! Separate data-only checkpoint. It cannot extract launch authority or accept
-//! a serialized report as publication proof. Drop only closes owned handles.
+//! a serialized report as publication proof. Drop releases the advisory lock
+//! and closes owned handles; it never removes checkpoint or target data.
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::super::materialization_store::MaterializationLock;
     use super::super::{
         c_component, create_file_at, entry_identity_at, file_identity, mkdirat_component,
         open_directory_nofollow, openat_directory, renameat2_noreplace_component,
         InstallTargetBinding,
     };
-    use fs2::FileExt as _;
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Write as _;
     use std::io::{Read, Seek, SeekFrom};
@@ -55,7 +56,7 @@ mod linux {
         target_name: OsString,
         target_identity: (u64, u64),
         events: BTreeMap<String, Event>,
-        lock: File,
+        lock: MaterializationLock,
         state: State,
     }
 
@@ -86,7 +87,7 @@ mod linux {
             authority.revalidate().map_err(core_error)?;
             let lock = create_file_at(journal.as_raw_fd(), OsStr::new("lock"), 0o600)?;
             private_file(&lock)?;
-            lock.try_lock_exclusive()?;
+            let lock = MaterializationLock::try_acquire(lock)?;
             lock.sync_all()?;
             journal.sync_all()?;
             authority.revalidate().map_err(core_error)?;
@@ -272,7 +273,7 @@ mod linux {
         ) -> std::io::Result<()> {
             self.validate_layout()?;
             let value = serde_json::json!({
-                "schema_version":1, "contract":"LocalLeafMaterializeV1",
+                "schema_version":crate::cli::npm_materialize::CHECKPOINT_SCHEMA_VERSION, "contract":"LocalLeafMaterializeV1",
                 "operation_id":self.authority.operation_id(),
                 "private_plan_digest":self.authority.private_plan_digest(),
                 "event":name, "target_identity":[self.target_identity.0,self.target_identity.1],

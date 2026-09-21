@@ -2,6 +2,11 @@
 //! A saved intent is reinspection input, never authority. No runtime is launched.
 use std::path::PathBuf;
 
+/// Persisted local intent/event schema, shared with release compatibility.
+pub(crate) const INTENT_SCHEMA_VERSION: u32 = 1;
+/// Target-local checkpoint schema; generic lifecycle inventory does not discover targets.
+pub(crate) const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(clap::Subcommand)]
 pub(crate) enum Action {
     /// Review exact local leaf archives and save an immutable operation intent.
@@ -195,7 +200,7 @@ mod linux {
             LocalPackageRecoveryBoundary, PendingBoundaryAuthorization, TaskBoundaryPermit,
         },
     };
-    const SCHEMA: u32 = 1;
+    const SCHEMA: u32 = super::INTENT_SCHEMA_VERSION;
     const PATH_CAP: usize = 4096;
     const CONTINUED_UNDO_PHASES: [&str; 2] = [
         "private_contents_continued_undo_empty_root_retained",

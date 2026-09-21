@@ -363,7 +363,6 @@ mod linux {
         assert!(!evidence.published());
         assert!(!evidence.summary().package_code_executed);
         evidence.revalidate().unwrap();
-        drop(evidence);
         writer.begin_publication().unwrap();
         // Checkpoint's no-replace implementation is separately qualified; this
         // unit exercises only the core's before/after observed-root contract.
