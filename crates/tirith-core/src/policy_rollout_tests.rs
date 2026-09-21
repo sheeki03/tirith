@@ -6,6 +6,44 @@ use crate::extract::ScanContext;
 use crate::tokenize::ShellType;
 use tirith_test_support::GlobalStateGuard;
 
+#[test]
+fn connected_publisher_observation_is_scoped_fresh_and_never_execution_or_adoption() {
+    let _state = GlobalStateGuard::new().unwrap();
+    let snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
+    let now = Utc::now();
+    let publisher = crate::policy_team_client::PublisherObservation {
+        observed_unix_ms: now.timestamp_millis() as u64,
+    };
+    assert!(
+        review_for_publisher(request(&snapshot, &snapshot.policy, &[], now), &publisher).is_err()
+    );
+    let mut input = request(&snapshot, &snapshot.policy, &[], now);
+    input.scope = RolloutScope::RemoteManaged;
+    let report = review_for_publisher(input, &publisher).unwrap();
+    assert!(report.remote_publication_available);
+    assert!(
+        !report.execution_permitted
+            && !report.automatically_approved
+            && !report.fleet_adoption_verified
+    );
+    assert!(report.gaps.contains(&ImpactGap::FleetAdoptionUnavailable));
+    assert!(!report
+        .gaps
+        .contains(&ImpactGap::RemotePublicationUnavailable));
+    report.validate_stored().unwrap();
+    let mut input = request(
+        &snapshot,
+        &snapshot.policy,
+        &[],
+        now + chrono::Duration::milliseconds(60_001),
+    );
+    input.scope = RolloutScope::RemoteManaged;
+    assert!(review_for_publisher(input, &publisher).is_err());
+    let mut forged = report;
+    forged.scope = RolloutScope::PersonalUser;
+    assert!(forged.validate_stored().is_err());
+}
+
 fn id() -> RecordId {
     RecordId::parse(&uuid::Uuid::new_v4().to_string()).unwrap()
 }

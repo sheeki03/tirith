@@ -308,6 +308,160 @@ pub(crate) fn write_private_notice_bounded(
     )
 }
 
+/// Fixed native stores for optional enrollment and immutable review/state
+/// records. The selector alone determines target and cap; no arbitrary path is
+/// accepted. The caller still supplies actual state-machine/authority checks.
+pub(crate) fn update_private_team_record<F, V>(
+    selector: &tirith_core::policy_team_connection::TeamRecord,
+    mut transform: F,
+    mut revalidate: V,
+) -> Result<TransactionOutcome, String>
+where
+    F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
+    V: FnMut() -> Result<(), String>,
+{
+    let witness = selector.capture_current().map_err(|e| e.to_string())?;
+    let cap = selector.cap();
+    transactional_update_impl(witness.private_path(),witness.private_scope(),TransactionOptions{
+        dry_run:false,lock_timeout:std::time::Duration::from_secs(2),read_cap:cap,quiet:true,retain_artifacts:false,
+        #[cfg(unix)] private_parent:true,
+    },|snapshot|{
+        witness.revalidate().map_err(|e|e.to_string())?;snapshot.require_private()?;
+        if !witness.matches_private_bytes(snapshot.bytes()){return Err("private team record changed before publication".into())}
+        let update=private_team_record_update(transform(snapshot)?,cap)?;
+        witness.revalidate().map_err(|e|e.to_string())?;Ok(update)
+    },||{witness.revalidate().map_err(|e|e.to_string())?;revalidate()},|bytes|{
+        if bytes.len()>cap{return Err("private team record exceeds its fixed bound".into())}Ok(())
+    },#[cfg(test)] |_|Ok(()))
+    // Native errors may carry private paths. Public operation services receive
+    // a closed outcome message and must recapture status before retrying.
+    .map_err(|_|"private team record publication was not confirmed; inspect its current state before retrying".into())
+}
+fn private_team_record_update(update: FileUpdate, cap: usize) -> Result<FileUpdate, String> {
+    match update {
+        FileUpdate::Unchanged => Ok(FileUpdate::Unchanged),
+        FileUpdate::Write { bytes, .. } => {
+            if bytes.len() > cap {
+                return Err("private team record exceeds its fixed bound".into());
+            }
+            Ok(FileUpdate::Write {
+                bytes,
+                mode: 0o600,
+                preserve_existing_mode: false,
+                backup: false,
+            })
+        }
+    }
+}
+
+/// Selected team connections use the existing private transaction with a fixed
+/// bounded payload. No backup or directory-wide retention scan copies credentials.
+pub(crate) fn update_private_team_connection<F, V>(
+    path: &Path,
+    scope: &Path,
+    mut transform: F,
+    revalidate: V,
+) -> Result<TransactionOutcome, String>
+where
+    F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
+    V: FnMut() -> Result<(), String>,
+{
+    transactional_update_impl(
+        path,
+        scope,
+        TransactionOptions {
+            dry_run: false,
+            lock_timeout: std::time::Duration::from_secs(2),
+            read_cap: 128 * 1024,
+            quiet: true,
+            retain_artifacts: false,
+            #[cfg(unix)]
+            private_parent: true,
+        },
+        |snapshot| {
+            snapshot.require_private()?;
+            let update = transform(snapshot)?;
+            if matches!(&update,FileUpdate::Write{bytes,..} if bytes.len()>128*1024) {
+                return Err("team connection exceeds its fixed bound".into());
+            }
+            Ok(update)
+        },
+        revalidate,
+        |_| Ok(()),
+        #[cfg(test)]
+        |_| Ok(()),
+    )
+}
+/// Explicit disconnect, under the same writer rendezvous. The caller retains
+/// its stronger owner/ACL source witness until the exact native delete begins.
+pub(crate) fn delete_private_team_connection<F, V>(
+    path: &Path,
+    scope: &Path,
+    matches: F,
+    mut revalidate: V,
+) -> Result<(), String>
+where
+    F: Fn(Option<&[u8]>) -> bool,
+    V: FnMut() -> Result<(), String>,
+{
+    revalidate()?;
+    let pre = super::fs_helpers::read_snapshot_scoped_capped(path, scope, 128 * 1024)?;
+    pre.require_private()?;
+    if pre.bytes.is_none() || !matches(pre.bytes.as_deref()) {
+        return Err("team connection changed before disconnect".into());
+    }
+    let lock = PlatformTransaction::lock_for(path, scope, std::time::Duration::from_secs(2))?;
+    revalidate()?;
+    let tx = PlatformTransaction::begin(path, scope, lock)?;
+    tx.validate_snapshot(&pre)?;
+    revalidate()?;
+    tx.delete_private_expected(&pre, 128 * 1024)
+}
+
+/// Closed enrollment withdrawal. The connection path retains its independent
+/// 128 KiB limit; no arbitrary destination or caller-selected cap is accepted.
+pub(crate) fn delete_private_team_record<F, V>(
+    selector: &tirith_core::policy_team_connection::TeamRecord,
+    matches: F,
+    mut revalidate: V,
+) -> Result<(), String>
+where
+    F: Fn(Option<&[u8]>) -> bool,
+    V: FnMut() -> Result<(), String>,
+{
+    use tirith_core::policy_team_connection::TeamRecord;
+    if !matches!(selector, TeamRecord::Enrollment) {
+        return Err("only an explicit enrollment can be withdrawn by this operation".into());
+    }
+    let mut operation = || -> Result<(), String> {
+        let witness = selector.capture_current().map_err(|e| e.to_string())?;
+        let path = witness.private_path();
+        let scope = witness.private_scope();
+        let cap = selector.cap();
+        revalidate()?;
+        witness.revalidate().map_err(|e| e.to_string())?;
+        let pre = super::fs_helpers::read_snapshot_scoped_capped(path, scope, cap)?;
+        pre.require_private()?;
+        if pre.bytes.is_none()
+            || !matches(pre.bytes.as_deref())
+            || !witness.matches_private_bytes(pre.bytes.as_deref())
+        {
+            return Err("enrollment changed before withdrawal".into());
+        }
+        let lock = PlatformTransaction::lock_for(path, scope, std::time::Duration::from_secs(2))?;
+        revalidate()?;
+        witness.revalidate().map_err(|e| e.to_string())?;
+        let tx = PlatformTransaction::begin(path, scope, lock)?;
+        tx.validate_snapshot(&pre)?;
+        revalidate()?;
+        witness.revalidate().map_err(|e| e.to_string())?;
+        tx.delete_private_expected(&pre, cap)
+    };
+    operation().map_err(|_| {
+        "enrollment withdrawal was not confirmed; inspect local status before retrying".into()
+    })
+}
+
 /// Fixed small private activation claims share contained publication and the
 /// setup writer rendezvous. Inventory/authority validation runs again while
 /// that global lock is held, including when the transform is unchanged.
@@ -854,5 +1008,184 @@ mod activation_parent_tests {
             TransactionOutcome::Unchanged
         );
         assert!(!target.parent().unwrap().exists());
+    }
+}
+
+#[cfg(test)]
+mod team_connection_tests {
+    use super::*;
+    #[test]
+    fn private_connection_delete_rejects_changed_bytes_and_preserves_siblings() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("team-policy/connection.json");
+        update_private_team_connection(
+            &path,
+            root.path(),
+            |_| {
+                Ok(FileUpdate::write_text("private-test-record".into(), 0o600)
+                    .with_exact_mode()
+                    .with_backup(false))
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        let sibling = path.parent().unwrap().join("enrollment.json");
+        std::fs::write(&sibling, b"unrelated enrollment").unwrap();
+        assert!(delete_private_team_connection(
+            &path,
+            root.path(),
+            |bytes| bytes == Some(b"different"),
+            || Ok(())
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"private-test-record");
+        delete_private_team_connection(
+            &path,
+            root.path(),
+            |bytes| bytes == Some(b"private-test-record"),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"unrelated enrollment");
+    }
+    #[test]
+    fn private_connection_revalidation_refusal_creates_no_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("team-policy/connection.json");
+        assert!(update_private_team_connection(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("private-test-record".into(), 0o600)),
+            || Err("source changed".into())
+        )
+        .is_err());
+        assert!(!path.parent().unwrap().exists());
+    }
+    #[test]
+    fn private_connection_cap_is_applied_before_parent_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("team-policy/connection.json");
+        assert!(update_private_team_connection(
+            &path,
+            root.path(),
+            |_| Ok(FileUpdate::write_text("a".repeat(128 * 1024 + 1), 0o600)),
+            || Ok(())
+        )
+        .is_err());
+        assert!(!path.parent().unwrap().exists());
+    }
+}
+
+#[cfg(test)]
+mod closed_team_record_tests {
+    use super::*;
+    use tirith_core::policy_team::Id;
+    use tirith_core::policy_team_connection::TeamRecord;
+    #[test]
+    fn fixed_store_forces_private_mode_and_no_backup_at_exact_cap() {
+        for selector in [TeamRecord::Enrollment, TeamRecord::Rollout(Id::new())] {
+            let cap = selector.cap();
+            let update = FileUpdate::write_text("x".repeat(cap), 0o666).with_backup(true);
+            let FileUpdate::Write {
+                bytes,
+                mode,
+                preserve_existing_mode,
+                backup,
+            } = private_team_record_update(update, cap).unwrap()
+            else {
+                panic!("write required")
+            };
+            assert_eq!(bytes.len(), cap);
+            assert_eq!(mode, 0o600);
+            assert!(!preserve_existing_mode);
+            assert!(!backup);
+            assert!(private_team_record_update(
+                FileUpdate::write_text("x".repeat(cap + 1), 0o600),
+                cap
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn immutable_rollout_append_then_exact_preimage_update_preserves_sibling() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let selector = TeamRecord::Rollout(Id::new());
+        let append = |snapshot: &FileSnapshot| {
+            if snapshot.exists() {
+                return Err("immutable intent already exists".into());
+            }
+            Ok(FileUpdate::write_text("intent-v1".into(), 0o600))
+        };
+        update_private_team_record(&selector, append, || Ok(())).unwrap();
+        assert!(update_private_team_record(&selector, append, || Ok(())).is_err());
+        let sibling = TeamRecord::Rollout(Id::new());
+        update_private_team_record(
+            &sibling,
+            |_| Ok(FileUpdate::write_text("sibling".into(), 0o600)),
+            || Ok(()),
+        )
+        .unwrap();
+        let old = selector.capture_current().unwrap();
+        assert!(old.matches_private_bytes(Some(b"intent-v1")));
+        update_private_team_record(
+            &selector,
+            |snapshot| {
+                if snapshot.bytes() != Some(b"intent-v1") {
+                    return Err("old state changed".into());
+                }
+                Ok(FileUpdate::write_text("state-v2".into(), 0o600))
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(old.revalidate().is_err());
+        assert!(update_private_team_record(
+            &selector,
+            |snapshot| {
+                if snapshot.bytes() != Some(b"intent-v1") {
+                    return Err("old state changed".into());
+                }
+                Ok(FileUpdate::write_text("state-v3".into(), 0o600))
+            },
+            || Ok(())
+        )
+        .is_err());
+        assert_eq!(
+            selector.capture_current().unwrap().private_bytes(),
+            Some(b"state-v2".as_slice())
+        );
+        assert_eq!(
+            sibling.capture_current().unwrap().private_bytes(),
+            Some(b"sibling".as_slice())
+        );
+        assert!(!tirith_core::policy::config_dir()
+            .unwrap()
+            .join("team-policy/connection.json")
+            .exists());
+    }
+    #[test]
+    fn enrollment_refusal_and_oversize_rollout_have_no_persistent_effect() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        assert!(update_private_team_record(
+            &TeamRecord::Enrollment,
+            |_| Ok(FileUpdate::write_text("intent".into(), 0o600)),
+            || Err("fresh authorization refused".into())
+        )
+        .is_err());
+        let selector = TeamRecord::Rollout(Id::new());
+        assert!(update_private_team_record(
+            &selector,
+            |_| Ok(FileUpdate::write_text(
+                "x".repeat(selector.cap() + 1),
+                0o600
+            )),
+            || Ok(())
+        )
+        .is_err());
+        assert!(!tirith_core::policy::config_dir()
+            .unwrap()
+            .join("team-policy")
+            .exists());
     }
 }

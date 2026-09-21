@@ -1103,6 +1103,67 @@ impl PlatformTransaction {
         Ok(())
     }
 
+    /// Fixed exact private-file disconnect; does not enumerate or remove siblings.
+    pub(crate) fn delete_private_expected(
+        &self,
+        expected: &PlatformSnapshot,
+        cap: usize,
+    ) -> Result<(), String> {
+        if cap == 0
+            || expected
+                .bytes
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > cap)
+        {
+            return Err("private deletion input exceeds its fixed bound".into());
+        }
+        expected.require_private()?;
+        if expected.bytes.is_none() {
+            return Err("disconnect requires a present file".into());
+        }
+        self.validate_snapshot(expected)?;
+        let fd = unsafe {
+            libc::openat(
+                self.parent.dir.as_raw_fd(),
+                self.parent.name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err("cannot retain exact disconnect object".into());
+        }
+        let held = unsafe { fs::File::from_raw_fd(fd) };
+        let m = held
+            .metadata()
+            .map_err(|_| "cannot inspect disconnect object")?;
+        if !m.is_file()
+            || SnapshotGeneration::Present(FileGeneration::from_metadata(&m)) != expected.generation
+        {
+            return Err("disconnect object changed".into());
+        }
+        self.validate_snapshot(expected)?;
+        if unsafe { libc::unlinkat(self.parent.dir.as_raw_fd(), self.parent.name.as_ptr(), 0) } != 0
+        {
+            return Err("cannot remove selected connection".into());
+        }
+        // A non-cooperating owner-UID writer is not locked by flock. Detect an
+        // unexpected name/object transition; never retry deletion on that name.
+        if held
+            .metadata()
+            .map_err(|_| "disconnect outcome unavailable")?
+            .nlink()
+            != 0
+        {
+            return Err("disconnect outcome is uncertain; inspect status".into());
+        }
+        self.sync_parent()?;
+        let after = snapshot_from_parent_capped(&self.parent, &self.path, 0)?;
+        if after.bytes.is_some() {
+            return Err("connection was replaced after disconnect".into());
+        }
+        Ok(())
+    }
+
     fn create_empty_artifact(&self) -> Result<(CString, fs::File), String> {
         let provisional = CString::new(format!(
             ".tirith-setup-new-{}.tmp",

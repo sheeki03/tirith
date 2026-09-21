@@ -233,6 +233,145 @@ fn route(service: &Service, request: &http::Request) -> Result<Value, String> {
 fn route_for_project(service: &Service, request: &http::Request) -> Result<Value, String> {
     let cwd = Some(service.record.cwd.as_str());
     match (request.method.as_str(), request.target.as_str()) {
+        ("POST", "/api/team/rollout/prepare") => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                operation_id: String,
+                change: super::super::team_rollout::ReviewInput,
+            }
+            let query: Query = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_rollout::TeamRolloutService::capture(cwd)?
+                .prepare(&query.operation_id, query.change)
+        }
+        ("POST", "/api/team/rollout/rollback-plan") => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                operation_id: String,
+                publication_id: String,
+            }
+            let query: Query = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_rollout::TeamRolloutService::capture(cwd)?
+                .prepare_rollback(&query.operation_id, &query.publication_id)
+        }
+        ("POST", "/api/team/rollout/show") => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                operation_id: String,
+                refresh: bool,
+            }
+            let query: Query = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_rollout::TeamRolloutService::capture(cwd)?
+                .show(&query.operation_id, query.refresh)
+        }
+        ("POST", "/api/team/rollout/apply") => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                operation_id: String,
+                review_id: String,
+                rollback: bool,
+            }
+            let query: Query = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_rollout::TeamRolloutService::capture(cwd)?.apply(
+                &query.operation_id,
+                &query.review_id,
+                query.rollback,
+            )
+        }
+        ("POST", "/api/team/rollout/fleet") => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {}
+            let _: Query = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_rollout::TeamRolloutService::capture(cwd)?.fleet()
+        }
+        ("GET", "/api/team/enrollment") => {
+            super::super::team_enrollment::TeamEnrollmentService::capture(cwd)?.current()
+        }
+        ("POST", "/api/team/enrollment/activate") => {
+            let query: super::super::team_enrollment::ActivateRequest = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_enrollment::TeamEnrollmentService::capture(cwd)?.activate(query)
+        }
+        ("POST", "/api/team/enrollment/sync") => {
+            let query: super::super::team_enrollment::SelectedRequest = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_enrollment::TeamEnrollmentService::capture(cwd)?.sync(query)
+        }
+        ("POST", "/api/team/enrollment/disable") => {
+            let query: super::super::team_enrollment::DisableRequest = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_enrollment::TeamEnrollmentService::disable(query)
+        }
+        ("POST", "/api/team/enrollment/repair") => {
+            let query: super::super::team_enrollment::RepairRequest = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_enrollment::TeamEnrollmentService::repair(query)
+        }
+        ("POST", "/api/team/enrollment/abandon") => {
+            let query: super::super::team_enrollment::AbandonRequest = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_enrollment::TeamEnrollmentService::abandon(query)
+        }
+        ("POST", "/api/team/enrollment/reconcile") => {
+            let query: super::super::team_enrollment::ReconcileRequest = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_enrollment::TeamEnrollmentService::reconcile(query)
+        }
+        ("POST", "/api/team/enrollment/report") => {
+            let query: super::super::team_enrollment::ReportRequest = body(request)?;
+            let _admission = admission(service, request)?;
+            super::super::team_enrollment::TeamEnrollmentService::capture(cwd)?.report(query)
+        }
+        ("GET", "/api/team/connection") => serde_json::to_value(
+            super::super::team_connection::ConnectionService::current(false)?,
+        )
+        .map_err(|_| "cannot encode team connection status".into()),
+        ("POST", "/api/team/connection/status") => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                refresh: bool,
+            }
+            let query: Query = body(request)?;
+            let _admission = admission(service, request)?;
+            serde_json::to_value(super::super::team_connection::ConnectionService::current(
+                query.refresh,
+            )?)
+            .map_err(|_| "cannot encode team connection status".into())
+        }
+        ("POST", "/api/team/connection/connect") => {
+            let query: super::super::team_connection::ConnectRequest = body(request)?;
+            let _admission = admission(service, request)?;
+            serde_json::to_value(super::super::team_connection::ConnectionService::connect(
+                query,
+            )?)
+            .map_err(|_| "cannot encode team connection status".into())
+        }
+        ("POST", "/api/team/connection/disconnect") => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                expected_connection_id: String,
+            }
+            let query: Query = body(request)?;
+            let _admission = admission(service, request)?;
+            serde_json::to_value(
+                super::super::team_connection::ConnectionService::disconnect(
+                    &query.expected_connection_id,
+                )?,
+            )
+            .map_err(|_| "cannot encode team connection status".into())
+        }
+
         ("POST", "/api/artifacts/npm") => super::super::npm_artifact::browser::review(
             &service.record.cwd,
             body(request)?,

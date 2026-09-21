@@ -860,7 +860,7 @@ pub fn effective(json: bool, runtime: bool) -> i32 {
 /// The legacy `policy` field is a display projection, not a document to apply.
 /// Credentials have field-owned redaction even when their contents do not look
 /// like a known secret. Protocol metadata is built separately below.
-fn effective_policy_display(
+pub(crate) fn effective_policy_display(
     policy: &Policy,
     compiled: &tirith_core::redact::CompiledCustomPatterns,
 ) -> Result<serde_json::Value, serde_json::Error> {
@@ -1076,6 +1076,9 @@ fn print_effective_human(info: &EffectivePolicy) -> i32 {
         ResolutionMode::LocalOnly => {
             eprintln!("tirith policy effective: local-only diagnostic (remote policy and separate overlays excluded)");
             eprintln!("  Use `tirith policy effective --runtime` to resolve the policy used by enforcement.");
+        }
+        ResolutionMode::TeamPreview => {
+            eprintln!("tirith policy effective: team document preview (local restrictions evaluated; activation and current server revision unverified)");
         }
     }
     let patterns =

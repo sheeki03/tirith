@@ -3,6 +3,15 @@
 //! a typed staged authorization bound to its immutable complete leaf plan.
 #![allow(dead_code)]
 
+#[path = "npm_materialize_recovery_checkpoint.rs"]
+pub(crate) mod materialization_recovery_checkpoint;
+
+#[path = "npm_materialize_store.rs"]
+pub(crate) mod materialization_store;
+
+#[path = "npm_materialize_checkpoint.rs"]
+pub(crate) mod materialization;
+
 #[path = "npm_checkpoint_binding.rs"]
 mod npm_binding;
 #[cfg(target_os = "linux")]

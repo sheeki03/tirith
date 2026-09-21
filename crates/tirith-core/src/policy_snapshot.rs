@@ -16,6 +16,9 @@ pub enum ResolutionMode {
     Runtime,
     /// No remote request or list/trust/label overlays. Includes incidents.
     LocalOnly,
+    /// A supplied team document composed with local runtime restrictions for
+    /// review. This mode never grants local mutation or adoption authority.
+    TeamPreview,
 }
 
 /// Source identity, not a claim that a caller may write that source. Paths and
@@ -138,8 +141,13 @@ pub struct EffectivePolicySnapshot {
     pub custom_profile_overrides: Vec<String>,
     pub remote: RemotePolicyEvidence,
     witnesses: Vec<InputWitness>,
+    team_runtime: Option<crate::policy_team_enrollment::RuntimeEnrollment>,
+    team_runtime_refused: bool,
     bounded_input_refused: bool,
     resolution_cwd: Option<String>,
+    // Private integrity seal of the resolved data. Public diagnostic fields
+    // cannot be edited into a new policy or authorization scope after capture.
+    resolved_data_sha256: [u8; 32],
 }
 
 impl std::fmt::Debug for EffectivePolicySnapshot {
@@ -186,13 +194,83 @@ impl std::fmt::Debug for PrivatePolicyReplayGuard {
     }
 }
 
+// A narrow scoped refusal, not a partial policy resolver. It preserves the
+// complete runtime overlays but stops before any configured remote request.
+thread_local! {
+    static REFUSE_REMOTE_MUTATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+struct RemoteMutationScope(bool);
+impl RemoteMutationScope {
+    fn enter() -> Self {
+        Self(REFUSE_REMOTE_MUTATION.with(|active| active.replace(true)))
+    }
+}
+impl Drop for RemoteMutationScope {
+    fn drop(&mut self) {
+        REFUSE_REMOTE_MUTATION.with(|active| active.set(self.0));
+    }
+}
+pub(crate) fn refuse_configured_remote_mutation() -> bool {
+    REFUSE_REMOTE_MUTATION.with(std::cell::Cell::get)
+}
+
 impl EffectivePolicySnapshot {
+    /// Complete runtime policy for a local mutation that promises no network.
+    /// A configured remote authority is refused before fetch; no local-only
+    /// diagnostic snapshot is promoted. The ordinary resolver is unchanged.
+    pub fn resolve_for_local_mutation(cwd: Option<&str>) -> Result<Self, PolicyConflict> {
+        let snapshot = Self::resolve_runtime_without_network(cwd);
+        snapshot.revalidate_for_mutation()?;
+        Ok(snapshot)
+    }
+
+    /// Resolve full Runtime from current local inputs and the enrolled team
+    /// cache. A legacy remote authority refuses before contacting its endpoint.
+    /// The result still requires its ordinary evidence or mutation validation.
+    pub fn resolve_runtime_without_network(cwd: Option<&str>) -> Self {
+        let _scope = RemoteMutationScope::enter();
+        Self::resolve(cwd, ResolutionMode::Runtime)
+    }
+
     pub fn resolve(cwd: Option<&str>, mode: ResolutionMode) -> Self {
         let capture = ResolutionCapture::start();
         let policy = match mode {
             ResolutionMode::Runtime => resolve_runtime_policy(cwd),
             ResolutionMode::LocalOnly => Policy::discover_local_only(cwd),
+            ResolutionMode::TeamPreview => {
+                observe_remote(|remote| remote.availability = "preview_document_required".into());
+                Policy::fail_closed_policy()
+            }
         };
+        Self::finish_resolution(cwd, mode, policy, capture)
+    }
+
+    pub fn resolve_team_preview(
+        cwd: Option<&str>,
+        document: &crate::policy_team::PolicyDocument,
+    ) -> Result<Self, crate::policy_team::ErrorCode> {
+        let capture = ResolutionCapture::start();
+        let mut policy = Policy::team_document_baseline(document, cwd)?;
+        policy.apply_runtime_overrides();
+        let policy = compose_runtime_overlays(policy, cwd);
+        observe_remote(|remote| {
+            remote.availability = "team_document_preview".into();
+            remote.freshness = "supplied_document_unverified_current_revision".into();
+        });
+        Ok(Self::finish_resolution(
+            cwd,
+            ResolutionMode::TeamPreview,
+            policy,
+            capture,
+        ))
+    }
+
+    fn finish_resolution(
+        cwd: Option<&str>,
+        mode: ResolutionMode,
+        policy: Policy,
+        capture: ResolutionCapture,
+    ) -> Self {
         crate::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
         let mut captured = capture.finish();
         if mode == ResolutionMode::LocalOnly {
@@ -214,7 +292,7 @@ impl EffectivePolicySnapshot {
                 )
             })
             .unwrap_or_default();
-        Self {
+        let mut snapshot = Self {
             schema_version: 1,
             identity: uuid::Uuid::new_v4().to_string(),
             policy_posture_sha256: policy.enforcement_projection_hash(),
@@ -231,9 +309,37 @@ impl EffectivePolicySnapshot {
             custom_profile_overrides,
             remote: captured.remote,
             witnesses: captured.witnesses,
+            team_runtime: captured.team_runtime,
+            team_runtime_refused: captured.team_runtime_refused,
             bounded_input_refused: crate::policy::bounded_runtime_refused(),
             resolution_cwd: cwd.map(str::to_string),
-        }
+            resolved_data_sha256: [0; 32],
+        };
+        snapshot.resolved_data_sha256 = snapshot.resolved_data_digest();
+        snapshot
+    }
+
+    // Secret-bearing comparison material, never exposed as a public identity.
+    fn resolved_data_digest(&self) -> [u8; 32] {
+        let data = serde_json::json!({
+            "schema":self.schema_version,"identity":self.identity,"policy":self.policy,
+            // Policy's ordinary serialization deliberately omits these runtime
+            // provenance, overlay and credential fields. The private seal does not.
+            "policy_scope":self.policy.scope.as_str(),"policy_path":self.policy.path,
+            "context_labels":self.policy.context_labels,"ssh_host_labels":self.policy.ssh_host_labels,
+            "neutralized_fields":self.policy.neutralized_fields,
+            "google_safe_browsing_key":self.policy.threat_intel.google_safe_browsing_key,
+            "abusech_auth_key":self.policy.threat_intel.abusech_auth_key,
+            "mode":self.resolution_mode,"posture":self.policy_posture_sha256,
+            "fields":self.field_provenance,"neutralized":self.neutralized_settings,
+            "inputs":self.input_revisions,"primary":self.primary_input_revision,
+            "targets":self.operator_targets,"trust":self.trust_generation,
+            "expiry":self.next_trust_expiry,"profile":self.requested_profile,
+            "overrides":self.custom_profile_overrides,"remote":self.remote,
+            "team_runtime":self.team_runtime.as_ref().map(|runtime| runtime.private_replay_commitment()),
+            "team_runtime_refused":self.team_runtime_refused,
+        });
+        Sha256::digest(crate::audit::canonical_json_for_hash(&data).as_bytes()).into()
     }
 
     /// Check the same inputs using their original reader/trust semantics.
@@ -241,6 +347,17 @@ impl EffectivePolicySnapshot {
     /// A remote snapshot requires a new resolution for a remote-authorized
     /// mutation: a local recheck cannot prove the server has not changed.
     pub fn revalidate_inputs(&self) -> Result<(), PolicyConflict> {
+        if self.team_runtime_refused
+            || self
+                .team_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.revalidate().is_err())
+        {
+            return Err(PolicyConflict {
+                reason: "team Runtime enrollment or cache is unavailable or changed".into(),
+                changed_revisions: self.primary_input_revision.clone().into_iter().collect(),
+            });
+        }
         if self.bounded_input_refused || crate::policy::bounded_runtime_refused() {
             return Err(PolicyConflict {
                 reason: "bounded runtime policy input is unavailable".into(),
@@ -276,10 +393,10 @@ impl EffectivePolicySnapshot {
     /// A local witness cannot assert freshness of remote server authorization:
     /// the fetch API currently has no atomic server revision precondition.
     pub fn revalidate_for_mutation(&self) -> Result<(), PolicyConflict> {
-        self.revalidate_inputs()?;
+        self.revalidate_captured()?;
         if self.resolution_mode != ResolutionMode::Runtime {
             return Err(PolicyConflict {
-                reason: "local-only diagnostics cannot authorize policy mutations".into(),
+                reason: "diagnostic policy previews cannot authorize policy mutations".into(),
                 changed_revisions: Vec::new(),
             });
         }
@@ -291,6 +408,55 @@ impl EffectivePolicySnapshot {
             });
         }
         Ok(())
+    }
+
+    /// Validate the captured data and local witnesses without granting an
+    /// effect or claiming that a remote server revision is still current.
+    pub fn revalidate_captured(&self) -> Result<(), PolicyConflict> {
+        if self.resolved_data_digest() != self.resolved_data_sha256 {
+            return Err(PolicyConflict {
+                reason: "resolved policy data changed after capture".into(),
+                changed_revisions: Vec::new(),
+            });
+        }
+        self.revalidate_inputs()
+    }
+
+    /// Exact nonsecret enrollment evidence after full Runtime composition and
+    /// native/freshness revalidation. A fetched or TeamPreview document cannot
+    /// obtain this evidence. This is authenticated client self-report material,
+    /// not independent proof of enforcement or the server's latest revision.
+    pub fn team_runtime_evidence(
+        &self,
+    ) -> Result<Option<crate::policy_team_enrollment::TeamRuntimeEvidence>, PolicyConflict> {
+        self.revalidate_captured()?;
+        if self.resolution_mode != ResolutionMode::Runtime {
+            return Err(PolicyConflict {
+                reason: "team reports require an actual Runtime snapshot".into(),
+                changed_revisions: Vec::new(),
+            });
+        }
+        let evidence = self
+            .team_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.evidence());
+        if let Some(evidence) = &evidence {
+            let expected_path = format!(
+                "team-policy:{}:{}:{}",
+                evidence.authority_id().as_str(),
+                evidence.policy_id().as_str(),
+                evidence.revision().as_str()
+            );
+            if self.policy.scope != PolicyScope::Remote
+                || self.policy.path.as_deref() != Some(expected_path.as_str())
+            {
+                return Err(PolicyConflict {
+                    reason: "the effective Runtime did not retain the enrolled team policy".into(),
+                    changed_revisions: Vec::new(),
+                });
+            }
+        }
+        Ok(evidence)
     }
 
     /// Exact caller scope captured at resolution, retained for private replay.
@@ -358,6 +524,30 @@ impl EffectivePolicySnapshot {
             part(
                 &mut hash,
                 &serde_json::to_vec(&projection).expect("policy replay serialization"),
+            );
+        }
+        // Enrollment is never one of the caller's excluded writable paths.
+        // Bind activation, exact selected connection, revision and fetch time
+        // even when a workflow intentionally excludes its own policy output.
+        // Preserve existing personal-operation replay commitments while team
+        // enrollment is absent. Its retained absence witness still rejects an
+        // activation occurring during this invocation.
+        if self.team_runtime_refused
+            || self
+                .team_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.document().is_some())
+        {
+            part(&mut hash, b"team_runtime");
+            part(
+                &mut hash,
+                &serde_json::to_vec(&(
+                    self.team_runtime
+                        .as_ref()
+                        .map(|runtime| runtime.private_replay_commitment()),
+                    self.team_runtime_refused,
+                ))
+                .expect("team runtime replay serialization"),
             );
         }
         for witness in &self.witnesses {
@@ -439,7 +629,10 @@ impl EffectivePolicySnapshot {
 }
 
 pub(crate) fn resolve_runtime_policy(cwd: Option<&str>) -> Policy {
-    let mut policy = Policy::discover(cwd);
+    compose_runtime_overlays(Policy::discover(cwd), cwd)
+}
+
+fn compose_runtime_overlays(mut policy: Policy, cwd: Option<&str>) -> Policy {
     policy.load_user_lists();
     policy.load_org_lists(cwd);
     policy.load_trust_entries(cwd);
@@ -567,6 +760,8 @@ pub(crate) fn read_input(
 
 #[derive(Default)]
 struct CapturedResolution {
+    team_runtime: Option<crate::policy_team_enrollment::RuntimeEnrollment>,
+    team_runtime_refused: bool,
     fields: BTreeMap<String, FieldProvenance>,
     neutralized: Vec<NeutralizedSetting>,
     inputs: Vec<InputRevision>,
@@ -615,7 +810,11 @@ impl CapturedResolution {
                 scope: "repo".into(),
                 path: path.display().to_string(),
                 allowed_operation: "tightening_only".into(),
-                effective: policy.scope != PolicyScope::Remote,
+                effective: policy.scope != PolicyScope::Remote
+                    || policy
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| path.starts_with("team-policy:")),
                 reason: "repository content cannot relax trusted restrictions or grant trust"
                     .into(),
             });
@@ -1070,6 +1269,36 @@ pub(crate) fn observe_trust_expiry(expiry: chrono::DateTime<chrono::Utc>) {
     });
 }
 
+pub(crate) fn observe_team_runtime(runtime: crate::policy_team_enrollment::RuntimeEnrollment) {
+    with_capture(|capture| {
+        let present = runtime.document().is_some();
+        let revision = uuid::Uuid::new_v4().to_string();
+        capture.inputs.push(InputRevision {
+            source: PolicySource::new("team_enrollment", None),
+            revision: revision.clone(),
+            state: if present {
+                InputState::Present
+            } else {
+                InputState::Absent
+            },
+        });
+        if present {
+            capture.primary = Some(revision);
+        }
+        capture.team_runtime = Some(runtime);
+    });
+}
+
+pub(crate) fn observe_team_runtime_refusal(reason: &'static str) {
+    with_capture(|capture| {
+        capture.team_runtime_refused = true;
+        capture.remote.availability = "team_enrollment_refused".into();
+        capture.remote.freshness = "unavailable".into();
+        capture.remote.failure = Some(reason.into());
+        capture.remote.fallback = None;
+    });
+}
+
 pub(crate) fn observe_remote(update: impl FnOnce(&mut RemotePolicyEvidence)) {
     with_capture(|capture| update(&mut capture.remote));
 }
@@ -1093,6 +1322,152 @@ mod tests {
     use super::*;
     use crate::policy::{FailMode, PolicyScope};
     use tirith_test_support::GlobalStateGuard;
+
+    fn team_document(yaml: &str) -> crate::policy_team::PolicyDocument {
+        crate::policy_team::PolicyDocument {
+            schema_version: 1,
+            authority_id: crate::policy_team::Id::new(),
+            policy_id: crate::policy_team::Id::new(),
+            revision: crate::policy_team::Id::new(),
+            created_unix_ms: 1,
+            policy_semantics_version: crate::policy_team::POLICY_SEMANTICS_VERSION,
+            yaml: yaml.into(),
+        }
+    }
+
+    #[test]
+    fn team_preview_preserves_repository_and_runtime_list_restrictions() {
+        let state = GlobalStateGuard::new().unwrap();
+        let cwd = &state.roots().cwd;
+        let config = crate::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+        std::fs::write(config.join("blocklist"), "local-list.example\n").unwrap();
+        std::fs::write(
+            cwd.join(".tirith/policy.yaml"),
+            "paranoia: 4\nallowlist: [repo-grant.example]\nblocklist: [repo-deny.example]\n",
+        )
+        .unwrap();
+        let document = team_document("paranoia: 2\nblocklist: [team-deny.example]\n");
+        let snapshot =
+            EffectivePolicySnapshot::resolve_team_preview(cwd.to_str(), &document).unwrap();
+        assert_eq!(snapshot.resolution_mode, ResolutionMode::TeamPreview);
+        assert!(snapshot.team_runtime_evidence().is_err());
+        assert_eq!(snapshot.policy.paranoia, 4);
+        for domain in [
+            "local-list.example",
+            "repo-deny.example",
+            "team-deny.example",
+        ] {
+            assert!(snapshot.policy.is_blocklisted(domain));
+        }
+        assert!(!snapshot
+            .policy
+            .allowlist
+            .iter()
+            .any(|entry| entry == "repo-grant.example"));
+        assert!(snapshot
+            .operator_targets
+            .iter()
+            .any(|target| target.scope == "repo" && target.effective));
+        assert!(snapshot.revalidate_captured().is_ok());
+        assert!(snapshot.revalidate_for_mutation().is_err());
+        std::fs::write(config.join("blocklist"), "changed.example\n").unwrap();
+        assert!(snapshot.revalidate_captured().is_err());
+    }
+
+    #[test]
+    fn team_preview_refuses_competing_org_and_cannot_be_promoted_to_runtime() {
+        let state = GlobalStateGuard::new().unwrap();
+        let document = team_document("paranoia: 1\n");
+        let mut snapshot = EffectivePolicySnapshot::resolve_team_preview(None, &document).unwrap();
+        snapshot.resolution_mode = ResolutionMode::Runtime;
+        snapshot.remote = RemotePolicyEvidence::default();
+        assert!(snapshot.revalidate_captured().is_err());
+        assert!(snapshot.revalidate_for_mutation().is_err());
+        let org = state.roots().policy.join(".tirith");
+        std::fs::create_dir_all(&org).unwrap();
+        std::fs::write(org.join("policy.yaml"), "paranoia: 4\n").unwrap();
+        assert!(EffectivePolicySnapshot::resolve_team_preview(None, &document).is_err());
+        let runtime = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
+        assert_eq!(runtime.policy.scope, PolicyScope::Org);
+        assert_eq!(runtime.policy.paranoia, 4);
+    }
+
+    #[test]
+    fn team_preview_refuses_ambient_authority_without_fetching_or_writing_cache() {
+        let mut state = GlobalStateGuard::new().unwrap();
+        state.set_env(
+            "TIRITH_SERVER_URL",
+            "preview-must-not-connect://unavailable",
+        );
+        state.set_env("TIRITH_API_KEY", "preview-secret");
+        assert!(EffectivePolicySnapshot::resolve_team_preview(
+            None,
+            &team_document("paranoia: 2\n")
+        )
+        .is_err());
+        assert!(!crate::policy::config_dir()
+            .unwrap()
+            .join("team-policy")
+            .exists());
+        assert!(!crate::policy::config_dir()
+            .unwrap()
+            .join("policy-cache")
+            .exists());
+        let missing = EffectivePolicySnapshot::resolve(None, ResolutionMode::TeamPreview);
+        assert_eq!(missing.policy.path.as_deref(), Some("fail-closed"));
+        assert!(missing.revalidate_for_mutation().is_err());
+    }
+
+    #[test]
+    fn local_mutation_resolution_keeps_runtime_overlays_and_rechecks_them() {
+        let state = GlobalStateGuard::new().unwrap();
+        let config = crate::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("blocklist"), "before.example\n").unwrap();
+        let _bounded = crate::policy::BoundedRuntimePolicyInputs::enter();
+        let snapshot =
+            EffectivePolicySnapshot::resolve_for_local_mutation(state.roots().cwd.to_str())
+                .unwrap();
+        assert!(snapshot.policy.is_blocklisted("before.example"));
+        assert_eq!(snapshot.resolution_mode, ResolutionMode::Runtime);
+        assert!(snapshot.revalidate_for_mutation().is_ok());
+        std::fs::write(config.join("blocklist"), "after.example\n").unwrap();
+        assert!(snapshot.revalidate_for_mutation().is_err());
+    }
+
+    #[test]
+    fn local_mutation_refuses_configured_remote_before_fetch_and_restores_scope() {
+        let mut state = GlobalStateGuard::new().unwrap();
+        // Deliberately not a network URL even if this refusal regresses.
+        state.set_env(
+            "TIRITH_SERVER_URL",
+            "materialization-refusal://not-a-server",
+        );
+        state.set_env("TIRITH_API_KEY", "fixture-key-never-sent");
+        assert!(!refuse_configured_remote_mutation());
+        {
+            let _outer = RemoteMutationScope::enter();
+            {
+                let _inner = RemoteMutationScope::enter();
+                let snapshot = EffectivePolicySnapshot::resolve(
+                    state.roots().cwd.to_str(),
+                    ResolutionMode::Runtime,
+                );
+                assert_eq!(snapshot.remote.availability, "refused_local_mutation");
+                assert!(snapshot.revalidate_for_mutation().is_err());
+            }
+            assert!(refuse_configured_remote_mutation());
+        }
+        assert!(!refuse_configured_remote_mutation());
+        assert!(
+            EffectivePolicySnapshot::resolve_for_local_mutation(state.roots().cwd.to_str())
+                .is_err()
+        );
+        assert!(!refuse_configured_remote_mutation());
+    }
 
     #[test]
     fn runtime_includes_overlays_and_preserves_repository_tightening() {
@@ -1556,5 +1931,58 @@ mod tests {
             after.private_external_inputs_guard(&excluded),
             external.private_external_inputs_guard(&excluded)
         );
+    }
+}
+
+#[cfg(test)]
+mod resolved_data_integrity_tests {
+    use super::*;
+    #[test]
+    fn public_policy_and_matching_public_posture_edits_cannot_rewrite_resolved_authority() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
+        snapshot.revalidate_for_mutation().unwrap();
+        let mut edited = snapshot.clone();
+        edited.policy.task_gate.mode = crate::web3_policy::TaskGateMode::Enforce;
+        edited.policy_posture_sha256 = edited.policy.enforcement_projection_hash();
+        assert!(edited
+            .revalidate_for_mutation()
+            .unwrap_err()
+            .reason
+            .contains("resolved policy data changed"));
+        snapshot.revalidate_for_mutation().unwrap();
+        for variant in 0..3 {
+            let mut edited = snapshot.clone();
+            match variant {
+                0 => edited.policy.scope = PolicyScope::Remote,
+                1 => {
+                    edited
+                        .policy
+                        .context_labels
+                        .insert("production".into(), "critical".into());
+                }
+                _ => {
+                    edited.policy.threat_intel.abusech_auth_key =
+                        Some("changed-private-test-key".into())
+                }
+            }
+            assert!(edited
+                .revalidate_for_mutation()
+                .unwrap_err()
+                .reason
+                .contains("resolved policy data changed"));
+        }
+    }
+    #[test]
+    fn public_resolution_and_remote_context_cannot_be_promoted_to_runtime_authority() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let mut snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::LocalOnly);
+        snapshot.resolution_mode = ResolutionMode::Runtime;
+        snapshot.remote.availability = "not_configured".into();
+        assert!(snapshot
+            .revalidate_for_mutation()
+            .unwrap_err()
+            .reason
+            .contains("resolved policy data changed"));
     }
 }

@@ -225,7 +225,7 @@ impl RolloutService {
     }
 }
 
-fn captured_grants() -> Result<(Vec<TrustGrant>, bool), String> {
+pub(crate) fn captured_grants() -> Result<(Vec<TrustGrant>, bool), String> {
     let config =
         tirith_core::policy::config_dir().ok_or("operator configuration is unavailable")?;
     let store = match tirith_core::util::read_text_no_follow_capped(

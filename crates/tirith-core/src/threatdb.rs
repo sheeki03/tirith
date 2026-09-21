@@ -31,6 +31,9 @@
 
 pub mod operations;
 
+#[path = "threatdb/materialization_source.rs"]
+pub(crate) mod materialization_source;
+
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

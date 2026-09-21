@@ -3302,6 +3302,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tirith-policy-server"
+version = "0.4.2"
+dependencies = [
+ "axum",
+ "clap",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "rand_core 0.6.4",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tirith-core",
+ "tokio",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "tirith-sign"
 version = "0.4.2"
 dependencies = [

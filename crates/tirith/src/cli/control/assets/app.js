@@ -312,7 +312,183 @@
     recent.append(rawDetails('Inspect inventory coverage', jobs.coverage));
     const lifecycleId = field('Update or refresh operation ID', 'text', '', 'UUID retained from a lifecycle preview');
     recent.append(lifecycleId.label, button('Open saved lifecycle operation', () => requestDialog(() => api('/api/lifecycle/operation', {operation_id:lifecycleId.input.value.trim(), action:'status'}), displayLifecycle)));
-    return [install, approval, sources, retention, recent, supportPanel(), local, exportPanel];
+    return [install, approval, sources, await teamConnectionPanel(), await teamEnrollmentPanel(), teamRolloutPanel(), retention, recent, supportPanel(), local, exportPanel];
+  }
+  async function teamConnectionPanel() {
+    const section = panel('Optional team policy connection');
+    section.append(paragraph('Connect only if you use a team policy server. Personal protection needs no connection or administrator access. Saving a connection does not enable team policy or enroll this device.'));
+    const summary = element('div'); section.append(summary);
+    let selected = null;
+    function render(view) {
+      selected = view.connection;
+      summary.replaceChildren(row('Saved connection', selected.endpoint_origin || 'No authority selected', selected.configured ? 'Configured' : 'Not configured'));
+      if (selected.connection_id) summary.append(row('Connection ID', selected.connection_id), row('Authority ID', selected.authority_id), row('Policy ID', selected.policy_id));
+      if (selected.authentication === 'authenticated_now') {
+        summary.append(row('Authenticated role', selected.role || 'Unavailable'), row('Credential expiry', new Date(selected.credential_expires_unix_ms).toISOString()));
+      } else summary.append(paragraph('Role and credential expiry are unavailable until an explicit authentication check.'));
+      if (view.storage === 'saved_with_recovery') summary.append(paragraph('The connection was saved, but private recovery data was retained. Inspect local status before another change.', 'notice'));
+      replace.input.checked = false;
+    }
+    const server = field('Server URL', 'url', '', 'https://policy.example.com');
+    const authority = field('Authority UUID'); const policy = field('Policy UUID');
+    const credential = field('Selected private credential file', 'text', '', 'Absolute local file path');
+    const addresses = field('Optional fixed addresses', 'text', '', 'Up to eight IP addresses, separated by commas');
+    const ca = field('Optional private CA certificate file', 'text', '', 'Absolute local file path');
+    const replace = field('Replace the currently displayed connection', 'checkbox');
+    server.input.maxLength = 2048; authority.input.maxLength = policy.input.maxLength = 36;
+    credential.input.maxLength = ca.input.maxLength = 8192; addresses.input.maxLength = 512;
+    credential.input.autocomplete = ca.input.autocomplete = 'off';
+    section.append(button('Refresh local status', async () => render(await api('/api/team/connection'))), button('Authenticate selected connection', async () => render(await api('/api/team/connection/status', {refresh:true}))));
+    section.append(server.label, authority.label, policy.label, credential.label, addresses.label, ca.label, replace.label);
+    section.append(paragraph('The credential is read from the file you select. The token and CA contents are never displayed here. Connecting contacts the selected server to verify both UUID pins before saving.'));
+    section.append(button('Authenticate and save connection', async () => {
+      if (!selected) throw new Error('Load current connection status first.');
+      const pinned = addresses.input.value.split(',').map(v => v.trim()).filter(Boolean);
+      if (pinned.length > 8) throw new Error('Select no more than eight fixed addresses.');
+      const request = {server_url:server.input.value.trim(), authority_id:authority.input.value.trim(), policy_id:policy.input.value.trim(), credential_file:credential.input.value.trim(), private_ca_file:ca.input.value.trim() || null, pinned_addresses:pinned, expected_connection_id:selected.configured && replace.input.checked ? selected.connection_id : null};
+      try { render(await api('/api/team/connection/connect', request)); }
+      finally { credential.input.value = ''; ca.input.value = ''; }
+    }, 'primary'));
+    const disconnect = field('Disconnect the currently displayed connection', 'checkbox'); section.append(disconnect.label);
+    section.append(button('Disconnect', async () => {
+      if (!selected?.connection_id || !disconnect.input.checked) throw new Error('Inspect and acknowledge the displayed connection before disconnecting.');
+      try { render(await api('/api/team/connection/disconnect', {expected_connection_id:selected.connection_id})); }
+      finally { disconnect.input.checked = false; }
+    }));
+    try { render(await api('/api/team/connection')); } catch (error) { summary.append(paragraph(error.message || 'Private connection state is unavailable.', 'notice')); }
+    return section;
+  }
+  async function teamEnrollmentPanel() {
+    const section = panel('Optional team Runtime enrollment');
+    section.append(paragraph('Team policy stays off until you explicitly activate it. Activation and sync contact the saved authority using a Client credential and validate the fetched policy with repository and local restrictions. They do not send Applied reports.'));
+    const summary = element('div'); const result = element('div'); section.append(summary, result);
+    let current = null;
+    const activate = field('Activate the displayed connection, replacing the displayed activation if present', 'checkbox');
+    const disable = field('Disable the displayed activation', 'checkbox');
+    const repair = field('Remove only the enrollment that is currently malformed when this action runs', 'checkbox');
+    const abandon = field('Archive the displayed unresolved report; its server outcome remains unknown', 'checkbox');
+    function render(view) {
+      current = view;
+      summary.replaceChildren(row('Local Runtime', view.state), row('Selected connection ID', view.selected_connection_id || 'None'), row('Activation ID', view.activation_id || 'None'));
+      const evidence = view.runtime_evidence;
+      if (evidence) summary.append(row('Cached revision', evidence.revision), row('Client ID', evidence.client_id), row('Fetched', new Date(evidence.fetched_unix_ms).toISOString()));
+      if (view.state === 'runtime_refused') summary.append(paragraph('Runtime is blocked by stale, invalid, changed, or competing policy inputs. Sync requires the same connection; exact disable remains available offline.', 'notice'));
+      if (view.state === 'malformed' || view.state === 'storage_unavailable') summary.append(paragraph('Enrollment could not be safely admitted. Its bytes were preserved; automatic replacement is unavailable. Explicit removal applies only if the record is still malformed when the action captures it.', 'notice'));
+      if (view.report?.report_id) summary.append(row('Stored report', view.report.report_id, view.report.state));
+      const archives = view.report?.archived_reports || [];
+      if (archives.length) summary.append(paragraph(`${archives.length} of 4 bounded report archive slots are in use.`));
+      for (const archived of archives) {
+        summary.append(row('Archived report', archived.report_id, archived.state), row('Archive ID', archived.archive_id));
+        summary.append(button('Reconcile this archived report', () => perform('/api/team/enrollment/reconcile', {report_id:archived.report_id, archive_id:archived.archive_id})));
+      }
+      summary.append(paragraph(view.notice)); activate.input.checked = false; disable.input.checked = false; repair.input.checked = false; abandon.input.checked = false;
+    }
+    async function refresh() { render(await api('/api/team/enrollment')); }
+    function selected() {
+      if (!current?.selected_connection_id) throw new Error('Load a saved connection before this action.');
+      return {expected_connection_id:current.selected_connection_id, expected_activation_id:current.activation_id || null};
+    }
+    function enrolled() { const request = selected(); if (!request.expected_activation_id) throw new Error('Load the exact activation before this action.'); return request; }
+    async function perform(path, request) {
+      // Preserve the returned storage outcome even when the subsequent local
+      // refresh cannot complete. Never auto-retry a report after a transport error.
+      const view = await api(path, request);
+      result.replaceChildren(paragraph(view.notice || 'Operation completed.'), rawDetails('Inspect operation and storage outcome', view));
+      if (view.local_write?.includes('unconfirmed') || view.outcome?.includes('unknown') || view.outcome === 'pending_not_sent') result.prepend(paragraph('Completion is unconfirmed. Inspect the retained local state before another explicit action.', 'notice'));
+      await refresh();
+    }
+    section.append(button('Refresh local enrollment status', refresh), activate.label,
+      button('Fetch, validate, and activate', async () => {
+        if (!activate.input.checked) throw new Error('Acknowledge the displayed connection and activation first.');
+        const request = selected(); activate.input.checked = false;
+        await perform('/api/team/enrollment/activate', request);
+      }),
+      button('Fetch and sync this activation', () => perform('/api/team/enrollment/sync', enrolled())), disable.label,
+      button('Disable this activation offline', async () => {
+        if (!current?.activation_id || !disable.input.checked) throw new Error('Acknowledge the displayed activation first.');
+        const request = {expected_activation_id:current.activation_id}; disable.input.checked = false;
+        await perform('/api/team/enrollment/disable', request);
+      }),
+      repair.label,
+      button('Remove currently malformed enrollment', async () => {
+        if (!repair.input.checked) throw new Error('Acknowledge removal of the currently malformed enrollment first.');
+        repair.input.checked = false;
+        await perform('/api/team/enrollment/repair', {remove_malformed:true});
+      }),
+      paragraph('Reporting resolves actual Runtime and authenticates the same Client. The exact report is saved privately before sending. Uncertain outcomes keep that request for explicit retry, without a new sequence.'),
+      button('Report actual Runtime', () => perform('/api/team/enrollment/report', {...enrolled(), retry_report_id:null})),
+      button('Reconcile stored report without resending', () => {
+        if (!current?.report?.report_id) throw new Error('Load an exact stored report first.');
+        return perform('/api/team/enrollment/reconcile', {report_id:current.report.report_id, archive_id:current.report.archive_id || null});
+      }),
+      paragraph('Read-only reconciliation checks the exact request retained by the server. An unavailable or superseded report stays unknown. If Runtime has changed, explicit abandonment preserves the old request locally and permits a new report after fresh authentication; a late server commit can still cause a conflict.'),
+      abandon.label,
+      button('Archive unresolved report locally', async () => {
+        if (current?.report?.state !== 'pending' || !abandon.input.checked) throw new Error('Inspect and acknowledge the exact pending report first.');
+        const request = {report_id:current.report.report_id, acknowledge_unknown_outcome:true}; abandon.input.checked = false;
+        await perform('/api/team/enrollment/abandon', request);
+      }),
+      button('Retry exact pending report', () => {
+        if (current?.report?.state !== 'pending' || !current.report.report_id) throw new Error('Load an exact pending report before retrying.');
+        return perform('/api/team/enrollment/report', {...enrolled(), retry_report_id:current.report.report_id});
+      }));
+    try { await refresh(); } catch (error) { summary.append(paragraph(error.message || 'Local enrollment status is unavailable.', 'notice')); }
+    return section;
+  }
+  function teamRolloutPanel() {
+    const section = panel('Review a team policy rollout');
+    section.append(paragraph('A publisher can review selected workflows, then publish to the exact server revision shown. Device activation is separate. This panel contacts your server only after an explicit action.'));
+    const yamlLabel = element('label', 'Proposed policy YAML'); const yaml = element('textarea'); yaml.rows = 6; yaml.maxLength = 12000; yaml.setAttribute('aria-label', 'Proposed policy YAML'); yamlLabel.append(yaml);
+    const workflowLabel = element('label', 'Workflows, one command per line'); const workflows = element('textarea'); workflows.rows = 4; workflows.maxLength = 12000; workflows.setAttribute('aria-label', 'Team policy workflows'); workflowLabel.append(workflows);
+    const shell = select('Workflow shell', [['posix','Bash / Zsh / POSIX'],['fish','Fish'],['powershell','PowerShell'],['cmd','Windows CMD']]);
+    const interactive = field('Workflows run interactively', 'checkbox');
+    const id = field('Stored rollout operation ID'); id.input.maxLength = 36;
+    let pending = null;
+    section.append(yamlLabel, workflowLabel, shell.label, interactive.label,
+      paragraph('Browser requests are limited to 16 KiB in total. Use the CLI for larger policy documents. Workflows are inspected; these commands are never executed.', 'muted'),
+      button('Prepare impact review', async () => {
+        if (!pending) pending = {operation_id:crypto.randomUUID(),change:{yaml:yaml.value,commands:workflows.value.split('\n').map(c => c.trim()).filter(Boolean),shell:shell.input.value,interactive:interactive.input.checked}};
+        id.input.value = pending.operation_id;
+        if (new TextEncoder().encode(JSON.stringify(pending)).length > 16000) { pending = null; throw new Error('This review exceeds the browser request limit. Use tirith policy team rollout prepare with a local policy file.'); }
+        const selected = pending;
+        await requestDialog(() => api('/api/team/rollout/prepare', selected), view => { if (pending === selected) pending = null; yaml.value = ''; showTeamRollout(view); });
+      }, 'primary'), id.label,
+      button('Inspect stored review', () => requestDialog(() => api('/api/team/rollout/show',{operation_id:id.input.value.trim(),refresh:false}), view => { if (pending?.operation_id === view.operation_id) pending = null; showTeamRollout(view); })),
+      button('Refresh server operation status', () => requestDialog(() => api('/api/team/rollout/show',{operation_id:id.input.value.trim(),refresh:true}), showTeamRollout)),
+      button('Fetch client rollout reports', () => requestDialog(() => api('/api/team/rollout/fleet',{}), view => {
+        showDialog('Team client reports', view); operationContent.prepend(paragraph(view.notice, 'notice'));
+        for (const client of view.fleet?.clients || []) operationContent.append(row(client.client_id, client.report ? `Reported revision ${client.report.applied_revision}` : 'No report received', client.status));
+      })));
+    section.append(paragraph('If a response is lost, keep the displayed operation ID and inspect it before preparing another review. No review or retry approves a policy or exception automatically.', 'muted'));
+    return section;
+  }
+  function showTeamRollout(view) {
+    showDialog(view.kind === 'rollback' ? 'Review team policy rollback' : 'Review team policy publication', view);
+    operationContent.prepend(paragraph(view.notice, 'notice'), row('Operation', view.operation_id, view.phase), row('Expected server revision', view.expected_revision), row('Reviewed workflows', `${view.impact_review?.workflows?.length || 0} selected workflows`, view.historical_evidence?.review_freshness || 'Unavailable'));
+    const observations = {
+      authenticated_exact_intent_observation: 'The server confirmed the outcome for this exact request.',
+      server_has_no_record_at_this_observation: 'The server has no matching record at this time.',
+      submission_journal_durability_unconfirmed_no_server_mutation_sent: 'The local pending request could not be confirmed durable. No server change was sent.',
+      submission_outcome_not_confirmed: 'The server outcome is uncertain. Refresh this exact request before another action.'
+    };
+    if (view.current_observation) operationContent.append(paragraph(observations[view.current_observation] || 'The server outcome could not be confirmed.', 'notice'));
+    if (view.last_operation_observation) operationContent.append(row('Server outcome', view.last_operation_observation.failure_code || view.last_operation_observation.published_revision || 'No committed revision', view.last_operation_observation.outcome));
+    for (const workflow of view.impact_review?.workflows || []) operationContent.append(row(workflow.id, `${workflow.before} → ${workflow.proposed}`, workflow.comparison_available ? workflow.change : 'Comparison unavailable'));
+    for (const exception of view.impact_review?.exceptions || []) operationContent.append(row(exception.id, exception.expires_at ? `Expires ${exception.expires_at}` : 'No expiry recorded', exception.proposed));
+    const request = {operation_id:view.operation_id,review_id:view.review_id,rollback:view.kind === 'rollback'};
+    if (['prepared','submitted'].includes(view.phase) && view.historical_evidence?.review_freshness === 'recent') {
+      const reviewed = field('I reviewed this policy, its workflow impact and unavailable evidence', 'checkbox'); operationContent.append(reviewed.label);
+      operationActions.append(button(view.kind === 'rollback' ? 'Apply reviewed rollback' : 'Publish reviewed policy', async () => {
+        if (!reviewed.input.checked) throw new Error('Review and acknowledge this exact policy before submitting it.');
+        await requestDialog(() => api('/api/team/rollout/apply',request),showTeamRollout);
+      }, 'primary'));
+    }
+    operationActions.append(button('Refresh this operation', () => requestDialog(() => api('/api/team/rollout/show',{operation_id:view.operation_id,refresh:true}),showTeamRollout)));
+    if (view.kind === 'publication' && view.last_operation_observation?.rollback_eligible) {
+      const operationId = crypto.randomUUID();
+      operationActions.append(button('Prepare rollback review', () => requestDialog(() => api('/api/team/rollout/rollback-plan',{operation_id:operationId,publication_id:view.operation_id}),showTeamRollout)));
+      operationContent.append(paragraph('Rollback availability is rechecked on the server. Another publication or an expired window prevents rollback.', 'muted'));
+    }
   }
   function supportPanel() {
     const support = panel('Prepare a support report');

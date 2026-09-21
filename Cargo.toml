@@ -5,6 +5,7 @@ members = [
     "crates/tirith-test-support",
     "tools/sign-license",
     "tools/license-server",
+    "tools/policy-server",
 ]
 resolver = "2"
 

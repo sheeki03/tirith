@@ -1236,3 +1236,7 @@ mod run_impl {
         }
     }
 }
+
+pub(crate) use fs_transaction::{delete_private_team_connection, update_private_team_connection};
+
+pub(crate) use fs_transaction::{delete_private_team_record, update_private_team_record};

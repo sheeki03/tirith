@@ -28,6 +28,9 @@ use crate::util::dirfd::{
     file_generation, file_identity, DirCapability, EntryKind, FileGeneration,
 };
 
+#[path = "npm_materialize.rs"]
+pub mod materialize;
+
 #[path = "npm_install_execution.rs"]
 mod execution;
 #[path = "npm_install_metadata.rs"]

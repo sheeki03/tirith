@@ -2914,13 +2914,16 @@ mod tests {
         }
     }
 
-    fn deny_policy_changes(snapshot: &mut EffectivePolicySnapshot) {
-        snapshot.policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
-        snapshot
-            .policy
-            .task_gate
-            .effects_denied_for_untrusted_sources
-            .insert(tirith_core::effects::CommandEffectKind::PolicyChange);
+    fn deny_policy_changes() -> PathBuf {
+        let path = PathBuf::from(std::env::var_os("TIRITH_POLICY_ROOT").unwrap())
+            .join(".tirith/policy.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            b"task_gate:\n  mode: enforce\n  effects_denied_for_untrusted_sources: [policy_change]\n",
+        )
+        .unwrap();
+        path
     }
 
     fn gate_worker(id: &str) -> std::sync::mpsc::Sender<()> {
@@ -2970,10 +2973,11 @@ mod tests {
             assert_eq!(duplicate.state, JobState::Running);
             assert_eq!(active_job_count(), baseline + 1);
             assert!(service.undo_async("admission".into(), policy()).is_err());
-            let mut denied = policy();
-            deny_policy_changes(&mut denied);
+            // An invalid duplicate cannot replace the running worker's policy.
+            let mut invalid = policy();
+            invalid.policy.paranoia = 3;
             assert_eq!(
-                service.apply("admission", &denied).unwrap().state,
+                service.apply("admission", &invalid).unwrap().state,
                 JobState::Running
             );
             assert_eq!(service.read("admission").unwrap().state, JobState::Running);
@@ -3703,8 +3707,8 @@ mod tests {
     fn task_gate_denial_precedes_journal_and_destination_side_effects() {
         with_fake_env(true, |home, _| {
             let service = fixture(home);
-            let mut policy = policy();
-            deny_policy_changes(&mut policy);
+            deny_policy_changes();
+            let policy = policy();
             let error = service
                 .plan(
                     "denied",
@@ -3720,7 +3724,7 @@ mod tests {
     }
 
     #[test]
-    fn task_gate_denial_blocks_apply_and_undo_before_destination_changes() {
+    fn changed_task_policy_blocks_apply_and_undo_before_destination_changes() {
         with_fake_env(true, |home, _| {
             let service = fixture(home);
             let policy = policy();
@@ -3732,11 +3736,14 @@ mod tests {
                     &policy,
                 )
                 .unwrap();
-            let mut denied = self::policy();
-            deny_policy_changes(&mut denied);
+            let denied_path = deny_policy_changes();
+            let denied = self::policy();
             let result = service.apply("recheck", &denied).unwrap();
             assert_eq!(result.state, JobState::RefreshRequired);
-            assert!(result.detail.unwrap().contains("task gate"));
+            assert!(result
+                .detail
+                .unwrap()
+                .contains("external policy inputs changed since planning"));
             assert!(!home.join("settings.json").exists());
             // Coordination may create its private lock before authorization;
             // no destination or applied step may change on a denied request.
@@ -3746,9 +3753,23 @@ mod tests {
                 .steps
                 .iter()
                 .all(|step| step.state == StepState::Pending));
-            service.apply("recheck", &policy).unwrap();
+            std::fs::remove_file(&denied_path).unwrap();
+            let fresh = self::policy();
+            service
+                .plan(
+                    "undo-recheck",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &fresh,
+                )
+                .unwrap();
+            assert_eq!(
+                service.apply("undo-recheck", &fresh).unwrap().state,
+                JobState::Completed
+            );
             let original = std::fs::read(home.join("settings.json")).unwrap();
-            let error = service.undo("recheck", &denied).unwrap_err();
+            deny_policy_changes();
+            let error = service.undo("undo-recheck", &self::policy()).unwrap_err();
             assert!(error.contains("task gate"), "{error}");
             assert_eq!(std::fs::read(home.join("settings.json")).unwrap(), original);
         });

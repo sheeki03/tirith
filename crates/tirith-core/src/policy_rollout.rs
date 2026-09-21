@@ -329,7 +329,7 @@ impl ImpactReport {
         if self.schema_version != ROLLOUT_SCHEMA_VERSION
             || self.execution_permitted
             || self.automatically_approved
-            || self.remote_publication_available
+            || (self.remote_publication_available && self.scope != RolloutScope::RemoteManaged)
             || self.fleet_adoption_verified
         {
             return Err("unsupported rollout report version or authority claim".into());
@@ -348,7 +348,8 @@ impl ImpactReport {
         {
             return Err("stored rollout report exceeds collection limits".into());
         }
-        if !self.gaps.contains(&ImpactGap::RemotePublicationUnavailable)
+        if self.gaps.contains(&ImpactGap::RemotePublicationUnavailable)
+            == self.remote_publication_available
             || !self.gaps.contains(&ImpactGap::FleetAdoptionUnavailable)
             || (self.workflows.is_empty() && !self.gaps.contains(&ImpactGap::NoWorkflows))
         {
@@ -485,6 +486,33 @@ pub struct ImpactRequest<'a> {
     pub exception_inventory_complete: bool,
     pub clients: &'a [ClientObservation],
     pub now: DateTime<Utc>,
+}
+
+pub fn review_for_publisher(
+    request: ImpactRequest<'_>,
+    publisher: &crate::policy_team_client::PublisherObservation,
+) -> Result<ImpactReport, &'static str> {
+    let now: u64 = request
+        .now
+        .timestamp_millis()
+        .try_into()
+        .map_err(|_| "invalid review clock")?;
+    if request.scope != RolloutScope::RemoteManaged
+        || now
+            .checked_sub(publisher.observed_unix_ms)
+            .is_none_or(|age| age > 60_000)
+    {
+        return Err("publisher observation is unavailable or stale");
+    }
+    let mut report = review(request)?;
+    report.remote_publication_available = true;
+    report
+        .gaps
+        .retain(|gap| *gap != ImpactGap::RemotePublicationUnavailable);
+    report
+        .validate_stored()
+        .map_err(|_| "connected impact report failed validation")?;
+    Ok(report)
 }
 
 pub fn review(request: ImpactRequest<'_>) -> Result<ImpactReport, &'static str> {

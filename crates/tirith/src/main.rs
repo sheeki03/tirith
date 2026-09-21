@@ -6031,6 +6031,12 @@ impl PkgEcosystem {
 
 #[derive(Subcommand)]
 enum PkgAction {
+    /// Materialize reviewed local leaf archive data without running package code.
+    /// This Linux-only contract is separate from the disabled execution backend.
+    Materialize {
+        #[command(subcommand)]
+        action: cli::npm_materialize::Action,
+    },
     /// Inspect exact local npm tarballs or Python wheels without executing them.
     #[command(after_help = "\
 Examples:
@@ -6617,6 +6623,11 @@ Examples:
 
 #[derive(Subcommand)]
 enum PolicyAction {
+    /// Explicit optional team connection; Runtime enrollment is separate
+    Team {
+        #[command(subcommand)]
+        action: cli::team_connection::Action,
+    },
     /// Review a local profile rollout, then explicitly activate or undo its stored plan
     Rollout {
         #[command(subcommand)]
@@ -8359,6 +8370,9 @@ fn run() {
         }
 
         Commands::Pkg {
+            action: PkgAction::Materialize { action },
+        } => cli::npm_materialize::run(action),
+        Commands::Pkg {
             action:
                 PkgAction::Inspect {
                     artifacts,
@@ -8541,6 +8555,7 @@ fn run() {
                 // match.
                 PkgAction::Graph { .. } => unreachable!("pkg graph handled above"),
                 PkgAction::Inspect { .. } => unreachable!("pkg inspect handled above"),
+                PkgAction::Materialize { .. } => unreachable!("pkg materialize handled above"),
                 // `Diff` is likewise handled by its own earlier arm (it returns the
                 // release-differential verdict's exit code through
                 // `cli::provenance::run_diff`), so it never reaches here.
@@ -8940,6 +8955,7 @@ fn run() {
         }
 
         Commands::Policy { action } => match action {
+            PolicyAction::Team { action } => cli::team_connection::run(action),
             PolicyAction::Init {
                 force,
                 minimal,
@@ -10458,6 +10474,74 @@ fn run() {
 
 #[cfg(test)]
 mod help_category_tests {
+    #[test]
+    fn materialize_cli_requires_explicit_review_for_apply_and_recovery() {
+        with_large_cli_stack(|| {
+            use clap::Parser;
+            for action in ["apply", "recover", "undo"] {
+                assert!(super::Cli::try_parse_from([
+                    "tirith",
+                    "pkg",
+                    "materialize",
+                    action,
+                    "11111111-1111-4111-8111-111111111111"
+                ])
+                .is_err());
+                let parsed = super::Cli::try_parse_from([
+                    "tirith",
+                    "pkg",
+                    "materialize",
+                    action,
+                    "11111111-1111-4111-8111-111111111111",
+                    "--reviewed",
+                    &"a".repeat(64),
+                    "--json",
+                ])
+                .unwrap();
+                assert!(matches!(
+                    parsed.command,
+                    super::Commands::Pkg {
+                        action: super::PkgAction::Materialize { .. }
+                    }
+                ));
+            }
+        });
+    }
+    #[test]
+    fn materialize_cli_does_not_accept_execution_or_resolver_overrides() {
+        with_large_cli_stack(|| {
+            use clap::Parser;
+            for option in [
+                "--yes",
+                "--allow-degraded",
+                "--online",
+                "--script",
+                "--index-url",
+            ] {
+                assert!(super::Cli::try_parse_from([
+                    "tirith",
+                    "pkg",
+                    "materialize",
+                    "plan",
+                    "demo.tgz",
+                    "--target",
+                    "fresh",
+                    option
+                ])
+                .is_err());
+            }
+            assert!(super::Cli::try_parse_from([
+                "tirith",
+                "pkg",
+                "materialize",
+                "plan",
+                "--target",
+                "fresh"
+            ])
+            .is_err());
+        });
+    }
+
     use super::{
         Cli, Commands, PkgAction, TrustAction, TrustMutationScope, TrustQueryScope,
         COMMANDS_BY_CATEGORY,

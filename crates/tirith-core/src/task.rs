@@ -139,6 +139,52 @@ pub struct TaskSourceInput {
     pub receipt: Option<ProvenanceReceipt>,
 }
 
+/// A core-constructed description of an inert local package tree operation.
+/// There is no Deserialize implementation or public field/constructor: an
+/// untrusted envelope cannot relabel a shell/package execution as this action.
+/// This value describes effects; only the materializer's distinct sealed
+/// boundary and exact live operation can consume its resulting permit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalPackageTreeAction {
+    operation_id: String,
+    packages: Vec<String>,
+    destination: String,
+    inventory_sha256: String,
+}
+impl LocalPackageTreeAction {
+    pub(crate) fn new(
+        operation_id: &str,
+        packages: Vec<String>,
+        destination: String,
+        inventory_sha256: String,
+    ) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            packages,
+            destination,
+            inventory_sha256,
+        }
+    }
+    fn invalid(&self) -> bool {
+        !uuid::Uuid::parse_str(&self.operation_id)
+            .is_ok_and(|id| !id.is_nil() && id.to_string() == self.operation_id)
+            || self.packages.is_empty()
+            || self.packages.len() > 8
+            || self
+                .packages
+                .iter()
+                .any(|p| p.is_empty() || p.len() > MAX_STRING_BYTES)
+            || self.destination.is_empty()
+            || self.destination.len() > MAX_PATH_BYTES
+            || !std::path::Path::new(&self.destination).is_absolute()
+            || self.inventory_sha256.len() != 64
+            || !self
+                .inventory_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+}
+
 /// An operation the task proposes. Effects are inferred from this, never taken
 /// from the document's own description of itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +196,17 @@ pub enum ProposedAction {
     PackageInstall {
         ecosystem: String,
         package: String,
+    },
+    /// Native data-only writes; never arbitrary npm execution. Not accepted
+    /// from deserialized task documents.
+    #[serde(skip_deserializing)]
+    LocalPackageMaterialize {
+        binding: LocalPackageTreeAction,
+    },
+    /// Exact existing inventory removal, including a fixed private relocation.
+    #[serde(skip_deserializing)]
+    LocalPackageUndo {
+        binding: LocalPackageTreeAction,
     },
     ConfigWrite {
         path: String,
@@ -492,6 +549,8 @@ pub fn validate_envelope(envelope: &TaskEnvelopeInput) -> Vec<EnvelopeRejection>
             ProposedAction::PackageInstall { ecosystem, package } => {
                 ecosystem.len() > MAX_STRING_BYTES || package.len() > MAX_STRING_BYTES
             }
+            ProposedAction::LocalPackageMaterialize { binding }
+            | ProposedAction::LocalPackageUndo { binding } => binding.invalid(),
             ProposedAction::ConfigWrite { path } => path.len() > MAX_PATH_BYTES,
             ProposedAction::Narrative { text } => text.len() > MAX_STRING_BYTES,
         };
@@ -768,6 +827,17 @@ pub fn infer_effects_detailed_with_context(
             // policy that permits an ordinary write but denies persistence can
             // still refuse package transitions.
             effects.insert(CommandEffectKind::PersistenceChange);
+        }
+        ProposedAction::LocalPackageMaterialize { binding } => {
+            effects.insert(CommandEffectKind::PackageInstall);
+            effects.insert(CommandEffectKind::FilesystemWrite);
+            effects.insert(CommandEffectKind::PersistenceChange);
+            complete &= !binding.invalid();
+        }
+        ProposedAction::LocalPackageUndo { binding } => {
+            effects.insert(CommandEffectKind::FilesystemWrite);
+            effects.insert(CommandEffectKind::PersistenceChange);
+            complete &= !binding.invalid();
         }
         ProposedAction::ConfigWrite { path } => {
             effects.insert(CommandEffectKind::FilesystemWrite);
@@ -1849,5 +1919,66 @@ mod tests {
         assert!(!decision
             .allowed_effects
             .contains(&CommandEffectKind::PersistenceChange));
+    }
+}
+
+#[cfg(test)]
+mod local_package_tree_tests {
+    use super::*;
+    fn binding() -> LocalPackageTreeAction {
+        LocalPackageTreeAction::new(
+            "11111111-1111-4111-8111-111111111111",
+            vec!["leaf@1.0.0".into()],
+            "/tmp/exact-new-tree".into(),
+            "a".repeat(64),
+        )
+    }
+    #[test]
+    fn inert_materialization_and_cleanup_have_distinct_fixed_effects() {
+        let materialize =
+            infer_effects_detailed(&ProposedAction::LocalPackageMaterialize { binding: binding() });
+        let undo = infer_effects_detailed(&ProposedAction::LocalPackageUndo { binding: binding() });
+        assert!(materialize.complete && undo.complete);
+        assert_eq!(
+            materialize.effects,
+            BTreeSet::from([
+                CommandEffectKind::PackageInstall,
+                CommandEffectKind::FilesystemWrite,
+                CommandEffectKind::PersistenceChange
+            ])
+        );
+        assert_eq!(
+            undo.effects,
+            BTreeSet::from([
+                CommandEffectKind::FilesystemWrite,
+                CommandEffectKind::PersistenceChange
+            ])
+        );
+        assert!(infer_effects(&ProposedAction::PackageInstall {
+            ecosystem: "npm".into(),
+            package: "leaf".into()
+        })
+        .contains(&CommandEffectKind::NetworkEgress));
+    }
+    #[test]
+    fn untrusted_envelope_cannot_request_native_only_action_variants() {
+        for action in [
+            ProposedAction::LocalPackageMaterialize { binding: binding() },
+            ProposedAction::LocalPackageUndo { binding: binding() },
+        ] {
+            let value = serde_json::to_value(action).unwrap();
+            assert!(serde_json::from_value::<ProposedAction>(value.clone()).is_err());
+            let document = serde_json::json!({"actions":[value]}).to_string();
+            assert!(parse_envelope(&document).is_err());
+        }
+    }
+    #[test]
+    fn malformed_internal_native_binding_cannot_claim_complete_analysis() {
+        let mut bad = binding();
+        bad.operation_id = uuid::Uuid::nil().to_string();
+        assert!(
+            !infer_effects_detailed(&ProposedAction::LocalPackageMaterialize { binding: bad })
+                .complete
+        );
     }
 }

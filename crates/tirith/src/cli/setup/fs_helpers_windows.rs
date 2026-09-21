@@ -1782,6 +1782,42 @@ impl PlatformTransaction {
         Ok(())
     }
 
+    /// DELETE-capable, no-write/no-delete-sharing handle binds the deletion to
+    /// the exact locked private postimage, using the existing cleanup primitive.
+    pub(crate) fn delete_private_expected(
+        &self,
+        expected: &PlatformSnapshot,
+        cap: usize,
+    ) -> Result<(), String> {
+        if cap == 0
+            || expected
+                .bytes
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > cap)
+        {
+            return Err("private deletion input exceeds its fixed bound".into());
+        }
+        expected.require_private()?;
+        self.validate_snapshot(expected)?;
+        let SnapshotGeneration::Present(generation) = &expected.generation else {
+            return Err("disconnect requires a present file".into());
+        };
+        let handle = open_cleanup_handle(&self.destination)?
+            .ok_or("connection disappeared before disconnect")?;
+        let (file, bytes, actual) =
+            capture_stable_file_capped(handle.into_file(), &self.display_path, cap)?;
+        if &actual != generation || Some(bytes.as_slice()) != expected.bytes.as_deref() {
+            return Err("connection changed before disconnect".into());
+        }
+        // The retained DELETE handle already excludes replacement. Reopening
+        // here would conflict with its intentional sharing restriction.
+        mark_held_file_for_deletion(&file)?;
+        drop(file);
+        // Namespace persistence is not fsync-provable on Windows. The service
+        // releases its read witness, then proves absence before reporting it.
+        Ok(())
+    }
+
     pub(crate) fn prepare_temp<'a>(
         &'a self,
         bytes: &[u8],

@@ -1717,6 +1717,47 @@ impl Policy {
     /// incident-override merge (split out so the override applies exactly once
     /// regardless of which remote-fetch branch produced the policy).
     fn discover_resolved(cwd: Option<&str>) -> Self {
+        // Enrollment is a distinct fixed private input. Its hot path never
+        // contacts the team authority; stale/invalid/changed state cannot fall
+        // through to personal or legacy remote policy.
+        match crate::policy_team_enrollment::TeamEnrollment::capture_runtime() {
+            Ok(enrollment) => {
+                snapshot::observe_team_runtime(enrollment.clone());
+                if let Some(document) = enrollment.document() {
+                    let policy = match Self::team_document_baseline(document, cwd) {
+                        Ok(policy) => policy,
+                        Err(_) => {
+                            snapshot::observe_team_runtime_refusal(
+                                "competing_or_invalid_authority",
+                            );
+                            return Self::fail_closed_policy();
+                        }
+                    };
+                    if enrollment.revalidate().is_err() {
+                        snapshot::observe_team_runtime_refusal(
+                            "enrollment_changed_during_resolution",
+                        );
+                        return Self::fail_closed_policy();
+                    }
+                    snapshot::observe_remote(|remote| {
+                        remote.availability = "team_enrolled_cache".into();
+                        remote.freshness =
+                            "bounded_offline_cache_server_currentness_unknown".into();
+                        remote.fetched_at = enrollment.evidence().and_then(|evidence| {
+                            i64::try_from(evidence.fetched_unix_ms())
+                                .ok()
+                                .and_then(chrono::DateTime::from_timestamp_millis)
+                                .map(|time| time.to_rfc3339())
+                        });
+                    });
+                    return policy;
+                }
+            }
+            Err(_) => {
+                snapshot::observe_team_runtime_refusal("enrollment_unavailable");
+                return Self::fail_closed_policy();
+            }
+        }
         let local = Self::discover_local(cwd);
         // A remote replacement must not discard the local diagnostic DLP
         // protection for errors that have already observed trusted local data.
@@ -1732,6 +1773,18 @@ impl Policy {
         let key_from_env = snapshot::observe_env("TIRITH_API_KEY")
             .and_then(|value| value.into_string().ok())
             .filter(|s| !s.is_empty());
+        if snapshot::refuse_configured_remote_mutation()
+            && (url_from_env.is_some()
+                || key_from_env.is_some()
+                || local.policy_server_url.is_some()
+                || local.policy_server_api_key.is_some())
+        {
+            snapshot::observe_remote(|remote| {
+                remote.availability = "refused_local_mutation".into();
+                remote.failure = Some("remote_revision_precondition_unavailable".into());
+            });
+            return Self::fail_closed_policy();
+        }
         let (server_url, api_key) = match (url_from_env, key_from_env) {
             // A complete ambient pair is operator-controlled as one unit.
             (Some(url), Some(key)) => (url, key),
@@ -1951,7 +2004,7 @@ impl Policy {
         }
         let trusted = discover_trusted_local_policy_path_scoped();
         let trusted_path = trusted.as_ref().map(|(path, _)| path.clone());
-        let mut baseline = match trusted {
+        let baseline = match trusted {
             Some((path, scope)) => {
                 snapshot::observe_policy_target(&path, scope);
                 let (mut policy, document) =
@@ -1981,12 +2034,20 @@ impl Policy {
             }
         };
 
+        Self::merge_discovered_repository(baseline, cwd, trusted_path.as_deref())
+    }
+
+    fn merge_discovered_repository(
+        mut baseline: Self,
+        cwd: Option<&str>,
+        trusted_path: Option<&Path>,
+    ) -> Self {
         freeze_captured_policy_dlp_patterns(&baseline.dlp_custom_patterns);
         if let Some(repo_path) = discover_policy_path(cwd) {
             // TIRITH_POLICY_ROOT may intentionally point at this checkout. Do
             // not parse and append the same document a second time under a
             // different scope.
-            if trusted_path.as_ref() != Some(&repo_path) {
+            if trusted_path != Some(repo_path.as_path()) {
                 snapshot::observe_policy_target(&repo_path, PolicyScope::Repo);
                 let before = snapshot::values(&baseline);
                 let (mut repo, document) = Self::load_from_path_with_document(
@@ -2024,6 +2085,69 @@ impl Policy {
             }
         }
         baseline
+    }
+
+    pub(crate) fn team_document_baseline(
+        document: &crate::policy_team::PolicyDocument,
+        cwd: Option<&str>,
+    ) -> Result<Self, crate::policy_team::ErrorCode> {
+        let trusted = discover_trusted_local_policy_path_scoped();
+        // A second managed authority has no defined precedence. Keep the
+        // existing organization authority until its operator migrates it.
+        if trusted
+            .as_ref()
+            .is_some_and(|(_, scope)| *scope == PolicyScope::Org)
+        {
+            return Err(crate::policy_team::ErrorCode::Forbidden);
+        }
+        // Refuse a competing legacy authority without a request or cache read.
+        // Inspect the currently selected trusted local baseline, not repository
+        // declarations which the runtime has already denied redirection power.
+        let (local_url, local_key) = if let Some((path, scope)) = &trusted {
+            snapshot::observe_policy_target(path, *scope);
+            let (local, source) =
+                Self::load_from_path_with_document(path, PolicyReadMode::TrustedBaseline);
+            freeze_captured_policy_dlp_patterns(&local.dlp_custom_patterns);
+            if source.parse_failed {
+                return Err(crate::policy_team::ErrorCode::Forbidden);
+            }
+            (local.policy_server_url, local.policy_server_api_key)
+        } else {
+            (None, None)
+        };
+        let env_url = snapshot::observe_env("TIRITH_SERVER_URL")
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| !value.is_empty());
+        let env_key = snapshot::observe_env("TIRITH_API_KEY")
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| !value.is_empty());
+        if (local_url.is_some() && (local_key.is_some() || env_key.is_some()))
+            || (env_url.is_some() && env_key.is_some())
+        {
+            return Err(crate::policy_team::ErrorCode::Forbidden);
+        }
+        let mut policy = document.parsed_policy()?;
+        policy.scope = PolicyScope::Remote;
+        policy.path = Some(format!(
+            "team-policy:{}:{}:{}",
+            document.authority_id.as_str(),
+            document.policy_id.as_str(),
+            document.revision.as_str()
+        ));
+        snapshot::observe_remote_bytes(document.yaml.as_bytes());
+        snapshot::observe_replacement(
+            &policy,
+            PolicySource::new("remote", None),
+            None,
+            "selected team authority document; repository restrictions remain in force",
+        );
+        let trusted_path = trusted.map(|(path, _)| path);
+        let team_path = policy.path.clone();
+        let merged = Self::merge_discovered_repository(policy, cwd, trusted_path.as_deref());
+        if merged.scope != PolicyScope::Remote || merged.path != team_path {
+            return Err(crate::policy_team::ErrorCode::InvalidPolicy);
+        }
+        Ok(merged)
     }
 
     /// Merge a sanitized repository policy into a trusted baseline without
@@ -2772,7 +2896,7 @@ impl Policy {
     }
 
     /// Return a fail-closed policy that blocks everything.
-    fn fail_closed_policy() -> Self {
+    pub(crate) fn fail_closed_policy() -> Self {
         Policy {
             fail_mode: FailMode::Closed,
             allow_bypass_env: false,

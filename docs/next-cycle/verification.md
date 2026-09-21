@@ -1,5 +1,44 @@
 # Implementation verification
 
+## Optional team policy and local materialization (2026-09-21)
+
+The resumed source matches all 62 retained changed/new inputs at base
+`3629a724`. Its input manifest SHA-256 is
+`fe209fcf795e589e5a35869848237749365c2282b5b9ff8108231cedbbdb4b1b`. The corrected full CLI unit executable
+passes 2,064 tests, zero failures and two existing ignores. All five targeted
+parser/task-policy regressions pass. The earlier corresponding core executable
+passes 6,122 tests, zero failures and two existing ignores; the optional policy
+server passes all 26 tests. The subsequent core change only renames a private
+platform module. Strict workspace/all-target Clippy, formatting and diff checks
+pass on the resumed source. Retained failed fixture runs are not counted as passes.
+
+The real macOS HTTPS and Chromium journey passes 35 cases on its separately
+retained candidate. It exercises private-CA certificate verification and explicit
+address pins, authority mismatch refusal, separate connection and activation,
+reviewed publication, concurrent update refusal, bounded rollback, exact-intent
+reconciliation after lost replies, partial adoption, stale report retry refusal,
+historical report reconciliation, explicit unknown-outcome archival, offline
+withdrawal and malformed-enrollment repair. Browser checks cover explicit review
+acknowledgment, read-only refresh, clearing credential input paths and absence of
+credential values from the rendered page. Product processes pass all four owned
+process-group cleanup checks. Browser/driver cleanup uses its own API; this is not
+process-tree, remote-deployment, Windows or independent fleet-adoption evidence.
+
+The optional server, typed client protocol, local connection/enrollment and
+CLI/browser rollout controls are implemented. Personal operation remains
+independent of a server. The Linux-only local package materializer has explicit
+plan/apply/status/undo/recovery contracts and does not execute package code. Its
+native Linux write/recovery paths still require the new platform CI result.
+General npm/Python private-input execution remains disabled.
+
+Three retained release100 measurements at source `6b1aed52` share the exact
+EPYC 7763 compiler/image/CPU class on distinct recorded boots. They establish a
+reference for six allocation/RSS limits. Six actual growth variants and six
+zero-dose controls completed their benchmark workflows; raw matching-cohort
+evaluation remains separate from workflow success. The resource limits are not
+yet enabled. Signed replacement, final installed-package journeys, the beginner
+pilot and release/channel gates remain open.
+
 ## Integrated automatic activation and recovery qualification (2026-09-13)
 
 The local candidate built from 90 retained changed/new inputs at base
