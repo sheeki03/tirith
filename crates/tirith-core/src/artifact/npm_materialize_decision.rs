@@ -9,6 +9,7 @@ use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings};
 pub(in crate::artifact::npm_install) struct ArtifactDecision {
     source: MaterializationThreatSource,
     decision_digest: String,
+    verdict: crate::receipt::VerdictSummary,
 }
 impl ArtifactDecision {
     pub(in crate::artifact::npm_install) fn capture(
@@ -41,6 +42,7 @@ impl ArtifactDecision {
         Ok(Self {
             source,
             decision_digest,
+            verdict: crate::receipt::VerdictSummary::from_verdict(&verdict),
         })
     }
     pub(in crate::artifact::npm_install) fn revalidate(
@@ -51,6 +53,9 @@ impl ArtifactDecision {
     }
     pub(in crate::artifact::npm_install) fn private_commitment(&self) -> &str {
         &self.decision_digest
+    }
+    pub(in crate::artifact::npm_install) fn verdict(&self) -> &crate::receipt::VerdictSummary {
+        &self.verdict
     }
     pub(in crate::artifact::npm_install) fn publication(&self) -> (u64, u64) {
         self.source.publication()

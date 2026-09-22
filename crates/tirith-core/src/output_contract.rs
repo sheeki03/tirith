@@ -18,6 +18,15 @@ pub enum Projection {
     ArtifactReceiptCapsule,
     ArtifactReceiptNpm,
     ArtifactReceiptNpmArtifact,
+    NpmInstall,
+    NpmMaterialization,
+    NpmInstallSummary,
+    NpmMaterializationSummary,
+    NpmMaterializationRecovery,
+    NpmOperationArchive,
+    NpmOperationPackage,
+    NpmTransactionObservation,
+    NpmRecoveryObservation,
     Score,
     ScoreFactor,
     Install,
@@ -65,6 +74,14 @@ pub fn redact_projection(value: &mut Value, schema: Projection, compiled: &Compi
     });
 }
 
+/// Withhold display content when a producing route cannot capture its privacy
+/// policy. Canonical protocol fields remain usable; signed input is untouched.
+pub fn withhold_projection_content(value: &mut Value, schema: Projection) {
+    project_sensitive_strings(value, schema, &|_| {
+        "[withheld: privacy capture incomplete]".into()
+    });
+}
+
 /// Apply an audience-specific content projection through the same schema.
 /// Callers cannot use this to rewrite protocol tokens or signed representations.
 pub(crate) fn project_sensitive_strings(
@@ -103,6 +120,28 @@ pub(crate) fn project_sensitive_strings(
                     }
                     (Projection::ArtifactReceiptNpm, "artifacts") => {
                         Projection::ArtifactReceiptNpmArtifact
+                    }
+                    (Projection::NpmInstall, "summary") => Projection::NpmInstallSummary,
+                    (Projection::NpmMaterialization, "summary") => {
+                        Projection::NpmMaterializationSummary
+                    }
+                    (Projection::NpmMaterialization, "observation") => {
+                        Projection::NpmMaterializationRecovery
+                    }
+                    (Projection::NpmInstall | Projection::NpmMaterialization, "archives") => {
+                        Projection::NpmOperationArchive
+                    }
+                    (
+                        Projection::NpmInstallSummary
+                        | Projection::NpmMaterializationSummary
+                        | Projection::NpmMaterializationRecovery,
+                        "packages",
+                    ) => Projection::NpmOperationPackage,
+                    (Projection::NpmInstall, "transaction_observation") => {
+                        Projection::NpmTransactionObservation
+                    }
+                    (Projection::NpmInstall, "recovery_observation") => {
+                        Projection::NpmRecoveryObservation
                     }
                     (Projection::Score, "score_breakdown") => Projection::Score,
                     (Projection::Score, "factors") => Projection::ScoreFactor,
@@ -165,9 +204,173 @@ fn receipt_timestamp(value: &Value) -> bool {
     })
 }
 
+fn canonical_operation(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        uuid::Uuid::parse_str(text)
+            .ok()
+            .is_some_and(|id| !id.is_nil() && id.to_string() == text)
+    })
+}
+
+fn npm_install_phase(value: &Value) -> bool {
+    token(
+        value,
+        &[
+            "reviewed_intent",
+            "withdrawn",
+            "interrupted_or_running",
+            "published_verified",
+            "published_reconfirmed",
+            "transaction_result_unrecognized",
+            "qualification",
+            "signed_receipt_preflight",
+            "intent_revalidation",
+            "recovery_store",
+            "tool_closure",
+            "quarantine",
+            "staging",
+            "preparation",
+            "authorization",
+            "checkpoint",
+            "launch_capability",
+            "native_launch",
+            "supervision",
+            "native_cleanup",
+            "contained_outcome",
+            "output_verification",
+            "receipt_evidence",
+            "private_authority",
+            "private_receipt",
+            "private_completion_milestone",
+            "receipt_binding",
+            "publication_authority",
+            "publication",
+            "published_verification",
+            "committed_receipt",
+            "commit_authority",
+            "committed_completion_milestone",
+            "commit_confirmation",
+            "preparation_journal",
+        ],
+    )
+}
+
 fn protocol_field(schema: Projection, key: &str, value: &Value) -> bool {
     use Projection::*;
     match (schema, key) {
+        (NpmInstall | NpmInstallSummary | NpmRecoveryObservation, "contract") => {
+            token(value, &[crate::artifact::npm_install::CONTRACT])
+        }
+        (
+            NpmMaterialization | NpmMaterializationSummary | NpmMaterializationRecovery,
+            "contract",
+        ) => token(
+            value,
+            &[crate::artifact::npm_install::materialize::CONTRACT],
+        ),
+        (NpmInstall | NpmMaterialization | NpmRecoveryObservation, "operation")
+        | (
+            NpmInstallSummary | NpmMaterializationSummary | NpmMaterializationRecovery,
+            "operation_id",
+        ) => canonical_operation(value),
+        (NpmInstall | NpmMaterialization | NpmRecoveryObservation, "reviewed_sha256")
+        | (NpmInstallSummary | NpmMaterializationSummary, "public_plan_digest")
+        | (NpmMaterializationSummary, "inventory_digest")
+        | (NpmMaterializationRecovery, "original_public_plan_digest")
+        | (NpmOperationArchive, "sha256")
+        | (NpmOperationPackage, "compressed_sha256")
+        | (
+            NpmInstall | NpmTransactionObservation | NpmRecoveryObservation,
+            "private_receipt_id" | "committed_receipt_id",
+        )
+        | (
+            NpmRecoveryObservation,
+            "private_milestone_sha256" | "committed_milestone_sha256" | "observed_tree_sha256",
+        ) => lower_sha256(value),
+        (NpmMaterializationSummary, "artifacts") => value
+            .as_array()
+            .is_some_and(|items| items.iter().all(lower_sha256)),
+        (NpmInstall | NpmTransactionObservation, "phase") => npm_install_phase(value),
+        (NpmMaterialization, "phase") => token(
+            value,
+            &[
+                "reviewed_intent",
+                "withdrawn",
+                "interrupted_or_running",
+                "published_verified",
+                "failed_private_empty_retained",
+                "failed_private_objects_preserved",
+                "publication_uncertain_objects_preserved",
+                "published_recovered_verified",
+                "private_contents_undone_empty_root_retained",
+                "undo_incomplete_or_running",
+                "confirmation_incomplete_or_running",
+                "continue_undo_incomplete_or_running",
+                "private_contents_continued_undo_empty_root_retained",
+                "private_tree_observed_already_empty_root_retained",
+            ],
+        ),
+        (NpmInstall | NpmTransactionObservation, "execution_state") => token(
+            value,
+            &[
+                "not_started",
+                "may_have_started",
+                "started",
+                "completed",
+                "unknown",
+                "not_observed",
+                "not_observed_currently",
+                "historical_completed_run_authenticated",
+            ],
+        ),
+        (NpmInstall | NpmMaterialization, "current_code_safety")
+        | (
+            NpmInstall | NpmInstallSummary | NpmMaterializationSummary | NpmMaterializationRecovery,
+            "code_safety",
+        )
+        | (NpmInstall, "inode_continuity_across_interruption") => {
+            token(value, &["not_established"])
+        }
+        (NpmInstall, "current_tree") => token(value, &["matches_signed_committed_observation"]),
+        (NpmInstall, "backend_id") => token(value, &["landlock-seccomp"]),
+        (NpmInstallSummary, "node_version") => {
+            token(value, &[crate::artifact::npm_install::tools::NODE_VERSION])
+        }
+        (NpmInstallSummary, "npm_version") => {
+            token(value, &[crate::artifact::npm_install::tools::NPM_VERSION])
+        }
+        (NpmInstallSummary, "lifecycle_scripts") => {
+            canonical::<crate::artifact::npm_install::receipt_evidence::NpmLifecycleMode>(value)
+        }
+        (NpmInstallSummary, "dependency_graph") => {
+            canonical::<crate::artifact::npm_install::receipt_evidence::NpmDependencyGraph>(value)
+        }
+        (NpmMaterialization, "current_target_observation" | "private_journal_observation") => {
+            token(
+                value,
+                &[
+                    "present_directory_unverified_preserved",
+                    "present_non_directory_preserved",
+                    "absent",
+                    "unavailable_preserved",
+                ],
+            )
+        }
+        (NpmMaterializationRecovery, "action") => token(
+            value,
+            &["confirm_published", "undo_private", "continue_undo_private"],
+        ),
+        (NpmMaterializationRecovery, "outcome") => token(
+            value,
+            &[
+                "captured_current_inventory",
+                "confirmed_current_public_tree",
+                "observed_private_tree_already_empty",
+                "removed_exact_remaining_private_contents",
+                "removed_exact_private_contents",
+            ],
+        ),
+        (NpmRecoveryObservation, "at") => receipt_timestamp(value),
         (Verdict, "action" | "approval_fallback")
         | (Run | InstallUrl | CommandsError, "action") => {
             canonical::<crate::verdict::Action>(value)

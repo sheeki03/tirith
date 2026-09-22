@@ -816,6 +816,15 @@ impl EnvironmentCheckpoint {
         }
     }
 
+    /// Suppress automatic private rollback when child quiescence is unproven.
+    /// This preserves owned objects and does not assert any recovery success.
+    pub(crate) fn preserve_for_recovery(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.state == CheckpointState::Private {
+            self.state = CheckpointState::Retained;
+        }
+    }
+
     /// Atomically publish the privately verified target without claiming that the
     /// mandatory linked committed receipt has been recorded yet.
     pub fn publish_verified(&mut self) -> std::io::Result<()> {
@@ -1073,8 +1082,11 @@ impl EnvironmentCheckpoint {
 
 impl Drop for EnvironmentCheckpoint {
     fn drop(&mut self) {
+        // An unexpected unwind can interrupt supervision before child quiescence
+        // is known. Preserve the durable journal and private tree in that case;
+        // unwinding is never evidence that recursive cleanup is safe.
         #[cfg(target_os = "linux")]
-        if self.state == CheckpointState::Private {
+        if self.state == CheckpointState::Private && !std::thread::panicking() {
             let _ = self.rollback();
         }
     }
@@ -1591,6 +1603,50 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uncertain_child_cleanup_preserves_owned_tree_and_journal_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let binding = InstallTargetBinding::bind(&target).unwrap();
+        let mut checkpoint = EnvironmentCheckpoint::begin(&binding).unwrap();
+        let private = checkpoint.install_path().to_owned();
+        let journal = root.path().join(checkpoint_journal_name(&target));
+        std::fs::write(private.join("unfinished"), b"preserve").unwrap();
+        checkpoint.preserve_for_recovery();
+        assert_eq!(checkpoint.state(), CheckpointState::Retained);
+        drop(checkpoint);
+        assert_eq!(
+            std::fs::read(private.join("unfinished")).unwrap(),
+            b"preserve"
+        );
+        assert!(journal.is_dir());
+        assert!(!target.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unexpected_unwind_preserves_private_bytes_and_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let journal = root.path().join(checkpoint_journal_name(&target));
+        let result = std::panic::catch_unwind(|| {
+            let binding = InstallTargetBinding::bind(&target).unwrap();
+            let checkpoint = EnvironmentCheckpoint::begin(&binding).unwrap();
+            std::fs::write(checkpoint.install_path().join("unfinished"), b"preserve").unwrap();
+            panic!("unexpected supervisor unwind; no child cleanup established");
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(journal.join(CHECKPOINT_PENDING_TARGET).join("unfinished")).unwrap(),
+            b"preserve"
+        );
+        assert!(journal.join("manifest.json").is_file());
+        assert!(!target.exists());
+        let binding = InstallTargetBinding::bind(&target).unwrap();
+        assert!(EnvironmentCheckpoint::begin(&binding).is_err());
+    }
+
     /// A clean Allow verdict for receipt tests.
     fn allow_verdict() -> Verdict {
         Verdict {
@@ -1970,5 +2026,133 @@ mod tests {
             !displaced.join(CHECKPOINT_PENDING_TARGET).exists(),
             "only the exact held private target was removed"
         );
+    }
+    /// An actual exited process loses every checkpoint capability. Inert test
+    /// bytes only: this test does not manufacture npm execution/completion proof.
+    #[test]
+    #[ignore = "invoked only by bounded parent interruption tests"]
+    fn checkpoint_interruption_child_process() {
+        let root = std::env::var_os("TIRITH_CHECKPOINT_INTERRUPTION_ROOT")
+            .expect("isolated child fixture root");
+        let phase = std::env::var("TIRITH_CHECKPOINT_INTERRUPTION_PHASE").unwrap();
+        assert!(matches!(phase.as_str(), "private" | "published"));
+        let target = PathBuf::from(root).join("target");
+        let binding = InstallTargetBinding::bind(&target).unwrap();
+        let mut checkpoint = EnvironmentCheckpoint::begin(&binding).unwrap();
+        let payload = checkpoint.install_path().join("inert-test-bytes");
+        std::fs::write(&payload, b"owned inert fixture; not an executed package").unwrap();
+        File::open(&payload).unwrap().sync_all().unwrap();
+        if phase == "published" {
+            checkpoint.publish_verified().unwrap();
+        }
+        // Deliberately bypass Drop, matching interruption after durable state.
+        // No subprocesses were created by this helper, so exit reaps no children.
+        std::process::exit(23);
+    }
+
+    fn interrupted_checkpoint(root: &Path, phase: &str) {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "checkpoint_interruption_child_process",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TIRITH_CHECKPOINT_INTERRUPTION_ROOT", root)
+            .env("TIRITH_CHECKPOINT_INTERRUPTION_PHASE", phase)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(
+                    status.code(),
+                    Some(23),
+                    "fixture must reach its deliberate no-Drop exit"
+                );
+                return;
+            }
+            if Instant::now() >= deadline {
+                // Only this directly spawned, still-owned helper is signaled;
+                // it creates no child processes or external services.
+                let _ = child.kill();
+                child.wait().unwrap();
+                panic!("bounded checkpoint interruption helper timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn exited_private_checkpoint_is_preserved_even_after_its_advisory_lock_is_available() {
+        let root = tempfile::tempdir().unwrap();
+        interrupted_checkpoint(root.path(), "private");
+        let target = root.path().join("target");
+        let journal = root.path().join(checkpoint_journal_name(&target));
+        let pending = journal.join(CHECKPOINT_PENDING_TARGET);
+        let payload = pending.join("inert-test-bytes");
+        let original = std::fs::read(&payload).unwrap();
+        let manifest = std::fs::read(journal.join("manifest.json")).unwrap();
+        let lock = File::open(journal.join("lock")).unwrap();
+        lock.try_lock_exclusive().unwrap();
+        fs2::FileExt::unlock(&lock).unwrap();
+        let binding = InstallTargetBinding::bind(&target).unwrap();
+        assert_eq!(
+            EnvironmentCheckpoint::begin(&binding).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&payload).unwrap(), original);
+        assert_eq!(
+            std::fs::read(journal.join("manifest.json")).unwrap(),
+            manifest
+        );
+
+        // A fresh path occupant is never selected for cleanup using stale data.
+        let displaced = root.path().join("preserved-private-root");
+        std::fs::rename(&pending, &displaced).unwrap();
+        std::fs::create_dir(&pending).unwrap();
+        std::fs::write(pending.join("peer-owned"), b"must survive").unwrap();
+        assert!(EnvironmentCheckpoint::begin(&binding).is_err());
+        assert_eq!(
+            std::fs::read(pending.join("peer-owned")).unwrap(),
+            b"must survive"
+        );
+        assert_eq!(
+            std::fs::read(displaced.join("inert-test-bytes")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn exited_published_unconfirmed_checkpoint_never_reopens_public_target_for_undo() {
+        let root = tempfile::tempdir().unwrap();
+        interrupted_checkpoint(root.path(), "published");
+        let target = root.path().join("target");
+        let journal = root.path().join(checkpoint_journal_name(&target));
+        let payload = target.join("inert-test-bytes");
+        let original = std::fs::read(&payload).unwrap();
+        let manifest = std::fs::read(journal.join("manifest.json")).unwrap();
+        assert!(!journal.join(CHECKPOINT_PENDING_TARGET).exists());
+        assert_eq!(
+            InstallTargetBinding::bind(&target).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&payload).unwrap(), original);
+        assert_eq!(
+            std::fs::read(journal.join("manifest.json")).unwrap(),
+            manifest
+        );
+        std::fs::write(target.join("unrelated-new-file"), b"public addition").unwrap();
+        assert!(InstallTargetBinding::bind(&target).is_err());
+        assert_eq!(
+            std::fs::read(target.join("unrelated-new-file")).unwrap(),
+            b"public addition"
+        );
+        assert_eq!(std::fs::read(&payload).unwrap(), original);
     }
 }

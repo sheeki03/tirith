@@ -45,11 +45,13 @@ def contract(root: Path, version: str) -> dict:
     team = source_constant(root, "crates/tirith-core/src/policy_team.rs", "SCHEMA_VERSION")
     semantics = source_constant(root, "crates/tirith-core/src/policy_team.rs", "POLICY_SEMANTICS_VERSION")
     intent = source_constant(root, "crates/tirith/src/cli/npm_materialize.rs", "INTENT_SCHEMA_VERSION")
+    install_intent = source_constant(root, "crates/tirith/src/cli/npm_install.rs", "INTENT_SCHEMA_VERSION")
+    completion = source_constant(root, "crates/tirith/src/cli/npm_install_recovery.rs", "RECOVERY_MILESTONE_SCHEMA_VERSION")
     checkpoint = source_constant(root, "crates/tirith/src/cli/npm_materialize.rs", "CHECKPOINT_SCHEMA_VERSION")
     inventory = source_constant(root, "crates/tirith-core/src/artifact/npm_materialize.rs", "RECOVERY_INVENTORY_VERSION")
     receipt = source_constant(root, "crates/tirith-core/src/execution_state/shell_receipt.rs", "RECEIPT_SCHEMA_VERSION")
     acknowledged_receipt = source_constant(root, "crates/tirith-core/src/execution_state/shell_receipt.rs", "ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION")
-    if (team, semantics, intent, checkpoint, inventory, receipt, acknowledged_receipt) != (1, 1, 1, 1, 1, 3, 4):
+    if (team, semantics, intent, install_intent, completion, checkpoint, inventory, receipt, acknowledged_receipt) != (1, 1, 2, 1, 1, 1, 1, 3, 4):
         raise ValueError("persisted format implementation changed; review the compatibility contract before release")
     # A changed format needs a reviewed reader/migration contract, not an
     # automatically widened claim that every intervening version is supported.
@@ -71,17 +73,19 @@ def contract(root: Path, version: str) -> dict:
             "team_rollout": [team],
             "team_policy_document": [team],
             "team_policy_semantics": [semantics],
-            "npm_materialization_intent": [intent],
+            "npm_materialization_intent": [1, 2],
+            "npm_install_intent": [install_intent],
+            "npm_install_completion_milestone": [completion],
             "npm_materialization_checkpoint": [checkpoint],
             "npm_materialization_inventory": [inventory],
-            "npm_materialization_recovery_rule": "linux_only_fresh_policy_and_exact_current_ownership_required",
+            "npm_materialization_recovery_rule": "linux_only_schema2_bound_review_fresh_policy_and_exact_current_ownership_required",
         },
         "operation_journal_version": journal,
         "operation_journal_client_rule": "exact_client_version_required",
         "control_service_protocol": protocol,
         "control_service_reuse_rule": "exact_protocol_version_and_binary_sha256_required",
         "configuration_update_rule": "preserve_existing_bytes",
-        "features": ["effective_policy_snapshot_v1", "scoped_trust_grants_v1", "protection_profiles_v1", "owned_change_journals_v1", "team_policy_runtime_v1", "team_policy_recovery_v1", "npm_materialization_recovery_v1"],
+        "features": ["effective_policy_snapshot_v1", "scoped_trust_grants_v1", "protection_profiles_v1", "owned_change_journals_v1", "team_policy_runtime_v1", "team_policy_recovery_v1", "npm_materialization_recovery_v1", "npm_materialization_private_review_v2", "npm_install_intent_v1", "npm_complete_only_reconfirmation_v1"],
     }
 
 

@@ -271,6 +271,42 @@ pub(super) fn build_filters() -> Result<(BpfProgram, BpfProgram), String> {
     Ok((clone_fallback, default_deny))
 }
 
+/// The reviewed runtime policy with a narrower initial executable capability.
+/// Node's descriptor is CLOEXEC; pathname exec and memfd_create are denied.
+/// This numeric FD check is not a stateful one-exec guarantee: descriptor reuse
+/// remains possible. Landlock grants Execute only to the pinned ELF interpreter
+/// and never to writable directories. Ordinary capsules are unchanged.
+fn npm_filter(node_fd: i32) -> Result<BpfProgram, String> {
+    if !(3..256).contains(&node_fd) {
+        return Err("invalid npm Node descriptor".into());
+    }
+    let mut rules = policy_rules()?;
+    rules.remove(&libc::SYS_execve);
+    rules.insert(
+        libc::SYS_execveat,
+        vec![rule(vec![
+            eq(0, node_fd as u64)?,
+            eq(4, libc::AT_EMPTY_PATH as u64)?,
+        ])?],
+    );
+    SeccompFilter::new(
+        rules,
+        SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Allow,
+        TargetArch::aarch64,
+    )
+    .map_err(|e| e.to_string())?
+    .try_into()
+    .map_err(|e: seccompiler::BackendError| e.to_string())
+}
+
+pub(super) fn apply_npm(node_fd: i32) -> Result<(), String> {
+    let (fallback, _) = build_filters()?;
+    let filter = npm_filter(node_fd)?;
+    seccompiler::apply_filter(&fallback).map_err(|e| e.to_string())?;
+    seccompiler::apply_filter(&filter).map_err(|e| e.to_string())
+}
+
 /// Called only in the single-threaded Linux launcher after Landlock and NNP.
 pub(super) fn apply() -> Result<bool, String> {
     let (clone_fallback, default_deny) = build_filters()?;
@@ -324,6 +360,64 @@ mod tests {
             }
         }
         panic!("BPF did not terminate within its instruction bound")
+    }
+
+    #[test]
+    fn npm_filter_restricts_initial_exec_without_expanding_ambient_authority() {
+        const ARM: u32 = 0xc00000b7;
+        const ALLOW: u32 = 0x7fff0000;
+        const DENY: u32 = 0x50000 | libc::EPERM as u32;
+        let filter = npm_filter(19).unwrap();
+        let decide = |call, args| evaluate(&filter, ARM, call, args);
+        assert_eq!(
+            decide(
+                libc::SYS_execveat,
+                [19, 1, 2, 3, libc::AT_EMPTY_PATH as u64, 0]
+            ),
+            ALLOW
+        );
+        assert_eq!(
+            decide(
+                libc::SYS_execveat,
+                [20, 1, 2, 3, libc::AT_EMPTY_PATH as u64, 0]
+            ),
+            DENY
+        );
+        assert_eq!(decide(libc::SYS_execveat, [19, 1, 2, 3, 0, 0]), DENY);
+        for call in [
+            libc::SYS_execve,
+            libc::SYS_memfd_create,
+            libc::SYS_socket,
+            libc::SYS_fchmod,
+            libc::SYS_setpgid,
+            libc::SYS_setsid,
+            libc::SYS_process_vm_readv,
+        ] {
+            assert_eq!(decide(call, [0; 6]), DENY);
+        }
+        assert_eq!(
+            decide(
+                libc::SYS_prctl,
+                [libc::PR_SET_DUMPABLE as u64, 1, 0, 0, 0, 0]
+            ),
+            DENY
+        );
+        assert_eq!(
+            decide(
+                libc::SYS_prctl,
+                [
+                    libc::PR_SET_PDEATHSIG as u64,
+                    libc::SIGKILL as u64,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            ALLOW
+        );
+        assert!(npm_filter(2).is_err());
+        assert!(npm_filter(256).is_err());
     }
 
     #[test]

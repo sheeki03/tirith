@@ -150,7 +150,22 @@ impl Drop for PolicyDiagnosticCapture {
     fn drop(&mut self) {
         if self.active {
             POLICY_DIAGNOSTIC_CAPTURES.with(|captures| {
-                captures.borrow_mut().pop();
+                let mut captures = captures.borrow_mut();
+                if let Some(patterns) = captures
+                    .pop()
+                    .and_then(|capture| capture.frozen_dlp_custom_patterns)
+                {
+                    if let Some(parent) = captures.last_mut() {
+                        let frozen = parent
+                            .frozen_dlp_custom_patterns
+                            .get_or_insert_with(Vec::new);
+                        for pattern in patterns {
+                            if !frozen.contains(&pattern) {
+                                frozen.push(pattern);
+                            }
+                        }
+                    }
+                }
             });
             self.active = false;
         }
@@ -4682,6 +4697,37 @@ mod tests {
         assert!(!diagnostics[0].contains(first));
         assert!(!diagnostics[0].contains(second));
         assert_eq!(diagnostics[0].matches("[REDACTED:custom]").count(), 2);
+    }
+
+    #[test]
+    fn nested_silent_capture_retains_dlp_without_forwarding_diagnostics() {
+        let capture = PolicyDiagnosticCapture::start();
+        freeze_captured_policy_dlp_patterns(&["outer-secret".into()]);
+        policy_diagnostic!("outer diagnostic");
+        {
+            let _bounded = BoundedRuntimePolicyInputs::enter();
+            freeze_captured_policy_dlp_patterns(&["transaction-secret".into()]);
+            {
+                let _nested = PolicyDiagnosticCapture::start();
+                freeze_captured_policy_dlp_patterns(&[
+                    "deep-secret".into(),
+                    "transaction-secret".into(),
+                ]);
+                policy_diagnostic!("suppressed secret diagnostic");
+            }
+            policy_diagnostic!("another suppressed diagnostic");
+        }
+        assert_eq!(
+            captured_policy_dlp_patterns_or(&[]),
+            vec!["outer-secret", "transaction-secret", "deep-secret"]
+        );
+        assert_eq!(capture.drain(), vec!["outer diagnostic"]);
+        assert!(capture.drain().is_empty());
+        drop(capture);
+        assert_eq!(
+            captured_policy_dlp_patterns_or(&["fallback".into()]),
+            vec!["fallback"]
+        );
     }
 
     #[test]

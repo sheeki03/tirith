@@ -39,6 +39,9 @@ mod execution;
 mod metadata;
 #[path = "npm_install_receipt.rs"]
 pub mod receipt_evidence;
+#[cfg(target_os = "linux")]
+#[path = "npm_install_recovery.rs"]
+pub mod recovery;
 #[path = "npm_install_runtime_pack.rs"]
 pub mod runtime_pack;
 #[path = "npm_install_tools.rs"]
@@ -90,6 +93,46 @@ pub enum NpmInstallRefusal {
     ThreatDataChanged,
     ThreatDataStale,
 }
+
+impl std::fmt::Display for NpmInstallRefusal {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InputUnavailable => "an archive is unavailable or is not a bounded regular file",
+            Self::InputChanged => "an archive changed after inspection; review its current bytes",
+            Self::ArchiveUnsupported => "an archive is outside the supported npm archive contract",
+            Self::ManifestUnsupported => "package metadata is outside the supported leaf contract",
+            Self::DependencyGraphUnsupported => "this contract accepts only local packages without install-time dependencies",
+            Self::EmbeddedDependencies => "bundled dependencies are outside the supported leaf contract",
+            Self::EmbeddedResolutionMetadata => "embedded resolution metadata is not supported",
+            Self::PackageIdentityUnsupported => "a package name or version is not supported",
+            Self::ResourceLimit => "the operation exceeds an archive, tree, or work limit",
+            Self::DuplicatePackage => "more than one selected archive names the same package",
+            Self::DestinationUnavailable => "installation requires a new dedicated destination with an accessible parent",
+            Self::DestinationChanged => "the destination or its parent changed after review",
+            Self::PolicyChanged => "policy inputs changed; the previous review cannot authorize this operation",
+            Self::AuthorizationRefused => "fresh task authorization does not permit this exact operation",
+            Self::QuarantineUnavailable => "private artifact staging is unavailable",
+            Self::RecoveryRequired => "existing operation state requires recovery and must not be replayed",
+            Self::JournalConflict => "the operation journal conflicts with the reviewed operation",
+            Self::InvalidOperationId => "the operation identifier is not a canonical UUID",
+            Self::UnexpectedInstalledEntry => "the installed tree contains an unexpected entry, link, or file type",
+            Self::InstalledContentChanged => "the installed tree differs from its verified bytes or metadata",
+            Self::NativeExecutionUnqualified => "native npm execution has not passed qualification and remains disabled",
+            Self::ToolClosureUnsupported => "the required pinned Node, npm, and runtime files are unavailable on this host",
+            Self::ToolClosureChanged => "a retained Node, npm, or runtime file changed",
+            Self::ExecutionLayoutUnsupported => "the requested execution layout is outside the supported contract",
+            Self::ExecutionStateConflict => "execution state conflicts with this operation; retained objects require inspection",
+            Self::AnalysisIncomplete => "artifact analysis is incomplete and cannot authorize installation",
+            Self::ArtifactPolicyRefused => "current policy does not allow the inspected artifacts",
+            Self::ThreatDataUnavailable => "current production-signed ThreatDB v2 with artifact-hash coverage is required; available threat data cannot be used",
+            Self::ThreatDataChanged => "the retained threat-data generation changed; review again with current data",
+            Self::ThreatDataStale => "the signed threat-data generation is too old to authorize installation",
+        };
+        out.write_str(message)
+    }
+}
+
+impl std::error::Error for NpmInstallRefusal {}
 
 type Result<T> = std::result::Result<T, NpmInstallRefusal>;
 
@@ -683,6 +726,11 @@ impl NpmInstallPlan {
             destination,
             decision,
         })
+    }
+
+    /// The actual finalized static decision, including any policy-allowed findings.
+    pub fn verdict_summary(&self) -> &crate::receipt::VerdictSummary {
+        self.decision.verdict()
     }
 
     pub fn summary(&self) -> &NpmInstallSummary {

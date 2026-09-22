@@ -1,5 +1,109 @@
 # Implementation verification
 
+## September 22: passing CI and integrated npm review route
+
+Commit `87c0fdeecdbaf4c1bc3df6533b83b947e7e88819` passes
+[CI 35587858181](https://github.com/sheeki03/tirith/actions/runs/35587858181),
+including Linux, macOS, Windows, Rust 1.83, Clippy and Bash 5.3. This resolves
+the preceding receipt-reader fixture and oversized Linux test-image failures.
+The same commit passes release build checks (35587858552), native ARM containment
+(35587858374), fuzzing (35587858283) and benchmarks (35587858180). All six release
+target builds and npm, Debian and RPM package checks pass. Publication jobs are
+skipped: this is PR validation, not a published release or final cycle evidence.
+
+The subsequent working tree registers the separate `pkg install-npm` review,
+apply, status, undo and recovery command group, descriptor-based launch adapter
+and transaction coordinator. Execution remains unqualified and disabled. Local
+checks pass 45 core npm tests, seven release compatibility tests, eleven stored
+format inventory tests and thirteen npm-selected CLI tests. The latter selection
+includes command grammar and existing package metadata tests; it does not run
+the Linux-only intent tests on macOS.
+
+The auditable bootstrap sources regenerate the exact previously reviewed
+`41183108651b825e4712922f9056d1caf5766814f992167ac36fd200d9daa4d7`
+bundle. Seven generator controls, 51 binding/configuration/runtime-pack controls,
+37 descriptor parser controls and 35 synthetic resolver controls pass. These are
+source controls, not installation or native containment evidence.
+
+A separate native ARM Linux kernel probe passes all three execute-only inode
+cases. Its shared-inode negative control becomes readable when a same-user peer
+changes the parent's inode permissions. The corrected child-private inode stays
+execute-only and nondumpable; executable/memory reads are denied both with and
+without TRACEEXEC/detach. Owned process and container cleanup and input posthashes
+pass. Report digest:
+`ff3f92e8655f86bbf7fc1a05df3245359d8908ee564fdd311a2ad2d1cc90e4c9`.
+This harmless ELF probe does not execute Tirith or npm.
+
+The integrated v7 ARM Cargo check fails because the captured source omits two
+root test fixtures required by `include_bytes!` and `include_str!`. Its source
+manifest digest is
+`5d12b798eaabb0ee39aa264ed104674429656ebaab18b77ae2294fbc0d61366d`.
+All owned command cleanup and container removal checks pass, and captured inputs
+remain unchanged. The failed check is retained; it is not a successful typecheck
+or native execution result. The corrected v8 capture reaches actual compiler
+errors in the descriptor adapter and coordinator; those errors are corrected.
+The subsequent v9 capture reaches only new fixture compilation errors, also
+corrected. The v10 check then catches a test-only call to a private core method.
+The fixture now recaptures through the public preparation API and compares the
+whole private plan digest without widening core visibility. No failed attempt
+is a passing integrated check. Their owned
+commands, container removal and input posthash checks pass.
+
+The working tree now includes complete-only signed recovery milestones. A native
+completion witness is required to issue the private milestone; publication adds
+a linked committed milestone. Recovery freshly checks signed records, receipt
+contents, policy, artifacts, threat data, task authority and the whole current
+tree. Private or ambiguous interrupted state is preserved without replay or
+recursive deletion. Fresh macOS checks pass seven compatibility and twelve store
+inventory cases; nine publisher and seventeen source-capture controls pass.
+These do not run Linux-only recovery or checkpoint-interruption tests.
+
+The retained public ThreatDB artifact is production-signed but format 1, digest
+`9e0e55905f3898e95805e35f44ee0287adf749a25e38805f2c3c36c06c9577f1`.
+It cannot meet installation's format-2 artifact-hash requirement. The ignored
+native fixtures use the real parser/signature admission path and cannot replace
+it with a test signing key. Positive integrated execution remains unqualified.
+
+The latest review binds every private npm intent field except the recursive
+review digest, with a private random nonce that is excluded from output. Local
+materialization advances its review envelope to schema 2. Schema 1 remains
+readable, but apply, undo, recover and continued undo refuse before writes.
+Checkpoint and materialization-summary schemas remain unchanged. The publisher
+passes ten compatibility cases and the capture helper passes seventeen controls.
+Fresh independent source review found no further review-binding, migration or
+output-projection defects. A separate native authority review found no further
+defects in completion, publication ordering, signed recovery or the Linux
+architecture gates. These are source reviews; Linux mutation regressions and
+the full current workspace suite are still being run. The current macOS
+release-compatibility selection passes all seven cases.
+
+### Native resource detector qualification
+
+All six native control/growth pairs qualify the reviewed byte detectors on
+historical product source `415565d307c39e7000255955150185f3287581a6`.
+Controller `d766f9015a7a8be5e5f3f1b45c56422b514f31b1` uses the reviewed
+Apple M1 (Virtual), macOS 15 ARM cohort. Each pair runs on one runner boot.
+Every control passes all ceilings; every growth exceeds exactly its selected
+ceiling. Artifact ZIP hashes, all 246 extracted files and the actual raw-pair
+evaluations were independently rechecked. No automatic retry was used.
+
+| Detector | Run | Control bytes | Growth bytes | Ceiling bytes |
+| --- | --- | ---: | ---: | ---: |
+| Clean first request | [35692411130](https://github.com/sheeki03/tirith/actions/runs/35692411130) | 48,307,398 | 81,861,830 | 67,108,864 |
+| Clean subsequent requests | [35692414572](https://github.com/sheeki03/tirith/actions/runs/35692414572) | 120,397 | 153,165 | 131,072 |
+| URL first request | [35692418226](https://github.com/sheeki03/tirith/actions/runs/35692418226) | 72,060,260 | 105,614,692 | 100,663,296 |
+| URL subsequent requests | [35692422222](https://github.com/sheeki03/tirith/actions/runs/35692422222) | 1,670,663 | 2,194,951 | 2,097,152 |
+| History requests | [35692425496](https://github.com/sheeki03/tirith/actions/runs/35692425496) | 8,692,440 | 12,886,744 | 12,582,912 |
+| Ordinary check RSS | [35692430194](https://github.com/sheeki03/tirith/actions/runs/35692430194) | 43,630,592 | 61,538,304 | 50,331,648 |
+
+All five allocation experiments show their exact injected byte dose in every
+selected sample. The RSS paired median increase is 17,285,120 bytes; all one
+hundred growth measurements exceed the RSS ceiling. Combined retained report
+SHA-256: `0e76a8d573f7cd3f323f110e82f7216052fe9f228326aec354c97acee12055af`.
+This result does not qualify the later product source or enable CI budgets.
+Three final-source baselines, final detector/source compatibility review and
+broader host measurements remain. Earlier CPU-mismatch refusals stay retained.
+
 
 ## September 21 follow-up: test failures and npm descriptor compatibility
 

@@ -554,6 +554,120 @@ fn apply_containment_inner(
     })
 }
 
+/// Closed ARM64 npm launch. All filesystem capabilities were retained and
+/// validated by the single-threaded hidden launcher. No containing directory is
+/// granted for a runtime file, and no writable root grants executable access.
+/// This entry does not admit the generic private-input or Python route.
+#[cfg(target_arch = "aarch64")]
+pub fn apply_npm_descriptor_containment(
+    spec: &CapsuleSpec,
+    temp_home: &Path,
+    node_fd: i32,
+    read_files: &[(i32, bool)],
+    write_directories: &[i32],
+) -> Result<CapsuleCoverage, ContainError> {
+    use landlock::{
+        Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus, ABI,
+    };
+    use std::os::fd::BorrowedFd;
+    if !(3..256).contains(&node_fd)
+        || read_files.len() != 9
+        || read_files
+            .iter()
+            .filter(|(_, executable)| *executable)
+            .count()
+            != 1
+        || write_directories.len() != 2
+    {
+        return Err(ContainError::Unsupported(
+            "invalid closed npm capability set".into(),
+        ));
+    }
+    let mut used = std::collections::BTreeSet::new();
+    for (fd, directory) in read_files
+        .iter()
+        .map(|(fd, _)| (*fd, false))
+        .chain(write_directories.iter().map(|fd| (*fd, true)))
+    {
+        if !(3..256).contains(&fd)
+            || fd == node_fd
+            || !used.insert(fd)
+            || !spec.handles.extra_unix_fds.contains(&fd)
+        {
+            return Err(ContainError::Unsupported(
+                "overlapping npm capability descriptor".into(),
+            ));
+        }
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0
+            || (stat.st_mode & libc::S_IFMT)
+                != if directory {
+                    libc::S_IFDIR
+                } else {
+                    libc::S_IFREG
+                }
+        {
+            return Err(ContainError::Unsupported(
+                "npm capability type changed".into(),
+            ));
+        }
+    }
+    close_unexpected_fds(&spec.handles)?;
+    apply_rlimits(&spec.resources)?;
+    set_no_new_privs()?;
+    let all = AccessFs::from_all(ABI::V1);
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(all)
+        .map_err(|e| ContainError::Landlock(e.to_string()))?
+        .create()
+        .map_err(|e| ContainError::Landlock(e.to_string()))?;
+    for (fd, executable) in read_files {
+        // SAFETY: caller retains and validates every descriptor through apply.
+        let file = unsafe { BorrowedFd::borrow_raw(*fd) };
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(
+                file,
+                if *executable {
+                    AccessFs::ReadFile | AccessFs::Execute
+                } else {
+                    AccessFs::ReadFile.into()
+                },
+            ))
+            .map_err(|e| ContainError::Landlock(format!("exact npm runtime file: {e}")))?;
+    }
+    let writable = all & !AccessFs::Execute;
+    for fd in write_directories {
+        let directory = unsafe { BorrowedFd::borrow_raw(*fd) };
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(directory, writable))
+            .map_err(|e| ContainError::Landlock(format!("held npm directory: {e}")))?;
+    }
+    let status = ruleset
+        .restrict_self()
+        .map_err(|e| ContainError::Landlock(e.to_string()))?;
+    if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
+        return Err(ContainError::Unsupported(
+            "closed npm requires full Landlock enforcement".into(),
+        ));
+    }
+    aarch64_seccomp::apply_npm(node_fd).map_err(ContainError::Seccomp)?;
+    apply_env(&spec.environment, Some(temp_home));
+    Ok(CapsuleCoverage {
+        fs_read_enforced: true,
+        fs_write_enforced: true,
+        exec_limited: true,
+        network_raw_denied: true,
+        domain_proxy_enforced: false,
+        resource_limits_enforced: spec
+            .resources
+            .all_requested_enforced_by(RESOURCE_LIMIT_SUPPORT),
+        env_isolated: true,
+        handles_isolated: true,
+    })
+}
+
 /// Apply the rlimit-able dimensions of [`ResourceLimits`] via `setrlimit`. Each
 /// populated dimension is set to a soft==hard limit. `wall_clock_seconds` and
 /// `max_output_bytes` are NOT rlimits (the launcher/broker enforce those), so they

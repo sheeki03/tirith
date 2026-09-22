@@ -62,7 +62,9 @@ before another publication.
 | Local control service | Protocol 1, exact binary version and SHA-256 | Reuse requires the full identity; an update must quiesce writes and reconcile pending jobs. |
 | Team connection, enrollment, report and rollout records | Each schema 1; team policy semantics 1 | Candidates must retain team Runtime enforcement and explicit report/rollout recovery. A missing reader or capability refuses update and rollback, even if the old binary has the same package version. |
 | Shell execution receipts | Schema 3 active/unacknowledged records; schema 4 acknowledged terminal records | A hook acknowledges only an observed terminal result. Schema 4 is non-authorizing and eligible for the next locked cleanup; schema 3 recovery windows are preserved. Schema 1/2 are authenticated retirement inputs only. Older readers reject schema 4; missing reader declarations refuse update/rollback. Hook capability schema 3 is unchanged. Explicit ACK may end only its own exact clean shell-boundary record's retention at the actual acknowledgment time, advancing the ledger generation without upgrading its unresolved evidence. The observation remains available to normal reads until existing pressure or stale-session cleanup reclaims it; warnings, escalation, typed events and later transitions keep their existing retention. |
-| Local materialization intent/events, target checkpoints and recovery inventory | Each schema 1 | Linux recovery continues to require fresh policy, task authorization and exact current ownership. Format compatibility never authorizes a replay or removes retained records. |
+| Local materialization intent/events | Schemas 1 and 2; new records use schema 2 | Schema 2 binds the complete private intent and a private random nonce to the reviewed commitment. Schema 1 remains read-only history: apply, undo, recover and continue-undo refuse and preserve objects. Replan unstarted work with a new operation. Older schema 1 writers cannot read or safely mutate schema 2 records, and lack the required compatibility capability. |
+| Materialization target checkpoints and recovery inventory | Each schema 1 | Schema 2 intent recovery continues to require fresh policy, task authorization and exact current ownership. Format compatibility never authorizes a replay or removes retained records. |
+| Closed npm installation intent/events | Schema 1 in the separate `npm-install-intents` store | The reader describes reviewed intent and historical started/finished/withdrawn records. It does not qualify native execution or recovery. Missing readers refuse update/rollback, even when the directory is currently absent. Started objects remain preserved while recovery is unavailable. |
 
 The closed `persisted_formats` contract names these readers separately. A missing
 contract in older signed metadata or rollback evidence means unsupported; it is
@@ -70,8 +72,8 @@ not filled from the running client's capabilities. Publication checks the actual
 writer/reader constants and refuses an unreviewed format change.
 
 Inventory reads only fixed private team files, the bounded team rollout directory,
-the bounded materialization intent/event directory, and shell receipt declarations
-in the private session receipt directory. Known receipt locks and hook capability
+the separate bounded materialization and npm installation intent/event directories,
+and shell receipt declarations in the private session receipt directory. Known receipt locks and hook capability
 filenames are skipped; this inventory does not authenticate or declare compatibility
 for their payloads. The same captured bytes
 also expose document schemas and policy semantics inside enrollment caches and
@@ -80,9 +82,14 @@ It uses the existing
 guarded native readers, caps directory entries and total bytes, and reports
 unknown names, partial scans, changed inventories and unreadable records as
 incompatible. These observations expose no credentials, stored contents or paths.
-Target-local materialization checkpoints are **not discovered** by this inventory;
+Target-local materialization and npm installation checkpoints are **not discovered**
+by this inventory. Npm install reader compatibility does not imply successful or
+available target recovery. For materialization,
 the required recovery contract preserves the reader capability, and an explicit
-recovery must recapture its exact target and journals. This is not a claim that
+recovery for a schema 2 intent must recapture its exact target and journals. Legacy
+status identifies its stored schema and incomplete review binding; it never
+rewrites the intent, upgrades its authority, or reconstructs deletion permission.
+This is not a claim that
 all pending operations have been discovered, reconciled, or successfully recovered.
 
 Local format observations report only the surface, declared version, and
@@ -131,3 +138,29 @@ The optional native package-approval capability is separate from ordinary
 command checks and shell protection. Package metadata does not install or
 suggest sudo. Explicit approval issuance requires a supported host, protected
 helper, trusted sudo, and fresh interactive administrator confirmation.
+
+
+Closed npm installations retain a separate, bounded `npm-install-recovery` store
+with immutable signed private and committed completion milestones. The reader
+contract `npm_install_completion_milestone: [1]` and the feature
+`npm_complete_only_reconfirmation_v1` cover only reconfirmation of an already
+published tree. They do not claim private undo, native execution qualification,
+or replay of an interrupted package-manager run. Missing, unsigned, private-only,
+changed, and pre-quiescence state remains preserved.
+
+A private milestone requires a current opaque native-completion proof, a complete
+verified output tree, and the opaque signed private receipt. The committed
+milestone links that exact signed private envelope and the recorded committed
+receipt. Detached signatures use the configured audit key and are checked against
+the installation's trusted verification key, never a key included in saved state.
+The signed receipt content hashes and exact private-to-committed linkage are
+checked again during recovery; historical audit-log retention is not required to
+verify this independent signed milestone chain.
+
+Reconfirmation captures current archive, threat-data, policy, task, parent, and
+whole-tree observations, then records only fresh history. Every path, file byte,
+entry kind, mode, ownership, identity, and generation is included in the bounded
+walk. Root metadata is signed separately before and after publication because a
+rename can change it. Equality after interruption is a current observation, not
+proof of uninterrupted inode ownership or future immutability. No package code
+is replayed and no target entry is modified or removed by reconfirmation.

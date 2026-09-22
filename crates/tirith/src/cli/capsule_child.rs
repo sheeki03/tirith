@@ -43,6 +43,8 @@ use std::ffi::{OsStr, OsString};
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 mod aarch64_trace;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod npm_descriptor;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod parent_lifetime;
@@ -74,6 +76,8 @@ pub fn is_invocation(args: &[OsString]) -> bool {
 pub struct ParsedArgs {
     /// The serialized [`CapsuleSpec`] JSON.
     pub spec_json: String,
+    /// Closed ARM64 npm manifest; never enables generic private inputs.
+    pub npm_launch_json: Option<String>,
     /// The executable path/name passed to `execvp` for an ordinary launch, or a
     /// diagnostic label when `target_fd` selects held-descriptor execution.
     pub program: OsString,
@@ -185,6 +189,7 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     if sep < 3 {
         return Err("the `--` separator must follow the spec JSON".to_string());
     }
+    let mut npm_launch_json = None;
     let mut target_argv0 = None;
     let mut target_fd = None;
     let mut script_fd = None;
@@ -212,7 +217,14 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
             .filter(|_| option_index + 1 < sep)
             .ok_or_else(|| format!("missing value for internal launcher option {option:?}"))?
             .clone();
-        if option == "--target-argv0" {
+        if option == "--npm-launch-json" {
+            let value = value
+                .into_string()
+                .map_err(|_| "npm manifest is not UTF-8")?;
+            if value.len() > 32 * 1024 || npm_launch_json.replace(value).is_some() {
+                return Err("duplicate or oversized npm manifest".into());
+            }
+        } else if option == "--target-argv0" {
             if target_argv0.replace(value).is_some() {
                 return Err("duplicate `--target-argv0` launcher option".to_string());
             }
@@ -473,6 +485,7 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     let program_args = rest[1..].to_vec();
     Ok(ParsedArgs {
         spec_json,
+        npm_launch_json,
         program,
         target_argv0,
         target_fd,
@@ -516,6 +529,11 @@ pub fn run_on_main_thread(args: &[OsString]) -> ! {
         }
     };
     // The hidden CLI is callable independently of the parent launch helper.
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    if parsed.npm_launch_json.is_some() {
+        eprintln!("tirith __capsule-child: closed npm descriptor mode requires native Linux ARM64");
+        std::process::exit(2);
+    }
     // Check before dispatch on every OS: accepting private-input operands must
     // never silently downgrade them to an ordinary pathname-based launch.
     if let Err(error) = parsed.require_private_input_execution_qualification() {
@@ -1263,6 +1281,13 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         }
     };
 
+    if parsed.npm_launch_json.is_some()
+        && unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0
+    {
+        eprintln!("tirith __capsule-child: cannot disable npm launcher dumpability");
+        std::process::exit(2);
+    }
+
     // Defense in depth: refuse to apply containment unless we can CONFIRM the
     // process is single-threaded. Applying a per-thread seccomp filter + Landlock
     // in a multi-threaded process is unsound (the filter binds only the calling
@@ -1314,6 +1339,15 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         Ok(bound) => bound,
         Err(error) => {
             eprintln!("tirith __capsule-child: invalid sealed-input launch: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    let npm = match npm_descriptor::prepare(parsed, &spec) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("tirith __capsule-child: closed npm admission refused: {error}");
             std::process::exit(2);
         }
     };
@@ -1488,7 +1522,13 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
     if let Some(home) = temp_home.as_ref() {
         bound_write_roots.push((home.diagnostic_root.as_path(), home.fd));
     }
-    let containment_result = if bound_read_roots.is_empty() && bound_write_roots.is_empty() {
+    #[cfg(target_arch = "aarch64")]
+    let npm_result = npm.as_ref().map(|npm| npm.apply(&spec));
+    #[cfg(not(target_arch = "aarch64"))]
+    let npm_result: Option<Result<_, tirith_core::capsule::linux::ContainError>> = None;
+    let containment_result = if let Some(result) = npm_result {
+        result
+    } else if bound_read_roots.is_empty() && bound_write_roots.is_empty() {
         apply_containment(
             &spec,
             temp_home.as_ref().map(|home| home.runtime_root.as_path()),

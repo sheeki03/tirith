@@ -7,9 +7,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub(crate) const RECOVERY_RULE: &str =
-    "linux_only_fresh_policy_and_exact_current_ownership_required";
+    "linux_only_schema2_bound_review_fresh_policy_and_exact_current_ownership_required";
 pub(crate) const INVENTORY_SCOPE: &str =
-    "fixed_team_records_and_bounded_rollout_materialization_intents_and_shell_receipts; external_target_checkpoints_not_discovered";
+    "fixed_team_records_and_bounded_rollout_materialization_and_npm_install_intents_and_completion_milestones_and_shell_receipts; external_target_checkpoints_not_discovered";
 
 /// Missing contracts deserialize to empty readers and fail compatibility.
 /// Unknown fields are refused: adding a stored surface requires review.
@@ -25,6 +25,12 @@ pub(crate) struct PersistedFormats {
     pub team_policy_document: Vec<u32>,
     pub team_policy_semantics: Vec<u32>,
     pub npm_materialization_intent: Vec<u32>,
+    /// Historical closed-install records, not a native execution/recovery claim.
+    #[serde(default)]
+    pub npm_install_intent: Vec<u32>,
+    /// Signed complete-only npm reconfirmation; never install replay or deletion.
+    #[serde(default)]
+    pub npm_install_completion_milestone: Vec<u32>,
     pub npm_materialization_checkpoint: Vec<u32>,
     pub npm_materialization_inventory: Vec<u32>,
     pub npm_materialization_recovery_rule: String,
@@ -41,7 +47,12 @@ impl PersistedFormats {
             team_rollout: vec![team],
             team_policy_document: vec![team],
             team_policy_semantics: vec![tirith_core::policy_team::POLICY_SEMANTICS_VERSION],
-            npm_materialization_intent: vec![crate::cli::npm_materialize::INTENT_SCHEMA_VERSION],
+            // Schema 1 remains readable history, but cannot authorize mutation.
+            npm_materialization_intent: vec![1, crate::cli::npm_materialize::INTENT_SCHEMA_VERSION],
+            npm_install_intent: vec![crate::cli::npm_install::INTENT_SCHEMA_VERSION],
+            npm_install_completion_milestone: vec![
+                crate::cli::npm_install_recovery::RECOVERY_MILESTONE_SCHEMA_VERSION,
+            ],
             npm_materialization_checkpoint: vec![
                 crate::cli::npm_materialize::CHECKPOINT_SCHEMA_VERSION,
             ],
@@ -51,7 +62,7 @@ impl PersistedFormats {
             npm_materialization_recovery_rule: RECOVERY_RULE.into(),
         }
     }
-    pub(crate) fn readers(&self) -> [(&'static str, &Vec<u32>); 10] {
+    pub(crate) fn readers(&self) -> [(&'static str, &Vec<u32>); 12] {
         [
             ("shell_execution_receipt", &self.shell_execution_receipt),
             ("team_connection", &self.team_connection),
@@ -63,6 +74,11 @@ impl PersistedFormats {
             (
                 "npm_materialization_intent",
                 &self.npm_materialization_intent,
+            ),
+            ("npm_install_intent", &self.npm_install_intent),
+            (
+                "npm_install_completion_milestone",
+                &self.npm_install_completion_milestone,
             ),
             (
                 "npm_materialization_checkpoint",
@@ -97,7 +113,7 @@ impl PersistedFormats {
         }
         Ok(())
     }
-    pub(crate) fn supports_current_recovery(&self) -> bool {
+    pub(crate) fn supports_current_contract(&self) -> bool {
         Self::current()
             .readers()
             .into_iter()
@@ -222,36 +238,56 @@ fn policy_document_facts(
 fn canonical_id(value: &str) -> bool {
     tirith_core::policy_team::Id::parse(value).is_ok()
 }
-fn supported_name(name: &std::ffi::OsStr, materialization: bool) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordDirectory {
+    TeamRollout,
+    Materialization,
+    NpmInstall,
+    NpmCompletion,
+}
+fn supported_name(name: &std::ffi::OsStr, kind: RecordDirectory) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    if !materialization {
+    if kind == RecordDirectory::TeamRollout {
         return name.strip_suffix(".json").is_some_and(canonical_id);
     }
     let Some((id, suffix)) = name.split_once('.') else {
         return false;
     };
     canonical_id(id)
-        && matches!(
-            suffix,
-            "intent.json"
-                | "started.json"
-                | "finished.json"
-                | "withdrawn.json"
-                | "recovered.json"
-                | "undone.json"
-                | "confirm-started.json"
-                | "undo-started.json"
-                | "continue-undo-started.json"
-                | "continued-undo.json"
-        )
+        && match kind {
+            RecordDirectory::TeamRollout => false,
+            RecordDirectory::Materialization => matches!(
+                suffix,
+                "intent.json"
+                    | "started.json"
+                    | "finished.json"
+                    | "withdrawn.json"
+                    | "recovered.json"
+                    | "undone.json"
+                    | "confirm-started.json"
+                    | "undo-started.json"
+                    | "continue-undo-started.json"
+                    | "continued-undo.json"
+            ),
+            // The only recovery history is complete-only public reconfirmation.
+            RecordDirectory::NpmInstall => matches!(
+                suffix,
+                "intent.json"
+                    | "started.json"
+                    | "finished.json"
+                    | "withdrawn.json"
+                    | "recovered.json"
+            ),
+            RecordDirectory::NpmCompletion => matches!(suffix, "private.json" | "committed.json"),
+        }
 }
 fn directory_facts(
     directory: &Path,
     scope: &Path,
     surface: &'static str,
-    materialization: bool,
+    kind: RecordDirectory,
     budget: &mut Budget,
     facts: &mut Vec<FormatFact>,
 ) {
@@ -279,7 +315,7 @@ fn directory_facts(
             facts.push(unknown(surface, "inventory_limited"));
             break;
         }
-        if !supported_name(name, materialization) {
+        if !supported_name(name, kind) {
             facts.push(unknown(surface, "unknown_entry"));
             continue;
         }
@@ -287,12 +323,12 @@ fn directory_facts(
             &directory.join(name),
             scope,
             surface,
-            if materialization {
+            if kind != RecordDirectory::TeamRollout {
                 "schema"
             } else {
                 "schema_version"
             },
-            if materialization {
+            if kind != RecordDirectory::TeamRollout {
                 64 * 1024
             } else {
                 4 * 1024 * 1024
@@ -305,7 +341,7 @@ fn directory_facts(
         } else {
             fact
         });
-        if !materialization {
+        if kind == RecordDirectory::TeamRollout {
             for field in ["before", "candidate"] {
                 policy_document_facts(
                     value.as_ref().and_then(|value| value.get(field)),
@@ -324,8 +360,15 @@ fn directory_facts(
         }
         Err(_) => facts.push(unknown(surface, "inventory_changed")),
     }
-    if materialization && !cfg!(target_os = "linux") && !names.is_empty() {
-        facts.push(unknown(surface, "recovery_unsupported_on_this_platform"));
+    if kind != RecordDirectory::TeamRollout && !cfg!(target_os = "linux") && !names.is_empty() {
+        facts.push(unknown(
+            surface,
+            if kind == RecordDirectory::Materialization {
+                "recovery_unsupported_on_this_platform"
+            } else {
+                "operation_state_unsupported_on_this_platform"
+            },
+        ));
     }
 }
 fn lower_hex(value: &str, length: usize) -> bool {
@@ -452,7 +495,7 @@ pub(super) fn observe(config: Option<&Path>, state: Option<&Path>) -> Vec<Format
             &scope.join("team-policy/rollouts"),
             scope,
             "team_rollout",
-            false,
+            RecordDirectory::TeamRollout,
             &mut budget,
             &mut facts,
         );
@@ -472,7 +515,23 @@ pub(super) fn observe(config: Option<&Path>, state: Option<&Path>) -> Vec<Format
             &scope.join("materialization-intents"),
             scope,
             "npm_materialization_intent",
-            true,
+            RecordDirectory::Materialization,
+            &mut budget,
+            &mut facts,
+        );
+        directory_facts(
+            &scope.join("npm-install-intents"),
+            scope,
+            "npm_install_intent",
+            RecordDirectory::NpmInstall,
+            &mut budget,
+            &mut facts,
+        );
+        directory_facts(
+            &scope.join("npm-install-recovery"),
+            scope,
+            "npm_install_completion_milestone",
+            RecordDirectory::NpmCompletion,
             &mut budget,
             &mut facts,
         );
@@ -480,6 +539,11 @@ pub(super) fn observe(config: Option<&Path>, state: Option<&Path>) -> Vec<Format
         facts.push(unknown("shell_execution_receipt", "state_root_unavailable"));
         facts.push(unknown(
             "npm_materialization_intent",
+            "state_root_unavailable",
+        ));
+        facts.push(unknown("npm_install_intent", "state_root_unavailable"));
+        facts.push(unknown(
+            "npm_install_completion_milestone",
             "state_root_unavailable",
         ));
     }
@@ -494,13 +558,13 @@ mod tests {
     fn persisted_reader_contract_is_closed_bounded_and_requires_recovery_semantics() {
         let current = PersistedFormats::current();
         assert!(current.validate().is_ok());
-        assert!(current.supports_current_recovery());
-        assert!(!PersistedFormats::default().supports_current_recovery());
+        assert!(current.supports_current_contract());
+        assert!(!PersistedFormats::default().supports_current_contract());
         for (surface, _) in current.readers() {
             let mut raw = serde_json::to_value(&current).unwrap();
             raw[surface] = serde_json::json!([]);
             let missing: PersistedFormats = serde_json::from_value(raw).unwrap();
-            assert!(!missing.supports_current_recovery(), "{surface}");
+            assert!(!missing.supports_current_contract(), "{surface}");
             for invalid in [
                 serde_json::json!([0]),
                 serde_json::json!([1, 1]),
@@ -523,16 +587,27 @@ mod tests {
             .remove("shell_execution_receipt");
         let old: PersistedFormats = serde_json::from_value(old).unwrap();
         assert!(old.shell_execution_receipt.is_empty());
-        assert!(!old.supports_current_recovery());
+        assert!(!old.supports_current_contract());
+        assert_eq!(current.npm_materialization_intent, [1, 2]);
+        let mut legacy_materialization = current.clone();
+        legacy_materialization.npm_materialization_intent = vec![1];
+        assert!(!legacy_materialization.supports_current_contract());
+        assert_eq!(current.npm_install_intent, [1]);
+        assert_eq!(current.npm_install_completion_milestone, [1]);
+        let mut old = serde_json::to_value(&current).unwrap();
+        old.as_object_mut().unwrap().remove("npm_install_intent");
+        let old: PersistedFormats = serde_json::from_value(old).unwrap();
+        assert!(old.npm_install_intent.is_empty());
+        assert!(!old.supports_current_contract());
         let mut schema_three_only = current.clone();
         schema_three_only.shell_execution_receipt = vec![3];
-        assert!(!schema_three_only.supports_current_recovery());
+        assert!(!schema_three_only.supports_current_contract());
         let mut raw = serde_json::to_value(&current).unwrap();
         raw["future_store"] = serde_json::json!([1]);
         assert!(serde_json::from_value::<PersistedFormats>(raw).is_err());
         let mut changed = current;
         changed.npm_materialization_recovery_rule = "blind_replay".into();
-        assert!(!changed.supports_current_recovery());
+        assert!(!changed.supports_current_contract());
     }
 
     #[cfg(unix)]
@@ -558,7 +633,7 @@ mod tests {
         fn absent_optional_stores_are_observed_without_creating_them() {
             let temp = scope();
             let facts = observe(Some(temp.path()), Some(temp.path()));
-            assert_eq!(facts.len(), 6);
+            assert_eq!(facts.len(), 8);
             assert!(facts.iter().all(|fact| fact.state == "absent"));
             assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
             assert!(observe(None, None)
@@ -803,6 +878,152 @@ mod tests {
                 .unwrap()
                 .contains("outside-secret"));
         }
+        #[test]
+        fn npm_install_names_are_distinct_and_observations_do_not_claim_recovery() {
+            let temp = scope();
+            let id = "11111111-1111-4111-8111-111111111111";
+            let intents = temp.path().join("npm-install-intents");
+            for suffix in ["intent", "started", "finished", "withdrawn", "recovered"] {
+                file(&intents.join(format!("{id}.{suffix}.json")),
+                    br#"{"schema":1,"target":"/never/followed/private-npm-target","private":"npm-private-marker"}"#);
+            }
+            let facts = observe(Some(temp.path()), Some(temp.path()));
+            assert_eq!(
+                facts
+                    .iter()
+                    .filter(|f| f.surface == "npm_install_intent" && f.declared_version == Some(1))
+                    .count(),
+                5
+            );
+            let output = serde_json::to_string(&facts).unwrap();
+            assert!(!output.contains("npm-private-marker"));
+            assert!(!output.contains("private-npm-target"));
+            assert!(!output.contains(temp.path().to_str().unwrap()));
+            if !cfg!(target_os = "linux") {
+                assert!(facts.iter().any(|f| f.surface == "npm_install_intent"
+                    && f.state == "operation_state_unsupported_on_this_platform"));
+            }
+            for suffix in ["private", "undone", "future-event"] {
+                file(
+                    &intents.join(format!("{id}.{suffix}.json")),
+                    br#"{"schema":1}"#,
+                );
+            }
+            assert_eq!(
+                observe(Some(temp.path()), Some(temp.path()))
+                    .iter()
+                    .filter(|f| f.surface == "npm_install_intent" && f.state == "unknown_entry")
+                    .count(),
+                3
+            );
+            assert!(INVENTORY_SCOPE.contains("npm_install_intents"));
+            assert!(INVENTORY_SCOPE.contains("external_target_checkpoints_not_discovered"));
+        }
+        #[test]
+        fn npm_completion_store_inventory_is_closed_private_and_not_authentication() {
+            let temp = scope();
+            let id = "11111111-1111-4111-8111-111111111111";
+            let root = temp.path().join("npm-install-recovery");
+            for suffix in ["private", "committed"] {
+                file(&root.join(format!("{id}.{suffix}.json")), br#"{"schema":1,"private_plan_digest":"never-export-me","target":"/never/follow"}"#);
+            }
+            let facts = observe(None, Some(temp.path()));
+            assert_eq!(
+                facts
+                    .iter()
+                    .filter(|f| f.surface == "npm_install_completion_milestone"
+                        && f.declared_version == Some(1))
+                    .count(),
+                2
+            );
+            let public = serde_json::to_string(&facts).unwrap();
+            assert!(!public.contains("never-export-me") && !public.contains("/never/follow"));
+            file(&root.join(format!("{id}.replay.json")), br#"{"schema":1}"#);
+            assert!(observe(None, Some(temp.path()))
+                .iter()
+                .any(|f| f.surface == "npm_install_completion_milestone"
+                    && f.state == "unknown_entry"));
+            let committed = root.join(format!("{id}.committed.json"));
+            std::fs::remove_file(&committed).unwrap();
+            symlink("never-followed", &committed).unwrap();
+            assert!(observe(None, Some(temp.path())).iter().any(|f| f.surface
+                == "npm_install_completion_milestone"
+                && f.state == "unreadable"));
+        }
+        #[test]
+        fn npm_install_unknown_versions_and_unsafe_records_do_not_disappear() {
+            let temp = scope();
+            let path = temp
+                .path()
+                .join("npm-install-intents/11111111-1111-4111-8111-111111111111.intent.json");
+            file(&path, br#"{"schema":99}"#);
+            assert!(observe(None, Some(temp.path()))
+                .iter()
+                .any(|f| f.surface == "npm_install_intent" && f.declared_version == Some(99)));
+            for (bytes, expected) in [
+                (br#"{"schema":1,"schema":2}"#.as_slice(), "invalid"),
+                (b"{truncated".as_slice(), "invalid"),
+                (&vec![b' '; 64 * 1024 + 1], "unreadable"),
+            ] {
+                file(&path, bytes);
+                assert!(observe(None, Some(temp.path()))
+                    .iter()
+                    .any(|f| f.surface == "npm_install_intent" && f.state == expected));
+            }
+            std::fs::remove_file(&path).unwrap();
+            symlink("not-followed-private-target", &path).unwrap();
+            assert!(observe(None, Some(temp.path()))
+                .iter()
+                .any(|f| f.surface == "npm_install_intent" && f.state == "unreadable"));
+            assert!(std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            let mut facts = Vec::new();
+            let mut budget = Budget {
+                remaining: 0,
+                started: Instant::now(),
+            };
+            directory_facts(
+                path.parent().unwrap(),
+                temp.path(),
+                "npm_install_intent",
+                RecordDirectory::NpmInstall,
+                &mut budget,
+                &mut facts,
+            );
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].state, "inventory_limited");
+        }
+        #[test]
+        fn materialization_inventory_preserves_legacy_and_complete_review_declarations() {
+            let temp = scope();
+            let intents = temp.path().join("materialization-intents");
+            for schema in [1, 2] {
+                let id = uuid::Uuid::new_v4().to_string();
+                for suffix in ["intent", "started"] {
+                    file(&intents.join(format!("{id}.{suffix}.json")),
+                        &serde_json::to_vec(&serde_json::json!({"schema":schema,
+                            "target":"/not-followed/private-target", "review_nonce":"private-nonce"})).unwrap());
+                }
+            }
+            let facts = observe(Some(temp.path()), Some(temp.path()));
+            for schema in [1, 2] {
+                assert_eq!(
+                    facts
+                        .iter()
+                        .filter(|fact| fact.surface == "npm_materialization_intent"
+                            && fact.declared_version == Some(schema)
+                            && fact.state == "declared_local_unverified")
+                        .count(),
+                    2
+                );
+            }
+            let output = serde_json::to_string(&facts).unwrap();
+            assert!(!output.contains("private-target"));
+            assert!(!output.contains("private-nonce"));
+        }
+
         #[test]
         fn materialization_names_are_closed_and_external_targets_are_not_followed() {
             let temp = scope();

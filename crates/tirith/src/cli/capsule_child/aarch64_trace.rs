@@ -60,12 +60,18 @@ pub(super) fn advance_initial_stop(target_pid: libc::pid_t) -> Result<(), String
         );
     }
     registers[PC_INDEX] = expected_pc.checked_add(4).ok_or("invalid ARM trace PC")?;
+    // Form the write view after changing PC, so the mutation and the bytes
+    // passed to SETREGSET remain explicit to the compiler and reviewer.
+    let mut updated_vector = libc::iovec {
+        iov_base: registers.as_mut_ptr().cast(),
+        iov_len: std::mem::size_of_val(&registers),
+    };
     if unsafe {
         libc::ptrace(
             libc::PTRACE_SETREGSET,
             target_pid,
             NT_PRSTATUS as *mut libc::c_void,
-            &mut vector as *mut libc::iovec,
+            &mut updated_vector as *mut libc::iovec,
         )
     } < 0
     {

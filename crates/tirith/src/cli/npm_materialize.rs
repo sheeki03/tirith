@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 /// Persisted local intent/event schema, shared with release compatibility.
-pub(crate) const INTENT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const INTENT_SCHEMA_VERSION: u32 = 2;
 /// Target-local checkpoint schema; generic lifecycle inventory does not discover targets.
 pub(crate) const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 
@@ -21,7 +21,7 @@ pub(crate) enum Action {
     /// Reinspect a reviewed intent and publish to its still-absent target.
     Apply {
         operation: String,
-        /// Exact public commitment printed by plan. This is explicit review,
+        /// Exact commitment printed by plan. This is explicit review,
         /// not a substitute for current artifact, policy and task authorization.
         #[arg(long)]
         reviewed: String,
@@ -72,6 +72,7 @@ impl Action {
     }
 }
 pub(crate) fn run(action: Action) -> i32 {
+    let output = super::npm_operation_output::OutputContext::start();
     let json = action.json();
     #[cfg(target_os = "linux")]
     let result = linux::run(action);
@@ -80,45 +81,21 @@ pub(crate) fn run(action: Action) -> i32 {
         let _ = action;
         Err("LocalLeafMaterializeV1 publication is supported only on Linux".into())
     };
-    match result {
-        Ok(value) => {
-            let printed = if json {
-                serde_json::to_writer(std::io::stdout().lock(), &value).map_err(|e| e.to_string())
-            } else {
-                print_human(&value)
-            };
-            if printed.is_err() {
-                return 1;
-            }
-            println!();
-            0
-        }
-        Err(reason) => {
-            if json {
-                let _ = serde_json::to_writer(
-                    std::io::stdout().lock(),
-                    &serde_json::json!({"schema":1,"contract":"LocalLeafMaterializeV1","error":reason,"package_code_executed":false,"execution_authority":false}),
-                );
-                println!();
-            } else {
-                eprintln!(
-                    "tirith pkg materialize: {}",
-                    super::sanitize_for_human_output(&reason, false)
-                );
-            }
-            1
-        }
-    }
-}
-fn print_human(value: &serde_json::Value) -> Result<(), String> {
-    use std::io::Write;
-    let rendered = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    // JSON escaping avoids terminal controls in local paths. Private intent
-    // fields are never passed to this renderer.
-    std::io::stdout()
-        .lock()
-        .write_all(rendered.as_bytes())
-        .map_err(|e| e.to_string())
+    let (value, exit) = match result {
+        Ok(value) => (value, 0),
+        Err(reason) => (
+            serde_json::json!({"schema":INTENT_SCHEMA_VERSION,
+                "contract":"LocalLeafMaterializeV1","error":reason,
+                "package_code_executed":false,"execution_authority":false}),
+            1,
+        ),
+    };
+    output.finish(
+        &value,
+        super::npm_operation_output::OperationKind::Materialize,
+        json,
+        exit,
+    )
 }
 
 #[cfg(test)]
@@ -202,6 +179,8 @@ mod linux {
     };
     const SCHEMA: u32 = super::INTENT_SCHEMA_VERSION;
     const PATH_CAP: usize = 4096;
+    const REVIEW_DOMAIN: &[u8] = b"tirith-local-materialize-review-v2\0";
+    const LEGACY_REVIEW_REFUSAL: &str = "legacy review not fully bound; objects preserved; replan unstarted work with a new operation; started work remains read-only";
     const CONTINUED_UNDO_PHASES: [&str; 2] = [
         "private_contents_continued_undo_empty_root_retained",
         "private_tree_observed_already_empty_root_retained",
@@ -264,6 +243,10 @@ mod linux {
         private_plan_digest: String,
         summary: Value,
         reviewed_sha256: String,
+        // Kept private to prevent the public digest from becoming an oracle for
+        // private policy inputs. Schema 1 has no nonce and is read-only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review_nonce: Option<String>,
     }
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -348,6 +331,7 @@ mod linux {
             private_plan_digest: authority.private_plan_digest().into(),
             summary: serde_json::to_value(plan.summary()).map_err(err)?,
             reviewed_sha256: String::new(),
+            review_nonce: Some(uuid::Uuid::new_v4().to_string()),
         };
         intent.reviewed_sha256 = review_digest(&intent)?;
         validate_intent(&intent, &id)?;
@@ -457,6 +441,7 @@ mod linux {
         ),
         String,
     > {
+        require_complete_review(intent)?;
         if current_cwd() != Ok(intent.cwd.clone()) {
             return Err(
                 "current working directory differs from the reviewed resolution context".into(),
@@ -710,6 +695,7 @@ mod linux {
         intent: &Intent,
         action: MaterializationRecoveryAction,
     ) -> Result<Value, String> {
+        require_complete_review(intent)?;
         let undo = action != MaterializationRecoveryAction::ConfirmPublished;
         let _bounded = BoundedRuntimePolicyInputs::enter();
         if read_event(store, RecordKind::Started, intent, &["started"])?.is_none() {
@@ -920,7 +906,7 @@ mod linux {
     }
     fn validate_intent(intent: &Intent, id: &str) -> Result<(), String> {
         canonical_operation(id).map_err(err)?;
-        if intent.schema != SCHEMA
+        if !matches!(intent.schema, 1 | SCHEMA)
             || intent.contract != CONTRACT
             || intent.operation != id
             || intent.operator != unsafe { libc::geteuid() }
@@ -929,6 +915,16 @@ mod linux {
         {
             return Err("materialization intent schema or operator binding refused".into());
         }
+        match (intent.schema, intent.review_nonce.as_deref()) {
+            (1, None) => {}
+            (SCHEMA, Some(nonce))
+                if uuid::Uuid::parse_str(nonce).is_ok_and(|id| {
+                    id.get_version_num() == 4
+                        && id.get_variant() == uuid::Variant::RFC4122
+                        && id.to_string() == nonce
+                }) => {}
+            _ => return Err("materialization review nonce binding refused".into()),
+        }
         let summary: SummaryObservation = serde_json::from_value(intent.summary.clone())
             .map_err(|_| "materialization summary schema refused")?;
         let artifact_hashes = intent
@@ -936,7 +932,8 @@ mod linux {
             .iter()
             .map(|a| a.sha256.clone())
             .collect::<Vec<_>>();
-        if summary.schema != SCHEMA
+        // The core materialization summary has its own unchanged schema.
+        if summary.schema != 1
             || summary.contract != CONTRACT
             || summary.operation_id != id
             || !is_digest(&summary.public_plan_digest)
@@ -989,11 +986,17 @@ mod linux {
         Ok(())
     }
     fn public_projection(intent: &Intent) -> Value {
-        json!({"schema":SCHEMA,"contract":CONTRACT,"operation":intent.operation,"target":intent.target,"archives":intent.archives.iter().map(|a|json!({"path":a.path,"sha256":a.sha256})).collect::<Vec<_>>(),"summary":intent.summary})
+        json!({"schema":intent.schema,"contract":CONTRACT,"operation":intent.operation,"target":intent.target,"archives":intent.archives.iter().map(|a|json!({"path":a.path,"sha256":a.sha256})).collect::<Vec<_>>(),"summary":intent.summary})
     }
     fn public_intent(intent: &Intent, phase: &str) -> Value {
         let mut v = public_projection(intent);
         v["reviewed_sha256"] = json!(intent.reviewed_sha256);
+        v["stored_intent_schema"] = json!(intent.schema);
+        v["full_review_binding"] = json!(intent.schema == SCHEMA);
+        v["review_format_supports_mutations"] = json!(intent.schema == SCHEMA);
+        if intent.schema == 1 {
+            v["mutation_refusal"] = json!(LEGACY_REVIEW_REFUSAL);
+        }
         v["phase"] = json!(phase);
         v["package_code_executed"] = json!(false);
         v["execution_authority"] = json!(false);
@@ -1002,15 +1005,36 @@ mod linux {
         v
     }
     fn review_digest(intent: &Intent) -> Result<String, String> {
-        Ok(format!(
-            "{:x}",
-            Sha256::digest(
-                tirith_core::audit::canonical_json_for_hash(&public_projection(intent)).as_bytes()
-            )
-        ))
+        let mut digest = Sha256::new();
+        let value = match intent.schema {
+            // Historical comparison only: never permit a schema 1 mutation.
+            1 => public_projection(intent),
+            SCHEMA => {
+                digest.update(REVIEW_DOMAIN);
+                let mut value = serde_json::to_value(intent).map_err(err)?;
+                value
+                    .as_object_mut()
+                    .ok_or("materialization review object unavailable")?
+                    .remove("reviewed_sha256");
+                value
+            }
+            _ => return Err("materialization intent schema refused".into()),
+        };
+        digest.update(tirith_core::audit::canonical_json_for_hash(&value).as_bytes());
+        Ok(format!("{:x}", digest.finalize()))
+    }
+    fn require_complete_review(intent: &Intent) -> Result<(), String> {
+        if intent.schema != SCHEMA {
+            return Err(LEGACY_REVIEW_REFUSAL.into());
+        }
+        Ok(())
     }
     fn check_review(intent: &Intent, reviewed: &str) -> Result<(), String> {
-        if !is_digest(reviewed) || intent.reviewed_sha256 != reviewed {
+        require_complete_review(intent)?;
+        if !is_digest(reviewed)
+            || intent.reviewed_sha256 != reviewed
+            || review_digest(intent)? != reviewed
+        {
             return Err("reviewed commitment does not match this exact operation".into());
         }
         Ok(())
@@ -1021,6 +1045,7 @@ mod linux {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }
     fn event(intent: &Intent, phase: &str) -> Result<Vec<u8>, String> {
+        require_complete_review(intent)?;
         encode(&Event {
             schema: SCHEMA,
             operation: intent.operation.clone(),
@@ -1039,7 +1064,7 @@ mod linux {
             return Ok(None);
         };
         let e: Event = decode(&bytes)?;
-        if e.schema != SCHEMA
+        if e.schema != intent.schema
             || e.operation != intent.operation
             || e.reviewed_sha256 != intent.reviewed_sha256
             || !phases.contains(&e.phase.as_str())
@@ -1139,6 +1164,7 @@ mod linux {
                 private_plan_digest: "b".repeat(64),
                 summary: json!({"schema":1,"contract":CONTRACT,"operation_id":id,"public_plan_digest":"c".repeat(64),"inventory_digest":"d".repeat(64),"artifacts":["a".repeat(64)],"packages":[{"name":"demo","version":"1.0.0","compressed_sha256":"a".repeat(64)}],"files":1,"directories":1,"bytes":5,"threat_db_sequence":1,"signed_build_timestamp":1,"package_code_executed":false,"code_safety":"not_established"}),
                 reviewed_sha256: String::new(),
+                review_nonce: Some(uuid::Uuid::new_v4().to_string()),
             };
             result.reviewed_sha256 = review_digest(&result).unwrap();
             result
@@ -1289,6 +1315,8 @@ mod linux {
             let text = serde_json::to_string(&public).unwrap();
             for private in [
                 "private_plan_digest",
+                "review_nonce",
+                intent.review_nonce.as_deref().unwrap(),
                 "modified_seconds",
                 "parent_inode",
                 "policy",
@@ -1296,6 +1324,9 @@ mod linux {
             ] {
                 assert!(!text.contains(private), "{private}");
             }
+            assert_eq!(public["stored_intent_schema"], 2);
+            assert_eq!(public["full_review_binding"], true);
+            assert_eq!(public["review_format_supports_mutations"], true);
             assert_eq!(public["execution_authority"], false);
             assert_eq!(public["package_code_executed"], false);
             assert_eq!(public["current_code_safety"], "not_established");
@@ -1318,6 +1349,334 @@ mod linux {
             intent.summary["public_plan_digest"] = json!("e".repeat(64));
             assert_ne!(review_digest(&intent).unwrap(), before);
         }
+        #[test]
+        fn schema_two_review_commits_every_private_field_and_rehashing_cannot_reuse_review() {
+            let scope = GlobalStateGuard::new().unwrap();
+            let intent = intent(&scope);
+            validate_intent(&intent, &intent.operation).unwrap();
+            assert_eq!(intent.schema, 2);
+            assert_eq!(intent.summary["schema"], 1);
+            let original = serde_json::to_value(&intent).unwrap();
+            fn leaves(value: &Value, pointer: String, result: &mut Vec<String>) {
+                match value {
+                    Value::Object(map) => {
+                        for (key, value) in map {
+                            let key = key.replace('~', "~0").replace('/', "~1");
+                            leaves(value, format!("{pointer}/{key}"), result);
+                        }
+                    }
+                    Value::Array(array) => {
+                        for (index, value) in array.iter().enumerate() {
+                            leaves(value, format!("{pointer}/{index}"), result);
+                        }
+                    }
+                    _ => result.push(pointer),
+                }
+            }
+            let mut fields = Vec::new();
+            leaves(&original, String::new(), &mut fields);
+            for private in [
+                "/operator",
+                "/cwd",
+                "/parent_device",
+                "/parent_inode",
+                "/review_nonce",
+                "/private_plan_digest",
+                "/policy/digest/0",
+                "/archives/0/device",
+                "/archives/0/inode",
+                "/archives/0/size",
+                "/archives/0/mode",
+                "/archives/0/owner",
+                "/archives/0/links",
+                "/archives/0/modified_seconds",
+                "/archives/0/modified_nanos",
+                "/archives/0/changed_seconds",
+                "/archives/0/changed_nanos",
+            ] {
+                assert!(fields.iter().any(|field| field == private), "{private}");
+            }
+            for pointer in fields {
+                if matches!(pointer.as_str(), "/schema" | "/reviewed_sha256") {
+                    continue;
+                }
+                let mut changed = original.clone();
+                let field = changed.pointer_mut(&pointer).unwrap();
+                *field = match field {
+                    Value::String(value) => json!(format!("{value}-tampered")),
+                    Value::Number(value) => json!(value.as_u64().unwrap() ^ 1),
+                    Value::Bool(value) => json!(!*value),
+                    other => panic!("unexpected commitment leaf {pointer}: {other}"),
+                };
+                let mut changed: Intent = serde_json::from_value(changed).unwrap();
+                assert_ne!(
+                    review_digest(&changed).unwrap(),
+                    intent.reviewed_sha256,
+                    "{pointer}"
+                );
+                assert!(
+                    validate_intent(&changed, &intent.operation).is_err(),
+                    "{pointer}"
+                );
+                assert!(
+                    check_review(&changed, &intent.reviewed_sha256).is_err(),
+                    "{pointer}"
+                );
+                changed.reviewed_sha256 = review_digest(&changed).unwrap();
+                assert!(
+                    check_review(&changed, &intent.reviewed_sha256).is_err(),
+                    "{pointer}"
+                );
+            }
+        }
+
+        #[test]
+        fn schema_two_nonce_is_private_random_canonical_and_domain_separated() {
+            let scope = GlobalStateGuard::new().unwrap();
+            let mut intent = intent(&scope);
+            let original = intent.reviewed_sha256.clone();
+            let original_nonce = intent.review_nonce.clone();
+            let mut value = serde_json::to_value(&intent).unwrap();
+            value.as_object_mut().unwrap().remove("reviewed_sha256");
+            let unseparated = format!(
+                "{:x}",
+                Sha256::digest(tirith_core::audit::canonical_json_for_hash(&value).as_bytes())
+            );
+            assert_ne!(original, unseparated);
+            intent.review_nonce = Some(uuid::Uuid::new_v4().to_string());
+            assert_ne!(intent.review_nonce, original_nonce);
+            assert_ne!(review_digest(&intent).unwrap(), original);
+            for nonce in [
+                None,
+                Some(String::new()),
+                Some("not-a-uuid".into()),
+                Some("11111111-1111-1111-8111-111111111111".into()),
+                Some("11111111-1111-4111-7111-111111111111".into()),
+                Some("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into()),
+            ] {
+                intent.review_nonce = nonce;
+                intent.reviewed_sha256 = review_digest(&intent).unwrap();
+                assert!(validate_intent(&intent, &intent.operation).is_err());
+            }
+            intent.schema = 3;
+            assert!(review_digest(&intent).is_err());
+            assert!(validate_intent(&intent, &intent.operation).is_err());
+        }
+
+        fn legacy_intent(scope: &GlobalStateGuard) -> Intent {
+            let mut intent = intent(scope);
+            intent.schema = 1;
+            intent.review_nonce = None;
+            intent.target = scope
+                .roots()
+                .cwd
+                .join(format!("legacy-{}", intent.operation))
+                .to_str()
+                .unwrap()
+                .into();
+            // Freeze the historical schema 1 algorithm independently from the
+            // current review implementation. Old writers omitted all private fields.
+            let old_projection = json!({"schema":1,"contract":CONTRACT,
+                "operation":intent.operation,"target":intent.target,
+                "archives":intent.archives.iter().map(|a|json!({"path":a.path,"sha256":a.sha256})).collect::<Vec<_>>(),
+                "summary":intent.summary});
+            intent.reviewed_sha256 = format!(
+                "{:x}",
+                Sha256::digest(
+                    tirith_core::audit::canonical_json_for_hash(&old_projection).as_bytes()
+                )
+            );
+            intent
+        }
+
+        fn stored_bytes(scope: &GlobalStateGuard) -> std::collections::BTreeMap<String, Vec<u8>> {
+            std::fs::read_dir(scope.roots().tirith_state.join("materialization-intents"))
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (
+                        entry.file_name().to_str().unwrap().to_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        #[test]
+        fn legacy_status_preserves_schema_and_all_mutation_routes_preserve_records_and_objects() {
+            let scope = GlobalStateGuard::new().unwrap();
+            let histories = [
+                vec![],
+                vec![(RecordKind::Withdrawn, "withdrawn")],
+                vec![(RecordKind::Started, "started")],
+                vec![
+                    (RecordKind::Started, "started"),
+                    (RecordKind::Finished, "published_verified"),
+                ],
+                vec![
+                    (RecordKind::Started, "started"),
+                    (RecordKind::Recovered, "published_recovered_verified"),
+                ],
+                vec![
+                    (RecordKind::Started, "started"),
+                    (RecordKind::UndoStarted, "undo_started"),
+                    (
+                        RecordKind::Undone,
+                        "private_contents_undone_empty_root_retained",
+                    ),
+                ],
+                vec![
+                    (RecordKind::Started, "started"),
+                    (RecordKind::UndoStarted, "undo_started"),
+                    (RecordKind::ContinueUndoStarted, "continue_undo_started"),
+                ],
+                vec![
+                    (RecordKind::Started, "started"),
+                    (RecordKind::UndoStarted, "undo_started"),
+                    (RecordKind::ContinueUndoStarted, "continue_undo_started"),
+                    (RecordKind::ContinuedUndo, CONTINUED_UNDO_PHASES[0]),
+                ],
+            ];
+            for history in histories {
+                let legacy = legacy_intent(&scope);
+                validate_intent(&legacy, &legacy.operation).unwrap();
+                assert_eq!(review_digest(&legacy).unwrap(), legacy.reviewed_sha256);
+                let legacy_bytes = encode(&legacy).unwrap();
+                assert!(!String::from_utf8_lossy(&legacy_bytes).contains("review_nonce"));
+                let mut store = OperationStore::open(&legacy.operation, true).unwrap();
+                store.append(RecordKind::Intent, legacy_bytes).unwrap();
+                for (kind, phase) in history {
+                    store
+                        .append(
+                            kind,
+                            encode(&Event {
+                                schema: 1,
+                                operation: legacy.operation.clone(),
+                                reviewed_sha256: legacy.reviewed_sha256.clone(),
+                                phase: phase.into(),
+                                at: "2026-09-22T00:00:00Z".into(),
+                            })
+                            .unwrap(),
+                        )
+                        .unwrap();
+                }
+                drop(store);
+                let target = Path::new(&legacy.target);
+                let journal = target
+                    .parent()
+                    .unwrap()
+                    .join(format!(".tirith-materialize-{}", legacy.operation));
+                std::fs::create_dir(target).unwrap();
+                std::fs::create_dir(&journal).unwrap();
+                std::fs::write(target.join("public-sentinel"), b"public object remains").unwrap();
+                std::fs::write(journal.join("private-sentinel"), b"private object remains")
+                    .unwrap();
+                let target_inode = std::fs::symlink_metadata(target).unwrap().ino();
+                let journal_inode = std::fs::symlink_metadata(&journal).unwrap().ino();
+                let before = stored_bytes(&scope);
+                let view = status(&legacy.operation).unwrap();
+                assert_eq!(view["schema"], 1);
+                assert_eq!(view["stored_intent_schema"], 1);
+                assert_eq!(view["full_review_binding"], false);
+                assert_eq!(view["review_format_supports_mutations"], false);
+                assert_eq!(view["mutation_refusal"], LEGACY_REVIEW_REFUSAL);
+                assert_eq!(view["execution_authority"], false);
+                assert_eq!(view["historical_only"], true);
+                let actions = [
+                    Action::Apply {
+                        operation: legacy.operation.clone(),
+                        reviewed: legacy.reviewed_sha256.clone(),
+                        json: true,
+                    },
+                    Action::Undo {
+                        operation: legacy.operation.clone(),
+                        reviewed: legacy.reviewed_sha256.clone(),
+                        json: true,
+                    },
+                    Action::Recover {
+                        operation: legacy.operation.clone(),
+                        reviewed: legacy.reviewed_sha256.clone(),
+                        json: true,
+                    },
+                    continue_action(&legacy, &legacy.reviewed_sha256),
+                ];
+                for action in actions {
+                    assert_eq!(run(action).unwrap_err(), LEGACY_REVIEW_REFUSAL);
+                    assert_eq!(stored_bytes(&scope), before);
+                    assert_eq!(
+                        std::fs::read(target.join("public-sentinel")).unwrap(),
+                        b"public object remains"
+                    );
+                    assert_eq!(
+                        std::fs::read(journal.join("private-sentinel")).unwrap(),
+                        b"private object remains"
+                    );
+                    assert_eq!(
+                        std::fs::symlink_metadata(target).unwrap().ino(),
+                        target_inode
+                    );
+                    assert_eq!(
+                        std::fs::symlink_metadata(&journal).unwrap().ino(),
+                        journal_inode
+                    );
+                }
+                // Lower-level entry points also refuse; a refactor must not
+                // bypass the public route gate and upgrade legacy authority.
+                assert_eq!(
+                    event(&legacy, "started").unwrap_err(),
+                    LEGACY_REVIEW_REFUSAL
+                );
+                assert!(
+                    matches!(recapture(&legacy), Err(reason) if reason == LEGACY_REVIEW_REFUSAL)
+                );
+                let mut store = OperationStore::open(&legacy.operation, false).unwrap();
+                assert_eq!(
+                    recover_started(
+                        &mut store,
+                        &legacy,
+                        MaterializationRecoveryAction::UndoPrivate
+                    )
+                    .unwrap_err(),
+                    LEGACY_REVIEW_REFUSAL
+                );
+                drop(store);
+                assert_eq!(stored_bytes(&scope), before);
+            }
+        }
+
+        #[test]
+        fn legacy_digest_cannot_be_upgraded_by_adding_nonce_or_mixing_event_schemas() {
+            let scope = GlobalStateGuard::new().unwrap();
+            let mut legacy = legacy_intent(&scope);
+            legacy.review_nonce = Some(uuid::Uuid::new_v4().to_string());
+            assert!(validate_intent(&legacy, &legacy.operation).is_err());
+            legacy.review_nonce = None;
+            let mut store = OperationStore::open(&legacy.operation, true).unwrap();
+            store
+                .append(RecordKind::Intent, encode(&legacy).unwrap())
+                .unwrap();
+            store
+                .append(
+                    RecordKind::Started,
+                    encode(&Event {
+                        schema: SCHEMA,
+                        operation: legacy.operation.clone(),
+                        reviewed_sha256: legacy.reviewed_sha256.clone(),
+                        phase: "started".into(),
+                        at: "2026-09-22T00:00:00Z".into(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            drop(store);
+            let before = stored_bytes(&scope);
+            assert!(status(&legacy.operation)
+                .unwrap_err()
+                .contains("history binding"));
+            assert_eq!(stored_bytes(&scope), before);
+            assert!(!Path::new(&legacy.target).exists());
+        }
+
         #[test]
         fn duplicate_and_unknown_intent_fields_cannot_supply_restart_authority() {
             let scope = GlobalStateGuard::new().unwrap();

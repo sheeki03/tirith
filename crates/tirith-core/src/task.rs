@@ -203,6 +203,12 @@ pub enum ProposedAction {
     LocalPackageMaterialize {
         binding: LocalPackageTreeAction,
     },
+    /// Fresh observation of an already published tree, with only a durable
+    /// reconfirmation-history write. Cannot be supplied by task documents.
+    #[serde(skip_deserializing)]
+    LocalPackageReconfirm {
+        binding: LocalPackageTreeAction,
+    },
     /// Exact existing inventory removal, including a fixed private relocation.
     #[serde(skip_deserializing)]
     LocalPackageUndo {
@@ -550,7 +556,8 @@ pub fn validate_envelope(envelope: &TaskEnvelopeInput) -> Vec<EnvelopeRejection>
                 ecosystem.len() > MAX_STRING_BYTES || package.len() > MAX_STRING_BYTES
             }
             ProposedAction::LocalPackageMaterialize { binding }
-            | ProposedAction::LocalPackageUndo { binding } => binding.invalid(),
+            | ProposedAction::LocalPackageUndo { binding }
+            | ProposedAction::LocalPackageReconfirm { binding } => binding.invalid(),
             ProposedAction::ConfigWrite { path } => path.len() > MAX_PATH_BYTES,
             ProposedAction::Narrative { text } => text.len() > MAX_STRING_BYTES,
         };
@@ -834,7 +841,8 @@ pub fn infer_effects_detailed_with_context(
             effects.insert(CommandEffectKind::PersistenceChange);
             complete &= !binding.invalid();
         }
-        ProposedAction::LocalPackageUndo { binding } => {
+        ProposedAction::LocalPackageUndo { binding }
+        | ProposedAction::LocalPackageReconfirm { binding } => {
             effects.insert(CommandEffectKind::FilesystemWrite);
             effects.insert(CommandEffectKind::PersistenceChange);
             complete &= !binding.invalid();
@@ -1943,6 +1951,13 @@ mod local_package_tree_tests {
         let materialize =
             infer_effects_detailed(&ProposedAction::LocalPackageMaterialize { binding: binding() });
         let undo = infer_effects_detailed(&ProposedAction::LocalPackageUndo { binding: binding() });
+        let reconfirm =
+            infer_effects_detailed(&ProposedAction::LocalPackageReconfirm { binding: binding() });
+        assert!(reconfirm.complete);
+        assert_eq!(reconfirm.effects, undo.effects);
+        assert!(!reconfirm
+            .effects
+            .contains(&CommandEffectKind::PackageInstall));
         assert!(materialize.complete && undo.complete);
         assert_eq!(
             materialize.effects,
@@ -1970,6 +1985,7 @@ mod local_package_tree_tests {
         for action in [
             ProposedAction::LocalPackageMaterialize { binding: binding() },
             ProposedAction::LocalPackageUndo { binding: binding() },
+            ProposedAction::LocalPackageReconfirm { binding: binding() },
         ] {
             let value = serde_json::to_value(action).unwrap();
             assert!(serde_json::from_value::<ProposedAction>(value.clone()).is_err());

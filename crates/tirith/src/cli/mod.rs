@@ -4,7 +4,12 @@ pub(crate) mod audit_health;
 pub mod audit_retention;
 pub(crate) mod automatic_deadline;
 pub mod feedback;
+pub(crate) mod npm_install;
+pub(crate) mod npm_install_recovery;
+#[cfg(target_os = "linux")]
+mod npm_install_transaction;
 pub(crate) mod npm_materialize;
+mod npm_operation_output;
 pub mod project_review;
 pub mod recommended_setup;
 pub(crate) mod setup_activation;

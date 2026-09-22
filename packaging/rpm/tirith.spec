@@ -57,9 +57,10 @@ echo "  bash (~/.bashrc):                       eval \"\$(tirith init)\""
 echo "  fish (~/.config/fish/config.fish):      tirith init | source"
 echo ""
 echo "Then restart your terminal. Verify: tirith doctor"
-echo "Native package approval is optional and never elevates automatically."
-echo "Only 'tirith pkg approve' needs trusted sudo plus fresh administrator confirmation."
-echo "Without it, package approval is unavailable; normal command checks and shell protection still work."
+echo "Privileged package approval is off by default and never elevates automatically."
+echo "When explicitly requested on a supported host, 'tirith pkg approve' needs trusted sudo and fresh administrator confirmation."
+echo "Missing sudo affects that approval flow; ordinary checks and shell protection remain available."
+echo "Package execution remains disabled pending native qualification."
 echo ""
 
 %changelog

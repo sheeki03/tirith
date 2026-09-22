@@ -16,6 +16,9 @@ const REQUIRED_FEATURES: &[&str] = &[
     "team_policy_runtime_v1",
     "team_policy_recovery_v1",
     "npm_materialization_recovery_v1",
+    "npm_materialization_private_review_v2",
+    "npm_install_intent_v1",
+    "npm_complete_only_reconfirmation_v1",
 ];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -192,10 +195,10 @@ fn preview(
         .iter()
         .any(|required| !document.features.iter().any(|feature| feature == required))
     {
-        issues.push("candidate lacks a required policy, scoped-grant, profile, team Runtime/recovery, materialization recovery, or owned-journal capability; automatic downgrade is unsupported".into());
+        issues.push("candidate lacks a required policy, scoped-grant, profile, team Runtime/recovery, materialization recovery, npm intent, or owned-journal capability; automatic downgrade is unsupported".into());
     }
-    if !document.persisted_formats.supports_current_recovery() {
-        issues.push("candidate lacks the current team or materialization format/recovery contract; preserve this binary and retained records for explicit recovery".into());
+    if !document.persisted_formats.supports_current_contract() {
+        issues.push("candidate lacks the current persisted-state reader or materialization recovery contract; preserve this binary and retained records for explicit recovery".into());
     }
     if document.operation_journal_version != 1
         || document.operation_journal_client_rule != "exact_client_version_required"
@@ -555,6 +558,9 @@ mod tests {
             "team_policy_runtime_v1",
             "team_policy_recovery_v1",
             "npm_materialization_recovery_v1",
+            "npm_materialization_private_review_v2",
+            "npm_install_intent_v1",
+            "npm_complete_only_reconfirmation_v1",
         ] {
             let mut missing = current.clone();
             missing.features.retain(|value| value != feature);
@@ -579,6 +585,21 @@ mod tests {
         // Keep an independent assertion for the receipt format transition:
         // deriving every expectation from readers() would miss a stale contract.
         assert_eq!(current.persisted_formats.shell_execution_receipt, [3, 4]);
+        assert_eq!(current.persisted_formats.npm_materialization_intent, [1, 2]);
+        let mut legacy_materialization = current.clone();
+        legacy_materialization
+            .persisted_formats
+            .npm_materialization_intent = vec![1];
+        // Even with no current records, do not replace the writer with a binary
+        // that cannot retain the schema 2 review contract.
+        assert!(preview(&legacy_materialization, "fixture", vec![])
+            .require_compatible()
+            .is_err());
+        assert_eq!(current.persisted_formats.npm_install_intent, [1]);
+        assert_eq!(
+            current.persisted_formats.npm_install_completion_milestone,
+            [1]
+        );
         for (surface, supported) in current.persisted_formats.readers() {
             assert!(!supported.is_empty(), "{surface} has no declared readers");
             let mut cases: Vec<_> = supported
@@ -636,6 +657,46 @@ mod tests {
                     "missing reader declaration for {surface}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn missing_npm_install_reader_refuses_even_absent_state_without_claiming_execution_recovery() {
+        let current = Document::current();
+        assert!(current
+            .features
+            .iter()
+            .any(|v| v == "npm_install_intent_v1"));
+        assert!(!current
+            .features
+            .iter()
+            .any(|v| v == "npm_install_recovery_v1"));
+        let mut raw = serde_json::to_value(&current).unwrap();
+        raw["persisted_formats"]
+            .as_object_mut()
+            .unwrap()
+            .remove("npm_install_intent");
+        let older: Document = serde_json::from_value(raw).unwrap();
+        older.validate().unwrap();
+        assert!(older.persisted_formats.npm_install_intent.is_empty());
+        // Preserve the existing future-write reader contract conservatism;
+        // absence at one inventory instant does not permit losing this reader.
+        for observed in [
+            vec![],
+            vec![super::super::lifecycle::FormatFact {
+                surface: "npm_install_intent",
+                declared_version: None,
+                state: "absent",
+            }],
+            vec![super::super::lifecycle::FormatFact {
+                surface: "npm_install_intent",
+                declared_version: Some(1),
+                state: "declared_local_unverified",
+            }],
+        ] {
+            assert!(preview(&older, "fixture", observed)
+                .require_compatible()
+                .is_err());
         }
     }
 

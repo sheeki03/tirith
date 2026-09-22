@@ -31,6 +31,8 @@ mod linux {
         UndoStarted,
         ContinueUndoStarted,
         ContinuedUndo,
+        PrivateMilestone,
+        CommittedMilestone,
     }
     impl RecordKind {
         fn suffix(self) -> &'static str {
@@ -45,6 +47,8 @@ mod linux {
                 Self::UndoStarted => "undo-started",
                 Self::ContinueUndoStarted => "continue-undo-started",
                 Self::ContinuedUndo => "continued-undo",
+                Self::PrivateMilestone => "private",
+                Self::CommittedMilestone => "committed",
             }
         }
     }
@@ -84,9 +88,39 @@ mod linux {
         identity: (u64, u64),
         operation: String,
         retained: BTreeMap<String, RetainedRecord>,
+        namespace: IntentNamespace,
+    }
+    #[derive(Clone, Copy)]
+    enum IntentNamespace {
+        Materialization,
+        NpmInstall,
+        NpmRecovery,
+    }
+    impl IntentNamespace {
+        fn directory(&self) -> &'static str {
+            match self {
+                Self::Materialization => "materialization-intents",
+                Self::NpmInstall => "npm-install-intents",
+                Self::NpmRecovery => "npm-install-recovery",
+            }
+        }
     }
     impl OperationStore {
         pub(crate) fn open(operation: &str, create: bool) -> std::io::Result<Self> {
+            Self::open_namespace(operation, create, IntentNamespace::Materialization)
+        }
+        /// Fixed, separate closed-install namespace. Callers cannot select a path.
+        pub(crate) fn open_npm_install(operation: &str, create: bool) -> std::io::Result<Self> {
+            Self::open_namespace(operation, create, IntentNamespace::NpmInstall)
+        }
+        pub(crate) fn open_npm_recovery(operation: &str, create: bool) -> std::io::Result<Self> {
+            Self::open_namespace(operation, create, IntentNamespace::NpmRecovery)
+        }
+        fn open_namespace(
+            operation: &str,
+            create: bool,
+            namespace: IntentNamespace,
+        ) -> std::io::Result<Self> {
             canonical_operation(operation)?;
             let state = tirith_core::policy::state_dir()
                 .ok_or_else(|| refusal("state directory unavailable"))?;
@@ -99,7 +133,7 @@ mod linux {
                     "materialization state root must be absolute without parent components",
                 ));
             }
-            let path = state.join("materialization-intents");
+            let path = state.join(namespace.directory());
             if create {
                 crate::cli::setup::fs_helpers::ensure_private_directory(&path, &state).map_err(
                     |_| refusal("cannot create private materialization state directory"),
@@ -115,6 +149,7 @@ mod linux {
                 identity,
                 operation: operation.into(),
                 retained: BTreeMap::new(),
+                namespace,
             };
             result.revalidate()?;
             Ok(result)
@@ -151,6 +186,27 @@ mod linux {
                 return Err(refusal("materialization history capacity reached"));
             }
             let name = self.name(kind);
+            let allowed = match self.namespace {
+                IntentNamespace::NpmRecovery => matches!(
+                    kind,
+                    RecordKind::PrivateMilestone | RecordKind::CommittedMilestone
+                ),
+                IntentNamespace::NpmInstall => matches!(
+                    kind,
+                    RecordKind::Intent
+                        | RecordKind::Started
+                        | RecordKind::Finished
+                        | RecordKind::Withdrawn
+                        | RecordKind::Recovered
+                ),
+                IntentNamespace::Materialization => !matches!(
+                    kind,
+                    RecordKind::PrivateMilestone | RecordKind::CommittedMilestone
+                ),
+            };
+            if !allowed {
+                return Err(refusal("record kind does not belong to fixed namespace"));
+            }
             // Exclusive creation is the durable compare-and-set. An interrupted
             // partial record is preserved and never interpreted as permission.
             let mut file = create_file_at(self.directory.as_raw_fd(), OsStr::new(&name), 0o600)?;
@@ -179,20 +235,34 @@ mod linux {
                     return Err(refusal("unexpected materialization record name"));
                 };
                 canonical_operation(id)?;
-                if !matches!(
-                    suffix,
-                    "intent.json"
-                        | "started.json"
-                        | "finished.json"
-                        | "withdrawn.json"
-                        | "recovered.json"
-                        | "undone.json"
-                        | "confirm-started.json"
-                        | "undo-started.json"
-                        | "continue-undo-started.json"
-                        | "continued-undo.json"
-                ) {
-                    return Err(refusal("unexpected materialization record name"));
+                let supported = match self.namespace {
+                    IntentNamespace::NpmRecovery => {
+                        matches!(suffix, "private.json" | "committed.json")
+                    }
+                    IntentNamespace::NpmInstall => matches!(
+                        suffix,
+                        "intent.json"
+                            | "started.json"
+                            | "finished.json"
+                            | "withdrawn.json"
+                            | "recovered.json"
+                    ),
+                    IntentNamespace::Materialization => matches!(
+                        suffix,
+                        "intent.json"
+                            | "started.json"
+                            | "finished.json"
+                            | "withdrawn.json"
+                            | "recovered.json"
+                            | "undone.json"
+                            | "confirm-started.json"
+                            | "undo-started.json"
+                            | "continue-undo-started.json"
+                            | "continued-undo.json"
+                    ),
+                };
+                if !supported {
+                    return Err(refusal("unexpected record in fixed namespace"));
                 }
             }
             for (name, record) in &self.retained {
@@ -374,6 +444,61 @@ mod linux {
                 assert!(store.read(RecordKind::Intent).is_err());
                 assert!(std::fs::symlink_metadata(&path).is_ok());
             }
+        }
+        #[test]
+        fn npm_install_namespace_has_separate_records_and_lock_authority() {
+            let scope = GlobalStateGuard::new().unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut materialize = OperationStore::open(&id, true).unwrap();
+            let mut install = OperationStore::open_npm_install(&id, true).unwrap();
+            assert_ne!(materialize.path, install.path);
+            materialize
+                .append(RecordKind::Intent, b"materialize".to_vec())
+                .unwrap();
+            assert!(install.read(RecordKind::Intent).unwrap().is_none());
+            install
+                .append(RecordKind::Intent, b"npm-install".to_vec())
+                .unwrap();
+            assert_eq!(
+                materialize.read(RecordKind::Intent).unwrap(),
+                Some(b"materialize".to_vec())
+            );
+            assert_eq!(
+                install.read(RecordKind::Intent).unwrap(),
+                Some(b"npm-install".to_vec())
+            );
+            assert!(OperationStore::open_npm_install(&id, false).is_err());
+            assert!(OperationStore::open(&id, false).is_err());
+            drop(install);
+            assert!(OperationStore::open_npm_install(&id, false).is_ok());
+            assert!(OperationStore::open(&id, false).is_err());
+            assert!(scope.roots().cwd.exists());
+        }
+        #[test]
+        fn npm_install_store_refuses_replaced_namespace_and_preserves_original_record() {
+            let _scope = GlobalStateGuard::new().unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut install = OperationStore::open_npm_install(&id, true).unwrap();
+            install
+                .append(RecordKind::Intent, b"retained".to_vec())
+                .unwrap();
+            let displaced = install.path.with_file_name("retained-npm-install-intents");
+            std::fs::rename(&install.path, &displaced).unwrap();
+            std::fs::create_dir(&install.path).unwrap();
+            std::fs::set_permissions(&install.path, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            assert!(install.revalidate().is_err());
+            assert!(install
+                .append(RecordKind::Started, b"forged".to_vec())
+                .is_err());
+            assert_eq!(
+                std::fs::read(displaced.join(install.name(RecordKind::Intent))).unwrap(),
+                b"retained"
+            );
+            assert!(!install
+                .path
+                .join(install.name(RecordKind::Started))
+                .exists());
         }
         #[test]
         fn store_lock_release_is_not_extended_by_a_retained_descriptor() {

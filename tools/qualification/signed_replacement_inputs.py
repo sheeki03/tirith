@@ -25,7 +25,7 @@ TARGETS = {("Darwin", "arm64"): "aarch64-apple-darwin",
            ("Linux", "x86_64"): "x86_64-unknown-linux-gnu"}
 # Explicit complete local workspace scopes, including compile-time embedded
 # fixtures/assets, every local workspace package and compatibility generator.
-SCOPES = ("Cargo.toml", "Cargo.lock", "crates", "tools/sign-license",
+SCOPES = ("Cargo.toml", "Cargo.lock", "crates", "tests/fixtures", "tools/sign-license",
           "tools/license-server", "tools/policy-server", "threatdb-manifest.json",
           ".github/scripts/release-compatibility.py", "tools/qualification/mixed_audit_native.py")
 OPTIONAL = (".cargo", "rust-toolchain", "rust-toolchain.toml", "build.rs")
@@ -36,6 +36,8 @@ GENERATOR_INPUTS = ("Cargo.toml", ".github/scripts/release-compatibility.py",
                     "crates/tirith/src/cli/control/lifecycle.rs",
                     "crates/tirith-core/src/policy_team.rs",
                     "crates/tirith/src/cli/npm_materialize.rs",
+                    "crates/tirith/src/cli/npm_install.rs",
+                    "crates/tirith/src/cli/npm_install_recovery.rs",
                     "crates/tirith-core/src/artifact/npm_materialize.rs",
                     "crates/tirith-core/src/execution_state/shell_receipt.rs")
 

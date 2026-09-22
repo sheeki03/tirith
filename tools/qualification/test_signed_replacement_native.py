@@ -51,6 +51,18 @@ class SignedReplacementInputs(unittest.TestCase):
             with self.assertRaises(ValueError):
                 inputs.scan_source(source)
 
+    def test_workspace_source_scope_retains_root_compile_time_fixtures(self):
+        self.assertIn("tests/fixtures", inputs.SCOPES)
+        source = self.root / "source"
+        fixture = source / "tests/fixtures/embedded.dat"
+        fixture.parent.mkdir(mode=0o700, parents=True)
+        inputs.write_new(fixture, b"compile-time bytes")
+        with patch.object(inputs, "SCOPES", ("tests/fixtures",)), patch.object(inputs, "OPTIONAL", ()):
+            before = inputs.scan_source(source)
+            self.assertEqual(before["files"], [{"path": "tests/fixtures/embedded.dat", **inputs.identity(b"compile-time bytes")}])
+            fixture.write_bytes(b"changed compile-time bytes")
+            self.assertNotEqual(before, inputs.scan_source(source))
+
     def test_native_input_generation_change_and_link_are_refused(self):
         path = self.file("input", b"first")
         with inputs.HeldFile(path, 64) as held:

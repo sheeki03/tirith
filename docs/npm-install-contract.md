@@ -1,9 +1,39 @@
 # LocalLeafNoScriptsV1 installation contract
 
-Status: proposed bounded execution contract for WP26, requiring independent
-review and native enforcement evidence before a protected install route is
-enabled. The shipped local npm inspection/comparison API does not authorize
-installation.
+Status: the bounded WP26 implementation is registered for review and tracking.
+Native execution remains disabled on every host until the complete launch,
+publication and recovery route passes qualification. Inspection, comparison and
+saved review records do not authorize installation. Administrator access and
+confirmation flags do not enable the route.
+
+## Command lifecycle
+
+On Linux, `tirith pkg install-npm plan ARCHIVE... --target NEW_DIRECTORY`
+reinspects exact local archives and records an immutable review intent. Its
+output identifies the operation and the digest to review. `status OPERATION`
+reads historical observations. `apply OPERATION --reviewed DIGEST` requires that
+exact review and recaptures current inputs, policy and task authority; it
+currently refuses at the native qualification gate before recording a start.
+
+The review digest commits to the entire intent, including private policy inputs,
+working directory and retained archive generations. A private random nonce
+prevents that public digest from exposing a guessable policy commitment. Editing
+private state requires a different review digest even when the public display
+looks unchanged. Display redaction never rewrites the canonical intent.
+
+`undo OPERATION --reviewed DIGEST` can withdraw an unstarted intent. A started
+operation cannot be replayed or treated as unstarted merely because its final
+response is missing. `recover OPERATION --reviewed DIGEST` can reconfirm an
+already published tree using exact signed completion milestones, linked receipts
+and fresh archive, policy, threat-data and task checks. It never replays npm or
+modifies the target. Missing, private-only, changed or ambiguous state is
+preserved. All routes accept `--json`. Other platforms refuse before creating
+installation intent state.
+
+This uses separate private `npm-install-intents` and `npm-install-recovery`
+stores. Update and rollback compatibility require explicit readers for both
+schemas. The local
+`pkg materialize` command retains its separate data-only contract.
 
 ## Supported request
 
@@ -43,24 +73,17 @@ for that decision. The plan retains the source handles and private decision
 commitment and revalidates them before staging or other effects. This closes the
 preparation authority gap; it does not enable the contained install launcher.
 
+The source must be a current, production-signed ThreatDB v2 with artifact-hash
+coverage. A valid v1 signature alone cannot provide that coverage. The published
+v1 feed is insufficient for this route; a qualified v2 feed is a prerequisite,
+not something administrator privileges can replace.
+
 Before launch, the operation revalidates policy and every bound tool/input/
 destination generation under its retained authority boundary. Any changed byte,
 resolution input, expiry or destination refuses. A successful preview is not an
 authorization token independent of these inputs. Retries use the shared durable
 operation journal and immutable intent binding; they do not regenerate a
 different install under the same UUID.
-
-Suggested pure core interface:
-
-```rust
-prepare_local_leaf_install(
-    artifacts: &[VerifiedNpmArtifact],
-    policy: &EffectivePolicySnapshot,
-    tools: &QualifiedNpmToolClosure,
-    destination: &NewDestinationIdentity,
-    backend: &QualifiedCapsuleCoverage,
-) -> Result<NpmInstallPlan, NpmInstallRefusal>
-```
 
 `VerifiedNpmArtifact` must be constructible only from the retained/quarantined
 bytes and complete dependency-field capture. A deserialized inspection report
@@ -76,19 +99,30 @@ environment, project root and working directory are isolated; ambient project
 The install uses only staged local artifacts with offline operation and actual
 deny-all network enforcement. CLI flags alone are not containment.
 
-The child receives read access to the immutable staged artifacts and qualified
-tool closure, and write access only to a fresh transaction tree. It cannot write
-the existing project or an existing environment. The launcher requires native
-filesystem, raw-network and resource restrictions and fails closed when any
-required primitive is missing. It uses the existing bound-input capsule path,
-never the uncontained generic install runner.
+The registered ARM64 launch path passes sealed descriptors for the pinned Node
+executable, bootstrap, npm runtime pack, archives and empty configuration. The
+protected child copies Node into its own execute-only sealed inode so a peer
+cannot change its permissions through the parent's copy. Only nine exact
+runtime files receive filesystem read grants; only the pinned ELF interpreter
+receives an execution grant. Writable grants cover the new private target and
+temporary cache. The existing generic private-input execution path stays
+disabled.
 
-The exact npm argv remains part of qualification: candidate controls include
+The launcher requires native filesystem, raw-network and resource restrictions
+and refuses when any required primitive is missing. Its ARM64 seccomp filter
+restricts `execveat` to the initial numeric Node descriptor and denies pathname
+execution. That numeric check is not a stateful one-execution guarantee:
+descriptor reuse remains possible, and the pinned interpreter has an execution
+grant. Qualification must test this boundary; the source implementation alone
+does not establish containment.
+
+The exact npm argv remains part of qualification. Fixed controls include
 offline mode, ignored scripts, no audit/fund/update checks, disabled bin links,
 no root lockfile/save mutation, and an explicit transaction target. Their
-complete interaction must be observed on the pinned npm version, including
-hidden lockfiles and package metadata rewriting, before that argv is admitted
-to the closed contract table.
+complete interaction is bound to Node 26.7.0 and npm 11.19.0, including the entire
+hidden lockfile and physical target path used in its package keys. Native stock
+npm characterization has passed for the sealed bootstrap, but the full Tirith
+launch and output-verification transaction still needs native acceptance.
 
 ## Verification and recovery
 
@@ -101,11 +135,27 @@ success exit is not proof of installation integrity.
 Only a verified new tree can be published at the reserved destination through a
 retained-parent transaction. No existing environment is overwritten. The shared
 journal records staging, launch acceptance, child completion, verification and
-publication. Cancellation or crash before publication leaves only owned staging
-state; recovery never reruns an accepted install without establishing its prior
-outcome. Cleanup requires the original owned directory identity. External edits
-or uncertain publication produce a recovery-required state, not blanket
-rollback or deletion of user state.
+publication. Cancellation or crash may leave private staging and an uncertain
+execution outcome. Unknown child cleanup preserves the checkpoint. Recovery
+must never rerun an accepted installation. Cleanup requires retained current
+directory authority and verified state; a saved inode number alone does not
+prove ownership across a crash. External edits or uncertain publication require
+preservation. Published environments are never recursively deleted by this
+transaction.
+
+Only the native supervisor can produce the in-process completion witness used
+to sign a private completion milestone. It requires a successful authenticated
+launch, zero exit, complete containment and observed child/cache cleanup. A
+second signed milestone binds the linked committed receipt and the whole
+published tree. Recovery verifies both signatures using the trusted audit key,
+rechecks exact receipt contents and freshly observes every tree entry, file
+digest and metadata generation. A key supplied inside a milestone is never
+trusted. A signing challenge checks the configured private/public key pair
+before launch; mandatory milestone verification checks it again afterward.
+This establishes agreement with a recorded completed installation; it does not
+establish uninterrupted inode ownership or ongoing immutability. Private cleanup
+after a restart remains unavailable when retained ownership or quiescence cannot
+be established.
 
 ## Required acceptance evidence
 
@@ -119,8 +169,8 @@ rollback or deletion of user state.
   and cleanup under replaced directories.
 
 The available Docker server uses an aarch64 Linux 6.12.76 kernel. A separate WP27
-native aarch64 Landlock/seccomp qualification is in progress; existing protected
-package approvals still require x86_64. An emulated x86_64 process on that ARM
-kernel is not evidence of native x86_64 seccomp enforcement. Native x86_64 CI or
-a separately qualified aarch64 package-launch path is required before enabling
-this execution capability.
+native aarch64 Landlock/seccomp backend has passed its separate primitive and
+launcher checks, but that does not qualify this npm transaction. Existing
+package execution remains disabled. An emulated x86_64 process on an ARM kernel
+is not evidence of native x86_64 seccomp enforcement. The complete native npm
+contract must pass before this execution capability is enabled.

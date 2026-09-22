@@ -98,6 +98,18 @@ struct BoundLayout {
 }
 
 impl<'a> PreparedNpmExecution<'a> {
+    /// Identity of this retained preparation; a public string is not launch
+    /// authority and cannot reconstruct the opaque native completion proof.
+    pub fn operation_id(&self) -> &str {
+        &self.plan.id
+    }
+
+    /// The exact live preparation operation, used to reject an unrelated
+    /// checkpoint launch lease before any native child can be created.
+    pub fn operation(&self) -> BoundaryOperation<'_> {
+        self.plan.operation()
+    }
+
     pub fn capture(
         plan: &'a NpmInstallPlan,
         artifacts: &'a [VerifiedNpmArtifact],
@@ -173,6 +185,19 @@ impl<'a> PreparedNpmExecution<'a> {
         };
         prepared.revalidate()?;
         Ok(prepared)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn recovery_plan_binding(&self) -> Result<recovery::NpmRecoveryPlanBinding> {
+        self.revalidate_inputs()?;
+        self.plan.destination.revalidate_parent()?;
+        Ok(recovery::NpmRecoveryPlanBinding {
+            operation_id: self.plan.id.clone(),
+            private_plan_digest: self.plan.digest.clone(),
+            public_plan_digest: self.plan.summary.public_plan_digest.clone(),
+            target: self.target_policy_path(),
+            parent_identity: self.plan.destination.identity,
+        })
     }
 
     pub fn program(&self) -> Result<&crate::trusted_child::TrustedExecutable> {
@@ -464,8 +489,20 @@ impl<'a> PreparedNpmExecution<'a> {
         verify_tree(&published_path, &verified.retained, &verified.expected)
     }
 
+    /// Record the final preparation milestone after the CLI confirms its linked
+    /// signed committed receipt. This journal remains history, never authority.
+    pub fn record_published(&self, verified: &VerifiedNpmTree) -> Result<()> {
+        self.revalidate_published(verified)?;
+        self.write_phase_record(PreparationPhase::Published)?;
+        self.revalidate_published(verified)
+    }
+
     fn write_phase(&self, phase: PreparationPhase) -> Result<()> {
         self.revalidate_sources()?;
+        self.write_phase_record(phase)
+    }
+
+    fn write_phase_record(&self, phase: PreparationPhase) -> Result<()> {
         let record = PreparationRecord {
             schema: 1,
             contract: CONTRACT.into(),
@@ -702,6 +739,47 @@ mod tests {
             relative_posix(prefix, Path::new("/tmp/fixture/staging/npm-a.tgz")).unwrap(),
             "../npm-a.tgz"
         );
+    }
+
+    #[test]
+    fn actual_artifact_metadata_uses_physical_package_keys_and_sealed_sources() {
+        let bytes = include_bytes!("../../tests/fixtures/npm/npm-11.19.0-portable-pax.tgz");
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), bytes).unwrap();
+        let artifact = VerifiedNpmArtifact::open(input.path()).unwrap();
+        let operands = [NpmArtifactOperand {
+            sha256: artifact.sha256().into(),
+            operand: "/proc/self/fd/8".into(),
+        }];
+        let actual = expected_hidden_lock(
+            &[artifact],
+            &operands,
+            Path::new("/proc/self/fd/3"),
+            Path::new("/work/target"),
+        )
+        .unwrap();
+        let key = "../../../../work/target/node_modules/tirith-local-inspection-fixture";
+        let expected = serde_json::json!({"lockfileVersion":3,"requires":true,"packages":{
+            key:{"version":"1.0.0","resolved":"file:../8","hasInstallScript":true,
+                "integrity":format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes)))}
+        }});
+        assert_eq!(actual, expected);
+        metadata::verify_hidden_lock(&serde_json::to_vec(&actual).unwrap(), &expected).unwrap();
+        let mut wrong_key = actual.clone();
+        let packages = wrong_key["packages"].as_object_mut().unwrap();
+        let row = packages.remove(key).unwrap();
+        packages.insert("node_modules/tirith-local-inspection-fixture".into(), row);
+        assert!(
+            metadata::verify_hidden_lock(&serde_json::to_vec(&wrong_key).unwrap(), &expected)
+                .is_err()
+        );
+        let mut wrong_source = actual.clone();
+        wrong_source["packages"][key]["resolved"] = Value::String("file:../9".into());
+        assert!(metadata::verify_hidden_lock(
+            &serde_json::to_vec(&wrong_source).unwrap(),
+            &expected
+        )
+        .is_err());
     }
 
     #[test]

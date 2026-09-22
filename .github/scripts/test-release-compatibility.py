@@ -56,24 +56,51 @@ class PublicationTests(unittest.TestCase):
             "team_connection", "team_enrollment", "team_report", "team_rollout",
             "team_policy_document", "team_policy_semantics", "npm_materialization_intent",
             "npm_materialization_checkpoint", "npm_materialization_inventory",
-            "npm_materialization_recovery_rule", "shell_execution_receipt",
+            "npm_materialization_recovery_rule", "shell_execution_receipt", "npm_install_intent",
+            "npm_install_completion_milestone",
         })
         self.assertTrue(all(value == [1] for name, value in readers.items()
-                            if name not in ("npm_materialization_recovery_rule", "shell_execution_receipt")))
+                            if name not in ("npm_materialization_recovery_rule", "npm_materialization_intent", "shell_execution_receipt")))
         self.assertEqual(readers["shell_execution_receipt"], [3, 4])
+        self.assertEqual(readers["npm_materialization_intent"], [1, 2])
+        self.assertIn("npm_materialization_private_review_v2", result["features"])
+        self.assertEqual(readers["npm_install_intent"], [1])
+        self.assertIn("npm_install_intent_v1", result["features"])
+        self.assertIn("npm_complete_only_reconfirmation_v1", result["features"])
+        self.assertNotIn("npm_install_recovery_v1", result["features"])
         self.assertEqual(readers["npm_materialization_recovery_rule"],
-                         "linux_only_fresh_policy_and_exact_current_ownership_required")
+                         "linux_only_schema2_bound_review_fresh_policy_and_exact_current_ownership_required")
         self.assertTrue({"team_policy_runtime_v1", "team_policy_recovery_v1",
                          "npm_materialization_recovery_v1"} <= set(result["features"]))
         original = MODULE.source_constant
         for changed in ("SCHEMA_VERSION", "POLICY_SEMANTICS_VERSION", "INTENT_SCHEMA_VERSION",
                         "CHECKPOINT_SCHEMA_VERSION", "RECOVERY_INVENTORY_VERSION",
-                        "RECEIPT_SCHEMA_VERSION", "ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION"):
+                        "RECEIPT_SCHEMA_VERSION", "ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION", "RECOVERY_MILESTONE_SCHEMA_VERSION"):
             def replaced(root, path, name):
                 return 99 if name == changed else original(root, path, name)
             with self.subTest(changed=changed), patch.object(MODULE, "source_constant", replaced):
                 with self.assertRaisesRegex(ValueError, "persisted format implementation changed"):
                     MODULE.contract(ROOT, VERSION)
+
+    def test_materialization_legacy_writer_cannot_claim_full_review_binding(self):
+        original = MODULE.source_constant
+        def changed(root, path, name):
+            if path == "crates/tirith/src/cli/npm_materialize.rs" and name == "INTENT_SCHEMA_VERSION":
+                return 1
+            return original(root, path, name)
+        with patch.object(MODULE, "source_constant", changed):
+            with self.assertRaisesRegex(ValueError, "persisted format implementation changed"):
+                MODULE.contract(ROOT, VERSION)
+
+    def test_npm_install_schema_is_bound_independently_from_materialization(self):
+        original = MODULE.source_constant
+        def changed(root, path, name):
+            if path == "crates/tirith/src/cli/npm_install.rs" and name == "INTENT_SCHEMA_VERSION":
+                return 99
+            return original(root, path, name)
+        with patch.object(MODULE, "source_constant", changed):
+            with self.assertRaisesRegex(ValueError, "persisted format implementation changed"):
+                MODULE.contract(ROOT, VERSION)
 
     def test_signed_fixture_holds_every_literal_generator_source_dependency(self):
         # The fixture invokes this generator only while its declared inputs are
