@@ -2610,6 +2610,15 @@ fn tmp_roots() -> Vec<std::path::PathBuf> {
 /// (ch5): forces `fail_mode=Closed`, disables the bypass, elevates
 /// [`crate::incident::INCIDENT_ELEVATED_RULES`]. A corrupt flag fails SAFE.
 pub fn analyze(ctx: &AnalysisContext) -> Verdict {
+    static WP17_VISITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    // WP17 QUALIFICATION MUTANT ONLY: intentional real allocation; never ship.
+    let _wp17_padding = if ctx.input == "git status" && WP17_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        let mut bytes = vec![0u8; 0];
+        // Touch every page, so this is physical RSS as well as an allocator request.
+        for page in bytes.chunks_mut(4096) { std::hint::black_box(page)[0] = 0xa5; }
+        std::hint::black_box(bytes.as_slice());
+        Some(bytes)
+    } else { None };
     analyze_inner(ctx, true).0
 }
 
