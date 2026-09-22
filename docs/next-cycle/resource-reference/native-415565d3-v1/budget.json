@@ -1,0 +1,120 @@
+{
+  "schema_version": 2,
+  "status": "reviewed",
+  "review": "docs/next-cycle/resource-reference/native-415565d3-v1/threshold-review.json; SHA-256 202745c90b5b113858cfa0155bc62cea32ab2288a19a15aa16d20ae55745ef31; threshold review only, isolated detector qualification, CI not enabled",
+  "scope": "Six byte metrics on the native Apple M1 (Virtual) macos-15 cohort at source 415565d3; not final release, whole-hook timing, Windows or fleet qualification.",
+  "host": {
+    "system": "Darwin",
+    "release": "24.6.0",
+    "machine": "arm64"
+  },
+  "runner": {
+    "label": "macos-15",
+    "image": "macos15",
+    "image_version": "20260907.0337.1",
+    "cpu_model": "Apple M1 (Virtual)",
+    "logical_cpus": 3
+  },
+  "producer_sha256": {
+    "local": "b6e66f4276e7746a4877998b9481375477c64a8a8f7c7be24976fe031f64f785",
+    "allocation": "d27263ac94b9859096ff6253aa3f1cf3ac60eb2d7fe5dcfd3edf148b360d5050"
+  },
+  "native_helper_sha256": "913a3499bd78b39c6870b9dc280fcaad8a49739db7f2781bbfe914ff4db12e75",
+  "history_fixture": {
+    "local": {
+      "rows": 250000,
+      "bytes": 98500000
+    },
+    "allocation": {
+      "bytes": 4360000,
+      "rows": 10000
+    }
+  },
+  "build_contract": {
+    "build_profile": "release",
+    "rustc_verbose": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8",
+    "cargo_verbose": "cargo 1.98.1 (797e8a9bc 2026-08-05)\nrelease: 1.98.1\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\ncommit-date: 2026-08-05\nhost: aarch64-apple-darwin\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\nlibcurl: 8.7.1 (sys:0.4.90+curl-8.21.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Mac OS 15.7.9 [64-bit]",
+    "build_manifest_sha256": {
+      "Cargo.toml": "0f9f51fdaf2d020b92f32ef819932237d974ec949a435a4978632ab56e75c0e4",
+      "Cargo.lock": "dd63693eedf0d10a651227bdd75f55c9dab583cb12d3f15ecbe48ed9df9e5546"
+    },
+    "workflow_path": "sheeki03/tirith/.github/workflows/bench.yml"
+  },
+  "workload_samples": {
+    "local": 100,
+    "allocation": 100
+  },
+  "baseline_evidence": [
+    {
+      "run_id": "35573095026/1",
+      "context_sha256": "2218bc4c810a51dbf082b66de20dde5fd6da8c292ae04ba7f5652a1500a57197",
+      "source_revision": "415565d307c39e7000255955150185f3287581a6",
+      "build_profile": "release",
+      "derivation": "https://github.com/sheeki03/tirith/actions/runs/35573095026/artifacts/10626464210; recorded archive SHA-256 f008da58de0346ab7cb3854e6dd3d131e05772549e814bec4cb350e9879233c6; extracted file hashes independently checked in threshold-review.json",
+      "build_provenance_sha256": "48e54f8f55b65e7b5309fe470699503cb8063b8ac4c68b462bd495bd0e1b8a03",
+      "runner_boot_id": "7455598b-0eab-4b46-b4af-5eed7e4cbf28"
+    },
+    {
+      "run_id": "35573107325/1",
+      "context_sha256": "e69672f28885a2b7b291b621edbd3fecf4fe97367e4922016cdbb421d99a21a6",
+      "source_revision": "415565d307c39e7000255955150185f3287581a6",
+      "build_profile": "release",
+      "derivation": "https://github.com/sheeki03/tirith/actions/runs/35573107325/artifacts/10627393003; recorded archive SHA-256 08125e5e95522012da607064034ceae15940cc9df98cc5228b898eb1d4df00d9; extracted file hashes independently checked in threshold-review.json",
+      "build_provenance_sha256": "004b7e506dae03cc72bf32415aa18ce676b22313268f7df59a5889b32edf79bb",
+      "runner_boot_id": "a4930c2f-15a0-424c-9095-554f4ed1cd33"
+    },
+    {
+      "run_id": "35573122692/1",
+      "context_sha256": "212498241d6d0166c8a20fe66e46d2d63f695e3f616c9e457423430665e405fd",
+      "source_revision": "415565d307c39e7000255955150185f3287581a6",
+      "build_profile": "release",
+      "derivation": "https://github.com/sheeki03/tirith/actions/runs/35573122692/artifacts/10626573876; recorded archive SHA-256 a19218d863225015ad56940330b1a3c3cda4d7d149fcd51956d80a0d8ff2fa7e; extracted file hashes independently checked in threshold-review.json",
+      "build_provenance_sha256": "8799f6196bf7b52e7c3f2e4ff806ce6753b6c23a68716231fafd4526bbda23c5",
+      "runner_boot_id": "c96e1206-ce63-4d23-9348-18010b0c7df8"
+    }
+  ],
+  "limits": [
+    {
+      "metric": "allocation.analysis_clean.requested_bytes.max",
+      "unit": "bytes",
+      "maximum": 67108864,
+      "minimum_samples": 100,
+      "rationale": "Explicit coarse regression ceiling: three independent matching native runs have maximum 48307398 bytes and spread 0 bytes, leaving 38.92% headroom. Allocation metrics were deterministic across these runs; RSS includes measured native variation. Requires independent threshold review and the predeclared real-growth test before activation; no timing, live-heap or fleet guarantee."
+    },
+    {
+      "metric": "allocation.analysis_clean.subsequent.requested_bytes.max",
+      "unit": "bytes",
+      "maximum": 131072,
+      "minimum_samples": 99,
+      "rationale": "Explicit coarse regression ceiling: three independent matching native runs have maximum 120397 bytes and spread 0 bytes, leaving 8.87% headroom. Allocation metrics were deterministic across these runs; RSS includes measured native variation. Requires independent threshold review and the predeclared real-growth test before activation; no timing, live-heap or fleet guarantee."
+    },
+    {
+      "metric": "allocation.analysis_url_pipeline.requested_bytes.max",
+      "unit": "bytes",
+      "maximum": 100663296,
+      "minimum_samples": 100,
+      "rationale": "Explicit coarse regression ceiling: three independent matching native runs have maximum 72060138 bytes and spread 0 bytes, leaving 39.69% headroom. Allocation metrics were deterministic across these runs; RSS includes measured native variation. Requires independent threshold review and the predeclared real-growth test before activation; no timing, live-heap or fleet guarantee."
+    },
+    {
+      "metric": "allocation.analysis_url_pipeline.subsequent.requested_bytes.max",
+      "unit": "bytes",
+      "maximum": 2097152,
+      "minimum_samples": 99,
+      "rationale": "Explicit coarse regression ceiling: three independent matching native runs have maximum 1670536 bytes and spread 0 bytes, leaving 25.54% headroom. Allocation metrics were deterministic across these runs; RSS includes measured native variation. Requires independent threshold review and the predeclared real-growth test before activation; no timing, live-heap or fleet guarantee."
+    },
+    {
+      "metric": "allocation.history_recent_100.requested_bytes.max",
+      "unit": "bytes",
+      "maximum": 12582912,
+      "minimum_samples": 100,
+      "rationale": "Explicit coarse regression ceiling: three independent matching native runs have maximum 8692440 bytes and spread 0 bytes, leaving 44.76% headroom. Allocation metrics were deterministic across these runs; RSS includes measured native variation. Requires independent threshold review and the predeclared real-growth test before activation; no timing, live-heap or fleet guarantee."
+    },
+    {
+      "metric": "local.ordinary_check.peak_rss_bytes.max",
+      "unit": "bytes",
+      "maximum": 50331648,
+      "minimum_samples": 100,
+      "rationale": "Explicit coarse regression ceiling: three independent matching native runs have maximum 44613632 bytes and spread 1949696 bytes, leaving 12.82% headroom. Allocation metrics were deterministic across these runs; RSS includes measured native variation. Requires independent threshold review and the predeclared real-growth test before activation; no timing, live-heap or fleet guarantee."
+    }
+  ]
+}

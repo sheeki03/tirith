@@ -1,0 +1,202 @@
+{
+  "scope": "Independent read-only review of retained exact-415565d3 native baselines and proposed byte ceilings, not final-source qualification or active budget",
+  "blockers": [],
+  "independent_recompute_matches_parent_report": true,
+  "archive_verification_scope": "Rehashed all extracted files against retained extraction manifests and checked recorded archive digests match GitHub API metadata. Archive bytes were not retained here, so independent archive-byte rehash was not performed.",
+  "runs": [
+    {
+      "run": 35573095026,
+      "artifact_id": 10626464210,
+      "files_rehashed": 21,
+      "recorded_archive_sha256": "f008da58de0346ab7cb3854e6dd3d131e05772549e814bec4cb350e9879233c6",
+      "provenance": {
+        "schema_version": 1,
+        "source_revision": "415565d307c39e7000255955150185f3287581a6",
+        "source_tree": "4a86ecaac65cfad1bc1bf6334bee6faac75dee2b",
+        "selected_measurement_source": "415565d307c39e7000255955150185f3287581a6",
+        "expected_measurement_tree": null,
+        "event_revision": "415565d307c39e7000255955150185f3287581a6",
+        "run_id": "35573095026/1",
+        "workflow_ref": "sheeki03/tirith/.github/workflows/bench.yml@refs/heads/codex/next-cycle-foundations",
+        "workflow_sha": "415565d307c39e7000255955150185f3287581a6",
+        "runner_name": "GitHub Actions 1000036319",
+        "runner_boot_id": "7455598b-0eab-4b46-b4af-5eed7e4cbf28",
+        "runner_class": {
+          "system": "Darwin",
+          "release": "24.6.0",
+          "machine": "arm64",
+          "image": "macos15",
+          "image_version": "20260907.0337.1",
+          "cpu_model": "Apple M1 (Virtual)",
+          "logical_cpus": 3
+        },
+        "expected_reference_class": null,
+        "source_clean_before_build": true,
+        "rustc_verbose": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8",
+        "cargo_verbose": "cargo 1.98.1 (797e8a9bc 2026-08-05)\nrelease: 1.98.1\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\ncommit-date: 2026-08-05\nhost: aarch64-apple-darwin\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\nlibcurl: 8.7.1 (sys:0.4.90+curl-8.21.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Mac OS 15.7.9 [64-bit]",
+        "build_profile": "release",
+        "build_manifest_sha256": {
+          "Cargo.toml": "0f9f51fdaf2d020b92f32ef819932237d974ec949a435a4978632ab56e75c0e4",
+          "Cargo.lock": "dd63693eedf0d10a651227bdd75f55c9dab583cb12d3f15ecbe48ed9df9e5546"
+        },
+        "expected_build_manifest_sha256": null,
+        "reference_cohort": null,
+        "workload_samples": 100,
+        "admission_issues": []
+      }
+    },
+    {
+      "run": 35573107325,
+      "artifact_id": 10627393003,
+      "files_rehashed": 21,
+      "recorded_archive_sha256": "08125e5e95522012da607064034ceae15940cc9df98cc5228b898eb1d4df00d9",
+      "provenance": {
+        "schema_version": 1,
+        "source_revision": "415565d307c39e7000255955150185f3287581a6",
+        "source_tree": "4a86ecaac65cfad1bc1bf6334bee6faac75dee2b",
+        "selected_measurement_source": "415565d307c39e7000255955150185f3287581a6",
+        "expected_measurement_tree": null,
+        "event_revision": "415565d307c39e7000255955150185f3287581a6",
+        "run_id": "35573107325/1",
+        "workflow_ref": "sheeki03/tirith/.github/workflows/bench.yml@refs/heads/codex/next-cycle-foundations",
+        "workflow_sha": "415565d307c39e7000255955150185f3287581a6",
+        "runner_name": "GitHub Actions 1000036320",
+        "runner_boot_id": "a4930c2f-15a0-424c-9095-554f4ed1cd33",
+        "runner_class": {
+          "system": "Darwin",
+          "release": "24.6.0",
+          "machine": "arm64",
+          "image": "macos15",
+          "image_version": "20260907.0337.1",
+          "cpu_model": "Apple M1 (Virtual)",
+          "logical_cpus": 3
+        },
+        "expected_reference_class": null,
+        "source_clean_before_build": true,
+        "rustc_verbose": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8",
+        "cargo_verbose": "cargo 1.98.1 (797e8a9bc 2026-08-05)\nrelease: 1.98.1\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\ncommit-date: 2026-08-05\nhost: aarch64-apple-darwin\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\nlibcurl: 8.7.1 (sys:0.4.90+curl-8.21.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Mac OS 15.7.9 [64-bit]",
+        "build_profile": "release",
+        "build_manifest_sha256": {
+          "Cargo.toml": "0f9f51fdaf2d020b92f32ef819932237d974ec949a435a4978632ab56e75c0e4",
+          "Cargo.lock": "dd63693eedf0d10a651227bdd75f55c9dab583cb12d3f15ecbe48ed9df9e5546"
+        },
+        "expected_build_manifest_sha256": null,
+        "reference_cohort": null,
+        "workload_samples": 100,
+        "admission_issues": []
+      }
+    },
+    {
+      "run": 35573122692,
+      "artifact_id": 10626573876,
+      "files_rehashed": 21,
+      "recorded_archive_sha256": "a19218d863225015ad56940330b1a3c3cda4d7d149fcd51956d80a0d8ff2fa7e",
+      "provenance": {
+        "schema_version": 1,
+        "source_revision": "415565d307c39e7000255955150185f3287581a6",
+        "source_tree": "4a86ecaac65cfad1bc1bf6334bee6faac75dee2b",
+        "selected_measurement_source": "415565d307c39e7000255955150185f3287581a6",
+        "expected_measurement_tree": null,
+        "event_revision": "415565d307c39e7000255955150185f3287581a6",
+        "run_id": "35573122692/1",
+        "workflow_ref": "sheeki03/tirith/.github/workflows/bench.yml@refs/heads/codex/next-cycle-foundations",
+        "workflow_sha": "415565d307c39e7000255955150185f3287581a6",
+        "runner_name": "GitHub Actions 1000036321",
+        "runner_boot_id": "c96e1206-ce63-4d23-9348-18010b0c7df8",
+        "runner_class": {
+          "system": "Darwin",
+          "release": "24.6.0",
+          "machine": "arm64",
+          "image": "macos15",
+          "image_version": "20260907.0337.1",
+          "cpu_model": "Apple M1 (Virtual)",
+          "logical_cpus": 3
+        },
+        "expected_reference_class": null,
+        "source_clean_before_build": true,
+        "rustc_verbose": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8",
+        "cargo_verbose": "cargo 1.98.1 (797e8a9bc 2026-08-05)\nrelease: 1.98.1\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\ncommit-date: 2026-08-05\nhost: aarch64-apple-darwin\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\nlibcurl: 8.7.1 (sys:0.4.90+curl-8.21.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Mac OS 15.7.9 [64-bit]",
+        "build_profile": "release",
+        "build_manifest_sha256": {
+          "Cargo.toml": "0f9f51fdaf2d020b92f32ef819932237d974ec949a435a4978632ab56e75c0e4",
+          "Cargo.lock": "dd63693eedf0d10a651227bdd75f55c9dab583cb12d3f15ecbe48ed9df9e5546"
+        },
+        "expected_build_manifest_sha256": null,
+        "reference_cohort": null,
+        "workload_samples": 100,
+        "admission_issues": []
+      }
+    }
+  ],
+  "limits": [
+    {
+      "metric": "allocation.analysis_clean.requested_bytes.max",
+      "observed_maximum": 48307398,
+      "observed_spread": 0,
+      "proposed_maximum": 67108864,
+      "headroom_bytes": 18801466,
+      "headroom_percent": 38.92,
+      "declared_growth_dose_bytes": 33554432,
+      "minimum_observed_plus_dose_crosses_threshold_arithmetic_only": true
+    },
+    {
+      "metric": "allocation.analysis_clean.subsequent.requested_bytes.max",
+      "observed_maximum": 120397,
+      "observed_spread": 0,
+      "proposed_maximum": 131072,
+      "headroom_bytes": 10675,
+      "headroom_percent": 8.87,
+      "declared_growth_dose_bytes": 32768,
+      "minimum_observed_plus_dose_crosses_threshold_arithmetic_only": true
+    },
+    {
+      "metric": "allocation.analysis_url_pipeline.requested_bytes.max",
+      "observed_maximum": 72060138,
+      "observed_spread": 0,
+      "proposed_maximum": 100663296,
+      "headroom_bytes": 28603158,
+      "headroom_percent": 39.69,
+      "declared_growth_dose_bytes": 33554432,
+      "minimum_observed_plus_dose_crosses_threshold_arithmetic_only": true
+    },
+    {
+      "metric": "allocation.analysis_url_pipeline.subsequent.requested_bytes.max",
+      "observed_maximum": 1670536,
+      "observed_spread": 0,
+      "proposed_maximum": 2097152,
+      "headroom_bytes": 426616,
+      "headroom_percent": 25.54,
+      "declared_growth_dose_bytes": 524288,
+      "minimum_observed_plus_dose_crosses_threshold_arithmetic_only": true
+    },
+    {
+      "metric": "allocation.history_recent_100.requested_bytes.max",
+      "observed_maximum": 8692440,
+      "observed_spread": 0,
+      "proposed_maximum": 12582912,
+      "headroom_bytes": 3890472,
+      "headroom_percent": 44.76,
+      "declared_growth_dose_bytes": 4194304,
+      "minimum_observed_plus_dose_crosses_threshold_arithmetic_only": true
+    },
+    {
+      "metric": "local.ordinary_check.peak_rss_bytes.max",
+      "observed_maximum": 44613632,
+      "observed_spread": 1949696,
+      "proposed_maximum": 50331648,
+      "headroom_bytes": 5718016,
+      "headroom_percent": 12.82,
+      "declared_growth_dose_bytes": 16777216,
+      "minimum_observed_plus_dose_crosses_threshold_arithmetic_only": true
+    }
+  ],
+  "decision": "No blocker to using these as coarse cohort-specific thresholds in the predeclared real-growth qualification; do not enable them until actual paired growth tests pass.",
+  "qualifications": [
+    "Three distinct boot IDs and matching exact CPU/image/OS/toolchains/Python version+resolved-binary hash, producer and helper hashes.",
+    "Allocation requested-byte maxima deterministic across all three runs; RSS ceiling headroom 5718016 bytes exceeds observed three-run spread 1949696 bytes by 2.93x. This is operational headroom, not a statistical confidence bound.",
+    "The clean subsequent 128KiB threshold intentionally leaves 8.87% headroom for the exact deterministic allocation workload; it must be revisited when cohort/build contract changes rather than silently widened.",
+    "Declared growth doses arithmetically cross all thresholds, but detector sensitivity requires actual measured same-boot unmodified/grown pairs.",
+    "No timing, whole-hook, Windows, Linux, fleet, final release, or current source acceptance follows from these observations."
+  ],
+  "draft_budget_unchanged": true
+}

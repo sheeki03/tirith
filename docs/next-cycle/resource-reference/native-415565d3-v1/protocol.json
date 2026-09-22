@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "status": "draft",
+  "review": "Pending independent review of the exact 415565d3 port and controller. Thresholds were separately reviewed in threshold-review.json. Do not dispatch this draft.",
+  "cohort": "native-macos15-m1-virtual-415565d3-growth-v1",
+  "base_revision": "415565d307c39e7000255955150185f3287581a6",
+  "base_tree": "4a86ecaac65cfad1bc1bf6334bee6faac75dee2b",
+  "budget_path": "docs/next-cycle/resource-reference/native-415565d3-v1/budget.json",
+  "budget_sha256": "485001efeb2c0a58ac2a0a03d2591d0135b94a962d74b658259561d2a6258980",
+  "checker_sha256": "c409c5eb9fec640ecb79f26b6dd82320ac8265103705aca1f1d6131489f9f436",
+  "python_runtime": {
+    "version": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 17.0.0 (clang-1700.6.4.2)]",
+    "sha256": "d8f1d508de5acfd500f20d1949528375ff4a1f470efb267f00d1770941cdeee3"
+  },
+  "experiments": {
+    "clean_first": {
+      "control": {
+        "revision": "8984a30e23ddf23980f0e6c8eb039e14658ff97b",
+        "tree": "3aba31d3409e4021f3edeaf4b0fe303aad6079e5",
+        "source_sha256": "c115a48bad1759022ddacaa71712c1ec04050eee9e81c97c1eee024ffbb216b5"
+      },
+      "growth": {
+        "revision": "969997d48f68a08c86e3dac56ccd6ba7de69f9c9",
+        "tree": "e8615427ca5f296cb42ea3085a8741f901ee91e0",
+        "source_sha256": "7ce79b1af2c3a72cb3e5131f7994be94b8ed9cbd68574a830a4b155dd505c469"
+      }
+    },
+    "clean_subsequent": {
+      "control": {
+        "revision": "88609787e1f8f48ba3b42ea47592f65fc2b06b50",
+        "tree": "c119bfff8f50f79d1443b8978caf7dfa953f1c2b",
+        "source_sha256": "07648f45d30d885000f4856c7c24727f7e9bbda7b1a482feea5e39f80eac6368"
+      },
+      "growth": {
+        "revision": "e8a61e671d9f04482b60753657dd956b2f1a62da",
+        "tree": "e299010a5b551435316b85ed1d2bd7f194d9d45f",
+        "source_sha256": "a5e41d982143af5210b7ebe0e96dfdcef28101a78024642694c899052b2588a5"
+      }
+    },
+    "url_first": {
+      "control": {
+        "revision": "01bf3882eb347b19fef52c0f8ef19650a3a326b4",
+        "tree": "10375a966cc8f37b3027f3f83ff5ea5f71b81184",
+        "source_sha256": "fea0ea6468ef31792753c1c8d93bfec5df2804598c6b2c63161fc9eb473572d4"
+      },
+      "growth": {
+        "revision": "eed1eaeb053b065a2f8962a6e9284559384f53da",
+        "tree": "d0036e9cb84e1b086e0be45b2f29a329e36ac321",
+        "source_sha256": "fa6fcd3b1f96083d6e948700533403adef1548162bed2928e2a78050d57886e5"
+      }
+    },
+    "url_subsequent": {
+      "control": {
+        "revision": "2f900632a032afd5efcf369041b292c78d5576d6",
+        "tree": "d5545d86efa5d4782c1546adf990e08a0de6f701",
+        "source_sha256": "a2b94786ba88bfb548cfdda1fa208ccdb745d5f543e4d6047f0d2f8c73643631"
+      },
+      "growth": {
+        "revision": "902885680a5f9f86733ff320ba29b05f9bf5ecd8",
+        "tree": "d74def74ffd1b5493717fd52af700377345fbb1d",
+        "source_sha256": "f65af98467f3093670a12f8b3e3a2a8b3934d06782f0b59c0da3351c4b69eb91"
+      }
+    },
+    "history_requests": {
+      "control": {
+        "revision": "8a37750962134642babf58d0fb0f20948f5fcab4",
+        "tree": "1446b0535dff87155c0cda8954363d71afb3233e",
+        "source_sha256": "6e4e6b11070001206657fd77aa8d124192c0ecd38d9fbcd3e57da7d08d64cf2d"
+      },
+      "growth": {
+        "revision": "b980c273aa9f9f193899a21a034c4ed61b90b842",
+        "tree": "70a67b2ff8275549d7488f988126dfce7a124aa8",
+        "source_sha256": "512d4f092bc306e04edc3b1801b090b2c73951b13f6e127dd2c2a5dd85c1ffd5"
+      }
+    },
+    "ordinary_rss": {
+      "control": {
+        "revision": "d5dbdad1f000bd880847447bca40e92854351291",
+        "tree": "26647e49d1a643753919679ebc325f50607b6098",
+        "source_sha256": "8d1fbedb7be746e848abf114b18fb2897746b703562cf17663471d782804ddb9"
+      },
+      "growth": {
+        "revision": "5a6fc0b2a319b47a4a18e3557e19063696f0f1f3",
+        "tree": "71850999e99e657d01fc297a84c6a67c1baecbfc",
+        "source_sha256": "9b3f1d457fe1c06cd17ed03c9b178729aa577e9e92d035e7b4b31ce566c00ade"
+      }
+    }
+  }
+}
