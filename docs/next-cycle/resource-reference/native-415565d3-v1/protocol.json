@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "status": "draft",
-  "review": "Pending independent review of the exact 415565d3 port and controller. Thresholds were separately reviewed in threshold-review.json. Do not dispatch this draft.",
+  "status": "reviewed",
+  "review": "docs/next-cycle/resource-reference/native-415565d3-v1/port-review.md; SHA-256 2eaf978609e0eb3fa7e163d1c5a52c45e52882d009e189b308a940fde1a52caf; permits one bounded native collection per experiment, results remain unqualified until measured",
   "cohort": "native-macos15-m1-virtual-415565d3-growth-v1",
   "base_revision": "415565d307c39e7000255955150185f3287581a6",
   "base_tree": "4a86ecaac65cfad1bc1bf6334bee6faac75dee2b",

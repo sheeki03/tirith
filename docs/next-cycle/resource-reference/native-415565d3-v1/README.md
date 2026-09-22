@@ -5,10 +5,11 @@ resource-detector checks for the exact historical source `415565d3`. No mutation
 belongs in the product branch. This controller adds qualification documents only;
 it preserves the source collector, checker, workflow and measurement producers.
 
-The protocol is a draft pending review of these exact source ports. The collector
-refuses draft protocols before compilation. Nothing has been dispatched and no
-budget is active. Final product source still requires three fresh baselines and
-its own compatibility review before an enforced CI budget can be considered.
+The exact source ports and controller have been reviewed in `port-review.md`.
+The protocol permits one bounded collection per experiment and awaits actual
+native results. No budget is active. Final product source still requires three
+fresh baselines and its own compatibility review before an enforced CI budget
+can be considered.
 
 The separately retained threshold review approves the unchanged six byte ceilings
 only for isolated growth qualification. The draft budget's numeric thresholds,
@@ -41,9 +42,9 @@ local producer's exact `echo fixture` ordinary check.
 | history_requests | 4,194,304 | crates/tirith-core/src/history.rs |
 | ordinary_rss | 16,777,216 | crates/tirith/src/cli/check.rs |
 
-After exact-protocol review, create a separate reviewed protocol commit, push all
-thirteen refs without merging them, and dispatch the existing `bench.yml` once per
-experiment at that immutable controller revision. Use the tracked protocol path,
+Use this separately reviewed protocol commit to push all thirteen refs without
+merging them, then dispatch the existing `bench.yml` once per experiment at the
+verified controller revision. Use the tracked protocol path,
 `collect_pinned_reference=false`, and `resource_samples=100`. Each job serially
 builds and measures its control and growth variants on one retained boot. The
 workflow has a 120-minute job timeout and uploads collected evidence on failure.
