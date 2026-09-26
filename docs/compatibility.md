@@ -4,7 +4,9 @@ This matrix describes Tirith 0.4.2. The
 [0.4.2 release notes](release-notes-0.4.2.md) cover what that patch release
 changes, and the [0.4.0 release notes](release-notes-0.4.0.md) summarize the
 0.4 line's published capabilities, compatibility boundaries, and remaining
-limitations.
+limitations. The working tree also contains unreleased cycle features; their
+[task guides](next-cycle/user-journeys.md) and [verification record](next-cycle/verification.md)
+do not establish published-package or final-release qualification.
 
 ## Stability Tiers
 
@@ -43,7 +45,8 @@ what an experimental command must satisfy to move to stable.
 | `threat-db` | Experimental | Threat-DB `update` / `status` / `explain` / `sources` / `health` / `diff`. |
 | `package risk` / `package explain` / `package scan` | Experimental | Advisory package-name, local-content, installed-tree, and optional registry-provenance analysis. Does not enforce an install. |
 | `package inspect` | Experimental | Local-only verdict over wheel artifacts, artifact sets, or installed Python environments. No implicit download. |
-| `pkg approve` / `pkg install` | Experimental | Enforcing pip approval/install path on x86_64 Linux only. Unsupported systems refuse before pip starts; npm and Cargo are not enforcing backends. |
+| `pkg approve` | Experimental | Non-installing pip approval flow subject to its native authority and platform requirements. An approval cannot enable the disabled package-install backend. |
+| `pkg install` | Experimental | Disabled on every host: `private_input_execution_unqualified` refuses before resolver, quarantine, checkpoint, or package execution. Flags and elevation cannot enable it. Local inspection, `pkg verify-env`, ordinary command checks, and shell protection remain available. |
 | `pkg verify-env` | Experimental | Read-only RECORD verification of an installed Python environment. |
 | `pkg graph` / `pkg diff` / `pkg attest` / `pkg receipt` | Experimental | Provenance, differential, attestation-binding, and receipt evidence. Graph and attestation are not auto-allow decisions. |
 | `mcp lock` / `mcp verify` / `mcp diff` | Experimental | Source-qualified MCP config and descriptor drift. `verify` is the gating command; `diff` is informational. |
@@ -54,7 +57,7 @@ what an experimental command must satisfy to move to stable.
 | `mcp-server` | Experimental | MCP server mode (JSON-RPC over stdio). |
 | `lab` | Experimental | Adversarial training corpus runner. Offline. `--filter` narrows by tag; `--score` adds a 0-100 risk score per scenario. |
 | `task check` | Preview | Diagnostic task-envelope assessment. Reports what an envelope would be allowed to do; executes, fetches, resolves, and writes nothing, and declares `enforceability: observe_only`. |
-| `capsule run` | Experimental | Fail-closed contained run of an untrusted project. Enforceable on x86_64 Linux only; every other host refuses before anything is copied or spawned, with no degraded fallback. |
+| `capsule run` | Experimental | Fail-closed contained run of an untrusted project. The candidate supports native x86_64 and AArch64 Linux with required Landlock and seccomp controls; unsupported hosts or missing controls refuse before project copy/spawn, with no degraded fallback. Final integrated release-artifact qualification remains separate. |
 | `browser audit` | Experimental | Read-only Chromium-family extension integrity audit. Chrome, Chromium, Brave, and Edge; Firefox and XPI are refused by name. |
 | `pkg attest-npm` | Experimental | Point-in-time npm signature and provenance receipt over an installed project. |
 | `attest` | Experimental | Point-in-time build and deployment receipts (`build`, `verify-build`, `deployment`, `verify-deployment`). |
@@ -157,7 +160,7 @@ warning.
 
 ## JSON Output
 
-- `schema_version` is emitted in all JSON output (currently version 3)
+- Command-check JSON defaults to `schema_version: 3` with its existing fields. `tirith check --format json --json-schema 4` explicitly adds typed recovery advice; it keeps the same decision and exit code. Other commands retain their own documented schema versions.
 - Version 3 changes: added `Info` severity level (maps to `Allow` action), added `httpie_pipe_shell` and `xh_pipe_shell` rule IDs
 - JSON fields are additive only: new fields may appear in any release
 - Existing fields will not be removed or change type within a major version
@@ -192,7 +195,7 @@ it.
 
 | Document | Schema field | Notes |
 |---|---|---|
-| Command card | `schema_version` | Defaults to 1 and is SKIPPED when it equals 1, so a v1 card's signing bytes are byte-identical to what they were before schema 2 existed and every checked-in v1 signature still verifies. `web3` is likewise omitted when unset |
+| Command card | `schema_version` | New authoring uses schema 3 with a shell-bound command digest instead of raw command text. Legacy schema 1/2 verification and explicit signing migration retain their own contracts; a valid legacy signature does not satisfy exact Web3 authorization |
 | Browser extension baseline | `schema` plus an independent `format_version` | The hashing rules version is separate so a stale baseline reports one `schema_upgrade_required` entry rather than phantom drift on every extension |
 | npm provenance receipt | `schema` | |
 | Build receipt | `schema` | |

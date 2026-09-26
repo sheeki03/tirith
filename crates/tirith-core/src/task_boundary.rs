@@ -109,6 +109,10 @@ pub enum OwnedBoundary {
     /// `tirith pkg install` is about to checkpoint the target environment and
     /// prepare the contained install.
     PackageInstallPreparation,
+    /// Retained local npm bytes become inert files under a held new tree.
+    LocalPackageMaterialization,
+    /// Fresh exact-tree confirmation or delete-only recovery authorization.
+    LocalPackageRecovery,
     /// `tirith install <manager>` is about to contact a registry.
     PackageManagerNetwork,
     /// `tirith install <manager>` is about to spawn the package manager.
@@ -143,6 +147,8 @@ impl OwnedBoundary {
             Self::PackageApproval => "package_approval",
             Self::PackageResolve => "package_resolve",
             Self::PackageInstallPreparation => "package_install_preparation",
+            Self::LocalPackageMaterialization => "local_package_materialization",
+            Self::LocalPackageRecovery => "local_package_recovery",
             Self::PackageManagerNetwork => "package_manager_network",
             Self::PackageManagerExecution => "package_manager_execution",
             Self::RemoteScriptRun => "remote_script_run",
@@ -447,6 +453,11 @@ boundary_markers!(
     (PackageApprovalBoundary, PackageApproval),
     (PackageResolveBoundary, PackageResolve),
     (PackageInstallPreparationBoundary, PackageInstallPreparation),
+    (
+        LocalPackageMaterializationBoundary,
+        LocalPackageMaterialization
+    ),
+    (LocalPackageRecoveryBoundary, LocalPackageRecovery),
     (PackageManagerNetworkBoundary, PackageManagerNetwork),
     (PackageManagerExecutionBoundary, PackageManagerExecution),
     (RemoteScriptRunBoundary, RemoteScriptRun),
@@ -729,6 +740,7 @@ pub struct PendingBoundaryAuthorization<B: BoundaryMarker> {
     approval_satisfied: bool,
     approval_not_after: Option<DateTime<Utc>>,
     operation_binding_sha256: String,
+    task_gate_sha256: String,
     marker: PhantomData<fn() -> B>,
 }
 
@@ -876,6 +888,7 @@ impl<B: BoundaryMarker> PendingBoundaryAuthorization<B> {
         }
         Ok(ReservedBoundaryAuthorization {
             operation_binding_sha256,
+            task_gate_sha256: self.task_gate_sha256,
             boundary_operation_sha256,
             verified_receipts,
             not_after,
@@ -925,6 +938,7 @@ impl<B: BoundaryMarker> PendingBoundaryAuthorization<B> {
         }
         Ok(TaskBoundaryPermit {
             operation_binding_sha256: self.operation_binding_sha256,
+            task_gate_sha256: self.task_gate_sha256,
             boundary_operation_sha256,
             verified_receipts,
             not_after,
@@ -948,6 +962,7 @@ enum ReservedReplayAuthorization {
 #[must_use = "a reserved task authorization must be committed or aborted"]
 pub struct ReservedBoundaryAuthorization<B: BoundaryMarker> {
     operation_binding_sha256: String,
+    task_gate_sha256: String,
     boundary_operation_sha256: BTreeSet<String>,
     verified_receipts: usize,
     not_after: Option<DateTime<Utc>>,
@@ -1077,6 +1092,7 @@ impl<B: BoundaryMarker> ReservedBoundaryAuthorization<B> {
         }
         let ReservedBoundaryAuthorization {
             operation_binding_sha256,
+            task_gate_sha256,
             boundary_operation_sha256,
             verified_receipts,
             not_after,
@@ -1104,6 +1120,7 @@ impl<B: BoundaryMarker> ReservedBoundaryAuthorization<B> {
         }
         Ok(TaskBoundaryPermit {
             operation_binding_sha256,
+            task_gate_sha256,
             boundary_operation_sha256,
             verified_receipts,
             not_after,
@@ -1163,6 +1180,7 @@ impl PendingBoundaryAuthorization<PackageManagerExecutionBoundary> {
 #[must_use = "the task boundary permit must be consumed by its side-effect API"]
 pub struct TaskBoundaryPermit<B: BoundaryMarker> {
     operation_binding_sha256: String,
+    task_gate_sha256: String,
     boundary_operation_sha256: BTreeSet<String>,
     verified_receipts: usize,
     not_after: Option<DateTime<Utc>>,
@@ -1175,6 +1193,7 @@ pub struct TaskBoundaryPermit<B: BoundaryMarker> {
 /// before it happens.
 pub struct TaskBoundaryEffectLease<B: BoundaryMarker> {
     operation_binding_sha256: String,
+    task_gate_sha256: String,
     _boundary_operation_sha256: BTreeSet<String>,
     _verified_receipts: usize,
     not_after: Option<DateTime<Utc>>,
@@ -1182,6 +1201,20 @@ pub struct TaskBoundaryEffectLease<B: BoundaryMarker> {
 }
 
 impl<B: BoundaryMarker> TaskBoundaryEffectLease<B> {
+    pub fn authorize_effect_for_gate_at(
+        &self,
+        operation: &BoundaryOperation<'_>,
+        gate: &TaskGatePolicy,
+        now: DateTime<Utc>,
+    ) -> Result<(), BoundaryAuthorizationError> {
+        if self.task_gate_sha256 != gate_digest(gate) {
+            return Err(BoundaryAuthorizationError::InvalidTrustedContext(
+                "task_gate_changed",
+            ));
+        }
+        self.authorize_effect_at(operation, now)
+    }
+
     pub fn authorize_effect_at(
         &self,
         operation: &BoundaryOperation<'_>,
@@ -1200,6 +1233,22 @@ impl<B: BoundaryMarker> TaskBoundaryEffectLease<B> {
 }
 
 impl<B: BoundaryMarker> TaskBoundaryPermit<B> {
+    /// Consume only when this is the exact policy gate that issued the permit.
+    /// Operation equality alone cannot prove provenance was required/enforced.
+    pub fn into_effect_lease_for_gate_at(
+        self,
+        operation: &BoundaryOperation<'_>,
+        gate: &TaskGatePolicy,
+        now: DateTime<Utc>,
+    ) -> Result<TaskBoundaryEffectLease<B>, BoundaryAuthorizationError> {
+        if self.task_gate_sha256 != gate_digest(gate) {
+            return Err(BoundaryAuthorizationError::InvalidTrustedContext(
+                "task_gate_changed",
+            ));
+        }
+        self.into_effect_lease_at(operation, now)
+    }
+
     pub fn binds_operation(&self, operation: &BoundaryOperation<'_>) -> bool {
         operation.boundary == B::BOUNDARY
             && self.operation_binding_sha256 == operation_binding_digest(operation)
@@ -1220,6 +1269,7 @@ impl<B: BoundaryMarker> TaskBoundaryPermit<B> {
     ) -> Self {
         Self {
             operation_binding_sha256: operation_binding_digest(operation),
+            task_gate_sha256: gate_digest(&TaskGatePolicy::default()),
             boundary_operation_sha256: BTreeSet::new(),
             verified_receipts: 0,
             not_after: Some(not_after),
@@ -1244,6 +1294,7 @@ impl<B: BoundaryMarker> TaskBoundaryPermit<B> {
     ) -> Result<TaskBoundaryEffectLease<B>, BoundaryAuthorizationError> {
         let lease = TaskBoundaryEffectLease {
             operation_binding_sha256: self.operation_binding_sha256,
+            task_gate_sha256: self.task_gate_sha256,
             _boundary_operation_sha256: self.boundary_operation_sha256,
             _verified_receipts: self.verified_receipts,
             not_after: self.not_after,
@@ -1300,6 +1351,7 @@ impl<B: BoundaryMarker> BoundaryAuthorizationChallenge<B> {
                 assessment,
                 PendingReplayAuthorization::NotRequired,
                 self.operation_binding_sha256,
+                gate_digest(&self.gate),
             );
         }
 
@@ -1331,6 +1383,7 @@ impl<B: BoundaryMarker> BoundaryAuthorizationChallenge<B> {
             assessment,
             PendingReplayAuthorization::Required(evidence),
             self.operation_binding_sha256,
+            gate_digest(&self.gate),
         )
     }
 
@@ -1347,10 +1400,20 @@ impl<B: BoundaryMarker> BoundaryAuthorizationChallenge<B> {
     }
 }
 
+fn gate_digest(gate: &TaskGatePolicy) -> String {
+    crate::command_card::sha256_hex(
+        crate::audit::canonical_json_for_hash(
+            &serde_json::json!({"domain":"tirith-task-gate-permit-v1","gate":gate}),
+        )
+        .as_bytes(),
+    )
+}
+
 fn pending_from_assessment<B: BoundaryMarker>(
     assessment: BoundaryAssessment,
     replay: PendingReplayAuthorization,
     operation_binding_sha256: String,
+    task_gate_sha256: String,
 ) -> Result<PendingBoundaryAuthorization<B>, BoundaryAuthorizationError> {
     let approval_required = match &assessment.outcome {
         BoundaryOutcome::Allow => false,
@@ -1375,6 +1438,7 @@ fn pending_from_assessment<B: BoundaryMarker>(
         approval_satisfied: false,
         approval_not_after: None,
         operation_binding_sha256,
+        task_gate_sha256,
         marker: PhantomData,
     })
 }
@@ -3204,5 +3268,72 @@ mod tests {
                 ReplayStoreError::Expired
             ))
         ));
+    }
+}
+
+#[cfg(test)]
+mod exact_gate_lease_tests {
+    use super::*;
+    fn operation(envelope: &TaskEnvelopeInput) -> BoundaryOperation<'_> {
+        BoundaryOperation {
+            boundary: OwnedBoundary::LocalPackageRecovery,
+            envelope,
+            adapter: IngressAdapter::Unattributed,
+            boundary_effects: BTreeSet::new(),
+        }
+    }
+    #[test]
+    fn gate_binding_survives_direct_and_reserved_consumption_and_revalidation() {
+        let _state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let envelope = TaskEnvelopeInput {
+            actions: vec![ProposedAction::ConfigWrite {
+                path: "/tmp/held-operation".into(),
+            }],
+            ..TaskEnvelopeInput::default()
+        };
+        let op = operation(&envelope);
+        let gate = TaskGatePolicy::default();
+        let pending = || {
+            prepare_locally_derived_boundary_authorization::<LocalPackageRecoveryBoundary>(
+                &op,
+                &gate,
+                &TaskAnalysisContext::default(),
+            )
+            .unwrap()
+        };
+        let mut changed = gate.clone();
+        changed.mode = TaskGateMode::Enforce;
+        for reserved in [false, true] {
+            let permit = if reserved {
+                pending()
+                    .reserve_default_for_operation(&op, Utc::now())
+                    .unwrap()
+                    .commit_at_effect(&op, Utc::now())
+                    .unwrap()
+            } else {
+                pending().consume_default(Utc::now()).unwrap()
+            };
+            assert!(permit
+                .into_effect_lease_for_gate_at(&op, &changed, Utc::now())
+                .is_err());
+            let permit = if reserved {
+                pending()
+                    .reserve_default_for_operation(&op, Utc::now())
+                    .unwrap()
+                    .commit_at_effect(&op, Utc::now())
+                    .unwrap()
+            } else {
+                pending().consume_default(Utc::now()).unwrap()
+            };
+            let lease = permit
+                .into_effect_lease_for_gate_at(&op, &gate, Utc::now())
+                .unwrap();
+            lease
+                .authorize_effect_for_gate_at(&op, &gate, Utc::now())
+                .unwrap();
+            assert!(lease
+                .authorize_effect_for_gate_at(&op, &changed, Utc::now())
+                .is_err());
+        }
     }
 }

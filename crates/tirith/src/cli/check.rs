@@ -24,6 +24,34 @@ use tirith_core::threatdb_api::{RuntimeThreatMode, RuntimeThreatNetwork};
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::{action_from_findings, Action, Verdict};
 
+fn finding_display_targets(
+    finding: &tirith_core::verdict::Finding,
+    urls: &[tirith_core::extract::ExtractedUrl],
+) -> Vec<Option<String>> {
+    let domains = tirith_core::session_warnings::extract_domains_from_evidence_with_urls(
+        &finding.evidence,
+        urls,
+    );
+    if domains.is_empty() {
+        vec![None]
+    } else {
+        domains.into_iter().map(Some).collect()
+    }
+}
+
+fn display_targets_suppressed(
+    rule_id: &str,
+    targets: &[Option<String>],
+    suppressed: &[(String, Option<String>)],
+) -> bool {
+    !targets.is_empty()
+        && targets.iter().all(|target| {
+            suppressed
+                .iter()
+                .any(|(rule, domain)| rule == rule_id && domain == target)
+        })
+}
+
 /// W6: build a DISPLAY-ONLY clone of `effective` whose repeated Warn / WarnAck
 /// findings (already surfaced earlier this session) are collapsed, and return how
 /// many findings were hidden.
@@ -46,6 +74,7 @@ fn build_display_verdict(
     effective: &Verdict,
     session_id: &str,
     cooldown_secs: u64,
+    urls: &[tirith_core::extract::ExtractedUrl],
 ) -> (Verdict, usize) {
     // Suppression applies ONLY to an overall Warn/WarnAck verdict. If the command
     // is Blocked (including a Warn escalated to Block by policy override,
@@ -68,13 +97,12 @@ fn build_display_verdict(
             continue;
         }
         let rule_id = f.rule_id.to_string();
-        // Primary target/domain if one is readily available on the finding's
-        // evidence (scopes the cooldown per-domain, matching `cooldown_key`).
-        let target = tirith_core::session_warnings::extract_domains_from_evidence(&f.evidence)
-            .into_iter()
-            .next();
-        if !pairs.iter().any(|(r, t)| r == &rule_id && t == &target) {
-            pairs.push((rule_id, target));
+        // Equal raw URLs may have distinct authorities in different clients.
+        // A finding is suppressed only after every contextual target cools down.
+        for target in finding_display_targets(f, urls) {
+            if !pairs.iter().any(|(r, t)| r == &rule_id && t == &target) {
+                pairs.push((rule_id.clone(), target));
+            }
         }
     }
 
@@ -109,12 +137,7 @@ fn build_display_verdict(
             return true;
         }
         let rule_id = f.rule_id.to_string();
-        let target = tirith_core::session_warnings::extract_domains_from_evidence(&f.evidence)
-            .into_iter()
-            .next();
-        !suppressed
-            .iter()
-            .any(|(r, t)| r == &rule_id && t == &target)
+        !display_targets_suppressed(&rule_id, &finding_display_targets(f, urls), &suppressed)
     });
     let hidden = before - display.findings.len();
     (display, hidden)
@@ -125,6 +148,7 @@ pub fn run(
     cmd: &str,
     shell_type: ShellType,
     json: bool,
+    json_schema: u8,
     non_interactive: bool,
     interactive_flag: bool,
     approval_check: bool,
@@ -186,6 +210,20 @@ pub fn run(
             return 1;
         }
         return 0;
+    }
+
+    if let Some(channel) = execution_receipt {
+        match super::shell_verification::observe_check(cmd, channel) {
+            Ok(execution_state::ShellVerificationHookDecision::ForceDiagnosticBlock) => {
+                eprintln!("tirith: diagnostic command blocked; its inert body must not execute");
+                return 1;
+            }
+            Ok(_) => {} // Allowed/status probes retain ordinary policy and receipts.
+            Err(error) => {
+                eprintln!("tirith: shell verification check failed; command blocked: {error}");
+                return 1;
+            }
+        }
     }
 
     let interactive = if interactive_flag {
@@ -418,12 +456,13 @@ pub fn run(
         receipt_prepared = Some(prepared);
         effective
     } else {
-        tirith_core::escalation::post_process_verdict(
+        tirith_core::escalation::post_process_verdict_for_shell(
             &raw_verdict,
             &policy,
             cmd,
             &session_id,
             CallerContext::Cli,
+            shell_type,
         )
     };
     // `tirith check` is a preflight/diagnostic boundary: a zero exit only permits
@@ -577,6 +616,7 @@ pub fn run(
     // human decision back to Tirith. Legacy --approval-check callers without an
     // execution receipt keep the temp-file stdout contract below unchanged.
     if let (Some(channel), Some(token)) = (execution_receipt, receipt_token.as_deref()) {
+        let recovery = tirith_core::recovery::for_command(&effective, cmd, shell_type);
         let requires_warn_ack = effective.action == Action::WarnAck
             || (effective.action == Action::Warn && (strict_warn || policy.strict_warn));
         return complete_owned_receipt_check(
@@ -584,13 +624,19 @@ pub fn run(
             &session_id,
             token,
             channel,
-            requires_warn_ack,
-            warn_only,
+            ReceiptCheckOptions {
+                requires_warn_ack,
+                warn_only,
+                command: cmd,
+                shell: shell_type,
+            },
             &policy.dlp_custom_patterns,
+            &recovery,
         );
     }
 
     if approval_check {
+        let recovery = tirith_core::recovery::for_command(&effective, cmd, shell_type);
         // W6: collapse repeated Warn/WarnAck findings in the DISPLAY only. The
         // full `effective` verdict above already drove the action, exit code,
         // audit log, ack file, last_trigger, and webhook; only this rendering is
@@ -600,6 +646,7 @@ pub fn run(
             &effective,
             &session_id,
             tirith_core::suppression::DEFAULT_COOLDOWN_SECS,
+            &tirith_core::extract::extract_urls(cmd, shell_type),
         );
         let mut human = output::HumanInvocationWriter::new(
             std::io::stderr().lock(),
@@ -621,6 +668,7 @@ pub fn run(
             )
             .is_err();
         }
+        human_failed |= recovery.write_human(&mut human).is_err();
         human_failed |= human.finish().is_err();
         if human_failed {
             eprintln!("tirith: failed to write approval output");
@@ -702,10 +750,13 @@ pub fn run(
         } else {
             None
         };
-        if output::write_json_with_suggestions(
+        let recovery = (json_schema == 4)
+            .then(|| tirith_core::recovery::for_command(&effective, cmd, shell_type));
+        if output::write_json_with_recovery(
             &effective,
             &policy.dlp_custom_patterns,
             suggestions_opt,
+            recovery.as_ref(),
             std::io::stdout().lock(),
         )
         .is_err()
@@ -713,6 +764,7 @@ pub fn run(
             eprintln!("tirith: failed to write JSON output");
         }
     } else {
+        let recovery = tirith_core::recovery::for_command(&effective, cmd, shell_type);
         // W6: collapse repeated Warn/WarnAck findings in the DISPLAY only; the
         // full `effective` verdict already drove every enforcement side effect
         // above. `write_human_auto` writes the human verdict to stderr.
@@ -720,6 +772,7 @@ pub fn run(
             &effective,
             &session_id,
             tirith_core::suppression::DEFAULT_COOLDOWN_SECS,
+            &tirith_core::extract::extract_urls(cmd, shell_type),
         );
         let mut human = output::HumanInvocationWriter::new(
             std::io::stderr().lock(),
@@ -747,6 +800,7 @@ pub fn run(
             &mut human,
         )
         .is_err();
+        human_failed |= recovery.write_human(&mut human).is_err();
         // On a clean human verdict from DIRECT CLI use, confirm nothing was found
         // (`write_human_auto` is silent on no findings). Gated OFF for hook
         // invocations — a per-keystroke "no issues" would be noise — detected via
@@ -1036,11 +1090,13 @@ fn render_receipt_display(
     warn_only: bool,
     compiled: &tirith_core::redact::CompiledCustomPatterns,
     writer: impl std::io::Write,
+    urls: &[tirith_core::extract::ExtractedUrl],
 ) -> Result<(), String> {
     let (display, suppressed_count) = build_display_verdict(
         effective,
         session_id,
         tirith_core::suppression::DEFAULT_COOLDOWN_SECS,
+        urls,
     );
     let mut writer = output::HumanInvocationWriter::new(
         writer,
@@ -1121,15 +1177,29 @@ fn publish_armed_receipt(
     exit_code
 }
 
+struct ReceiptCheckOptions<'a> {
+    requires_warn_ack: bool,
+    warn_only: bool,
+    command: &'a str,
+    shell: ShellType,
+}
+
 fn complete_owned_receipt_check(
     effective: &Verdict,
     session_id: &str,
     token: &str,
     channel: ShellReceiptChannel,
-    requires_warn_ack: bool,
-    warn_only: bool,
+    options: ReceiptCheckOptions<'_>,
     custom_patterns: &[String],
+    recovery: &tirith_core::recovery::RecoveryAdvice,
 ) -> i32 {
+    let ReceiptCheckOptions {
+        requires_warn_ack,
+        warn_only,
+        command,
+        shell,
+    } = options;
+    let urls = tirith_core::extract::extract_urls(command, shell);
     let interaction_dlp = tirith_core::redact::CompiledCustomPatterns::new_silent(custom_patterns);
     if effective.action == Action::Block && !effective.bypass_honored {
         if let Err(error) = render_receipt_display(
@@ -1138,9 +1208,11 @@ fn complete_owned_receipt_check(
             warn_only,
             &interaction_dlp,
             std::io::stderr().lock(),
+            &urls,
         ) {
             eprintln!("tirith: {error}");
         }
+        let _ = recovery.write_human(std::io::stderr().lock());
         discard_receipt_best_effort(token, channel);
         return 1;
     }
@@ -1153,6 +1225,7 @@ fn complete_owned_receipt_check(
             warn_only,
             &interaction_dlp,
             std::io::stderr().lock(),
+            &urls,
         ) {
             eprintln!("tirith: {error}");
         }
@@ -1170,6 +1243,7 @@ fn complete_owned_receipt_check(
             warn_only,
             &interaction_dlp,
             std::io::stderr().lock(),
+            &urls,
         ) {
             eprintln!("tirith: {error}");
             discard_receipt_best_effort(token, channel);
@@ -1186,6 +1260,7 @@ fn complete_owned_receipt_check(
             warn_only,
             &interaction_dlp,
             &mut *tty,
+            &urls,
         )?;
         resolve_owned_interactions(&requirements, &interaction_dlp, tty)
     });
@@ -1263,19 +1338,17 @@ fn prompt_signal_from_code(code: u8) -> Option<libc::c_int> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "dragonfly"))]
 unsafe fn prompt_errno_location() -> *mut libc::c_int {
     unsafe { libc::__errno_location() }
 }
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "dragonfly",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
+#[cfg(any(target_os = "android", target_os = "openbsd", target_os = "netbsd"))]
+unsafe fn prompt_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno() }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 unsafe fn prompt_errno_location() -> *mut libc::c_int {
     unsafe { libc::__error() }
 }
@@ -2403,6 +2476,30 @@ pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
     }
 }
 
+pub fn acknowledge_receipt(channel: ShellReceiptChannel) -> i32 {
+    let bytes = match read_receipt_stdin() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("tirith: {error}");
+            return 1;
+        }
+    };
+    let token = match parse_receipt_token_frame(&bytes) {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("tirith: {error}");
+            return 1;
+        }
+    };
+    match execution_state::acknowledge_shell_execution_receipt(token, channel) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("tirith: failed to acknowledge shell execution receipt: {error}");
+            1
+        }
+    }
+}
+
 pub fn reconcile_receipt(channel: ShellReceiptChannel) -> i32 {
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,
@@ -2436,6 +2533,24 @@ fn prepare_receipt_consumption(
     command: &str,
     context: &ShellReceiptContext,
 ) -> Result<PreparedExecution, String> {
+    prepare_receipt_consumption_with_network(
+        command,
+        context,
+        if crate::cli::offline_env_active() {
+            RuntimeThreatNetwork::CacheOnly
+        } else {
+            RuntimeThreatNetwork::Online
+        },
+    )
+}
+
+/// The automatic fixed-command route forces cache-only threat enrichment while
+/// retaining the same full policy/receipt preparation as ordinary consumption.
+pub(super) fn prepare_receipt_consumption_with_network(
+    command: &str,
+    context: &ShellReceiptContext,
+    network: RuntimeThreatNetwork,
+) -> Result<PreparedExecution, String> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("resolve shell receipt working directory: {error}"))?;
     let cwd_string = cwd.display().to_string();
@@ -2460,11 +2575,7 @@ fn prepare_receipt_consumption(
         context.shell(),
         &policy.threat_intel,
         RuntimeThreatMode::Inline,
-        if crate::cli::offline_env_active() {
-            RuntimeThreatNetwork::CacheOnly
-        } else {
-            RuntimeThreatNetwork::Online
-        },
+        network,
     );
     tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
     if context.strict_warn_override() {
@@ -3392,5 +3503,49 @@ mod receipt_interaction_tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod contextual_display_tests {
+    use super::*;
+    use tirith_core::verdict::{Evidence, Finding, RuleId, Severity};
+
+    fn finding() -> Finding {
+        Finding {
+            rule_id: RuleId::PlainHttpToSink,
+            severity: Severity::Medium,
+            title: "network warning".into(),
+            description: "context fixture".into(),
+            evidence: vec![Evidence::Url {
+                raw: "http://0x7f.0x/path".into(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }
+    }
+
+    #[test]
+    fn display_cooldown_requires_every_client_authority() {
+        let finding = finding();
+        let urls = tirith_core::extract::extract_urls(
+            "curl http://0x7f.0x/path; wget http://0x7f.0x/path",
+            ShellType::Posix,
+        );
+        let targets = finding_display_targets(&finding, &urls);
+        assert_eq!(targets, [Some("0x7f.0x".into()), Some("127.0.0.0".into())]);
+        let rule = finding.rule_id.to_string();
+        let mut suppressed = vec![(rule.clone(), Some("127.0.0.0".into()))];
+        assert!(!display_targets_suppressed(&rule, &targets, &suppressed));
+        suppressed.push((rule.clone(), Some("0x7f.0x".into())));
+        assert!(display_targets_suppressed(&rule, &targets, &suppressed));
+        assert!(!display_targets_suppressed(
+            "other_rule",
+            &targets,
+            &suppressed
+        ));
+        assert!(!display_targets_suppressed(&rule, &[], &suppressed));
     }
 }

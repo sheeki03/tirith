@@ -24,6 +24,15 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 /// Run context rules across every executable segment and return the
 /// highest-severity context signal.
 pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
+    check_with_runtime_effects(input, shell, policy, true)
+}
+
+pub(crate) fn check_with_runtime_effects(
+    input: &str,
+    shell: ShellType,
+    policy: &Policy,
+    runtime_effects: bool,
+) -> Vec<Finding> {
     if !policy.context_guard_enabled {
         return Vec::new();
     }
@@ -33,7 +42,7 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
 
     let mut findings = tokenize::tokenize(input, shell)
         .iter()
-        .filter_map(|seg| check_segment(input, shell, policy, seg))
+        .filter_map(|seg| check_segment(input, shell, policy, seg, runtime_effects))
         .collect::<Vec<_>>();
     findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
     findings.into_iter().take(1).collect()
@@ -44,6 +53,7 @@ fn check_segment(
     shell: ShellType,
     policy: &Policy,
     seg: &tokenize::Segment,
+    runtime_effects: bool,
 ) -> Option<Finding> {
     seg.command.as_deref()?;
     let (leader, args, environment) = match resolve_context_segment_checked(seg, shell) {
@@ -74,7 +84,9 @@ fn check_segment(
         // The command is analyzed before it changes provider configuration.
         // Evict the process cache now so the next command cannot reuse the old
         // context during its five-second TTL.
-        context_detect::invalidate_cache();
+        if runtime_effects {
+            context_detect::invalidate_cache();
+        }
         return None;
     }
 

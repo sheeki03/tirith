@@ -84,7 +84,7 @@ fn seed_capability_cache(state_dir: &std::path::Path, verdict: &str) {
     };
     let cache_dir = state_dir.join("tirith");
     std::fs::create_dir_all(&cache_dir).unwrap();
-    // Schema 2 mirrors cli::bash_capability::CACHE_SCHEMA; tirith_version blank
+    // Schema 3 mirrors cli::bash_capability::CACHE_SCHEMA; tirith_version blank
     // (version match is only enforced with a sibling `.hooks-version`, which
     // assets/ lacks). The bash_fingerprint line binds the mtime+size of the
     // live bash binary (repo-0211).
@@ -101,7 +101,7 @@ fn seed_capability_cache(state_dir: &std::path::Path, verdict: &str) {
     std::fs::write(
         cache_dir.join("bash-enter-capability"),
         format!(
-            "schema=2\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+            "schema=3\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
              bash_path={bash_path}\nbash_fingerprint={bash_fingerprint}\n\
              enter_capability={verdict}\nreason=seeded by test\n"
         ),
@@ -736,18 +736,18 @@ fn doctor_explains_blocking_when_preexec_has_no_enforcement() {
 }
 
 #[test]
-fn doctor_reports_not_loaded_when_exports_absent() {
+fn doctor_reports_unknown_activation_when_exports_absent() {
     // User set a bash knob but the hook exported no effective state (e.g. the
     // shell was non-interactive, so the hook no-op'd).
     let stdout = doctor_stdout(&[("TIRITH_BASH_MODE", "enter")]);
     assert!(
-        stdout.contains("bash hook:            not loaded in this process"),
-        "expected not-loaded marker, got:\n{stdout}"
+        stdout.contains("bash hook:            state not reported to this process"),
+        "absent exports must not prove missing activation, got:\n{stdout}"
     );
     // No effective protection claimed when nothing exported.
     assert!(
         !stdout.contains("effective protection:"),
-        "should not print effective protection when hook not loaded, got:\n{stdout}"
+        "should not print effective protection when no marker was exported, got:\n{stdout}"
     );
     // Requested mode still renders so the user sees their setting.
     assert!(

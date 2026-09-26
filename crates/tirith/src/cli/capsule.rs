@@ -33,8 +33,8 @@
 //!   its exit code. Used by `tirith run` and `temp-run --capsule`.
 //! - [`run_to_completion_bound_inputs`]: execute a content-bound program against
 //!   immutable named inputs and a held writable target. This is the production D4
-//!   `pkg install` seam. Its enforcing execution is x86_64 Linux-only; every other
-//!   platform or architecture refuses before the package interpreter starts.
+//!   `pkg install` seam. It requires Linux private namespaces and complete native
+//!   containment; other platforms or missing capabilities refuse before execution.
 //! - [`spawn_piped`]: build the contained child with piped stdin/stdout/stderr and
 //!   hand back a [`ManagedChild`] the caller bridges (the MCP gateway needs to sit
 //!   between the client and the upstream server). Linux and macOS support
@@ -70,6 +70,85 @@ use std::time::Instant;
 )]
 use tirith_core::capsule::{Capsule, CapsuleCoverage, CapsuleSpec, NoOpCapsule};
 use tirith_core::trusted_child::TrustedExecutable;
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub(crate) mod npm_descriptor;
+
+#[cfg(all(test, target_os = "linux"))]
+mod npm_native_tests;
+
+/// A native npm run whose authenticated launch, successful exit, owned process
+/// cleanup and complete containment were all observed by this process. The held
+/// directory pins the target identity until the recovery issuer consumes this
+/// evidence; it makes no claim that output bytes remain unchanged.
+///
+/// There is no constructor, deserializer, cloning or conversion from the public
+/// `CapsuleOutcome` projection. Only the native npm success branch mints this.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct CompletedNpmRun {
+    operation_id: String,
+    target: std::fs::File,
+    target_identity: (u64, u64),
+    outcome: CapsuleExecutionOutcome,
+}
+
+#[cfg(target_os = "linux")]
+impl CompletedNpmRun {
+    pub(crate) fn outcome(&self) -> &CapsuleExecutionOutcome {
+        &self.outcome
+    }
+
+    pub(crate) fn matches_binding(
+        &self,
+        operation_id: &str,
+        target: &std::fs::File,
+    ) -> Result<(), String> {
+        if operation_id != self.operation_id {
+            return Err("completed npm run belongs to another operation".into());
+        }
+        matches_completed_npm_target(&self.target, self.target_identity, target)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn matches_completed_npm_target(
+    held: &std::fs::File,
+    expected: (u64, u64),
+    candidate: &std::fs::File,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    for file in [held, candidate] {
+        let stat = file
+            .metadata()
+            .map_err(|_| "completed npm target identity is unavailable".to_string())?;
+        if !stat.is_dir() || stat.nlink() == 0 || (stat.dev(), stat.ino()) != expected {
+            return Err("completed npm run does not bind this retained target".into());
+        }
+    }
+    Ok(())
+}
+
+/// One-shot closed npm launch. The generic private-input route remains refused.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_to_completion_npm_local_leaf(
+    prepared: &mut tirith_core::artifact::npm_install::PreparedNpmExecution<'_>,
+    authorized: crate::cli::package_checkpoint::AuthorizedInstallLaunch,
+    output_presentation: BoundOutputPresentation,
+    validate_intent: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<CompletedNpmRun, CapsuleExecutionError> {
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        npm_descriptor::run(prepared, authorized, output_presentation, validate_intent)
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    {
+        let _ = (prepared, authorized, output_presentation, validate_intent);
+        Err(CapsuleRefused { backend_id: "landlock-seccomp",
+            reason: "closed npm descriptor execution requires the characterized native Linux ARM64 runtime".into(),
+        }.into())
+    }
+}
 
 /// The download path already caps remote scripts at 10 MiB. Enforce the same
 /// bound again at the stdin launch boundary so no other caller can make the
@@ -226,8 +305,9 @@ pub struct CapsuleOutcome {
     pub ephemeral_home_cleanup_confirmed: Option<bool>,
 }
 
-/// Why a target that definitely started was terminated by the parent-owned
-/// capsule supervisor.
+/// Why the parent-owned capsule supervisor rejected a launch or its outcome.
+/// A cleanup failure can precede proof of target resume; this tag alone must
+/// never be interpreted as proof that target code definitely started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub enum CapsuleTerminationKind {
@@ -237,11 +317,14 @@ pub enum CapsuleTerminationKind {
     SupervisionIo,
     Presentation,
     CleanupFailure,
+    /// The contained target reached a nonzero or signaled exit.
+    UnsuccessfulExit,
 }
 
-/// Typed post-exec termination evidence. The reason is bounded, parent-generated
-/// text; `cleanup_confirmed` records whether the complete owned process tree was
-/// proven gone before launch resources were released.
+/// Typed launch/execution termination evidence. The reason is bounded,
+/// parent-generated text and describes known phase limits; `cleanup_confirmed`
+/// records whether the complete owned process tree was proven gone before
+/// launch resources were released.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapsuleTermination {
     pub kind: CapsuleTerminationKind,
@@ -283,9 +366,10 @@ pub struct CapsuleRefused {
     pub reason: String,
 }
 
-/// Failure phase for capability-bound enforcing launches. Pre-exec refusal and a
-/// failure after authenticated target resume must never collapse into one error:
-/// callers need to know whether attacker-controlled code ran.
+/// Failure phase for capability-bound enforcing launches. A pre-exec refusal is
+/// only valid after cleanup is proven. A terminated launch may have crossed the
+/// authenticated target resume, or cleanup may have failed before that could be
+/// established. Callers must preserve that uncertainty and the owned resources.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub enum CapsuleExecutionError {
@@ -311,7 +395,7 @@ impl std::fmt::Display for CapsuleExecutionError {
                 termination,
             } => write!(
                 f,
-                "[{backend_id}] target executed, then capsule supervision terminated it: {} (cleanup confirmed={})",
+                "[{backend_id}] capsule launch or execution was terminated: {} (cleanup confirmed={})",
                 termination.reason, termination.cleanup_confirmed
             ),
         }
@@ -2315,14 +2399,62 @@ fn normalize_bound_target_policy(
     Ok((filesystem, requested_target_policy))
 }
 
-/// Production `pkg install` seam: execute a content-bound program against immutable
-/// named inputs and one held writable target directory. x86_64 Linux constructs a
-/// private user+mount namespace in the hidden launcher, exposes only sealed
-/// bind-mounted input names, installs the target Landlock WRITE rule from the
+/// Qualification refusal for the package-only private named-input backend.
+/// Generic capsule coverage does not establish this additional input-lifetime
+/// guarantee. There is deliberately no environment, flag, or test override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrivateInputExecutionRefusal {
+    InputLifetimeUnqualified,
+}
+
+impl std::fmt::Display for PrivateInputExecutionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputLifetimeUnqualified => f.write_str(
+                "private_input_execution_unqualified: contained package execution is disabled; \
+                 the private-input backend cannot guarantee unchanged package inputs throughout \
+                 execution against another process owned by the same user. Sudo or administrator \
+                 access does not qualify this backend. Package inspection and ordinary command \
+                 protection remain available.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PrivateInputExecutionRefusal {}
+
+impl PrivateInputExecutionRefusal {
+    pub(crate) fn into_capsule_refusal(self, spec: &CapsuleSpec) -> CapsuleRefused {
+        CapsuleRefused {
+            backend_id: select_backend(spec).backend_id,
+            reason: self.to_string(),
+        }
+    }
+}
+
+/// A single production decision shared by the public install command, its
+/// side-effect seam, and both sides of the hidden private-input launcher.
+/// Re-enabling requires a reviewed implementation and native qualification of
+/// immutable named inputs for the complete target lifetime.
+pub(crate) fn require_private_input_execution_qualification(
+) -> Result<(), PrivateInputExecutionRefusal> {
+    Err(PrivateInputExecutionRefusal::InputLifetimeUnqualified)
+}
+
+/// Disabled production `pkg install` seam. The qualification guard refuses before
+/// target/input binding, staging creation, or spawning the hidden launcher. The
+/// retained implementation below is not an enabled or qualified capability.
+///
+/// Intended contract: execute a content-bound program against immutable
+/// named inputs and one held writable target directory. A qualified Linux host constructs a
+/// private user+mount namespace in the hidden launcher, copies sealed source
+/// bytes into a private filesystem made read-only and verified in full, installs
+/// the target Landlock WRITE rule from the
 /// retained directory descriptor, and proves achieved coverage plus target exec
-/// before reporting execution. Other operating systems refuse explicitly;
-/// non-x86_64 Linux cannot provide the required deny-all seccomp coverage and
-/// therefore fails closed before the package interpreter starts.
+/// before reporting execution. Native x86_64 and AArch64 filters are implemented;
+/// each launch must still prove kernel, namespace, policy, and tool requirements.
+/// Other operating systems or incomplete coverage refuse before execution. This
+/// primitive does not itself qualify the complete package install/receipt flow.
 pub fn run_to_completion_bound_inputs(
     spec: &CapsuleSpec,
     program: &TrustedExecutable,
@@ -2332,6 +2464,8 @@ pub fn run_to_completion_bound_inputs(
     extra_env: &[(String, String)],
     output_presentation: BoundOutputPresentation,
 ) -> Result<CapsuleExecutionOutcome, CapsuleExecutionError> {
+    require_private_input_execution_qualification()
+        .map_err(|error| error.into_capsule_refusal(spec))?;
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (
@@ -2982,7 +3116,15 @@ impl LinuxLaunchProof {
         read_achieved_coverage_until(&mut self.coverage_reader, deadline)
     }
 
-    fn confirm_target_exec(mut self, deadline: Instant) -> Result<(), TargetExecConfirmationError> {
+    fn confirm_target_exec(self, deadline: Instant) -> Result<(), TargetExecConfirmationError> {
+        self.confirm_target_exec_with(deadline, || Ok(()))
+    }
+
+    fn confirm_target_exec_with(
+        mut self,
+        deadline: Instant,
+        before_ack: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), TargetExecConfirmationError> {
         use std::os::fd::AsRawFd as _;
         use tirith_core::runner::{
             TARGET_ACK_RESUME, TARGET_EXEC_OBSERVED, TARGET_LAUNCH_ERROR, TARGET_LAUNCH_RESUMED,
@@ -3008,6 +3150,17 @@ impl LinuxLaunchProof {
                 ))
             }
         }
+        // Authority callbacks run with a real target held at exec. Convert an
+        // unexpected callback unwind into the same pre-ACK refusal as an error,
+        // so the caller reaches owned cleanup before its temporary roots drop.
+        // The panic payload is not serialized into lifecycle evidence.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(before_ack))
+            .map_err(|_| {
+                TargetExecConfirmationError::BeforeAck(
+                    "current authority validation panicked before resume ACK".to_string(),
+                )
+            })?
+            .map_err(TargetExecConfirmationError::BeforeAck)?;
         let ack = self.ack_parent.take().ok_or_else(|| {
             TargetExecConfirmationError::BeforeAck(
                 "target-exec authorization endpoint was already consumed".to_string(),
@@ -5769,6 +5922,48 @@ fn linux_contained_command_os_with_options(
     bound_inputs: Option<BoundInputLaunch>,
     bound_work_directory: Option<BoundDirectoryFd>,
 ) -> Result<PreparedContainedCommand, CapsuleRefused> {
+    linux_contained_command_os_with_npm_options(
+        spec,
+        program,
+        args,
+        exact_env,
+        sel,
+        target_argv0,
+        temp_home,
+        bound_target,
+        bound_script,
+        launch_status_fd,
+        launch_ack_fd,
+        coverage_status_fd,
+        extra_bound_fds,
+        bound_directory,
+        bound_inputs,
+        bound_work_directory,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "linux")]
+fn linux_contained_command_os_with_npm_options(
+    spec: &CapsuleSpec,
+    program: &OsStr,
+    args: &[OsString],
+    exact_env: Option<&[(String, String)]>,
+    sel: &SelectedBackend,
+    target_argv0: Option<&OsStr>,
+    temp_home: Option<&mut HeldTempHome>,
+    bound_target: Option<BoundTargetFd>,
+    bound_script: Option<BoundTargetFd>,
+    launch_status_fd: Option<i32>,
+    launch_ack_fd: Option<i32>,
+    coverage_status_fd: Option<i32>,
+    extra_bound_fds: Vec<BoundTargetFd>,
+    bound_directory: Option<BoundDirectoryFd>,
+    bound_inputs: Option<BoundInputLaunch>,
+    bound_work_directory: Option<BoundDirectoryFd>,
+    npm_launch: Option<(String, i32, Vec<i32>)>,
+) -> Result<PreparedContainedCommand, CapsuleRefused> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     if launch_status_fd.is_some() || launch_ack_fd.is_some() {
         return Err(CapsuleRefused {
@@ -5800,6 +5995,20 @@ fn linux_contained_command_os_with_options(
     // stays bound to that inode across unlink/replacement of the installation
     // pathname, so an attacker cannot substitute the privileged pre-containment
     // launcher that receives the sealed target/script/status descriptors.
+    // The ignored native fixture uses the separately captured production child
+    // because libtest does not dispatch our hidden launcher. The release build
+    // has no alternate launcher selection or environment override.
+    #[cfg(test)]
+    let test_launcher = npm_native_tests::retained_launcher().map_err(|reason| CapsuleRefused {
+        backend_id: sel.backend_id,
+        reason,
+    })?;
+    #[cfg(test)]
+    let mut cmd = match &test_launcher {
+        Some(file) => Command::new(format!("/proc/self/fd/{}", file.as_raw_fd())),
+        None => Command::new("/proc/self/exe"),
+    };
+    #[cfg(not(test))]
     let mut cmd = Command::new("/proc/self/exe");
     cmd.arg(crate::cli::capsule_child::SUBCOMMAND)
         .arg(spec_json);
@@ -5857,14 +6066,28 @@ fn linux_contained_command_os_with_options(
             .arg("--target-dir-visible-root")
             .arg(&bound.target_visible_root);
     }
+    let npm_fds = npm_launch
+        .as_ref()
+        .map(|(_, _, fds)| fds.clone())
+        .unwrap_or_default();
+    if let Some((json, node_fd, _)) = npm_launch {
+        cmd.arg("--npm-launch-json")
+            .arg(json)
+            .arg("--target-fd")
+            .arg(node_fd.to_string());
+    }
     cmd.arg("--").arg(program).args(args);
     configure_linux_launcher_environment(&mut cmd, exact_env, sel.backend_id)?;
     use std::os::unix::process::CommandExt as _;
     // SAFETY: setpgid/fcntl are async-signal-safe. The target inherits this owned
     // group. Each content-bound descriptor already occupies its atomically
     // reserved policy slot; pre_exec only clears CLOEXEC before launcher re-exec.
+    let supervisor_pid = unsafe { libc::getpid() };
     unsafe {
         cmd.pre_exec(move || {
+            #[cfg(test)]
+            let _retain_test_launcher_until_exec = &test_launcher;
+            crate::cli::capsule_child::parent_lifetime::arm_before_exec(supervisor_pid)?;
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -5928,6 +6151,13 @@ fn linux_contained_command_os_with_options(
             }
             if let Some(coverage_fd) = coverage_status_fd {
                 if libc::fcntl(coverage_fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            // npm parent retains these exact reserved numbers through layout
+            // revalidation and completion; only the forked child clears CLOEXEC.
+            for descriptor in &npm_fds {
+                if libc::fcntl(*descriptor, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
@@ -6064,7 +6294,24 @@ fn reserve_bound_directory_fd(
 fn validate_bound_launch_inputs(inputs: &[BoundLaunchInput]) -> Result<(), CapsuleRefused> {
     let mut names = std::collections::BTreeSet::new();
     let mut approved = 0usize;
+    let mut total_bytes = 0u64;
     for input in inputs {
+        let metadata = input.source.metadata().map_err(|error| CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: format!("inspect captured input: {error}"),
+        })?;
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: "captured input size overflow".into(),
+            })?;
+        if !metadata.is_file() || total_bytes > 64 * 1024 * 1024 {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: "wheel input collection exceeds the 64 MiB private staging bound".into(),
+            });
+        }
         let name = input.name.as_str();
         if name.is_empty()
             || name == "."
@@ -6124,6 +6371,18 @@ fn seal_bound_launch_input(
     use sha2::{Digest as _, Sha256};
     use std::os::fd::FromRawFd as _;
 
+    let expected_length = input.source.metadata().map_err(|error| CapsuleRefused {
+        backend_id: "landlock-seccomp",
+        reason: format!("inspect captured input before bounded sealing: {error}"),
+    })?;
+    if !expected_length.is_file() || expected_length.len() > 64 * 1024 * 1024 {
+        return Err(CapsuleRefused {
+            backend_id: "landlock-seccomp",
+            reason: "captured input must remain a regular file within the 64 MiB per-input bound"
+                .to_owned(),
+        });
+    }
+    let expected_length = expected_length.len();
     input
         .source
         .seek(SeekFrom::Start(0))
@@ -6153,16 +6412,28 @@ fn seal_bound_launch_input(
     let mut sealed = unsafe { std::fs::File::from_raw_fd(raw as i32) };
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
     loop {
+        // Read at most one byte beyond the retained regular-file size. A
+        // concurrent growing writer cannot turn sealing into unbounded work.
+        let read_limit = (expected_length.saturating_sub(total).saturating_add(1))
+            .min(buffer.len() as u64) as usize;
         let count = input
             .source
-            .read(&mut buffer)
+            .read(&mut buffer[..read_limit])
             .map_err(|error| CapsuleRefused {
                 backend_id: "landlock-seccomp",
                 reason: format!("read bound input {:?}: {error}", input.name),
             })?;
         if count == 0 {
             break;
+        }
+        total += count as u64;
+        if total > expected_length {
+            return Err(CapsuleRefused {
+                backend_id: "landlock-seccomp",
+                reason: "captured input grew while being sealed".to_owned(),
+            });
         }
         digest.update(&buffer[..count]);
         sealed
@@ -6176,7 +6447,7 @@ fn seal_bound_launch_input(
             })?;
     }
     let actual = format!("{:x}", digest.finalize());
-    if actual != input.expected_sha256 {
+    if total != expected_length || actual != input.expected_sha256 {
         return Err(CapsuleRefused {
             backend_id: "landlock-seccomp",
             reason: format!(
@@ -6667,8 +6938,9 @@ pub struct CapsuleDoctorInfo {
     /// The backend selected for this host.
     pub backend_id: &'static str,
     /// Whether the backend can fully satisfy a locked-down (deny-all) spec. This
-    /// alone does not make `pkg install` available: its dedicated bound-input seam
-    /// also requires x86_64 Linux.
+    /// alone does not make `pkg install` available: the package flow separately
+    /// requires Linux private namespaces, bound inputs, a supported toolchain,
+    /// and its policy/approval/publication checks.
     pub deny_all_enforceable: bool,
     /// The individual coverage flags achieved for a locked-down spec.
     pub fs_read_enforced: bool,
@@ -6757,6 +7029,32 @@ mod tests {
         }
         assert_eq!(unsafe { libc::closedir(stream) }, 0);
         entries
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_npm_target_match_uses_the_retained_inode_across_rename() {
+        use std::os::unix::fs::MetadataExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let private = parent.path().join("private");
+        let published = parent.path().join("published");
+        std::fs::create_dir(&private).unwrap();
+        let held = std::fs::File::open(&private).unwrap();
+        let stat = held.metadata().unwrap();
+        let expected = (stat.dev(), stat.ino());
+        std::fs::rename(&private, &published).unwrap();
+        let current = std::fs::File::open(&published).unwrap();
+        matches_completed_npm_target(&held, expected, &current).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        let replacement = std::fs::File::open(&private).unwrap();
+        assert!(matches_completed_npm_target(&held, expected, &replacement).is_err());
+        assert!(
+            matches_completed_npm_target(&held, (expected.0, expected.1 ^ 1), &current).is_err()
+        );
+        let regular = tempfile::tempfile().unwrap();
+        assert!(matches_completed_npm_target(&held, expected, &regular).is_err());
+        std::fs::remove_dir(&published).unwrap();
+        assert!(matches_completed_npm_target(&held, expected, &current).is_err());
     }
 
     #[cfg(all(target_os = "linux", target_env = "musl"))]
@@ -6892,6 +7190,90 @@ mod tests {
             .confirm_target_exec(Instant::now() + Duration::from_secs(2))
             .expect("valid terminal resume proof");
         launcher.join().expect("launcher fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authority_callback_runs_only_after_observation_and_can_prevent_ack() {
+        use std::io::{Read as _, Write as _};
+        use tirith_core::runner::{TARGET_EXEC_OBSERVED, TARGET_LAUNCH_ERROR};
+        for observed in [false, true] {
+            let (proof, mut status_writer, mut ack_guard) = linux_launch_proof_fixture();
+            status_writer
+                .write_all(&[if observed {
+                    TARGET_EXEC_OBSERVED
+                } else {
+                    TARGET_LAUNCH_ERROR
+                }])
+                .unwrap();
+            let called = std::cell::Cell::new(false);
+            let error = proof
+                .confirm_target_exec_with(Instant::now() + Duration::from_secs(2), || {
+                    called.set(true);
+                    Err("current task policy refused".into())
+                })
+                .expect_err("no resume authority");
+            assert_eq!(called.get(), observed);
+            assert!(matches!(error, TargetExecConfirmationError::BeforeAck(_)));
+            let mut received = Vec::new();
+            ack_guard.read_to_end(&mut received).unwrap();
+            assert!(
+                received.is_empty(),
+                "a refused callback must send no resume ACK"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn panicking_authority_callback_is_a_pre_ack_refusal() {
+        use std::io::{Read as _, Write as _};
+        use tirith_core::runner::TARGET_EXEC_OBSERVED;
+        let (proof, mut status_writer, mut ack_guard) = linux_launch_proof_fixture();
+        status_writer.write_all(&[TARGET_EXEC_OBSERVED]).unwrap();
+        let error = proof
+            .confirm_target_exec_with(Instant::now() + Duration::from_secs(2), || {
+                panic!("private callback payload must not become evidence")
+            })
+            .expect_err("callback unwind must reach the owned pre-ACK cleanup path");
+        match error {
+            TargetExecConfirmationError::BeforeAck(message) => {
+                assert!(message.contains("panicked before resume ACK"));
+                assert!(!message.contains("private callback payload"));
+            }
+            TargetExecConfirmationError::AfterAck(_) => panic!("no authorization was sent"),
+        }
+        let mut received = Vec::new();
+        ack_guard.read_to_end(&mut received).unwrap();
+        assert!(
+            received.is_empty(),
+            "a panicking callback must send no resume ACK"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_authority_callback_precedes_actual_ack() {
+        use std::io::{Read as _, Write as _};
+        use tirith_core::runner::{TARGET_ACK_RESUME, TARGET_EXEC_OBSERVED, TARGET_LAUNCH_RESUMED};
+        let (proof, mut status_writer, mut ack_guard) = linux_launch_proof_fixture();
+        let authorized = Arc::new(AtomicBool::new(false));
+        let guard_authorized = Arc::clone(&authorized);
+        let launcher = std::thread::spawn(move || {
+            status_writer.write_all(&[TARGET_EXEC_OBSERVED]).unwrap();
+            let mut ack = Vec::new();
+            ack_guard.read_to_end(&mut ack).unwrap();
+            assert_eq!(ack, [TARGET_ACK_RESUME]);
+            assert!(guard_authorized.load(Ordering::Acquire));
+            status_writer.write_all(&[TARGET_LAUNCH_RESUMED]).unwrap();
+        });
+        proof
+            .confirm_target_exec_with(Instant::now() + Duration::from_secs(2), || {
+                assert!(!authorized.swap(true, Ordering::AcqRel));
+                Ok(())
+            })
+            .unwrap();
+        launcher.join().unwrap();
     }
 
     #[test]

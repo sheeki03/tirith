@@ -45,6 +45,10 @@ struct PrivKeyPattern {
 }
 
 fn main() {
+    // Preserve the full Cargo target, including libc/ABI, for release selection.
+    // OS + architecture alone would silently map musl builds onto GNU archives.
+    let target = env::var("TARGET").expect("Cargo supplies the compilation target");
+    println!("cargo:rustc-env=TIRITH_BUILD_TARGET={target}");
     let out_dir = env::var("OUT_DIR").unwrap();
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     // Data files live under the crate dir so they ship in the crate tarball.

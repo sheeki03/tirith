@@ -1,0 +1,42 @@
+[
+  {
+    "path": "node_modules/@npmcli/config/lib/index.js",
+    "sha256": "938b85a17fde9f2355497fd4befc9bac45d406fb4afacd8af63322796697ff06",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/@npmcli/config/lib/index.js"
+  },
+  {
+    "path": "node_modules/@npmcli/config/lib/definitions/definitions.js",
+    "sha256": "f9cffb281460dfc5aa98f4f2e91a47052b814faece72fc9a80eaf3fff2ceb8eb",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/@npmcli/config/lib/definitions/definitions.js"
+  },
+  {
+    "path": "node_modules/@npmcli/config/lib/type-defs.js",
+    "sha256": "c0302947dd7fa087476cea7781650c3df4c0e777628c31bd405808cfc8f3bd00",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/@npmcli/config/lib/type-defs.js"
+  },
+  {
+    "path": "node_modules/@npmcli/config/lib/parse-field.js",
+    "sha256": "e80d5fa3875f1317ed4ab070d2e6644c741ba22e64e3abc20ec74c421f0be7aa",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/@npmcli/config/lib/parse-field.js"
+  },
+  {
+    "path": "node_modules/nopt/lib/type-defs.js",
+    "sha256": "230fee3a48e92b863c5d2d9d62e5c8de020cdb636037cd589730ddebe221c902",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/nopt/lib/type-defs.js"
+  },
+  {
+    "path": "node_modules/nopt/lib/nopt-lib.js",
+    "sha256": "73cf6ad54ac9ea1a29b59954fc0473e28693069aede1586ac4acf64a92899d2e",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/nopt/lib/nopt-lib.js"
+  },
+  {
+    "path": "lib/cli/entry.js",
+    "sha256": "667a44c1fa8795fdbba8ad843736ca7f8f24e64511985e9a7060b002123560c6",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/lib/cli/entry.js"
+  },
+  {
+    "path": "lib/npm.js",
+    "sha256": "dd258b095bff5a0a16636bcc4cb457330624999485f64e1944d57424cbebebea",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/lib/npm.js"
+  }
+]

@@ -1,0 +1,119 @@
+{
+  "schema_version": 2,
+  "status": "draft",
+  "review": "Pending root review and actual injected-growth qualification; docs/resource-budget-review.md#pinned-epyc-7763-draft",
+  "scope": "Six coarse allocation-request/completed-child RSS regression limits for the pinned release100 Linux EPYC7763 workload; not timing guarantees, cold startup, whole-tree memory or full WP17.",
+  "host": {
+    "system": "Linux",
+    "release": "6.17.0-1022-azure",
+    "machine": "x86_64"
+  },
+  "runner": {
+    "label": "ubuntu-latest",
+    "image": "ubuntu24",
+    "image_version": "20260907.300.1",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "logical_cpus": 4
+  },
+  "producer_sha256": {
+    "local": "70024f76844ece2c4de0133760377dd44b1fa3a8f3c7070793741a11f34d6400",
+    "allocation": "d27263ac94b9859096ff6253aa3f1cf3ac60eb2d7fe5dcfd3edf148b360d5050"
+  },
+  "history_fixture": {
+    "local": {
+      "rows": 250000,
+      "bytes": 98500000
+    },
+    "allocation": {
+      "bytes": 4360000,
+      "rows": 10000
+    }
+  },
+  "workload_samples": {
+    "local": 100,
+    "allocation": 100
+  },
+  "baseline_evidence": [
+    {
+      "run_id": "34709899626/1",
+      "context_sha256": "5c55ca889cd859a3990eaeb3b81c5293bf33de7a303821133c21b8906d7f95ee",
+      "source_revision": "150e753a0adf8f9f13c8cc2b38f7a9325de40d91",
+      "build_profile": "release",
+      "derivation": "docs/resource-budget-review.md#pinned-epyc-7763-draft",
+      "build_provenance_sha256": "898c3fced8791a673053595012d6369ec4ed2e4b1518ebf9e9539752d563b817",
+      "runner_boot_id": "4e9a6e01-e476-4fd1-be40-b4892884f397"
+    },
+    {
+      "run_id": "34709899626/2",
+      "context_sha256": "be00bb45ab7bcf120d9fb52ea6336f16389cea8d1e401c22f93573dec9c1b56c",
+      "source_revision": "150e753a0adf8f9f13c8cc2b38f7a9325de40d91",
+      "build_profile": "release",
+      "derivation": "docs/resource-budget-review.md#pinned-epyc-7763-draft",
+      "build_provenance_sha256": "a45bd88c1a7a7409350d583471f327b1b77df89dbc39389864239bfc31213f74",
+      "runner_boot_id": "06f0be71-bded-43af-9618-8c1ea3437138"
+    },
+    {
+      "run_id": "34709899626/3",
+      "context_sha256": "a211d87cd653ce4b7480ad3096d6e87e5e40909dd9435a1a75bea0188e9ead8c",
+      "source_revision": "150e753a0adf8f9f13c8cc2b38f7a9325de40d91",
+      "build_profile": "release",
+      "derivation": "docs/resource-budget-review.md#pinned-epyc-7763-draft",
+      "build_provenance_sha256": "2e3f36fb0d162868c1a040d4cd9b66dc0f7807abdd9bd22a2736b7e4a51318c7",
+      "runner_boot_id": "94cdb5ad-4309-41d1-976a-e782185b9e46"
+    }
+  ],
+  "build_contract": {
+    "build_profile": "release",
+    "rustc_verbose": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+    "cargo_verbose": "cargo 1.98.1 (797e8a9bc 2026-08-05)\nrelease: 1.98.1\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\ncommit-date: 2026-08-05\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Ubuntu 24.4.0 (noble) [64-bit]",
+    "build_manifest_sha256": {
+      "Cargo.toml": "d382d1e50d73b3062a3bec5a461bd17017b8417444258559e014173fa47fb9e5",
+      "Cargo.lock": "6bed94688b407f844a026ac8550b463faab265ec4453f1d408621f1692f16264"
+    },
+    "workflow_path": "sheeki03/tirith/.github/workflows/bench.yml"
+  },
+  "limits": [
+    {
+      "metric": "allocation.analysis_clean.requested_bytes.max",
+      "unit": "bytes",
+      "maximum": 67108864,
+      "minimum_samples": 100,
+      "rationale": "Coarse bound on all samples, retaining incremental initialization after the earlier tier1 workload; 64 MiB permits about 39% growth from the identical observed maximum."
+    },
+    {
+      "metric": "allocation.analysis_clean.subsequent.requested_bytes.max",
+      "unit": "bytes",
+      "maximum": 131072,
+      "minimum_samples": 99,
+      "rationale": "Separate steady-state request ceiling; 128 KiB permits about 23% growth from the identical observed subsequent count."
+    },
+    {
+      "metric": "allocation.analysis_url_pipeline.requested_bytes.max",
+      "unit": "bytes",
+      "maximum": 100663296,
+      "minimum_samples": 100,
+      "rationale": "Coarse bound retaining this ordered workload\u2019s incremental first-sample initialization; 96 MiB permits about 40% growth."
+    },
+    {
+      "metric": "allocation.analysis_url_pipeline.subsequent.requested_bytes.max",
+      "unit": "bytes",
+      "maximum": 2097152,
+      "minimum_samples": 99,
+      "rationale": "Separate repeated URL-pipeline request ceiling; 2 MiB permits about 27% growth."
+    },
+    {
+      "metric": "allocation.history_recent_100.requested_bytes.max",
+      "unit": "bytes",
+      "maximum": 12582912,
+      "minimum_samples": 100,
+      "rationale": "Bound cumulative allocation requests for the exact 100-record read from the fixed fixture; 12 MiB permits about 45% growth and is not a bound on live heap or input bytes."
+    },
+    {
+      "metric": "local.ordinary_check.peak_rss_bytes.max",
+      "unit": "bytes",
+      "maximum": 50331648,
+      "minimum_samples": 100,
+      "rationale": "Bound the completed-child kernel RSS maximum for the exact ordinary-check command including first invocation; observed between-run spread is 0.10%, while 48 MiB permits about 23% growth."
+    }
+  ]
+}

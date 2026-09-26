@@ -211,10 +211,11 @@ Enable in this order, one step at a time, with burn-in between:
 3. the package and install boundary;
 4. the run and capsule boundary, where the backend reports achieved
    containment;
-5. production Web3 network and signer requirements. There is no card
-   requirement to enable: `require_command_card` is inert and no surface checks
-   a Web3 card, so this step is `networks`, `allowed_signers`, and `deny_rpc`
-   only;
+5. production Web3 network, signer and destination requirements. Required
+   exact command cards are enforced, but executable identity and artifact
+   execution rechecks can make approval unavailable. Review the
+   [current limits](security/web3-command-guard.md#command-cards-for-web3-operations)
+   before requiring a card; a required but unavailable approval blocks;
 6. the precise CI artifact-poisoning finding as a merge or release policy
    signal, if wanted.
 

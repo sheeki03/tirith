@@ -50,6 +50,23 @@ grep -q '^tirith ' <<<"$version_output" || {
   exit 1
 }
 
+if [[ "$(uname -m)" == x86_64 && ! -e /usr/bin/sudo ]]; then
+  set +e
+  status_output=$("${runtime_env[@]}" "$tirith_bin" status --json 2>&1)
+  approve_output=$("${runtime_env[@]}" "$tirith_bin" pkg approve pip examplepkg==1.0.0 \
+    --target "$state_root/approval-target" --format json 2>&1)
+  approve_rc=$?
+  set -e
+  grep -q '"package_approval"' <<<"$status_output"
+  grep -q '"trusted_sudo_present": false' <<<"$status_output"
+  grep -q '"ordinary_protection_requires_sudo": false' <<<"$status_output"
+  [[ "$approve_rc" -eq 1 ]]
+  grep -q '"error_phase": "native_authority"' <<<"$approve_output"
+  grep -q 'Native package-approval issuance is off:' <<<"$approve_output"
+  [[ ! -e "$state_root/approval-target" ]]
+  [[ ! -d "$state_root/data/tirith/quarantine" ]]
+fi
+
 set +e
 safe_output=$("${runtime_env[@]}" "$tirith_bin" check --non-interactive --shell posix -- "printf release-smoke" 2>&1)
 safe_rc=$?
@@ -100,11 +117,10 @@ grep -q '^tirith-package-approval-authority: blocked_native:' <<<"$helper_output
   exit 1
 }
 
-# extrasafe/seccompiler currently supports Linux x86_64 only. The shipped
-# aarch64 binary must remain honest about that missing security control: a
-# locked-down capsule requires raw-network denial and therefore has to refuse
-# before launching anything. This exercises the release binary on the target
-# architecture rather than relying only on a compile-time cfg assertion.
+# This script's ARM release-runtime job executes on x86_64 under QEMU.
+# QEMU cannot install the native seccomp boundary, so the actual artifact must
+# refuse raw-network requirements before launch. Native ARM acceptance runs
+# separately through test-native-arm-artifact.sh and must prove enforcement.
 if [[ "$(uname -m)" == "aarch64" ]]; then
   capsule_project="$state_root/capsule-project"
   mkdir -p "$capsule_project"

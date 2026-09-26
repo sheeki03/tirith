@@ -82,7 +82,7 @@ for (const [name, dependencyVersion] of Object.entries(rootPackage.optionalDepen
   }
 }
 const rootFiles = packFiles(rootDirectory);
-const expectedRootFiles = ["LICENSE-AGPL", "LICENSE-COMMERCIAL", "bin/tirith", "package.json"].sort();
+const expectedRootFiles = ["LICENSE-AGPL", "LICENSE-COMMERCIAL", "README.md", "bin/tirith", "package.json"].sort();
 if (JSON.stringify(rootFiles) !== JSON.stringify(expectedRootFiles)) {
   throw new Error(`tirith pack members changed: ${JSON.stringify(rootFiles)}`);
 }

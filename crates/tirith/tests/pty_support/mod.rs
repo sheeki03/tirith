@@ -16,12 +16,15 @@
 // inevitably has items a given file does not touch.
 #![allow(dead_code)]
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+mod owned;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,17 +36,107 @@ use tempfile::TempDir;
 /// so the two never interleave on the PTY master.
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
-/// Absolute path to an embedded shell hook under `assets/shell/lib/`
-/// (`embedded_shell_hooks_match_repo_hooks` guarantees it matches `shell/lib/`).
+/// Certification overrides are paired to prevent combining a shipped binary
+/// with repository hook assets accidentally. Explicit invalid overrides fail.
+fn candidate_paths() -> Option<(PathBuf, PathBuf)> {
+    match (
+        std::env::var_os("TIRITH_CERTIFY_BINARY"),
+        std::env::var_os("TIRITH_CERTIFY_HOOK_DIR"),
+    ) {
+        (None, None) => None,
+        (Some(binary), Some(hooks)) => {
+            let binary = PathBuf::from(binary);
+            let hooks = PathBuf::from(hooks);
+            assert!(
+                binary.is_absolute() && binary.is_file(),
+                "certification binary must be an existing absolute file"
+            );
+            assert_eq!(
+                binary.file_name().and_then(|s| s.to_str()),
+                Some("tirith"),
+                "certification binary must be named tirith for hook PATH resolution"
+            );
+            assert!(
+                hooks.is_absolute() && hooks.is_dir(),
+                "certification hook directory must be an existing absolute directory"
+            );
+            Some((binary, hooks))
+        }
+        _ => panic!("TIRITH_CERTIFY_BINARY and TIRITH_CERTIFY_HOOK_DIR must be set together"),
+    }
+}
+
+fn selected_shell(family: &str, candidate: Option<PathBuf>) -> Option<PathBuf> {
+    let key = format!("TIRITH_CERTIFY_{}", family.to_ascii_uppercase());
+    let candidate = match std::env::var_os(key) {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            assert!(
+                path.is_absolute() && path.is_file(),
+                "explicit certification shell must be an existing absolute file"
+            );
+            Some(path)
+        }
+        None => candidate,
+    };
+    if std::env::var("TIRITH_CERTIFY_SHELLS")
+        .unwrap_or_default()
+        .split(',')
+        .any(|value| value == family)
+    {
+        assert!(
+            candidate.is_some(),
+            "required certification shell {family} is unavailable"
+        );
+    }
+    candidate
+}
+
+/// Hook from the exact candidate bundle in certification mode, otherwise the
+/// embedded repository copy used by ordinary development tests.
 pub fn embedded_hook(file: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/shell/lib")
-        .join(file)
+    assert!(
+        Path::new(file).components().count() == 1,
+        "hook name must be a basename"
+    );
+    let path = candidate_paths()
+        .map(|(_, hooks)| hooks)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib"))
+        .join(file);
+    assert!(
+        path.is_file(),
+        "candidate hook is unavailable: {}",
+        path.display()
+    );
+    path
+}
+
+/// Fixed loader beside the candidate bundle's lib directory. A separate
+/// accessor keeps embedded_hook basename-only instead of admitting traversal.
+pub fn embedded_loader() -> PathBuf {
+    let root = candidate_paths()
+        .map(|(_, hooks)| {
+            assert_eq!(
+                hooks.file_name().and_then(|name| name.to_str()),
+                Some("lib"),
+                "candidate hooks must use the packaged lib directory"
+            );
+            hooks
+                .parent()
+                .expect("absolute packaged lib has a parent")
+                .to_path_buf()
+        })
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell"));
+    let loader = root.join("tirith.sh");
+    assert!(loader.is_file(), "candidate source loader is unavailable");
+    loader
 }
 
 /// Path to the freshly-built `tirith` binary under test.
 pub fn tirith_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_tirith"))
+    candidate_paths()
+        .map(|(binary, _)| binary)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_tirith")))
 }
 
 /// Directory of the freshly-built `tirith` binary. The hooks resolve `tirith`
@@ -60,6 +153,14 @@ pub fn tirith_bin_dir() -> PathBuf {
 /// Locate a modern bash (>= 5). macOS's `/bin/bash` is 3.2 (too old for enter
 /// mode); checks the Homebrew paths and whatever's on `PATH`. `None` ⇒ skip.
 pub fn modern_bash() -> Option<PathBuf> {
+    if std::env::var_os("TIRITH_CERTIFY_BASH").is_some() {
+        let path = selected_shell("bash", None).unwrap();
+        assert!(
+            bash_major_version(&path).is_some_and(|version| version >= 5),
+            "certification Bash must be >= 5"
+        );
+        return Some(path);
+    }
     let mut candidates: Vec<PathBuf> = vec![
         PathBuf::from("/opt/homebrew/bin/bash"),
         PathBuf::from("/usr/local/bin/bash"),
@@ -73,9 +174,12 @@ pub fn modern_bash() -> Option<PathBuf> {
             }
         }
     }
-    candidates
-        .into_iter()
-        .find(|p| p.exists() && bash_major_version(p).map(|v| v >= 5).unwrap_or(false))
+    selected_shell(
+        "bash",
+        candidates
+            .into_iter()
+            .find(|p| p.exists() && bash_major_version(p).map(|v| v >= 5).unwrap_or(false)),
+    )
 }
 
 /// Parse the major version of the bash binary at `path`.
@@ -116,18 +220,21 @@ pub fn bash_version_string(path: &Path) -> Option<String> {
 
 /// Locate a fish shell. Returns `None` when fish is not installed.
 pub fn fish_bin() -> Option<PathBuf> {
-    let out = Command::new("sh")
-        .args(["-c", "command -v fish"])
-        .output()
-        .ok()?;
+    if std::env::var_os("TIRITH_CERTIFY_FISH").is_some() {
+        return selected_shell("fish", None);
+    }
+    let out = Command::new("sh").args(["-c", "command -v fish"]).output();
+    let Ok(out) = out else {
+        return selected_shell("fish", None);
+    };
     if !out.status.success() {
-        return None;
+        return selected_shell("fish", None);
     }
     let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if p.is_empty() {
-        None
+        selected_shell("fish", None)
     } else {
-        Some(PathBuf::from(p))
+        selected_shell("fish", Some(PathBuf::from(p)))
     }
 }
 
@@ -142,13 +249,29 @@ pub fn zsh_bin() -> Option<PathBuf> {
             }
         }
     }
-    candidates.into_iter().find(|path| path.is_file())
+    selected_shell("zsh", candidates.into_iter().find(|path| path.is_file()))
 }
 
 /// A fresh, fully-isolated environment for one PTY session: holds the temp dirs
 /// alive and exposes the env var map for the spawned shell. Drop cleans up.
+/// The root outlives every actual PTY owner, including an unwinding caller.
+struct Fixture {
+    root: Option<TempDir>,
+    failed: AtomicBool,
+    reports: Mutex<Vec<serde_json::Value>>,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if self.failed.load(Ordering::Acquire) || thread::panicking() {
+            if let Some(root) = self.root.take() {
+                eprintln!("TIRITH_PTY_FIXTURE_RETAINED {}", root.keep().display());
+            }
+        }
+    }
+}
+
 pub struct IsolatedEnv {
-    _root: TempDir,
+    fixture: Arc<Fixture>,
     pub home: PathBuf,
     pub state_home: PathBuf,
     pub data_home: PathBuf,
@@ -156,6 +279,10 @@ pub struct IsolatedEnv {
     /// A scratch directory the test may use as the shell's cwd.
     pub workdir: PathBuf,
     env: HashMap<String, String>,
+    // PID identifies which fixture capability supplies the observed session.
+    // It is never used to signal a process.
+    shell_pid: Cell<Option<u32>>,
+    loaded_session_id: RefCell<Option<String>>,
 }
 
 impl IsolatedEnv {
@@ -184,9 +311,9 @@ impl IsolatedEnv {
             config_home.display().to_string(),
         );
         env.insert("TERM".to_string(), "xterm-256color".to_string());
-        // Unique session id per IsolatedEnv so per-session state never collides
-        // between concurrent tests (`process::id()` is shared across a run, so
-        // pair it with a per-call counter).
+        // An inherited correlation ID deliberately exercises fresh-hook
+        // isolation. Receipt assertions use the ID actually registered by the
+        // spawned shell, never this parent value.
         use std::sync::atomic::{AtomicU64, Ordering};
         static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
         env.insert(
@@ -199,15 +326,34 @@ impl IsolatedEnv {
         );
         // Audit log off: tests assert on terminal behaviour, not the log.
         env.insert("TIRITH_LOG".to_string(), "0".to_string());
+        // Delivery evidence must not depend on DNS/HTTP enrichment or a
+        // background ThreatDB refresh, including package certification runs.
+        env.insert("TIRITH_OFFLINE".to_string(), "1".to_string());
+        if let Some((_, hooks)) = candidate_paths() {
+            env.insert(
+                "TIRITH_SHELL_DIR".into(),
+                hooks
+                    .parent()
+                    .expect("candidate lib directory has a parent")
+                    .display()
+                    .to_string(),
+            );
+        }
 
         Self {
-            _root: root,
+            fixture: Arc::new(Fixture {
+                root: Some(root),
+                failed: AtomicBool::new(false),
+                reports: Mutex::new(Vec::new()),
+            }),
             home,
             state_home,
             data_home,
             config_home,
             workdir,
             env,
+            shell_pid: Cell::new(None),
+            loaded_session_id: RefCell::new(None),
         }
     }
 
@@ -223,11 +369,57 @@ impl IsolatedEnv {
         self
     }
 
-    /// Stable session identity injected into the shell under test.
-    pub fn session_id(&self) -> &str {
-        self.env
-            .get("TIRITH_SESSION_ID")
-            .expect("pty harness: session id must be present")
+    /// Observe the session that this actual spawned shell registered. This is
+    /// test metadata, not a capability or an execution-proof shortcut: the
+    /// conformance assertions still independently inspect the durable ledger.
+    pub fn session_id(&self) -> String {
+        if let Some(id) = self.loaded_session_id.borrow().as_ref() {
+            return id.clone();
+        }
+        let pid = self
+            .shell_pid
+            .get()
+            .expect("pty harness: spawned shell PID");
+        let directory = self.state_home.join("tirith/sessions/execution-receipts");
+        let mut matching = Vec::new();
+        for entry in std::fs::read_dir(directory).expect("registered shell capability directory") {
+            let path = entry.expect("capability directory entry").path();
+            if path.extension().and_then(|part| part.to_str()) != Some("capability") {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path).expect("capability metadata");
+            assert!(metadata.is_file() && metadata.len() <= 16 * 1024);
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .expect("read fixture capability")
+                .take(16 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(bytes.len() <= 16 * 1024);
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("fixture capability must be valid JSON");
+            if value["shell_pid"].as_u64() == Some(u64::from(pid)) {
+                let id = value["session_id"].as_str().expect("registered session ID");
+                assert!(!id.is_empty() && id.len() <= 128);
+                assert!(id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+                matching.push(id.to_owned());
+            }
+        }
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one capability for the spawned shell"
+        );
+        let id = matching.pop().unwrap();
+        assert_ne!(
+            Some(&id),
+            self.env.get("TIRITH_SESSION_ID"),
+            "a fresh hook must not reuse the injected parent session ID"
+        );
+        *self.loaded_session_id.borrow_mut() = Some(id.clone());
+        id
     }
 
     /// Fixed-slot execution ledger created by protocol-v3 receipt consumption.
@@ -267,7 +459,7 @@ impl IsolatedEnv {
         let path = self.bash_enter_capability_file();
         std::fs::create_dir_all(path.parent().expect("capability cache parent"))
             .expect("pty harness: create state dir");
-        // Schema 2 mirrors `CACHE_SCHEMA` (repo-0211 binds mtime+size).
+        // Schema 3 mirrors `CACHE_SCHEMA` (repo-0211 binds mtime+size).
         // tirith_version is blank: the hook only enforces it when a sibling
         // `.hooks-version` exists, which the harness (sourcing the hook
         // directly) does not create.
@@ -283,7 +475,7 @@ impl IsolatedEnv {
             })
             .unwrap_or_default();
         let body = format!(
-            "schema=2\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
+            "schema=3\ntirith_version=\nshell=bash\nbash_version={bash_version}\n\
              bash_path={}\nbash_fingerprint={}\nenter_capability={verdict}\n\
              reason=seeded by pty conformance harness\n",
             bash_path.display(),
@@ -339,12 +531,27 @@ fn answer_terminal_queries(writer: &SharedWriter, data: &[u8]) {
 /// A live shell running inside a PTY. `send`/`expect`/`drain` drive it;
 /// `output()` returns all read so far. Killed on `Drop` as a backstop, but
 /// callers should still [`PtySession::close`] for a clean exit.
+#[derive(Default, Clone, serde::Serialize)]
+struct ReaderEnd {
+    native_eof: bool,
+    error: Option<String>,
+}
+
 pub struct PtySession {
-    writer: SharedWriter,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Option<SharedWriter>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    child: owned::Leader,
+    fixture: Arc<Fixture>,
+    reader: Option<thread::JoinHandle<()>>,
+    reader_done: mpsc::Receiver<ReaderEnd>,
+    reader_end: Option<ReaderEnd>,
+    reader_stop: Arc<AtomicBool>,
     rx: mpsc::Receiver<Vec<u8>>,
     buf: String,
+    output_closed: bool,
     closed: bool,
+    id: String,
+    cleanup_passed: bool,
 }
 
 /// How long any single `expect` may wait WITHOUT NEW OUTPUT before failing.
@@ -357,9 +564,32 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 /// purpose: it is a backstop, not the thing that decides a test's verdict.
 const MAX_TOTAL_WAIT: Duration = Duration::from_secs(180);
 
+fn clone_master_file(master: &dyn portable_pty::MasterPty) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let original = master
+        .as_raw_fd()
+        .ok_or_else(|| std::io::Error::other("native PTY FD missing"))?;
+    // The master object retains original throughout this call. fcntl creates
+    // a new owned descriptor; no sampled or borrowed descriptor is closed.
+    let duplicate = unsafe { libc::fcntl(original, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(duplicate) })
+}
+
 impl PtySession {
     /// Spawn `program` with `args` in a fresh PTY under `env` (cwd = `workdir`).
     pub fn spawn(env: &IsolatedEnv, program: &Path, args: &[&str]) -> Self {
+        Self::spawn_with_setup(env, program, args, || {})
+    }
+
+    fn spawn_with_setup(
+        env: &IsolatedEnv,
+        program: &Path,
+        args: &[&str],
+        after_spawn: impl FnOnce(),
+    ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 40,
@@ -392,53 +622,119 @@ impl PtySession {
         }
         cmd.cwd(&env.workdir);
 
+        owned::require_reaper().expect("pty harness: waitable child contract");
+        // Configure the shared open-file description before any child exists.
+        // Reader shutdown can therefore be bounded without closing a numeric
+        // descriptor from a different thread or retrying an ambiguous close.
+        let fd = pair
+            .master
+            .as_raw_fd()
+            .expect("pty harness: native master FD");
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0
+        );
+        let id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (done_tx, reader_done) = mpsc::channel();
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let fixture = Arc::clone(&env.fixture);
         let child = pair
             .slave
             .spawn_command(cmd)
             .expect("pty harness: spawn shell");
-        // Drop the slave once the child holds it, or the master never sees EOF.
         drop(pair.slave);
-
-        // `take_writer` is single-shot, so the one writer is mutex-shared between
-        // the reader thread (answers terminal queries inline, promptly enough for
-        // fish's startup probes, and forwards output on `tx`) and the driver.
-        let writer: SharedWriter = Arc::new(Mutex::new(
-            pair.master.take_writer().expect("pty harness: take_writer"),
-        ));
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .expect("pty harness: clone_reader");
-        // Master no longer needed (reader cloned, writer taken).
-        drop(pair.master);
-
-        // Drain on a background thread so a chatty shell can't deadlock us by
-        // filling the kernel pipe buffer while we write.
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let answer_writer = Arc::clone(&writer);
-        thread::spawn(move || {
-            let mut chunk = [0u8; 4096];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        answer_terminal_queries(&answer_writer, &chunk[..n]);
-                        if tx.send(chunk[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Self {
-            writer,
-            child,
+        // Establish the RAII owner before any subsequent fallible setup.
+        let mut session = Self {
+            writer: None,
+            master: Some(pair.master),
+            child: owned::Leader::new(child),
+            fixture,
+            reader: None,
+            reader_done,
+            reader_end: None,
+            reader_stop,
             rx,
             buf: String::new(),
+            output_closed: false,
             closed: false,
-        }
+            id,
+            cleanup_passed: false,
+        };
+        eprintln!(
+            "TIRITH_PTY_OWNED_BEGIN {}",
+            serde_json::json!({"schema_version":1,
+            "id":session.id,"pid":session.child.pid,"scope":"original_owned_pty_session",
+            "fixture_root":session.fixture.root.as_ref().map(|root| root.path())})
+        );
+        assert!(
+            session.child.valid_group(),
+            "pty harness: native original session/group required"
+        );
+        after_spawn();
+        env.shell_pid.set(Some(session.child.pid as u32));
+        *env.loaded_session_id.borrow_mut() = None;
+        // portable-pty's UnixMasterWriter Drop writes newline/EOT. Fresh
+        // owned CLOEXEC File duplicates release this PTY without injecting
+        // further input during teardown, including failure/unwind paths.
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(
+            clone_master_file(session.master.as_ref().unwrap().as_ref())
+                .expect("pty harness: writer handle"),
+        )));
+        session.writer = Some(Arc::clone(&writer));
+        let mut reader = clone_master_file(session.master.as_ref().unwrap().as_ref())
+            .expect("pty harness: reader handle");
+        drop(session.master.take());
+        let stop = Arc::clone(&session.reader_stop);
+        session.reader = Some(
+            thread::Builder::new()
+                .name("tirith-pty-reader".into())
+                .spawn(move || {
+                    let mut outcome = ReaderEnd::default();
+                    let mut chunk = [0u8; 4096];
+                    let mut total = 0usize;
+                    while !stop.load(Ordering::Acquire) {
+                        match reader.read(&mut chunk) {
+                            Ok(0) => {
+                                outcome.native_eof = true;
+                                break;
+                            }
+                            Ok(n) => {
+                                total += n;
+                                if total > 8 * 1024 * 1024 {
+                                    outcome.error = Some("PTY transcript bound exceeded".into());
+                                    break;
+                                }
+                                answer_terminal_queries(&writer, &chunk[..n]);
+                                if tx.send(chunk[..n].to_vec()).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(5))
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                continue
+                            }
+                            // Unix PTY masters report EIO when the final slave closes.
+                            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                                outcome.native_eof = true;
+                                break;
+                            }
+                            Err(error) => {
+                                outcome.error = Some(error.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    // Close both cloned descriptors before acknowledging completion.
+                    drop(reader);
+                    drop(writer);
+                    let _ = done_tx.send(outcome);
+                })
+                .expect("pty harness: reader thread"),
+        );
+        session
     }
 
     /// Pull available output into the buffer, blocking at most `slice` for the
@@ -447,7 +743,7 @@ impl PtySession {
         match self.rx.recv_timeout(slice) {
             Ok(bytes) => self.buf.push_str(&String::from_utf8_lossy(&bytes)),
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => self.closed = true,
+            Err(RecvTimeoutError::Disconnected) => self.output_closed = true,
         }
         // Greedily absorb any further queued chunks.
         while let Ok(bytes) = self.rx.try_recv() {
@@ -457,7 +753,12 @@ impl PtySession {
 
     /// Write raw bytes to the shell's stdin (the PTY master).
     pub fn send_raw(&mut self, bytes: &[u8]) {
-        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut w = self
+            .writer
+            .as_ref()
+            .expect("live PTY writer")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         w.write_all(bytes).expect("pty harness: write to pty");
         w.flush().expect("pty harness: flush pty");
     }
@@ -510,7 +811,7 @@ impl PtySession {
                     self.buf.trim_end()
                 );
             }
-            if self.closed && self.rx.try_recv().is_err() {
+            if self.output_closed && self.rx.try_recv().is_err() {
                 panic!(
                     "pty harness: shell exited before {:?} appeared\n\
                      ---- captured output ----\n{}\n-------------------------",
@@ -545,7 +846,7 @@ impl PtySession {
             if last_progress.elapsed() >= timeout || started.elapsed() >= MAX_TOTAL_WAIT {
                 return self.buf.clone();
             }
-            if self.closed && self.rx.try_recv().is_err() {
+            if self.output_closed && self.rx.try_recv().is_err() {
                 return self.buf.clone();
             }
             self.pump(Duration::from_millis(100));
@@ -601,34 +902,133 @@ impl PtySession {
         }
     }
 
-    /// Send `exit` and wait briefly for the shell to terminate.
+    /// Normal close requires separate output, reader, owner and native-session
+    /// evidence. EOF never implies process exit, and no wait reaps early.
     pub fn close(&mut self) {
+        self.finish(true);
+        assert!(
+            self.cleanup_passed,
+            "pty harness: native cleanup incomplete; fixture retained"
+        );
+    }
+
+    fn finish(&mut self, graceful: bool) {
         if self.closed {
             return;
         }
-        // Best-effort: the shell may already be mid-prompt.
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(b"exit\r");
-            let _ = w.flush();
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                self.closed = true;
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.child.kill();
         self.closed = true;
+        let mut errors = Vec::new();
+        if graceful {
+            if let Some(writer) = self.writer.as_ref() {
+                if let Ok(mut writer) = writer.lock() {
+                    if let Err(error) = writer.write_all(b"exit\r").and_then(|_| writer.flush()) {
+                        errors.push(error.to_string());
+                    }
+                }
+            }
+            let until = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < until {
+                if self.reader_end.is_none() {
+                    self.reader_end = self.reader_done.try_recv().ok();
+                }
+                match self.child.exited() {
+                    Ok(true) if self.reader_end.is_some() => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        errors.push(error.to_string());
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        // A failed interactive `exit` (for example, vi command mode), and
+        // ordinary Drop, still need the reader alive when the actual owned
+        // group terminates. Stopping it first would manufacture missing EOF.
+        if self.reader_end.is_none() {
+            self.reader_end = self.reader_done.try_recv().ok();
+        }
+        let leader_exited_before_reader_drain = match self.child.exited() {
+            Ok(exited) => Some(exited),
+            Err(error) => {
+                errors.push(error.to_string());
+                None
+            }
+        };
+        let mut original_group_stop_requested_before_reader_drain = false;
+        let mut group_signal_permission_denied_before_reader_drain = false;
+        if self.reader.is_some()
+            && self.reader_end.is_none()
+            && !self.reader_stop.load(Ordering::Acquire)
+        {
+            original_group_stop_requested_before_reader_drain = true;
+            match self.child.stop_original_group() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // As in native cleanup, this is a diagnostic, never proof
+                    // of exit. Require actual EOF and the later native facts.
+                    group_signal_permission_denied_before_reader_drain = true;
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+            self.reader_end = self.reader_done.recv_timeout(Duration::from_secs(1)).ok();
+        }
+        let reader_stop_fallback = self.reader.is_some() && self.reader_end.is_none();
+        self.reader_stop.store(true, Ordering::Release);
+        let mut reader_joined = self.reader.is_none();
+        if self.reader.is_some() {
+            if self.reader_end.is_none() {
+                self.reader_end = self.reader_done.recv_timeout(Duration::from_secs(1)).ok();
+            }
+            // A completion acknowledgement precedes join; never join a known
+            // live/unresponsive reader whose descriptor ownership is unknown.
+            if self.reader_end.is_some() {
+                reader_joined = self.reader.take().unwrap().join().is_ok();
+            }
+        }
+        drop(self.master.take());
+        drop(self.writer.take());
+        let private_pty_handles_released = reader_joined;
+        let native = self.child.cleanup();
+        let native_eof = self.reader_end.as_ref().is_some_and(|end| end.native_eof);
+        if let Some(error) = self.reader_end.as_ref().and_then(|end| end.error.as_ref()) {
+            errors.push(error.clone());
+        }
+        self.cleanup_passed = native.leader_reaped
+            && native.original_group_exited
+            && native.original_session_exited
+            && native.reaped_after_native_observation
+            && native.errors.is_empty()
+            && native_eof
+            && private_pty_handles_released
+            && reader_joined
+            && errors.is_empty();
+        if !self.cleanup_passed || thread::panicking() {
+            self.fixture.failed.store(true, Ordering::Release);
+        }
+        let report = serde_json::json!({"schema_version":1,
+            "id":self.id,"pid":self.child.pid,"scope":"original_owned_pty_session",
+            "passed":self.cleanup_passed,"native":native,"native_eof":native_eof,
+            "graceful_exit_requested":graceful,
+            "leader_exited_before_reader_drain":leader_exited_before_reader_drain,
+            "original_group_stop_requested_before_reader_drain":original_group_stop_requested_before_reader_drain,
+            "group_signal_permission_denied_before_reader_drain":group_signal_permission_denied_before_reader_drain,
+            "reader_stop_fallback":reader_stop_fallback,
+            "reader_joined":reader_joined,"private_pty_handles_released":private_pty_handles_released,"errors":errors,
+            "descriptor_release":"portable-pty RAII handles dropped after reader acknowledgement/join; opaque Drop does not report close syscall status",
+            "scope_limit":"No escaped-session, arbitrary process-tree or external-interruption claim"});
+        self.fixture
+            .reports
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(report.clone());
+        eprintln!("TIRITH_PTY_OWNED_CLEANUP {report}");
     }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        if !self.closed {
-            let _ = self.child.kill();
-        }
+        self.finish(false);
     }
 }
 
@@ -679,3 +1079,7 @@ pub fn wait_for_marker_count(
         thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "ownership_tests.rs"]
+mod ownership_tests;

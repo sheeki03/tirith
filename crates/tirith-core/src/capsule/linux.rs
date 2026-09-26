@@ -36,7 +36,7 @@
 //!    roots; everything else (including the sensitive subtrees in
 //!    [`crate::capsule::deny_default_paths`] that are not under a grant) is denied
 //!    by Landlock's default-deny model.
-//! 5. **seccomp** (`extrasafe`): a default-deny syscall policy that allows the
+//! 5. **seccomp** (`extrasafe` on x86_64, reviewed `seccompiler` policy on AArch64): a default-deny syscall policy that allows the
 //!    basics + file I/O + thread creation + fork/exec, but grants **no
 //!    socket-creation syscalls**, so the child cannot open a raw outbound socket.
 //! 6. **Environment cleanup**: drop every variable except the policy's survivors,
@@ -82,12 +82,21 @@ const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
     wall_clock_seconds: false,
 };
 
-/// Whether this build can install a seccomp filter. `extrasafe`/`seccompiler`
-/// only support `linux-x86_64`; on any other Linux architecture the seccomp layer
-/// is unavailable and must be reported as such (the rest of the containment still
-/// applies). Kept as a `const fn` so both the backend and its tests agree.
-pub const fn seccomp_supported() -> bool {
-    cfg!(target_arch = "x86_64")
+#[cfg(target_arch = "aarch64")]
+mod aarch64_seccomp;
+
+/// Report only an architecture with an implemented filter and, on AArch64,
+/// observed kernel seccomp support. User-mode emulators that cannot install a
+/// native filter retain the before-launch unsupported result.
+pub fn seccomp_supported() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64_seccomp::kernel_support_observed()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        cfg!(target_arch = "x86_64")
+    }
 }
 
 /// The Linux containment backend. Stateless: it probes the kernel on demand.
@@ -545,6 +554,120 @@ fn apply_containment_inner(
     })
 }
 
+/// Closed ARM64 npm launch. All filesystem capabilities were retained and
+/// validated by the single-threaded hidden launcher. No containing directory is
+/// granted for a runtime file, and no writable root grants executable access.
+/// This entry does not admit the generic private-input or Python route.
+#[cfg(target_arch = "aarch64")]
+pub fn apply_npm_descriptor_containment(
+    spec: &CapsuleSpec,
+    temp_home: &Path,
+    node_fd: i32,
+    read_files: &[(i32, bool)],
+    write_directories: &[i32],
+) -> Result<CapsuleCoverage, ContainError> {
+    use landlock::{
+        Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus, ABI,
+    };
+    use std::os::fd::BorrowedFd;
+    if !(3..256).contains(&node_fd)
+        || read_files.len() != 9
+        || read_files
+            .iter()
+            .filter(|(_, executable)| *executable)
+            .count()
+            != 1
+        || write_directories.len() != 2
+    {
+        return Err(ContainError::Unsupported(
+            "invalid closed npm capability set".into(),
+        ));
+    }
+    let mut used = std::collections::BTreeSet::new();
+    for (fd, directory) in read_files
+        .iter()
+        .map(|(fd, _)| (*fd, false))
+        .chain(write_directories.iter().map(|fd| (*fd, true)))
+    {
+        if !(3..256).contains(&fd)
+            || fd == node_fd
+            || !used.insert(fd)
+            || !spec.handles.extra_unix_fds.contains(&fd)
+        {
+            return Err(ContainError::Unsupported(
+                "overlapping npm capability descriptor".into(),
+            ));
+        }
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0
+            || (stat.st_mode & libc::S_IFMT)
+                != if directory {
+                    libc::S_IFDIR
+                } else {
+                    libc::S_IFREG
+                }
+        {
+            return Err(ContainError::Unsupported(
+                "npm capability type changed".into(),
+            ));
+        }
+    }
+    close_unexpected_fds(&spec.handles)?;
+    apply_rlimits(&spec.resources)?;
+    set_no_new_privs()?;
+    let all = AccessFs::from_all(ABI::V1);
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(all)
+        .map_err(|e| ContainError::Landlock(e.to_string()))?
+        .create()
+        .map_err(|e| ContainError::Landlock(e.to_string()))?;
+    for (fd, executable) in read_files {
+        // SAFETY: caller retains and validates every descriptor through apply.
+        let file = unsafe { BorrowedFd::borrow_raw(*fd) };
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(
+                file,
+                if *executable {
+                    AccessFs::ReadFile | AccessFs::Execute
+                } else {
+                    AccessFs::ReadFile.into()
+                },
+            ))
+            .map_err(|e| ContainError::Landlock(format!("exact npm runtime file: {e}")))?;
+    }
+    let writable = all & !AccessFs::Execute;
+    for fd in write_directories {
+        let directory = unsafe { BorrowedFd::borrow_raw(*fd) };
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(directory, writable))
+            .map_err(|e| ContainError::Landlock(format!("held npm directory: {e}")))?;
+    }
+    let status = ruleset
+        .restrict_self()
+        .map_err(|e| ContainError::Landlock(e.to_string()))?;
+    if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
+        return Err(ContainError::Unsupported(
+            "closed npm requires full Landlock enforcement".into(),
+        ));
+    }
+    aarch64_seccomp::apply_npm(node_fd).map_err(ContainError::Seccomp)?;
+    apply_env(&spec.environment, Some(temp_home));
+    Ok(CapsuleCoverage {
+        fs_read_enforced: true,
+        fs_write_enforced: true,
+        exec_limited: true,
+        network_raw_denied: true,
+        domain_proxy_enforced: false,
+        resource_limits_enforced: spec
+            .resources
+            .all_requested_enforced_by(RESOURCE_LIMIT_SUPPORT),
+        env_isolated: true,
+        handles_isolated: true,
+    })
+}
+
 /// Apply the rlimit-able dimensions of [`ResourceLimits`] via `setrlimit`. Each
 /// populated dimension is set to a soft==hard limit. `wall_clock_seconds` and
 /// `max_output_bytes` are NOT rlimits (the launcher/broker enforce those), so they
@@ -903,6 +1026,15 @@ impl extrasafe::RuleSet for PostExecRuntime {
             Sysno::getppid,
             Sysno::getpgrp,
             Sysno::getrlimit,
+            // Descriptor-local libuv readiness and relative sleep; sockets,
+            // io_uring and process/namespace escape remain independently denied.
+            Sysno::nanosleep,
+            Sysno::clock_nanosleep,
+            Sysno::epoll_create1,
+            Sysno::epoll_ctl,
+            Sysno::epoll_pwait,
+            Sysno::eventfd2,
+            Sysno::ppoll,
             Sysno::sysinfo,
             // POSIX-shell redirection and in-script pipelines. Every inherited
             // descriptor was closed before this filter is installed, and newly
@@ -917,6 +1049,16 @@ impl extrasafe::RuleSet for PostExecRuntime {
             // the authority over *where* either syscall may create a directory.
             Sysno::mkdir,
             Sysno::mkdirat,
+            // pip creates, replaces and removes temporary/target entries. These
+            // content/topology operations remain mediated by Landlock; metadata
+            // changes such as chmod/chown/utime are deliberately not granted.
+            Sysno::unlink,
+            Sysno::unlinkat,
+            Sysno::rmdir,
+            Sysno::rename,
+            Sysno::renameat,
+            // Process-local creation mask; existing file metadata stays denied.
+            Sysno::umask,
         ]
     }
 
@@ -977,10 +1119,24 @@ impl extrasafe::RuleSet for PostExecRuntime {
                 SeccompilerComparator::Eq,
                 0,
             ));
+        // The stable guard terminates its entire group when its supervisor dies.
+        // pid=0 is always the caller's own group; every group escape stays denied.
+        let kill_own_group = SeccompRule::new(Sysno::kill)
+            .and_condition(SeccompArgumentFilter::new64(
+                0,
+                SeccompilerComparator::Eq,
+                0,
+            ))
+            .and_condition(SeccompArgumentFilter::new64(
+                1,
+                SeccompilerComparator::Eq,
+                libc::SIGKILL as u64,
+            ));
         let mut rules: std::collections::HashMap<_, Vec<_>> = [
             (Sysno::prlimit64, vec![prlimit]),
             (Sysno::getpgid, vec![getpgid]),
             (Sysno::prctl, vec![parent_death_signal]),
+            (Sysno::kill, vec![kill_own_group]),
         ]
         .into_iter()
         .collect();
@@ -1078,6 +1234,26 @@ impl extrasafe::RuleSet for SafeDescriptorControls {
                     )),
             );
         }
+        // CPython's custom opener sets CLOEXEC with this exact ioctl. It
+        // changes only the caller's descriptor flags, like permitted F_SETFD.
+        rules.entry(Sysno::ioctl).or_insert_with(Vec::new).push(
+            SeccompRule::new(Sysno::ioctl)
+                .and_condition(SeccompArgumentFilter::new64(
+                    0,
+                    SeccompilerComparator::Le,
+                    i32::MAX as u64,
+                ))
+                .and_condition(SeccompArgumentFilter::new64(
+                    1,
+                    SeccompilerComparator::Eq,
+                    libc::FIOCLEX,
+                ))
+                .and_condition(SeccompArgumentFilter::new64(
+                    2,
+                    SeccompilerComparator::Eq,
+                    0,
+                )),
+        );
         for command in SAFE_FCNTL_COMMANDS {
             rules.entry(Sysno::fcntl).or_insert_with(Vec::new).push(
                 SeccompRule::new(Sysno::fcntl).and_condition(SeccompArgumentFilter::new32(
@@ -1130,12 +1306,14 @@ fn apply_seccomp() -> Result<bool, ContainError> {
     Ok(true)
 }
 
-/// Non-x86_64 Linux: the `extrasafe`/`seccompiler` stack only supports
-/// `linux-x86_64`, so no seccomp filter can be installed. The rest of the
-/// containment (rlimits, no-new-privs, Landlock, env) still applies; the caller
-/// reports `network_raw_denied = false` and an enforcing surface that requires it
-/// will fail closed.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+fn apply_seccomp() -> Result<bool, ContainError> {
+    aarch64_seccomp::apply().map_err(ContainError::Seccomp)
+}
+
+/// Other Linux architectures have no reviewed syscall policy. Keep runtime
+/// capability reporting honest and refuse enforcing network requirements.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn apply_seccomp() -> Result<bool, ContainError> {
     Ok(false)
 }
@@ -1429,6 +1607,12 @@ mod tests {
 
     #[test]
     fn seccomp_supported_matches_arch() {
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            seccomp_supported(),
+            aarch64_seccomp::kernel_support_observed()
+        );
+        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(seccomp_supported(), cfg!(target_arch = "x86_64"));
     }
 
@@ -1441,10 +1625,10 @@ mod tests {
         assert!(SafeDescriptorControls.simple_rules().is_empty());
         let rules = SafeDescriptorControls.conditional_rules();
         let ioctl_rules = rules.get(&Sysno::ioctl).expect("conditional ioctl rules");
-        assert_eq!(ioctl_rules.len(), SAFE_TERMINAL_IOCTL_REQUESTS.len());
+        assert_eq!(ioctl_rules.len(), SAFE_TERMINAL_IOCTL_REQUESTS.len() + 1);
         assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&{ libc::TIOCSTI }));
         assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&{ libc::TIOCLINUX }));
-        for rule in ioctl_rules {
+        for rule in &ioctl_rules[..SAFE_TERMINAL_IOCTL_REQUESTS.len()] {
             assert_eq!(rule.argument_filters.len(), 2);
             assert!(rule
                 .argument_filters
@@ -1458,6 +1642,21 @@ mod tests {
                 .value;
             assert!(SAFE_TERMINAL_IOCTL_REQUESTS.contains(&request));
         }
+
+        let close_on_exec = ioctl_rules.last().unwrap();
+        assert_eq!(close_on_exec.argument_filters.len(), 3);
+        assert!(close_on_exec
+            .argument_filters
+            .iter()
+            .any(|f| f.arg_idx == 0 && f.value == i32::MAX as u64));
+        assert!(close_on_exec
+            .argument_filters
+            .iter()
+            .any(|f| f.arg_idx == 1 && f.value == libc::FIOCLEX));
+        assert!(close_on_exec
+            .argument_filters
+            .iter()
+            .any(|f| f.arg_idx == 2 && f.value == 0));
 
         let fcntl_rules = rules.get(&Sysno::fcntl).expect("conditional fcntl rules");
         assert_eq!(fcntl_rules.len(), SAFE_FCNTL_COMMANDS.len());
@@ -1509,7 +1708,6 @@ mod tests {
             Sysno::connect,
             Sysno::setsid,
             Sysno::setpgid,
-            Sysno::kill,
             Sysno::tkill,
             Sysno::tgkill,
             Sysno::rt_sigqueueinfo,
@@ -1521,6 +1719,17 @@ mod tests {
                 "conditional post-exec runtime must not grant {denied:?}"
             );
         }
+        let own_group = conditional.get(&Sysno::kill).expect("own-group kill rule");
+        assert_eq!(own_group.len(), 1);
+        assert_eq!(own_group[0].argument_filters.len(), 2);
+        assert!(own_group[0]
+            .argument_filters
+            .iter()
+            .any(|filter| filter.arg_idx == 0 && filter.value == 0));
+        assert!(own_group[0]
+            .argument_filters
+            .iter()
+            .any(|filter| filter.arg_idx == 1 && filter.value == libc::SIGKILL as u64));
         let prlimit = conditional
             .get(&Sysno::prlimit64)
             .expect("self-query-only prlimit64 rule");
@@ -1683,7 +1892,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn seccomp_guard_death_subprocess() {
         use std::io::BufRead as _;
@@ -1705,13 +1914,10 @@ mod tests {
                 );
                 // A second pipe whose WRITE end the target keeps open itself, so
                 // reading it can never reach EOF. That is the target's blocking
-                // primitive after it observes parent death: `read` is in the
-                // seccomp allow-set (SystemIO::allow_read) while `nanosleep`,
-                // `clock_nanosleep`, and `pause` are all absent from every
-                // enabled rule set, so the filter's EPERM default made those
-                // return instantly and the target exited normally instead of
-                // waiting to be killed. Created BEFORE `apply_seccomp` because
-                // `pipe2` is itself not permitted afterwards.
+                // primitive after it observes parent death: an allowed `read`
+                // has no timer deadline and cannot finish before the signal.
+                // Create both pipes before containment to keep fixture setup
+                // separate from the parent-death behavior under examination.
                 let mut hold = [0i32; 2];
                 assert_eq!(
                     unsafe { libc::pipe2(hold.as_mut_ptr(), libc::O_CLOEXEC) },
@@ -1779,12 +1985,8 @@ mod tests {
                         // would then report a normal exit and defeat the
                         // controller's WIFSIGNALED proof.
                         //
-                        // Block instead — on `read`, which IS permitted
-                        // (SystemIO::allow_read). `nanosleep`, `clock_nanosleep`
-                        // and `pause` are in NO enabled rule set, so the seccomp
-                        // default action returns EPERM immediately and any
-                        // sleep-based wait degenerates into an instant normal
-                        // exit; that, not signal latency, is what kept failing.
+                        // Block instead on the permitted `read` operation,
+                        // without a timer that could race the signal.
                         // This process holds `hold[1]` open itself, so `hold[0]`
                         // can never reach EOF and only the parent-death SIGKILL
                         // ends the wait, however delayed it is. A genuinely
@@ -1890,7 +2092,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn production_seccomp_parent_death_signal_kills_and_reaps_target() {
         const MODE: &str = "TIRITH_SECCOMP_GUARD_DEATH_MODE";
@@ -1915,6 +2117,224 @@ mod tests {
         assert!(
             !marker.exists(),
             "target survived its seccomp-confined guard"
+        );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn runtime_file_topology_subprocess() {
+        let Some(root) = std::env::var_os("TIRITH_RUNTIME_FILE_TOPOLOGY_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let writable = root.join("writable");
+        let readonly = root.join("readonly");
+        let outside = root.join("outside");
+        // Retain a harmless read descriptor so the actual installed filter is
+        // tested above stdio without granting any external file-write right.
+        let descriptor = std::fs::File::open(readonly.join("source")).unwrap();
+        use std::os::fd::AsRawFd as _;
+        let fd = descriptor.as_raw_fd();
+        assert!(fd > 2);
+        set_no_new_privs().unwrap();
+        let filesystem = FilesystemPolicy {
+            read_roots: vec![readonly.clone()],
+            write_roots: vec![writable.clone()],
+            deny_roots: vec![],
+        };
+        assert!(apply_landlock(&filesystem, &[], &[]).unwrap().fs_confined());
+        assert!(apply_seccomp().unwrap());
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        assert_eq!(
+            unsafe { libc::ioctl(fd, libc::FIOCLEX, std::ptr::null::<libc::c_void>()) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC
+        );
+        assert_eq!(
+            unsafe { libc::ioctl(fd, libc::FIONCLEX, std::ptr::null::<libc::c_void>()) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        let mask = unsafe { libc::syscall(libc::SYS_umask, 0o027) };
+        assert!((0..=0o777).contains(&mask));
+        assert_eq!(unsafe { libc::syscall(libc::SYS_umask, mask) }, 0o027);
+        std::fs::rename(writable.join("source"), writable.join("renamed")).unwrap();
+        std::fs::remove_file(writable.join("renamed")).unwrap();
+        std::fs::remove_dir(writable.join("empty")).unwrap();
+        for source in [readonly.join("source"), outside.join("source")] {
+            assert!(std::fs::remove_file(&source).is_err());
+            assert!(std::fs::rename(&source, writable.join("escaped")).is_err());
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        assert!(std::fs::set_permissions(
+            outside.join("source"),
+            std::fs::Permissions::from_mode(0o777)
+        )
+        .is_err());
+        for syscall in [
+            libc::SYS_socket,
+            libc::SYS_io_uring_setup,
+            libc::SYS_setsid,
+            libc::SYS_unshare,
+        ] {
+            assert_eq!(unsafe { libc::syscall(syscall, 0, 0, 0, 0, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn runtime_file_topology_remains_confined_to_writable_roots() {
+        if !landlock_probe().usable {
+            // The separate native artifact qualification lane requires Landlock;
+            // portable builds retain their explicit unsupported-host refusal.
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        for name in ["writable", "readonly", "outside"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+            std::fs::write(root.path().join(name).join("source"), b"captured").unwrap();
+        }
+        std::fs::create_dir(root.path().join("writable/empty")).unwrap();
+        let outside = root.path().join("outside/source");
+        use std::os::unix::fs::PermissionsExt as _;
+        let outside_mode = std::fs::metadata(&outside).unwrap().permissions().mode();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "capsule::linux::tests::runtime_file_topology_subprocess",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TIRITH_RUNTIME_FILE_TOPOLOGY_FIXTURE", root.path())
+            .output()
+            .expect("run isolated file-topology fixture");
+        assert!(
+            output.status.success(),
+            "file topology fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("readonly/source")).unwrap(),
+            b"captured"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"captured");
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode(),
+            outside_mode
+        );
+        assert!(std::fs::read_dir(root.path().join("writable"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn runtime_readiness_subprocess() {
+        if std::env::var_os("TIRITH_RUNTIME_READINESS_FIXTURE").is_none() {
+            return;
+        }
+        assert!(apply_seccomp().expect("apply production syscall policy"));
+        let duration = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        };
+        assert_eq!(
+            unsafe { libc::nanosleep(&duration, std::ptr::null_mut()) },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &duration, std::ptr::null_mut())
+            },
+            0
+        );
+        let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(
+            epoll >= 0 && event >= 0,
+            "create local readiness descriptors"
+        );
+        let mut interest = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: 7,
+        };
+        assert_eq!(
+            unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, event, &mut interest) },
+            0
+        );
+        let ready = 1u64;
+        assert_eq!(
+            unsafe { libc::write(event, (&ready as *const u64).cast(), 8) },
+            8
+        );
+        let mut observed: libc::epoll_event = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::epoll_pwait(epoll, &mut observed, 1, 100, std::ptr::null()) },
+            1
+        );
+        let mut poll = libc::pollfd {
+            fd: event,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ppoll(&mut poll, 1, &duration, std::ptr::null()) },
+            1
+        );
+        unsafe {
+            libc::close(event);
+            libc::close(epoll);
+        }
+        // Local readiness never supplies network or arbitrary signal authority.
+        for syscall in [
+            libc::SYS_socket,
+            libc::SYS_io_uring_setup,
+            libc::SYS_setsid,
+            libc::SYS_unshare,
+        ] {
+            assert_eq!(unsafe { libc::syscall(syscall, 0, 0, 0, 0, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+        assert_eq!(unsafe { libc::kill(libc::getppid(), 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn production_policy_allows_local_readiness_without_network_or_signal_escape() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "capsule::linux::tests::runtime_readiness_subprocess",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TIRITH_RUNTIME_READINESS_FIXTURE", "1")
+            .output()
+            .expect("run isolated production filter readiness fixture");
+        assert!(
+            output.status.success(),
+            "readiness fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

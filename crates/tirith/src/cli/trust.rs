@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +46,7 @@ pub fn classify_scope(pattern: &str) -> ScopeKind {
     tirith_core::policy::classify_trust_pattern(pattern)
 }
 
-/// A unified trust listing row shown by `trust list`.
+/// Legacy-compatible row used to compare active trust snapshots.
 #[derive(Debug, Clone, Serialize)]
 struct TrustListRow {
     pattern: String,
@@ -60,31 +60,6 @@ struct TrustListRow {
     scope_coverage: String,
     /// True when the entry is dangerously broad (wildcard / bare TLD).
     broad_warning: bool,
-}
-
-/// Print an error from a trust subcommand, with a "try --scope user" hint
-/// when the error mentions "git repository" (i.e., `--scope repo` failed
-/// because we are outside a git repo).
-fn print_trust_error(subcmd: &str, err: &str, hint_pattern: Option<&str>) {
-    eprintln!("{}", trust_error_line(subcmd, err));
-    if err.contains("git repository") {
-        if let Some(pattern) = hint_pattern {
-            let display_pattern = human(pattern);
-            let quoted = if display_pattern == pattern {
-                tirith_core::safe_command::shell_single_quote(pattern)
-                    .unwrap_or_else(|| "'[unsafe pattern]'".to_string())
-            } else {
-                "'[unsafe pattern]'".to_string()
-            };
-            eprintln!(
-                "  try: tirith trust {} {} --scope user",
-                human(subcmd),
-                quoted
-            );
-        } else {
-            eprintln!("  try: tirith trust {} --scope user", human(subcmd));
-        }
-    }
 }
 
 fn human(value: &str) -> String {
@@ -103,10 +78,12 @@ fn trust_error_line(action: &str, detail: &str) -> String {
     format!("tirith: trust {}: {}", human(action), human(detail))
 }
 
+#[cfg(test)]
 fn unknown_scope_line(action: &str, scope: &str, allowed: &str) -> String {
     trust_error_line(action, &format!("unknown scope '{scope}' (use {allowed})"))
 }
 
+#[cfg(test)]
 fn trust_prompt_line(domain: &str) -> String {
     format!(
         "Trust {}? [y/N/r(rule-scoped)/t(temporary 7d)] ",
@@ -219,11 +196,13 @@ fn write_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String>
 /// repo-0233: retained-parent cross-process lock for trust-store mutations. The
 /// mutation sites load → modify → write; without a nonreplaceable lock two
 /// processes can lose each other's entries after an atomic sidecar replacement.
+#[cfg(test)]
 struct TrustStoreLock {
     lock_destination: tirith_core::util::ContainedAtomicFile,
     data_destination: tirith_core::util::ContainedAtomicFile,
 }
 
+#[cfg(test)]
 impl TrustStoreLock {
     fn data_destination(&self) -> &tirith_core::util::ContainedAtomicFile {
         &self.data_destination
@@ -238,6 +217,7 @@ impl TrustStoreLock {
     }
 }
 
+#[cfg(test)]
 fn trust_store_root<'a>(
     scope: &str,
     path: &'a std::path::Path,
@@ -250,6 +230,7 @@ fn trust_store_root<'a>(
     .ok_or_else(|| "trust store has no containment root".to_string())
 }
 
+#[cfg(test)]
 fn preflight_trust_store_mutation(scope: &str, path: &std::path::Path) -> Result<(), String> {
     let root = trust_store_root(scope, path)?;
     let policy = tirith_core::policy::Policy::discover_local_only(root.to_str());
@@ -257,6 +238,7 @@ fn preflight_trust_store_mutation(scope: &str, path: &std::path::Path) -> Result
         .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn lock_trust_store(scope: &str, path: &std::path::Path) -> Result<TrustStoreLock, String> {
     // Keep this primitive safe even if a future mutation caller forgets the
     // command-level preflight: no lock file or parent may be created first.
@@ -277,34 +259,6 @@ fn lock_trust_store(scope: &str, path: &std::path::Path) -> Result<TrustStoreLoc
     })
 }
 
-fn load_store_retained(
-    destination: &tirith_core::util::ContainedAtomicFile,
-    path: &std::path::Path,
-) -> Result<TrustStore, String> {
-    let bytes = match destination.read_capped(TRUST_STORE_MAX_BYTES) {
-        Ok(bytes) => bytes,
-        Err(tirith_core::util::OpenRegularError::NotFound) => return Ok(TrustStore::default()),
-        Err(tirith_core::util::OpenRegularError::NotRegularFile) => {
-            return Err(format!(
-                "refusing non-regular or symlinked trust store at {}",
-                path.display()
-            ))
-        }
-        Err(tirith_core::util::OpenRegularError::TooLarge) => {
-            return Err(format!(
-                "trust store at {} exceeds the {} byte limit",
-                path.display(),
-                TRUST_STORE_MAX_BYTES
-            ))
-        }
-        Err(tirith_core::util::OpenRegularError::Io(error)) => {
-            return Err(format!("cannot read {}: {error}", path.display()))
-        }
-    };
-    serde_json::from_slice(&bytes)
-        .map_err(|error| format!("corrupt trust store at {}: {error}", path.display()))
-}
-
 fn load_store_scoped(scope: &str, path: &std::path::Path) -> Result<TrustStore, String> {
     if scope == "repo" {
         load_repo_store(path)
@@ -313,6 +267,7 @@ fn load_store_scoped(scope: &str, path: &std::path::Path) -> Result<TrustStore, 
     }
 }
 
+#[cfg(test)]
 fn serialize_store_for_write(store: &TrustStore) -> Result<Vec<u8>, String> {
     let bytes = serde_json::to_vec_pretty(store)
         .map_err(|error| format!("failed to serialize trust store: {error}"))?;
@@ -351,6 +306,7 @@ fn write_store_scoped_permitted(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn write_store_scoped_permitted_locked(
     scope: &str,
     path: &std::path::Path,
@@ -1100,63 +1056,22 @@ fn write_repo_store(path: &std::path::Path, store: &TrustStore) -> Result<(), St
 }
 
 /// Parse a duration string like "1h", "7d", "30d" into an expiry timestamp.
+#[cfg(test)]
 fn parse_ttl(ttl: &str) -> Result<String, String> {
-    let ttl = ttl.trim();
-    if ttl.is_empty() {
-        return Err("empty TTL".to_string());
-    }
-
-    let (num_str, unit) = if let Some(n) = ttl.strip_suffix('d') {
-        (n, "d")
-    } else if let Some(n) = ttl.strip_suffix('h') {
-        (n, "h")
-    } else if let Some(n) = ttl.strip_suffix('m') {
-        (n, "m")
-    } else {
-        return Err(format!(
-            "unsupported TTL format: {ttl} (use e.g. 1h, 7d, 30d)"
-        ));
-    };
-
-    let num: u64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid TTL number: {num_str}"))?;
-    if num == 0 {
-        return Err("TTL must be > 0".to_string());
-    }
-
-    let multiplier: u64 = match unit {
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86400,
-        _ => unreachable!(),
-    };
-
-    let seconds = num
-        .checked_mul(multiplier)
-        .ok_or_else(|| format!("TTL value too large: {num}{unit}"))?;
-
-    let seconds_i64 =
-        i64::try_from(seconds).map_err(|_| format!("TTL value too large: {num}{unit}"))?;
-
-    let expires = chrono::Utc::now() + chrono::Duration::seconds(seconds_i64);
-    Ok(expires.to_rfc3339())
+    tirith_core::trust_grants::expiry_from_ttl(ttl, chrono::Utc::now())
 }
 
-/// Check if an entry is expired. No `ttl_expires` (older/`--permanent` entries)
-/// never expires; an unparseable `ttl_expires` is treated as NOT expired so a
-/// malformed timestamp never silently revokes trust.
+/// Expired and malformed timestamps are inactive, matching enforcement.
 fn is_expired(entry: &TrustEntry) -> bool {
-    if let Some(ref exp) = entry.ttl_expires {
-        if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(exp) {
-            return expiry < chrono::Utc::now();
-        }
-    }
-    false
+    matches!(
+        tirith_core::trust_grants::expiry(entry.ttl_expires.as_deref(), chrono::Utc::now()),
+        tirith_core::trust_grants::Expiry::Expired | tirith_core::trust_grants::Expiry::Invalid
+    )
 }
 
 /// Format the time remaining until an RFC3339 expiry, e.g. "in 6d" / "in 2h".
 /// Returns `None` for a permanent (no-TTL) entry, "expired" when already past.
+#[cfg(test)]
 fn humanize_expiry(ttl_expires: Option<&str>) -> Option<String> {
     let exp = ttl_expires?;
     let expiry = chrono::DateTime::parse_from_rfc3339(exp).ok()?;
@@ -1179,6 +1094,7 @@ fn humanize_expiry(ttl_expires: Option<&str>) -> Option<String> {
 }
 
 /// Validate a pattern for trust add.
+#[cfg(test)]
 fn validate_pattern(pattern: &str, policy: &tirith_core::policy::Policy) -> Result<(), String> {
     tirith_core::policy::validate_trust_pattern(pattern)?;
     if policy.is_blocklisted(pattern) {
@@ -1202,273 +1118,12 @@ pub fn add(
     scope: &str,
     json: bool,
 ) -> i32 {
-    if let Some(rule_id) = rule_id {
-        if human(rule_id) != rule_id {
-            eprintln!("tirith: trust add: rule id contains unsafe display characters");
-            return 1;
-        }
-    }
-    if let Some(reason) = reason {
-        if tirith_core::mcp::output_filter::sanitize_for_display(reason) != reason {
-            eprintln!("tirith: trust add: reason contains unsafe display characters");
-            return 1;
-        }
-    }
-    // Validate against policy plus flat user/org blocklists loaded below.
-    let mut policy = tirith_core::policy::Policy::discover(None);
-    policy.load_user_lists();
-    policy.load_org_lists(None);
-    if let Err(e) = validate_pattern(pattern, &policy) {
-        eprintln!("{}", trust_error_line("add", &e));
-        return 1;
-    }
-
-    // --ttl and --permanent are mutually exclusive (clap enforces it too; guard
-    // here for the library-call path).
-    if permanent && ttl.is_some() {
-        eprintln!("tirith: trust add: --permanent cannot be combined with --ttl");
-        return 1;
-    }
-
-    // Narrow-trust-by-default: a broad pattern (domain/wildcard/bare-TLD) requires
-    // an explicit `--broad` opt-in.
-    let scope_kind = classify_scope(pattern);
-    if scope_kind.is_broad() && !broad {
-        eprintln!(
-            "tirith: trust add: '{}' is a {} pattern — {}.",
-            human(pattern),
-            scope_kind.label(),
-            scope_kind.coverage()
-        );
-        eprintln!(
-            "  Trust the narrowest thing that works (a specific URL or path), \
-             or pass --broad to accept this scope."
-        );
-        if scope_kind == ScopeKind::BareTld {
-            eprintln!(
-                "  Note: trusting a bare TLD allows EVERY host under '.{}' — \
-                 this is almost never what you want.",
-                human(pattern)
-            );
-        }
-        return 1;
-    }
-
-    let path = match trust_store_path(scope) {
-        Ok(p) => p,
-        Err(e) => {
-            print_trust_error("add", &e, Some(pattern));
-            return 1;
-        }
-    };
-
-    if let Err(error) = preflight_trust_store_mutation(scope, &path) {
-        eprintln!("tirith: trust store mutation refused: {error}");
-        return 1;
-    }
-    // repo-0233: hold the store lock across load → mutate → write.
-    let store_lock = match lock_trust_store(scope, &path) {
-        Ok(guard) => guard,
-        Err(e) => {
-            eprintln!("tirith: trust store lock failed: {e}");
-            return 1;
-        }
-    };
-    let mut store = match load_store_retained(store_lock.data_destination(), &path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{}", trust_error_line("add", &e));
-            return 1;
-        }
-    };
-
-    // Resolve the effective TTL:
-    //   --permanent          -> no expiry
-    //   --ttl <d>            -> that duration
-    //   neither              -> DEFAULT_TTL (trust expires by default)
-    let (ttl_expires, ttl_label): (Option<String>, Option<String>) = if permanent {
-        (None, None)
-    } else {
-        let effective = ttl.unwrap_or(DEFAULT_TTL);
-        match parse_ttl(effective) {
-            Ok(exp) => (Some(exp), Some(effective.to_string())),
-            Err(e) => {
-                eprintln!("{}", trust_error_line("add", &e));
-                return 1;
-            }
-        }
-    };
-
-    let entry = TrustEntry {
-        pattern: pattern.to_string(),
-        rule_id: rule_id.map(String::from),
-        ttl_expires: ttl_expires.clone(),
-        added: chrono::Utc::now().to_rfc3339(),
-        source: "cli".to_string(),
-        reason: reason.map(str::to_string),
-    };
-
-    store.entries.push(entry);
-
-    if let Err(e) = write_store_scoped_permitted_locked(scope, &path, &store, &store_lock) {
-        eprintln!("{}", trust_error_line("add", &e));
-        return 1;
-    }
-
-    if let Err(error) =
-        tirith_core::audit::log_trust_change(pattern, rule_id, "add", ttl_expires.as_deref(), scope)
-    {
-        eprintln!(
-            "{}",
-            trust_error_line(
-                "add",
-                &format!("trust store changed but audit append failed: {error}")
-            )
-        );
-        return 1;
-    }
-
-    if json {
-        let out = serde_json::json!({
-            "added": pattern,
-            "scope": scope,
-            "rule_id": rule_id,
-            "scope_kind": scope_kind,
-            "scope_coverage": scope_kind.coverage(),
-            "ttl": ttl_label,
-            "ttl_expires": ttl_expires,
-            "permanent": permanent,
-            "reason": reason,
-        });
-        return print_json(&out);
-    }
-    let ttl_note = match &ttl_label {
-        Some(t) => format!(", ttl: {t}"),
-        None => ", permanent (no expiry)".to_string(),
-    };
-    eprintln!(
-        "tirith: trusted '{}' (scope: {}, {} pattern{})",
-        human(pattern),
-        human(scope),
-        scope_kind.label(),
-        human(&ttl_note)
-    );
-    if scope_kind.is_dangerous() {
-        eprintln!(
-            "  warning: this is a {} entry — {}.",
-            scope_kind.label(),
-            scope_kind.coverage()
-        );
-    }
-    0
+    super::trust_lifecycle::add(
+        pattern, rule_id, ttl, permanent, broad, false, reason, scope, json,
+    )
 }
 
-/// `tirith trust list [--rule <id>] [--json] [--expired] [--scope user|repo|all]`
-pub fn list(rule_filter: Option<&str>, json: bool, show_expired: bool, scope: &str) -> i32 {
-    if !matches!(scope, "user" | "repo" | "all") {
-        eprintln!(
-            "{}",
-            unknown_scope_line("list", scope, "'user', 'repo', or 'all'")
-        );
-        return 1;
-    }
-
-    let mut rows: Vec<TrustListRow> = match collect_rows(scope, show_expired) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{}", trust_error_line("list", &e));
-            return 1;
-        }
-    };
-
-    if let Some(filter) = rule_filter {
-        rows.retain(|r| {
-            r.rule_id
-                .as_ref()
-                .map(|id| id.eq_ignore_ascii_case(filter))
-                .unwrap_or(false)
-        });
-    }
-
-    if json {
-        return print_json(&rows);
-    }
-    if rows.is_empty() {
-        eprintln!("tirith: no trust entries found");
-    } else {
-        let max_pat = rows
-            .iter()
-            .map(|r| human(&r.pattern).len())
-            .max()
-            .unwrap_or(7)
-            .max(7);
-        let max_src = rows
-            .iter()
-            .map(|r| human(&r.source).len())
-            .max()
-            .unwrap_or(6)
-            .max(6);
-        let max_rule = rows
-            .iter()
-            .map(|r| r.rule_id.as_ref().map(|s| human(s).len()).unwrap_or(1))
-            .max()
-            .unwrap_or(4)
-            .max(4);
-        // A '!' suffix marks a dangerously broad entry; size the SCOPE column
-        // on the *rendered* string so the trailing '!' never breaks alignment.
-        let scope_render = |row: &TrustListRow| -> String {
-            if row.broad_warning {
-                format!("{}!", row.scope_kind.label())
-            } else {
-                row.scope_kind.label().to_string()
-            }
-        };
-        let max_scope = rows
-            .iter()
-            .map(|r| scope_render(r).len())
-            .max()
-            .unwrap_or(5)
-            .max(5);
-
-        eprintln!(
-            "{:<max_pat$}  {:<max_rule$}  {:<max_scope$}  {:<max_src$}  EXPIRES",
-            "PATTERN", "RULE", "SCOPE", "SOURCE"
-        );
-        let mut any_dangerous = false;
-        for row in &rows {
-            let pattern_display = human(&row.pattern);
-            let rule_display = human(row.rule_id.as_deref().unwrap_or("-"));
-            let source_display = human(&row.source);
-            let expires_display = match (&row.expires, row.expired) {
-                (Some(exp), true) => format!("{} (EXPIRED)", human(exp)),
-                (Some(exp), false) => match humanize_expiry(Some(exp)) {
-                    Some(h) => format!("{} ({})", human(exp), human(&h)),
-                    None => human(exp),
-                },
-                (None, _) => "permanent".to_string(),
-            };
-            let scope_display = scope_render(row);
-            if row.broad_warning {
-                any_dangerous = true;
-            }
-            eprintln!(
-                "{:<max_pat$}  {:<max_rule$}  {:<max_scope$}  {:<max_src$}  {}",
-                pattern_display, rule_display, scope_display, source_display, expires_display
-            );
-        }
-        if any_dangerous {
-            eprintln!(
-                "\ntirith: '!' marks dangerously broad entries (wildcard / bare TLD). \
-                 Run 'tirith trust explain <pattern>' for detail."
-            );
-        }
-    }
-
-    0
-}
-
-/// Collect every trust-style row for the given scope. Shared by `list` and the
-/// scope-visualisation paths. `show_expired` controls whether expired
+/// Collect trust-style rows for the retained legacy diff format. `show_expired` controls whether expired
 /// TTL-bearing entries are included.
 fn collect_rows(scope: &str, show_expired: bool) -> Result<Vec<TrustListRow>, String> {
     let mut rows: Vec<TrustListRow> = Vec::new();
@@ -1597,82 +1252,6 @@ fn make_row(
     }
 }
 
-/// `tirith trust remove <pattern> [--rule <rule_id>] [--scope user|repo]`
-pub fn remove(pattern: &str, rule_id: Option<&str>, scope: &str) -> i32 {
-    let path = match trust_store_path(scope) {
-        Ok(p) => p,
-        Err(e) => {
-            print_trust_error("remove", &e, Some(pattern));
-            return 1;
-        }
-    };
-
-    if let Err(error) = preflight_trust_store_mutation(scope, &path) {
-        eprintln!("tirith: trust store mutation refused: {error}");
-        return 1;
-    }
-    // repo-0233: hold the store lock across load → mutate → write.
-    let store_lock = match lock_trust_store(scope, &path) {
-        Ok(guard) => guard,
-        Err(e) => {
-            eprintln!("tirith: trust store lock failed: {e}");
-            return 1;
-        }
-    };
-    let mut store = match load_store_retained(store_lock.data_destination(), &path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{}", trust_error_line("remove", &e));
-            return 1;
-        }
-    };
-    let before_len = store.entries.len();
-
-    store.entries.retain(|entry| {
-        let pattern_matches = entry.pattern == pattern;
-        let rule_matches = match (rule_id, &entry.rule_id) {
-            (Some(filter), Some(entry_rule)) => filter.eq_ignore_ascii_case(entry_rule),
-            (Some(_), None) => false,
-            (None, _) => true,
-        };
-        !(pattern_matches && rule_matches)
-    });
-
-    let removed = before_len - store.entries.len();
-    if removed == 0 {
-        eprintln!(
-            "tirith: trust remove: no matching entry found for '{}'",
-            human(pattern)
-        );
-        return 1;
-    }
-
-    if let Err(e) = write_store_scoped_permitted_locked(scope, &path, &store, &store_lock) {
-        eprintln!("{}", trust_error_line("remove", &e));
-        return 1;
-    }
-
-    if let Err(error) =
-        tirith_core::audit::log_trust_change(pattern, rule_id, "remove", None, scope)
-    {
-        eprintln!(
-            "{}",
-            trust_error_line(
-                "remove",
-                &format!("trust store changed but audit append failed: {error}"),
-            )
-        );
-        return 1;
-    }
-
-    eprintln!(
-        "tirith: removed {removed} trust entry/entries for '{}' (scope: {})",
-        human(pattern),
-        human(scope)
-    );
-    0
-}
-
 /// Read and JSON-parse `last_trigger.json` from the data dir.
 ///
 /// Shared by `last()` (interactive prompt) and `from_last_trigger()` (suggest
@@ -1750,6 +1329,7 @@ fn extract_target_rule_pairs(val: &serde_json::Value) -> Vec<(String, Option<Str
 /// `raw_host`). Reduce a URL target to its host so a pair can be matched back to
 /// the host the user was actually asked about; a target that is already a bare
 /// host (or any non-URL) maps to itself.
+#[cfg(test)]
 fn target_host(target: &str) -> String {
     extract_host(target).unwrap_or_else(|| target.to_string())
 }
@@ -1761,6 +1341,7 @@ fn target_host(target: &str) -> String {
 /// rules whose finding targeted `host`, never the flat top-level `rule_ids`
 /// array. This is what stops `last()`'s rule-scoped choice from granting one
 /// host every rule in the whole verdict. Results are de-duped, preserving order.
+#[cfg(test)]
 fn rules_for_host(val: &serde_json::Value, host: &str) -> Vec<String> {
     let mut rules: Vec<String> = Vec::new();
     for (target, rule_id) in extract_target_rule_pairs(val) {
@@ -1848,7 +1429,8 @@ fn format_add_line(target: &str, rule_id: Option<&str>, needs_broad: bool) -> St
             };
             format!("tirith trust add {quoted}{broad} --rule {rid} --ttl {DEFAULT_TTL}")
         }
-        None => format!("tirith trust add {quoted}{broad} --ttl {DEFAULT_TTL}"),
+        None => "# No rule was recorded; select --rule explicitly before trusting this target."
+            .to_string(),
     }
 }
 
@@ -1896,6 +1478,11 @@ pub fn from_last_trigger(apply: bool) -> i32 {
     let mut failed = 0;
     for (target, rule_id) in &pairs {
         let broad = classify_scope(target).is_broad();
+        if broad || rule_id.is_none() {
+            eprintln!("tirith: this finding lacks an exact target and rule; review it and opt into --broad or --all-rules explicitly");
+            failed += 1;
+            continue;
+        }
         // Pass DEFAULT_TTL explicitly (not None) so the applied entry uses the
         // same source the printed suggestion's `--ttl {DEFAULT_TTL}` does. `add()`
         // would resolve None to DEFAULT_TTL anyway, but sharing the one constant
@@ -1930,426 +1517,17 @@ pub fn from_last_trigger(apply: bool) -> i32 {
 
 /// `tirith trust last` -- show last trigger and offer to trust.
 pub fn last() -> i32 {
-    let val = match load_last_trigger_value() {
-        Ok(Some(v)) => v,
+    match load_last_trigger_value() {
+        Ok(Some(_)) => from_last_trigger(false),
         Ok(None) => {
             eprintln!("tirith: no recent trigger found");
-            return 1;
+            1
         }
-        Err(e) => {
-            eprintln!("{}", trust_error_line("last", &e));
-            return 1;
-        }
-    };
-
-    if let Some(ts) = val.get("timestamp").and_then(|v| v.as_str()) {
-        eprintln!("Last trigger at: {}", human(ts));
-    }
-    if let Some(cmd) = val.get("command_redacted").and_then(|v| v.as_str()) {
-        eprintln!("Command: {}", human(cmd));
-    }
-
-    let mut domains: Vec<String> = Vec::new();
-    if let Some(findings) = val.get("findings").and_then(|v| v.as_array()) {
-        for finding in findings {
-            if let Some(title) = finding.get("title").and_then(|v| v.as_str()) {
-                eprintln!("  - {}", human(title));
-            }
-            if let Some(evidence) = finding.get("evidence").and_then(|v| v.as_array()) {
-                for ev in evidence {
-                    if let Some(raw) = ev.get("raw").and_then(|v| v.as_str()) {
-                        if let Some(host) = extract_host(raw) {
-                            if !domains.contains(&host) {
-                                domains.push(host);
-                            }
-                        }
-                    }
-                    if let Some(host) = ev.get("raw_host").and_then(|v| v.as_str()) {
-                        let h = host.to_string();
-                        if !domains.contains(&h) {
-                            domains.push(h);
-                        }
-                    }
-                }
-            }
+        Err(error) => {
+            eprintln!("{}", trust_error_line("last", &error));
+            1
         }
     }
-
-    if domains.is_empty() {
-        eprintln!("\ntirith: no domain/URL found in last trigger to trust");
-        return 0;
-    }
-
-    for domain in &domains {
-        let display_domain = human(domain);
-        eprintln!();
-        eprint!("{}", trust_prompt_line(domain));
-        let _ = io::stderr().flush();
-
-        let stdin = io::stdin();
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line).is_err() {
-            continue;
-        }
-        let choice = line.trim().to_lowercase();
-
-        match choice.as_str() {
-            "y" | "yes" => {
-                // A bare `y` trusts the whole domain — keep that affordance,
-                // but it is a broad scope, so pass `broad = true` explicitly.
-                add(domain, None, None, false, true, None, "user", false);
-            }
-            "r" | "rule" => {
-                // Pair this host with ONLY the rule(s) that actually fired for
-                // it (per-finding, from `extract_target_rule_pairs`), not every
-                // top-level rule in the verdict. Trusting one host under a rule
-                // that fired on a DIFFERENT target would be over-broad.
-                let host_rules = rules_for_host(&val, domain);
-                if host_rules.is_empty() {
-                    eprintln!("tirith: no rule IDs for {display_domain}, adding global trust");
-                    add(domain, None, None, false, true, None, "user", false);
-                } else {
-                    for rid in &host_rules {
-                        // Rule-scoped trust is narrow by construction.
-                        add(domain, Some(rid), None, false, true, None, "user", false);
-                    }
-                }
-            }
-            "t" | "temp" | "temporary" => {
-                add(domain, None, Some("7d"), false, true, None, "user", false);
-            }
-            _ => {
-                eprintln!("tirith: skipped {display_domain}");
-            }
-        }
-    }
-
-    0
-}
-
-/// `tirith trust gc [--expired] [--scope user|repo|all]`
-///
-/// `--expired` is the default and only collection mode today; it is accepted
-/// explicitly so the command reads clearly and leaves room for future modes.
-pub fn gc(expired: bool, scope: &str, json: bool) -> i32 {
-    gc_with_action("gc", expired, scope, json)
-}
-
-/// `tirith trust prune` — spec-named alias for `gc` (M6 ch3). Both
-/// invoke the same backing implementation; only the audit `trust_action`
-/// field differs so an operator can tell which command the user actually
-/// typed.
-pub fn prune(expired: bool, scope: &str, json: bool) -> i32 {
-    gc_with_action("prune", expired, scope, json)
-}
-
-fn gc_with_action(action_label: &str, expired: bool, scope: &str, json: bool) -> i32 {
-    if !matches!(scope, "user" | "repo" | "all") {
-        eprintln!(
-            "{}",
-            unknown_scope_line(action_label, scope, "'user', 'repo', or 'all'"),
-        );
-        return 1;
-    }
-    // `--expired` is currently the only mode; if a caller explicitly passes
-    // nothing we still collect expired entries (documented default).
-    let _ = expired;
-
-    let scopes: Vec<&str> = match scope {
-        "all" => vec!["user", "repo"],
-        s => vec![s],
-    };
-
-    let mut total_removed = 0;
-    let mut per_scope: Vec<(String, usize)> = Vec::new();
-
-    for s in scopes {
-        let path = match trust_store_path(s) {
-            Ok(p) => p,
-            Err(e) => {
-                if scope != "all" {
-                    print_trust_error(action_label, &e, None);
-                    return 1;
-                }
-                continue;
-            }
-        };
-
-        if let Err(error) = preflight_trust_store_mutation(s, &path) {
-            eprintln!("{}", trust_error_line(action_label, &error));
-            return 1;
-        }
-        // repo-0233: hold the store lock across load → mutate → write.
-        let store_lock = match lock_trust_store(s, &path) {
-            Ok(guard) => guard,
-            Err(e) => {
-                eprintln!("{}", trust_error_line(action_label, &e));
-                return 1;
-            }
-        };
-        let mut store = match load_store_retained(store_lock.data_destination(), &path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("{}", trust_error_line(action_label, &e));
-                return 1;
-            }
-        };
-        let before = store.entries.len();
-        // Capture removed entries so each lands in the audit log under the right
-        // `trust_action` (M6 ch3) — otherwise gc/prune sweeps are invisible there.
-        let expired_entries: Vec<TrustEntry> = store
-            .entries
-            .iter()
-            .filter(|entry| is_expired(entry))
-            .cloned()
-            .collect();
-        store.entries.retain(|entry| !is_expired(entry));
-        let removed = before - store.entries.len();
-
-        if removed > 0 {
-            if let Err(e) = write_store_scoped_permitted_locked(s, &path, &store, &store_lock) {
-                eprintln!("{}", trust_error_line(action_label, &e));
-                return 1;
-            }
-            for entry in &expired_entries {
-                if let Err(error) = tirith_core::audit::log_trust_change(
-                    &entry.pattern,
-                    entry.rule_id.as_deref(),
-                    action_label,
-                    entry.ttl_expires.as_deref(),
-                    s,
-                ) {
-                    eprintln!(
-                        "{}",
-                        trust_error_line(
-                            action_label,
-                            &format!("trust store changed but audit append failed: {error}"),
-                        )
-                    );
-                    return 1;
-                }
-            }
-            if !json {
-                eprintln!(
-                    "tirith: {}: removed {removed} expired entries from {} scope",
-                    human(action_label),
-                    human(s),
-                );
-            }
-        }
-
-        per_scope.push((s.to_string(), removed));
-        total_removed += removed;
-    }
-
-    if json {
-        let out = serde_json::json!({
-            "removed_total": total_removed,
-            "by_scope": per_scope
-                .iter()
-                .map(|(s, n)| serde_json::json!({ "scope": s, "removed": n }))
-                .collect::<Vec<_>>(),
-        });
-        return print_json(&out);
-    }
-    if total_removed == 0 {
-        eprintln!("tirith: {}: no expired entries found", human(action_label));
-    }
-
-    0
-}
-
-// --- trust explain ---------------------------------------------------------
-
-/// `tirith trust explain <pattern> [--scope ...]` — explain one trust entry:
-/// what it covers, how broad it is, when it expires, and why it was added.
-#[derive(Debug, Serialize)]
-struct ExplainReport {
-    pattern: String,
-    /// True when no matching trust/allowlist entry exists.
-    found: bool,
-    /// One report per matching entry (a pattern may appear in several scopes).
-    matches: Vec<ExplainMatch>,
-}
-
-#[derive(Debug, Serialize)]
-struct ExplainMatch {
-    source: String,
-    rule_id: Option<String>,
-    scope_kind: ScopeKind,
-    scope_coverage: String,
-    /// True when this entry is dangerously broad.
-    broad_warning: bool,
-    added: Option<String>,
-    reason: Option<String>,
-    ttl_expires: Option<String>,
-    /// Human "in 6d" / "expired" / `None` for permanent.
-    expires_in: Option<String>,
-    expired: bool,
-    permanent: bool,
-}
-
-/// `tirith trust explain <pattern>`.
-pub fn explain(pattern: &str, scope: &str, json: bool) -> i32 {
-    if !matches!(scope, "user" | "repo" | "all") {
-        eprintln!(
-            "{}",
-            unknown_scope_line("explain", scope, "'user', 'repo', or 'all'")
-        );
-        return 1;
-    }
-    if pattern.is_empty() {
-        eprintln!("tirith: trust explain: pattern must not be empty");
-        return 1;
-    }
-
-    // Gather full entry detail (reason/added) from the trust stores, plus
-    // bare allowlist/policy rows. Show expired entries too — `explain` is for
-    // understanding an entry, including a stale one.
-    let mut matches: Vec<ExplainMatch> = Vec::new();
-
-    let scopes: Vec<&str> = match scope {
-        "all" => vec!["user", "repo"],
-        s => vec![s],
-    };
-    for s in &scopes {
-        let path = match trust_store_path(s) {
-            Ok(p) => p,
-            Err(e) => {
-                if scope != "all" {
-                    print_trust_error("explain", &e, None);
-                    return 1;
-                }
-                continue;
-            }
-        };
-        let store = match load_store_scoped(s, &path) {
-            Ok(st) => st,
-            Err(e) => {
-                eprintln!("{}", trust_error_line("explain", &e));
-                return 1;
-            }
-        };
-        for entry in &store.entries {
-            if entry.pattern == pattern {
-                let kind = classify_scope(&entry.pattern);
-                matches.push(ExplainMatch {
-                    source: format!("trust-{s}"),
-                    rule_id: entry.rule_id.clone(),
-                    scope_kind: kind,
-                    scope_coverage: kind.coverage().to_string(),
-                    broad_warning: kind.is_dangerous(),
-                    added: Some(entry.added.clone()),
-                    reason: entry.reason.clone(),
-                    ttl_expires: entry.ttl_expires.clone(),
-                    expires_in: humanize_expiry(entry.ttl_expires.as_deref()),
-                    expired: is_expired(entry),
-                    permanent: entry.ttl_expires.is_none(),
-                });
-            }
-        }
-    }
-
-    // Also surface a match coming purely from policy / flat allowlist files.
-    if scope == "all" {
-        if let Ok(rows) = collect_rows("all", true) {
-            for r in rows {
-                let from_allowlist_or_policy =
-                    r.source.starts_with("allowlist") || r.source == "policy";
-                if r.pattern == pattern && from_allowlist_or_policy {
-                    matches.push(ExplainMatch {
-                        source: r.source,
-                        rule_id: r.rule_id,
-                        scope_kind: r.scope_kind,
-                        scope_coverage: r.scope_coverage,
-                        broad_warning: r.broad_warning,
-                        added: None,
-                        reason: None,
-                        ttl_expires: None,
-                        expires_in: None,
-                        expired: false,
-                        permanent: true,
-                    });
-                }
-            }
-        }
-    }
-
-    let report = ExplainReport {
-        pattern: pattern.to_string(),
-        found: !matches.is_empty(),
-        matches,
-    };
-
-    if json {
-        return print_json(&report);
-    }
-
-    if !report.found {
-        // Still explain what *would* happen if this pattern were trusted.
-        let kind = classify_scope(pattern);
-        eprintln!(
-            "tirith: '{}' is not currently trusted in scope '{}'.",
-            human(pattern),
-            human(scope)
-        );
-        eprintln!(
-            "  If added, it would be a {} entry — {}.",
-            kind.label(),
-            kind.coverage()
-        );
-        if kind.is_broad() {
-            eprintln!("  That is a broad scope; `trust add` would require --broad to accept it.");
-        }
-        return 0;
-    }
-
-    println!("trust explain: {}", human(pattern));
-    for (i, m) in report.matches.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        println!("  source:   {}", human(&m.source));
-        println!(
-            "  scope:    {} — {}",
-            m.scope_kind.label(),
-            human(&m.scope_coverage)
-        );
-        if let Some(rid) = &m.rule_id {
-            println!("  rule:     {} (suppresses this rule only)", human(rid));
-        } else {
-            println!("  rule:     (global — suppresses every rule)");
-        }
-        if let Some(added) = &m.added {
-            println!("  added:    {}", human(added));
-        }
-        match &m.reason {
-            Some(r) => println!("  reason:   {}", human_multiline(r)),
-            None => println!("  reason:   (none recorded)"),
-        }
-        match (&m.ttl_expires, m.permanent) {
-            (_, true) => println!("  expires:  never (permanent)"),
-            (Some(exp), false) => {
-                let suffix = m
-                    .expires_in
-                    .as_deref()
-                    .map(|h| format!(" ({h})"))
-                    .unwrap_or_default();
-                println!("  expires:  {}{}", human(exp), human(&suffix));
-            }
-            (None, false) => println!("  expires:  never (permanent)"),
-        }
-        if m.expired {
-            println!("  status:   EXPIRED — run 'tirith trust gc --expired' to remove it");
-        }
-        if m.broad_warning {
-            println!(
-                "  warning:  dangerously broad — {}",
-                m.scope_kind.coverage()
-            );
-        }
-    }
-    0
 }
 
 // --- trust diff ------------------------------------------------------------
@@ -2488,13 +1666,6 @@ fn record_trust_snapshot(snapshot: &TrustSnapshot) {
         }
     }
     let _ = atomic_write(&path, body.as_bytes());
-}
-
-/// Take a snapshot of the current trust set and fold it into the history file.
-/// Called by the read-only `trust list` / `trust diff` paths so a diff trail
-/// accrues over time without any extra user action.
-pub fn snapshot_current_trust() {
-    record_trust_snapshot(&current_trust_snapshot());
 }
 
 #[derive(Debug, Serialize)]
@@ -2936,8 +2107,8 @@ mod tests {
     }
 
     #[test]
-    fn test_is_expired_unparseable_ttl_is_not_expired() {
-        // A malformed timestamp must never silently revoke trust.
+    fn test_is_expired_unparseable_ttl_matches_inactive_enforcement() {
+        // Malformed timestamps cannot authorize trust in either reader.
         let entry = TrustEntry {
             pattern: "example.com".to_string(),
             rule_id: None,
@@ -2946,7 +2117,7 @@ mod tests {
             source: "cli".to_string(),
             reason: None,
         };
-        assert!(!is_expired(&entry));
+        assert!(is_expired(&entry));
     }
 
     #[test]

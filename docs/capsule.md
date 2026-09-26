@@ -16,8 +16,8 @@ tirith itself launches, never to arbitrary shell commands.
 | `tirith run` (live execution is Linux-only; `--no-exec` is inspection-only on Unix) | default for every live run (`--capsule` remains accepted) | deny-all | fail closed |
 | `tirith temp-run` | `--capsule` | deny-all | best-effort (runs uncontained if no backend, and says so) |
 | `tirith gateway run` | `--capsule` (or the `secure` gateway profile) | deny-all | fail closed |
-| `tirith pkg install` (enforcing execution is x86_64 Linux-only) | always | deny-all | fail closed; every other platform or architecture refuses before pip starts |
-| `tirith capsule run` (enforceable on x86_64 Linux only) | `--preset untrusted-project` | deny-all (no domain allow-listing is offered) | fail closed; every other platform or architecture refuses before anything is copied or spawned |
+| `tirith pkg install` (execution currently disabled on every host) | always | deny-all | refuses before resolver, quarantine, checkpoint, or package execution |
+| `tirith capsule run` (native x86_64 and AArch64 Linux with usable Landlock and seccomp) | `--preset untrusted-project` | deny-all (no domain allow-listing is offered) | fail closed; hosts missing required controls refuse before anything is copied or spawned |
 
 "Fail closed" means: if this host's backend cannot enforce the containment the
 surface requires, the command refuses to run rather than running the child
@@ -25,9 +25,21 @@ uncontained. The `temp-run` surface is the only best-effort one, because it is
 explicitly a filesystem-impact preview rather than a security boundary; with
 `--capsule` it hardens the run where it can and reports honestly when it cannot.
 
-The `tirith pkg install` platform limit applies only to the enforcing execution
-step. `tirith pkg approve` remains a non-installing approval flow, and
-`tirith pkg verify-env` verifies an existing environment without launching pip.
+`tirith pkg install pip` currently refuses with `private_input_execution_unqualified`
+on every host. The private named-input backend cannot guarantee unchanged package
+inputs throughout execution against another process owned by the same user.
+Read-only mounts and initial digest checks alone do not establish that guarantee.
+The command refuses before resolver execution, network access, quarantine writes,
+checkpoint creation, or package execution. `--yes`, `--allow-degraded`, sudo, and
+administrator access do not enable it. The hidden private-input launcher also
+refuses before creating a namespace or starting its target.
+
+This restriction applies to contained package execution. `tirith package inspect`
+and `tirith pkg verify-env` remain available; the latter verifies an existing
+environment without launching pip. `tirith pkg approve` remains subject to its
+separate approval-authority and platform requirements and never installs; an
+approval cannot bypass this execution refusal. Ordinary capsules and command
+protection retain their existing platform and coverage requirements.
 
 ### The untrusted-project preset
 
@@ -93,12 +105,13 @@ is what happens when no audit chain is configured at all (including under
 prints whether the receipt was anchored, so a caller that needs a tamper-evident
 receipt must read that line rather than trusting exit 0.
 
-The preset is enforceable on x86_64 Linux with a usable Landlock ABI and nowhere
-else. Raw-network denial needs seccomp, which is x86_64 Linux only in this
-build; macOS cannot enforce a per-process memory ceiling or a process-count
-ceiling at all; and the parent-owned wall-clock and combined-output supervisor
-is Linux-only. Every other host refuses before anything is copied or spawned,
-naming the exact control it could not deliver.
+The preset is enforceable on native x86_64 and AArch64 Linux with usable
+Landlock and seccomp. AArch64 readiness includes a kernel seccomp probe; a
+user-mode emulator that cannot install the filter does not qualify. macOS
+cannot enforce a per-process memory ceiling or a process-count ceiling, and
+the parent-owned wall-clock and combined-output supervisor is Linux-only.
+Hosts missing any required control refuse before anything is copied or
+spawned, naming the exact control they could not deliver.
 
 For the operator workflow this preset exists for, including what to run before
 and after the contained run, see

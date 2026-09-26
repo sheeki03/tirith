@@ -1,7 +1,11 @@
 //! `tirith pkg install | verify-env | approve | receipt`, the package-firewall
 //! CLI surface (PR D7).
 //!
-//! This is the operator-facing command that drives the D1-D6 machinery end to end:
+//! Contained `pkg install` execution is currently disabled by the shared
+//! private-input qualification guard, before resolver or package side effects.
+//! The remaining commands retain their existing authority and platform gates.
+//!
+//! The retained D1-D6 implementation provides:
 //!
 //! * **`pkg approve`** resolves a Python requirement set into the D1 quarantine (D2),
 //!   firewalls + re-binds it (D3/D4), and prints the [`InstallPlanDigest`] the
@@ -10,11 +14,10 @@
 //!   interpreter, target env, platform tags, install-command semantics, redacted
 //!   policy hash, threat-DB sequence, capsule backend, required coverage, expiry);
 //!   the sorted SHA-set is a display label only.
-//! * **`pkg install`** repeats the resolve + re-bind, re-derives the digest of the
-//!   plan it is ABOUT to run, requires a matching un-expired approval record (or an
-//!   explicit `--yes` for the unattended path), runs the contained install (D4,
-//!   fail-closed under degraded coverage), verifies the installed RECORD (D5), and
-//!   records a tamper-evident, Ed25519-mandatory receipt (D6).
+//! * **`pkg install`** currently refuses before this pipeline. The retained
+//!   implementation resolves and re-binds an approved plan, installs through the
+//!   capsule (D4), verifies RECORD (D5), and requires a signed receipt (D6).
+//!   None of those stages can bypass the private-input qualification refusal.
 //! * **`pkg verify-env`** runs the D5 post-install RECORD verification over an
 //!   already-installed environment, without installing anything.
 //! * **`pkg receipt`** lists and shows the D6 [`ArtifactScanReceipt`]s.
@@ -23,9 +26,9 @@
 //!
 //! `tirith install` (in [`crate::cli::install`]) is the ANALYSIS path: it inspects a
 //! package-manager command and optionally runs the real, UNcontained install.
-//! `tirith pkg install` is the ENFORCING path: it installs ONLY the inspected,
-//! hash-pinned bytes, inside the capsule, and refuses on degraded coverage. The two
-//! stay separate commands. This module reuses `tirith install`'s
+//! `tirith pkg install` retains the ENFORCING path but currently refuses on every
+//! host because the private-input backend is unqualified. The two stay separate
+//! commands. This module reuses `tirith install`'s
 //! `MISPLACED_TIRITH_FLAGS` footgun guard (a tirith-owned flag placed after the
 //! trailing args would silently not affect tirith).
 //!
@@ -60,7 +63,6 @@ use tirith_core::package_approval::{
     PackageApprovalRecordV2, VerifiedPackageApproval,
 };
 use tirith_core::policy::Policy;
-use tirith_core::receipt::ArtifactScanReceipt;
 use tirith_core::task_analysis::TaskAnalysisContext;
 use tirith_core::task_boundary::{
     BoundaryAuthorizationError, BoundaryMarker, BoundaryOperation, OwnedBoundary,
@@ -128,7 +130,11 @@ pub enum PkgAction {
     /// SHA-256 in the owner-only operator trust store.
     TrustTool { path: PathBuf, json: bool },
     /// List / show the D6 tamper-evident receipts.
-    Receipt { which: ReceiptQuery, json: bool },
+    Receipt {
+        which: ReceiptQuery,
+        json: bool,
+        display_json: bool,
+    },
 }
 
 /// Which receipt(s) `pkg receipt` reports.
@@ -209,7 +215,11 @@ pub fn run(action: PkgAction) -> i32 {
             packages,
             json,
         } => run_verify_env(&target, &packages, json),
-        PkgAction::Receipt { which, json } => run_receipt(which, json),
+        PkgAction::Receipt {
+            which,
+            json,
+            display_json,
+        } => run_receipt(which, json, display_json),
         PkgAction::TrustTool { path, json } => run_trust_tool(&path, json),
     }
 }
@@ -1015,13 +1025,10 @@ fn run_approve(
     artifact_origin: &[String],
     json: bool,
 ) -> i32 {
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return report_approve_error(
-            "native_authority",
-            "blocked_native: package approvals are redeemable only on x86_64 Linux",
-            json,
-            1,
-        );
+    if let Err(error) =
+        super::package_approval_authority::availability().require_explicit_issuance()
+    {
+        return report_approve_error("native_authority", &error.to_string(), json, 1);
     }
     if let Some(failure) = precheck(ecosystem, requirements) {
         return report_approve_error("precheck", &failure.reason, json, failure.exit_code);
@@ -1185,10 +1192,6 @@ fn run_install(
     if let Some(failure) = precheck(ecosystem, requirements) {
         return report_pkg_precheck_failure("install", &failure, json);
     }
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
-    let policy = discover_pkg_enforcement_policy(cwd.as_deref());
     let request = match validated_resolver_request(requirements, index_url, artifact_origin) {
         Ok(request) => request,
         Err(error) => {
@@ -1202,6 +1205,23 @@ fn run_install(
             );
         }
     };
+    // Validate syntax first, then refuse an unqualified execution backend before
+    // policy discovery, target retention, resolver/network work, quarantine,
+    // approval consumption, checkpoint creation, or receipt publication.
+    if let Err(error) = capsule::require_private_input_execution_qualification() {
+        return report_install_failure(
+            "refused_before_exec",
+            &error.to_string(),
+            false,
+            false,
+            json,
+            1,
+        );
+    }
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let policy = discover_pkg_enforcement_policy(cwd.as_deref());
     let target_binding = match bind_install_target(target) {
         Ok(binding) => binding,
         Err(error) => {
@@ -2273,100 +2293,127 @@ fn run_verify_env(target: &Path, packages: &[String], json: bool) -> i32 {
 // pkg receipt
 // ---------------------------------------------------------------------------
 
-fn run_receipt(which: ReceiptQuery, json: bool) -> i32 {
-    match which {
-        ReceiptQuery::List => match ArtifactScanReceipt::list() {
-            Ok(receipts) => {
-                if json {
-                    let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &receipts);
-                    println!();
-                } else if receipts.is_empty() {
-                    eprintln!("tirith pkg receipt: no artifact-scan receipts found");
-                } else {
-                    for r in &receipts {
-                        print_receipt_summary(r);
-                    }
-                }
-                0
+fn run_receipt(which: ReceiptQuery, json: bool, display_json: bool) -> i32 {
+    use super::receipt_display as display;
+    let compiled = display::output_dlp();
+    let is_list = matches!(which, ReceiptQuery::List);
+    let selected = match which {
+        ReceiptQuery::Show(id) => display::load_artifact(&id).map(|receipt| vec![receipt]),
+        ReceiptQuery::List | ReceiptQuery::Last => display::list_artifact().map(|mut receipts| {
+            receipts.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            if !is_list {
+                receipts.truncate(1);
             }
-            Err(e) => {
-                eprintln!("tirith pkg receipt: {e}");
-                1
-            }
-        },
-        ReceiptQuery::Last => match ArtifactScanReceipt::list() {
-            Ok(receipts) => match receipts.first() {
-                Some(r) => {
-                    print_receipt_full(r, json);
-                    0
-                }
-                None => {
-                    eprintln!("tirith pkg receipt: no artifact-scan receipts found");
-                    1
-                }
-            },
-            Err(e) => {
-                eprintln!("tirith pkg receipt: {e}");
-                1
-            }
-        },
-        ReceiptQuery::Show(id) => match ArtifactScanReceipt::load(&id) {
-            Ok(r) => {
-                print_receipt_full(&r, json);
-                // A content-hash mismatch means the saved file was edited.
-                if !r.content_hash_matches() {
-                    eprintln!(
-                        "  WARNING: this receipt's stored id does not match its content \
-                         (the file may have been edited)"
-                    );
-                    return 1;
-                }
-                0
-            }
-            Err(e) => {
-                eprintln!("tirith pkg receipt: {e}");
-                1
-            }
-        },
-    }
-}
-
-fn print_receipt_summary(r: &ArtifactScanReceipt) {
-    eprintln!(
-        "  {} {} {} {} artifact(s) {}",
-        tirith_core::receipt::short_hash(&r.receipt_id),
-        r.verdict.action,
-        r.capsule.backend_id,
-        r.artifact_sha256.len(),
-        r.timestamp
-    );
-}
-
-fn print_receipt_full(r: &ArtifactScanReceipt, json: bool) {
-    if json {
-        let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), r);
-        println!();
-        return;
-    }
-    eprintln!("tirith pkg receipt: {}", r.receipt_id);
-    eprintln!("  schema:        {}", r.schema);
-    eprintln!("  tirith:        {}", r.tirith_version);
-    eprintln!("  engine SHA:    {}", r.engine_build_sha);
-    eprintln!("  policy hash:   {}", r.policy_hash);
-    eprintln!("  DB sequence:   {}", r.threat_db_sequence);
-    eprintln!("  resolver:      {}", r.resolver_command);
-    eprintln!("  capsule:       {}", r.capsule.backend_id);
-    eprintln!("  artifacts:     {}", r.artifact_sha256.len());
-    eprintln!("  verdict:       {}", r.verdict.action);
-    eprintln!("  when:          {}", r.timestamp);
-    eprintln!(
-        "  content valid: {}",
-        if r.content_hash_matches() {
-            "yes"
-        } else {
-            "NO (edited?)"
+            receipts
+        }),
+    };
+    let receipts = match selected {
+        Ok(receipts) => receipts,
+        Err(error) => {
+            eprintln!("tirith pkg receipt: {error}");
+            return 1;
         }
-    );
+    };
+    if !is_list && receipts.is_empty() {
+        eprintln!("tirith pkg receipt: no artifact-scan receipts found");
+        return 1;
+    }
+    let values = receipts
+        .iter()
+        .map(|receipt| {
+            if display_json {
+                Ok(display::artifact_display(receipt, &compiled))
+            } else if json {
+                display::artifact_canonical(receipt, &compiled)
+            } else {
+                Ok(display::artifact(receipt, &compiled))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let values = match values {
+        Ok(values) => values,
+        Err(error) => {
+            eprintln!("tirith pkg receipt: {error}");
+            return 1;
+        }
+    };
+    let output = if is_list {
+        serde_json::Value::Array(values)
+    } else {
+        values.into_iter().next().expect("selected receipt")
+    };
+    if let Err(error) = display::bounded(&output) {
+        eprintln!("tirith pkg receipt: {error}");
+        return 1;
+    }
+    if json || display_json {
+        let written = if display_json {
+            display::write(&output)
+        } else if is_list {
+            super::write_json_stdout(&receipts, "tirith pkg receipt: failed to write JSON output")
+        } else {
+            super::write_json_stdout(
+                &receipts[0],
+                "tirith pkg receipt: failed to write JSON output",
+            )
+        };
+        if !written {
+            return 1;
+        }
+    } else if is_list {
+        if receipts.is_empty() {
+            eprintln!("tirith pkg receipt: no artifact-scan receipts found");
+        }
+        for row in output.as_array().expect("receipt list") {
+            eprintln!(
+                "  {} {} {} {} artifact(s) {}",
+                tirith_core::receipt::short_hash(&display::text(row, "receipt_id")),
+                display::text(&row["verdict"], "action"),
+                display::text(&row["capsule"], "backend_id"),
+                row["artifact_sha256"].as_array().map_or(0, Vec::len),
+                display::text(row, "timestamp")
+            );
+        }
+    } else {
+        eprintln!(
+            "tirith pkg receipt: {}",
+            display::text(&output, "receipt_id")
+        );
+        eprintln!("  schema: {}", output["schema"]);
+        for (label, key) in [
+            ("tirith", "tirith_version"),
+            ("engine SHA", "engine_build_sha"),
+            ("policy hash", "policy_hash"),
+            ("resolver", "resolver_command"),
+            ("when", "timestamp"),
+        ] {
+            eprintln!("  {label}: {}", display::text(&output, key));
+        }
+        eprintln!(
+            "  capsule: {}",
+            display::text(&output["capsule"], "backend_id")
+        );
+        eprintln!("  verdict: {}", display::text(&output["verdict"], "action"));
+        eprintln!("  DB sequence: {}", output["threat_db_sequence"]);
+        eprintln!("  artifacts: {}", receipts[0].artifact_sha256.len());
+        eprintln!(
+            "  content valid: {}",
+            if receipts[0].content_hash_matches() {
+                "yes"
+            } else {
+                "NO (edited?)"
+            }
+        );
+    }
+    if receipts
+        .iter()
+        .any(|receipt| !receipt.content_hash_matches())
+    {
+        eprintln!("tirith pkg receipt: stored receipt content does not match its ID.");
+        1
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------

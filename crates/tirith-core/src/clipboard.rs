@@ -25,6 +25,58 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Android/Bionic shim for the `arboard` clipboard crate, which ships
+/// X11/Wayland/Windows/macOS backends only and has no Android implementation
+/// (see the `cfg(not(target_os = "android"))` gate in Cargo.toml). It presents
+/// exactly the surface `clipboard.rs` uses so the rest of this module compiles
+/// unchanged. Tirith has no Android clipboard backend, even when an optional
+/// display server is present. Every operation reports "no backend" through the
+/// existing degradation path, never fabricated clipboard content.
+#[cfg(target_os = "android")]
+#[allow(dead_code)]
+mod android_clipboard {
+    /// Mirrors `arboard::Clipboard` (the subsets this module calls).
+    pub struct Clipboard;
+
+    /// Mirrors `arboard::Error` for the variants/uses in this module.
+    pub enum Error {
+        ContentNotAvailable,
+        Other(String),
+    }
+
+    impl std::fmt::Display for Error {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Error::ContentNotAvailable => write!(f, "content not available"),
+                Error::Other(s) => write!(f, "{s}"),
+            }
+        }
+    }
+
+    impl Clipboard {
+        pub fn new() -> Result<Self, Error> {
+            // Wording matches the keywords `classify_arboard_error` maps to
+            // `NoBackend` ("no display server"), so callers degrade identically.
+            Err(Error::Other(
+                "no display server backend compiled for Android clipboard access".into(),
+            ))
+        }
+
+        pub fn get_text(&mut self) -> Result<String, Error> {
+            Err(Error::ContentNotAvailable)
+        }
+
+        pub fn set_text(&mut self, _s: String) -> Result<(), Error> {
+            Err(Error::Other("no clipboard backend on Android".into()))
+        }
+    }
+}
+
+/// On Android, resolve every `arboard::…` path in this module to the shim above;
+/// on all other targets this alias is compiled out and the real crate is used.
+#[cfg(target_os = "android")]
+use android_clipboard as arboard;
+
 /// Read cap for the companion `clipboard_source.json`; larger → unreadable
 /// (`None`) rather than buffered. Mirrors the incident-flag / command-card caps.
 /// Public so `tirith browser host` rejects a record whose serialized form would
@@ -139,8 +191,8 @@ pub fn content_sha256_hex(bytes: &[u8]) -> String {
 /// callers degrade (empty envelope, exit 0 in JSON mode), never panic.
 #[derive(Debug, Error)]
 pub enum ClipboardError {
-    /// No clipboard backend (Linux without X/Wayland, non-interactive Windows
-    /// session). Caller degrades gracefully.
+    /// No clipboard backend (Android, Linux without X/Wayland, non-interactive
+    /// Windows session). Caller degrades gracefully.
     #[error("no clipboard backend available (headless display server?)")]
     NoBackend,
 
@@ -206,6 +258,19 @@ mod tests {
     fn no_backend_renders_stable_message() {
         let msg = ClipboardError::NoBackend.to_string();
         assert!(msg.contains("no clipboard backend"));
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_clipboard_never_reports_empty_or_copied_content() {
+        assert!(matches!(
+            read_clipboard_text(),
+            Err(ClipboardError::NoBackend)
+        ));
+        assert!(matches!(
+            write_clipboard_text("test"),
+            Err(ClipboardError::NoBackend)
+        ));
     }
 
     /// `Other` carries the upstream message through unchanged.

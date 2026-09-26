@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Versioned personal protection profiles, explicit shell/profile setup, scoped expiring trust grants, and shared reviewed operations with status, cancellation and owned undo.
+- Authenticated loopback controls for protection settings, history, project review, support selection, retained audit segments and supported lifecycle changes.
+- Bounded offline npm artifact inspection and release comparison, explicit project-surface review, and policy impact reports with coverage and adoption limits.
+- Current-shell diagnostic verification based on authenticated harmless probes; configured or inherited hook state alone does not claim observed blocking.
+- Optional self-hosted team policy service, explicit client enrollment, reviewed publication and rollback, and adoption reports that retain missing, stale and failed clients.
+- Reviewed local materialization of dependency-free, script-free npm artifacts on supported Linux hosts, with exact artifact binding and explicit recovery. Package code execution remains unavailable.
+- Separate npm installation review and status commands, with a sealed descriptor launcher and signed completion records under development. Execution stays disabled pending native qualification and a current signed v2 threat feed.
+
+### Fixed
+
+- Remove sudo dependencies and suggestions from native packages. Ordinary protection stays unprivileged; manual privileged-helper installation is off by default, and unsupported or missing approval prerequisites have explicit guidance.
+- Preserve protocol fields under custom redaction, apply fresh privacy rules to selected support exports, and keep signed verification material separate from display copies.
+- Apply fresh privacy rules to npm operation output while preserving review handles and historical stderr behavior. Preserve private checkpoint data during unexpected unwinding, and check receipt-signing keys before package execution can start.
+- Bind npm approvals to the complete private review, including policy and file generations. Older materialization reviews remain readable but cannot authorize changes; unstarted work requires a new review.
+- Bound recent history and tuning reads, preserve all contributing blockers in previews, and report expectation labels without inferring safety or automatic approval.
+- Preserve exact audit history through reviewed rotation and recovery; retained segment deletion requires an irreversible acknowledgement and never offers a false undo.
+- Recognize literal bracket conditions, bounded numeric shell arithmetic, and simple Python data pipelines without hiding executable substitutions or unresolved variable commands (#260, #264).
+- Correct Android clipboard and errno portability, refuse incompatible release installation on Android, and document the remaining native qualification limits (#261, based on #262).
+- Preserve the exact release libc/ABI during update selection. Linux installation and npm launch refuse incompatible or unidentified runtimes before selecting a GNU executable.
+
 ## [0.4.2] - 2026-09-11
 
 ### Fixed
