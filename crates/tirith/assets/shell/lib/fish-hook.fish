@@ -209,8 +209,15 @@ function _tirith_v3_new_capture_file
             not string match -q '/*' -- "$_TIRITH_RM_BIN"
         return 1
     end
-    set -l file (umask 077; command "$_TIRITH_MKTEMP_BIN")
+    # fish command substitution runs in the CURRENT shell, not a subshell, so
+    # `umask 077` here would leak 077 into the whole interactive session — unlike
+    # bash/zsh, where `$( ... )` / `( ... )` is a subshell. Save and restore it,
+    # so a failed mktemp cannot leave the session at 077 either.
+    set -l saved_umask (umask)
+    umask 077
+    set -l file (command "$_TIRITH_MKTEMP_BIN")
     set -l create_status $status
+    umask $saved_umask
     if test $create_status -ne 0; or test -z "$file"; or not test -f "$file"; or test -L "$file"; or not test -O "$file"
         if test -n "$file"
             command "$_TIRITH_RM_BIN" -f -- "$file" 2>/dev/null
